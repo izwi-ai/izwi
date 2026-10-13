@@ -12,7 +12,8 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
+use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use crate::models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
@@ -42,7 +43,8 @@ struct DirectTtsGenerationShape {
     units: u64,
     max_output_samples: u64,
     has_reference_decode: bool,
-    kokoro_max_chunk_expanded_frames: Option<u64>,
+    /// Planned frames of one Kokoro stream chunk.
+    kokoro_chunk_frames: Option<usize>,
 }
 
 fn direct_tts_generation_shape(
@@ -53,22 +55,21 @@ fn direct_tts_generation_shape(
 ) -> Result<DirectTtsGenerationShape> {
     let explicit = request.config.options.max_tokens;
     if matches!(variant.family(), ModelFamily::KokoroTts) {
+        // The direct route streams: it synthesizes one planned chunk (at
+        // most `KOKORO_STREAM_TARGET_CHARS`) at a time and hands its audio
+        // on, so it holds one chunk's workspace and output (KOK-8).
         let budget = kokoro_output_budget(&request.text, request.config.options.speed)?;
+        let frames = crate::runtime::kokoro::kokoro_stream_chunk_frames(
+            &request.text,
+            request.config.options.speed,
+        );
         return Ok(DirectTtsGenerationShape {
             units: u64::try_from(budget.max_model_tokens).map_err(|_| {
                 Error::InvalidInput("Kokoro model-token budget exceeds u64".to_string())
             })?,
-            max_output_samples: u64::try_from(budget.max_samples).map_err(|_| {
-                Error::InvalidInput("Kokoro output-sample budget exceeds u64".to_string())
-            })?,
+            max_output_samples: kokoro_chunk_price(frames, backend)?.output_samples,
             has_reference_decode: false,
-            kokoro_max_chunk_expanded_frames: Some(
-                u64::try_from(budget.max_chunk_expanded_frames).map_err(|_| {
-                    Error::InvalidInput(
-                        "Kokoro expanded-frame workspace budget exceeds u64".to_string(),
-                    )
-                })?,
-            ),
+            kokoro_chunk_frames: Some(frames),
         });
     }
     let (units, output_samples_per_unit, has_reference_decode) = match variant.family() {
@@ -137,7 +138,7 @@ fn direct_tts_generation_shape(
             .checked_mul(output_samples_per_unit)
             .ok_or_else(|| Error::Overloaded("TTS output shape overflowed".to_string()))?,
         has_reference_decode,
-        kokoro_max_chunk_expanded_frames: None,
+        kokoro_chunk_frames: None,
     })
 }
 
@@ -206,23 +207,22 @@ fn direct_tts_additional_resources(
         .max_output_samples
         .checked_mul(std::mem::size_of::<f32>() as u64)
         .ok_or_else(|| Error::Overloaded("TTS output reservation overflowed".to_string()))?;
-    let (state_host_bytes, cpu_tensor_bytes, accelerator_tensor_bytes) =
-        if let Some(max_chunk_expanded_frames) = shape.kokoro_max_chunk_expanded_frames {
-            let workspace = kokoro_peak_workspace(max_chunk_expanded_frames)?;
-            (
-                workspace.host_bytes,
-                workspace.cpu_tensor_bytes,
-                workspace.accelerator_tensor_bytes,
-            )
-        } else {
-            let state_bytes = shape
-                .units
-                .checked_mul(DIRECT_TTS_STATE_BYTES_PER_UNIT)
-                .ok_or_else(|| {
-                    Error::Overloaded("TTS session reservation overflowed".to_string())
-                })?;
-            (0, state_bytes, state_bytes)
-        };
+    let (state_host_bytes, cpu_tensor_bytes, accelerator_tensor_bytes) = if let Some(frames) =
+        shape.kokoro_chunk_frames
+    {
+        let price = kokoro_chunk_price(frames, backend)?;
+        (
+            price.host_bytes,
+            price.cpu_tensor_bytes,
+            price.accelerator_tensor_bytes,
+        )
+    } else {
+        let state_bytes = shape
+            .units
+            .checked_mul(DIRECT_TTS_STATE_BYTES_PER_UNIT)
+            .ok_or_else(|| Error::Overloaded("TTS session reservation overflowed".to_string()))?;
+        (0, state_bytes, state_bytes)
+    };
     let (reference_host_bytes, reference_accelerator_bytes) =
         if shape.has_reference_decode && request.reference_audio.is_some() {
             (
@@ -960,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn kokoro_max_text_at_minimum_speed_uses_the_hard_model_output_contract() {
+    fn kokoro_max_text_keeps_the_hard_unit_contract_and_reserves_one_chunk_of_output() {
         let max_sequence_length = 4096usize;
         let max_text_chars = max_sequence_length * 8;
         let mut request = GenerationRequest::new("x".repeat(max_text_chars));
@@ -974,86 +974,54 @@ mod tests {
         )
         .unwrap();
 
-        let expected_frames = budget
-            .max_model_tokens
-            .checked_mul(100)
-            .unwrap()
-            .min(max_text_chars * 4_096);
-        let expected_samples = expected_frames
-            .checked_mul(600)
-            .and_then(|samples| samples.checked_add((max_text_chars - 1) * 960))
-            .unwrap();
-        assert_eq!(budget.max_samples, expected_samples);
-        assert_eq!(budget.max_chunk_expanded_frames, 4_096);
         assert_eq!(shape.units, budget.max_model_tokens as u64);
-        assert_eq!(shape.max_output_samples, expected_samples as u64);
+        // One 180-character chunk at 4 frames per character, halved speed.
+        assert_eq!(shape.kokoro_chunk_frames, Some(1_440));
+        assert_eq!(shape.max_output_samples, 1_440 * 600);
     }
 
+    /// KOK-8/9: a 45-word stream reserved 3.34 GB on Metal (4,096 frames of
+    /// workspace plus the whole text's output at 50 bins per token) and was
+    /// refused against 2.30 GB of live memory, although one chunk of real
+    /// speech needs far less. The stream now reserves its largest planned
+    /// chunk at the planning pace, with the final-stage im2col counted
+    /// (rounded to a power of two on Metal), and one chunk of output.
     #[test]
-    fn kokoro_worst_case_chunk_reserves_architecture_peak_on_each_backend() {
-        // 29 input characters authorize at least 512 worst-case model tokens,
-        // so the per-chunk frame ceiling, rather than total request tokens,
-        // determines the live activation peak.
-        let mut request = GenerationRequest::new("x".repeat(29));
-        request.config.options.speed = 0.5;
-        let budget = kokoro_output_budget(&request.text, request.config.options.speed).unwrap();
-        assert_eq!(budget.max_chunk_expanded_frames, 4_096);
-
-        let expanded_frames = 4_096u64;
-        let generator_time_scale = 2 * 10 * 6;
-        let final_stage_elements_per_frame = generator_time_scale * 128;
-        let retained_elements_per_frame = generator_time_scale * 22 + 512 + 2 * 2;
-        let cpu_tensor_bytes = expanded_frames
-            * (final_stage_elements_per_frame * 10 + retained_elements_per_frame)
-            * std::mem::size_of::<f32>() as u64;
-        let accelerator_tensor_bytes = expanded_frames
-            * (final_stage_elements_per_frame * 9 + retained_elements_per_frame)
-            * std::mem::size_of::<f32>() as u64;
-        let host_workspace_bytes =
-            expanded_frames * generator_time_scale * 5 * 40 * std::mem::size_of::<f32>() as u64;
-        let output_bytes = budget.max_samples as u64 * std::mem::size_of::<f32>() as u64;
-
-        let cpu = direct_tts_additional_resources(
-            BackendKind::Cpu,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-        let metal = direct_tts_additional_resources(
-            BackendKind::Metal,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-        let cuda = direct_tts_additional_resources(
-            BackendKind::Cuda,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-
+    fn kokoro_stream_reserves_one_planned_chunk_on_each_backend() {
+        use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+        let paragraph = "Good morning. Today we are testing a speech synthesis system on a \
+            laptop. The goal is to measure how fast it runs, how much memory it uses, and \
+            whether every word in this paragraph comes out clearly, without skipping, \
+            repeating, or adding anything at the end.";
+        let request = GenerationRequest::new(paragraph);
+        let resources = |backend| {
+            direct_tts_additional_resources(backend, &request, ModelVariant::Kokoro82M, 4_096)
+                .unwrap()
+        };
+        let frames = 180 * 4;
+        let price = |backend| kokoro_chunk_price(frames, backend).unwrap();
+        let output_bytes = frames as u64 * 600 * 4;
+        let metal = price(BackendKind::Metal);
         assert_eq!(
-            cpu.host_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes + cpu_tensor_bytes)
+            resources(BackendKind::Metal).unified_bytes,
+            ResourceAmount::Known(output_bytes + metal.host_bytes + metal.accelerator_tensor_bytes)
         );
+        let cpu = price(BackendKind::Cpu);
         assert_eq!(
-            metal.unified_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes + accelerator_tensor_bytes)
+            resources(BackendKind::Cpu).host_bytes,
+            ResourceAmount::Known(output_bytes + cpu.host_bytes + cpu.cpu_tensor_bytes)
         );
+        let cuda = price(BackendKind::Cuda);
         assert_eq!(
-            cuda.host_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes)
+            resources(BackendKind::Cuda).device_bytes,
+            ResourceAmount::Known(cuda.accelerator_tensor_bytes)
         );
-        assert_eq!(
-            cuda.device_bytes,
-            ResourceAmount::Known(accelerator_tensor_bytes)
-        );
+        let ResourceAmount::Known(metal_total) = resources(BackendKind::Metal).unified_bytes else {
+            panic!("known Metal reservation");
+        };
         assert!(
-            output_bytes + host_workspace_bytes + cpu_tensor_bytes < 4 * 1024 * 1024 * 1024,
-            "the enforced frame ceiling must keep a worst-case chunk admissible on practical hosts"
+            metal_total < 1_100 * 1024 * 1024,
+            "45-word stream reserves {metal_total} bytes on Metal"
         );
     }
 

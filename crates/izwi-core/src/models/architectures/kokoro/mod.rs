@@ -4,6 +4,7 @@
 //! voice-pack handling, and future Candle inference implementation from the
 //! generic runtime orchestration layer.
 
+pub(crate) mod admission;
 mod albert;
 mod config;
 mod decoder;

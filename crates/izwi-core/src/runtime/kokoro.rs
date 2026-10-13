@@ -8,6 +8,7 @@ use tracing::info;
 use crate::engine::WorkUnit;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+use crate::models::architectures::kokoro::admission::kokoro_chunk_frame_bound;
 use crate::models::architectures::kokoro::{
     kokoro_output_budget, KokoroPreparedRequest, KokoroSynthesisResult, KokoroTtsModel,
 };
@@ -17,8 +18,17 @@ use crate::runtime::service::RuntimeService;
 use crate::runtime::tts::direct_tts_retained_input_bytes;
 use crate::runtime::types::{AudioChunk, GenerationRequest};
 
-const KOKORO_STREAM_TARGET_CHARS: usize = 180;
+pub(crate) const KOKORO_STREAM_TARGET_CHARS: usize = 180;
 const KOKORO_STREAM_MIN_CHARS: usize = 64;
+
+/// Planned frames of the largest chunk the stream planner can produce for
+/// `text`: its chunks never exceed `KOKORO_STREAM_TARGET_CHARS`.
+pub(crate) fn kokoro_stream_chunk_frames(text: &str, speed: f32) -> usize {
+    kokoro_chunk_frame_bound(
+        text.trim().chars().count().min(KOKORO_STREAM_TARGET_CHARS),
+        speed,
+    )
+}
 
 fn kokoro_streaming_capability() -> CapabilityKind {
     CapabilityKind::StreamingTts
@@ -73,6 +83,7 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::InferenceError("Kokoro model not loaded".to_string()))?;
         let text = request.text;
+        let text_for_limit = text.clone();
         let speaker = request
             .config
             .options
@@ -113,7 +124,17 @@ impl RuntimeService {
         }
         let mut expected_sample_rate: Option<u32> = None;
         let mut emitted_samples = 0usize;
-        let mut materialized_output_capacity = 0usize;
+        // Admission reserved one chunk of output at the planning pace for
+        // the largest chunk the planner can produce (KOK-8); each chunk's
+        // audio is handed on before the next is synthesized.
+        let chunk_sample_limit =
+            crate::models::architectures::kokoro::admission::kokoro_chunk_price(
+                kokoro_stream_chunk_frames(&text_for_limit, speed),
+                self.backend_router.context().backend_kind,
+            )?
+            .output_samples;
+        let chunk_sample_limit = usize::try_from(chunk_sample_limit)
+            .map_err(|_| Error::Overloaded("Kokoro chunk sample limit exceeds usize".into()))?;
 
         for (sequence, chunk_text) in stream_chunks.into_iter().enumerate() {
             let model_for_task = model.clone();
@@ -134,7 +155,7 @@ impl RuntimeService {
                             speaker_for_task.as_deref(),
                             language_for_task.as_deref(),
                             speed,
-                            output_budget.max_samples,
+                            chunk_sample_limit,
                         )?;
                         Ok((residency_lease, synthesis))
                     },
@@ -159,17 +180,11 @@ impl RuntimeService {
                 output_budget.max_samples,
                 "streamed samples",
             )?;
-            materialized_output_capacity = checked_kokoro_sample_growth(
-                materialized_output_capacity,
-                synthesis.samples.capacity(),
-                output_budget.max_samples,
-                "streamed sample capacity",
-            )?;
             record_kokoro_materialized_output(
                 job,
                 retained_input_bytes,
-                materialized_output_capacity,
-                output_budget.max_samples,
+                synthesis.samples.capacity(),
+                chunk_sample_limit,
             )?;
 
             let mut chunk = AudioChunk::new(request_id.clone(), sequence, synthesis.samples)

@@ -65,7 +65,7 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
 };
-use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
+use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };
@@ -941,30 +941,54 @@ pub(super) fn add_fish_s2_artifact_to_admission(
     Ok(())
 }
 
+/// What one engine Kokoro request reserves, from its prepared chunks
+/// (KOK-8/9): the widest chunk's decoder workspace (chunks run one after
+/// another) and the joined output of every chunk, each at the planning pace
+/// for its own text rather than the model's 50-bins-per-token ceiling.
 fn kokoro_synthesis_resources(
     backend: BackendKind,
-    text: &str,
-    speed: f32,
+    prepared: &crate::engine::KokoroPreparedText,
 ) -> Result<ResourceVector> {
-    let budget = kokoro_output_budget(text, speed)?;
-    let workspace = kokoro_peak_workspace(
-        u64::try_from(budget.max_chunk_expanded_frames)
-            .map_err(|_| Error::Overloaded("Kokoro frame budget exceeds u64".into()))?,
-    )?;
-    let output_bytes = u64::try_from(budget.max_samples)
-        .ok()
-        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
-        .ok_or_else(|| Error::Overloaded("Kokoro output reservation overflowed".into()))?;
-    let host_bytes = output_bytes
-        .checked_add(workspace.host_bytes)
-        .ok_or_else(|| Error::Overloaded("Kokoro host reservation overflowed".into()))?;
+    use crate::models::architectures::kokoro::admission::{
+        kokoro_chunk_frame_bound, kokoro_chunk_price,
+    };
+    let overflow = || Error::Overloaded("Kokoro reservation overflowed".into());
+    let mut widest: Option<crate::models::architectures::kokoro::admission::KokoroChunkPrice> =
+        None;
+    let mut output_samples = 0u64;
+    for (index, chunk) in prepared.chunks.iter().enumerate() {
+        let frames = kokoro_chunk_frame_bound(chunk.source_text.chars().count(), chunk.speed);
+        let price = kokoro_chunk_price(frames, backend)?;
+        let pause = if index == 0 {
+            0
+        } else {
+            KOKORO_JOIN_PAUSE_SAMPLES
+        };
+        output_samples = output_samples
+            .checked_add(price.output_samples)
+            .and_then(|samples| samples.checked_add(pause))
+            .ok_or_else(overflow)?;
+        if widest.is_none_or(|current| price.frames > current.frames) {
+            widest = Some(price);
+        }
+    }
+    let widest =
+        widest.ok_or_else(|| Error::InvalidInput("Kokoro request has no chunks".into()))?;
+    let host_bytes = output_samples
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .and_then(|bytes| bytes.checked_add(widest.host_bytes))
+        .ok_or_else(overflow)?;
     super::tts::direct_tts_physical_resources(
         backend,
         host_bytes,
-        workspace.cpu_tensor_bytes,
-        workspace.accelerator_tensor_bytes,
+        widest.cpu_tensor_bytes,
+        widest.accelerator_tensor_bytes,
     )
 }
+
+/// Silence the executor inserts between joined Kokoro chunks (40 ms at
+/// 24 kHz).
+const KOKORO_JOIN_PAUSE_SAMPLES: u64 = 960;
 
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
     if job
@@ -6177,12 +6201,11 @@ impl RuntimeService {
         )?;
         let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
         let prepared_text = prepared
-            .tts_text_for_execution()
+            .prepared_kokoro_tts_artifact_for_executor()?
             .ok_or_else(|| Error::InferenceError("prepared Kokoro request lost its text".into()))?;
         execution.resources = execution.resources.checked_add(kokoro_synthesis_resources(
             self.backend_router.context().backend_kind,
-            prepared_text,
-            prepared.params.speed,
+            &prepared_text,
         )?)?;
         match self
             .coordinator
@@ -10886,6 +10909,46 @@ mod tests {
         assert_eq!(
             Some(spec.resources),
             asr_transient_resources(backend, variant, after, Some(257.0 / 16_000.0)).unwrap()
+        );
+    }
+
+    /// KOK-8: an engine Kokoro request reserves its widest prepared chunk's
+    /// workspace and the joined output of its chunks at the planning pace,
+    /// not 4,096 frames and the 50-bins-per-token output of its whole text.
+    #[test]
+    fn kokoro_engine_reservation_follows_the_prepared_chunks() {
+        use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+        use crate::models::architectures::kokoro::KokoroPreparedRequest;
+        let chunk = |text: &str| KokoroPreparedRequest {
+            source_text: text.into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            phonemes: "p".into(),
+            token_ids: vec![1; 8],
+            ref_style: candle_core::Tensor::zeros(
+                (1, 4),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            speed: 1.0,
+        };
+        let prepared = crate::engine::KokoroPreparedText {
+            source_text: "ab".into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            chunks: vec![chunk(&"a".repeat(100)), chunk(&"b".repeat(40))],
+        };
+        let wide = kokoro_chunk_price(400, BackendKind::Metal).unwrap();
+        let narrow = kokoro_chunk_price(160, BackendKind::Metal).unwrap();
+        let output = (wide.output_samples + narrow.output_samples + 960) * 4;
+        assert_eq!(
+            kokoro_synthesis_resources(BackendKind::Metal, &prepared)
+                .unwrap()
+                .unified_bytes,
+            ResourceAmount::Known(output + wide.host_bytes + wide.accelerator_tensor_bytes)
         );
     }
 
