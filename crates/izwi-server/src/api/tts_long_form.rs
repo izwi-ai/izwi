@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use izwi_core::{GenerationRequest, GenerationResult, ModelVariant, RuntimeService};
+use izwi_core::{GenerationRequest, GenerationResult, ModelVariant, RuntimeService, TtsStopReason};
 
 const DEFAULT_CHUNK_MAX_CHARS: usize = 480;
 const CHUNK_MAX_CHARS_MIN: usize = 80;
@@ -292,23 +292,41 @@ pub fn split_tts_text_for_long_form(
     }
 }
 
+/// Requests for one speech job. An automatic budget (`max_tokens` 0)
+/// splits only text one request cannot finish (TPIPE-2), and every request
+/// gets the automatic budget of its own text; an explicit budget keeps the
+/// caller's split rule.
 pub fn expand_generation_requests_for_long_form(
     base_request: &GenerationRequest,
     variant: ModelVariant,
 ) -> Vec<GenerationRequest> {
-    let chunks = split_tts_text_for_long_form(
-        variant,
-        base_request.config.options.max_tokens,
-        base_request.text.as_str(),
-    );
+    let requested = base_request.config.options.max_tokens;
+    let automatic = requested == 0 && variant != ModelVariant::FishAudioS2Pro;
+    let chunks = if automatic
+        && !crate::api::tts_policy::tts_text_exceeds_one_request(variant, &base_request.text)
+    {
+        vec![base_request.text.trim().to_string()]
+    } else {
+        split_tts_text_for_long_form(variant, requested, base_request.text.as_str())
+    };
+    let budget_for = |request: &mut GenerationRequest| {
+        if variant == ModelVariant::FishAudioS2Pro || automatic {
+            if let Some(frames) =
+                crate::api::tts_policy::resolve_tts_output_frames(variant, &request.text, None)
+            {
+                request.config.options.max_tokens = frames;
+            } else if variant == ModelVariant::FishAudioS2Pro {
+                request.config.options.max_tokens = 4096;
+            }
+        }
+    };
 
     if chunks.len() <= 1 {
         let mut request = base_request.clone();
-        if variant == ModelVariant::FishAudioS2Pro && request.config.options.max_tokens == 0 {
-            request.config.options.max_tokens =
-                crate::api::tts_policy::resolve_tts_output_frames(variant, &request.text, None)
-                    .unwrap_or(4096);
+        if variant == ModelVariant::FishAudioS2Pro && request.config.options.max_tokens != 0 {
+            return vec![request];
         }
+        budget_for(&mut request);
         return vec![request];
     }
 
@@ -319,14 +337,26 @@ pub fn expand_generation_requests_for_long_form(
             let mut req = base_request.clone();
             req.id = format!("{}:{}", base_request.id, idx + 1);
             req.text = text;
-            if variant == ModelVariant::FishAudioS2Pro {
-                req.config.options.max_tokens =
-                    crate::api::tts_policy::resolve_tts_output_frames(variant, &req.text, None)
-                        .unwrap_or(4096);
-            }
+            budget_for(&mut req);
             req
         })
         .collect()
+}
+
+/// Leave the budget automatic (`0`) when the client set none and the text is
+/// longer than one automatic request can speak, so long form splits it
+/// instead of the request being cut at its cap.
+pub(crate) fn defer_automatic_budget_to_long_form(
+    request: &mut GenerationRequest,
+    variant: ModelVariant,
+    explicit_frames: Option<usize>,
+) {
+    if explicit_frames.unwrap_or(0) == 0
+        && variant != ModelVariant::FishAudioS2Pro
+        && crate::api::tts_policy::tts_text_exceeds_one_request(variant, &request.text)
+    {
+        request.config.options.max_tokens = 0;
+    }
 }
 
 pub async fn generate_long_form_tts(
@@ -349,9 +379,11 @@ pub async fn generate_long_form_tts(
     let mut sample_rate: Option<u32> = None;
     let mut total_tokens = 0usize;
     let mut total_time_ms = 0f32;
+    let mut stop_reasons = Vec::with_capacity(split_request_count);
 
     for chunk_request in planned_requests {
         let output = runtime.generate(chunk_request).await?;
+        stop_reasons.push(output.stop_reason);
         if let Some(existing_rate) = sample_rate {
             if existing_rate != output.sample_rate {
                 return Err(izwi_core::Error::InferenceError(format!(
@@ -384,6 +416,7 @@ pub async fn generate_long_form_tts(
             "request_wall_ms": started.elapsed().as_secs_f64() * 1000.0,
             "constituents": constituent_diagnostics,
         })),
+        stop_reason: TtsStopReason::combine(stop_reasons),
     })
 }
 
@@ -431,6 +464,12 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
     let mut sequence = progress.as_deref().map_or(0, |p| p.next_sequence());
     let mut segment = progress.as_deref().map_or(0, |p| p.completed_segments());
     let mut tokens = progress.as_deref().map_or(0, |p| p.completed_tokens());
+    // A resumed plan cannot see earlier segments' stop reasons.
+    let mut stop_reasons = vec![if tokens > 0 {
+        None
+    } else {
+        Some(TtsStopReason::EndOfSpeech)
+    }];
     let mut execution_ms = progress
         .as_deref()
         .map_or(0.0, |p| p.completed_execution_ms());
@@ -511,6 +550,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let mut emitted = false;
         let mut segment_tokens = 0;
         let mut segment_ms = 0.0;
+        let mut segment_stop = None;
         while let Some(mut chunk) = tokio::select! {
             chunk = receiver.recv() => chunk,
             _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::InferenceError("Speech segment timed out".into())),
@@ -520,6 +560,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                 if chunk.is_final {
                     segment_tokens = stats.tokens_generated;
                     segment_ms = stats.generation_time_ms;
+                    segment_stop = stats.stop_reason;
                 } else {
                     segment_tokens += stats.tokens_generated;
                     segment_ms += stats.generation_time_ms;
@@ -596,6 +637,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
                 .map_err(progress_error)?;
         }
         duration += segment_duration;
+        stop_reasons.push(segment_stop);
         remaining = remaining.saturating_sub(segment_tokens);
         tokens += segment_tokens;
         execution_ms += segment_ms;
@@ -611,6 +653,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         } else {
             0.0
         },
+        stop_reason: TtsStopReason::combine(stop_reasons),
     });
     output
         .send(terminal)
@@ -702,6 +745,61 @@ mod tests {
         assert!(auto.segments.len() > 1);
         assert_eq!(auto.segments, limited.segments);
         assert_eq!(limited.max_output_frames, Some(2584));
+    }
+
+    /// TPIPE-2: an automatic budget never splits long form, so text longer
+    /// than one request's 120 s cap was cut at the cap with a 200. Text one
+    /// automatic request cannot finish now splits, each request budgeted for
+    /// its own text; shorter text stays one request with its automatic
+    /// budget; an explicit budget is kept.
+    #[test]
+    fn automatic_budget_splits_only_text_one_request_cannot_finish() {
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let cap =
+            izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames(
+            );
+        let sentence = "The committee reviewed every proposal in detail before the vote. ";
+        let long = sentence.repeat(30);
+        assert!(crate::api::tts_policy::tts_text_exceeds_one_request(
+            variant, &long
+        ));
+        let mut request = GenerationRequest::new(long.clone()).with_model_variant(variant);
+        request.config.options.max_tokens =
+            crate::api::tts_policy::resolve_tts_output_frames(variant, &long, None).unwrap();
+        assert_eq!(request.config.options.max_tokens, cap);
+        defer_automatic_budget_to_long_form(&mut request, variant, None);
+        assert_eq!(request.config.options.max_tokens, 0);
+        let planned = expand_generation_requests_for_long_form(&request, variant);
+        assert!(planned.len() > 1);
+        for chunk in &planned {
+            let budget = chunk.config.options.max_tokens;
+            assert!(budget > 0 && budget < cap, "chunk budget {budget}");
+        }
+
+        let short = sentence.repeat(3);
+        let mut request = GenerationRequest::new(short.clone()).with_model_variant(variant);
+        request.config.options.max_tokens =
+            crate::api::tts_policy::resolve_tts_output_frames(variant, &short, None).unwrap();
+        let automatic = request.config.options.max_tokens;
+        defer_automatic_budget_to_long_form(&mut request, variant, None);
+        assert_eq!(request.config.options.max_tokens, automatic);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&request, variant).len(),
+            1
+        );
+
+        // An explicit budget is the caller's: no deferral, no split.
+        let mut request = GenerationRequest::new(long).with_model_variant(variant);
+        request.config.options.max_tokens = 300;
+        defer_automatic_budget_to_long_form(&mut request, variant, Some(300));
+        let planned = expand_generation_requests_for_long_form(&request, variant);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].config.options.max_tokens, 300);
+        // Families without automatic long form never split.
+        assert!(!crate::api::tts_policy::tts_text_exceeds_one_request(
+            ModelVariant::Kokoro82M,
+            &sentence.repeat(30)
+        ));
     }
 
     #[test]

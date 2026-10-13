@@ -25,7 +25,7 @@ use crate::runtime::telemetry::{
     RuntimeStageOutputCounters, RuntimeStageTiming,
 };
 use crate::runtime::types::{
-    AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult,
+    AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult, TtsStopReason,
 };
 use crate::runtime::CoordinatorLane;
 
@@ -479,6 +479,7 @@ impl RuntimeService {
             generation_time_ms,
             tokens_generated,
             rtf,
+            stop_reason: result.stop_reason,
         });
         let send = chunk_tx.send(chunk);
         match deadline {
@@ -508,6 +509,7 @@ impl RuntimeService {
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
+        let budget_frames = core_request.params.max_tokens;
 
         let output = self.run_request(core_request).await?;
         let diagnostics = Some(serde_json::json!({
@@ -538,6 +540,7 @@ impl RuntimeService {
             total_tokens,
             total_time_ms,
             diagnostics,
+            stop_reason: TtsStopReason::for_budget(budget_frames, total_tokens),
         })
     }
 
@@ -599,6 +602,7 @@ impl RuntimeService {
         }
 
         let terminal_deadline = core_request.deadline;
+        let budget_frames = core_request.params.max_tokens;
         let mut next_sequence = 0usize;
         let output = self
             .run_streaming_request(core_request, |stream_chunk| {
@@ -634,6 +638,7 @@ impl RuntimeService {
             generation_time_ms: output.generation_time.as_secs_f32() * 1000.0,
             tokens_generated: output.num_tokens,
             rtf: output.rtf(),
+            stop_reason: TtsStopReason::for_budget(budget_frames, output.num_tokens),
         });
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
         info!("Streaming generation complete via core engine");

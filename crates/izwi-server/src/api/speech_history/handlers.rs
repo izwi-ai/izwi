@@ -1845,6 +1845,11 @@ async fn synthesize_record_internal(
         false,
         variant,
     );
+    crate::api::tts_long_form::defer_automatic_budget_to_long_form(
+        &mut generation_request,
+        variant,
+        req.max_output_tokens.or(req.max_tokens),
+    );
     let permit = state.acquire_workload_permit(workload_class).await;
     state.runtime.load_model(variant).await?;
     let mut runtime_context = permit.runtime_context();
@@ -1987,12 +1992,17 @@ async fn stream_record_creation(
 ) -> Result<Response, ApiError> {
     let stream_entry_started = std::time::Instant::now();
     let tenant_key = ctx.tenant_key();
-    let generation_request = build_generation_request(
+    let mut generation_request = build_generation_request(
         req.clone(),
         ctx.correlation_id,
         input_text.clone(),
         true,
         variant,
+    );
+    crate::api::tts_long_form::defer_automatic_budget_to_long_form(
+        &mut generation_request,
+        variant,
+        req.max_output_tokens.or(req.max_tokens),
     );
     let planned_count = if variant == ModelVariant::FishAudioS2Pro {
         crate::api::tts_long_form::SpeechTextPlan::fish(
@@ -3136,6 +3146,7 @@ mod tests {
             generation_time_ms: 10.0,
             tokens_generated: 1,
             rtf: 0.2,
+            stop_reason: None,
         });
         statistics.observe(&first);
         let mut terminal = AudioChunk::final_chunk("request".into(), 1, Vec::new());
@@ -3143,6 +3154,7 @@ mod tests {
             generation_time_ms: 25.0,
             tokens_generated: 2,
             rtf: 0.3,
+            stop_reason: None,
         });
         statistics.observe(&terminal);
         assert_eq!(statistics.tokens, 2);
@@ -3345,7 +3357,7 @@ mod tests {
                 None,
                 1,
             ),
-            1_110
+            1_470
         );
     }
 

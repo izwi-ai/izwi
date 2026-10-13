@@ -284,8 +284,11 @@ impl ModelVariant {
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
-    /// Qwen3-TTS codec frame rate encoded in model variant naming ("12Hz").
-    pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 12.0;
+    /// Qwen3-TTS codec frame rate: the speech tokenizer's 24 kHz output over
+    /// its 1,920-sample decode upsampling (`speech_tokenizer/config.json`).
+    /// The "12Hz" in the variant name is rounded; budgets at 12 Hz cut 4% of
+    /// the audio they meant to allow (QTTS-21).
+    pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 24_000.0 / 1_920.0;
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
     pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;

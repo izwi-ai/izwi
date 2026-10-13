@@ -120,7 +120,7 @@ pub use runtime::{
 pub use runtime::{
     validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,
     DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult,
+    DiarizationWord, GenerationRequest, GenerationResult, TtsStopReason,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 

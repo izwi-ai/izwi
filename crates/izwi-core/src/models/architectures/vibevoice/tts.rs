@@ -59,7 +59,8 @@ const AUTO_MAX_OUTPUT_FRAMES: usize = 384;
 /// 2 x 128 x 3200 x 32 x 4 B = 105 MB in the decoder FFN, inside the 512 MiB
 /// decode workspace a row is priced at, whatever the utterance length.
 const VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES: usize = 32;
-const WORDS_PER_SECOND: f32 = 2.6;
+const WORDS_PER_SECOND: f32 = 2.0;
+const CJK_CHARS_PER_SECOND: f32 = 3.0;
 const AUTO_PADDING_SECONDS: f32 = 0.8;
 pub const VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF: f64 = 300.0;
 /// Classifier-free guidance of the reference demos (`--cfg_scale` 1.3 in
@@ -1809,22 +1810,23 @@ impl VibeVoiceTtsRetainedState {
 }
 
 pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
-    let word_count = text
-        .split_whitespace()
-        .filter(|word| !word.is_empty())
-        .count();
-    let char_count = text.chars().filter(|ch| !ch.is_whitespace()).count();
-    let effective_words = if word_count > 0 {
-        word_count as f32
-    } else if char_count > 0 {
-        (char_count as f32 / 4.0).ceil()
-    } else {
-        1.0
-    };
-    let estimated_secs = AUTO_PADDING_SECONDS + effective_words / WORDS_PER_SECOND;
+    // A slow pace per language, so slow voices reach end of speech inside
+    // the budget; unspaced CJK text is budgeted by characters (VVT-9).
+    let estimated_secs = AUTO_PADDING_SECONDS
+        + crate::models::shared::speech_duration::estimated_speech_secs(
+            text,
+            WORDS_PER_SECOND,
+            CJK_CHARS_PER_SECOND,
+        );
     let estimated_frames =
         (estimated_secs * ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ).ceil() as usize;
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
+}
+
+/// The largest automatic output-frame budget; longer text is split by long
+/// form.
+pub fn vibevoice_tts_auto_max_output_frames() -> usize {
+    AUTO_MAX_OUTPUT_FRAMES
 }
 
 /// Decoder positions one VibeVoice TTS prompt may take before its first

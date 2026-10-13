@@ -9,8 +9,12 @@ use super::MAX_VOICE_CLONE_REFERENCE_FRAMES;
 /// split by long form.
 pub const QWEN3_TTS_AUTO_MAX_AUDIO_SECS: f32 = 120.0;
 const AUTO_MIN_AUDIO_SECS: f32 = 4.0;
-const AUTO_WORDS_PER_SECOND: f32 = 2.5;
-const AUTO_CHARS_PER_WORD: usize = 5;
+/// A slow speaking pace, so a slow voice still reaches end of speech inside
+/// its budget: the `ryan` voice spoke 2.35 words per second live, and a
+/// 2.5 words-per-second budget cut its last words (TPIPE-2).
+const AUTO_WORDS_PER_SECOND: f32 = 2.0;
+/// Mandarin and Japanese speech runs about 4-5 characters per second.
+const AUTO_CJK_CHARS_PER_SECOND: f32 = 3.0;
 const AUTO_END_PADDING_SECS: f32 = 2.0;
 
 /// Talker positions one request's prompt may take before its first frame.
@@ -24,17 +28,15 @@ pub(crate) const QWEN3_TTS_STATE_PROMPT_TOKENS: usize = 1_024;
 
 const _: () = assert!(QWEN3_TTS_STATE_PROMPT_TOKENS > MAX_VOICE_CLONE_REFERENCE_FRAMES + 16);
 
-/// The automatic output-frame budget for `text`: its estimated speaking time
-/// plus padding, between 4 s and [`QWEN3_TTS_AUTO_MAX_AUDIO_SECS`].
+/// The automatic output-frame budget for `text`: its speaking time at a slow
+/// pace (per language) plus padding, between 4 s and
+/// [`QWEN3_TTS_AUTO_MAX_AUDIO_SECS`].
 pub fn qwen3_tts_auto_max_frames_for_text(text: &str) -> usize {
-    let word_count = text.split_whitespace().count();
-    let char_word_equivalent = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .count()
-        .div_ceil(AUTO_CHARS_PER_WORD);
-    let estimated_words = word_count.max(char_word_equivalent).max(1);
-    let estimated_secs = ((estimated_words as f32) / AUTO_WORDS_PER_SECOND + AUTO_END_PADDING_SECS)
+    let estimated_secs = (crate::models::shared::speech_duration::estimated_speech_secs(
+        text,
+        AUTO_WORDS_PER_SECOND,
+        AUTO_CJK_CHARS_PER_SECOND,
+    ) + AUTO_END_PADDING_SECS)
         .clamp(AUTO_MIN_AUDIO_SECS, QWEN3_TTS_AUTO_MAX_AUDIO_SECS);
     let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
     frames.clamp(
@@ -58,6 +60,40 @@ pub(crate) fn qwen3_tts_state_floor_tokens() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// QTTS-21: the frame rate is the published codec's, not the "12Hz" in
+    /// the variant name.
+    #[test]
+    fn frame_rate_matches_the_published_speech_tokenizer_config() {
+        // Top-level keys of Qwen3-TTS-12Hz-*/speech_tokenizer/config.json.
+        let published: serde_json::Value = serde_json::from_str(
+            r#"{"model_type": "qwen3_tts_tokenizer_12hz", "input_sample_rate": 24000,
+                "output_sample_rate": 24000, "decode_upsample_rate": 1920,
+                "encode_downsample_rate": 1920}"#,
+        )
+        .unwrap();
+        let rate = published["output_sample_rate"].as_f64().unwrap()
+            / published["decode_upsample_rate"].as_f64().unwrap();
+        assert_eq!(f64::from(ModelVariant::QWEN3_TTS_FRAME_RATE_HZ), rate);
+        assert_eq!(rate, 12.5);
+    }
+
+    /// TPIPE-2: the live 46-word paragraph spoken by `ryan` (2.35 words/s)
+    /// reached end of speech at 252 frames; the old 12 Hz, 2.5 words/s
+    /// budget of 245 frames cut its last eight words.
+    #[test]
+    fn automatic_budget_leaves_room_for_a_slow_voice() {
+        let paragraph = "Good morning. Today we are testing a speech system that reads \
+            longer passages aloud, and we want to hear whether every sentence comes out \
+            clearly without the voice drifting, rushing, or stopping before the final word \
+            of the paragraph has been spoken.";
+        let words = paragraph.split_whitespace().count();
+        let needed = (words as f32 / 2.35 * 12.5).ceil() as usize;
+        assert!(qwen3_tts_auto_max_frames_for_text(paragraph) >= needed + needed / 10);
+        // Unspaced Mandarin is budgeted by characters, not as one word.
+        let mandarin = "今天我们正在测试一个语音系统".repeat(4);
+        assert!(qwen3_tts_auto_max_frames_for_text(&mandarin) >= 56 * 125 / 10 / 4);
+    }
 
     #[test]
     fn state_floor_covers_a_full_clone_prompt_and_the_largest_auto_budget() {

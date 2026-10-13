@@ -2,7 +2,10 @@ use izwi_core::catalog::ModelFamily;
 pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
     qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
 };
-use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
+use izwi_core::runtime_models::architectures::vibevoice::tts::{
+    vibevoice_tts_auto_max_frames_for_text, vibevoice_tts_auto_max_output_frames,
+};
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::ModelVariant;
 
@@ -29,6 +32,25 @@ pub(crate) fn resolve_tts_output_frames(
         Some(0) | None => Some(model_max_frames),
         Some(_) => unreachable!("positive requested frames handled above"),
     }
+}
+
+/// Whether `text` is too long for one automatic request of `variant`: its
+/// automatic budget reaches the per-request cap, so one request would cut
+/// it. Only families that advertise automatic long form split; Fish plans
+/// its own segments.
+pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) -> bool {
+    if !variant
+        .speech_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_auto_long_form)
+    {
+        return false;
+    }
+    let cap = match variant.family() {
+        ModelFamily::Qwen3Tts => qwen3_tts_auto_max_output_frames(),
+        ModelFamily::VibeVoiceTts => vibevoice_tts_auto_max_output_frames(),
+        _ => return false,
+    };
+    resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)
 }
 
 fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
