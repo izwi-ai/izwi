@@ -143,8 +143,9 @@ pub async fn speech(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
+    crate::api::tts_policy::check_tts_input_length(&req.input)?;
     let req = resolve_saved_voice_request(&state, normalize_speech_request(req)).await?;
-    info!("OpenAI speech request: {} chars", req.input.len());
+    info!("OpenAI speech request: {} bytes", req.input.len());
 
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;

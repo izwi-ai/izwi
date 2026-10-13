@@ -9,6 +9,29 @@ use izwi_core::runtime_models::architectures::vibevoice::tts::{
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::ModelVariant;
 
+/// The longest speech input one request may carry, in UTF-8 bytes
+/// (`IZWI_TTS_MAX_TEXT_BYTES`, default 1 MiB). Long form splits text into
+/// model-sized calls, so this bounds only the request itself (TPIPE-14).
+pub(crate) fn tts_max_text_bytes() -> usize {
+    std::env::var("IZWI_TTS_MAX_TEXT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024 * 1024)
+}
+
+/// Refuse an over-limit speech input with 413 before any model loads.
+pub(crate) fn check_tts_input_length(text: &str) -> Result<(), crate::error::ApiError> {
+    let limit = tts_max_text_bytes();
+    if text.len() > limit {
+        return Err(crate::error::ApiError::payload_too_large(format!(
+            "Speech input is {} bytes, above the {limit}-byte limit; send it as several requests",
+            text.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Optional speech-sampling fields a request may set beside `temperature`
 /// and `top_k`. Anything left unset keeps the model family's reference
 /// default (TPIPE-24): Qwen3-TTS generation_config, LFM 0.8 / top-k 64,

@@ -27,11 +27,7 @@ pub(crate) struct SpeechTextPlan {
 impl SpeechTextPlan {
     pub fn fish(text: &str, max_output_frames: usize) -> Result<Self, izwi_core::Error> {
         use sha2::{Digest, Sha256};
-        let max_bytes = std::env::var("IZWI_TTS_MAX_TEXT_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(1024 * 1024);
+        let max_bytes = crate::api::tts_policy::tts_max_text_bytes();
         if text.len() > max_bytes {
             return Err(izwi_core::Error::InvalidInput(format!(
                 "Speech text exceeds configured limit of {max_bytes} bytes"

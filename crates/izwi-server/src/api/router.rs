@@ -1514,6 +1514,46 @@ mod tests {
         );
     }
 
+    /// TPIPE-14: an over-limit speech input is refused with 413 on both
+    /// speech routes before a model is loaded or a record is created.
+    #[tokio::test]
+    async fn over_limit_speech_input_is_payload_too_large_on_both_routes() {
+        // `test_state` holds the env lock; nothing sets the text limit.
+        let (state, _root) = test_state("tts_input_limit", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &config);
+        let text = "x".repeat(1024 * 1024 + 1);
+        let openai = serde_json::json!({
+            "model": "Kokoro-82M",
+            "input": text,
+            "voice": "af_heart"
+        })
+        .to_string();
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/audio/speech", Some(&openai)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let first_party = serde_json::json!({
+            "model_id": "Kokoro-82M",
+            "text": text,
+            "stream": true
+        })
+        .to_string();
+        let response = send_request(
+            app,
+            build_request(Method::POST, "/v1/text-to-speech", Some(&first_party)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn keyed_streaming_and_reference_tts_reject_before_creating_records() {
         use crate::speech_history_store::SpeechRouteKind;

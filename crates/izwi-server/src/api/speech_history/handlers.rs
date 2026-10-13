@@ -741,6 +741,7 @@ async fn create_record(
     let mut req = normalize_create_request(req);
     let model_id = required_trimmed(req.model_id.as_deref(), "model_id")?;
     let input_text = required_trimmed(req.text.as_deref(), "text")?;
+    crate::api::tts_policy::check_tts_input_length(&input_text)?;
     let variant = parse_tts_model_variant(model_id.as_str())
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {err}")))?;
 
