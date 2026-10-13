@@ -445,7 +445,9 @@ impl PhysicalPagedKvCache {
             .checked_add(token_count)
             .ok_or_else(|| Error::InvalidInput("physical paged context overflow".into()))?;
         if end > self.capacity_tokens() {
-            return Err(Error::InvalidInput(format!(
+            // The sequence outgrew the state its load fitted: a capacity
+            // refusal (503), not a malformed request.
+            return Err(Error::Overloaded(format!(
                 "physical paged append ends at {end}, beyond capacity {}",
                 self.capacity_tokens()
             )));

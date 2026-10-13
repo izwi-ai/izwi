@@ -3453,8 +3453,16 @@ impl EngineCoreRequest {
                 self.id
             )));
         }
-        if input_tokens == 0 || input_tokens >= max_sequence_tokens {
+        if input_tokens == 0 {
             return Err(Error::InvalidInput(format!(
+                "ASR request {} has an empty exact prefill",
+                self.id
+            )));
+        }
+        if input_tokens >= max_sequence_tokens {
+            // The load fitted a context too small for this request's audio:
+            // a capacity refusal (503); longer audio is chunked upstream.
+            return Err(Error::Overloaded(format!(
                 "ASR request {} exact prefill has {input_tokens} tokens and leaves no output capacity in the configured {max_sequence_tokens}-token context",
                 self.id
             )));
