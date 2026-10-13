@@ -1491,6 +1491,16 @@ fn standard_session_cache_layout(
     )
 }
 
+/// Prefill length of the streaming-mode voice-clone ICL block, as the
+/// reference's `generate_icl_prompt` builds it: text is added position-wise
+/// onto the codec-BOS plus reference-codec embeddings, so the block is always
+/// `codec_tokens` long. Text past the codec length is not prefilled; it feeds
+/// one token per generated frame (the trailing text), and shorter text is
+/// padded with `tts_pad`.
+fn voice_clone_icl_prefill_tokens(_text_tokens: usize, codec_tokens: usize) -> usize {
+    codec_tokens
+}
+
 fn voice_clone_session_cache_layout(
     max_position_embeddings: usize,
     prompt_tokens: usize,
@@ -1530,7 +1540,7 @@ fn voice_clone_session_cache_layout(
     let base_prefill_tokens =
         conditioned_prefill_tokens(0, has_language, false, 0).ok_or_else(cache_layout_overflow)?;
     let prefill_tokens = base_prefill_tokens
-        .checked_add(text_tokens.max(codec_tokens))
+        .checked_add(voice_clone_icl_prefill_tokens(text_tokens, codec_tokens))
         .ok_or_else(cache_layout_overflow)?;
 
     resolve_session_cache_layout(
@@ -3024,6 +3034,10 @@ impl Qwen3TtsModel {
             return Ok((icl_input, tts_pad_embed.clone()));
         }
 
+        debug_assert_eq!(
+            voice_clone_icl_prefill_tokens(text_lens, codec_lens),
+            codec_lens
+        );
         if text_lens > codec_lens {
             let text_prefix = text_embed.i((.., ..codec_lens, ..))?;
             let trailing = text_embed.i((.., codec_lens.., ..))?;
@@ -5103,6 +5117,34 @@ mod tests {
         .unwrap();
         assert!(large_reference.prefill_tokens > small_reference.prefill_tokens);
         assert_eq!(capped_reference, explicit_cap);
+    }
+
+    /// QTTS-8: the voice-clone layout prices exactly the prefill the ICL
+    /// block builds, base + reference frames + codec BOS, whether the
+    /// reference + target text is shorter or longer than the reference
+    /// codes. A 3 s reference (38 frames) with a long target used to be
+    /// authorized for more tokens than were prepared, failing the request.
+    #[test]
+    fn voice_clone_layout_prefill_matches_the_icl_block_for_any_text_length() {
+        let base = conditioned_prefill_tokens(0, false, false, 0).unwrap();
+        // prompt = 8 framing + target tokens; reference = 5 framing + text.
+        for (target, reference, frames) in [(4, 3, 38), (40, 30, 38), (300, 40, 38), (5, 5, 400)] {
+            let layout = voice_clone_session_cache_layout(
+                4_096,
+                target + 8,
+                reference + 5,
+                frames,
+                false,
+                64,
+            )
+            .unwrap();
+            let codec_tokens = frames.min(MAX_VOICE_CLONE_REFERENCE_FRAMES) + 1;
+            assert_eq!(
+                layout.prefill_tokens,
+                base + codec_tokens,
+                "target {target}, reference {reference}, frames {frames}"
+            );
+        }
     }
 
     #[test]
