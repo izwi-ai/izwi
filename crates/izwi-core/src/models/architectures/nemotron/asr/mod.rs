@@ -32,6 +32,7 @@ use crate::kv::v2::{
     TensorRole, TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::model::ModelVariant;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::memory::accounting::TensorStorageAccounting;
 use crate::tokenizer::Tokenizer;
 
@@ -533,6 +534,7 @@ pub struct NemotronStreamingState {
     pre_encode_state: NemotronStreamingPreEncodeState,
     encoder_state: NemotronStreamingEncoderState,
     rnnt_state: Option<NemotronRnntStreamState>,
+    detokenizer: IncrementalDetokenizer,
     assembled_text: String,
     emitted_tokens: usize,
 }
@@ -848,6 +850,7 @@ impl NemotronStreamingState {
             pre_encode_state: NemotronStreamingPreEncodeState::new(),
             encoder_state,
             rnnt_state: None,
+            detokenizer: IncrementalDetokenizer::new(),
             assembled_text: String::new(),
             emitted_tokens: 0,
         }
@@ -855,6 +858,26 @@ impl NemotronStreamingState {
 
     fn attach_rnnt_state(&mut self, rnnt_state: NemotronRnntStreamState) {
         self.rnnt_state = Some(rnnt_state);
+    }
+
+    /// The transcript after the RNNT state's newest tokens. Only the tokens
+    /// since the last emission are detokenized; a final chunk flushes any
+    /// held-back text.
+    fn advance_text(&mut self, decoder: &NemotronDecoder, is_final: bool) -> Result<String> {
+        let token_ids = self
+            .rnnt_state
+            .as_ref()
+            .ok_or_else(|| Error::InferenceError("Nemotron stream is missing RNNT state".into()))?
+            .token_ids();
+        let decode = |ids: &[usize]| -> Result<String> { Ok(decoder.decode(ids)) };
+        let mut delta = self.detokenizer.step(token_ids, decode)?;
+        if is_final {
+            delta.push_str(&self.detokenizer.finish(token_ids, decode)?);
+        }
+        let mut text = String::with_capacity(self.assembled_text.len() + delta.len());
+        text.push_str(&self.assembled_text);
+        text.push_str(&delta);
+        Ok(text)
     }
 
     pub fn profile(&self) -> &NemotronStreamingProfile {
@@ -1018,6 +1041,7 @@ impl NemotronStreamingState {
             "input_finished": self.input_finished,
             "final_event_emitted": self.final_event_emitted,
             "emitted_tokens": self.emitted_tokens,
+            "detokenized_tokens": self.detokenizer.decoded_tokens(),
             "cache_status": format!("{:?}", self.cache_status),
             "supports_realtime_cache_decode": true,
             "supports_realtime_stream_decode": self.rnnt_state.is_some(),
@@ -1592,6 +1616,8 @@ struct NemotronStageTimings {
     encode_profile: Option<NemotronEncodeProfile>,
     rnnt_decode: Duration,
     text_assembly: Duration,
+    /// Tokens passed to the text decoder.
+    detokenized_tokens: u64,
 }
 
 impl NemotronStageTimings {
@@ -1640,6 +1666,7 @@ impl NemotronStageTimings {
             "encode_ms": duration_ms(self.encode),
             "rnnt_decode_ms": duration_ms(self.rnnt_decode),
             "text_assembly_ms": duration_ms(self.text_assembly),
+            "detokenized_tokens": self.detokenized_tokens,
         })
     }
 }
@@ -2396,15 +2423,16 @@ impl NemotronAsrModel {
             drop(rnnt_states);
             let mut outputs = Vec::with_capacity(rows.len());
             for (row, mut batch) in rows.iter_mut().zip(event_batches.drain(..)) {
-                let (tokens, text) = {
-                    let rnnt = row.state.rnnt_state.as_ref().ok_or_else(|| {
+                let tokens = row
+                    .state
+                    .rnnt_state
+                    .as_ref()
+                    .ok_or_else(|| {
                         Error::InferenceError("Nemotron prepared row lost RNNT state".into())
-                    })?;
-                    (
-                        rnnt.token_ids().len(),
-                        self.decoder.decode(rnnt.token_ids()),
-                    )
-                };
+                    })?
+                    .token_ids()
+                    .len();
+                let text = row.state.advance_text(&self.decoder, row.chunk.is_final)?;
                 row.state.emitted_tokens = tokens;
                 batch.record_decoded_text(row.state, text, row.chunk.is_final)?;
                 outputs.push(batch.into_events(row.state));
@@ -2637,20 +2665,19 @@ impl NemotronAsrModel {
                 .network
                 .encode_streaming_chunk(&mut state.encoder_state, prompt_id)?
             {
-                let (decoded, text) = {
+                let decoded = {
                     let rnnt_state = state.rnnt_state.as_mut().ok_or_else(|| {
                         Error::InferenceError("Nemotron stream is missing RNNT state".to_string())
                     })?;
                     let mut ignored = |_token_id: usize| {};
-                    let decoded = self.network.decode_rnnt_streaming_chunk(
+                    self.network.decode_rnnt_streaming_chunk(
                         rnnt_state,
                         &encoder_chunk.encoded,
                         encoder_chunk.frames,
                         &mut ignored,
-                    )?;
-                    let text = self.decoder.decode(rnnt_state.token_ids());
-                    (decoded, text)
+                    )?
                 };
+                let text = state.advance_text(&self.decoder, encoder_chunk.is_final)?;
                 state.emitted_tokens = decoded.stats.emitted_tokens;
                 batch.record_decoded_text(state, text, encoder_chunk.is_final)?;
                 progressed = true;
@@ -2743,11 +2770,8 @@ impl NemotronAsrModel {
                         Error::InferenceError("Nemotron realtime cohort row lost RNNT state".into())
                     })?;
                     row.state.emitted_tokens = rnnt_state.token_ids().len();
-                    batch.record_decoded_text(
-                        row.state,
-                        self.decoder.decode(rnnt_state.token_ids()),
-                        chunk.is_final,
-                    )?;
+                    let text = row.state.advance_text(&self.decoder, chunk.is_final)?;
+                    batch.record_decoded_text(row.state, text, chunk.is_final)?;
                 }
             }
 
@@ -2834,16 +2858,20 @@ impl NemotronAsrModel {
 
         let mut token_ids = Vec::<usize>::new();
         let mut assembled = String::new();
+        let mut detokenizer = IncrementalDetokenizer::new();
+        let decode_text = |ids: &[usize]| -> Result<String> { Ok(self.decoder.decode(ids)) };
         let decoded = {
             let mut on_token = |token_id: usize| {
                 token_ids.push(token_id);
                 let text_start = Instant::now();
-                let decoded = self.decoder.decode(&token_ids);
-                let delta = text_delta(&assembled, &decoded);
+                // The decoder is infallible, so a step cannot fail.
+                let delta = detokenizer
+                    .step(&token_ids, decode_text)
+                    .unwrap_or_default();
                 if !delta.is_empty() {
                     on_delta(delta.as_str());
+                    assembled.push_str(&delta);
                 }
-                assembled = decoded;
                 timings.text_assembly += text_start.elapsed();
             };
             let decode_start = Instant::now();
@@ -2863,11 +2891,15 @@ impl NemotronAsrModel {
             timings.rnnt_decode = decode_start.elapsed();
             decoded
         };
-        if assembled.is_empty() {
-            let text_start = Instant::now();
-            assembled = self.decoder.decode(&decoded.token_ids);
-            timings.text_assembly += text_start.elapsed();
+        let text_start = Instant::now();
+        // The callback saw the same tokens the decode returns.
+        let held_back = detokenizer.finish(&decoded.token_ids, decode_text)?;
+        if !held_back.is_empty() {
+            on_delta(held_back.as_str());
+            assembled.push_str(&held_back);
         }
+        timings.text_assembly += text_start.elapsed();
+        timings.detokenized_tokens = detokenizer.decoded_tokens();
 
         Ok(self.build_decode_output(
             assembled,
@@ -3399,6 +3431,55 @@ mod tests {
             decode_vocab_tokens(&ids, &vocab),
             "Bonjour ! Ça va ? Oui, merci.?"
         );
+    }
+
+    #[test]
+    fn incremental_deltas_concatenate_to_the_full_vocab_decode() {
+        use crate::models::shared::detokenize::stream_deltas;
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let vocab: Vec<String> = [
+            "▁hel",
+            "lo",
+            "▁world",
+            "▁",
+            "▁.",
+            "▁,",
+            "▁?",
+            ".",
+            "##ing",
+            "<unk>",
+            "<blank>",
+            "<en>",
+            "[PAD]",
+            "▁你",
+            "好",
+            "▁世界",
+            "😀",
+            "▁🎉",
+            "▁Ça",
+            "é",
+            "▁!",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let decoder = NemotronDecoder::Vocab(vocab.clone());
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_5);
+        for _ in 0..500 {
+            let ids = (0..rng.gen_range(0..60))
+                .map(|_| rng.gen_range(0..vocab.len() + 2))
+                .collect::<Vec<_>>();
+            let (deltas, detokenizer) =
+                stream_deltas(&ids, |ids: &[usize]| Ok(decoder.decode(ids)));
+            assert_eq!(
+                deltas.concat(),
+                decode_vocab_tokens(&ids, &vocab),
+                "{ids:?}"
+            );
+            assert_eq!(detokenizer.divergences(), 0, "{ids:?}");
+        }
     }
 
     #[test]

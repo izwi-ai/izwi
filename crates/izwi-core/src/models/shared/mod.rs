@@ -6,6 +6,7 @@
 pub mod attention;
 pub mod chat;
 pub mod config;
+pub(crate) mod detokenize;
 pub mod grammar;
 pub mod memory;
 pub mod moe;

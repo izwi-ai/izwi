@@ -2490,18 +2490,63 @@ struct NormalizedTextWord {
     end: usize,
 }
 
+const MIN_REPEAT_COUNT: usize = 4;
+const MIN_PHRASE_WORDS: usize = 2;
+const MAX_PHRASE_WORDS: usize = 8;
+/// Raw words of the tail that [`trim_repeated_phrase_tail`] scans first.
+const REPEAT_SCAN_TAIL_WORDS: usize = 128;
+
+/// `input` without the repeats of a phrase that ends it four or more times,
+/// keeping one occurrence. Only the last few dozen words can decide this, so
+/// a decode loop that checks every token scans a bounded tail; the whole text
+/// is scanned only when a run reaches the start of that tail.
 pub(super) fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
-    let words = normalized_text_words(input);
-    const MIN_REPEAT_COUNT: usize = 4;
-    const MIN_PHRASE_WORDS: usize = 2;
-    const MAX_PHRASE_WORDS: usize = 8;
+    let tail_start = tail_start_of_last_words(input, REPEAT_SCAN_TAIL_WORDS);
+    let (start, scan) = match tail_start {
+        Some(start) => {
+            let words = normalized_text_words(&input[start..]);
+            // With this many words every phrase length's count either stops
+            // at a mismatch inside the tail or reaches the threshold, so the
+            // tail decides unless the winning run reaches its first word.
+            let decisive = words.len() >= MIN_REPEAT_COUNT * MAX_PHRASE_WORDS * 2;
+            match repeated_phrase_tail_end(&words) {
+                RepeatedTail::Found { end, bounded: true } if decisive => (start, Some(end)),
+                RepeatedTail::None if decisive => return None,
+                _ => (0, scan_whole_text(input)),
+            }
+        }
+        None => (0, scan_whole_text(input)),
+    };
+    scan.map(|end| input[..start + end].trim_end().to_string())
+}
+
+fn scan_whole_text(input: &str) -> Option<usize> {
+    match repeated_phrase_tail_end(&normalized_text_words(input)) {
+        RepeatedTail::Found { end, .. } => Some(end),
+        RepeatedTail::None => None,
+    }
+}
+
+enum RepeatedTail {
+    None,
+    /// Keep `input[..end]`. `bounded` is false when the repeats ran back to
+    /// the first scanned word, so earlier words might extend the run.
+    Found {
+        end: usize,
+        bounded: bool,
+    },
+}
+
+fn repeated_phrase_tail_end(words: &[NormalizedTextWord]) -> RepeatedTail {
     let max_phrase_words = MAX_PHRASE_WORDS.min(words.len() / MIN_REPEAT_COUNT);
     for phrase_words in MIN_PHRASE_WORDS..=max_phrase_words {
         let mut repeat_count = 1usize;
+        let mut bounded = false;
         while words.len() >= phrase_words.saturating_mul(repeat_count + 1) {
             let right_start = words.len() - phrase_words * repeat_count;
             let left_start = right_start.saturating_sub(phrase_words);
-            if !normalized_word_ranges_equal(&words, left_start, right_start, phrase_words) {
+            if !normalized_word_ranges_equal(words, left_start, right_start, phrase_words) {
+                bounded = true;
                 break;
             }
             repeat_count += 1;
@@ -2509,8 +2554,31 @@ pub(super) fn trim_repeated_phrase_tail(input: &str) -> Option<String> {
 
         if repeat_count >= MIN_REPEAT_COUNT {
             let keep_words = words.len() - phrase_words * (repeat_count - 1);
-            let end = words[keep_words - 1].end;
-            return Some(input[..end].trim_end().to_string());
+            return RepeatedTail::Found {
+                end: words[keep_words - 1].end,
+                bounded,
+            };
+        }
+    }
+    RepeatedTail::None
+}
+
+/// Byte offset where the last `count` whitespace-separated words of `input`
+/// begin, or `None` when `input` has no more than `count` words.
+fn tail_start_of_last_words(input: &str, count: usize) -> Option<usize> {
+    let mut words = 0usize;
+    let mut in_word = false;
+    for (idx, ch) in input.char_indices().rev() {
+        if ch.is_whitespace() {
+            if in_word {
+                words += 1;
+                if words == count {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            in_word = false;
+        } else {
+            in_word = true;
         }
     }
     None
@@ -2955,6 +3023,42 @@ mod tests {
             trimmed,
             "So, human spaceflight is very expensive, and it's very expensive."
         );
+    }
+
+    #[test]
+    fn repeated_phrase_tail_scan_of_the_tail_matches_the_whole_text() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let whole =
+            |input: &str| scan_whole_text(input).map(|end| input[..end].trim_end().to_string());
+        let vocabulary = [
+            "very",
+            "expensive.",
+            "It's",
+            "a",
+            "b",
+            "—",
+            "Yes,",
+            "你好",
+            "!",
+        ];
+        let mut rng = ChaCha8Rng::seed_from_u64(0x8_3_6);
+        for _ in 0..400 {
+            // A random prefix, then a phrase repeated 0–40 times: runs that
+            // stay inside the scanned tail and runs that cross its start.
+            let mut words = (0..rng.gen_range(0..300))
+                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+                .collect::<Vec<_>>();
+            let phrase = (0..rng.gen_range(1..=9))
+                .map(|_| vocabulary[rng.gen_range(0..vocabulary.len())])
+                .collect::<Vec<_>>();
+            for _ in 0..rng.gen_range(0..40) {
+                words.extend(&phrase);
+            }
+            let text = words.join(" ");
+            assert_eq!(trim_repeated_phrase_tail(&text), whole(&text), "{text}");
+        }
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::kv::v2::{
     StateComponentId, StateUpdateKind,
 };
 use crate::model::ModelVariant;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::memory::accounting::{
     deep_copy_tensor_storage, TensorStorageAccounting,
 };
@@ -422,6 +423,7 @@ pub(crate) struct ParakeetRetainedDecodeState {
     guard_steps: usize,
     token_ids: Vec<usize>,
     token_frames: Vec<TdtTokenFrame>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     counters: ParakeetDecodeCounters,
     finished: bool,
@@ -473,6 +475,9 @@ struct ParakeetDecodeCounters {
     tdt_blank_steps: usize,
     host_argmax_reads: usize,
     device_argmax_scalar_reads: usize,
+    /// Tokens passed to the text decoder: O(emitted tokens) with the
+    /// incremental detokenizer.
+    detokenized_tokens: u64,
 }
 
 pub struct ParakeetAsrModel {
@@ -759,6 +764,7 @@ impl ParakeetAsrModel {
                     guard_steps: 0,
                     token_ids: Vec::new(),
                     token_frames: Vec::new(),
+                    detokenizer: IncrementalDetokenizer::new(),
                     assembled: String::new(),
                     counters: ParakeetDecodeCounters::default(),
                     finished: false,
@@ -868,6 +874,7 @@ impl ParakeetAsrModel {
             "encode_ms": artifact.encode_ms,
             "tdt_joint_steps": state.counters.tdt_joint_steps,
             "tdt_emitted_tokens": state.counters.tdt_emitted_tokens,
+            "detokenized_tokens": state.counters.detokenized_tokens,
             "tdt_blank_steps": state.counters.tdt_blank_steps,
             "host_argmax_reads": state.counters.host_argmax_reads,
             "device_argmax_scalar_reads": state.counters.device_argmax_scalar_reads,
@@ -1002,9 +1009,10 @@ impl ParakeetAsrModel {
                 }
                 let mut steps = Vec::with_capacity(rows.len());
                 for row in rows.iter_mut() {
-                    let previous = row.state.assembled.clone();
-                    row.state.assembled = self.decoder.decode(&row.state.token_ids);
-                    let delta = text_delta(&previous, &row.state.assembled);
+                    let mut delta = row
+                        .state
+                        .detokenizer
+                        .step(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?;
                     let guard_limit = row
                         .artifact
                         .encoded_len
@@ -1022,6 +1030,15 @@ impl ParakeetAsrModel {
                     }
                     row.state.finished =
                         exhausted || budget_reached || row.state.guard_steps >= guard_limit;
+                    if row.state.finished {
+                        delta.push_str(
+                            &row.state
+                                .detokenizer
+                                .finish(&row.state.token_ids, |ids| Ok(self.decoder.decode(ids)))?,
+                        );
+                    }
+                    row.state.assembled.push_str(&delta);
+                    row.state.counters.detokenized_tokens = row.state.detokenizer.decoded_tokens();
                     row.state.counters.tdt_emitted_tokens = tokens;
                     steps.push(ParakeetRetainedDecodeStep {
                         delta,
@@ -1263,16 +1280,20 @@ impl ParakeetAsrModel {
         let mut token_frames = Vec::<TdtTokenFrame>::new();
         let mut assembled = String::new();
         let mut decode_counters = ParakeetDecodeCounters::default();
+        let mut detokenizer = IncrementalDetokenizer::new();
+        let decode_text = |ids: &[usize]| -> Result<String> { Ok(self.decoder.decode(ids)) };
 
         let mut on_token = |token_id: usize, emission: TdtTokenFrame| {
             token_ids.push(token_id);
             token_frames.push(emission);
-            let decoded = self.decoder.decode(&token_ids);
-            let delta = text_delta(&assembled, &decoded);
+            // The decoder is infallible, so a step cannot fail.
+            let delta = detokenizer
+                .step(&token_ids, decode_text)
+                .unwrap_or_default();
             if !delta.is_empty() {
                 on_delta(delta.as_str());
+                assembled.push_str(&delta);
             }
-            assembled = decoded;
         };
 
         let decode_started = Instant::now();
@@ -1299,10 +1320,13 @@ impl ParakeetAsrModel {
         }
         timings.tdt_decode_ms = elapsed_ms(decode_started);
 
-        if assembled.is_empty() {
-            assembled = self.decoder.decode(&token_ids);
+        let held_back = detokenizer.finish(&token_ids, decode_text)?;
+        if !held_back.is_empty() {
+            on_delta(held_back.as_str());
+            assembled.push_str(&held_back);
         }
 
+        decode_counters.detokenized_tokens = detokenizer.decoded_tokens();
         decode_counters.tdt_emitted_tokens = token_ids.len();
         timings.model_total_ms = elapsed_ms(model_started);
 
@@ -1397,6 +1421,7 @@ fn parakeet_diagnostics_json(
             "tdt_blank_steps": decode.tdt_blank_steps,
             "host_argmax_reads": decode.host_argmax_reads,
             "device_argmax_scalar_reads": decode.device_argmax_scalar_reads,
+            "detokenized_tokens": decode.detokenized_tokens,
             "generated_tokens": decode.tdt_emitted_tokens,
             "max_symbols_per_frame": max_symbols,
         },
@@ -1833,18 +1858,6 @@ struct ParakeetEncoded {
     encoded: Tensor,
     encoded_len: usize,
     windows: usize,
-}
-
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
-    }
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current.chars().skip(common).collect()
 }
 
 struct ConvSubsamplingDw {
@@ -3239,6 +3252,18 @@ mod tests {
         assert_eq!(steps.last().unwrap().tokens_generated, bound);
         assert_eq!(steps.len(), bound);
         assert!(diagnostics.get("stop_reason").is_none());
+        // The streamed deltas are the transcript, detokenized incrementally:
+        // re-decoding every step would pass bound·(bound+1)/2 tokens.
+        let deltas = steps
+            .iter()
+            .map(|step| step.delta.as_str())
+            .collect::<String>();
+        assert_eq!(deltas, steps.last().unwrap().text);
+        let detokenized = diagnostics["detokenized_tokens"].as_u64().unwrap();
+        assert!(
+            detokenized <= 4 * bound as u64,
+            "detokenized {detokenized} tokens"
+        );
 
         // Each frame emits max_symbols one-token words with zero duration,
         // timed at 80 ms per encoder frame.

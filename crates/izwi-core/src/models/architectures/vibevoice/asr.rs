@@ -42,6 +42,7 @@ use crate::models::architectures::vibevoice::{
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
+use crate::models::shared::detokenize::IncrementalDetokenizer;
 use crate::models::shared::weights::gguf::load_model_weights;
 
 const DEFAULT_MAX_NEW_TOKENS: usize = 768;
@@ -377,6 +378,7 @@ pub(crate) struct VibeVoiceAsrDecodeState {
     pos: usize,
     pending_token: Option<u32>,
     generated: Vec<u32>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     stop_tokens: Vec<u32>,
     stop_sequences: Vec<String>,
@@ -402,6 +404,7 @@ struct VibeVoiceAsrDecodeCheckpointPayload {
     pos: usize,
     pending_token: Option<u32>,
     generated: Vec<u32>,
+    detokenizer: IncrementalDetokenizer,
     assembled: String,
     finished: bool,
     stop_reason: Option<&'static str>,
@@ -956,6 +959,7 @@ impl VibeVoiceAsrModel {
             pos: 0,
             pending_token: None,
             generated: Vec::new(),
+            detokenizer: IncrementalDetokenizer::new(),
             assembled: String::new(),
             stop_tokens: collect_stop_token_ids(&built_in_stop_tokens, &options.stop_token_ids),
             stop_sequences: sanitize_stop_sequences(&options.stop_sequences),
@@ -1723,6 +1727,7 @@ impl VibeVoiceAsrModel {
         let prefill_ms = elapsed_ms(prefill_started);
         let mut next = argmax_last_logits(&logits, cuda_device_argmax)?;
         let mut generated = Vec::new();
+        let mut detokenizer = IncrementalDetokenizer::new();
         let mut assembled = String::new();
         let built_in_stop_tokens = [
             self.tokenizer.specials().im_end,
@@ -1747,13 +1752,15 @@ impl VibeVoiceAsrModel {
                 break;
             }
             generated.push(next);
-            let decoded = self.tokenizer.decode(&generated)?;
-            let (visible_decoded, matched_stop_sequence) =
-                truncate_at_stop_sequence(&decoded, &stop_sequences);
-            if visible_decoded.len() > assembled.len() {
-                on_delta(&visible_decoded[assembled.len()..]);
+            let mut piece = detokenizer.step(&generated, |ids| self.tokenizer.decode(ids))?;
+            if generated.len() >= max_new_tokens {
+                piece.push_str(&detokenizer.finish(&generated, |ids| self.tokenizer.decode(ids))?);
             }
-            assembled = visible_decoded;
+            let (delta, matched_stop_sequence) =
+                append_until_stop_sequence(&mut assembled, &piece, &stop_sequences);
+            if !delta.is_empty() {
+                on_delta(&delta);
+            }
             if let Some(sequence) = matched_stop_sequence {
                 stop_reason = Some("stop_sequence");
                 stop_sequence = Some(sequence);
@@ -1765,6 +1772,14 @@ impl VibeVoiceAsrModel {
                 .language_model
                 .forward_managed(&token, pos, physical_cache)?;
             next = argmax_last_logits(&logits, cuda_device_argmax)?;
+        }
+        if stop_reason.is_some_and(|reason| reason != "stop_sequence") {
+            let held_back = detokenizer.finish(&generated, |ids| self.tokenizer.decode(ids))?;
+            let (delta, _) =
+                append_until_stop_sequence(&mut assembled, &held_back, &stop_sequences);
+            if !delta.is_empty() {
+                on_delta(&delta);
+            }
         }
         let decode_ms = elapsed_ms(decode_started);
         let reached_max_tokens = stop_reason.is_none() && generated.len() >= max_new_tokens;
@@ -1806,6 +1821,7 @@ impl VibeVoiceAsrModel {
                 },
                 "decode": {
                     "generated_tokens": generated.len(),
+                    "detokenized_tokens": detokenizer.decoded_tokens(),
                     "max_new_tokens": max_new_tokens,
                     "stop_reason": stop_reason,
                     "stop_token_id": stop_token_id,
@@ -2043,6 +2059,7 @@ impl VibeVoiceAsrDecodeState {
                 pos: self.pos,
                 pending_token: self.pending_token,
                 generated: self.generated.clone(),
+                detokenizer: self.detokenizer.clone(),
                 assembled: self.assembled.clone(),
                 finished: self.finished,
                 stop_reason: self.stop_reason,
@@ -2082,6 +2099,7 @@ impl VibeVoiceAsrDecodeState {
         self.pos = payload.pos;
         self.pending_token = payload.pending_token;
         self.generated = payload.generated;
+        self.detokenizer = payload.detokenizer;
         self.assembled = payload.assembled;
         self.finished = payload.finished;
         self.stop_reason = payload.stop_reason;
@@ -2118,7 +2136,7 @@ fn finish_vibevoice_decode_sample(
     state: &mut VibeVoiceAsrDecodeState,
     next: u32,
     built_in_stop_tokens: [u32; 2],
-    decode: impl FnOnce(&[u32]) -> Result<String>,
+    mut decode: impl FnMut(&[u32]) -> Result<String>,
 ) -> Result<VibeVoiceAsrDecodeStep> {
     if state.stop_tokens.contains(&next) {
         state.finished = true;
@@ -2128,23 +2146,28 @@ fn finish_vibevoice_decode_sample(
             "request_stop_token"
         });
         state.stop_token_id = Some(next);
-        return Ok(vibevoice_terminal_step(state));
+        let held_back = state.detokenizer.finish(&state.generated, &mut decode)?;
+        let (delta, _) =
+            append_until_stop_sequence(&mut state.assembled, &held_back, &state.stop_sequences);
+        return Ok(VibeVoiceAsrDecodeStep {
+            delta,
+            ..vibevoice_terminal_step(state)
+        });
     }
 
     state.generated.push(next);
-    let decoded = decode(&state.generated)?;
-    let (visible, matched) = truncate_at_stop_sequence(&decoded, &state.stop_sequences);
-    let delta = if let Some(delta) = visible.strip_prefix(&state.assembled) {
-        delta.to_string()
-    } else {
-        visible.clone()
-    };
-    state.assembled = visible;
+    let mut piece = state.detokenizer.step(&state.generated, &mut decode)?;
+    let reached_max_tokens = state.generated.len() >= state.max_new_tokens;
+    if reached_max_tokens {
+        piece.push_str(&state.detokenizer.finish(&state.generated, &mut decode)?);
+    }
+    let (delta, matched) =
+        append_until_stop_sequence(&mut state.assembled, &piece, &state.stop_sequences);
     if let Some(sequence) = matched {
         state.finished = true;
         state.stop_reason = Some("stop_sequence");
         state.stop_sequence = Some(sequence);
-    } else if state.generated.len() >= state.max_new_tokens {
+    } else if reached_max_tokens {
         state.finished = true;
         state.stop_reason = Some("max_tokens");
     } else {
@@ -2611,25 +2634,39 @@ fn sanitize_stop_sequences(sequences: &[String]) -> Vec<String> {
     out
 }
 
-fn truncate_at_stop_sequence(text: &str, stop_sequences: &[String]) -> (String, Option<String>) {
+/// Append `piece` to the visible `text` and cut it at the earliest stop
+/// sequence. Earlier text was already checked, so only matches that reach
+/// into `piece` are searched for. Returns the text this call made visible
+/// and the matched sequence.
+fn append_until_stop_sequence(
+    text: &mut String,
+    piece: &str,
+    stop_sequences: &[String],
+) -> (String, Option<String>) {
+    let visible_before = text.len();
+    let longest = stop_sequences.iter().map(String::len).max().unwrap_or(0);
+    let mut search_from = visible_before.saturating_sub(longest.saturating_sub(1));
+    while !text.is_char_boundary(search_from) {
+        search_from -= 1;
+    }
+    text.push_str(piece);
     let mut earliest: Option<(usize, &str)> = None;
     for sequence in stop_sequences {
-        let Some(idx) = text.find(sequence) else {
+        let Some(idx) = text[search_from..].find(sequence.as_str()) else {
             continue;
         };
-        if earliest
-            .map(|(existing_idx, _)| idx < existing_idx)
-            .unwrap_or(true)
-        {
+        let idx = search_from + idx;
+        if earliest.is_none_or(|(existing_idx, _)| idx < existing_idx) {
             earliest = Some((idx, sequence.as_str()));
         }
     }
-
-    if let Some((idx, sequence)) = earliest {
-        (text[..idx].to_string(), Some(sequence.to_string()))
-    } else {
-        (text.to_string(), None)
-    }
+    let matched = earliest.map(|(idx, sequence)| {
+        let sequence = sequence.to_string();
+        text.truncate(idx);
+        sequence
+    });
+    let delta = text.get(visible_before..).unwrap_or_default().to_string();
+    (delta, matched)
 }
 
 fn parse_vibevoice_asr_output(raw: &str) -> VibeVoiceAsrParsedOutput {
@@ -3216,6 +3253,7 @@ mod tests {
             pos: prompt_tokens,
             pending_token,
             generated: Vec::new(),
+            detokenizer: IncrementalDetokenizer::new(),
             assembled: String::new(),
             stop_tokens: vec![9, 10],
             stop_sequences: Vec::new(),
@@ -3394,6 +3432,11 @@ mod tests {
         initial.take_completed_writes();
         let mut state = test_decode_state(initial, 2, Some(4));
         state.generated.push(4);
+        state
+            .detokenizer
+            .step(&state.generated, byte_decode)
+            .unwrap();
+        let detokenizer_before = state.detokenizer.clone();
         state.assembled = "before".into();
         let replacement = test_managed_cache(arena, bindings, 8, 2);
         let mut checkpoint = state.begin_managed_quantum(replacement).unwrap();
@@ -3403,9 +3446,14 @@ mod tests {
             forward_vibevoice_pending_decode_batch(&model, &device, &mut rows).unwrap();
         }
         state.generated.push(5);
+        state
+            .detokenizer
+            .step(&state.generated, byte_decode)
+            .unwrap();
         state.assembled = "after".into();
         state.finished = true;
         state.rollback_managed_quantum(&mut checkpoint).unwrap();
+        assert_eq!(state.detokenizer, detokenizer_before);
 
         assert_eq!(state.sequence_position(), 2);
         assert_eq!(state.pending_token, Some(4));
@@ -3821,10 +3869,92 @@ mod tests {
     fn stop_sequences_are_trimmed_and_deduplicated() {
         let sequences = vec![" END ".to_string(), "".to_string(), "END".to_string()];
         assert_eq!(sanitize_stop_sequences(&sequences), vec!["END".to_string()]);
+        let mut text = "hello E".to_string();
         assert_eq!(
-            truncate_at_stop_sequence("hello END ignored", &sanitize_stop_sequences(&sequences)),
-            ("hello ".to_string(), Some("END".to_string()))
+            append_until_stop_sequence(
+                &mut text,
+                "ND ignored",
+                &sanitize_stop_sequences(&sequences)
+            ),
+            (String::new(), Some("END".to_string()))
         );
+        assert_eq!(text, "hello ");
+    }
+
+    /// Byte-level decode: ids are UTF-8 bytes, rendered lossily.
+    fn byte_decode(ids: &[u32]) -> Result<String> {
+        let bytes = ids.iter().map(|&id| id as u8).collect::<Vec<_>>();
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn stream_managed_text(
+        text: &str,
+        stop: Option<u32>,
+        max_new_tokens: usize,
+        stop_sequences: &[&str],
+    ) -> (Vec<VibeVoiceAsrDecodeStep>, VibeVoiceAsrDecodeState) {
+        let (arena, bindings) = test_managed_arena();
+        let mut state = test_decode_state(test_managed_cache(arena, bindings, 0, 0), 0, None);
+        state.stop_tokens = vec![1_000];
+        state.max_new_tokens = max_new_tokens;
+        state.stop_sequences = stop_sequences.iter().map(|s| s.to_string()).collect();
+        let mut steps = Vec::new();
+        for id in text.bytes().map(u32::from).chain(stop) {
+            let step = finish_vibevoice_decode_sample(&mut state, id, [1_000, 1_001], byte_decode)
+                .unwrap();
+            let finished = step.finished;
+            steps.push(step);
+            if finished {
+                break;
+            }
+        }
+        (steps, state)
+    }
+
+    #[test]
+    fn managed_decode_streams_whole_characters_with_linear_detokenize_work() {
+        let text = "héllo 你好世界 😀🎉 ".repeat(200);
+        let (steps, state) = stream_managed_text(&text, Some(1_000), usize::MAX, &[]);
+        let deltas = steps
+            .iter()
+            .map(|step| step.delta.as_str())
+            .collect::<String>();
+        assert_eq!(deltas, text);
+        assert_eq!(state.assembled, text);
+        assert!(steps.iter().all(|step| !step.delta.contains('\u{FFFD}')));
+        assert_eq!(state.stop_reason, Some("model_stop_token"));
+        let n = state.generated.len() as u64;
+        // Re-decoding every step would pass n(n+1)/2 ≈ 2.9M tokens.
+        assert!(
+            state.detokenizer.decoded_tokens() <= 8 * n,
+            "decoded {} tokens for {n}",
+            state.detokenizer.decoded_tokens()
+        );
+    }
+
+    #[test]
+    fn managed_decode_flushes_a_held_back_character_at_the_token_budget() {
+        // The budget ends inside the 4-byte emoji: the final step flushes the
+        // incomplete bytes as the full decode renders them.
+        let (steps, state) = stream_managed_text("ab😀", None, 4, &[]);
+        let deltas = steps
+            .iter()
+            .map(|step| step.delta.as_str())
+            .collect::<String>();
+        assert_eq!(deltas, byte_decode(&state.generated).unwrap());
+        assert_eq!(deltas, "ab\u{FFFD}");
+        assert_eq!(state.stop_reason, Some("max_tokens"));
+    }
+
+    #[test]
+    fn managed_decode_stops_on_a_sequence_split_across_tokens() {
+        let (steps, state) = stream_managed_text("say 你好 END more", None, usize::MAX, &["END"]);
+        // Deltas before the match already carried "EN"; the visible text
+        // is cut back to before the sequence, as the full re-decode did.
+        assert!(steps.last().is_some_and(|step| step.finished));
+        assert_eq!(state.assembled, "say 你好 ");
+        assert_eq!(state.stop_reason, Some("stop_sequence"));
+        assert_eq!(state.stop_sequence.as_deref(), Some("END"));
     }
 
     #[test]
