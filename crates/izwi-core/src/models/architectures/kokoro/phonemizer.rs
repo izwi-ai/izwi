@@ -103,6 +103,18 @@ impl EspeakPhonemizer {
         phonemize_with(text, voice, |input| self.run_espeak(voice.espeak, input))
     }
 
+    /// `text`'s clauses with their phonemes, from one espeak-ng call for
+    /// the whole text (see [`phonemize_units_with`]).
+    pub fn phonemize_units(
+        &self,
+        text: &str,
+        language: Option<&str>,
+        speaker: Option<&str>,
+    ) -> Result<Vec<KokoroPhonemeUnit>> {
+        let voice = kokoro_voice_for(language, speaker)?;
+        phonemize_units_with(text, voice, |input| self.run_espeak(voice.espeak, input))
+    }
+
     /// One espeak-ng run: IPA with `^` ties, one output line per clause.
     fn run_espeak(&self, voice: &str, text: &str) -> Result<String> {
         let output = Command::new(&self.bin_path)
@@ -212,17 +224,62 @@ fn inside_word(ch: char, prev: Option<char>, next: Option<char>) -> bool {
         || (ch == '.' && between(|c| c.is_alphabetic()))
 }
 
+/// How a clause of the text ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KokoroBoundary {
+    /// `.`, `!`, `?` or `…`.
+    Sentence,
+    /// `,`, `;`, `:` or `—`.
+    Clause,
+    /// The end of the text without closing punctuation.
+    End,
+}
+
+/// One clause of the input: its text, its phonemes (punctuation tokens
+/// included) and how it ends. Planning packs these into chunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KokoroPhonemeUnit {
+    pub text: String,
+    pub phonemes: String,
+    pub boundary: KokoroBoundary,
+}
+
+fn boundary_of(punct: char) -> Option<KokoroBoundary> {
+    match punct {
+        '.' | '!' | '?' | '…' => Some(KokoroBoundary::Sentence),
+        ',' | ';' | ':' | '—' => Some(KokoroBoundary::Clause),
+        _ => None,
+    }
+}
+
 /// Phonemes for `text` in `voice`'s conventions, with `run` invoking
-/// espeak-ng on a string. The word segments between punctuation tokens go
-/// to espeak-ng in one call, joined by commas: espeak-ng ends a clause (and
-/// an output line) at every comma, so line `i` is segment `i`. If the line
-/// count does not match (espeak-ng split or merged a clause on its own),
-/// each segment is phonemized separately instead.
+/// espeak-ng on a string: the clauses of [`phonemize_units_with`] joined
+/// by spaces.
 pub(crate) fn phonemize_with(
     text: &str,
     voice: KokoroVoice,
-    mut run: impl FnMut(&str) -> Result<String>,
+    run: impl FnMut(&str) -> Result<String>,
 ) -> Result<String> {
+    Ok(phonemize_units_with(text, voice, run)?
+        .into_iter()
+        .map(|unit| unit.phonemes)
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+/// `text`'s clauses with their phonemes, with `run` invoking espeak-ng on
+/// a string. The word segments between punctuation tokens go to espeak-ng
+/// in one call for the whole text, joined by commas: espeak-ng ends a clause
+/// (and an output line) at every comma, so line `i` is segment `i`. If the
+/// line count does not match (espeak-ng split or merged a clause on its
+/// own), each segment is phonemized separately instead. Punctuation stays
+/// where it was, and a clause ends after sentence or clause punctuation
+/// (closing quotes and brackets stay with the clause they close).
+pub(crate) fn phonemize_units_with(
+    text: &str,
+    voice: KokoroVoice,
+    mut run: impl FnMut(&str) -> Result<String>,
+) -> Result<Vec<KokoroPhonemeUnit>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err(Error::InvalidInput(
@@ -256,32 +313,66 @@ pub(crate) fn phonemize_with(
     let mut phonemized = phonemized
         .into_iter()
         .map(|line| espeak_to_misaki(&line, voice.g2p));
-    let mut out = String::with_capacity(trimmed.len() * 2);
+
+    let mut units = Vec::new();
+    let mut unit_text = String::new();
+    let mut unit_phonemes = String::new();
+    let mut pending: Option<KokoroBoundary> = None;
+    let mut close = |text: &mut String, phonemes: &mut String, boundary| {
+        let unit = KokoroPhonemeUnit {
+            text: std::mem::take(text).trim().to_string(),
+            phonemes: std::mem::take(phonemes).trim().to_string(),
+            boundary,
+        };
+        if !unit.phonemes.is_empty() {
+            units.push(unit);
+        }
+    };
     for piece in &pieces {
+        if let Some(boundary) = pending {
+            let closes_quote = matches!(piece, Piece::Punct(')' | '”' | '"'));
+            if !closes_quote {
+                close(&mut unit_text, &mut unit_phonemes, boundary);
+                pending = None;
+            }
+        }
         match piece {
-            Piece::Words(_) => {
+            Piece::Words(words) => {
+                unit_text.push_str(words);
                 if let Some(phonemes) = phonemized.next() {
-                    out.push_str(&phonemes);
+                    unit_phonemes.push_str(&phonemes);
                 }
             }
-            Piece::Punct(punct) => out.push(*punct),
+            Piece::Punct(punct) => {
+                unit_text.push(*punct);
+                unit_phonemes.push(*punct);
+                if let Some(boundary) = boundary_of(*punct) {
+                    pending = Some(boundary);
+                }
+            }
             Piece::Space => {
-                if !out.is_empty() && !out.ends_with(' ') {
-                    out.push(' ');
+                unit_text.push(' ');
+                if !unit_phonemes.is_empty() && !unit_phonemes.ends_with(' ') {
+                    unit_phonemes.push(' ');
                 }
             }
         }
     }
-    let out = out.trim().to_string();
-    if !out
-        .chars()
-        .any(|ch| !KOKORO_PUNCTUATION.contains(&ch) && ch != ' ')
-    {
+    close(
+        &mut unit_text,
+        &mut unit_phonemes,
+        pending.unwrap_or(KokoroBoundary::End),
+    );
+    if !units.iter().any(|unit| {
+        unit.phonemes
+            .chars()
+            .any(|ch| !KOKORO_PUNCTUATION.contains(&ch) && ch != ' ')
+    }) {
         return Err(Error::InferenceError(
             "espeak-ng returned empty phonemes for Kokoro request".to_string(),
         ));
     }
-    Ok(out)
+    Ok(units)
 }
 
 /// espeak-ng's output, one cleaned line per clause.
@@ -732,6 +823,44 @@ mod tests {
 
         assert!(phonemize_with("?!", KokoroVoice::US, |_| Ok(String::new())).is_err());
         assert!(phonemize_with("   ", KokoroVoice::US, |_| Ok(String::new())).is_err());
+    }
+
+    /// KOK-11: a whole multi-sentence text is phonemized in one espeak-ng
+    /// call and comes back as clauses with their boundaries; closing quotes
+    /// stay with the sentence they close.
+    #[test]
+    fn units_split_at_clauses_from_one_espeak_call() {
+        let calls = RefCell::new(0usize);
+        let fake = |input: &str| -> Result<String> {
+            *calls.borrow_mut() += 1;
+            Ok(input
+                .split(", ")
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+        let units = phonemize_units_with(
+            "He said “Hi.” Then, at last, we left! Done",
+            KokoroVoice::US,
+            fake,
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), 1);
+        let summary = units
+            .iter()
+            .map(|u| (u.text.as_str(), u.phonemes.as_str(), u.boundary))
+            .collect::<Vec<_>>();
+        use KokoroBoundary::*;
+        assert_eq!(
+            summary,
+            [
+                ("He said “Hi.”", "he said “hi.”", Sentence),
+                ("Then,", "then,", Clause),
+                ("at last,", "at last,", Clause),
+                ("we left!", "we left!", Sentence),
+                ("Done", "done", End),
+            ]
+        );
     }
 
     /// KOK-3/KOK-4 live: the pinned espeak-ng 1.52 output through misaki's

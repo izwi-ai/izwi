@@ -8,7 +8,8 @@ pub(crate) mod admission;
 mod albert;
 mod config;
 mod decoder;
-mod phonemizer;
+pub(crate) mod phonemizer;
+pub mod planning;
 mod prosody;
 mod text_encoder;
 mod voice;
@@ -659,6 +660,48 @@ impl KokoroTtsModel {
             .into_iter()
             .filter(|speaker| phonemizer::kokoro_speaker_supported(speaker))
             .collect())
+    }
+
+    /// Plan `text` into chunks within the voice pack's phoneme limit and
+    /// `policy`'s character budgets, phonemizing the whole text once
+    /// (KOK-11). Each chunk carries the phonemes [`Self::prepare_planned`]
+    /// feeds the model, so nothing is phonemized again.
+    pub fn plan_chunks(
+        &self,
+        text: &str,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        policy: planning::KokoroChunkPolicy,
+    ) -> Result<Vec<planning::KokoroPlannedChunk>> {
+        let speaker = self.resolve_speaker(speaker)?;
+        let units = self
+            .phonemizer
+            .phonemize_units(text, language, Some(&speaker))?;
+        Ok(planning::plan_chunks(
+            units,
+            policy,
+            KOKORO_MAX_PHONEMES_PER_CHUNK,
+        ))
+    }
+
+    /// The model inputs for a planned chunk, from its phonemes (no G2P).
+    pub fn prepare_planned(
+        &self,
+        chunk: &planning::KokoroPlannedChunk,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        speed: f32,
+    ) -> Result<KokoroPreparedRequest> {
+        let requested_speaker = speaker.map(str::to_owned);
+        let resolved = self.resolve_speaker(speaker)?;
+        self.prepared_from_phonemes(
+            &chunk.text,
+            requested_speaker,
+            language.map(str::to_owned),
+            speed,
+            &resolved,
+            chunk.phonemes.clone(),
+        )
     }
 
     pub fn prepare_request(
