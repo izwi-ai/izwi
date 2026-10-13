@@ -6,7 +6,10 @@
 mod config;
 mod predictor;
 mod rope;
+mod speaker_encoder;
 mod speech_tokenizer;
+
+use speaker_encoder::SpeakerEncoder;
 mod talker;
 mod tokenizer;
 
@@ -19,7 +22,7 @@ pub use speech_tokenizer::{SpeechTokenizerDecodeStats, SpeechTokenizerDecoder};
 pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::VarBuilder;
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -994,6 +997,8 @@ pub struct Qwen3TtsModel {
     code_predictor: CodePredictor,
     /// Speech tokenizer decoder for codec to audio conversion
     speech_tokenizer: SpeechTokenizerDecoder,
+    /// ECAPA x-vector encoder for voice cloning (Base checkpoints).
+    speaker_encoder: Option<SpeakerEncoder>,
     /// Model configuration
     config: Qwen3TtsConfig,
     /// Decode-time KV page size.
@@ -1428,6 +1433,43 @@ fn cache_layout_overflow() -> Error {
     Error::Overloaded("Qwen3-TTS session cache layout overflow".to_string())
 }
 
+/// The speaker slot of the codec prefix: a preset speaker's codec token, or a
+/// voice-clone x-vector already shaped `[1, 1, hidden]`.
+#[derive(Clone, Copy)]
+enum SpeakerPrefix<'a> {
+    Id(u32),
+    Embedding(&'a Tensor),
+}
+
+/// Loads the ECAPA x-vector encoder when the checkpoint ships one. It runs in
+/// F32 (about 45 MB) whatever the talker dtype.
+fn load_speaker_encoder(
+    config: &Qwen3TtsConfig,
+    weights_path: &Path,
+    device: &Device,
+) -> Result<Option<SpeakerEncoder>> {
+    let Some(encoder_config) = config.speaker_encoder_config.clone() else {
+        return Ok(None);
+    };
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(
+            std::slice::from_ref(&weights_path),
+            DType::F32,
+            device,
+        )?
+    };
+    if !vb.contains_tensor("speaker_encoder.fc.weight") {
+        return Ok(None);
+    }
+    if encoder_config.enc_dim != config.talker_config.hidden_size {
+        return Err(Error::ModelLoadError(format!(
+            "Qwen3-TTS speaker encoder width {} does not match the talker hidden size {}",
+            encoder_config.enc_dim, config.talker_config.hidden_size
+        )));
+    }
+    SpeakerEncoder::load(encoder_config, vb.pp("speaker_encoder")).map(Some)
+}
+
 fn conditioned_prefill_tokens(
     prompt_tokens: usize,
     has_language: bool,
@@ -1507,6 +1549,7 @@ fn voice_clone_session_cache_layout(
     reference_prompt_tokens: usize,
     reference_frames: usize,
     has_language: bool,
+    has_speaker_embedding: bool,
     requested_max_frames: usize,
 ) -> Result<TtsSessionCacheLayout> {
     let target_text_tokens = prompt_tokens.checked_sub(8).filter(|count| *count > 0);
@@ -1537,8 +1580,8 @@ fn voice_clone_session_cache_layout(
         .min(MAX_VOICE_CLONE_REFERENCE_FRAMES)
         .checked_add(1)
         .ok_or_else(cache_layout_overflow)?;
-    let base_prefill_tokens =
-        conditioned_prefill_tokens(0, has_language, false, 0).ok_or_else(cache_layout_overflow)?;
+    let base_prefill_tokens = conditioned_prefill_tokens(0, has_language, has_speaker_embedding, 0)
+        .ok_or_else(cache_layout_overflow)?;
     let prefill_tokens = base_prefill_tokens
         .checked_add(voice_clone_icl_prefill_tokens(text_tokens, codec_tokens))
         .ok_or_else(cache_layout_overflow)?;
@@ -1655,6 +1698,11 @@ impl Qwen3TtsModel {
             predictor_state_dtype,
         );
         let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
+        let speaker_encoder = if is_voice_clone_model {
+            load_speaker_encoder(&config, &weights_path, &device.device)?
+        } else {
+            None
+        };
 
         Ok(Self {
             device,
@@ -1668,6 +1716,7 @@ impl Qwen3TtsModel {
             talker,
             code_predictor,
             speech_tokenizer,
+            speaker_encoder,
             config,
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
@@ -1705,6 +1754,7 @@ impl Qwen3TtsModel {
                 reference_prompt_ids.len(),
                 reference_frames,
                 has_language,
+                self.speaker_encoder.is_some(),
                 request.max_frames,
             )
         } else {
@@ -2102,8 +2152,13 @@ impl Qwen3TtsModel {
         }
 
         let language_id = self.resolve_language_id(language);
-        let base_prefill =
-            self.build_conditioned_prefill_embeddings(&[], None, language_id, None)?;
+        let speaker_embedding = self.reference_speaker_embedding(reference)?;
+        let base_prefill = self.build_conditioned_prefill_embeddings(
+            &[],
+            speaker_embedding.as_ref().map(SpeakerPrefix::Embedding),
+            language_id,
+            None,
+        )?;
         let tts_pad_embed = self
             .talker
             .get_projected_special_embed(self.specials.tts_pad_token_id)?;
@@ -2170,7 +2225,7 @@ impl Qwen3TtsModel {
         let instruct_ids = self.encode_instruction_ids(instruct)?;
         let prefill_embeds = self.build_conditioned_prefill_embeddings(
             &prompt_ids,
-            Some(speaker_id),
+            Some(SpeakerPrefix::Id(speaker_id)),
             language_id,
             instruct_ids.as_deref(),
         )?;
@@ -3372,10 +3427,31 @@ impl Qwen3TtsModel {
         Ok(new_samples)
     }
 
+    /// The voice-clone x-vector as the reference computes it: the ECAPA
+    /// encoder over the reference audio resampled to 24 kHz, shaped
+    /// `[1, 1, hidden]` in the codec-embedding dtype. `None` for checkpoints
+    /// without a speaker encoder.
+    fn reference_speaker_embedding(&self, reference: &SpeakerReference) -> Result<Option<Tensor>> {
+        let Some(encoder) = &self.speaker_encoder else {
+            return Ok(None);
+        };
+        let samples = crate::audio::resample_mono_high_quality(
+            &reference.audio_samples,
+            reference.sample_rate,
+            encoder.config().sample_rate,
+        )?;
+        let embedding = encoder.embed_samples(&samples, &self.device.device)?;
+        Ok(Some(
+            embedding
+                .reshape((1, 1, encoder.config().enc_dim))?
+                .to_dtype(self.dtype)?,
+        ))
+    }
+
     fn build_conditioned_prefill_embeddings(
         &self,
         prompt_ids: &[u32],
-        speaker_id: Option<u32>,
+        speaker: Option<SpeakerPrefix<'_>>,
         language_id: Option<u32>,
         instruct_ids: Option<&[u32]>,
     ) -> Result<Tensor> {
@@ -3400,20 +3476,32 @@ impl Qwen3TtsModel {
                 self.specials.codec_think_eos_id,
             ]);
         }
-        if let Some(speaker_id) = speaker_id {
+        let tags = codec_prefix_ids.len();
+        if let Some(SpeakerPrefix::Id(speaker_id)) = speaker {
             codec_prefix_ids.push(speaker_id);
         }
         codec_prefix_ids.push(self.specials.codec_pad_id);
         codec_prefix_ids.push(self.specials.codec_bos_id);
 
-        let prefix_len = codec_prefix_ids.len();
+        let mut codec_prefix = self.talker.get_codec_embedding_batch(&codec_prefix_ids)?;
+        if let Some(SpeakerPrefix::Embedding(embedding)) = speaker {
+            // The reference splices the x-vector between the tags and pad/BOS.
+            codec_prefix = Tensor::cat(
+                &[
+                    &codec_prefix.i((.., ..tags, ..))?,
+                    embedding,
+                    &codec_prefix.i((.., tags.., ..))?,
+                ],
+                1,
+            )?;
+        }
+        let prefix_len = codec_prefix.dim(1)?;
         if prefix_len < 2 {
             return Err(Error::InferenceError(
                 "Invalid codec prefix while building conditioned prefill".to_string(),
             ));
         }
 
-        let codec_prefix = self.talker.get_codec_embedding_batch(&codec_prefix_ids)?;
         let codec_without_last = codec_prefix.i((.., ..prefix_len - 1, ..))?;
 
         let mut tts_overlay_ids = vec![self.specials.tts_pad_token_id; prefix_len - 2];
@@ -4334,6 +4422,7 @@ mod tests {
             tts_bos_token_id: 151672,
             tts_eos_token_id: 151673,
             tts_pad_token_id: 151671,
+            speaker_encoder_config: None,
             talker_config: TalkerConfig {
                 model_type: "qwen3_tts_talker".to_string(),
                 hidden_size: 1024,
@@ -5101,16 +5190,17 @@ mod tests {
         assert_eq!(capped.talker_cache_tokens(), Some(127));
 
         let small_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, 8, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, 8, false, false, 64).unwrap();
         let large_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, 200, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, 200, false, false, 64).unwrap();
         let capped_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, usize::MAX, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, usize::MAX, false, false, 64).unwrap();
         let explicit_cap = voice_clone_session_cache_layout(
             2_048,
             20,
             15,
             MAX_VOICE_CLONE_REFERENCE_FRAMES,
+            false,
             false,
             64,
         )
@@ -5135,10 +5225,23 @@ mod tests {
                 reference + 5,
                 frames,
                 false,
+                false,
                 64,
             )
             .unwrap();
             let codec_tokens = frames.min(MAX_VOICE_CLONE_REFERENCE_FRAMES) + 1;
+            // QTTS-7: the x-vector takes one codec-prefix slot.
+            let with_xvector = voice_clone_session_cache_layout(
+                4_096,
+                target + 8,
+                reference + 5,
+                frames,
+                false,
+                true,
+                64,
+            )
+            .unwrap();
+            assert_eq!(with_xvector.prefill_tokens, layout.prefill_tokens + 1);
             assert_eq!(
                 layout.prefill_tokens,
                 base + codec_tokens,
