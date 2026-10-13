@@ -481,6 +481,9 @@ pub struct GenerationResult {
 impl GenerationResult {
     /// Duration in seconds
     pub fn duration_secs(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
         self.samples.len() as f32 / self.sample_rate as f32
     }
 

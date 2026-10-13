@@ -513,6 +513,22 @@ impl RuntimeService {
     }
 }
 
+/// A finished request must carry audio at a real sample rate: an empty
+/// result is an error, not a 200 with an empty WAV (TPIPE-18).
+fn ensure_speech_audio(
+    variant: ModelVariant,
+    request_id: &str,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<()> {
+    if samples.is_empty() || sample_rate == 0 {
+        return Err(Error::InferenceError(format!(
+            "{variant} produced no audio for request {request_id}"
+        )));
+    }
+    Ok(())
+}
+
 /// Speak numbers, currency, dates, times and units as words when the
 /// request asks for it, or leaves it unset for a family that normalizes by
 /// default (`batch.tts.normalize_text`, TPIPE-26). English text only.
@@ -563,6 +579,7 @@ impl RuntimeService {
         }));
         let samples = output.audio.samples;
         let sample_rate = output.audio.sample_rate;
+        ensure_speech_audio(resolved_variant, &output.request_id, &samples, sample_rate)?;
         let total_tokens = output.num_tokens;
         let total_time_ms = output.generation_time.as_secs_f32() * 1000.0;
 
@@ -824,6 +841,25 @@ mod tests {
     /// the scheduler token count is not a frame count; medium (313 / 313)
     /// really hit its budget. A family without the end-of-speech step
     /// signal never reads as a context stop.
+    #[test]
+    fn empty_speech_output_is_an_error_and_never_a_nan_duration() {
+        let variant = ModelVariant::Kokoro82M;
+        assert!(ensure_speech_audio(variant, "empty", &[], 24_000).is_err());
+        assert!(ensure_speech_audio(variant, "rateless", &[0.1], 0).is_err());
+        assert!(ensure_speech_audio(variant, "ok", &[0.1], 24_000).is_ok());
+        let result = GenerationResult {
+            request_id: "rateless".into(),
+            samples: vec![0.1; 10],
+            sample_rate: 0,
+            total_tokens: 1,
+            total_time_ms: 5.0,
+            diagnostics: None,
+            stop_reason: None,
+        };
+        assert_eq!(result.duration_secs(), 0.0);
+        assert_eq!(result.rtf(), 0.0);
+    }
+
     /// Kokoro speaks "$1,250.75" and "March 3rd" as words by default; a
     /// family that reads them itself is left alone unless the request asks,
     /// and a request can turn Kokoro's off.
