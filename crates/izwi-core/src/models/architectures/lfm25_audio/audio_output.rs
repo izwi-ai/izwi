@@ -130,7 +130,12 @@ impl Lfm25AudioHead {
 
         let mut depth_embeddings = Vec::with_capacity(cfg.codebooks);
         for idx in 0..cfg.codebooks {
-            depth_embeddings.push(CodebookEmbeddingHead::load(loader, device, idx)?);
+            depth_embeddings.push(CodebookEmbeddingHead::load(
+                loader,
+                device,
+                idx,
+                cfg.audio_end_token_id,
+            )?);
         }
 
         let codebook_offsets = (0..cfg.codebooks)
@@ -1171,6 +1176,11 @@ struct CodebookEmbeddingHead {
     embedding: Embedding,
     norm: DepthRmsNorm,
     to_logits: QLinear,
+    /// Codes this head may emit: all 2049 for codebook 0, below the
+    /// end-of-audio code for codebooks 1-7. EOA is only meaningful in
+    /// codebook 0 (training sets every codebook to it at once), and a stray
+    /// 2048 in codebooks 1-7 is an index the detokenizer cannot decode.
+    code_limit: Option<usize>,
 }
 
 enum CodebookSample {
@@ -1190,7 +1200,12 @@ impl CodebookSample {
 }
 
 impl CodebookEmbeddingHead {
-    fn load(loader: &GgufLoader, device: &Device, idx: usize) -> Result<Self> {
+    fn load(
+        loader: &GgufLoader,
+        device: &Device,
+        idx: usize,
+        audio_end_token_id: u32,
+    ) -> Result<Self> {
         let embedding = load_embedding_any(
             loader,
             device,
@@ -1211,6 +1226,7 @@ impl CodebookEmbeddingHead {
             embedding,
             norm,
             to_logits,
+            code_limit: (idx > 0).then_some(audio_end_token_id as usize),
         })
     }
 
@@ -1245,7 +1261,8 @@ impl CodebookEmbeddingHead {
         rng: &mut SimpleRng,
     ) -> Result<CodebookSample> {
         let logits = self.logits(hidden)?;
-        let vocab_limit = logits.dim(0)?;
+        let vocab = logits.dim(0)?;
+        let vocab_limit = self.code_limit.map_or(vocab, |limit| limit.min(vocab));
         if config.temperature <= 1e-5 {
             if let Some(token) = greedy_token_tensor_from_logits(&logits, vocab_limit)? {
                 return Ok(CodebookSample::DeviceGreedy(token));
@@ -1488,6 +1505,80 @@ mod tests {
                 .to_vec1::<u32>()
                 .unwrap();
             assert_eq!(actual, expected);
+        }
+    }
+
+    /// A codebook head over 3 codes (EOA = 2) whose logits always favour EOA.
+    fn eoa_favouring_head(idx: usize) -> super::CodebookEmbeddingHead {
+        use candle_core::quantized::{GgmlDType, QTensor};
+        use candle_transformers::models::with_tracing::QMatMul;
+
+        let device = Device::Cpu;
+        let quantize = |values: Vec<f32>, shape: &[usize]| {
+            QTensor::quantize(
+                &Tensor::from_vec(values, shape, &device).unwrap(),
+                GgmlDType::F32,
+            )
+            .unwrap()
+        };
+        // Rows are output codes: code 2 reads every hidden unit with weight 5.
+        let to_logits = quantize(
+            vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 5.0, 5.0, 5.0, 5.0],
+            &[3, 4],
+        );
+        super::CodebookEmbeddingHead {
+            embedding: candle_nn::Embedding::new(
+                Tensor::zeros((3, 4), DType::F32, &device).unwrap(),
+                4,
+            ),
+            norm: super::DepthRmsNorm::from_qtensor(quantize(vec![1.0; 4], &[4]), 1e-5).unwrap(),
+            to_logits: super::QLinear {
+                weight: QMatMul::from_weights(std::sync::Arc::new(to_logits)).unwrap(),
+                bias: None,
+            },
+            code_limit: (idx > 0).then_some(2),
+        }
+    }
+
+    /// LFT-11: codebooks 1-7 never emit the end-of-audio code (which the
+    /// detokenizer cannot decode), greedy or sampled; codebook 0 still can.
+    #[test]
+    fn codebooks_after_the_first_never_emit_end_of_audio() {
+        use super::super::sampling::{Lfm25SamplingConfig, SimpleRng};
+
+        let hidden = Tensor::ones((1, 1, 4), DType::F32, &Device::Cpu).unwrap();
+        let greedy = Lfm25SamplingConfig::default();
+        let sampled = Lfm25SamplingConfig {
+            temperature: 50.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let mut rng = SimpleRng::new(17);
+        let first = eoa_favouring_head(0);
+        assert_eq!(
+            first
+                .sample(&hidden, &greedy, &mut rng)
+                .unwrap()
+                .to_token()
+                .unwrap(),
+            2
+        );
+        let later = eoa_favouring_head(3);
+        assert_ne!(
+            later
+                .sample(&hidden, &greedy, &mut rng)
+                .unwrap()
+                .to_token()
+                .unwrap(),
+            2
+        );
+        for _ in 0..64 {
+            let code = later
+                .sample(&hidden, &sampled, &mut rng)
+                .unwrap()
+                .to_token()
+                .unwrap();
+            assert!(code < 2, "codebook 3 emitted end-of-audio");
         }
     }
 
