@@ -54,6 +54,10 @@ const SPEECH_TOKEN_COMPRESS_RATIO: usize = 3_200;
 const MIN_FRAMES_BEFORE_STOP: usize = 4;
 const AUTO_MIN_OUTPUT_FRAMES: usize = 8;
 const AUTO_MAX_OUTPUT_FRAMES: usize = 384;
+/// Frames per chunk of the final acoustic decode. One F32 chunk peaks near
+/// 2 x 128 x 3200 x 32 x 4 B = 105 MB in the decoder FFN, inside the 512 MiB
+/// decode workspace a row is priced at, whatever the utterance length.
+const VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES: usize = 32;
 const WORDS_PER_SECOND: f32 = 2.6;
 const AUTO_PADDING_SECONDS: f32 = 0.8;
 pub const VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF: f64 = 300.0;
@@ -123,6 +127,8 @@ pub struct VibeVoiceTtsProfile {
     pub positive_decode_ms: f32,
     pub negative_decode_ms: f32,
     pub final_decode_ms: f32,
+    /// Chunks of the final decode ([`VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES`]).
+    pub final_decode_chunks: usize,
     pub host_audio_ms: f32,
     pub frames_generated: usize,
     pub diffusion_steps: usize,
@@ -959,14 +965,12 @@ impl VibeVoiceTtsModel {
             &state.artifact.normalization.scale,
         )?;
         let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode_frames(&unscaled)?;
+        // Read back per chunk inside the decode, so host_audio_ms stays 0.
+        let (samples, chunks) = self
+            .acoustic_tokenizer
+            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
         profile.final_decode_ms = elapsed_ms(started);
-        let started = Instant::now();
-        let samples = audio
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        profile.host_audio_ms = elapsed_ms(started);
+        profile.final_decode_chunks = chunks;
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
@@ -1218,14 +1222,12 @@ impl VibeVoiceTtsModel {
             &reference.normalization.scale,
         )?;
         let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode_frames(&unscaled)?;
+        // Read back per chunk inside the decode, so host_audio_ms stays 0.
+        let (samples, chunks) = self
+            .acoustic_tokenizer
+            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
         profile.final_decode_ms = elapsed_ms(started);
-        let started = Instant::now();
-        let samples = audio
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        profile.host_audio_ms = elapsed_ms(started);
+        profile.final_decode_chunks = chunks;
         let kernel_telemetry_end = kernel_telemetry_snapshot();
         apply_kernel_telemetry_delta(&mut profile, &kernel_telemetry_start, &kernel_telemetry_end);
         info!(?profile, "VibeVoice TTS generation profile");

@@ -338,6 +338,41 @@ impl VibeVoiceAcousticTokenizer {
         decoder.forward(&self.frames_last_to_channels_first(latents)?)
     }
 
+    /// [`Self::decode_frames`] `chunk_frames` frames at a time through the
+    /// streaming decoder's conv caches, reading each chunk back to host F32
+    /// and synchronizing the device before the next. The decoder is causal,
+    /// so the concatenated chunks equal one whole-sequence pass, while the
+    /// working set is one chunk: the FFN hidden alone is `128 x 3200 x 4B`
+    /// per frame and stage in F32, 1.26 GB for a 384-frame utterance in one
+    /// pass. Returns the samples and the number of chunks decoded.
+    pub(crate) fn decode_frames_chunked(
+        &self,
+        latents: &Tensor,
+        chunk_frames: usize,
+    ) -> Result<(Vec<f32>, usize)> {
+        let (_, frames, _) = latents.dims3()?;
+        let chunk_frames = chunk_frames.max(1);
+        let mut cache = TokenizerStreamingState::new();
+        let mut samples = Vec::new();
+        let mut chunks = 0;
+        let mut start = 0;
+        while start < frames {
+            let len = chunk_frames.min(frames - start);
+            let chunk = self
+                .decode_streaming(&latents.narrow(1, start, len)?, &mut cache)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            samples.extend_from_slice(&chunk);
+            // The chunk's tensors are dropped; synchronizing lets the backend
+            // release their pooled buffers before the next chunk.
+            latents.device().synchronize()?;
+            chunks += 1;
+            start += len;
+        }
+        Ok((samples, chunks))
+    }
+
     /// [`Self::decode_frames`] continuing from `cache`; same latent layout.
     fn decode_streaming(
         &self,
@@ -3565,6 +3600,31 @@ mod tests {
         let config: VibeVoiceTokenizerConfig = serde_json::from_str(config).unwrap();
         let vb = VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, Device::Cpu);
         VibeVoiceAcousticTokenizer::load(&config, vb).unwrap()
+    }
+
+    /// VVT-8: the chunked final decode (streaming conv caches, 32-frame
+    /// chunks) equals one whole-sequence decode, across chunk boundaries and
+    /// for a ragged last chunk.
+    #[test]
+    fn chunked_final_decode_matches_whole_sequence_decode() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let tokenizer = xorshift_acoustic_tokenizer();
+        let latents = xorshift_tensor(&[1, 77, 64], 21, 1.0, &Device::Cpu).unwrap();
+        let whole = host_f32(&tokenizer.decode_frames(&latents).unwrap()).unwrap();
+        let scale = whole.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(scale > 1e-3, "decoder output is silent");
+        for chunk_frames in [1, 5, 32, 77, 500] {
+            let (chunked, chunks) = tokenizer
+                .decode_frames_chunked(&latents, chunk_frames)
+                .unwrap();
+            assert_eq!(chunks, 77usize.div_ceil(chunk_frames));
+            let error = max_abs_diff(&chunked, &whole);
+            assert!(
+                error <= 1e-5 * scale.max(1.0),
+                "{chunk_frames}-frame chunks diverge by {error}"
+            );
+        }
     }
 
     /// VVT-1: a final decode of exactly `vae_dim` (64) frames used to pass
