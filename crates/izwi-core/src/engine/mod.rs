@@ -3045,6 +3045,7 @@ impl Engine {
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
         rows: (usize, usize),
+        minimum_tokens: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
         self.core
@@ -3056,6 +3057,7 @@ impl Engine {
                 logical_context_tokens,
                 portable_state_copies,
                 rows,
+                minimum_tokens,
             )
     }
 
@@ -3065,6 +3067,7 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         let _step = self.step_gate.lock().await;
         self.core.write().await.load_composite_retained_state(
@@ -3072,6 +3075,7 @@ impl Engine {
             contract,
             static_domain,
             logical_context_tokens,
+            minimum_tokens,
         )
     }
 

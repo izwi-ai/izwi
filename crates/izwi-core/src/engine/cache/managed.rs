@@ -522,8 +522,10 @@ pub(crate) enum PortableFitHeadroom {
     Planning,
     /// Planning headroom clamped to live memory
     /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR state, which
-    /// must leave room for the requests it serves.
-    Live,
+    /// must leave room for the requests it serves. `minimum_tokens` is the
+    /// one-chunk floor each sequence must reach (`0`: the page minimum); it
+    /// is admitted against planning headroom or the load is refused.
+    Live { minimum_tokens: u64 },
 }
 
 impl ManagedKvCacheManager {
@@ -613,7 +615,7 @@ impl ManagedKvCacheManager {
             PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
             // ASR state keeps the one reserve its invocation fit keeps too:
             // the configured floor or the measured untracked growth (ADM-11).
-            PortableFitHeadroom::Live => (
+            PortableFitHeadroom::Live { .. } => (
                 authority.state_fit_headroom_bytes(self.worker_backend)?,
                 authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
             ),
@@ -673,7 +675,13 @@ impl ManagedKvCacheManager {
                 })
         };
 
-        let minimum_tokens = u64::from(page_tokens_hint).min(maximum_tokens);
+        let floor_tokens = match headroom {
+            PortableFitHeadroom::Live { minimum_tokens } => minimum_tokens,
+            PortableFitHeadroom::Planning => 0,
+        };
+        let minimum_tokens = u64::from(page_tokens_hint)
+            .max(floor_tokens)
+            .min(maximum_tokens);
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
             let message = format!(
@@ -682,7 +690,7 @@ impl ManagedKvCacheManager {
             // An ASR floor that planning headroom cannot hold is a capacity
             // refusal (503), not a load defect.
             return Err(match headroom {
-                PortableFitHeadroom::Live => Error::Overloaded(message),
+                PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
                 PortableFitHeadroom::Planning => Error::ModelLoadError(message),
             });
         }
@@ -5968,14 +5976,14 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
-        let live = fit(PortableFitHeadroom::Live);
+        let live = fit(PortableFitHeadroom::Live { minimum_tokens: 0 });
         assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
 
         // Right after a large load live memory can read below the reserve
         // (Granite on Metal: 0.8 GB live beside a 1 GiB reserve). The
         // minimum is admitted against planning headroom, so the fit returns
         // it instead of failing the load; only growth is capped by live.
-        let fit_with = |capacity: u64, available: u64| {
+        let fit_with = |capacity: u64, available: u64, floor: u64| {
             ManagedKvCacheManager::for_worker(
                 Some(Arc::new(ResourceAuthority::new_advisory(Arc::new(
                     TestCapacityProvider {
@@ -5998,15 +6006,35 @@ mod tests {
                 8,
                 8,
                 1,
-                PortableFitHeadroom::Live,
+                PortableFitHeadroom::Live {
+                    minimum_tokens: floor,
+                },
             )
         };
-        assert_eq!(fit_with(RESERVE + bytes(4_096), RESERVE / 2).unwrap(), 64);
+        assert_eq!(
+            fit_with(RESERVE + bytes(4_096), RESERVE / 2, 0).unwrap(),
+            64
+        );
         // A minimum that planning headroom cannot hold is a capacity refusal.
         assert!(matches!(
-            fit_with(RESERVE + bytes(64) - 1, RESERVE + bytes(64) - 1),
+            fit_with(RESERVE + bytes(64) - 1, RESERVE + bytes(64) - 1, 0),
             Err(Error::Overloaded(_))
         ));
+        // An ASR floor of one chunk per sequence (Qwen3-ASR's 1,307 tokens):
+        // with live memory below the reserve the fit still reaches the floor
+        // (never a context smaller than one chunk), or refuses with
+        // Overloaded when planning headroom cannot hold it.
+        let reach = fit_with(RESERVE + bytes(4_096), RESERVE / 2, 1_307).unwrap();
+        assert!((1_307..1_307 + 64).contains(&reach), "floor fit {reach}");
+        assert!(matches!(
+            fit_with(RESERVE + bytes(1_024), RESERVE / 2, 1_307),
+            Err(Error::Overloaded(_))
+        ));
+        // A floor above the model's own context is capped by it.
+        assert_eq!(
+            fit_with(RESERVE + bytes(4_096), RESERVE / 2, 1 << 20).unwrap(),
+            4_096
+        );
     }
 
     fn host_bytes_vector(bytes: u64) -> ResourceVector {

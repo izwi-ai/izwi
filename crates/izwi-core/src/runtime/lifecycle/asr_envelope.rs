@@ -225,6 +225,63 @@ pub(crate) fn max_chunk_secs(variant: ModelVariant) -> Option<f32> {
     envelope_geometry(variant).map(|geometry| geometry.max_chunk_secs)
 }
 
+/// Planners cut long audio at 95% of the solved invocation limit
+/// (`NativeExecutor::asr_chunk_plan`), so a full 30 s chunk needs a context
+/// sized for `30 / 0.95` seconds.
+const PLANNED_CHUNK_SECS: f32 = 30.0 / 0.95;
+
+/// The smallest decoder context, in tokens, one `variant` sequence needs for
+/// one full chunk: its text prompt, the chunk's audio tokens and its decode
+/// budget (P2.5, ADM-10). A state fit must reach at least this, or refuse
+/// the load: a smaller published context cannot hold a default request
+/// (an LFM2.5 Audio fit published 320 tokens, below a 30 s prompt of 391).
+/// `None` for families without an LLM decoder context (Parakeet, Nemotron).
+pub(crate) fn minimum_sequence_tokens(variant: ModelVariant) -> Option<u64> {
+    use crate::runtime::{asr_sequence_ceiling, ASR_TEXT_PROMPT_TOKEN_RESERVE as PROMPT};
+    let geometry = envelope_geometry(variant)?;
+    let rate = geometry.audio_tokens_per_sec;
+    let tokens = match variant {
+        // The decoder's whole target window (prompt and output).
+        ModelVariant::WhisperLargeV3Turbo => geometry.prompt_tokens as usize,
+        // Single-pass planning reserves the default generation budget.
+        ModelVariant::Qwen3Asr06BGguf | ModelVariant::Qwen3Asr17BGguf => {
+            asr_sequence_ceiling(PROMPT, rate, PLANNED_CHUNK_SECS, 768)
+        }
+        _ if variant.family() == ModelFamily::GraniteSpeechAsr => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            PLANNED_CHUNK_SECS,
+            crate::runtime::granite_auto_asr_max_tokens_for_duration(30.0),
+        ),
+        // The retained route's one 60 s tokenizer chunk.
+        ModelVariant::VibeVoiceAsr => asr_sequence_ceiling(
+            geometry.prompt_tokens as usize,
+            rate,
+            geometry.max_chunk_secs,
+            crate::models::architectures::vibevoice::asr::vibevoice_auto_asr_max_tokens_for_duration(
+                geometry.max_chunk_secs,
+            ),
+        ),
+        // The realtime decoder emits about one token per audio token.
+        ModelVariant::VoxtralMini4BRealtime2602 => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            PLANNED_CHUNK_SECS,
+            (rate * PLANNED_CHUNK_SECS).ceil() as usize,
+        ),
+        // LFM2.5 Audio cuts 30 s chunks itself and decodes up to its
+        // single-pass default.
+        ModelVariant::Lfm25Audio15BGguf => asr_sequence_ceiling(
+            PROMPT,
+            rate,
+            geometry.max_chunk_secs,
+            crate::models::registry::LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS,
+        ),
+        _ => return None,
+    };
+    u64::try_from(tokens).ok()
+}
+
 fn overflow() -> Error {
     Error::Overloaded("ASR request envelope overflow".into())
 }
@@ -398,6 +455,28 @@ mod tests {
         assert_eq!(
             envelope(ModelVariant::WhisperLargeV3Turbo, f32::NAN),
             envelope(ModelVariant::WhisperLargeV3Turbo, 0.0)
+        );
+    }
+
+    /// One chunk per sequence: a default request's prompt and decode budget.
+    #[test]
+    fn minimum_sequence_tokens_hold_one_chunk() {
+        let floor = |variant| minimum_sequence_tokens(variant).unwrap();
+        assert_eq!(floor(ModelVariant::Qwen3Asr06BGguf), 1_307);
+        assert_eq!(floor(ModelVariant::VibeVoiceAsr), 1_938);
+        assert_eq!(floor(ModelVariant::WhisperLargeV3Turbo), 448);
+        // A 30 s LFM prompt is about 391 tokens; the floor adds its 1,024
+        // single-pass decode budget.
+        assert_eq!(floor(ModelVariant::Lfm25Audio15BGguf), 128 + 375 + 1_024);
+        assert!(floor(ModelVariant::GraniteSpeech412BPlus) > 128 + 316);
+        assert!(floor(ModelVariant::VoxtralMini4BRealtime2602) > 2 * 395);
+        assert_eq!(
+            minimum_sequence_tokens(ModelVariant::ParakeetTdt06BV3),
+            None
+        );
+        assert_eq!(
+            minimum_sequence_tokens(ModelVariant::Nemotron35AsrStreaming06B),
+            None
         );
     }
 

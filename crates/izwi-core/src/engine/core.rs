@@ -5549,6 +5549,7 @@ impl EngineCore {
             logical_context_tokens,
             portable_state_copies,
             rows,
+            0,
         )
     }
 
@@ -5562,6 +5563,7 @@ impl EngineCore {
         logical_context_tokens: Option<usize>,
         portable_state_copies: u32,
         (retained_rows, staged_rows): (usize, usize),
+        minimum_tokens: u64,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         if retained_rows == 0
             || staged_rows == 0
@@ -5582,7 +5584,7 @@ impl EngineCore {
             logical_context_tokens,
             portable_state_copies,
             (retained_rows, staged_rows),
-            PortableFitHeadroom::Live,
+            PortableFitHeadroom::Live { minimum_tokens },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5671,6 +5673,7 @@ impl EngineCore {
         full_contract: &crate::kv::v2::InferenceStateContract,
         static_domain: crate::kv::v2::StateDomainId,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
         if self.composite_retained_state.contains_key(&model_instance) {
             return Err(Error::InvalidInput(
@@ -5685,7 +5688,7 @@ impl EngineCore {
             logical_context_tokens,
             1,
             // Whisper's decoder state: ASR, fitted within live memory.
-            PortableFitHeadroom::Live,
+            PortableFitHeadroom::Live { minimum_tokens },
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
@@ -10971,6 +10974,7 @@ mod tests {
                 &crate::engine::cache::composite::tests::contract(),
                 crate::kv::v2::StateDomainId::new(2),
                 Some(32),
+                0,
             )
             .unwrap();
         let request_weak = Arc::downgrade(&loaded);

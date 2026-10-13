@@ -149,7 +149,7 @@ type FishS2TtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<FishS2
 type QwenTtsLoaderFn = fn(&Path, ModelVariant, DeviceProfile, usize, &str) -> Result<Qwen3TtsModel>;
 type KokoroLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<KokoroTtsModel>;
 
-const LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
+pub(crate) const LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const LFM25_AUDIO_ASR_MIN_CHUNK_NEW_TOKENS: usize = 128;
 const LFM25_AUDIO_ASR_MAX_CHUNK_NEW_TOKENS: usize = 256;
 const LFM25_AUDIO_ASR_TOKENS_PER_SECOND: f32 = 8.0;

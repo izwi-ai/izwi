@@ -184,6 +184,12 @@ fn state_fit_budgets(
     (floor, growth.min(floor))
 }
 
+/// The one-chunk floor of an ASR variant's decoder context (`0` for other
+/// variants, and for ASR families without an LLM decoder context).
+fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
+    super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
+}
+
 fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
     available_bytes / remaining_groups.max(1)
 }
@@ -1434,8 +1440,15 @@ impl ModelLifecycleController {
             let PortableInvocationContextIntent::Automatic { ceiling } = intent else {
                 unreachable!("portable invocation context intent was matched above")
             };
+            // An ASR invocation holds at least one chunk per sequence, unless
+            // the model's own context is smaller (P2.5).
+            let minimum = if asr {
+                minimum.max(asr_minimum_tokens(variant).min(maximum))
+            } else {
+                minimum
+            };
             if ceiling < minimum {
-                return Err(Error::ModelLoadError(format!(
+                return Err(does_not_fit(format!(
                     "published automatic context is below the invocation minimum: context={ceiling}, minimum={minimum}"
                 )));
             }
@@ -2458,6 +2471,7 @@ impl ModelLifecycleController {
                                 Some(retained_max_tokens),
                                 2,
                                 self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -2592,6 +2606,7 @@ impl ModelLifecycleController {
                                 Some(retained_max_tokens),
                                 2,
                                 self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         // The retained pool serves several sequences, but one
@@ -2694,6 +2709,7 @@ impl ModelLifecycleController {
                                 Some(retained_max_tokens),
                                 2,
                                 self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         // The legacy invocation route keeps the duration-budget
@@ -2762,6 +2778,7 @@ impl ModelLifecycleController {
                                 &physical_spec.retained,
                                 physical_spec.retained_static_domain,
                                 Some(physical_spec.retained_max_tokens),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         let retained_uses = contracts
@@ -3050,6 +3067,7 @@ impl ModelLifecycleController {
                                 Some(retained_max_tokens),
                                 2,
                                 self.asr_state_rows(),
+                                asr_minimum_tokens(variant),
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
