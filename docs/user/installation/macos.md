@@ -109,6 +109,21 @@ export IZWI_BACKEND=metal
 izwi serve
 ```
 
+### Metal precision
+
+Each model family picks its own precision on Metal. `IZWI_METAL_DTYPE`
+overrides that choice for every family:
+
+| Value | Effect |
+|-------|--------|
+| `auto` (default) | Each family's Metal policy. |
+| `f32` | F32 weights and activations for every family that uses the shared dtype policy. Use this if a model produces wrong or empty output on Metal. |
+| `f16`, `bf16` | Lower-precision default for families that use the shared dtype policy. Experimental. BF16 is slower than F16 on M1 and M2. |
+
+A per-family variable such as `IZWI_WHISPER_DTYPE` is more specific and takes
+precedence over `IZWI_METAL_DTYPE`. On Metal, a per-family `f16` or `bf16`
+setting is now applied as written instead of being replaced with F32.
+
 ---
 
 ## Data Locations

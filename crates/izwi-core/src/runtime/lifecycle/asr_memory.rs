@@ -2263,11 +2263,11 @@ mod tests {
         std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "f32");
         let _restore = Restore("IZWI_VIBEVOICE_ASR_DTYPE");
         assert_eq!(vibevoice(BackendKind::Cuda).resident_bytes, 2 * default);
-        // CPU and Metal resolve F32 whatever is requested.
+        // CPU resolves F32 whatever is requested; Metal honours the override.
         std::env::set_var("IZWI_VIBEVOICE_ASR_DTYPE", "bf16");
         assert_eq!(
             vibevoice(BackendKind::Cpu).resident_bytes,
-            vibevoice(BackendKind::Metal).logical_resident_bytes
+            2 * vibevoice(BackendKind::Metal).logical_resident_bytes
         );
     }
 

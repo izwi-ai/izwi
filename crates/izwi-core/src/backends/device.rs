@@ -191,9 +191,9 @@ impl DeviceProfile {
     /// Select optimal dtype based on device kind and requested preference
     ///
     /// # Optimization Notes:
-    /// - Metal on Apple Silicon: F32 is preferred over F16/BF16 for better performance
-    ///   and numerical stability. Apple's GPU architecture doesn't benefit from F16
-    ///   the same way NVIDIA GPUs do with Tensor Cores.
+    /// - Metal: each family keeps its own default (F32 unless a family policy
+    ///   says otherwise); `IZWI_METAL_DTYPE` replaces that default, and an
+    ///   explicit request (F32, F16 or BF16) is honoured.
     /// - CUDA: BF16 is preferred for compute, F16 for memory-constrained scenarios
     /// - CPU: Always F32 since most CPUs don't have efficient F16/BF16 paths
     pub fn select_dtype(&self, requested: Option<&str>) -> DType {
@@ -307,7 +307,7 @@ impl DeviceProfile {
             let raw = raw.trim();
             if !raw.is_empty() {
                 if let Some(dtype) = parse_dtype_name(raw) {
-                    return self.resolve_requested_dtype(raw, dtype);
+                    return self.resolve_requested_dtype(request, raw, dtype);
                 }
 
                 return Err(DTypeSelectionError {
@@ -322,6 +322,7 @@ impl DeviceProfile {
 
     fn resolve_requested_dtype(
         &self,
+        request: DTypeSelectionRequest<'_>,
         raw: &str,
         requested: DType,
     ) -> std::result::Result<DTypeSelection, DTypeSelectionError> {
@@ -330,10 +331,7 @@ impl DeviceProfile {
                 dtype: DType::F32,
                 reason: "CPU inference uses F32 regardless of lower-precision override".into(),
             }),
-            DeviceKind::Metal => Ok(DTypeSelection {
-                dtype: DType::F32,
-                reason: "Metal policy keeps F32 for existing stability/performance behavior".into(),
-            }),
+            DeviceKind::Metal => self.resolve_requested_metal_dtype(request, raw, requested),
             DeviceKind::Cuda => match requested {
                 DType::F32 => Ok(DTypeSelection {
                     dtype: DType::F32,
@@ -363,37 +361,134 @@ impl DeviceProfile {
         }
     }
 
+    /// An explicit Metal request is honoured: weights and activations at F16
+    /// or BF16 are what llama.cpp, whisper.cpp and MLX run on Apple GPUs, and
+    /// Candle's Metal gemm accumulates in F32 for both. BF16 is accepted on
+    /// every Apple family (Candle has BF16 kernels everywhere) but runs slower
+    /// than F16 before Apple9, so the reason says so.
+    fn resolve_requested_metal_dtype(
+        &self,
+        request: DTypeSelectionRequest<'_>,
+        raw: &str,
+        requested: DType,
+    ) -> std::result::Result<DTypeSelection, DTypeSelectionError> {
+        if request
+            .model_family
+            .is_some_and(|family| METAL_REQUEST_IS_CONFIG_HINT.contains(&family))
+        {
+            let default = self.metal_default_dtype_selection(request);
+            return Ok(DTypeSelection {
+                dtype: default.dtype,
+                reason: format!(
+                    "{:?} passes its checkpoint config dtype rather than a user override; {}",
+                    request.model_family, default.reason
+                )
+                .into(),
+            });
+        }
+        match requested {
+            DType::F32 => Ok(DTypeSelection {
+                dtype: DType::F32,
+                reason: "explicit Metal F32 override".into(),
+            }),
+            DType::F16 if self.capabilities.supports_f16 => Ok(DTypeSelection {
+                dtype: DType::F16,
+                reason: "explicit Metal F16 override".into(),
+            }),
+            DType::F16 => Err(DTypeSelectionError {
+                requested: raw.to_string(),
+                reason: "Metal device does not report F16 support".into(),
+            }),
+            DType::BF16 if self.metal_supports_fast_bf16() => Ok(DTypeSelection {
+                dtype: DType::BF16,
+                reason: "explicit Metal BF16 override on an Apple9+ GPU".into(),
+            }),
+            DType::BF16 => Ok(DTypeSelection {
+                dtype: DType::BF16,
+                reason: "explicit Metal BF16 override; GPUs before Apple9 (M1/M2) run BF16 slower than F16".into(),
+            }),
+            _ => Err(DTypeSelectionError {
+                requested: raw.to_string(),
+                reason: "dtype override is not supported for Metal inference".into(),
+            }),
+        }
+    }
+
+    /// Whether this profile's device is an Apple9+ GPU (M3/M4/M5), the tier
+    /// whose BF16 matches F16 throughput. False off Metal and when the family
+    /// cannot be read.
+    pub fn metal_supports_fast_bf16(&self) -> bool {
+        self.kind.is_metal() && metal_supports_fast_bf16(&self.device)
+    }
+
+    /// The Metal default: `IZWI_METAL_DTYPE` when it names a dtype, else the
+    /// family policy.
+    fn metal_default_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
+        self.metal_default_dtype_selection_with(request, MetalDTypeOverride::from_env())
+    }
+
+    fn metal_default_dtype_selection_with(
+        &self,
+        request: DTypeSelectionRequest<'_>,
+        global: MetalDTypeOverride,
+    ) -> DTypeSelection {
+        match global {
+            MetalDTypeOverride::Auto => self.metal_family_dtype_selection(request),
+            MetalDTypeOverride::F32 => DTypeSelection {
+                dtype: DType::F32,
+                reason: "IZWI_METAL_DTYPE=f32 forces F32 on Metal".into(),
+            },
+            MetalDTypeOverride::F16 => DTypeSelection {
+                dtype: DType::F16,
+                reason: "IZWI_METAL_DTYPE=f16 selects F16 on Metal".into(),
+            },
+            MetalDTypeOverride::Bf16 => DTypeSelection {
+                dtype: DType::BF16,
+                reason: if self.metal_supports_fast_bf16() {
+                    "IZWI_METAL_DTYPE=bf16 selects BF16 on an Apple9+ GPU".into()
+                } else {
+                    "IZWI_METAL_DTYPE=bf16 selects BF16; GPUs before Apple9 (M1/M2) run BF16 slower than F16".into()
+                },
+            },
+        }
+    }
+
     fn default_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
         match self.kind {
             DeviceKind::Cpu => DTypeSelection {
                 dtype: DType::F32,
                 reason: "CPU default dtype is F32".into(),
             },
-            DeviceKind::Metal => DTypeSelection {
-                dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
-                    DType::F16
-                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
-                    DType::F32
-                } else if request.model_family == Some(ModelFamily::Voxtral)
-                    && request.checkpoint_dtype != Some(DType::F32)
-                {
-                    DType::F16
-                } else {
-                    DType::F32
-                },
-                reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
-                    "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
-                } else if request.model_family == Some(ModelFamily::VoxtralTts) {
-                    "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
-                } else if request.model_family == Some(ModelFamily::Voxtral)
-                    && request.checkpoint_dtype != Some(DType::F32)
-                {
-                    "Voxtral Metal policy uses F16 to keep realtime decoding within Apple GPU memory and latency limits".into()
-                } else {
-                    "Metal default dtype remains F32".into()
-                },
-            },
+            DeviceKind::Metal => self.metal_default_dtype_selection(request),
             DeviceKind::Cuda => self.default_cuda_dtype_selection(request),
+        }
+    }
+
+    /// The per-family Metal default, before `IZWI_METAL_DTYPE`.
+    fn metal_family_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
+        DTypeSelection {
+            dtype: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                DType::F16
+            } else if request.model_family == Some(ModelFamily::VoxtralTts) {
+                DType::F32
+            } else if request.model_family == Some(ModelFamily::Voxtral)
+                && request.checkpoint_dtype != Some(DType::F32)
+            {
+                DType::F16
+            } else {
+                DType::F32
+            },
+            reason: if request.model_family == Some(ModelFamily::VibeVoiceTts) {
+                "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
+            } else if request.model_family == Some(ModelFamily::VoxtralTts) {
+                "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
+            } else if request.model_family == Some(ModelFamily::Voxtral)
+                && request.checkpoint_dtype != Some(DType::F32)
+            {
+                "Voxtral Metal policy uses F16 to keep realtime decoding within Apple GPU memory and latency limits".into()
+            } else {
+                "Metal default dtype remains F32".into()
+            },
         }
     }
 
@@ -915,6 +1010,126 @@ pub fn parse_dtype_name(raw: &str) -> Option<DType> {
     }
 }
 
+/// Families whose loader passes the checkpoint's config dtype (not a user
+/// override) through the requested-dtype path. On Metal that hint keeps the
+/// family default. Granite Speech resolves its own `IZWI_GRANITE_SPEECH_DTYPE`
+/// before it reaches the resolver, so only its config hint arrives here.
+const METAL_REQUEST_IS_CONFIG_HINT: &[ModelFamily] = &[ModelFamily::GraniteSpeechAsr];
+
+/// The global Metal dtype override variable.
+pub const METAL_DTYPE_ENV: &str = "IZWI_METAL_DTYPE";
+
+/// `IZWI_METAL_DTYPE`: `auto` (or unset) keeps each family's Metal policy;
+/// `f32`, `f16` or `bf16` replaces the family default wherever the Metal
+/// resolver is consulted. `f32` is the escape hatch from every lower-precision
+/// Metal policy, weight-only F16 included. A per-family override such as
+/// `IZWI_WHISPER_DTYPE` is more specific and wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetalDTypeOverride {
+    #[default]
+    Auto,
+    F32,
+    F16,
+    Bf16,
+}
+
+impl MetalDTypeOverride {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
+        }
+        match parse_dtype_name(raw)? {
+            DType::F32 => Some(Self::F32),
+            DType::F16 => Some(Self::F16),
+            DType::BF16 => Some(Self::Bf16),
+            _ => None,
+        }
+    }
+
+    /// Reads [`METAL_DTYPE_ENV`]. An unrecognised value is ignored (`Auto`)
+    /// with a warning, once per process.
+    pub fn from_env() -> Self {
+        let Ok(raw) = std::env::var(METAL_DTYPE_ENV) else {
+            return Self::Auto;
+        };
+        Self::parse(&raw).unwrap_or_else(|| {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "Ignoring invalid {METAL_DTYPE_ENV}={raw:?}; expected f32, f16, bf16 or auto"
+                );
+            }
+            Self::Auto
+        })
+    }
+
+    pub fn dtype(self) -> Option<DType> {
+        match self {
+            Self::Auto => None,
+            Self::F32 => Some(DType::F32),
+            Self::F16 => Some(DType::F16),
+            Self::Bf16 => Some(DType::BF16),
+        }
+    }
+}
+
+/// An Apple GPU family (`MTLGPUFamilyApple<N>`): M1 is Apple7, M2 Apple8,
+/// M3 and M4 Apple9, M5 Apple10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AppleGpuFamily(pub u8);
+
+impl AppleGpuFamily {
+    /// The first family whose BF16 throughput matches F16. llama.cpp measured
+    /// BF16 at 0.81x on M2 Ultra and about parity on M3+.
+    pub const FAST_BF16: Self = Self(9);
+
+    pub fn supports_fast_bf16(self) -> bool {
+        self >= Self::FAST_BF16
+    }
+}
+
+/// The newest Apple GPU family `device` supports, or `None` off Metal.
+/// Candle's `supports_bf16()` is true on every Metal device, so the
+/// precision policy reads the family itself (`MTLDevice supportsFamily:`).
+pub fn metal_apple_gpu_family(device: &Device) -> Option<AppleGpuFamily> {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use objc2_metal::{MTLDevice, MTLGPUFamily};
+
+        let Device::Metal(metal) = device else {
+            return None;
+        };
+        let raw = metal.device().as_ref();
+        [
+            (MTLGPUFamily::Apple10, 10),
+            (MTLGPUFamily::Apple9, 9),
+            (MTLGPUFamily::Apple8, 8),
+            (MTLGPUFamily::Apple7, 7),
+            (MTLGPUFamily::Apple6, 6),
+            (MTLGPUFamily::Apple5, 5),
+            (MTLGPUFamily::Apple4, 4),
+            (MTLGPUFamily::Apple3, 3),
+            (MTLGPUFamily::Apple2, 2),
+            (MTLGPUFamily::Apple1, 1),
+        ]
+        .into_iter()
+        .find(|(family, _)| raw.supportsFamily(*family))
+        .map(|(_, generation)| AppleGpuFamily(generation))
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    {
+        let _ = device;
+        None
+    }
+}
+
+/// Whether `device` is an Apple9+ GPU (M3/M4/M5), the Metal BF16 tier.
+pub fn metal_supports_fast_bf16(device: &Device) -> bool {
+    metal_apple_gpu_family(device).is_some_and(AppleGpuFamily::supports_fast_bf16)
+}
+
 fn parse_cuda_ordinal(raw: Option<&str>) -> Option<usize> {
     raw.map(str::trim)
         .filter(|raw| !raw.is_empty())
@@ -1153,14 +1368,175 @@ mod tests {
         // Default should be F32 for Metal
         assert_eq!(metal_profile.select_dtype(None), DType::F32);
 
-        // Explicit BF16 request should still give F32 for Metal
-        assert_eq!(metal_profile.select_dtype(Some("bf16")), DType::F32);
-
-        // Explicit F16 request should give F32 for Metal
-        assert_eq!(metal_profile.select_dtype(Some("f16")), DType::F32);
-
         // F32 request should give F32
         assert_eq!(metal_profile.select_dtype(Some("f32")), DType::F32);
+
+        // A device without F16 support refuses an F16 override; the lenient
+        // selector falls back to the default.
+        assert_eq!(
+            metal_profile
+                .try_select_dtype(Some("f16"))
+                .unwrap_err()
+                .requested,
+            "f16"
+        );
+        assert_eq!(metal_profile.select_dtype(Some("f16")), DType::F32);
+    }
+
+    fn metal_test_profile() -> DeviceProfile {
+        DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                prefers_f32: true,
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        }
+    }
+
+    #[test]
+    fn metal_honours_explicit_lower_precision_requests() {
+        let metal = metal_test_profile();
+        assert_eq!(metal.select_dtype(Some("f16")), DType::F16);
+        assert_eq!(metal.select_dtype(Some("bf16")), DType::BF16);
+        assert_eq!(metal.select_dtype(Some("f32")), DType::F32);
+        for family in [
+            ModelFamily::WhisperAsr,
+            ModelFamily::VibeVoiceAsr,
+            ModelFamily::Qwen3Tts,
+        ] {
+            assert_eq!(
+                metal.select_model_dtype(family, Some("float16")),
+                DType::F16
+            );
+            assert_eq!(
+                metal
+                    .select_model_dtype_checked(family, Some("f32"), "test")
+                    .unwrap(),
+                DType::F32
+            );
+        }
+        // A test profile on the CPU device has no Apple family, so the reason
+        // warns that BF16 is the slow tier.
+        let bf16 = metal
+            .try_resolve_dtype(DTypeSelectionRequest::new(Some("bf16")))
+            .unwrap();
+        assert!(bf16.reason.contains("before Apple9"), "{}", bf16.reason);
+    }
+
+    #[test]
+    fn metal_config_hints_keep_the_family_default() {
+        let metal = metal_test_profile();
+        assert_eq!(
+            metal.select_model_dtype(ModelFamily::GraniteSpeechAsr, Some("torch.bfloat16")),
+            DType::F32
+        );
+    }
+
+    #[test]
+    fn metal_global_override_replaces_family_defaults_only() {
+        let metal = metal_test_profile();
+        let request = |family| DTypeSelectionRequest::new(None).with_model_family(family);
+        let with = |family, global| {
+            metal
+                .metal_default_dtype_selection_with(request(family), global)
+                .dtype
+        };
+
+        // `auto` keeps every family default unchanged.
+        assert_eq!(
+            with(ModelFamily::ParakeetAsr, MetalDTypeOverride::Auto),
+            DType::F32
+        );
+        assert_eq!(
+            with(ModelFamily::NemotronAsr, MetalDTypeOverride::Auto),
+            DType::F32
+        );
+        assert_eq!(
+            with(ModelFamily::VibeVoiceTts, MetalDTypeOverride::Auto),
+            DType::F16
+        );
+        assert_eq!(
+            metal
+                .metal_default_dtype_selection_with(
+                    request(ModelFamily::Voxtral).with_checkpoint_dtype(DType::BF16),
+                    MetalDTypeOverride::Auto
+                )
+                .dtype,
+            DType::F16
+        );
+
+        // A named dtype replaces them.
+        assert_eq!(
+            with(ModelFamily::VibeVoiceTts, MetalDTypeOverride::F32),
+            DType::F32
+        );
+        assert_eq!(
+            with(ModelFamily::WhisperAsr, MetalDTypeOverride::F16),
+            DType::F16
+        );
+        assert_eq!(
+            with(ModelFamily::WhisperAsr, MetalDTypeOverride::Bf16),
+            DType::BF16
+        );
+    }
+
+    #[test]
+    fn metal_dtype_override_parses_names_and_auto() {
+        assert_eq!(
+            MetalDTypeOverride::parse(""),
+            Some(MetalDTypeOverride::Auto)
+        );
+        assert_eq!(
+            MetalDTypeOverride::parse(" AUTO "),
+            Some(MetalDTypeOverride::Auto)
+        );
+        assert_eq!(
+            MetalDTypeOverride::parse("fp32"),
+            Some(MetalDTypeOverride::F32)
+        );
+        assert_eq!(
+            MetalDTypeOverride::parse("half"),
+            Some(MetalDTypeOverride::F16)
+        );
+        assert_eq!(
+            MetalDTypeOverride::parse("bfloat16"),
+            Some(MetalDTypeOverride::Bf16)
+        );
+        assert_eq!(MetalDTypeOverride::parse("int8"), None);
+        assert_eq!(MetalDTypeOverride::Auto.dtype(), None);
+        assert_eq!(MetalDTypeOverride::F16.dtype(), Some(DType::F16));
+    }
+
+    #[test]
+    fn apple_gpu_family_bf16_tier_starts_at_apple9() {
+        assert!(!AppleGpuFamily(7).supports_fast_bf16());
+        assert!(!AppleGpuFamily(8).supports_fast_bf16());
+        assert!(AppleGpuFamily(9).supports_fast_bf16());
+        assert!(AppleGpuFamily(10).supports_fast_bf16());
+        assert_eq!(metal_apple_gpu_family(&Device::Cpu), None);
+        assert!(!metal_supports_fast_bf16(&Device::Cpu));
+        assert!(!DeviceProfile::cpu().metal_supports_fast_bf16());
+    }
+
+    /// Every Apple Silicon Mac is Apple7 or newer; a Metal device that reads
+    /// no family would leave the BF16 tier silently off.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_device_reports_an_apple_silicon_family() {
+        let Some(device) = metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let family = metal_apple_gpu_family(&device).expect("Apple GPU family");
+        eprintln!("Metal device family: Apple{}", family.0);
+        assert!(family >= AppleGpuFamily(7), "{family:?}");
+        assert_eq!(
+            metal_supports_fast_bf16(&device),
+            family >= AppleGpuFamily::FAST_BF16
+        );
     }
 
     #[test]
@@ -1398,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    fn non_cuda_checked_model_dtype_keeps_legacy_fallbacks() {
+    fn non_cuda_checked_model_dtype_falls_back_or_honours_metal_overrides() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1425,12 +1801,12 @@ mod tests {
             metal_profile
                 .select_model_dtype_checked(ModelFamily::Qwen3Chat, Some("bf16"), "Qwen3 chat")
                 .unwrap(),
-            DType::F32
+            DType::BF16
         );
     }
 
     #[test]
-    fn cpu_and_metal_whisper_model_dtype_stays_f32() {
+    fn cpu_and_metal_whisper_model_dtype_defaults_to_f32() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1465,7 +1841,7 @@ mod tests {
             metal_profile
                 .select_model_dtype_checked(ModelFamily::WhisperAsr, Some("bf16"), "Whisper")
                 .unwrap(),
-            DType::F32
+            DType::BF16
         );
     }
 
@@ -1504,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_and_metal_nemotron_model_dtype_stays_f32() {
+    fn cpu_and_metal_nemotron_model_dtype_defaults_to_f32() {
         let cpu_profile = DeviceProfile {
             device: Device::Cpu,
             kind: DeviceKind::Cpu,
@@ -1541,7 +1917,7 @@ mod tests {
             metal_profile
                 .select_model_dtype_checked(ModelFamily::NemotronAsr, Some("f16"), "Nemotron ASR")
                 .unwrap(),
-            DType::F32
+            DType::F16
         );
     }
 
