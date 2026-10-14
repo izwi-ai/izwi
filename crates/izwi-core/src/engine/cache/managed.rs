@@ -3413,6 +3413,22 @@ impl ManagedKvCacheManager {
                 Arc::strong_count(&state.runtime),
             )));
         }
+        // Physical caches clone the arena handle, not the runtime. A clone
+        // that outlived its step would keep device backing alive after the
+        // lease is released, so the runtime must be the arena's only owner.
+        if let Some((arena, owners)) = state
+            .runtime
+            .arenas
+            .iter()
+            .map(|(id, arena)| (id, Arc::strong_count(arena)))
+            .find(|(_, owners)| *owners != 1)
+        {
+            return Err(Error::InferenceError(format!(
+                "managed KV model {} arena generation {} has {owners} owners, expected 1",
+                model_instance.get(),
+                arena.generation,
+            )));
+        }
         for group in &state.runtime.plan.groups {
             loop {
                 let evicted = state
@@ -10489,6 +10505,33 @@ mod tests {
             authority.snapshot().reserved.host_bytes,
             ResourceAmount::Known(0)
         );
+    }
+
+    #[test]
+    fn unload_refuses_while_a_physical_cache_still_holds_the_arena() {
+        let model = ModelInstanceId::new(46);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+        let arena_id = runtime.plan().groups[0].arena;
+        // What an executor step's PhysicalPagedKvCache holds.
+        let leaked = Arc::clone(runtime.arena(arena_id).expect("resolved arena"));
+        drop(runtime);
+
+        let error = manager.unload_model(model).expect_err("a live arena clone");
+        assert!(error.to_string().contains("owners, expected 1"), "{error}");
+        drop(leaked);
+        assert!(manager
+            .unload_model(model)
+            .expect("unload after the clone drops"));
     }
 
     #[test]
