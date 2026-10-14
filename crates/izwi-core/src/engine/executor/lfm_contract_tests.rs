@@ -257,3 +257,47 @@ fn sealed_lfm_chat_prefill_is_bounded_and_priced_per_token() {
     assert_eq!(sealed.workspace_per_work_unit_bytes, 147_456);
     assert_eq!(sealed.max_workspace_bytes, 147_456 * 1_024);
 }
+
+#[test]
+fn sealed_decode_quantum_fits_the_continuous_decode_work_budget() {
+    let variant = ModelVariant::Lfm2512BInstructGguf;
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Metal,
+    )
+    .unwrap();
+    draft.seal_chat_workspace(8192).unwrap();
+    draft.seal_chat_decode_quantum(8).unwrap();
+    assert!(draft.seal_chat_decode_quantum(4).is_err());
+    let decode = draft
+        .execution_contracts(CapabilityKind::Chat)
+        .unwrap()
+        .into_iter()
+        .flat_map(|contract| contract.stages.to_vec())
+        .find(|stage| stage.selector == crate::engine::StageWorkSelector::SequenceDecode)
+        .expect("chat decode stage");
+    // An 8-token isolated quantum must pass the stage's work-unit check on
+    // every backend, not only where the batch width is already 8.
+    assert!(decode.max_work_units >= 8, "{}", decode.max_work_units);
+}
+
+#[test]
+fn sustained_decode_quanta_are_honoured_on_every_backend() {
+    for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+        let mut profile = crate::engine::ExecutionProfile::fail_closed(
+            backend,
+            None,
+            crate::engine::ExecutionMode::Sequence,
+        );
+        profile.resolved_from_loaded_model = true;
+        profile.incremental_decode = true;
+        profile.preferred_decode_tokens = 8;
+        profile.sustained_decode_quantum = true;
+        assert!(profile.effective_sustained_decode_quantum(), "{backend:?}");
+        profile.sustained_decode_quantum = false;
+        assert!(!profile.effective_sustained_decode_quantum(), "{backend:?}");
+    }
+}

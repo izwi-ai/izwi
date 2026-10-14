@@ -3839,7 +3839,12 @@ impl NativeChatModel {
                 model.sustained_decode_quantum(),
                 false,
             ),
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => (1, false, false),
+            Self::Lfm2(model) => (
+                model.preferred_decode_tokens(),
+                model.sustained_decode_quantum(),
+                false,
+            ),
+            Self::Qwen3(_) | Self::Gemma3(_) => (1, false, false),
         }
     }
 }

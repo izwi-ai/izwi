@@ -442,6 +442,24 @@ impl Lfm2ChatModel {
             .ok_or_else(workspace_overflow)
     }
 
+    /// Decode tokens per engine step for an isolated row: each token still
+    /// commits on its own, but scheduling, state staging and stream delivery
+    /// are paid once per quantum. Streams deliver in bursts of this size.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        match self.device_kind() {
+            BackendKind::Cpu => 4,
+            BackendKind::Metal | BackendKind::Cuda => 8,
+        }
+    }
+
+    /// The quantum outlives the request's soft scheduling SLA (about 0.7 s
+    /// for interactive and streaming chat), after which the scheduler would
+    /// otherwise grant one token per step. It still yields to waiting or
+    /// co-batched work and to hard deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.preferred_decode_tokens() > 1
+    }
+
     /// Prefill span: long prompts run in spans of this many tokens on every
     /// backend, bounding activation memory (a 32K prompt in one pass held
     /// ~4.6 GB), and an isolated request uses the whole span rather than the
@@ -572,6 +590,14 @@ impl Lfm2ChatModel {
                 tokens_generated: state.generated_ids.len(),
                 input_tokens_committed: 0,
                 finished: true,
+            });
+        }
+        // Steady-state decode (a pending token, no prefill output) takes the
+        // one-synchronization batched step with a single row.
+        if state.pending_token.is_some() && state.unconsumed_output.is_none() {
+            let mut steps = self.decode_step_batch(&mut [state])?;
+            return steps.pop().ok_or_else(|| {
+                Error::InferenceError("LFM2 single-row decode produced no step".into())
             });
         }
         let mut committed = 0usize;
