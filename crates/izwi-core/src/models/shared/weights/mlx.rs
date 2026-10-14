@@ -306,14 +306,16 @@ pub fn load_conv2d(
     let expected_ohwi = (out_channels, kernel_size, kernel_size, in_channels);
 
     if dims == expected_ohwi {
-        // Candle 0.11's Metal and non-cudnn CUDA im2col conv2d copy a strided
-        // kernel to a contiguous buffer and then multiply the original one.
-        ws = ws.permute((0, 3, 1, 2))?.contiguous()?;
+        ws = ws.permute((0, 3, 1, 2))?;
     } else if dims != expected_oihw {
         return Err(Error::ModelLoadError(format!(
             "Conv2d weight shape mismatch: got={dims:?}, expected OIHW={expected_oihw:?} or OHWI={expected_ohwi:?}"
         )));
     }
+    // Candle 0.11's Metal and non-cudnn CUDA im2col conv2d copy a strided
+    // kernel to a contiguous buffer and then multiply the original one. Both
+    // the permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = ws.contiguous()?;
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get(out_channels, "bias")?)
@@ -344,9 +346,7 @@ pub fn load_conv1d_no_bias(
     let mut ws = vb.get_unchecked_dtype("weight", vb.dtype())?;
     if let Ok(dims) = ws.dims3() {
         if dims == expected_oki {
-            // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a
-            // strided kernel to a contiguous buffer and then multiply the original.
-            ws = ws.permute((0, 2, 1))?.contiguous()?;
+            ws = ws.permute((0, 2, 1))?;
         } else if dims != expected_oik {
             return Err(Error::ModelLoadError(format!(
                 "Conv1d weight shape mismatch: got={dims:?}, expected OIK={expected_oik:?} or OKI={expected_oki:?}"
@@ -364,6 +364,10 @@ pub fn load_conv1d_no_bias(
             "Conv1d weight must be a 2D/3D tensor".to_string(),
         ));
     }
+    // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a strided
+    // kernel to a contiguous buffer and then multiply the original. Both the
+    // permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = ws.contiguous()?;
 
     Ok(Conv1d::new(ws, None, cfg))
 }
@@ -389,9 +393,7 @@ pub fn load_conv1d(
     let mut ws = vb.get_unchecked_dtype("weight", vb.dtype())?;
     if let Ok(dims) = ws.dims3() {
         if dims == expected_oki {
-            // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a
-            // strided kernel to a contiguous buffer and then multiply the original.
-            ws = ws.permute((0, 2, 1))?.contiguous()?;
+            ws = ws.permute((0, 2, 1))?;
         } else if dims != expected_oik {
             return Err(Error::ModelLoadError(format!(
                 "Conv1d weight shape mismatch: got={dims:?}, expected OIK={expected_oik:?} or OKI={expected_oki:?}"
@@ -409,6 +411,10 @@ pub fn load_conv1d(
             "Conv1d weight must be a 2D/3D tensor".to_string(),
         ));
     }
+    // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a strided
+    // kernel to a contiguous buffer and then multiply the original. Both the
+    // permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = ws.contiguous()?;
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get_unchecked_dtype("bias", vb.dtype())?)
@@ -621,5 +627,102 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "MLX conv loaders: {failures:?}");
+    }
+
+    /// Pins Candle 0.11's strided-kernel bug and izwi's guard against it.
+    /// Candle's CPU im2col conv1d copies a strided kernel to a contiguous
+    /// buffer and then multiplies the original storage as if it were row-major
+    /// (Metal and non-cudnn CUDA do the same for conv1d and conv2d). If the
+    /// first assertion fails, a Candle upgrade changed that: re-audit before
+    /// relying on it. Every izwi conv loader must hand Candle contiguous
+    /// kernels, from MLX OKI/OHWI layouts and from Fortran-ordered `.pth`.
+    #[test]
+    fn candle_conv_strided_kernel_canary() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+        use crate::models::shared::weights::pytorch::test_support::write_f32_state_dict;
+        use candle_core::{Device, Module};
+
+        let cpu = Device::Cpu;
+        let input = xorshift_tensor(&[2, 8, 20], 5, 1.0, &cpu).unwrap();
+        let oki = xorshift_tensor(&[6, 3, 8], 9, 0.05, &cpu).unwrap();
+        let strided = oki.permute((0, 2, 1)).unwrap();
+        assert!(!strided.is_contiguous());
+        let oik = strided.contiguous().unwrap();
+        let cfg = Conv1dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let want = host_f32(&Conv1d::new(oik.clone(), None, cfg).forward(&input).unwrap()).unwrap();
+        let buggy = host_f32(&Conv1d::new(strided, None, cfg).forward(&input).unwrap()).unwrap();
+        assert!(
+            max_abs_diff(&buggy, &want) > 1e-2,
+            "Candle CPU conv1d now honours strided kernels; re-audit report 09"
+        );
+
+        let dir = std::env::temp_dir().join(format!("izwi-conv-canary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fortran_vb = |name: &str, weight: &Tensor| {
+            let path = dir.join(format!("{name}.pth"));
+            write_f32_state_dict(&path, "weight", weight, true);
+            VarBuilder::from_pth(path, DType::F32, &cpu).unwrap()
+        };
+        let mlx_vb = |weight: &Tensor| {
+            let weights = std::collections::HashMap::from([("weight".to_string(), weight.clone())]);
+            VarBuilder::from_tensors(weights, DType::F32, &cpu)
+        };
+
+        // Candle's own `.pth` reader returns a Fortran tensor as a strided view.
+        let raw = fortran_vb("raw", &oik).get((6, 8, 3), "weight").unwrap();
+        assert!(!raw.is_contiguous());
+
+        let mut failures = Vec::new();
+        let conv1d_layouts = [
+            ("oki", mlx_vb(&oki)),
+            ("fortran-oik", fortran_vb("oik", &oik)),
+        ];
+        for (layout, vb) in conv1d_layouts {
+            for (loader, conv) in [
+                (
+                    "load_conv1d",
+                    load_conv1d(8, 6, 3, cfg, vb.clone()).unwrap(),
+                ),
+                (
+                    "load_conv1d_no_bias",
+                    load_conv1d_no_bias(8, 6, 3, cfg, vb).unwrap(),
+                ),
+            ] {
+                let err = max_abs_diff(&host_f32(&conv.forward(&input).unwrap()).unwrap(), &want);
+                if !conv.weight().is_contiguous() || err > 1e-6 {
+                    failures.push(format!("{loader} {layout}: max|d|={err:e}"));
+                }
+            }
+        }
+
+        let ohwi = xorshift_tensor(&[6, 3, 3, 8], 13, 0.05, &cpu).unwrap();
+        let oihw = ohwi.permute((0, 3, 1, 2)).unwrap().contiguous().unwrap();
+        let image = xorshift_tensor(&[1, 8, 9, 7], 17, 1.0, &cpu).unwrap();
+        let cfg2d = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let want2d = host_f32(
+            &Conv2d::new(oihw.clone(), None, cfg2d)
+                .forward(&image)
+                .unwrap(),
+        )
+        .unwrap();
+        let conv2d_layouts = [
+            ("ohwi", mlx_vb(&ohwi)),
+            ("fortran-oihw", fortran_vb("oihw", &oihw)),
+        ];
+        for (layout, vb) in conv2d_layouts {
+            let conv = load_conv2d(8, 6, 3, cfg2d, vb).unwrap();
+            let err = max_abs_diff(&host_f32(&conv.forward(&image).unwrap()).unwrap(), &want2d);
+            if !conv.weight().is_contiguous() || err > 1e-6 {
+                failures.push(format!("load_conv2d {layout}: max|d|={err:e}"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(failures.is_empty(), "strided conv kernels: {failures:?}");
     }
 }
