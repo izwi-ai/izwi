@@ -773,11 +773,9 @@ impl RuntimeService {
         let aligner_limit = aligner_model
             .as_ref()
             .and_then(|model| model.max_audio_seconds_hint());
-        let use_single_pass_asr = should_use_single_pass_diarization_asr(
-            audio.duration_secs,
-            aligner_limit,
-            aligner_model.is_some(),
-        );
+        let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
+        let use_single_pass_asr =
+            should_use_single_pass_diarization_asr(audio.duration_secs, chunk_limit);
         let invocation_asr = matches!(
             asr_contract.metadata.state_requirement,
             InferenceStateRequirement::Invocation
@@ -828,15 +826,7 @@ impl RuntimeService {
             };
             (transcription.text, Vec::new(), transcription.language)
         } else if invocation_asr {
-            let cfg = pipeline_chunk_config();
-            let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
-            let cfg = degrade_pipeline_chunk_config(cfg, chunk_limit);
-            let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
-            if chunks.is_empty() {
-                return Err(Error::InvalidInput(
-                    "ASR chunk planner produced no chunks".to_string(),
-                ));
-            }
+            let (cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
             let mut assembler = TranscriptAssembler::new(cfg);
             let mut transcribed = Vec::with_capacity(chunks.len());
             for chunk in chunks {
@@ -879,7 +869,6 @@ impl RuntimeService {
             (assembler.finish().trim().to_string(), transcribed, None)
     } else {
         let audio_for_task = audio.clone();
-        let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
         let (text, chunks) = self
             .coordinator
             .run_loaded_blocking_stage(
@@ -1172,19 +1161,29 @@ fn degrade_pipeline_chunk_config(
     cfg
 }
 
-fn should_use_single_pass_diarization_asr(
-    duration_secs: f32,
-    aligner_limit: Option<f32>,
-    aligner_available: bool,
-) -> bool {
-    if !aligner_available {
-        return true;
-    }
-
-    match aligner_limit {
+/// One ASR pass over the whole file is allowed only when it fits the
+/// combined ASR/aligner chunk limit (`None` = unbounded). Without an aligner
+/// the ASR limit alone still applies: invocation-backed families reject
+/// over-bound audio, and the chunked path falls back to per-chunk timings.
+fn should_use_single_pass_diarization_asr(duration_secs: f32, chunk_limit: Option<f32>) -> bool {
+    match chunk_limit {
         Some(limit) if limit.is_finite() && limit > 0.0 => duration_secs <= limit,
         _ => true,
     }
+}
+
+fn plan_invocation_asr_chunks(
+    audio: &PipelineAudio,
+    chunk_limit: Option<f32>,
+) -> Result<(AsrLongFormConfig, Vec<AudioChunk>)> {
+    let cfg = degrade_pipeline_chunk_config(pipeline_chunk_config(), chunk_limit);
+    let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
+    if chunks.is_empty() {
+        return Err(Error::InvalidInput(
+            "ASR chunk planner produced no chunks".to_string(),
+        ));
+    }
+    Ok((cfg, chunks))
 }
 
 fn transcribe_audio_chunks(
@@ -3405,22 +3404,67 @@ Here is the refined transcript:
     }
 
     #[test]
-    fn should_use_single_pass_diarization_asr_prefers_stable_path_when_possible() {
+    fn should_use_single_pass_diarization_asr_respects_combined_limit() {
         assert!(should_use_single_pass_diarization_asr(
             27.3,
-            Some(300.0),
-            true
+            combined_chunk_limit(None, Some(300.0))
         ));
-        assert!(should_use_single_pass_diarization_asr(27.3, None, true));
-        assert!(should_use_single_pass_diarization_asr(
-            600.0,
-            Some(300.0),
-            false
-        ));
+        assert!(should_use_single_pass_diarization_asr(27.3, None));
         assert!(!should_use_single_pass_diarization_asr(
             600.0,
-            Some(300.0),
-            true
+            combined_chunk_limit(None, Some(300.0))
         ));
+        // An aligner with a longer limit no longer lifts the ASR limit.
+        assert!(!should_use_single_pass_diarization_asr(
+            120.0,
+            combined_chunk_limit(Some(30.0), Some(300.0))
+        ));
+    }
+
+    #[test]
+    fn diarization_asr_without_aligner_chunks_by_the_asr_limit() {
+        let asr_only = combined_chunk_limit(Some(30.0), None);
+        assert!(!should_use_single_pass_diarization_asr(116.5, asr_only));
+        assert!(!should_use_single_pass_diarization_asr(600.0, asr_only));
+        assert!(should_use_single_pass_diarization_asr(27.3, asr_only));
+    }
+
+    #[test]
+    fn diarization_asr_without_aligner_plans_bounded_chunks_with_fallback_timings() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let sample_rate = PIPELINE_SAMPLE_RATE;
+        let audio = PipelineAudio {
+            samples: vec![0.0_f32; 60 * sample_rate as usize].into(),
+            sample_rate,
+            duration_secs: 60.0,
+        };
+        let chunk_limit = combined_chunk_limit(Some(30.0), None);
+        assert!(!should_use_single_pass_diarization_asr(
+            audio.duration_secs,
+            chunk_limit
+        ));
+
+        let (_cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit).expect("plan");
+        assert!(chunks.len() >= 2, "60 s must split into >= 2 chunks");
+        for chunk in &chunks {
+            let secs = chunk.len_samples() as f32 / sample_rate as f32;
+            assert!(secs <= 30.0, "chunk of {secs} s exceeds the 30 s ASR limit");
+        }
+
+        let transcribed = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, range)| TranscribedChunk {
+                range: *range,
+                text: format!("alpha{index} beta{index} gamma{index}"),
+                language: None,
+            })
+            .collect::<Vec<_>>();
+        let timings = fallback_word_timings_from_chunks(&transcribed, sample_rate);
+        assert!(!timings.is_empty());
+        let last_end_ms = timings.iter().map(|(_, _, end)| *end).max().unwrap();
+        assert!(last_end_ms > 30_000, "timings must cover the later chunks");
     }
 }
