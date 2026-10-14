@@ -4,8 +4,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
@@ -17,7 +15,6 @@ use crate::backends::state::{
 };
 use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
-use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
@@ -30,9 +27,7 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::backbone::{Lfm2ShortConvRuntimeState, QuantizedLfm2Backbone};
 use super::config::{parse_lfm2_backbone_config, Lfm2BackboneConfig};
-use super::physical::{
-    lfm2_managed_cache_contract, lfm2_physical_state_spec, Lfm2PhysicalStateSpec,
-};
+use super::physical::lfm2_managed_cache_contract;
 
 pub struct ChatDecodeState {
     shortconv: Lfm2ShortConvRuntimeState,
@@ -189,12 +184,6 @@ impl ChatDecodeState {
 }
 
 #[derive(Debug, Clone)]
-pub struct ChatGenerationOutput {
-    pub text: String,
-    pub tokens_generated: usize,
-}
-
-#[derive(Debug, Clone)]
 struct SpecialTokenIds {
     bos: Option<u32>,
     im_start: u32,
@@ -232,188 +221,6 @@ struct PromptScaffoldTokens {
     user_header: Vec<u32>,
     assistant_header: Vec<u32>,
     newline: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PrefillMode {
-    Auto,
-    Full,
-    Token,
-}
-
-impl Lfm2PrefillMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Full => "full",
-            Self::Token => "token",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PrefillExecution {
-    Full,
-}
-
-impl Lfm2PrefillExecution {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Lfm2PrefillConfig {
-    mode: Lfm2PrefillMode,
-    token_prompt_threshold: usize,
-}
-
-impl Lfm2PrefillConfig {
-    const DEFAULT_TOKEN_THRESHOLD: usize = 64;
-
-    fn resolve(self, _prompt_tokens: usize) -> Lfm2PrefillExecution {
-        // Candle's quantized LFM2 ShortConv cache ignores `index_pos` for
-        // one-token calls, so token prefill can reuse state from a previous
-        // request. A full prompt pass replaces both attention and ShortConv
-        // state deterministically at the request boundary.
-        Lfm2PrefillExecution::Full
-    }
-}
-
-fn parse_lfm2_prefill_mode(raw: Option<&str>) -> Lfm2PrefillMode {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("full" | "sequence") => Lfm2PrefillMode::Full,
-        Some("token" | "token_mode") => Lfm2PrefillMode::Token,
-        _ => Lfm2PrefillMode::Auto,
-    }
-}
-
-fn parse_lfm2_prefill_threshold(raw: Option<&str>) -> usize {
-    raw.map(str::trim)
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD)
-}
-
-fn lfm2_prefill_config() -> &'static Lfm2PrefillConfig {
-    static CONFIG: OnceLock<Lfm2PrefillConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| Lfm2PrefillConfig {
-        mode: parse_lfm2_prefill_mode(std::env::var("IZWI_LFM2_PREFILL_MODE").ok().as_deref()),
-        token_prompt_threshold: parse_lfm2_prefill_threshold(
-            std::env::var("IZWI_LFM2_PREFILL_TOKEN_THRESHOLD")
-                .ok()
-                .as_deref(),
-        ),
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2DefaultSystemPolicy {
-    Auto,
-    Always,
-    Never,
-}
-
-impl Lfm2DefaultSystemPolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Always => "always",
-            Self::Never => "never",
-        }
-    }
-}
-
-fn parse_lfm2_default_system_policy(raw: Option<&str>) -> Lfm2DefaultSystemPolicy {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("always" | "on" | "true" | "1") => Lfm2DefaultSystemPolicy::Always,
-        Some("never" | "off" | "false" | "0") => Lfm2DefaultSystemPolicy::Never,
-        _ => Lfm2DefaultSystemPolicy::Auto,
-    }
-}
-
-fn lfm2_default_system_policy() -> &'static Lfm2DefaultSystemPolicy {
-    static POLICY: OnceLock<Lfm2DefaultSystemPolicy> = OnceLock::new();
-    POLICY.get_or_init(|| {
-        parse_lfm2_default_system_policy(
-            std::env::var("IZWI_LFM2_DEFAULT_SYSTEM_POLICY")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-fn should_prepend_default_system(
-    messages: &[ChatMessage],
-    policy: Lfm2DefaultSystemPolicy,
-) -> bool {
-    if matches!(
-        messages.first().map(|message| &message.role),
-        Some(ChatRole::System)
-    ) {
-        return false;
-    }
-    match policy {
-        Lfm2DefaultSystemPolicy::Always => true,
-        Lfm2DefaultSystemPolicy::Never => false,
-        // The checkpoint template adds only an explicitly supplied system
-        // message. Do not change instructions when a second user turn arrives.
-        Lfm2DefaultSystemPolicy::Auto => false,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PromptStylePolicy {
-    Standard,
-    Aggressive,
-}
-
-impl Lfm2PromptStylePolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Aggressive => "aggressive",
-        }
-    }
-}
-
-fn parse_lfm2_prompt_style_policy(raw: Option<&str>) -> Lfm2PromptStylePolicy {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("aggressive" | "compact" | "lean") => Lfm2PromptStylePolicy::Aggressive,
-        _ => Lfm2PromptStylePolicy::Standard,
-    }
-}
-
-fn lfm2_prompt_style_policy() -> &'static Lfm2PromptStylePolicy {
-    static POLICY: OnceLock<Lfm2PromptStylePolicy> = OnceLock::new();
-    POLICY.get_or_init(|| {
-        parse_lfm2_prompt_style_policy(
-            std::env::var("IZWI_LFM2_PROMPT_STYLE_POLICY")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-fn should_use_aggressive_single_turn_prompt(
-    messages: &[ChatMessage],
-    prepend_default_system: bool,
-    style_policy: Lfm2PromptStylePolicy,
-) -> bool {
-    if prepend_default_system {
-        return false;
-    }
-    let single_user_turn = messages.len() == 1
-        && matches!(
-            messages.first().map(|message| &message.role),
-            Some(ChatRole::User)
-        );
-    if !single_user_turn {
-        return false;
-    }
-    matches!(style_policy, Lfm2PromptStylePolicy::Aggressive)
 }
 
 impl PromptScaffoldTokens {
@@ -511,15 +318,6 @@ impl ChatTokenizer {
         self.inner.encode(text)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
-    }
-
     fn validate_selection(&self, token: u32) -> Result<()> {
         if token as usize >= self.vocab_size || self.non_generatable.contains(&token) {
             return Err(Error::InferenceError(format!(
@@ -609,21 +407,6 @@ impl Lfm2ChatModel {
             device.kind,
             gguf_path.display()
         );
-        let prefill = lfm2_prefill_config();
-        info!(
-            "LFM2 prefill policy: mode={}, token_prompt_threshold={}",
-            prefill.mode.as_str(),
-            prefill.token_prompt_threshold
-        );
-        info!(
-            "LFM2 default system policy: {}",
-            lfm2_default_system_policy().as_str()
-        );
-        info!(
-            "LFM2 prompt style policy: {}",
-            lfm2_prompt_style_policy().as_str()
-        );
-
         Ok(Self {
             device,
             tokenizer,
@@ -970,127 +753,6 @@ impl Lfm2ChatModel {
         Ok(steps)
     }
 
-    pub(crate) fn physical_state_spec(
-        &self,
-        stage_graphs: &[&[StageDescriptor]],
-    ) -> Result<Lfm2PhysicalStateSpec> {
-        lfm2_physical_state_spec(&self.config, stage_graphs)
-    }
-
-    pub(crate) fn generate_with_callback_physical(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<ChatGenerationOutput> {
-        self.generate_with_callback_state(messages, max_new_tokens, on_delta, cache, shortconv)
-    }
-
-    fn generate_with_callback_state(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-    ) -> Result<ChatGenerationOutput> {
-        let total_started = Instant::now();
-        let prompt_build_started = Instant::now();
-        let prompt_ids = self.build_prompt(messages)?;
-        let prompt_build_ms = prompt_build_started.elapsed().as_secs_f64() * 1000.0;
-        let model = &self.text_model;
-
-        let prompt_len = prompt_ids.len();
-        let prefill_started = Instant::now();
-        let prefill_cfg = *lfm2_prefill_config();
-        let prefill_exec = prefill_cfg.resolve(prompt_len);
-        let (mut logits, mut position, prefill_steps) =
-            self.prefill_prompt(model, prompt_ids.as_slice(), prefill_exec, cache, shortconv)?;
-        let prefill_forward_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
-
-        let max_new_tokens = max_new_tokens.max(1);
-        let mut generated_ids = Vec::with_capacity(max_new_tokens);
-        let mut assembled = String::with_capacity(max_new_tokens.saturating_mul(4));
-        let mut decoder = IncrementalDecoder::new(true);
-        let mut stop_reason = "length";
-        let decode_started = Instant::now();
-        let mut first_delta_ms: Option<f64> = None;
-
-        while generated_ids.len() < max_new_tokens {
-            self.tokenizer.validate_logits(&logits)?;
-            let next = argmax(&logits.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?)?;
-            self.tokenizer.validate_selection(next)?;
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-            {
-                stop_reason = "eos";
-                break;
-            }
-
-            let delta = self
-                .tokenizer
-                .inner
-                .decode_incrementally(&mut decoder, next)?;
-            generated_ids.push(next);
-            if !delta.is_empty() {
-                if first_delta_ms.is_none() {
-                    first_delta_ms = Some(total_started.elapsed().as_secs_f64() * 1000.0);
-                }
-                on_delta(&delta);
-            }
-            assembled.push_str(&delta);
-
-            if should_check_repetition_loop(generated_ids.len())
-                && has_token_repetition_loop(&generated_ids)
-            {
-                stop_reason = "repetition";
-                break;
-            }
-
-            let next_tensor = Tensor::from_slice(&[next], (1, 1), &self.device.device)?;
-            logits = model
-                .forward_tokens_physical(&next_tensor, position, cache, shortconv)
-                .map_err(|e| Error::InferenceError(format!("LFM2 GGUF decode failed: {e}")))?;
-            position += 1;
-        }
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
-            let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-            tracing::debug!(
-                target: "izwi::lfm2::timing",
-                prompt_tokens = prompt_len,
-                prefill_policy = prefill_cfg.mode.as_str(),
-                prefill_execution = prefill_exec.as_str(),
-                prefill_steps,
-                prompt_build_ms,
-                prefill_forward_ms,
-                first_delta_ms = first_delta_ms.unwrap_or(total_ms),
-                decode_ms,
-                total_ms,
-                generated_tokens = generated_ids.len(),
-                "LFM2 chat timing breakdown"
-            );
-        }
-
-        let suffix = self
-            .tokenizer
-            .inner
-            .finish_incremental_decode(&mut decoder)?;
-        assembled.push_str(&suffix);
-        validate_terminal_text(&assembled, stop_reason, generated_ids.len())?;
-        if !suffix.is_empty() {
-            on_delta(&suffix);
-        }
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
-        })
-    }
-
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         self.build_prompt(messages)
     }
@@ -1102,14 +764,6 @@ impl Lfm2ChatModel {
             ));
         }
 
-        let prepend_default_system =
-            should_prepend_default_system(messages, *lfm2_default_system_policy());
-        let prompt_style = *lfm2_prompt_style_policy();
-        if should_use_aggressive_single_turn_prompt(messages, prepend_default_system, prompt_style)
-        {
-            return self.build_aggressive_single_turn_prompt(messages[0].content.as_str());
-        }
-
         let mut ids = Vec::new();
         if let Some(bos) = self.tokenizer.specials.bos {
             ids.push(bos);
@@ -1117,22 +771,9 @@ impl Lfm2ChatModel {
 
         let last_assistant_index = messages
             .iter()
-            .rposition(|message| matches!(message.role, ChatRole::Assistant))
-            .map(|index| index + usize::from(prepend_default_system));
+            .rposition(|message| matches!(message.role, ChatRole::Assistant));
 
-        let mut prompt_index = 0usize;
-        if prepend_default_system {
-            self.append_prompt_message(
-                &mut ids,
-                prompt_index,
-                &ChatRole::System,
-                "You are a helpful assistant.",
-                last_assistant_index,
-            )?;
-            prompt_index += 1;
-        }
-
-        for message in messages {
+        for (prompt_index, message) in messages.iter().enumerate() {
             self.append_prompt_message(
                 &mut ids,
                 prompt_index,
@@ -1140,7 +781,6 @@ impl Lfm2ChatModel {
                 message.content.as_str(),
                 last_assistant_index,
             )?;
-            prompt_index += 1;
         }
 
         ids.push(self.tokenizer.specials.im_start);
@@ -1180,49 +820,6 @@ impl Lfm2ChatModel {
         Ok(())
     }
 
-    fn build_aggressive_single_turn_prompt(&self, content: &str) -> Result<Vec<u32>> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Err(Error::InvalidInput(
-                "Chat request must include at least one tokenizable message".to_string(),
-            ));
-        }
-
-        // Aggressive TTFT mode intentionally uses a leaner single-turn prompt to
-        // reduce prefill token count for common benchmark traffic.
-        let mut ids = self.tokenizer.encode_text(trimmed)?;
-        ids.extend_from_slice(&self.prompt_scaffold.newline);
-        ids.push(self.tokenizer.specials.im_start);
-        ids.extend_from_slice(&self.prompt_scaffold.assistant_header);
-        Ok(ids)
-    }
-
-    fn prefill_prompt(
-        &self,
-        model: &QuantizedLfm2Backbone,
-        prompt_ids: &[u32],
-        exec: Lfm2PrefillExecution,
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-    ) -> Result<(Tensor, usize, usize)> {
-        if prompt_ids.is_empty() {
-            return Err(Error::InvalidInput(
-                "LFM2 chat prompt must include at least one token".to_string(),
-            ));
-        }
-
-        match exec {
-            Lfm2PrefillExecution::Full => {
-                record_prefill_sequence_span(prompt_ids.len());
-                let input_ids =
-                    Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device.device)?;
-                let logits = model
-                    .forward_tokens_physical(&input_ids, 0, cache, shortconv)
-                    .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
-                Ok((logits, prompt_ids.len(), 1))
-            }
-        }
-    }
 }
 
 impl InferenceStateContractProvider for Lfm2ChatModel {
@@ -1294,35 +891,6 @@ fn argmax_batch(logits: &Tensor) -> Result<Vec<u32>> {
         .map_err(Error::from)
 }
 
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
-        2 => {
-            let (batch, _vocab) = logits.dims2()?;
-            if batch != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected batched logits for argmax: expected batch=1, got {batch}"
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected logits rank for argmax: {rank}"
-            )));
-        }
-    };
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
-}
-
 fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
     if let Some((_reasoning, tail)) = input.rsplit_once("</think>") {
         Cow::Owned(tail.trim().to_string())
@@ -1360,27 +928,19 @@ fn has_token_repetition_loop(ids: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_token_repetition_loop, parse_lfm2_default_system_policy, parse_lfm2_prefill_mode,
-        parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy, should_check_repetition_loop,
-        should_prepend_default_system, should_use_aggressive_single_turn_prompt,
-        strip_past_assistant_thinking, Lfm2DefaultSystemPolicy, Lfm2PrefillConfig,
-        Lfm2PrefillExecution, Lfm2PrefillMode, Lfm2PromptStylePolicy,
+        has_token_repetition_loop, should_check_repetition_loop, strip_past_assistant_thinking,
     };
-    use crate::models::shared::chat::{ChatMessage, ChatRole};
 
     #[test]
-    fn lfm2_packed_greedy_tokens_match_scalar_rows_including_ties() {
-        use candle_core::{Device, IndexOp, Tensor};
+    fn lfm2_packed_greedy_tokens_pick_the_first_maximum_per_row() {
+        use candle_core::{Device, Tensor};
         let logits = Tensor::from_vec(
             vec![1f32, 4., 2., 4., -3., -2., -1., -4., 9., 2., 1., 0.],
             (3, 4),
             &Device::Cpu,
         )
         .unwrap();
-        let expected = (0..3)
-            .map(|row| super::argmax(&logits.i(row).unwrap()).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(super::argmax_batch(&logits).unwrap(), expected);
+        assert_eq!(super::argmax_batch(&logits).unwrap(), vec![1, 2, 0]);
         assert_eq!(
             super::argmax_batch(&logits.narrow(0, 1, 1).unwrap()).unwrap(),
             vec![2]
@@ -1437,156 +997,6 @@ mod tests {
         assert!(should_check_repetition_loop(256));
         assert!(!should_check_repetition_loop(257));
         assert!(should_check_repetition_loop(272));
-    }
-
-    #[test]
-    fn parse_prefill_mode_defaults_to_auto_for_unknown_values() {
-        assert_eq!(parse_lfm2_prefill_mode(None), Lfm2PrefillMode::Auto);
-        assert_eq!(
-            parse_lfm2_prefill_mode(Some("unsupported")),
-            Lfm2PrefillMode::Auto
-        );
-        assert_eq!(parse_lfm2_prefill_mode(Some("FULL")), Lfm2PrefillMode::Full);
-        assert_eq!(
-            parse_lfm2_prefill_mode(Some("token_mode")),
-            Lfm2PrefillMode::Token
-        );
-    }
-
-    #[test]
-    fn parse_prefill_threshold_defaults_when_missing_or_invalid() {
-        assert_eq!(
-            parse_lfm2_prefill_threshold(None),
-            Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD
-        );
-        assert_eq!(
-            parse_lfm2_prefill_threshold(Some("0")),
-            Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD
-        );
-        assert_eq!(parse_lfm2_prefill_threshold(Some("96")), 96);
-    }
-
-    #[test]
-    fn prefill_policy_forces_request_isolated_full_passes() {
-        let config = Lfm2PrefillConfig {
-            mode: Lfm2PrefillMode::Auto,
-            token_prompt_threshold: 64,
-        };
-        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Full);
-        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Full);
-        assert_eq!(config.resolve(65), Lfm2PrefillExecution::Full);
-
-        let explicitly_unsafe = Lfm2PrefillConfig {
-            mode: Lfm2PrefillMode::Token,
-            token_prompt_threshold: usize::MAX,
-        };
-        assert_eq!(explicitly_unsafe.resolve(1), Lfm2PrefillExecution::Full);
-    }
-
-    #[test]
-    fn parse_default_system_policy_defaults_to_auto_for_unknown_values() {
-        assert_eq!(
-            parse_lfm2_default_system_policy(None),
-            Lfm2DefaultSystemPolicy::Auto
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("unsupported")),
-            Lfm2DefaultSystemPolicy::Auto
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("always")),
-            Lfm2DefaultSystemPolicy::Always
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("never")),
-            Lfm2DefaultSystemPolicy::Never
-        );
-    }
-
-    #[test]
-    fn auto_default_system_policy_preserves_instructions_across_turns() {
-        let single_turn = vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hello".to_string(),
-        }];
-        assert!(!should_prepend_default_system(
-            &single_turn,
-            Lfm2DefaultSystemPolicy::Auto
-        ));
-
-        let multi_turn = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: "hi".to_string(),
-            },
-        ];
-        assert!(!should_prepend_default_system(
-            &multi_turn,
-            Lfm2DefaultSystemPolicy::Auto
-        ));
-    }
-
-    #[test]
-    fn parse_prompt_style_policy_defaults_to_standard_for_unknown_values() {
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(None),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("unsupported")),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("standard")),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("aggressive")),
-            Lfm2PromptStylePolicy::Aggressive
-        );
-    }
-
-    #[test]
-    fn aggressive_single_turn_prompt_only_applies_to_single_user_turns() {
-        let single_user_turn = vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hello".to_string(),
-        }];
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Standard
-        ));
-        assert!(should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            true,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
-
-        let multi_turn = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: "hi".to_string(),
-            },
-        ];
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &multi_turn,
-            false,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
     }
 }
 

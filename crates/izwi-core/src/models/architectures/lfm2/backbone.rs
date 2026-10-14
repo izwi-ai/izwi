@@ -14,7 +14,7 @@ use crate::backends::state::{
     InvocationRingDepthwiseConvTransaction, PhysicalStateSequenceId, PhysicalStateTransactionId,
     StateComponentValue, TensorStateArena,
 };
-use crate::engine::{InvocationTensorLease, StageDescriptor};
+use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_rope_pair_bshd,
@@ -34,7 +34,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm2BackboneConfig;
 use super::physical::LFM2_SHORTCONV_STATE_DOMAIN;
-use super::physical::{lfm2_physical_state_spec, Lfm2PhysicalStateSpec, Lfm2StateLayout};
+use super::physical::Lfm2StateLayout;
 
 #[derive(Clone)]
 pub(crate) struct Lfm2ShortConvRuntimeState {
@@ -1348,13 +1348,6 @@ impl QuantizedLfm2Backbone {
 
     pub fn hidden_size(&self) -> usize {
         self.cfg.embedding_length
-    }
-
-    pub(crate) fn physical_state_spec(
-        &self,
-        stage_graphs: &[&[StageDescriptor]],
-    ) -> Result<Lfm2PhysicalStateSpec> {
-        lfm2_physical_state_spec(&self.cfg, stage_graphs)
     }
 
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
