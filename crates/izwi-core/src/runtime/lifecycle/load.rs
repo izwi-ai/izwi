@@ -6756,6 +6756,41 @@ mod tests {
         Ok(runtime.logical_token_reach())
     }
 
+    /// A2: portable chat arenas are fully resident from load, so fitting the
+    /// model's whole advertised context pinned gigabytes for an idle model.
+    /// The automatic fit is capped; a zero cap restores the full context.
+    #[test]
+    fn portable_auto_chat_context_is_capped() -> crate::error::Result<()> {
+        for (cap, expected) in [(4_096_usize, 4_096_u64), (0, 16_384)] {
+            let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+                Arc::new(ObservedUnifiedProvider {
+                    capacity: 64 * GIB,
+                    available: 64 * GIB,
+                    observed: 0,
+                }),
+            ));
+            let mut config = crate::engine::EngineCoreConfig {
+                backend: BackendKind::Cpu,
+                max_retained_sequences: 1,
+                max_staged_transactions: 1,
+                portable_auto_context_cap_tokens: cap,
+                ..Default::default()
+            };
+            config.portable_context_auto = true;
+            let mut core =
+                crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+            let runtime = core
+                .load_managed_model_cache(
+                    ModelInstanceId::new(4_102),
+                    &crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract()),
+                    Some(16_384),
+                )?
+                .expect("managed runtime");
+            assert_eq!(runtime.logical_token_reach(), expected, "cap {cap}");
+        }
+        Ok(())
+    }
+
     /// R-1: Qwen3-TTS retained state collapsed to one 64-token page on
     /// Metal, cutting every CustomVoice request at 54 frames and refusing
     /// every clone. The fit must reach every request's prompt plus its

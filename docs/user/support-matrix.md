@@ -261,8 +261,14 @@ pass its release lane.
 ### CUDA context policy
 
 CUDA uses the native context reported by the loaded chat checkpoint. CPU and
-Metal retain the configured sequence limit (4,096 tokens by default). The
-current native CUDA ceilings are:
+Metal allocate the chat KV arena in full when the model loads, so without an
+explicit `max_sequence_length` they fit the checkpoint's context to the memory
+budget and cap it at 32,768 tokens; an idle model therefore no longer holds its
+whole advertised context in unified memory. Set `max_sequence_length` (or
+`IZWI_MAX_SEQUENCE_LENGTH`) to choose a longer context that the memory budget
+can hold. Chat requests claim KV as they generate rather than reserving their
+whole output budget, so concurrent requests share one arena. The current
+native CUDA ceilings are:
 
 | Model | CUDA ceiling | Source |
 |---|---:|---|

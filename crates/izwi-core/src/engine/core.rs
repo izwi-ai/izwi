@@ -5730,6 +5730,17 @@ impl EngineCore {
                     fit.staged_transaction_rows,
                 )
             } else {
+                // An automatically fitted portable chat context is capped: the
+                // arena is fully resident from load, so an idle model would
+                // otherwise hold its whole advertised context in memory.
+                let cap = self.config.portable_auto_context_cap_tokens;
+                let logical_context_tokens =
+                    if self.config.portable_context_auto && backend != BackendKind::Cuda && cap > 0
+                    {
+                        logical_context_tokens.map(|tokens| tokens.min(cap))
+                    } else {
+                        logical_context_tokens
+                    };
                 (
                     self.resolve_managed_token_reach_for_contract(
                         backend,
