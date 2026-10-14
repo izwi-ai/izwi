@@ -4,7 +4,7 @@
 //! generation-safe identities, committed request tables, reservations, and the
 //! reference/pin counts that determine when an arena slot may be reused.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use thiserror::Error;
 
@@ -325,7 +325,9 @@ pub(crate) struct KvCoordinatorTableResetPlan {
 pub struct KvCacheCoordinator {
     arena: KvArenaId,
     slots: Vec<BlockSlot>,
-    free: VecDeque<u32>,
+    /// Ordered so allocation is lowest-index-first after any free/recycle
+    /// churn, which keeps growable arenas compact (`max index + 1` sizes them).
+    free: BTreeSet<u32>,
     tables: HashMap<TableKey, KvSnapshot>,
     transactions: HashMap<PlanId, Transaction>,
     terminal_transactions: TerminalTransactionHistory,
@@ -522,11 +524,14 @@ impl KvCacheCoordinator {
             if !groups_seen.insert(group_request.group) {
                 return Err(KvCoordinatorError::DuplicateGroup);
             }
-            let expected_group = request
+            // One set per group keeps membership checks O(1) per intent;
+            // scanning the snapshot per intent was O(pages^2) per step.
+            let expected_blocks: Option<HashSet<CacheBlockRef>> = request
                 .expected
                 .groups
                 .iter()
-                .find(|group| group.group == group_request.group);
+                .find(|group| group.group == group_request.group)
+                .map(|group| group.blocks.iter().copied().collect());
             for intent in &group_request.blocks {
                 has_provisional_blocks = true;
                 match *intent {
@@ -539,7 +544,10 @@ impl KvCacheCoordinator {
                         if !blocks_seen.insert(block) {
                             return Err(KvCoordinatorError::DuplicateBlock);
                         }
-                        if !expected_group.is_some_and(|group| group.blocks.contains(&block)) {
+                        if !expected_blocks
+                            .as_ref()
+                            .is_some_and(|blocks| blocks.contains(&block))
+                        {
                             return Err(KvCoordinatorError::BlockNotInSnapshot);
                         }
                         let slot = &self.slots[block.index as usize];
@@ -558,8 +566,9 @@ impl KvCacheCoordinator {
                         }
                         match *intent {
                             KvBlockIntent::Existing(_) | KvBlockIntent::Writable(_) => {
-                                if !expected_group
-                                    .is_some_and(|group| group.blocks.contains(&block))
+                                if !expected_blocks
+                                    .as_ref()
+                                    .is_some_and(|blocks| blocks.contains(&block))
                                 {
                                     return Err(KvCoordinatorError::BlockNotInSnapshot);
                                 }
@@ -589,12 +598,9 @@ impl KvCacheCoordinator {
                 }
             }
         }
-        let reusable_pages = self
-            .free
-            .iter()
-            .filter(|index| self.slots[**index as usize].generation < u32::MAX)
-            .count();
-        if fresh_count > reusable_pages {
+        // Exhausted slots retire instead of re-entering the free set, so every
+        // free page is reusable (asserted by `check_invariants`).
+        if fresh_count > self.free.len() {
             return Err(KvCoordinatorError::Capacity);
         }
         if request.target_committed_tokens > request.expected.committed_tokens
@@ -1284,11 +1290,14 @@ impl KvCacheCoordinator {
 
     /// Expensive internal consistency check intended for tests/shadow diagnostics.
     pub fn check_invariants(&self) -> KvCoordinatorResult<()> {
-        let free: HashSet<_> = self.free.iter().copied().collect();
-        if free.len() != self.free.len() {
-            return Err(KvCoordinatorError::Invariant(
-                "free list contains duplicate slots".to_string(),
-            ));
+        let free = &self.free;
+        if let Some(index) = free
+            .iter()
+            .find(|index| self.slots[**index as usize].generation == u32::MAX)
+        {
+            return Err(KvCoordinatorError::Invariant(format!(
+                "exhausted slot {index} is on the free list"
+            )));
         }
         let mut table_refs = vec![0usize; self.slots.len()];
         for snapshot in self.tables.values() {
@@ -1368,7 +1377,7 @@ impl KvCacheCoordinator {
         // Allocate the lowest currently free logical page first. CUDA arenas
         // can then materialize a compact resident prefix instead of being
         // forced to grow to the logical maximum on their first reservation.
-        let index = self.free.pop_front().expect("capacity prevalidated");
+        let index = self.free.pop_first().expect("capacity prevalidated");
         let slot = &mut self.slots[index as usize];
         slot.generation = slot
             .generation
@@ -1461,7 +1470,8 @@ impl KvCacheCoordinator {
             if slot.generation == u32::MAX {
                 slot.retired = true;
             } else {
-                self.free.push_back(index);
+                let inserted = self.free.insert(index);
+                debug_assert!(inserted, "slot {index} was already free");
             }
         }
     }
@@ -1647,6 +1657,32 @@ mod tests {
             .flat_map(|group| group.blocks.iter().map(|block| block.index))
             .collect::<Vec<_>>();
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn recycled_low_pages_are_reallocated_before_untouched_high_pages() {
+        // A FIFO free list would hand out 3, 4, 5 here (recycled pages queue
+        // behind the never-used ones) and force growable arenas past their
+        // live high-water mark.
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 8);
+        let initial = coordinator
+            .register_table(session("recycle", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 31, initial.clone(), 3, 48);
+        coordinator.prepare(31).unwrap();
+        assert!(coordinator.abort(31).unwrap());
+        assert_eq!(coordinator.stats().free_pages, 8);
+
+        reserve_fresh(&mut coordinator, 32, initial, 3, 48);
+        let indices = coordinator
+            .prepare(32)
+            .unwrap()
+            .provisional_groups
+            .iter()
+            .flat_map(|group| group.blocks.iter().map(|block| block.index))
+            .collect::<Vec<_>>();
+        assert_eq!(indices, vec![0, 1, 2]);
+        coordinator.check_invariants().unwrap();
     }
 
     #[test]
