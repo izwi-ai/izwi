@@ -4,8 +4,10 @@
 //! It uses a Qwen3 architecture with MRoPE (Multi-modal Rotary Position Embeddings)
 //! to handle both text and audio modalities.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{ops, Embedding, Linear, Module, RmsNorm, VarBuilder};
 
@@ -516,16 +518,29 @@ enum TextEmbeddingTable {
 }
 
 impl TextEmbeddingTable {
-    fn load(vocab: usize, hidden: usize, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+    /// With `f16`, a float table is read straight from `checkpoint` at F16
+    /// ([`read_f16_embedding`]); an MLX-quantized one is dequantized through
+    /// `vb` at F32 and converted.
+    fn load(
+        vocab: usize,
+        hidden: usize,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+        checkpoint: &Path,
+    ) -> Result<Self> {
         let Some(device) = f16 else {
             return Ok(Self::Dense(mlx::load_embedding(vocab, hidden, vb)?));
         };
+        let name = format!("{}.weight", vb.prefix());
+        if let Some(read) = read_f16_embedding(checkpoint, &name, vocab, hidden)? {
+            return Ok(Self::F16(read.table.to_device(device)?, read.relative_l2));
+        }
         let host = mlx::load_embedding(vocab, hidden, projection_var_builder(&vb, f16))?;
         let table = host.embeddings().to_dtype(DType::F32)?;
         let f16_table = table.to_dtype(DType::F16)?;
-        // Check the conversion against the original F32 rows before they are
-        // dropped (every 257th row: unstructured, cheap).
-        let rows = (0..vocab as u32).step_by(257).collect::<Vec<_>>();
+        // Check the conversion against the dequantized F32 rows before they
+        // are dropped.
+        let rows = sampled_embedding_rows(vocab);
         let rows = Tensor::from_vec(rows.clone(), rows.len(), &Device::Cpu)?;
         let original = table
             .index_select(&rows, 0)?
@@ -559,6 +574,102 @@ impl TextEmbeddingTable {
     }
 }
 
+/// The rows a weight-only F16 embedding conversion is checked on: every
+/// 257th (unstructured, cheap).
+fn sampled_embedding_rows(rows: usize) -> Vec<u32> {
+    (0..rows as u32).step_by(257).collect()
+}
+
+/// Whether a text embedding stored at `dtype` is read in place at F16 by
+/// [`read_f16_embedding`] (any other form is read through the builder at
+/// F32 first). The Qwen3-TTS residency plan prices the read from this.
+pub(crate) fn text_embedding_reads_in_place(dtype: DType) -> bool {
+    matches!(dtype, DType::BF16 | DType::F16 | DType::F32)
+}
+
+/// An embedding table read from its checkpoint at F16.
+pub(crate) struct F16EmbeddingRead {
+    /// The `[rows, cols]` F16 table, on the host.
+    pub(crate) table: Tensor,
+    /// The conversion's relative L2 against the stored values on sampled
+    /// rows (infinite when not finite).
+    pub(crate) relative_l2: f64,
+    /// Host memory the read allocated: the F16 table's buffer.
+    pub(crate) host_bytes: u64,
+}
+
+/// Reads `name` (`[rows, cols]`) from the memory-mapped safetensors
+/// `checkpoint` straight into an F16 host table: each stored value is
+/// decoded and rounded to F16 in place, so the read allocates the F16 table
+/// and nothing else. Reading it through a builder copied the stored table
+/// and widened it to F32 first: a 1.87 GB host peak for 1.7B's 151936 x
+/// 2048 embedding against the F16 table's 0.62 GB, which kept 1.7B from
+/// loading on a 16 GB Mac.
+///
+/// The conversion is checked on [`sampled_embedding_rows`] of the finished
+/// table against F32 references decoded from the stored bytes (exact for
+/// BF16, F16 and F32), one row at a time. `Ok(None)` when the tensor is not
+/// stored as a float the read decodes ([`text_embedding_reads_in_place`]).
+pub(crate) fn read_f16_embedding(
+    checkpoint: &Path,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<Option<F16EmbeddingRead>> {
+    // SAFETY: as every safetensors load here, the checkpoint must not be
+    // modified while mapped.
+    let mapped = unsafe { MmapedSafetensors::new(checkpoint)? };
+    let view = mapped.get(name)?;
+    let dtype = match DType::try_from(view.dtype()) {
+        Ok(dtype) if text_embedding_reads_in_place(dtype) => dtype,
+        _ => return Ok(None),
+    };
+    let width = dtype.size_in_bytes();
+    let data = view.data();
+    if view.shape() != [rows, cols] || data.len() != rows * cols * width {
+        return Err(Error::ModelLoadError(format!(
+            "{name}: expected [{rows}, {cols}] of {dtype:?}, the checkpoint holds {:?} ({} bytes)",
+            view.shape(),
+            data.len()
+        )));
+    }
+    let decode: fn(&[u8]) -> f32 = match dtype {
+        DType::BF16 => |b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32(),
+        DType::F16 => |b| half::f16::from_le_bytes([b[0], b[1]]).to_f32(),
+        _ => |b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+    };
+    let mut values = Vec::with_capacity(rows * cols);
+    values.extend(
+        data.chunks_exact(width)
+            .map(|bytes| half::f16::from_f32(decode(bytes))),
+    );
+    let host_bytes = (values.capacity() * std::mem::size_of::<half::f16>()) as u64;
+    let table = Tensor::from_vec(values, (rows, cols), &Device::Cpu)?;
+
+    let (mut error, mut norm) = (0f64, 0f64);
+    for row in sampled_embedding_rows(rows) {
+        let row = row as usize;
+        let converted = table.i(row)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let stored = &data[row * cols * width..(row + 1) * cols * width];
+        for (&value, bytes) in converted.iter().zip(stored.chunks_exact(width)) {
+            let reference = f64::from(decode(bytes));
+            let diff = f64::from(value) - reference;
+            error += diff * diff;
+            norm += reference * reference;
+        }
+    }
+    let relative = (error / norm.max(f64::MIN_POSITIVE)).sqrt();
+    Ok(Some(F16EmbeddingRead {
+        table,
+        relative_l2: if relative.is_finite() {
+            relative
+        } else {
+            f64::INFINITY
+        },
+        host_bytes,
+    }))
+}
+
 /// Qwen3-TTS Talker model
 pub struct TalkerModel {
     text_embedding: TextEmbeddingTable,
@@ -580,15 +691,21 @@ pub struct TalkerPhysicalBatchOutput {
 }
 
 impl TalkerModel {
-    /// Load the talker model from VarBuilder
     /// Load the talker. With `f16`, its projections and text embedding are
-    /// stored in F16 on that device (activations stay F32).
-    pub fn load(cfg: TalkerConfig, vb: VarBuilder, f16: Option<&Device>) -> Result<Self> {
+    /// stored in F16 on that device (activations stay F32); the embedding
+    /// is read from `checkpoint`, the safetensors file `vb` reads.
+    pub fn load(
+        cfg: TalkerConfig,
+        vb: VarBuilder,
+        f16: Option<&Device>,
+        checkpoint: &Path,
+    ) -> Result<Self> {
         let text_embedding = TextEmbeddingTable::load(
             cfg.text_vocab_size,
             cfg.text_hidden_size,
             vb.pp("model.text_embedding"),
             f16,
+            checkpoint,
         )?;
         let text_projection = TextProjection::load(
             cfg.text_hidden_size,
@@ -1600,5 +1717,83 @@ pub(crate) mod tests {
         assert_eq!((cache_a.context_len(), cache_b.context_len()), (2, 2));
         assert!(cache_a.take_completed_writes().is_empty());
         assert!(cache_b.take_completed_writes().is_empty());
+    }
+
+    /// The weight-only F16 text embedding is read in place from each float
+    /// form: rounded exactly as a Candle F16 cast of the stored values,
+    /// allocating only the F16 table, and checked on sampled rows against
+    /// the stored values (an F16 overflow on a sampled row is infinite).
+    /// Other forms are left to the builder; a wrong shape is an error.
+    #[test]
+    fn f16_embedding_reads_each_float_form_in_place() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = Device::Cpu;
+        let (rows, cols) = (300, 24);
+        let values = xorshift_tensor(&[rows, cols], 0x5EED, 0.4, &device).unwrap();
+        let mut overflow = values.to_vec2::<f32>().unwrap();
+        overflow[257][3] = 1e6;
+        let mut tensors = HashMap::new();
+        for (name, dtype) in [
+            ("bf16", DType::BF16),
+            ("f16", DType::F16),
+            ("f32", DType::F32),
+        ] {
+            tensors.insert(name.to_string(), values.to_dtype(dtype).unwrap());
+        }
+        tensors.insert("overflow".into(), Tensor::new(overflow, &device).unwrap());
+        tensors.insert("u8".into(), values.to_dtype(DType::U8).unwrap());
+        let dir =
+            std::env::temp_dir().join(format!("izwi-qwen3-tts-embedding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+
+        for name in ["bf16", "f16", "f32"] {
+            let read = read_f16_embedding(&path, name, rows, cols)
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.table.dtype(), DType::F16, "{name}");
+            assert_eq!(read.table.dims(), [rows, cols], "{name}");
+            assert_eq!(read.host_bytes, (rows * cols * 2) as u64, "{name}");
+            let expected = tensors[name]
+                .to_dtype(DType::F32)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = read
+                .table
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(got, expected, "{name}");
+            assert!(read.relative_l2 < 1e-3, "{name}: {}", read.relative_l2);
+            if name == "f32" {
+                // F32 values really are rounded, and the check sees it.
+                assert!(read.relative_l2 > 0.0);
+            } else {
+                // A BF16 or F16 value in F16 range survives exactly but
+                // for the rare subnormal.
+                assert!(read.relative_l2 < 1e-5, "{name}: {}", read.relative_l2);
+            }
+        }
+        let overflow = read_f16_embedding(&path, "overflow", rows, cols)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overflow.relative_l2, f64::INFINITY);
+        assert!(read_f16_embedding(&path, "u8", rows, cols)
+            .unwrap()
+            .is_none());
+        assert!(read_f16_embedding(&path, "bf16", rows - 1, cols).is_err());
+        assert!(!text_embedding_reads_in_place(DType::U32));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -28,6 +28,9 @@ pub use predictor::{
 pub use speech_tokenizer::{
     SpeechTokenizerDecodeStats, SpeechTokenizerDecoder, SpeechTokenizerStream,
 };
+#[cfg(test)]
+pub(crate) use talker::read_f16_embedding as read_qwen3_tts_f16_text_embedding;
+pub(crate) use talker::text_embedding_reads_in_place as qwen3_tts_text_embedding_reads_in_place;
 pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
@@ -1539,14 +1542,21 @@ fn record_qwen3_tts_codec_stream_frames(frames: usize) {
 
 /// The talker and code predictor, their projections and the text embedding
 /// stored in F16 on `f16` when given (weight-only F16), else dense.
+/// `checkpoint` is the safetensors file the builders read.
 fn load_qwen3_tts_transformers(
     talker_config: &config::TalkerConfig,
     code_predictor_config: &config::CodePredictorConfig,
     talker_vb: &VarBuilder,
     code_predictor_vb: &VarBuilder,
     f16: Option<&Device>,
+    checkpoint: &Path,
 ) -> Result<(TalkerModel, CodePredictor)> {
-    let talker = TalkerModel::load(talker_config.clone(), talker_vb.pp("talker"), f16)?;
+    let talker = TalkerModel::load(
+        talker_config.clone(),
+        talker_vb.pp("talker"),
+        f16,
+        checkpoint,
+    )?;
     let code_predictor = CodePredictor::load(
         code_predictor_config.clone(),
         code_predictor_vb.pp("talker.code_predictor"),
@@ -2013,6 +2023,7 @@ impl Qwen3TtsModel {
                     &talker_vb,
                     &code_predictor_vb,
                     f16,
+                    &weights_path,
                 )
             },
             |(talker, code_predictor)| {
@@ -5881,19 +5892,29 @@ pub(crate) mod tests {
         let device = candle_core::Device::Cpu;
         let talker_cfg = talker::tests::tiny_talker(&device).config().clone();
         let predictor_cfg = talker_cfg.code_predictor_config.clone();
-        let vb_for = |gate_scale| {
-            candle_nn::VarBuilder::from_tensors(
-                tiny_transformer_tensors(&talker_cfg, gate_scale),
-                DType::F32,
-                &device,
+        // The checkpoint is a file: the F16 text embedding is read from it
+        // in place.
+        let dir = std::env::temp_dir().join(format!("izwi-qwen3-tts-f16-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vb_for = |gate_scale: f32| {
+            let path = dir.join(format!("model-{gate_scale}.safetensors"));
+            candle_core::safetensors::save(
+                &tiny_transformer_tensors(&talker_cfg, gate_scale),
+                &path,
             )
+            .unwrap();
+            let vb = unsafe {
+                candle_nn::VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &device)
+            }
+            .unwrap();
+            (vb, path)
         };
-        let load = |vb: &candle_nn::VarBuilder, f16| {
-            load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, vb, vb, f16).unwrap()
+        let load = |vb: &candle_nn::VarBuilder, f16, path: &Path| {
+            load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, vb, vb, f16, path).unwrap()
         };
-        let vb = vb_for(0.4);
-        let (dense_talker, dense_predictor) = load(&vb, None);
-        let (half_talker, half_predictor) = load(&vb, Some(&device));
+        let (vb, path) = vb_for(0.4);
+        let (dense_talker, dense_predictor) = load(&vb, None, &path);
+        let (half_talker, half_predictor) = load(&vb, Some(&device), &path);
         let dense =
             qwen3_tts_numeric_probe(&dense_talker, &dense_predictor, DType::F32, DType::F32)
                 .unwrap();
@@ -5929,12 +5950,14 @@ pub(crate) mod tests {
             reason: "test tier".into(),
         };
         for (gate_scale, expect_f16) in [(0.4f32, true), (1e6, false)] {
-            let vb = vb_for(gate_scale);
+            let (vb, path) = vb_for(gate_scale);
             let (_, precision) = load_weight_only_f16(
                 "tiny Qwen3-TTS",
                 &selection,
                 &device,
-                |f16| load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, &vb, &vb, f16),
+                |f16| {
+                    load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, &vb, &vb, f16, &path)
+                },
                 |(talker, predictor)| {
                     qwen3_tts_weight_only_self_check(
                         talker,
@@ -5953,6 +5976,7 @@ pub(crate) mod tests {
                 precision.reason
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

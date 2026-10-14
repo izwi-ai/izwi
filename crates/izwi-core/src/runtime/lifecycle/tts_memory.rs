@@ -29,7 +29,9 @@ use crate::models::architectures::kokoro::{
     KOKORO_MODEL_MEMO_MAX_BYTES,
 };
 use crate::models::architectures::qwen3::core::qwen3_dense_projection_fusion_enabled;
-use crate::models::architectures::qwen3::tts::{qwen3_tts_load_layout, Qwen3TtsLoadLayout};
+use crate::models::architectures::qwen3::tts::{
+    qwen3_tts_load_layout, qwen3_tts_text_embedding_reads_in_place, Qwen3TtsLoadLayout,
+};
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_weight_dtype;
 use crate::models::architectures::voxtral::tts::model::{VoxtralTtsDTypePlan, VoxtralTtsModel};
 
@@ -143,9 +145,16 @@ fn price_qwen3_tts(
         let name = tensor.name.as_str();
         if layout.weight_only_f16 && qwen3_tts_weight_only_f16_tensor(name) {
             // Read on the host, converted there and uploaded once at F16
-            // (biases stay F32); the text embedding passes through F32.
+            // (biases stay F32). A float text embedding is converted
+            // straight from the memory map; a quantized one passes through
+            // F32.
             if name == QWEN3_TTS_TEXT_EMBEDDING {
-                ledger.host_converted_through(tensor, Some(DType::F32), DType::F16)?;
+                if matches!(tensor.dtype, StoredDType::Dense(dtype) if qwen3_tts_text_embedding_reads_in_place(dtype))
+                {
+                    ledger.host_converted_in_place(tensor, DType::F16)?;
+                } else {
+                    ledger.host_converted_through(tensor, Some(DType::F32), DType::F16)?;
+                }
             } else if name.ends_with(".bias") {
                 ledger.host_converted(tensor, DType::F32)?;
             } else {
@@ -432,16 +441,48 @@ mod tests {
     }
 
     /// Weight-only F16 on Metal prices what the staged loader holds: the F16
-    /// residency, plus the one host transient above it, the text embedding
-    /// read at F32 and converted to F16 (every other tensor is converted
-    /// and uploaded one at a time at its exact size). The final Metal run
-    /// measured 0.6B Base's whole process footprint peaking at 3,945 MiB
-    /// over this load; the price must cover it without the dense reload
-    /// (6.21 GB) a failed self-check falls back to, which refused 1.7B
-    /// CustomVoice at 9.99 GB.
+    /// residency, plus the one host transient above it, the text embedding's
+    /// F16 table, read in place from the BF16 checkpoint (every other tensor
+    /// is converted and uploaded one at a time at its exact size). The
+    /// transient is tied to the loader: `read_f16_embedding` on a BF16 file
+    /// reports what it allocated per element. The final Metal run measured
+    /// 0.6B Base's whole process footprint peaking at 3,945 MiB over this
+    /// load when the embedding was still read through F32, which held 4
+    /// more bytes per element (1.24 GB); the price plus those bytes must
+    /// cover it, without the dense reload (6.21 GB) a failed self-check
+    /// falls back to, which refused 1.7B CustomVoice at 9.99 GB.
     #[test]
     fn qwen_weight_only_f16_prices_the_staged_f16_load() {
         let _env = env_lock();
+        let host_bytes_per_element = {
+            let (rows, cols) = (300, 16);
+            let dir = std::env::temp_dir().join(format!(
+                "izwi-qwen3-tts-embedding-price-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("model.safetensors");
+            let table =
+                candle_core::Tensor::ones((rows, cols), DType::BF16, &candle_core::Device::Cpu)
+                    .unwrap();
+            candle_core::safetensors::save(
+                &std::collections::HashMap::from([(QWEN3_TTS_TEXT_EMBEDDING.to_string(), table)]),
+                &path,
+            )
+            .unwrap();
+            let read = crate::models::architectures::qwen3::tts::read_qwen3_tts_f16_text_embedding(
+                &path,
+                QWEN3_TTS_TEXT_EMBEDDING,
+                rows,
+                cols,
+            )
+            .unwrap()
+            .unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            let elements = (rows * cols) as u64;
+            assert_eq!(read.host_bytes % elements, 0);
+            read.host_bytes / elements
+        };
         for (file, files, voice_clone, measured_peak) in [
             (
                 "0.6B Base",
@@ -486,18 +527,18 @@ mod tests {
                 .find(|tensor| tensor.name == QWEN3_TTS_TEXT_EMBEDDING)
                 .unwrap()
                 .elements();
-            let f32_and_f16 = embedding * (4 + 2);
             assert_eq!(
                 f16.load_peak_bytes - f16.resident_bytes,
-                f32_and_f16,
+                embedding * host_bytes_per_element,
                 "{file}"
             );
             assert!(f16.load_peak_bytes < dense.load_peak_bytes, "{file}");
             if let Some(measured) = measured_peak {
-                assert!(f16.load_peak_bytes >= measured, "{file}");
+                assert!(f16.load_peak_bytes + embedding * 4 >= measured, "{file}");
             }
         }
-        // 1.7B CustomVoice now asks for 6.38 GB, not 9.99.
+        // 1.7B CustomVoice now asks for 5.13 GB, not 9.99 (dense reload
+        // priced) or 6.38 (embedding read through F32).
         let files = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
         let layout = qwen_layout(false, BackendKind::Metal);
         let peak = price_qwen3_tts(&files, BackendKind::Metal, &layout)
@@ -505,7 +546,7 @@ mod tests {
             .estimate()
             .unwrap()
             .load_peak_bytes;
-        assert!(peak < 6_400_000_000, "{peak}");
+        assert!(peak <= 5_800_000_000, "{peak}");
     }
 
     /// The reference-audio components load only for voice cloning: a
@@ -607,8 +648,9 @@ mod tests {
     /// The final Metal run's 0.6B CustomVoice weight load grew the device
     /// 2,408,677,376 bytes and passes. A dense reload after a failed F16
     /// self-check, which admission no longer prices, passes only when it
-    /// fits what was authorized (0.6B's does); 1.7B's does not and fails the
-    /// load closed instead of running unpriced.
+    /// fits what was authorized; since the F16 text embedding is read in
+    /// place (no F32 transient), neither 0.6B's nor 1.7B's does, and each
+    /// fails the load closed instead of running unpriced.
     #[test]
     fn reconciliation_accepts_the_f16_load_and_fails_an_unpriced_dense_reload() {
         let _env = env_lock();
@@ -653,7 +695,7 @@ mod tests {
             reconcile(&small, small_variant, false).unwrap(),
             2_408_677_376
         );
-        assert!(reconcile(&small, small_variant, true).is_ok());
+        assert!(reconcile(&small, small_variant, true).is_err());
         assert!(reconcile(&large, large_variant, true).is_err());
     }
 

@@ -790,11 +790,11 @@ impl Ledger {
     }
 
     /// [`Self::host_converted`] for a weight the loader reads at an
-    /// `intermediate` host dtype first (Qwen3-TTS's F16 text embedding is
-    /// read at F32, then converted). The read converts the stored copy and
-    /// drops it, so the intermediate is alive with the stored copy while it
-    /// is read and with the converted form after: the larger pair, not all
-    /// three.
+    /// `intermediate` host dtype first (an MLX-quantized Qwen3-TTS text
+    /// embedding is dequantized at F32, then converted). The read converts
+    /// the stored copy and drops it, so the intermediate is alive with the
+    /// stored copy while it is read and with the converted form after: the
+    /// larger pair, not all three.
     pub(super) fn host_converted_through(
         &mut self,
         tensor: &CensusTensor,
@@ -809,6 +809,24 @@ impl Ledger {
             }
             None => sum(&[tensor.stored_bytes, bytes])?,
         };
+        self.host_staged(bytes, host)
+    }
+
+    /// [`Self::host_converted`] for a weight converted straight from its
+    /// memory map (Qwen3-TTS's float text embedding): the converted copy is
+    /// the only host allocation, the mapped checkpoint pages being file
+    /// backed.
+    pub(super) fn host_converted_in_place(
+        &mut self,
+        tensor: &CensusTensor,
+        dtype: DType,
+    ) -> Result<()> {
+        let bytes = dense_bytes(tensor.elements(), dtype)?;
+        self.host_staged(bytes, bytes)
+    }
+
+    /// A weight of `bytes` uploaded once from `host` bytes of host buffers.
+    fn host_staged(&mut self, bytes: u64, host: u64) -> Result<()> {
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {
                 logical: bytes,
