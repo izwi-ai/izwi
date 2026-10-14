@@ -490,23 +490,16 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "Failed to reconcile orphaned artifact cleanup state during startup: {err}"
         )),
     }
-    let mut preload_failures = preload_configured_models(&state).await;
-    preload_failures.extend(warmup_preloaded_asr_models(&state).await);
-    for warning in startup_warnings.iter().chain(&preload_failures) {
+    for warning in &startup_warnings {
         warn!(warning = %warning, "Startup readiness warning");
     }
     state.lifecycle.record_startup_warnings(startup_warnings);
-    state.lifecycle.record_preload_failures(preload_failures);
-    state.lifecycle.mark_ready();
-
-    info!("Runtime service initialized");
-    let batch_worker_supervisor = start_batch_runtime_worker(&state);
-    let batch_worker_drain = batch_worker_supervisor.drain_handle();
 
     // Build router
     let app = api::create_router(state.clone(), &serve_config);
 
-    // Start server
+    // Bind before preloading models: liveness answers during long loads, and
+    // readiness reports the "initializing" phase until preload finishes.
     let bind = BindConfig {
         host: serve_config.host.clone(),
         port: serve_config.port,
@@ -515,18 +508,56 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Server listening on http://{}", addr);
 
+    let preload_state = state.clone();
+    serve_local(
+        state,
+        listener,
+        app,
+        async move {
+            let mut preload_failures = preload_configured_models(&preload_state).await;
+            preload_failures.extend(warmup_preloaded_asr_models(&preload_state).await);
+            preload_failures
+        },
+        shutdown_requested(),
+    )
+    .await
+}
+
+/// Serve the local role on an already bound listener while `preload` loads
+/// the configured models. The server turns ready, and the batch worker
+/// starts, only once preload finishes; a shutdown that begins first
+/// abandons the preload.
+async fn serve_local<P, S>(
+    state: AppState,
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    preload: P,
+    shutdown_requested: S,
+) -> anyhow::Result<()>
+where
+    P: std::future::Future<Output = Vec<String>> + Send + 'static,
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    let batch_worker_drain = Arc::new(std::sync::OnceLock::new());
+    let startup = tokio::spawn(complete_local_startup(
+        state.clone(),
+        preload,
+        batch_worker_drain.clone(),
+    ));
+
     // Clone state for shutdown handler
     let shutdown_state = state.clone();
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
 
     // Spawn server with graceful shutdown
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(
+        shutdown_requested,
         shutdown_state,
         batch_worker_drain,
         shutdown_started_tx,
     ));
 
-    info!("Server ready. Press Ctrl+C to stop.");
+    info!("Server accepting connections. Press Ctrl+C to stop.");
     let http_shutdown_grace = http_shutdown_grace_timeout();
     let server_result = await_http_server_shutdown(
         async move { server.await },
@@ -540,8 +571,17 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "HTTP graceful shutdown timed out; dropping remaining connections"
         );
     }
+    // A preload still running when shutdown began is abandoned; a finished
+    // startup hands over its batch worker.
+    startup.abort();
+    let batch_worker_supervisor = startup.await.ok().flatten();
     shutdown_worker_then_cleanup(
-        batch_worker_supervisor.shutdown_for_process(),
+        async move {
+            match batch_worker_supervisor {
+                Some(supervisor) => supervisor.shutdown_for_process().await,
+                None => Ok(()),
+            }
+        },
         cleanup_runtime_for_shutdown(&state),
     )
     .await?;
@@ -550,6 +590,38 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     }
 
     Ok(())
+}
+
+/// Finish local startup after the listener is bound: record preload
+/// failures (they keep readiness failed), mark the server ready and start the
+/// batch worker. Nothing starts once shutdown has begun.
+async fn complete_local_startup<P>(
+    state: AppState,
+    preload: P,
+    batch_worker_drain: Arc<std::sync::OnceLock<BatchWorkerDrain>>,
+) -> Option<BatchWorkerSupervisor>
+where
+    P: std::future::Future<Output = Vec<String>>,
+{
+    let preload_failures = preload.await;
+    for warning in &preload_failures {
+        warn!(warning = %warning, "Startup readiness warning");
+    }
+    state.lifecycle.record_preload_failures(preload_failures);
+    if state.lifecycle.snapshot().draining {
+        return None;
+    }
+    state.lifecycle.mark_ready();
+    info!("Runtime service initialized");
+    let supervisor = start_batch_runtime_worker(&state);
+    let _ = batch_worker_drain.set(supervisor.drain_handle());
+    // Shutdown marks the lifecycle draining before it reads the drain slot,
+    // and this reads the lifecycle after filling it, so one side always sees
+    // the other and the worker cannot miss the drain.
+    if state.lifecycle.snapshot().draining {
+        supervisor.drain_handle().begin();
+    }
+    Some(supervisor)
 }
 
 fn validate_role_topology(role: ServerRole, topology: GatewayTopology) -> anyhow::Result<()> {
@@ -2330,12 +2402,8 @@ async fn warmup_preloaded_asr_models(state: &AppState) -> Vec<String> {
     warnings
 }
 
-/// Wait for shutdown signal and cleanup
-async fn shutdown_signal(
-    state: AppState,
-    batch_worker_drain: BatchWorkerDrain,
-    shutdown_started: oneshot::Sender<()>,
-) {
+/// Resolve on Ctrl+C, SIGTERM or the desktop owner pipe closing.
+async fn shutdown_requested() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -2366,10 +2434,24 @@ async fn shutdown_signal(
             info!("Desktop owner pipe closed, shutting down...");
         },
     }
+}
+
+/// Wait for shutdown and begin draining the server, runtime and batch worker.
+async fn shutdown_signal<S>(
+    shutdown_requested: S,
+    state: AppState,
+    batch_worker_drain: Arc<std::sync::OnceLock<BatchWorkerDrain>>,
+    shutdown_started: oneshot::Sender<()>,
+) where
+    S: std::future::Future<Output = ()>,
+{
+    shutdown_requested.await;
 
     state.lifecycle.mark_draining();
     state.runtime.begin_drain();
-    batch_worker_drain.begin();
+    if let Some(drain) = batch_worker_drain.get() {
+        drain.begin();
+    }
     let _ = shutdown_started.send(());
 
     drop(state);
@@ -2505,6 +2587,122 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    fn local_test_state() -> (AppState, ServeRuntimeConfig, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let models_dir = temp_dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+        let serve_config = ServeRuntimeConfig {
+            backend: BackendPreference::Cpu,
+            ui_enabled: false,
+            models_dir,
+            ..ServeRuntimeConfig::default()
+        };
+        let runtime = RuntimeService::new(serve_config.engine_config()).expect("runtime");
+        let state = AppState::new(runtime, &serve_config).expect("state");
+        std::env::remove_var("IZWI_DB_PATH");
+        std::env::remove_var("IZWI_MEDIA_DIR");
+        (state, serve_config, temp_dir)
+    }
+
+    async fn lifecycle_ready(client: &reqwest::Client, base: &str) -> (u16, bool) {
+        let response = client
+            .get(format!("{base}/readyz"))
+            .send()
+            .await
+            .expect("readiness answers");
+        let status = response.status().as_u16();
+        let body: serde_json::Value = response.json().await.expect("readiness JSON");
+        let lifecycle_ready = body["checks"]
+            .as_array()
+            .expect("readiness checks")
+            .iter()
+            .any(|check| check["name"] == "lifecycle_ready" && check["ok"] == true);
+        (status, lifecycle_ready)
+    }
+
+    #[tokio::test]
+    async fn local_server_answers_liveness_while_models_preload() {
+        let _env = env_lock();
+        let (state, serve_config, _temp_dir) = local_test_state();
+        let app = api::create_router(state.clone(), &serve_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let (release_preload, preload_released) = oneshot::channel::<()>();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve_local(
+            state.clone(),
+            listener,
+            app,
+            async move {
+                let _ = preload_released.await;
+                Vec::new()
+            },
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+
+        let live = client
+            .get(format!("{base}/livez"))
+            .send()
+            .await
+            .expect("liveness must answer while models preload");
+        assert_eq!(live.status().as_u16(), 200);
+        assert_eq!(lifecycle_ready(&client, &base).await, (503, false));
+
+        release_preload.send(()).expect("preload is waiting");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !lifecycle_ready(&client, &base).await.1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ready once preload finishes");
+
+        stop.send(()).expect("server is running");
+        tokio::time::timeout(Duration::from_secs(60), server)
+            .await
+            .expect("server stops")
+            .expect("server task")
+            .expect("server result");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_preload_abandons_startup_without_becoming_ready() {
+        let _env = env_lock();
+        let (state, serve_config, _temp_dir) = local_test_state();
+        let app = api::create_router(state.clone(), &serve_config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            serve_local(
+                state.clone(),
+                listener,
+                app,
+                std::future::pending::<Vec<String>>(),
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("shutdown does not wait for preload")
+        .expect("server result");
+        let lifecycle = state.lifecycle.snapshot();
+        assert!(!lifecycle.ready);
+        assert!(lifecycle.draining);
+        assert!(!state.batch_worker_health.snapshot().running);
+    }
 
     #[test]
     fn jittered_poll_interval_is_deterministic_and_bounded() {
