@@ -48,6 +48,60 @@ pub struct BatchRuntimeStore {
     test_pcm_replay_entry_limit: Option<u64>,
     #[cfg(test)]
     test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
+    #[cfg(test)]
+    test_faults: Option<Arc<StoreFaults>>,
+}
+
+/// Store calls a test can make fail transiently, as a dropped connection or
+/// pool-acquire timeout would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum StoreFaultPoint {
+    WorkerHeartbeat,
+    RenewStageLease,
+    StageLeaseState,
+    CompleteStage,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct StoreFaults {
+    /// Per point: calls still let through, then calls still failed.
+    armed: std::sync::Mutex<std::collections::HashMap<StoreFaultPoint, (u32, u32)>>,
+}
+
+#[cfg(test)]
+impl StoreFaults {
+    /// Let the next `skip` calls through, then fail the `fail` calls after.
+    pub(crate) fn arm(&self, point: StoreFaultPoint, skip: u32, fail: u32) {
+        self.armed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(point, (skip, fail));
+    }
+
+    pub(crate) fn pending_failures(&self, point: StoreFaultPoint) -> u32 {
+        self.armed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&point)
+            .map_or(0, |(_, fail)| *fail)
+    }
+
+    fn trip(&self, point: StoreFaultPoint) -> bool {
+        let mut armed = self.armed.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some((skip, fail)) = armed.get_mut(&point) else {
+            return false;
+        };
+        if *skip > 0 {
+            *skip -= 1;
+            return false;
+        }
+        if *fail > 0 {
+            *fail -= 1;
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -752,6 +806,8 @@ impl BatchRuntimeStore {
             test_pcm_replay_entry_limit: None,
             #[cfg(test)]
             test_durable_tts_acceptance_failpoint: None,
+            #[cfg(test)]
+            test_faults: None,
         }
     }
 
@@ -794,6 +850,25 @@ impl BatchRuntimeStore {
         failpoint: Option<DurableTtsAcceptanceFailpoint>,
     ) {
         self.test_durable_tts_acceptance_failpoint = failpoint;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_faults_for_test(&mut self, faults: Arc<StoreFaults>) {
+        self.test_faults = Some(faults);
+    }
+
+    fn inject_fault(&self, point: StoreFaultPoint) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self
+            .test_faults
+            .as_ref()
+            .is_some_and(|faults| faults.trip(point))
+        {
+            bail!("Injected transient store failure at {point:?}");
+        }
+        #[cfg(not(test))]
+        let _ = point;
+        Ok(())
     }
 
     pub(crate) fn now_millis(&self) -> i64 {
@@ -3707,6 +3782,7 @@ impl BatchRuntimeStore {
         output_artifact_ids: Vec<String>,
     ) -> anyhow::Result<Option<JobStage>> {
         validate_stage_output_artifact_ids(&output_artifact_ids)?;
+        self.inject_fault(StoreFaultPoint::CompleteStage)?;
         let db = self.db.connection().await?;
         let tx = db
             .begin_with_options(write_transaction_options())
@@ -3840,6 +3916,7 @@ impl BatchRuntimeStore {
         lease: &StageLease,
         lease_duration_ms: u64,
     ) -> anyhow::Result<bool> {
+        self.inject_fault(StoreFaultPoint::RenewStageLease)?;
         let db = self.db.connection().await?;
         let now = self.now_millis();
         let lease_expires_at = now.saturating_add(i64::try_from(lease_duration_ms.max(1))?);
@@ -3878,6 +3955,7 @@ impl BatchRuntimeStore {
         &self,
         lease: &StageLease,
     ) -> anyhow::Result<Option<StageLeaseState>> {
+        self.inject_fault(StoreFaultPoint::StageLeaseState)?;
         let db = self.db.connection().await?;
         let now = self.now_millis();
         let row = db
@@ -5504,6 +5582,7 @@ impl BatchRuntimeStore {
         &self,
         update: RegisteredWorkerHeartbeatUpdate,
     ) -> anyhow::Result<RuntimeWorkerHeartbeat> {
+        self.inject_fault(StoreFaultPoint::WorkerHeartbeat)?;
         let db = self.db.connection().await?;
         let now = self.now_millis();
         let queue_names = update

@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::Notify, task::JoinHandle};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Every idle slot polls every `poll_interval`, and they all report the same
 /// worker row. An unchanged heartbeat is re-sent at most this often; any
@@ -36,6 +36,16 @@ use tracing::{debug, error, info};
 /// (`IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS`), so liveness stays fresh while
 /// the shared database no longer takes a commit per slot per poll.
 const HEARTBEAT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// First retry delay after a lease renewal fails with a store error. It
+/// doubles per consecutive failure, capped at the regular renewal interval.
+const LEASE_RENEWAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn lease_renewal_retry_delay(consecutive_failures: u32, renewal_interval: Duration) -> Duration {
+    LEASE_RENEWAL_RETRY_DELAY
+        .saturating_mul(1 << consecutive_failures.saturating_sub(1).min(8))
+        .min(renewal_interval)
+}
 
 /// The last heartbeat this runner committed and when.
 struct WrittenHeartbeat {
@@ -641,6 +651,9 @@ impl BatchWorkerRunner {
             return Ok(false);
         }
 
+        // The store stamps the lease after this instant, so a local deadline
+        // measured from here never outlives the durable one.
+        let mut lease_deadline = Instant::now() + self.config.lease_duration;
         let Some(claimed) = self
             .store
             .claim_next_stage_with_filter(
@@ -791,6 +804,7 @@ impl BatchWorkerRunner {
         cancellation_tick.tick().await;
         let mut awaiting_teardown = false;
         let mut ownership_lost = false;
+        let mut renewal_failures = 0_u32;
         let execution_result = loop {
             tokio::select! {
                 result = &mut execution => {
@@ -807,11 +821,14 @@ impl BatchWorkerRunner {
                     awaiting_teardown = true;
                 },
                 _ = renewal_tick.tick(), if !ownership_lost => {
+                    let renewal_started = Instant::now();
                     match self.store.renew_stage_lease(
                         &lease,
                         self.config.lease_duration.as_millis() as u64,
                     ).await {
                         Ok(true) => {
+                            lease_deadline = renewal_started + self.config.lease_duration;
+                            renewal_failures = 0;
                             if let Err(error) = self.record_heartbeat(
                                 "running",
                                 Some((claimed.job.id.clone(), claimed.stage.id.clone())),
@@ -827,15 +844,30 @@ impl BatchWorkerRunner {
                             cancellation.cancel(StageCancellationReason::LeaseLost);
                         }
                         Err(error) => {
-                            // A control-plane failure makes ownership unknown;
-                            // it does not stop the underlying executor. Request
-                            // cooperative cancellation, retain capacity, and
-                            // keep trying the exact renewal until ownership is
-                            // conclusively lost or execution resolves.
-                            awaiting_teardown = true;
-                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                            // A store error is not an answer about ownership:
+                            // the durable lease is still ours until it
+                            // expires. Retry the exact renewal with backoff,
+                            // and only request cooperative cancellation once
+                            // the local lease deadline has passed, when a
+                            // recovery sweep may already have reclaimed it.
+                            renewal_failures = renewal_failures.saturating_add(1);
+                            warn!(
+                                worker_id = %self.config.worker_id,
+                                stage_id = %lease.stage_id,
+                                consecutive_failures = renewal_failures,
+                                error = %format!("{error:#}"),
+                                "Failed to renew active batch stage lease; retrying"
+                            );
                             self.health.record_error(format!(
                                 "Failed to renew active batch stage lease: {error:#}"
+                            ));
+                            if Instant::now() >= lease_deadline {
+                                awaiting_teardown = true;
+                                cancellation.cancel(StageCancellationReason::LeaseLost);
+                            }
+                            renewal_tick.reset_after(lease_renewal_retry_delay(
+                                renewal_failures,
+                                renewal_interval,
                             ));
                         }
                     }
@@ -862,11 +894,14 @@ impl BatchWorkerRunner {
                             cancellation.cancel(StageCancellationReason::LeaseLost);
                         }
                         Err(error) => {
-                            awaiting_teardown = true;
-                            cancellation.cancel(StageCancellationReason::LeaseLost);
+                            // Unknown, not lost: the next poll retries.
                             self.health.record_error(format!(
                                 "Failed to query active batch stage lease: {error:#}"
                             ));
+                            if Instant::now() >= lease_deadline {
+                                awaiting_teardown = true;
+                                cancellation.cancel(StageCancellationReason::LeaseLost);
+                            }
                         }
                     }
                 }
@@ -1442,7 +1477,7 @@ mod tests {
     use super::*;
     use crate::{
         batch_runtime::{
-            store::{NewJobStage, NewRuntimeJob},
+            store::{NewJobStage, NewRuntimeJob, StoreFaultPoint, StoreFaults},
             types::{
                 RuntimeArtifactKind, RuntimeArtifactRole, RuntimeCancellationState, RuntimeJobKind,
                 RuntimeJobStatus, RuntimeStageStatus,
@@ -1636,6 +1671,15 @@ mod tests {
         Arc::new(BatchRuntimeStore::initialize_with_database(
             StoreDatabase::new(db_path),
         ))
+    }
+
+    fn build_store_with_faults() -> (Arc<BatchRuntimeStore>, Arc<StoreFaults>) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let db_path = root.keep().join("runtime.sqlite");
+        let faults = Arc::new(StoreFaults::default());
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+        store.set_faults_for_test(faults.clone());
+        (Arc::new(store), faults)
     }
 
     async fn create_queued_fake_stage(
@@ -2137,6 +2181,137 @@ mod tests {
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn transient_lease_store_errors_do_not_cancel_execution_before_the_lease_deadline() {
+        let (store, faults) = build_store_with_faults();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let cancellation = Arc::new(RwLock::new(None));
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.poll_interval = Duration::from_millis(10);
+        config.lease_duration = Duration::from_millis(1_500);
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(CancellationAwareBlockingExecutor {
+                started: started.clone(),
+                release: release.clone(),
+                cancellation: cancellation.clone(),
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        );
+        let run = tokio::spawn(async move { runner.run_once().await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("executor should start");
+
+        faults.arm(StoreFaultPoint::StageLeaseState, 0, 5);
+        faults.arm(StoreFaultPoint::RenewStageLease, 0, 2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while faults.pending_failures(StoreFaultPoint::StageLeaseState) > 0
+                || faults.pending_failures(StoreFaultPoint::RenewStageLease) > 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("runner should hit the injected store errors");
+        // The renewal retries land well inside the lease; give one a chance.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let signal = cancellation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .expect("context cancellation signal");
+        assert!(
+            !signal.is_cancelled(),
+            "transient store errors cancelled a live attempt: {:?}",
+            signal.reason()
+        );
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("executor should settle")
+            .expect("runner join")
+            .expect("run once"));
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Completed);
+        assert_eq!(stage.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_errors_past_the_local_lease_deadline_cancel_execution() {
+        let (store, faults) = build_store_with_faults();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let cancellation = Arc::new(RwLock::new(None));
+        let lease_duration = Duration::from_millis(600);
+        let mut config = BatchWorkerConfig::local("worker-test");
+        config.poll_interval = Duration::from_millis(10);
+        config.lease_duration = lease_duration;
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(CancellationAwareBlockingExecutor {
+                started: started.clone(),
+                release: release.clone(),
+                cancellation: cancellation.clone(),
+            })],
+            config,
+            BatchWorkerHealth::new("worker-test"),
+        );
+        faults.arm(StoreFaultPoint::RenewStageLease, 0, u32::MAX);
+        let run = tokio::spawn(async move { runner.run_once().await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("executor should start");
+        let executing_since = Instant::now();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if cancellation
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .as_ref()
+                    .is_some_and(StageCancellationSignal::is_cancelled)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("runner should give up once the local lease deadline passes");
+        assert!(executing_since.elapsed() >= lease_duration / 2);
+        let signal = cancellation
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+            .expect("context cancellation signal");
+        assert_eq!(signal.reason(), Some(StageCancellationReason::LeaseLost));
+
+        faults.arm(StoreFaultPoint::RenewStageLease, 0, 0);
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("executor should settle")
+            .expect("runner join")
+            .expect("run once"));
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Retrying);
+        assert_eq!(stage.error_code.as_deref(), Some("lease_lost"));
     }
 
     #[tokio::test]
