@@ -67,9 +67,13 @@ const NEMOTRON3_MAX_CHUNK_LEN: usize = 264;
 const NEMOTRON3_MAX_SPKCACHE_LEN: usize = 264;
 const NEMOTRON3_HEAD_D_MODEL: usize = 192;
 // The formulas below explicitly count the largest live tensors in each
-// model stage. Keep a factor of two for allocator/kernel workspaces which are
-// backend implementation details rather than Candle tensors visible here.
-const SORTFORMER_TENSOR_SAFETY_FACTOR: u64 = 2;
+// model stage. A 1.5x factor covers what they cannot see: allocator retention
+// and kernel scratch. Measured on the real checkpoints (CPU, release, one
+// diarize call that fills the cache and runs full chunks; see
+// `sortformer_workspace_measured_peak_per_profile`), the process footprint
+// grew 3.8x the live malloc bytes on v2.1 (allocator retention), and the
+// estimate is 1.1-1.25x that footprint for every v2.1 profile.
+const SORTFORMER_WORKSPACE_SAFETY_PERCENT: u128 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortformerWorkspaceEstimate {
@@ -595,7 +599,13 @@ fn workspace_estimate_for(
             },
         ) => {
             // Conv subsampling's first output is the largest
-            // duration/frequency activation of the encoder stack.
+            // duration/frequency activation of the encoder stack. The
+            // dw_striding chain holds at most three of it at once: the conv0
+            // matmul result and its NCHW copy, then that copy and its ReLU
+            // output; the depthwise stage after it holds the ReLU output plus
+            // two quarter-size tensors (per-group outputs and their `cat`).
+            // Live malloc bytes peaked at 2.02x conv0's output (+96.2 MiB at
+            // 1,520 feature frames), against the 8x counted before.
             let conv_t = u(chunk_feature_frames.div_ceil(2));
             let conv_f = u(topology.feature_bins.div_ceil(2));
             let conv_elements = conv_t * conv_f * u(conv_channels);
@@ -612,7 +622,7 @@ fn workspace_estimate_for(
                 u(transformer_heads) * u(composite_frames) * u(composite_frames);
             let transformer_elements =
                 transformer_linear * 20 + transformer_ff * 4 + transformer_scores * 4;
-            conv_elements * 8 + conformer_elements + transformer_elements + conformer_linear * 8
+            conv_elements * 3 + conformer_elements + transformer_elements + conformer_linear * 8
         }
         (
             SortformerEncoderTopology::FeatureStackingRope {
@@ -646,9 +656,9 @@ fn workspace_estimate_for(
             )))
         }
     };
-    let accelerator_bytes = (feature_elements + graph_elements)
-        * f32_bytes
-        * u(SORTFORMER_TENSOR_SAFETY_FACTOR as usize);
+    let accelerator_bytes =
+        ((feature_elements + graph_elements) * f32_bytes * SORTFORMER_WORKSPACE_SAFETY_PERCENT)
+            .div_ceil(100);
 
     let to_u64 = |bytes: u128, domain: &str| {
         u64::try_from(bytes).map_err(|_| {
@@ -5400,5 +5410,221 @@ mod tests {
         let (_, _, output_range) =
             update_streaming_state(state, &chunk_rows, &preds, 1, 1, false, cfg).unwrap();
         assert_eq!(output_range, 8..16);
+    }
+
+    /// The workspace estimate bounds the measured per-chunk peak of each
+    /// streaming profile, and over-reserves v2.1 by at most the 1.5x safety
+    /// factor. Peaks are the largest process-footprint growth of one diarize
+    /// call recorded by `sortformer_workspace_measured_peak_per_profile`
+    /// (M1 Pro, CPU, release build, 2026-10-14), for the sample counts it
+    /// uses: the speaker cache and FIFO filled, then three full chunks.
+    #[test]
+    fn sortformer_workspace_estimate_bounds_the_measured_peak() {
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
+        let previous = std::env::var(key).ok();
+        let v21 = SortformerWorkspaceTopology::v21_production();
+        for (profile, samples, measured) in [
+            ("model", 970_240_usize, 384_631_072_u64),
+            ("high_latency", 1_754_880, 750_699_096),
+            ("low_latency", 535_040, 234_455_304),
+        ] {
+            std::env::set_var(key, profile);
+            let cfg = resolve_streaming_config(
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                &SortformerModulesConfig::default(),
+                PRODUCTION_CONFORMER_D_MODEL,
+                4,
+                SortformerEncoderKind::Conformer,
+            )
+            .unwrap();
+            let estimate = workspace_estimate_for(v21, cfg, samples, false).unwrap();
+            let total = estimate.host_bytes + estimate.accelerator_bytes;
+            assert!(
+                total >= measured,
+                "v2.1 {profile}: {total} B < measured {measured} B"
+            );
+            assert!(
+                total <= measured * 3 / 2,
+                "v2.1 {profile}: {total} B is over 1.5x the measured {measured} B"
+            );
+        }
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        // Nemotron-3's peak was 51 MiB: the estimate bounds it with room to
+        // spare (its RoPE and upsampler counts are not calibrated here).
+        let nemotron3 = workspace_estimate_for(
+            SortformerWorkspaceTopology::nemotron3_production(),
+            nemotron3_workspace_streaming_config(),
+            1_351_680,
+            false,
+        )
+        .unwrap();
+        assert!(nemotron3.host_bytes + nemotron3.accelerator_bytes >= 53_624_904);
+    }
+
+    /// Live process memory for the measurement below: the physical
+    /// footprint (what the OS and Metal working set charge) and the bytes
+    /// malloc has handed out and not taken back. `purge` first returns
+    /// malloc's cached free pages, so a baseline does not hide reuse.
+    #[cfg(target_os = "macos")]
+    fn process_memory_sample(purge: bool) -> (u64, u64) {
+        #[repr(C)]
+        struct MallocStatistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // rusage_info_v0: a 16-byte UUID, then u64 fields; ri_phys_footprint
+        // is the eighth of them (index 9 counting the UUID as two words).
+        let mut info = [0_u64; 32];
+        let mut stats = MallocStatistics {
+            blocks_in_use: 0,
+            size_in_use: 0,
+            max_size_in_use: 0,
+            size_allocated: 0,
+        };
+        // SAFETY: both buffers are large enough for the structures libSystem
+        // writes (rusage_info_v0 is 96 bytes) and outlive the calls. Pressure
+        // relief only returns free pages to the OS.
+        unsafe {
+            if purge {
+                malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+            }
+            assert_eq!(
+                proc_pid_rusage(std::process::id() as i32, 0, info.as_mut_ptr().cast()),
+                0
+            );
+            malloc_zone_statistics(std::ptr::null_mut(), &mut stats);
+        }
+        (info[9], stats.size_in_use as u64)
+    }
+
+    /// Measures one diarize call per streaming profile on the real
+    /// checkpoints (CPU, which is also where Sortformer runs on the Metal
+    /// backend) and prints the peak footprint and malloc deltas next to the
+    /// loaded model's own workspace estimate. The audio fills the speaker
+    /// cache and FIFO and then runs full chunks, so the composite is at its
+    /// largest. Run with `--ignored --nocapture`; the figures calibrate
+    /// `workspace_estimate_for` (see `MEASURED_*` in the bound test).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires local Sortformer checkpoints; measurement only"]
+    fn sortformer_workspace_measured_peak_per_profile() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let models_root = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("izwi")
+                    .join("models")
+            });
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
+        let previous = std::env::var(key).ok();
+        for (variant, profile) in [
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "model"),
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "high_latency"),
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "low_latency"),
+            (ModelVariant::Nemotron3Diarization, "model"),
+        ] {
+            let model_dir = models_root.join(variant.dir_name());
+            if !model_dir.exists() {
+                eprintln!(
+                    "skipping {variant}: no checkpoint at {}",
+                    model_dir.display()
+                );
+                continue;
+            }
+            std::env::set_var(key, profile);
+            let model = SortformerDiarizerModel::load(&model_dir, variant, DeviceProfile::cpu())
+                .expect("checkpoint should load");
+            let cfg = model.model.streaming.expect("streaming profile");
+            let chunk_frames = (cfg.chunk_len + cfg.chunk_left_context + cfg.chunk_right_context)
+                * cfg.subsampling_factor;
+            let fill_frames = (cfg.spkcache_len + cfg.fifo_len) * cfg.subsampling_factor;
+            let samples = (fill_frames + 3 * chunk_frames) * PRODUCTION_HOP_LENGTH;
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            let audio: Vec<f32> = (0..samples)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / (1_u64 << 24) as f32 - 0.5) * 0.2
+                })
+                .collect();
+            let config = DiarizationConfig::default();
+            model
+                .diarize(
+                    &audio[..TARGET_SAMPLE_RATE as usize / 2],
+                    TARGET_SAMPLE_RATE,
+                    &config,
+                )
+                .expect("warm-up");
+            let estimate = model.workspace_estimate(samples).unwrap();
+            let mut peaks = Vec::new();
+            for _ in 0..3 {
+                let (footprint_base, malloc_base) = process_memory_sample(true);
+                let stop = Arc::new(AtomicBool::new(false));
+                let footprint_peak = Arc::new(AtomicU64::new(footprint_base));
+                let malloc_peak = Arc::new(AtomicU64::new(malloc_base));
+                let sampler = {
+                    let (stop, footprint_peak, malloc_peak) =
+                        (stop.clone(), footprint_peak.clone(), malloc_peak.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Acquire) {
+                            let (footprint, malloc) = process_memory_sample(false);
+                            footprint_peak.fetch_max(footprint, Ordering::AcqRel);
+                            malloc_peak.fetch_max(malloc, Ordering::AcqRel);
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        }
+                    })
+                };
+                model
+                    .diarize(&audio, TARGET_SAMPLE_RATE, &config)
+                    .expect("diarize");
+                stop.store(true, Ordering::Release);
+                sampler.join().unwrap();
+                peaks.push((
+                    footprint_peak.load(Ordering::Acquire) - footprint_base,
+                    malloc_peak.load(Ordering::Acquire) - malloc_base,
+                ));
+            }
+            let footprint = peaks.iter().map(|peak| peak.0).max().unwrap();
+            let malloc = peaks.iter().map(|peak| peak.1).max().unwrap();
+            let estimated = estimate.host_bytes + estimate.accelerator_bytes;
+            let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+            println!(
+                "{variant} {profile}: {:.1} s audio, chunk {chunk_frames} feature frames, \
+                 composite {} frames; footprint peak +{:.1} MiB, malloc peak +{:.1} MiB \
+                 (runs {peaks:?}); estimate {:.1} MiB (host {:.1} + accelerator {:.1}), \
+                 {:.2}x the larger peak",
+                samples as f64 / TARGET_SAMPLE_RATE as f64,
+                subsampled_len_3x(chunk_frames) + cfg.spkcache_len + cfg.fifo_len,
+                mib(footprint),
+                mib(malloc),
+                mib(estimated),
+                mib(estimate.host_bytes),
+                mib(estimate.accelerator_bytes),
+                estimated as f64 / footprint.max(malloc) as f64,
+            );
+        }
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 }
