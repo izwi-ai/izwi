@@ -226,7 +226,13 @@ impl Lfm2ShortConvRuntimeState {
             self.cursor,
             valid,
         );
-        if (input.device().is_cuda() || input.device().is_metal()) && output.is_none() {
+        // With fused kernels enabled, an accelerator kernel that declines is
+        // a defect, not a reason to fall back silently to many small ops.
+        // `IZWI_FUSED_KERNELS=0` asks for the device-agnostic op path.
+        if (input.device().is_cuda() || input.device().is_metal())
+            && output.is_none()
+            && crate::kernels::use_fused_kernels_for_device(input.device())
+        {
             return Err(Error::InferenceError(
                 "LFM2 accelerator ShortConv ring kernel is unavailable".into(),
             ));
@@ -2737,6 +2743,69 @@ pub(crate) mod tests {
                 .unwrap()
         );
         assert_eq!(full_ring.dtype(), DType::F32);
+    }
+
+    /// `IZWI_FUSED_KERNELS=0` falls back to the op path on an accelerator
+    /// and matches the CPU ring across a chunk boundary.
+    fn assert_unfused_ring_matches_cpu(device: &Device) {
+        let _env = crate::env_test_lock().lock().unwrap();
+        let previous = std::env::var_os("IZWI_FUSED_KERNELS");
+        std::env::set_var("IZWI_FUSED_KERNELS", "0");
+        let run = |device: &Device| {
+            let component = StateComponentId::new(1);
+            let mut state = Lfm2ShortConvRuntimeState {
+                cursor: 0,
+                capacity: 3,
+                hidden: 2,
+                components: vec![(component, None)],
+            };
+            let input = Tensor::from_vec(
+                vec![0.1f32, 0.2, 0.3, 0.4, 0.5, -0.2, 0.1, 0.6, -0.1, 0.2],
+                (1, 2, 5),
+                device,
+            )
+            .unwrap();
+            let weight =
+                Tensor::from_vec(vec![0.2f32, 0.3, 0.5, -0.1, 0.4, 0.7], (2, 3), device).unwrap();
+            let first = state
+                .apply(component, &input.narrow(2, 0, 2).unwrap(), &weight)
+                .unwrap();
+            state.advance(2).unwrap();
+            let second = state
+                .apply(component, &input.narrow(2, 2, 3).unwrap(), &weight)
+                .unwrap();
+            Tensor::cat(&[&first, &second], 2)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let result = (run(device), run(&Device::Cpu));
+        match previous {
+            Some(value) => std::env::set_var("IZWI_FUSED_KERNELS", value),
+            None => std::env::remove_var("IZWI_FUSED_KERNELS"),
+        }
+        let (accelerated, cpu) = result;
+        for (lhs, rhs) in accelerated.iter().zip(&cpu) {
+            assert!((lhs - rhs).abs() < 1e-6, "{lhs} != {rhs}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn unfused_shortconv_ring_falls_back_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        assert_unfused_ring_matches_cpu(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
+    fn unfused_shortconv_ring_falls_back_on_cuda() {
+        assert_unfused_ring_matches_cpu(&Device::new_cuda(0).expect("CUDA device required"));
     }
 
     #[test]
