@@ -181,9 +181,9 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Kokoro 82M",
     fullName: "Kokoro-82M by hexgrad",
     description:
-      "Lightweight multilingual TTS model with 54 built-in voices (Rust runtime integration pending)",
+      "Lightweight multilingual TTS model with 41 built-in voices in English, Spanish, French, Hindi, Italian and Portuguese",
     category: "tts",
-    capabilities: ["Text to Speech", "54 Voices", "24 kHz"],
+    capabilities: ["Text to Speech", "41 Voices", "24 kHz"],
     size: "346 MB",
   },
   "VibeVoice-1.5B": {

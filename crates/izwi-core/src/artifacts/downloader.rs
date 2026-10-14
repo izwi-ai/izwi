@@ -2540,6 +2540,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
+    /// The advertised Kokoro voice count is the voices it speaks: every
+    /// downloaded voice except the Japanese and Mandarin ones, which have
+    /// no G2P yet and are hidden and refused.
+    #[test]
+    fn kokoro_advertises_only_the_voices_it_speaks() {
+        use crate::models::architectures::kokoro::phonemizer::kokoro_speaker_supported;
+        let (downloader, temp_dir) = test_downloader();
+        let spoken = downloader
+            .get_model_files(ModelVariant::Kokoro82M)
+            .iter()
+            .filter_map(|file| file.strip_prefix("voices/")?.strip_suffix(".pt"))
+            .filter(|voice| kokoro_speaker_supported(voice))
+            .count();
+        assert_eq!(spoken, ModelVariant::KOKORO_BUILT_IN_VOICE_COUNT);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
     fn test_downloader() -> (ModelDownloader, PathBuf) {
         let temp_dir =
             std::env::temp_dir().join(format!("izwi-downloader-test-{}", Uuid::new_v4()));

@@ -290,7 +290,9 @@ impl ModelVariant {
     /// the audio they meant to allow (QTTS-21).
     pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 24_000.0 / 1_920.0;
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
-    pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
+    /// Kokoro's 54 voices less the 13 Japanese and Mandarin ones, which
+    /// have no G2P yet and are hidden and refused.
+    pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 41;
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;

@@ -420,6 +420,8 @@ const VOXTRAL_TTS_SPEAKERS: SpeakerProfile[] = [
   },
 ];
 
+// The voices the server speaks: Kokoro's Japanese (j*) and Mandarin (z*)
+// voices have no G2P yet, so the server hides them and refuses them.
 const KOKORO_VOICE_IDS = [
   "af_alloy",
   "af_aoede",
@@ -459,22 +461,9 @@ const KOKORO_VOICE_IDS = [
   "hm_psi",
   "if_sara",
   "im_nicola",
-  "jf_alpha",
-  "jf_gongitsune",
-  "jf_nezumi",
-  "jf_tebukuro",
-  "jm_kumo",
   "pf_dora",
   "pm_alex",
   "pm_santa",
-  "zf_xiaobei",
-  "zf_xiaoni",
-  "zf_xiaoxiao",
-  "zf_xiaoyi",
-  "zm_yunjian",
-  "zm_yunxi",
-  "zm_yunxia",
-  "zm_yunyang",
 ] as const;
 
 function kokoroLanguageForVoice(voiceId: string): string {
@@ -484,10 +473,6 @@ function kokoroLanguageForVoice(voiceId: string): string {
       return "American English";
     case "b":
       return "British English";
-    case "j":
-      return "Japanese";
-    case "z":
-      return "Mandarin Chinese";
     case "e":
       return "Spanish";
     case "f":
