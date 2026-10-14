@@ -112,6 +112,52 @@ fn diarization_decode_resources(backend: crate::backends::BackendKind) -> Resour
     resources
 }
 
+/// What a diarization job keeps authorized once its audio is decoded: the
+/// retained input and decoded samples it has materialized, plus the generic
+/// base workspace every request keeps. The decode allowance is given back,
+/// so it is not pending through the diarizer, ASR, aligner and LLM loads.
+fn diarization_retained_resources(
+    backend: crate::backends::BackendKind,
+    retained: JobResourceObservation,
+) -> Result<ResourceVector> {
+    let shared_bytes = || {
+        retained
+            .host_bytes
+            .checked_add(retained.accelerator_bytes)
+            .ok_or_else(|| Error::Overloaded("diarization retained audio overflowed".to_string()))
+    };
+    let mut resources = ResourceVector::zero();
+    match backend {
+        crate::backends::BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(shared_bytes()?)
+        }
+        crate::backends::BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(shared_bytes()?)
+        }
+        crate::backends::BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(retained.host_bytes);
+            resources.device_bytes = ResourceAmount::Known(retained.accelerator_bytes);
+        }
+    }
+    crate::runtime::service::transient_resources(backend, 0).checked_add(resources)
+}
+
+/// Settle a diarization job once its audio is decoded: record the decode
+/// peak, restore the pending claim for the source copy about to be freed,
+/// free it, then give back the decode allowance.
+fn settle_decoded_job(
+    job: &JobLease,
+    backend: crate::backends::BackendKind,
+    peak_usage: JobResourceObservation,
+    steady_usage: JobResourceObservation,
+    retained_source: Option<String>,
+) -> Result<()> {
+    job.record_materialized_usage(peak_usage)?;
+    job.prepare_materialized_release(steady_usage)?;
+    drop(retained_source);
+    job.shrink_authorization(diarization_retained_resources(backend, steady_usage)?)
+}
+
 /// Run one diarize body under a stage-scoped lease on the loaded model's own
 /// workspace estimate. The lease is consumed: it is released when this
 /// returns, whether the body succeeds or fails, so no workspace claim stays
@@ -459,6 +505,7 @@ impl RuntimeService {
         let model_id = model_id.map(ToOwned::to_owned);
         let config = config.clone();
         let observation_job = job.clone();
+        let backend = self.backend_context().backend_kind;
         let (runtime_request, audio) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
@@ -477,9 +524,13 @@ impl RuntimeService {
                     ],
                     &audio,
                 )?;
-                observation_job.record_materialized_usage(peak_usage)?;
-                observation_job.prepare_materialized_release(steady_usage)?;
-                drop(retained_source);
+                settle_decoded_job(
+                    &observation_job,
+                    backend,
+                    peak_usage,
+                    steady_usage,
+                    retained_source,
+                )?;
                 Ok((runtime_request, audio))
             })
             .await?;
@@ -629,6 +680,7 @@ impl RuntimeService {
         let llm_model_id = llm_model_id.map(ToOwned::to_owned);
         let config = config.clone();
         let observation_job = pipeline_job.clone();
+        let backend = self.backend_context().backend_kind;
         let (runtime_request, audio) = self
             .coordinator
             .run_host_blocking_stage(&pipeline_job, move || {
@@ -656,9 +708,13 @@ impl RuntimeService {
                     ],
                     &audio,
                 )?;
-                observation_job.record_materialized_usage(peak_usage)?;
-                observation_job.prepare_materialized_release(steady_usage)?;
-                drop(retained_source);
+                settle_decoded_job(
+                    &observation_job,
+                    backend,
+                    peak_usage,
+                    steady_usage,
+                    retained_source,
+                )?;
                 Ok((runtime_request, audio))
             })
             .await?;
@@ -2612,6 +2668,88 @@ mod tests {
         assert!(matches!(mismatched, Err(Error::InferenceError(_))));
         assert_eq!(authority.snapshot().reserved, before.reserved);
         assert_eq!(authority.snapshot().reservations, before.reservations);
+    }
+
+    /// ADM-2: once the audio is decoded and diarized, the job holds only
+    /// what it retains (the decoded audio, the retained input and the
+    /// generic base workspace). The pipeline's ASR load then sees live
+    /// memory less that base, not less the 512 MiB decode allowance or a
+    /// Sortformer workspace.
+    #[tokio::test]
+    async fn after_diarizing_the_job_leaves_live_memory_to_the_asr_load() {
+        use crate::backends::BackendKind;
+        use crate::engine::{ReservationClass, ReservationOwner};
+        use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
+        const LIVE: u64 = 64 * 1024 * 1024 * 1024;
+        let samples = 3 * PIPELINE_SAMPLE_RATE as usize;
+        let input_bytes = 44 + samples * 2;
+        let steady = JobResourceObservation::host((2 * input_bytes + samples * 4) as u64);
+        let peak = JobResourceObservation::host((3 * input_bytes + samples * 4) as u64);
+        for backend in [BackendKind::Metal, BackendKind::Cuda] {
+            let coordinator = Arc::new(InferenceCoordinator::new(backend, 1, 4));
+            let context = RuntimeRequestContext::default();
+            let job = coordinator
+                .admit_observed(
+                    JobSpec {
+                        request_id: "diarize-then-load-asr".to_string(),
+                        lane: CoordinatorLane::Pipeline,
+                        priority: context.priority,
+                        workload_class: context.workload_class,
+                        deadline: None,
+                        resources: crate::runtime::service::transient_resources(
+                            backend,
+                            input_bytes,
+                        )
+                        .checked_add(diarization_decode_resources(backend))
+                        .unwrap(),
+                    },
+                    JobResourceObservation::host(input_bytes as u64),
+                )
+                .await
+                .unwrap();
+            settle_decoded_job(&job, backend, peak, steady, Some(String::new())).unwrap();
+            let workspace =
+                crate::models::architectures::sortformer::diarization::checkpoint_profile_workspace_estimate(
+                    ModelVariant::DiarStreamingSortformer4SpkV21,
+                    samples,
+                    backend == BackendKind::Cuda,
+                )
+                .unwrap();
+            diarize_under_workspace_lease(&coordinator, &job, workspace, |observer| {
+                observer(SortformerWorkspaceEvent::Materialized { workspace })?;
+                observer(SortformerWorkspaceEvent::Releasing { workspace })
+            })
+            .unwrap();
+
+            let authority = coordinator.resource_authority();
+            let base = crate::runtime::service::transient_resources(backend, 0);
+            let known = |amount: ResourceAmount| match amount {
+                ResourceAmount::Known(bytes) => bytes,
+                ResourceAmount::Unknown => panic!("{backend:?}: unknown amount"),
+            };
+            if backend == BackendKind::Metal {
+                // The live pre-load check of the pipeline's ASR load.
+                let headroom = authority
+                    .live_preload_headroom_bytes(backend)
+                    .unwrap()
+                    .expect("a live sample");
+                assert_eq!(headroom, LIVE - known(base.unified_bytes));
+            } else {
+                // A guarded model reservation of all memory but the retained
+                // audio and the base.
+                let asr = authority.reserve(
+                    ReservationOwner::new(ReservationClass::Model, "asr"),
+                    ResourceVector {
+                        host_bytes: ResourceAmount::Known(
+                            LIVE - steady.host_bytes - known(base.host_bytes),
+                        ),
+                        device_bytes: ResourceAmount::Known(LIVE - known(base.device_bytes)),
+                        ..ResourceVector::zero()
+                    },
+                );
+                assert!(asr.is_ok(), "{asr:?}");
+            }
+        }
     }
 
     #[tokio::test]

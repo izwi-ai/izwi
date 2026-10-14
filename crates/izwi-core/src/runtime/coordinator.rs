@@ -800,7 +800,11 @@ impl InferenceCoordinator {
         Ok(PreparationAdmissionBridge {
             coordinator,
             preparation_spec: spec,
-            reservation: Some(reservation),
+            reservation: Some(
+                reservation
+                    .into_inner()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            ),
         })
     }
 
@@ -891,7 +895,7 @@ impl InferenceCoordinator {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
                 _permit: permit,
-                reservation,
+                reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
                     coordinator: self.clone(),
                 },
@@ -950,7 +954,7 @@ impl InferenceCoordinator {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
                 _permit: permit,
-                reservation,
+                reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
                     coordinator: self.clone(),
                 },
@@ -2174,14 +2178,14 @@ pub struct JobLease {
 }
 
 impl JobLease {
-    /// Reconcile observed physical usage against this job's immutable
-    /// authorization. Future authorized growth remains pending. Observations
-    /// are monotonic; the runtime restores pending claims before dropping or
-    /// replacing temporary physical allocations.
+    /// Reconcile observed physical usage against this job's authorization,
+    /// which is fixed at admission and can only shrink. Future authorized
+    /// growth remains pending. Observations are monotonic; the runtime
+    /// restores pending claims before dropping or replacing temporary
+    /// physical allocations.
     pub fn record_materialized_usage(&self, observation: JobResourceObservation) -> Result<()> {
         let resources = observed_resources(observation, self._inner.coordinator.backend)?;
-        self._inner
-            .reservation
+        self.reservation()
             .record_materialized_usage(resources)
             .map_err(|error| match error {
                 Error::InferenceError(message) => {
@@ -2205,9 +2209,22 @@ impl JobLease {
         observation: JobResourceObservation,
     ) -> Result<()> {
         let resources = observed_resources(observation, self._inner.coordinator.backend)?;
+        self.reservation().prepare_materialized_release(resources)
+    }
+
+    /// Give back the part of this job's authorization it can no longer use
+    /// (a decode allowance after decode). It never grows the job and never
+    /// drops below its materialized usage.
+    pub(crate) fn shrink_authorization(&self, resources: ResourceVector) -> Result<()> {
+        let resources = effective_resources(resources, self._inner.coordinator.backend)?;
+        self.reservation().shrink(resources)
+    }
+
+    fn reservation(&self) -> std::sync::MutexGuard<'_, ResourceLease> {
         self._inner
             .reservation
-            .prepare_materialized_release(resources)
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -2263,7 +2280,8 @@ impl Drop for ModelLoadLease {
 struct JobLeaseInner {
     coordinator: Arc<InferenceCoordinator>,
     _permit: OwnedSemaphorePermit,
-    reservation: ResourceLease,
+    // Locked only to shrink the authorization; observations take it briefly.
+    reservation: Mutex<ResourceLease>,
     active: ActiveJobGuard,
 }
 
