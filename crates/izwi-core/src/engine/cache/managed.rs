@@ -1457,12 +1457,16 @@ impl ManagedKvCacheManager {
                 let mut offload = offload::ModelOffload {
                     arenas: HashMap::with_capacity(plan.groups.len()),
                 };
+                // The model lease is charged one budget, so the arenas share
+                // it: giving each arena the whole budget let a multi-domain
+                // model keep `arenas x budget` bytes resident on the host.
+                let per_arena_budget = split_host_offload_budget(policy.budget_bytes, arenas.len());
                 for arena in arenas.values() {
                     offload.arenas.insert(
                         arena.id(),
                         offload::ArenaOffload::new(
                             crate::backends::kv::arena_page_bytes(arena.config()),
-                            policy.budget_bytes,
+                            per_arena_budget,
                         )?,
                     );
                 }
@@ -4679,6 +4683,12 @@ fn managed_prefix_namespace(
         multimodal_artifact: None,
         cache_salt,
     }))
+}
+
+/// Evenly divide one model's host-offload budget between its arenas so the
+/// pools together never exceed the single budget charged to the model lease.
+fn split_host_offload_budget(budget_bytes: u64, arenas: usize) -> u64 {
+    budget_bytes / u64::try_from(arenas.max(1)).unwrap_or(u64::MAX)
 }
 
 fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -8422,6 +8432,17 @@ mod tests {
             64,
             "same tenant reuses"
         );
+    }
+
+    #[test]
+    fn host_offload_budget_is_shared_by_every_arena_of_one_model() {
+        // H5: the lease is charged one budget per model; pools may not hold
+        // more than that in total.
+        assert_eq!(split_host_offload_budget(1_000, 1), 1_000);
+        assert_eq!(split_host_offload_budget(1_000, 2), 500);
+        assert_eq!(split_host_offload_budget(1_000, 3), 333);
+        assert!(split_host_offload_budget(1_000, 3) * 3 <= 1_000);
+        assert_eq!(split_host_offload_budget(1_000, 0), 1_000);
     }
 
     #[test]
