@@ -812,6 +812,18 @@ fn validate_decode_query(query: &Tensor, dtype: DType) -> Result<()> {
     Ok(())
 }
 
+/// Tokens one CPU attention task covers before the context is split further.
+const CPU_ATTENTION_MIN_PARTITION_TOKENS: usize = 256;
+
+/// One (row, KV head, context slice) unit of CPU paged attention: the
+/// online-softmax state of every query head in the KV head's group.
+struct CpuAttentionPartial {
+    maxes: Vec<f32>,
+    sums: Vec<f32>,
+    /// `[group, value_dim]`, unnormalized.
+    values: Vec<f32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn online_paged_decode<T>(
     keys: &[T],
@@ -834,8 +846,7 @@ where
     f32: From<T>,
 {
     let batch_size = tables.rows.len();
-    let mut output = vec![0.0f32; batch_size * query_heads * value_dim];
-    let queries_per_kv_head = query_heads / kv_heads;
+    let group = query_heads / kv_heads;
     let key_page_stride = page_tokens * kv_heads * key_dim;
     let value_page_stride = page_tokens * kv_heads * value_dim;
 
@@ -854,61 +865,138 @@ where
         }
     }
 
-    let compute_head = |row_head: usize, output: &mut [f32], accumulator: &mut Vec<f32>| {
-        let row = row_head / query_heads;
-        let query_head = row_head % query_heads;
+    // Split long contexts so a small batch still uses every core; each slice
+    // is merged back by its log-sum-exp state.
+    let base_tasks = (batch_size * kv_heads).max(1);
+    let max_context = tables
+        .rows
+        .iter()
+        .map(|row| row.context_len)
+        .max()
+        .unwrap_or(0);
+    let partitions = rayon::current_num_threads()
+        .div_ceil(base_tasks)
+        .min(max_context.div_ceil(CPU_ATTENTION_MIN_PARTITION_TOKENS))
+        .max(1);
+    let partition_tokens = max_context.div_ceil(partitions).max(1);
+
+    // The softmax scale is folded into the queries, converted once.
+    let scaled_queries = (0..batch_size * query_heads * key_dim)
+        .map(|index| f32::from(queries[query_start + index]) * softmax_scale)
+        .collect::<Vec<_>>();
+
+    let compute = |task: usize| -> CpuAttentionPartial {
+        let row = task / (kv_heads * partitions);
+        let kv_head = (task / partitions) % kv_heads;
+        let partition = task % partitions;
         let table = &tables.rows[row];
-        let kv_head = query_head / queries_per_kv_head;
-        let query_offset = query_start + row_head * key_dim;
-        accumulator.resize(value_dim, 0.0);
-        accumulator.fill(0.0);
-        let mut running_max = f32::NEG_INFINITY;
-        let mut running_sum = 0.0f32;
-
-        for token in 0..table.context_len {
+        let start = (partition * partition_tokens).min(table.context_len);
+        let end = ((partition + 1) * partition_tokens).min(table.context_len);
+        let query_base = (row * query_heads + kv_head * group) * key_dim;
+        let group_queries = &scaled_queries[query_base..query_base + group * key_dim];
+        let mut partial = CpuAttentionPartial {
+            maxes: vec![f32::NEG_INFINITY; group],
+            sums: vec![0.0; group],
+            values: vec![0.0; group * value_dim],
+        };
+        let mut key_tile = Vec::with_capacity(page_tokens * key_dim);
+        let mut value_tile = Vec::with_capacity(page_tokens * value_dim);
+        let mut scores = Vec::with_capacity(page_tokens);
+        let mut token = start;
+        while token < end {
+            // One tile = the rest of the current physical page.
             let physical_token = table.first_page_offset + token;
-            let logical_page = physical_token / page_tokens;
-            let page = tables.pages[table.page_start + logical_page];
+            let page = tables.pages[table.page_start + physical_token / page_tokens];
             let page_offset = physical_token % page_tokens;
-            let key_offset =
-                key_start + page * key_page_stride + (page_offset * kv_heads + kv_head) * key_dim;
-            let value_offset = value_start
-                + page * value_page_stride
-                + (page_offset * kv_heads + kv_head) * value_dim;
-            let mut score = 0.0f32;
-            for dim in 0..key_dim {
-                score += f32::from(queries[query_offset + dim]) * f32::from(keys[key_offset + dim]);
+            let tile = (page_tokens - page_offset).min(end - token);
+            key_tile.clear();
+            value_tile.clear();
+            for slot in page_offset..page_offset + tile {
+                let key_offset =
+                    key_start + page * key_page_stride + (slot * kv_heads + kv_head) * key_dim;
+                let value_offset = value_start
+                    + page * value_page_stride
+                    + (slot * kv_heads + kv_head) * value_dim;
+                key_tile.extend(
+                    keys[key_offset..key_offset + key_dim]
+                        .iter()
+                        .map(|&k| f32::from(k)),
+                );
+                value_tile.extend(
+                    values[value_offset..value_offset + value_dim]
+                        .iter()
+                        .map(|&v| f32::from(v)),
+                );
             }
-            score *= softmax_scale;
-            if let Some(softcap) = softcap {
-                score = softcap * (score / softcap).tanh();
+            for (head, query) in group_queries.chunks_exact(key_dim).enumerate() {
+                scores.clear();
+                scores.extend(key_tile.chunks_exact(key_dim).map(|key| {
+                    let score = query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>();
+                    match softcap {
+                        Some(softcap) => softcap * (score / softcap).tanh(),
+                        None => score,
+                    }
+                }));
+                let tile_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let next_max = partial.maxes[head].max(tile_max);
+                let rescale = if partial.sums[head] == 0.0 {
+                    0.0
+                } else {
+                    (partial.maxes[head] - next_max).exp()
+                };
+                let accumulator = &mut partial.values[head * value_dim..(head + 1) * value_dim];
+                if rescale != 1.0 {
+                    accumulator.iter_mut().for_each(|value| *value *= rescale);
+                }
+                let mut tile_sum = 0.0;
+                for (score, value) in scores.iter().zip(value_tile.chunks_exact(value_dim)) {
+                    let weight = (score - next_max).exp();
+                    tile_sum += weight;
+                    for (out, v) in accumulator.iter_mut().zip(value) {
+                        *out += weight * v;
+                    }
+                }
+                partial.sums[head] = partial.sums[head] * rescale + tile_sum;
+                partial.maxes[head] = next_max;
             }
-
-            let next_max = running_max.max(score);
-            let previous_weight = (running_max - next_max).exp();
-            let token_weight = (score - next_max).exp();
-            running_sum = running_sum * previous_weight + token_weight;
-            for dim in 0..value_dim {
-                accumulator[dim] = accumulator[dim] * previous_weight
-                    + f32::from(values[value_offset + dim]) * token_weight;
-            }
-            running_max = next_max;
+            token += tile;
         }
-        for dim in 0..value_dim {
-            output[dim] = accumulator[dim] / running_sum;
-        }
+        partial
     };
 
-    let row_heads = batch_size * query_heads;
-    if row_heads >= 8 {
-        output.par_chunks_mut(value_dim).enumerate().for_each_init(
-            || Vec::with_capacity(value_dim),
-            |acc, (row_head, output)| compute_head(row_head, output, acc),
-        );
+    let tasks = batch_size * kv_heads * partitions;
+    let partials = if tasks > 1 {
+        (0..tasks).into_par_iter().map(compute).collect::<Vec<_>>()
     } else {
-        let mut accumulator = Vec::with_capacity(value_dim);
-        for (row_head, output) in output.chunks_mut(value_dim).enumerate() {
-            compute_head(row_head, output, &mut accumulator);
+        (0..tasks).map(compute).collect::<Vec<_>>()
+    };
+
+    let mut output = vec![0.0f32; batch_size * query_heads * value_dim];
+    for (base, slices) in partials.chunks_exact(partitions).enumerate() {
+        let row = base / kv_heads;
+        let kv_head = base % kv_heads;
+        for head in 0..group {
+            let global_max = slices
+                .iter()
+                .map(|slice| slice.maxes[head])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let out_base = ((row * query_heads) + kv_head * group + head) * value_dim;
+            let out = &mut output[out_base..out_base + value_dim];
+            let mut total = 0.0f32;
+            for slice in slices {
+                if slice.sums[head] == 0.0 {
+                    continue;
+                }
+                let weight = (slice.maxes[head] - global_max).exp();
+                total += slice.sums[head] * weight;
+                for (out, value) in out
+                    .iter_mut()
+                    .zip(&slice.values[head * value_dim..(head + 1) * value_dim])
+                {
+                    *out += value * weight;
+                }
+            }
+            out.iter_mut().for_each(|value| *value /= total);
         }
     }
     Ok(output)
