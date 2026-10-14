@@ -559,6 +559,20 @@ impl LifecycleRetryPolicy {
     }
 }
 
+/// How a chat model's CUDA KV pool is sized at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaResidentPool {
+    /// No resident fit: the arena grows on demand up to the model context.
+    Disabled,
+    /// A materialized arena of at most one model context, fitted to device
+    /// headroom after the CUDA context reserve and decode workspace. For
+    /// small models that share the GPU.
+    OneContext,
+    /// Like [`Self::OneContext`], but with incremental CUDA chat the pool may
+    /// cover every retained row's context, up to device headroom.
+    RetainedRows,
+}
+
 fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
     if let Some(value) = value {
         let value = value.max(0.0);
@@ -5670,7 +5684,7 @@ impl EngineCore {
             capability,
             logical_context_tokens,
             None,
-            false,
+            CudaResidentPool::Disabled,
             0,
         )
     }
@@ -5698,7 +5712,7 @@ impl EngineCore {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
         staged_transaction_rows: Option<u32>,
-        fit_cuda_resident_context: bool,
+        cuda_resident_pool: CudaResidentPool,
         decode_workspace_reserve_bytes: u64,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
@@ -5707,7 +5721,8 @@ impl EngineCore {
         let backend = self.managed_kv_cache.worker_backend();
         let retained_sequence_rows = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
-        let fit_cuda_resident_context = backend == BackendKind::Cuda && fit_cuda_resident_context;
+        let fit_cuda_resident_context =
+            backend == BackendKind::Cuda && cuda_resident_pool != CudaResidentPool::Disabled;
         let staged_transaction_rows = staged_transaction_rows.unwrap_or(
             u32::try_from(self.config.max_staged_transactions).map_err(|_| {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
@@ -5722,7 +5737,8 @@ impl EngineCore {
                 })?;
                 let context = u64::try_from(context)
                     .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
-                let incremental = self.config.cuda_incremental_chat_enabled();
+                let incremental = self.config.cuda_incremental_chat_enabled()
+                    && cuda_resident_pool == CudaResidentPool::RetainedRows;
                 let automatic_rows = self.config.automatic_row_limits.retained_sequences;
                 let context_reserve_bytes = self
                     .config

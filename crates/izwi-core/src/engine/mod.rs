@@ -30,6 +30,7 @@ pub(crate) use cache::managed::{plan_managed_state_capacity, ManagedStateCapacit
 pub(crate) use cache::managed::{CUDA_AUTOMATIC_ROWS_GUIDANCE, CUDA_EXPLICIT_ROWS_GUIDANCE};
 mod config;
 mod core;
+pub(crate) use core::CudaResidentPool;
 pub mod execution;
 mod execution_group;
 mod executor;
@@ -3044,7 +3045,7 @@ impl Engine {
             capability,
             logical_context_tokens,
             None,
-            false,
+            core::CudaResidentPool::Disabled,
             0,
         )
         .await
@@ -3056,7 +3057,7 @@ impl Engine {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
         staged_transaction_rows: Option<u32>,
-        fit_cuda_resident_context: bool,
+        cuda_resident_pool: core::CudaResidentPool,
         decode_workspace_reserve_bytes: u64,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
         let _step = self.step_gate.lock().await;
@@ -3068,7 +3069,7 @@ impl Engine {
                 capability,
                 logical_context_tokens,
                 staged_transaction_rows,
-                fit_cuda_resident_context,
+                cuda_resident_pool,
                 decode_workspace_reserve_bytes,
             )
     }

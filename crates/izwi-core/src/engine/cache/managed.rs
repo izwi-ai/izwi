@@ -6872,6 +6872,34 @@ mod tests {
         );
     }
 
+    /// LFM2.5 chat on CUDA fits one 32K context (6 attention layers x 8 KV
+    /// heads x 64 x K/V x F32 = 24,576 B/token, 64-token pages) instead of
+    /// growing a 128K arena: the whole context fits a small GPU after the
+    /// context reserve, and a tighter budget yields a smaller reach rather
+    /// than an overcommitted arena.
+    #[test]
+    fn lfm25_chat_cuda_fit_is_bounded_by_one_context() {
+        let paged = [CudaContiguousPagedGeometry {
+            page_tokens: 64,
+            bytes_per_page: 64 * 24_576,
+        }];
+        // Ring state for 95 retained + 8 staged rows (10 layers x 3 x 2048 x F32).
+        let fixed = 103 * 245_760;
+        let one_context = cuda_resident_required_bytes(32_768, &paged, fixed).unwrap();
+        assert_eq!(one_context, 805_306_368 + fixed);
+        // A 6 GiB GPU after ~1.4 GB of weights and a 1 GiB context reserve.
+        let roomy = 6 * 1024 * 1024 * 1024 - 1_400_000_000 - 1024 * 1024 * 1024;
+        assert_eq!(
+            fit_cuda_resident_token_reach(32_768, 64, &paged, fixed, roomy).unwrap(),
+            32_768
+        );
+        // A crowded device: the reach shrinks and still fits.
+        let tight = 300 * 1024 * 1024;
+        let tokens = fit_cuda_resident_token_reach(32_768, 64, &paged, fixed, tight).unwrap();
+        assert!((4_096..32_768).contains(&tokens), "{tokens}");
+        assert!(cuda_resident_required_bytes(tokens, &paged, fixed).unwrap() <= tight);
+    }
+
     #[test]
     fn qwen38_resident_context_leaves_room_for_decode_and_safety_headroom() {
         let fixed = 2_667_184_128;
