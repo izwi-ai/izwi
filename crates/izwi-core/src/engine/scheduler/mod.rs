@@ -2310,6 +2310,23 @@ impl Scheduler {
         true
     }
 
+    /// Release every scheduler fence held by a row that was rolled back before
+    /// execution. A realtime row also clears its session's in-flight marker
+    /// when it still names this exact plan; its FIFO head stays queued, so the
+    /// same operation is scheduled again.
+    pub(crate) fn release_unexecuted_quantum(&mut self, scheduled: &ScheduledRequest) -> bool {
+        if let Some(state) = self.realtime_sessions.get_mut(&scheduled.request_id) {
+            if state.sequence_id == scheduled.sequence_id
+                && state
+                    .in_flight
+                    .is_some_and(|in_flight| in_flight.plan_id == scheduled.plan_id)
+            {
+                state.in_flight = None;
+            }
+        }
+        self.release_execution_quantum_for_retry(&scheduled.session_key())
+    }
+
     /// Remove service charged when a scheduled quantum never reached
     /// execution. The engine calls this exactly once while removing the
     /// corresponding active plan, so capacity retries cannot lose weighted
@@ -4162,6 +4179,63 @@ mod tests {
             WorkUnit::RealtimePreparation { operation_id, .. }
                 if *operation_id == newer_operation
         ));
+    }
+
+    #[test]
+    fn unexecuted_realtime_row_release_reschedules_the_same_operation() {
+        let mut scheduler = small_scheduler();
+        let mut realtime = build_request(TaskType::ASR, "deferred-realtime", Priority::High);
+        realtime
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        assert!(scheduler.add_realtime_session(&realtime));
+        scheduler.add_request(&build_request(
+            TaskType::Chat,
+            "waiting-chat",
+            Priority::Normal,
+        ));
+        allow_incremental_prefill(&mut scheduler, "waiting-chat");
+        let session = SessionKey::new(
+            realtime.id.clone(),
+            scheduler.get_sequence_id(&realtime.id).expect("epoch"),
+        );
+        let (operation, _) = scheduler
+            .enqueue_realtime_push(&session, 80, 1, 2)
+            .expect("realtime push");
+
+        // The core defers every row of a mixed schedule it cannot dispatch.
+        let first = scheduler.schedule();
+        assert_eq!(first.prefill_requests.len(), 1);
+        let deferred = first
+            .decode_requests
+            .iter()
+            .find(|row| row.request_id == realtime.id)
+            .cloned()
+            .expect("realtime row");
+        for row in first.decode_requests.iter().chain(&first.prefill_requests) {
+            assert!(scheduler.release_unexecuted_quantum(row));
+        }
+
+        let second = scheduler.schedule();
+        let retried = second
+            .decode_requests
+            .iter()
+            .find(|row| row.request_id == realtime.id)
+            .expect("released realtime session is scheduled again");
+        assert_ne!(retried.plan_id, deferred.plan_id);
+        assert!(matches!(
+            &retried.work,
+            WorkUnit::RealtimePreparation { operation_id, .. } if *operation_id == operation
+        ));
+        assert_eq!(second.prefill_requests.len(), 1);
+
+        // A stale release must not free the newer plan's fence.
+        scheduler.release_unexecuted_quantum(&deferred);
+        assert!(scheduler
+            .schedule()
+            .decode_requests
+            .iter()
+            .all(|row| row.request_id != realtime.id));
     }
 
     #[test]

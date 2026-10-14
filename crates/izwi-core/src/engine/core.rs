@@ -1259,7 +1259,7 @@ impl EngineCore {
                     tracker.rollback_unexecuted_plan(scheduled.plan_id);
                 }
             }
-            self.scheduler.release_execution_quantum_for_retry(&session);
+            self.scheduler.release_unexecuted_quantum(scheduled);
             self.release_managed_session_if_ready(&session);
         }
     }
@@ -6560,6 +6560,7 @@ mod tests {
     struct MockExecutor {
         initialized: bool,
         cleanup_calls: Arc<Mutex<Vec<String>>>,
+        prefill: PrefillMode,
     }
 
     impl MockExecutor {
@@ -6567,6 +6568,7 @@ mod tests {
             Self {
                 initialized: false,
                 cleanup_calls,
+                prefill: PrefillMode::Full,
             }
         }
 
@@ -6597,7 +6599,7 @@ mod tests {
                 request.model_variant,
                 ExecutionMode::Sequence,
             );
-            profile.prefill = PrefillMode::Full;
+            profile.prefill = self.prefill;
             profile.recompute_safe = true;
             profile.cache_release_safe = true;
             Some(profile)
@@ -7261,6 +7263,65 @@ mod tests {
             .expect_err("unbound realtime requests must fail before scheduler insertion");
         assert!(error.to_string().contains("loaded model instance"));
         assert_eq!(core.pending_request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn realtime_row_deferred_by_serial_prefill_is_scheduled_again() {
+        // Resumable prefill may share a schedule with decode-phase rows.
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor {
+            prefill: PrefillMode::Incremental,
+            ..MockExecutor::new(Arc::new(Mutex::new(Vec::new())))
+        }));
+        let mut core =
+            EngineCore::new_with_unified_executor(EngineCoreConfig::default(), executor).unwrap();
+        assert_eq!(
+            core.config
+                .resolved_physical_execution_capacity()
+                .candidate_dispatch_limit
+                .get(),
+            1
+        );
+        // Admission authenticates a loaded Voxtral binding; this test installs
+        // only the scheduler session and request it would register.
+        let mut realtime = EngineCoreRequest::asr_bytes(Vec::new())
+            .with_model_variant(ModelVariant::VoxtralMini4BRealtime2602);
+        realtime.id = "live-transcript".to_string();
+        realtime
+            .enable_realtime_asr_ingress()
+            .expect("realtime ingress");
+        assert!(core.scheduler.add_realtime_session(&realtime));
+        let session = core
+            .get_session_key(&realtime.id)
+            .expect("realtime session");
+        core.requests
+            .insert(realtime.id.clone(), Arc::new(realtime));
+        core.enqueue_realtime_asr_push(&session, Arc::from(vec![0.0; 160]), 16_000, 1, 1)
+            .await
+            .expect("realtime push");
+        let mut waiting = EngineCoreRequest::tts("waiting prefill");
+        waiting.id = "waiting-prefill".to_string();
+        core.add_request(waiting).unwrap();
+
+        // The previous step served decode, so the single slot prefers prefill
+        // and defers the realtime decode-phase row.
+        core.next_single_candidate_phase = ExecutionPhase::Prefill;
+        core.step().await.expect("prefill step");
+        assert!(core.active_plans.is_empty());
+
+        let prepared = core
+            .prepare_step()
+            .await
+            .unwrap()
+            .expect("decode-preferred step");
+        assert!(
+            core.active_plans
+                .values()
+                .any(|plan| plan.session == session
+                    && matches!(plan.work, WorkUnit::RealtimePreparation { .. })),
+            "the rolled-back realtime operation must be scheduled again"
+        );
+        assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
+        drop(prepared);
     }
 
     #[test]
