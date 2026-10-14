@@ -548,6 +548,9 @@ struct RequestMetadata {
     /// is clipped to end there, so the manager can publish the committed
     /// tensor snapshot that the conversation's next turn attaches to.
     managed_snapshot_boundary: Option<u32>,
+    /// The prompt's first-turn (system prompt) boundary, clipped like the
+    /// history boundary so requests sharing only a system prompt can attach.
+    managed_preamble_boundary: Option<u32>,
     /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
     /// are already resident (shared pages plus a forked tensor snapshot), so
     /// the first prefill span starts here instead of zero. `None` means a
@@ -747,6 +750,7 @@ impl Scheduler {
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
             managed_snapshot_boundary: request.managed_snapshot_boundary(),
+            managed_preamble_boundary: request.managed_preamble_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
         };
 
@@ -813,6 +817,7 @@ impl Scheduler {
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
                 managed_snapshot_boundary: request.managed_snapshot_boundary(),
+                managed_preamble_boundary: request.managed_preamble_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
             },
         );
@@ -1003,30 +1008,33 @@ impl Scheduler {
     }
 
     /// Phase 5a: clip an incremental prefill span `[start, start + tokens)`
-    /// that crosses the declared history boundary, floored to the snapshot
-    /// interval, so it ends exactly on it. Spans that end at or before it, or
-    /// start at or past it, keep their exact length.
+    /// that crosses a declared snapshot boundary (the first-turn boundary,
+    /// then the history boundary), floored to the snapshot interval, so it
+    /// ends exactly on the first one it crosses. Spans that cross none keep
+    /// their exact length.
     fn clip_prefill_to_snapshot_boundary(
         metadata: &RequestMetadata,
         start: usize,
         tokens: usize,
     ) -> usize {
-        let (Some(interval), Some(boundary)) = (
-            metadata.managed_snapshot_prefill_interval,
-            metadata.managed_snapshot_boundary,
-        ) else {
+        let Some(interval) = metadata.managed_snapshot_prefill_interval else {
             return tokens;
         };
         if metadata.cache_policy.prefill != PrefillMode::Incremental || interval < 2 {
             return tokens;
         }
-        let (interval, boundary) = (interval as usize, boundary as usize);
-        let aligned = boundary - boundary % interval;
-        if aligned > start && aligned < start.saturating_add(tokens) {
-            aligned - start
-        } else {
-            tokens
-        }
+        let interval = interval as usize;
+        let end = start.saturating_add(tokens);
+        [
+            metadata.managed_preamble_boundary,
+            metadata.managed_snapshot_boundary,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|boundary| boundary as usize - boundary as usize % interval)
+        .filter(|aligned| *aligned > start && *aligned < end)
+        .min()
+        .map_or(tokens, |aligned| aligned - start)
     }
 
     /// Schedule requests for the next step.
@@ -3610,6 +3618,7 @@ mod tests {
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             managed_prefix_cursor: None,
         }
     }
@@ -3667,6 +3676,34 @@ mod tests {
         assert_eq!(
             Scheduler::clip_prefill_to_snapshot_boundary(&undeclared, 0, 256),
             256
+        );
+    }
+
+    /// A shared system prompt ends the first turn: a span crossing both the
+    /// first-turn and the history boundary ends on the first-turn floor, and
+    /// the next span on the history floor.
+    #[test]
+    fn prefill_spans_clip_to_the_first_turn_then_the_history_boundary() {
+        let mut metadata = snapshot_metadata(Some(16), PrefillMode::Incremental);
+        metadata.managed_preamble_boundary = Some(99);
+        metadata.managed_snapshot_boundary = Some(126);
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 127),
+            96
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 96, 31),
+            16
+        );
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 112, 15),
+            15
+        );
+        // Only a first-turn boundary declared: it clips on its own.
+        metadata.managed_snapshot_boundary = None;
+        assert_eq!(
+            Scheduler::clip_prefill_to_snapshot_boundary(&metadata, 0, 127),
+            96
         );
     }
 
@@ -5346,14 +5383,19 @@ mod tests {
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
     }
 
+    /// A loaded model's sustained-quantum opt-in outlives the soft SLA on
+    /// every backend; without the opt-in, or from an unloaded profile, the
+    /// row falls back to one token per step.
     #[test]
-    fn sustained_cuda_quantum_survives_soft_sla_only_with_loaded_opt_in() {
+    fn sustained_quantum_survives_soft_sla_only_with_loaded_opt_in() {
         for (backend, loaded, enabled, expected) in [
             (BackendKind::Cuda, true, true, 2),
             (BackendKind::Cuda, true, false, 1),
             (BackendKind::Cuda, false, true, 1),
-            (BackendKind::Cpu, true, true, 1),
-            (BackendKind::Metal, true, true, 1),
+            (BackendKind::Cpu, true, true, 2),
+            (BackendKind::Cpu, true, false, 1),
+            (BackendKind::Metal, true, true, 2),
+            (BackendKind::Metal, false, true, 1),
         ] {
             let mut scheduler = Scheduler::new(SchedulerConfig {
                 max_batch_size: 2,

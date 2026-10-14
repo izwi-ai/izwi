@@ -525,8 +525,11 @@ impl Default for ManagedKvCacheManager {
 /// What a portable managed-state fit may spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortableFitHeadroom {
-    /// Stable planning headroom (chat and Fish state).
-    Planning,
+    /// Stable planning headroom (chat and Fish state). `minimum_tokens` is
+    /// the context the model needs to be useful (chat: one ordinary
+    /// conversation; `0`: the page minimum). A load that cannot reach it is
+    /// refused with a capacity error instead of publishing a tiny context.
+    Planning { minimum_tokens: u64 },
     /// Planning headroom clamped to live memory
     /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR and TTS
     /// retained state, which must leave room for the requests it serves.
@@ -652,7 +655,7 @@ impl ManagedKvCacheManager {
         };
         let planning = authority.planning_headroom_bytes(self.worker_backend)?;
         let (growth_headroom, safety_reserve_bytes) = match headroom {
-            PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
+            PortableFitHeadroom::Planning { .. } => (planning, safety_reserve_bytes),
             // Retained state keeps the one reserve its invocation fit keeps
             // too: the configured floor or, for an observed load, the
             // measured untracked growth (ADM-11).
@@ -721,8 +724,8 @@ impl ManagedKvCacheManager {
         };
 
         let floor_tokens = match headroom {
-            PortableFitHeadroom::Live { minimum_tokens, .. } => minimum_tokens,
-            PortableFitHeadroom::Planning => 0,
+            PortableFitHeadroom::Live { minimum_tokens, .. }
+            | PortableFitHeadroom::Planning { minimum_tokens } => minimum_tokens,
         };
         let minimum_tokens = u64::from(page_tokens_hint)
             .max(floor_tokens)
@@ -740,11 +743,13 @@ impl ManagedKvCacheManager {
                 minimum_bytes,
                 floor_budget_bytes,
             );
-            // An ASR or TTS floor that planning headroom cannot hold is a
-            // capacity refusal (503), not a load defect.
+            // A model-authored floor (ASR, TTS, chat) that headroom cannot
+            // hold is a capacity refusal (503), not a load defect.
             return Err(match headroom {
-                PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
-                PortableFitHeadroom::Planning => Error::ModelLoadError(message),
+                PortableFitHeadroom::Planning { minimum_tokens: 0 } => {
+                    Error::ModelLoadError(message)
+                }
+                _ => Error::Overloaded(message),
             });
         }
         let budget_bytes = growth_budget_bytes.max(minimum_bytes);
@@ -2641,8 +2646,16 @@ impl ManagedKvCacheManager {
             // publishes the pages of every later prefill span inside its
             // prompt, so a conversation's chain keeps growing turn by turn
             // instead of stopping at the first chunk.
-            let declared_boundary = request.and_then(|request| request.managed_snapshot_boundary());
-            let boundary_publication = declared_boundary.is_some()
+            let declared_boundaries = request
+                .map(|request| {
+                    [
+                        request.managed_preamble_boundary(),
+                        request.managed_snapshot_boundary(),
+                    ]
+                })
+                .unwrap_or_default();
+            let declared_boundary = declared_boundaries.iter().any(Option::is_some);
+            let boundary_publication = declared_boundary
                 && session_generation == ManagedSessionGeneration::INITIAL
                 && target_committed_tokens > 1
                 && request.is_some_and(|request| {
@@ -2669,15 +2682,18 @@ impl ManagedKvCacheManager {
                 )?;
                 if !publications.is_empty() {
                     // Without a declared boundary keep the DS1.2b rule (any
-                    // aligned commit of an eligible span). With one, only
-                    // the span ending on the boundary's interval floor
-                    // snapshots: each snapshot is the full hybrid state.
+                    // aligned commit of an eligible span). With them, only a
+                    // span ending on a boundary's interval floor (first turn
+                    // or history) snapshots: each snapshot is the full
+                    // hybrid state.
                     let snapshot = match (declared_boundary, &snapshot_sharing) {
-                        (None, _) => true,
-                        (Some(boundary), Some((_, _, interval))) if *interval > 0 => {
-                            target_committed_tokens == boundary - boundary % *interval
+                        (false, _) => true,
+                        (true, Some((_, _, interval))) if *interval > 0 => {
+                            declared_boundaries.iter().flatten().any(|boundary| {
+                                target_committed_tokens == boundary - boundary % *interval
+                            })
                         }
-                        (Some(_), _) => false,
+                        (true, _) => false,
                     };
                     pending_prefixes.push(PendingPrefixCommit {
                         arena: group.arena,
@@ -4881,10 +4897,12 @@ fn prefix_enabled_for_domain(
     domain_id: crate::kv::CacheDomainId,
 ) -> bool {
     // Only paged-attention domains route through the token-page index below.
-    // For a hybrid contract the paged attach is sound only when the tensor
-    // domains can fork their committed snapshots at the same cursor, so the
-    // strict sharing gate must accept the whole contract; contracts without
-    // tensor domains keep the plain paged behavior.
+    // For a hybrid contract the paged attach is sound only when every other
+    // domain can fork its committed state at the same cursor, so the strict
+    // sharing gate must accept the whole contract; only paged-only contracts
+    // keep the plain paged behavior. A ring (LFM2 ShortConv), append or
+    // static domain has no snapshot fork path, so attaching pages beside it
+    // would continue from a reset ring at cursor N.
     let paged_shareable = contract.domains.iter().any(|domain| {
         if domain.id() != domain_id {
             return false;
@@ -4897,12 +4915,12 @@ fn prefix_enabled_for_domain(
     if !paged_shareable {
         return false;
     }
-    let tensor_domains = contract
+    let stateful_domains = contract
         .domains
         .iter()
-        .filter(|domain| matches!(domain, StateDomainSpec::Tensor(_)))
+        .filter(|domain| !matches!(domain, StateDomainSpec::PagedAttention(_)))
         .count();
-    tensor_domains == 0 || tensor_snapshot_prefix_policy(contract).is_some()
+    stateful_domains == 0 || tensor_snapshot_prefix_policy(contract).is_some()
 }
 
 fn sliding_window_for_domain(
@@ -6349,7 +6367,7 @@ mod tests {
                     8,
                     8,
                     1,
-                    PortableFitHeadroom::Planning,
+                    PortableFitHeadroom::Planning { minimum_tokens: 0 },
                 )
                 .unwrap(),
             4_096
@@ -6370,11 +6388,30 @@ mod tests {
                 8,
                 8,
                 2,
-                PortableFitHeadroom::Planning,
+                PortableFitHeadroom::Planning { minimum_tokens: 0 },
             )
             .unwrap();
         assert!(selected < 4_096);
         assert!(selected >= 64);
+
+        // With a chat floor the same squeeze is a capacity refusal (503),
+        // not a published sub-floor context; a floor that fits is honoured.
+        let floored = |minimum_tokens| {
+            duplicated.fit_portable_logical_token_reach(
+                ModelInstanceId::new(902),
+                &contract,
+                40_960,
+                RESERVE,
+                64,
+                8,
+                8,
+                2,
+                PortableFitHeadroom::Planning { minimum_tokens },
+            )
+        };
+        assert!(matches!(floored(4_096), Err(Error::Overloaded(_))));
+        let reach = floored(1_024).unwrap();
+        assert!((1_024..4_096).contains(&reach), "{reach}");
     }
 
     /// ASR state fits spend live memory, not only ledger headroom: with the
@@ -6447,7 +6484,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
+        assert_eq!(fit(PortableFitHeadroom::Planning { minimum_tokens: 0 }), 4_096);
         let live = fit(PortableFitHeadroom::Live {
             minimum_tokens: 0,
             reserve: StateFitReserve::MeasuredUntracked,
@@ -6870,6 +6907,82 @@ mod tests {
             cuda_contiguous_replacement_required_bytes(65_536, &paged, TENSOR_BYTES).unwrap()
                 > exact_resident
         );
+    }
+
+    /// A paged attach beside an un-snapshotted ShortConv ring would restart
+    /// the ring at zero at cursor N. Even if LFM2's attention domain opted
+    /// into committed-page sharing, the gate must refuse it.
+    #[test]
+    fn prefix_gate_rejects_paged_attach_beside_an_unsnapshotted_ring() {
+        let config = crate::models::architectures::lfm2::config::Lfm2BackboneConfig {
+            architecture: "lfm2".into(),
+            block_count: 4,
+            context_length: 64,
+            embedding_length: 16,
+            embedding_length_out: None,
+            feed_forward_length: Some(32),
+            attention_head_count: 4,
+            attention_head_count_kv: vec![0, 2, 0, 2],
+            attention_layer_norm_rms_epsilon: 1e-5,
+            attention_sliding_window: None,
+            rope_freq_base: 1_000_000.0,
+            shortconv_l_cache: 3,
+        };
+        let mut contract =
+            crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(
+                &config,
+                crate::kv::v2::StateDType::F32,
+            )
+            .unwrap();
+        let mut attention = None;
+        for domain in &mut contract.domains {
+            if let StateDomainSpec::PagedAttention(spec) = domain {
+                spec.header.prefix = PrefixPolicy::CommittedPages {
+                    positions: crate::kv::v2::PositionSemantics::Absolute,
+                };
+                attention = Some(spec.header.id);
+            }
+        }
+        let attention = attention.expect("LFM2 has a paged attention domain");
+        assert!(contract
+            .domains
+            .iter()
+            .any(|domain| matches!(domain, StateDomainSpec::Ring(_))));
+        assert!(!prefix_enabled_for_domain(&contract, attention));
+        // A paged-only contract keeps plain paged sharing.
+        let paged_only = crate::kv::v2::test_contract();
+        assert!(prefix_enabled_for_domain(
+            &paged_only,
+            paged_only.domains[0].id()
+        ));
+    }
+
+    /// LFM2.5 chat on CUDA fits one 32K context (6 attention layers x 8 KV
+    /// heads x 64 x K/V x F16 = 12,288 B/token, 64-token pages) instead of
+    /// growing a 128K arena: the whole context fits a small GPU after the
+    /// context reserve, and a tighter budget yields a smaller reach rather
+    /// than an overcommitted arena.
+    #[test]
+    fn lfm25_chat_cuda_fit_is_bounded_by_one_context() {
+        let paged = [CudaContiguousPagedGeometry {
+            page_tokens: 64,
+            bytes_per_page: 64 * 12_288,
+        }];
+        // Ring state for 95 retained + 8 staged rows (10 layers x 3 x 2048 x F32).
+        let fixed = 103 * 245_760;
+        let one_context = cuda_resident_required_bytes(32_768, &paged, fixed).unwrap();
+        assert_eq!(one_context, 402_653_184 + fixed);
+        // A 6 GiB GPU after ~1.4 GB of weights and a 1 GiB context reserve.
+        let roomy = 6 * 1024 * 1024 * 1024 - 1_400_000_000 - 1024 * 1024 * 1024;
+        assert_eq!(
+            fit_cuda_resident_token_reach(32_768, 64, &paged, fixed, roomy).unwrap(),
+            32_768
+        );
+        // A crowded device: the reach shrinks and still fits.
+        let tight = 300 * 1024 * 1024;
+        let tokens = fit_cuda_resident_token_reach(32_768, 64, &paged, fixed, tight).unwrap();
+        assert!((4_096..32_768).contains(&tokens), "{tokens}");
+        assert!(cuda_resident_required_bytes(tokens, &paged, fixed).unwrap() <= tight);
     }
 
     #[test]

@@ -185,9 +185,8 @@ explicitly rejected because that shared path only supports penalties of 1 or
 higher. Default direct generation remains greedy. The default greedy batched
 path retains packed token readback; sampled rows retain independent RNG history.
 Sampler, incremental UTF-8 decoder and prefill cursor are part of rollback.
-Automatic prompt policy no longer adds new system instructions on the second
-turn; explicit system messages and `IZWI_LFM2_DEFAULT_SYSTEM_POLICY=always` remain
-available.
+The prompt is rendered exactly like the checkpoint's chat template: one BOS, a
+system turn only when the request sends one, and no extra instructions.
 
 `IZWI_LFM2_DIAGNOSTICS=1` additionally checks intermediate norms, projections,
 attention, recurrent convolution and MLP outputs. It logs layer/row/position,

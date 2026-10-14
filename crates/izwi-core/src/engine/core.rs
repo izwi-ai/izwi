@@ -559,10 +559,53 @@ impl LifecycleRetryPolicy {
     }
 }
 
+/// The context a chat model needs to be useful on CPU and Metal: below it a
+/// load is refused (503) instead of publishing, say, a 64-token context that
+/// rejects every real prompt.
+const CHAT_MINIMUM_CONTEXT_TOKENS: u64 = 4_096;
+
+/// How a chat model's CUDA KV pool is sized at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaResidentPool {
+    /// No resident fit: the arena grows on demand up to the model context.
+    Disabled,
+    /// A materialized arena of at most one model context, fitted to device
+    /// headroom after the CUDA context reserve and decode workspace. For
+    /// small models that share the GPU.
+    OneContext,
+    /// Like [`Self::OneContext`], but with incremental CUDA chat the pool may
+    /// cover every retained row's context, up to device headroom.
+    RetainedRows,
+}
+
 fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
     if let Some(value) = value {
         let value = value.max(0.0);
         *target = Some(target.unwrap_or(0.0) + value);
+    }
+}
+
+/// A completed chat row reports `MaxTokens` when it spent its whole budget.
+///
+/// The output processor maps every completed disposition to `StopToken`, so
+/// a reply cut off at `max_tokens` would read as a natural stop. Every chat
+/// family counts only emitted tokens (stop tokens are never counted), and the
+/// request's `max_tokens` is already bounded by the remaining context, so a
+/// row whose count reached the budget was cut off.
+fn chat_budget_finish_reason(
+    reason: Option<OutputFinishReason>,
+    task_type: super::types::TaskType,
+    max_tokens: usize,
+    generated: usize,
+) -> Option<OutputFinishReason> {
+    if reason == Some(OutputFinishReason::StopToken)
+        && task_type == super::types::TaskType::Chat
+        && max_tokens > 0
+        && generated >= max_tokens
+    {
+        Some(OutputFinishReason::MaxTokens)
+    } else {
+        reason
     }
 }
 
@@ -5126,6 +5169,14 @@ impl EngineCore {
                     engine_output.num_tokens = resolved_total;
                     engine_output.token_stats.generated_tokens = resolved_total;
                 }
+                if let Some(request) = self.requests.get(&request_id) {
+                    engine_output.finish_reason = chat_budget_finish_reason(
+                        engine_output.finish_reason,
+                        request.task_type,
+                        request.params.max_tokens,
+                        engine_output.num_tokens,
+                    );
+                }
             }
             if Self::has_user_visible_output(&exec_output) {
                 if let Some(phase) = self.request_phase_timings.get_mut(&request_id) {
@@ -5638,7 +5689,7 @@ impl EngineCore {
             capability,
             logical_context_tokens,
             None,
-            false,
+            CudaResidentPool::Disabled,
             0,
         )
     }
@@ -5666,7 +5717,7 @@ impl EngineCore {
         capability: &crate::kv::InferenceStateCapability,
         logical_context_tokens: Option<usize>,
         staged_transaction_rows: Option<u32>,
-        fit_cuda_resident_context: bool,
+        cuda_resident_pool: CudaResidentPool,
         decode_workspace_reserve_bytes: u64,
     ) -> Result<Option<Arc<super::ManagedKvModelRuntime>>> {
         let Some(contract) = capability.managed_contract() else {
@@ -5675,7 +5726,8 @@ impl EngineCore {
         let backend = self.managed_kv_cache.worker_backend();
         let retained_sequence_rows = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
-        let fit_cuda_resident_context = backend == BackendKind::Cuda && fit_cuda_resident_context;
+        let fit_cuda_resident_context =
+            backend == BackendKind::Cuda && cuda_resident_pool != CudaResidentPool::Disabled;
         let staged_transaction_rows = staged_transaction_rows.unwrap_or(
             u32::try_from(self.config.max_staged_transactions).map_err(|_| {
                 Error::InvalidInput("managed state transaction limit exceeds u32".into())
@@ -5690,7 +5742,8 @@ impl EngineCore {
                 })?;
                 let context = u64::try_from(context)
                     .map_err(|_| Error::ModelLoadError("model context exceeds u64".into()))?;
-                let incremental = self.config.cuda_incremental_chat_enabled();
+                let incremental = self.config.cuda_incremental_chat_enabled()
+                    && cuda_resident_pool == CudaResidentPool::RetainedRows;
                 let automatic_rows = self.config.automatic_row_limits.retained_sequences;
                 let context_reserve_bytes = self
                     .config
@@ -5753,7 +5806,9 @@ impl EngineCore {
                         contract,
                         logical_context_tokens,
                         1,
-                        PortableFitHeadroom::Planning,
+                        PortableFitHeadroom::Planning {
+                            minimum_tokens: CHAT_MINIMUM_CONTEXT_TOKENS,
+                        },
                     )?,
                     retained_sequence_rows,
                     staged_transaction_rows,
@@ -5924,7 +5979,7 @@ impl EngineCore {
             logical_context_tokens,
             1,
             (retained_rows, staged_rows),
-            PortableFitHeadroom::Planning,
+            PortableFitHeadroom::Planning { minimum_tokens: 0 },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -7148,6 +7203,31 @@ mod tests {
             .expect("model instance");
         bind_managed_test_state(core, &mut request, model_instance);
         request
+    }
+
+    #[test]
+    fn chat_rows_that_spend_their_budget_report_max_tokens() {
+        use super::super::types::FinishReason;
+        let stop = Some(FinishReason::StopToken);
+        assert_eq!(
+            chat_budget_finish_reason(stop, TaskType::Chat, 128, 128),
+            Some(FinishReason::MaxTokens)
+        );
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 128, 127), stop);
+        // Only chat budgets count tokens; other tasks and terminal kinds keep
+        // their reason.
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::TTS, 8, 8), stop);
+        for reason in [
+            Some(FinishReason::Aborted),
+            Some(FinishReason::Error),
+            None,
+        ] {
+            assert_eq!(
+                chat_budget_finish_reason(reason, TaskType::Chat, 8, 8),
+                reason
+            );
+        }
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 0, 0), stop);
     }
 
     #[test]

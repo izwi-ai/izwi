@@ -10,23 +10,35 @@ pub(crate) fn enabled() -> bool {
 /// Reduce on the tensor's device; only one byte crosses the device boundary.
 /// NaN comparisons are false, and abs(infinity) is not less than infinity.
 pub(crate) fn validate_finite(tensor: &Tensor, stage: &str) -> Result<()> {
-    if tensor.elem_count() == 0 {
-        return Err(Error::InferenceError(format!("{stage}: empty tensor")));
+    if finite_flag(tensor)?.to_vec1::<f32>()?[0] == 0.0 {
+        return Err(non_finite_error(tensor, stage));
     }
-    let finite = tensor
+    Ok(())
+}
+
+/// The finite check left on the device: a `[1]` F32 tensor that is 1 when
+/// every value of `tensor` is finite and 0 otherwise, for a caller to read
+/// back together with other per-step values in one synchronization.
+pub(crate) fn finite_flag(tensor: &Tensor) -> Result<Tensor> {
+    if tensor.elem_count() == 0 {
+        return Err(Error::InferenceError("finite check of an empty tensor".into()));
+    }
+    tensor
         .abs()?
         .lt(f64::INFINITY)?
         .min_all()?
-        .to_scalar::<u8>()?;
-    if finite == 0 {
-        return Err(Error::InferenceError(format!(
-            "{stage}: non-finite values (NaN or infinity), shape {:?}, dtype {:?}, device {:?}",
-            tensor.dims(),
-            tensor.dtype(),
-            tensor.device().location()
-        )));
-    }
-    Ok(())
+        .to_dtype(candle_core::DType::F32)?
+        .reshape(1)
+        .map_err(Error::from)
+}
+
+pub(crate) fn non_finite_error(tensor: &Tensor, stage: &str) -> Error {
+    Error::InferenceError(format!(
+        "{stage}: non-finite values (NaN or infinity), shape {:?}, dtype {:?}, device {:?}",
+        tensor.dims(),
+        tensor.dtype(),
+        tensor.device().location()
+    ))
 }
 
 pub(crate) fn check(tensor: &Tensor, stage: &str, position: usize) -> Result<()> {

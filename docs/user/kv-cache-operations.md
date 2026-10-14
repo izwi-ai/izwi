@@ -92,6 +92,16 @@ The raw namespace is deliberately omitted from health output. A non-null
 provider fallback. If policy resolution cannot preserve at least one
 maximum-length request, startup fails.
 
+The policy's `dtype` is the configured default. Each model's state contract
+picks the storage its kernels support, so a loaded model can store its KV in
+another dtype. For example, LFM2.5 chat stores F16 KV on Metal and CUDA and
+F32 on CPU. The storage a model actually uses is reported per loaded model in
+`runtime.loaded_models[].kv_storage`:
+
+```json
+"kv_storage": [{ "domain": 1, "page_tokens": 64, "dtype": "f16" }]
+```
+
 ## Prefix isolation and capacity
 
 The server engages prefix reuse in catalog-auto mode by default: a model

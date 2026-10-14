@@ -1,18 +1,13 @@
 //! Physical state contracts shared by the LFM2 chat and audio capabilities.
 
-use crate::engine::StageDescriptor;
 use crate::error::{Error, Result};
 use crate::kv::v2::{
-    stage_graph_fingerprint, AttentionMask, AttentionPattern, BoundedShape,
-    CapabilityStateDescriptorV2, CheckpointPolicy, ComponentShapeInstantiation, DomainStepIntent,
-    InferenceStateContract, InvocationLeaseScope, InvocationStageWorkspace,
-    InvocationStateCapacity, InvocationWorkspaceDomain, InvocationWorkspaceProfile,
-    InvocationWorkspaceSet, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
-    PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy, RetainedStateCapability,
-    RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
+    AttentionMask, AttentionPattern, BoundedShape,
+    CheckpointPolicy, ComponentShapeInstantiation, DomainStepIntent,
+    InferenceStateContract, KeyEncoding, PageSizeConstraint, PagedAttentionDomainSpec,
+    PagedAttentionLayerSpec, PlacementPolicy, PrefixPolicy, RingStateDomainSpec, ShapeAxis, ShapeDimension, ShapeDimensionValue, ShapeExtent, StateClock,
     StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec, StateGroupId,
-    StateGroupSpec, StateScope, StateUpdateKind, TensorComponentSpec, TensorRole, WorkspaceFormula,
-    CURRENT_INFERENCE_STATE_ABI,
+    StateGroupSpec, StateScope, StateUpdateKind, TensorComponentSpec, TensorRole, CURRENT_INFERENCE_STATE_ABI,
 };
 use crate::models::shared::attention::paged::default_kv_page_size;
 
@@ -35,12 +30,6 @@ impl Lfm2StateIds {
         shortconv: LFM2_SHORTCONV_STATE_DOMAIN,
         main_group: LFM2_MAIN_STATE_GROUP,
     };
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Lfm2PhysicalStateSpec {
-    pub(crate) descriptor: CapabilityStateDescriptorV2,
-    pub(crate) invocation: InferenceStateContract,
 }
 
 /// Canonical mapping between loaded LFM layers and physical state ordinals.
@@ -141,119 +130,12 @@ impl Lfm2StateLayout {
     }
 }
 
-pub(crate) fn lfm2_physical_state_spec(
-    config: &Lfm2BackboneConfig,
-    stage_graphs: &[&[StageDescriptor]],
-) -> Result<Lfm2PhysicalStateSpec> {
-    if stage_graphs.is_empty() {
-        return Err(Error::ModelLoadError(
-            "LFM2 physical state has no execution graph".into(),
-        ));
-    }
-    let layout = Lfm2StateLayout::from_config(config)?;
-    let invocation = lfm2_main_invocation_contract(config, &layout, Lfm2StateIds::CANONICAL)?;
-    let max_tokens = u64::try_from(config.context_length)
-        .map_err(|_| Error::ModelLoadError("LFM2 context exceeds u64".into()))?;
-    let max_domain_id = invocation
-        .domains
-        .iter()
-        .map(|domain| domain.id().get())
-        .max()
-        .ok_or_else(|| Error::ModelLoadError("LFM2 invocation contract is empty".into()))?;
-
-    let mut profiles = Vec::with_capacity(stage_graphs.len());
-    for stages in stage_graphs {
-        let mut ordered = stages.iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|stage| stage.id);
-        let mut invocation_stages = Vec::with_capacity(ordered.len());
-        for (index, stage) in ordered.into_iter().enumerate() {
-            let mut domains = invocation
-                .domains
-                .iter()
-                .cloned()
-                .map(|state| {
-                    let (fixed_bytes, capacity) = match &state {
-                        StateDomainSpec::PagedAttention(_) => (
-                            paged_f32_invocation_bytes(&state, max_tokens)?,
-                            InvocationStateCapacity::decoder_context(max_tokens)?,
-                        ),
-                        StateDomainSpec::Ring(_) => (
-                            ring_f32_invocation_bytes(&state)?,
-                            InvocationStateCapacity::SemanticBounded,
-                        ),
-                        _ => {
-                            return Err(Error::ModelLoadError(
-                                "LFM2 invocation contract contains an unsupported state kind"
-                                    .into(),
-                            ));
-                        }
-                    };
-                    Ok(InvocationWorkspaceDomain::State {
-                        placement: state.header().placement,
-                        formula: WorkspaceFormula {
-                            fixed_bytes,
-                            dimensions: vec![],
-                            terms: vec![],
-                        },
-                        state,
-                        capacity,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if stage.max_workspace_bytes > 0 {
-                let scratch_id = max_domain_id
-                    .checked_add(u32::try_from(index + 1).map_err(|_| {
-                        Error::ModelLoadError("LFM2 execution stage count exceeds u32".into())
-                    })?)
-                    .ok_or_else(|| {
-                        Error::ModelLoadError("LFM2 scratch domain id overflow".into())
-                    })?;
-                domains.push(InvocationWorkspaceDomain::Scratch {
-                    id: StateDomainId::new(scratch_id),
-                    placement: PlacementPolicy::BackendLocal,
-                    alignment_bytes: 64,
-                    zero_on_release: false,
-                    formula: WorkspaceFormula {
-                        fixed_bytes: stage.max_workspace_bytes,
-                        dimensions: vec![],
-                        terms: vec![],
-                    },
-                });
-            }
-            invocation_stages.push(InvocationStageWorkspace {
-                stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
-                groups: invocation.groups.clone(),
-                domains,
-            });
-        }
-        profiles.push(InvocationWorkspaceProfile {
-            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
-            stages: invocation_stages,
-        });
-    }
-    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
-    profiles.dedup();
-    let descriptor = CapabilityStateDescriptorV2 {
-        abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Stateless,
-        invocation: InvocationWorkspaceSet::Bounded { profiles },
-    };
-    for stages in stage_graphs {
-        descriptor.validate_against_stages(stages)?;
-    }
-    Ok(Lfm2PhysicalStateSpec {
-        descriptor,
-        invocation,
-    })
-}
-
 pub(crate) fn lfm2_main_invocation_contract(
     config: &Lfm2BackboneConfig,
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
-    lfm2_main_contract(config, layout, ids, invocation_header)
+    lfm2_main_contract(config, layout, ids, invocation_header, StateDType::F32)
 }
 
 /// Scheduler-owned cache contract for incremental LFM2 chat.
@@ -261,12 +143,20 @@ pub(crate) fn lfm2_main_invocation_contract(
 /// The semantic domains intentionally remain identical to the invocation
 /// contract shared with LFM2.5 Audio. Only their lifetime, placement, and
 /// checkpoint policy change so paged attention and ShortConv advance under one
-/// retained row transaction.
+/// retained row transaction. `kv_dtype` is the paged KV storage; activations
+/// stay F32 and the attention call sites cast to and from it.
 pub(crate) fn lfm2_managed_cache_contract(
     config: &Lfm2BackboneConfig,
+    kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
     let layout = Lfm2StateLayout::from_config(config)?;
-    lfm2_main_contract(config, &layout, Lfm2StateIds::CANONICAL, retained_header)
+    lfm2_main_contract(
+        config,
+        &layout,
+        Lfm2StateIds::CANONICAL,
+        retained_header,
+        kv_dtype,
+    )
 }
 
 fn lfm2_main_contract(
@@ -274,6 +164,7 @@ fn lfm2_main_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
     header: fn(StateDomainId, StateClock) -> StateDomainHeader,
+    kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
@@ -319,7 +210,7 @@ fn lfm2_main_contract(
             max_tokens: preferred_tokens.max(256),
             multiple_of: 1,
         },
-        accepted_dtypes: vec![StateDType::F32],
+        accepted_dtypes: vec![kv_dtype],
     });
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
@@ -473,13 +364,7 @@ pub(crate) fn ring_f32_invocation_bytes(state: &StateDomainSpec) -> Result<u64> 
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::engine::{
-        ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
-        StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
-    };
 
     fn config() -> Lfm2BackboneConfig {
         Lfm2BackboneConfig {
@@ -541,7 +426,7 @@ mod tests {
 
     #[test]
     fn managed_contract_declares_one_transactional_retained_paged_ring_group() {
-        let contract = lfm2_managed_cache_contract(&config()).unwrap();
+        let contract = lfm2_managed_cache_contract(&config(), StateDType::F32).unwrap();
         assert_eq!(contract.domains.len(), 2);
         assert_eq!(contract.groups.len(), 1);
         assert_eq!(
@@ -594,66 +479,6 @@ mod tests {
                 ]
                 && component.accepted_dtypes == vec![StateDType::F32]
         }));
-    }
-
-    #[test]
-    fn physical_spec_declares_one_atomic_paged_and_ring_group() {
-        let stage = StageDescriptor {
-            id: StageId::new(1),
-            name: "lfm2_decode".into(),
-            selector: StageWorkSelector::Atomic,
-            domain: ExecutionDomain::ExecutionGroup,
-            progress: StageProgressKind::Atomic,
-            concurrency: ConcurrencyClass::Exclusive,
-            physical_launch_policy: crate::engine::PhysicalLaunchPolicy::ExecutionGroupExclusive,
-            batch_mode: NativeBatchMode::None,
-            max_batch_size: 1,
-            max_work_units: 1,
-            workspace_base_bytes: 256,
-            workspace_per_row_bytes: 0,
-            workspace_per_work_unit_bytes: 0,
-            max_workspace_bytes: 256,
-            max_padding_basis_points: 0,
-            max_formation_delay: Duration::ZERO,
-            shape_policy: StageShapePolicy::Exact,
-            membership_safe_point: MembershipSafePoint::OperationBoundary,
-            output_visibility: OutputVisibility::AfterQuantumCommit,
-            retained_state_selections: None,
-        };
-        let spec = lfm2_physical_state_spec(&config(), &[&[stage]]).unwrap();
-        assert_eq!(spec.invocation.domains.len(), 2);
-        assert_eq!(
-            spec.invocation.groups[0].domains,
-            vec![LFM2_ATTENTION_STATE_DOMAIN, LFM2_SHORTCONV_STATE_DOMAIN]
-        );
-        assert!(spec.invocation.domains.iter().all(|domain| {
-            domain.header().scope == StateScope::Invocation
-                && domain.header().placement == PlacementPolicy::BackendLocal
-                && domain.header().checkpoint == CheckpointPolicy::None
-        }));
-        let StateDomainSpec::PagedAttention(attention) = &spec.invocation.domains[0] else {
-            panic!("first domain must be paged attention");
-        };
-        assert_eq!(
-            attention
-                .layers
-                .iter()
-                .map(|layer| layer.model_layer)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert!(attention.layers.iter().all(|layer| {
-            layer.pattern == AttentionPattern::SlidingWindow { window_tokens: 8 }
-        }));
-        assert_eq!(
-            paged_f32_invocation_bytes(&spec.invocation.domains[0], 17).unwrap(),
-            32_768
-        );
-        let StateDomainSpec::Ring(shortconv) = &spec.invocation.domains[1] else {
-            panic!("second domain must be ShortConv ring");
-        };
-        assert_eq!(shortconv.capacity_steps, 3);
-        assert_eq!(shortconv.components_per_step.len(), 3);
     }
 
     #[test]

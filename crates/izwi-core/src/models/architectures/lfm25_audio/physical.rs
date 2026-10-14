@@ -237,7 +237,7 @@ pub(crate) fn lfm25_audio_retained_state_spec(
             "LFM2.5 Audio retained state has no execution graph".into(),
         ));
     }
-    let retained = lfm2_managed_cache_contract(main_config)?;
+    let retained = lfm2_managed_cache_contract(main_config, StateDType::F32)?;
     let retained_max_tokens = main_config.context_length;
     let main_invocation = (mode == Lfm25AudioRetainedMode::Asr)
         .then(|| {

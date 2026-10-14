@@ -185,7 +185,7 @@ fn select(
 }
 
 #[test]
-fn lfm2_decode_rejects_nonfinite_logits_before_selecting_pad() {
+fn lfm2_decode_rejects_nonfinite_logits_and_never_selects_pad() {
     let model = tiny_lfm_model();
     for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         for index in [0, 3, 6] {
@@ -199,11 +199,13 @@ fn lfm2_decode_rejects_nonfinite_logits_before_selecting_pad() {
             assert!(state.generated_ids.is_empty());
         }
     }
+    // A finite pad peak is masked out, never selected.
     let mut state = new_state(&model, ChatGenerationConfig::default());
-    let error = select(&model, &mut state, 0)
-        .expect_err("reject finite pad")
-        .to_string();
-    assert!(error.contains("non-generatable"), "{error}");
+    let mut values = [-1000f32; 7];
+    values[0] = 1000.;
+    values[3] = 0.;
+    assert_eq!(inject(&model, &mut state, &values).unwrap().delta, "a");
+    assert!(!state.generated_ids.contains(&0));
 }
 
 #[test]
@@ -231,6 +233,44 @@ fn lfm2_decode_rejects_empty_eos_and_honors_configured_stop() {
     assert_eq!(end.text, "a");
     assert_eq!(end.tokens_generated, 1);
     assert_eq!(state.stop_reason(), Some("configured_stop"));
+}
+
+#[test]
+fn lfm2_never_selects_a_control_token_greedy_or_sampled() {
+    let model = tiny_lfm_model();
+    // <|pad|> (0) and <|im_start|> (1) are control tokens; the best
+    // generatable id is 4 ("b").
+    let logits = [9., 8., -1000., 1., 2., -1000., -1000.];
+    let sampled = ChatGenerationConfig {
+        temperature: 1.0,
+        top_k: 3,
+        seed: 7,
+        ..Default::default()
+    };
+    for config in [ChatGenerationConfig::default(), sampled] {
+        for _ in 0..8 {
+            let mut state = new_state(&model, config.clone());
+            let step = inject(&model, &mut state, &logits).expect("control ids are masked");
+            assert!(matches!(step.delta.as_str(), "a" | "b"), "{}", step.delta);
+        }
+    }
+    let mut greedy = new_state(&model, ChatGenerationConfig::default());
+    assert_eq!(inject(&model, &mut greedy, &logits).unwrap().delta, "b");
+}
+
+#[test]
+fn lfm2_json_constrained_rows_never_take_the_batched_argmax() {
+    let model = tiny_lfm_model();
+    let plain = new_state(&model, ChatGenerationConfig::default());
+    assert!(plain.greedy);
+    let json = new_state(
+        &model,
+        ChatGenerationConfig {
+            constrain_json_object: true,
+            ..Default::default()
+        },
+    );
+    assert!(!json.greedy);
 }
 
 #[test]
@@ -301,6 +341,31 @@ fn lfm2_prefill_quantum_rollback_restores_progress_and_can_retry() {
         .continue_resumable_prefill_managed(&mut state, &[3, 4], 0, 1)
         .unwrap();
     assert_eq!(state.prefill_progress(), 1);
+}
+
+#[test]
+fn lfm2_repetition_loop_finishes_with_its_text_instead_of_failing() {
+    let model = tiny_lfm_model();
+    let mut state = model
+        .begin_resumable_prefill_state_managed(
+            &[3],
+            1024,
+            &ChatGenerationConfig::default(),
+            cache(),
+        )
+        .unwrap();
+    let mut last = None;
+    for step in 0..1024 {
+        let result = select(&model, &mut state, 3 + step % 2).expect("a loop is not an error");
+        if result.finished {
+            last = Some(result);
+            break;
+        }
+    }
+    let last = last.expect("the loop guard stops the reply");
+    assert_eq!(state.stop_reason(), Some("repetition"));
+    assert!(last.tokens_generated >= 256 && last.tokens_generated < 1024);
+    assert!(last.text.starts_with("abab"), "{}", last.text);
 }
 
 #[cfg(feature = "cuda")]
