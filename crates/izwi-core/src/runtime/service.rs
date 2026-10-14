@@ -3286,6 +3286,11 @@ impl RuntimeService {
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
+        // Model contracts read the page grid when they load; publish the one
+        // the engine uses so the two can never disagree.
+        crate::models::shared::attention::paged::publish_configured_kv_page_size(
+            core_config.block_size,
+        );
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();

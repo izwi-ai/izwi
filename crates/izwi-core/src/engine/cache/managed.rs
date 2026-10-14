@@ -1504,6 +1504,14 @@ impl ManagedKvCacheManager {
                     .interval_steps
                     .is_multiple_of(u64::from(group.page_tokens))
             {
+                // Hybrid prefix reuse is unusable without snapshots, so say
+                // why instead of silently serving every turn cold.
+                tracing::warn!(
+                    ?model_instance,
+                    snapshot_interval_tokens = policy.interval_steps,
+                    page_tokens = group.page_tokens,
+                    "Recurrent-state snapshot interval is not a multiple of the KV page size; hybrid prefix reuse is disabled for this model"
+                );
                 return None;
             }
             Some(TensorSnapshotSharing {
