@@ -2916,7 +2916,10 @@ fn try_apply_rope_pair_thd(
     }));
     match kernel_result {
         Ok(Ok((q_out, k_out))) => Ok(Some((q_out, k_out))),
-        Ok(Err(_)) | Err(_) => Ok(None),
+        failure => {
+            crate::models::shared::telemetry::report_kernel_fallback("qwen3.rope", &failure);
+            Ok(None)
+        }
     }
 }
 

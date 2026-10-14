@@ -3890,7 +3890,10 @@ fn try_apply_granite_rope_pair_bhtd(
     }));
     match kernel_result {
         Ok(Ok((q_out, k_out))) => Ok(Some((q_out, k_out))),
-        Ok(Err(_)) | Err(_) => Ok(None),
+        failure => {
+            crate::models::shared::telemetry::report_kernel_fallback("granite.rope_bshd", &failure);
+            Ok(None)
+        }
     }
 }
 
@@ -3907,7 +3910,10 @@ fn try_apply_granite_rope_pair_thd(
     }));
     match kernel_result {
         Ok(Ok((q_out, k_out))) => Ok(Some((q_out, k_out))),
-        Ok(Err(_)) | Err(_) => Ok(None),
+        failure => {
+            crate::models::shared::telemetry::report_kernel_fallback("granite.rope_thd", &failure);
+            Ok(None)
+        }
     }
 }
 

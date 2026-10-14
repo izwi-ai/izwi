@@ -4123,7 +4123,10 @@ fn try_apply_rope_thd(
 
     match kernel_result {
         Ok(Ok((query_rot, key_rot))) => Ok(Some((query_rot, key_rot))),
-        Ok(Err(_)) | Err(_) => Ok(None),
+        failure => {
+            crate::models::shared::telemetry::report_kernel_fallback("qwen36moe.rope", &failure);
+            Ok(None)
+        }
     }
 }
 
