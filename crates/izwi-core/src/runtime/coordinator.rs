@@ -2531,19 +2531,41 @@ impl DeviceCapacityProbe {
     }
 
     fn apply_cap(&self, total: u64, available: u64) -> (u64, u64) {
-        Self::apply_optional_cap(self.configured_cap, total, available)
+        match self.backend {
+            BackendKind::Cpu => Self::apply_host_budget(self.configured_cap, total, available),
+            BackendKind::Metal | BackendKind::Cuda => {
+                Self::apply_optional_cap(self.configured_cap, total, available)
+            }
+        }
     }
 
     fn apply_host_cap(&self, total: u64, available: u64) -> (u64, u64) {
-        Self::apply_optional_cap(self.configured_host_cap, total, available)
+        Self::apply_host_budget(self.configured_host_cap, total, available)
     }
 
+    /// A device budget shrinks by what is already in use on the device.
     fn apply_optional_cap(cap: Option<u64>, total: u64, available: u64) -> (u64, u64) {
         match cap {
             Some(cap) => {
                 let effective_total = total.min(cap);
                 let used = total.saturating_sub(available.min(total));
                 (effective_total, effective_total.saturating_sub(used))
+            }
+            None => (total, available),
+        }
+    }
+
+    /// Host memory samples are system-wide: memory other processes use is not
+    /// charged to this process's budget, or any busy host would leave a small
+    /// budget with nothing (a 2 GiB budget on a 16 GiB host with 12 GiB in use
+    /// elsewhere reported 0 bytes available). The budget bounds this process
+    /// through the ledger, which charges every reservation against it; the
+    /// live figure is the memory the OS has available, at most the budget.
+    fn apply_host_budget(cap: Option<u64>, total: u64, available: u64) -> (u64, u64) {
+        match cap {
+            Some(cap) => {
+                let effective_total = total.min(cap);
+                (effective_total, available.min(effective_total))
             }
             None => (total, available),
         }
@@ -3816,8 +3838,28 @@ Pages free: 10.\n";
         assert_eq!(probe.apply_cap(100, 70), (80, 50));
         assert_eq!(probe.apply_cap(100, 10), (80, 0));
         assert_eq!(probe.apply_cap(64, 40), (64, 40));
-        assert_eq!(probe.apply_host_cap(100, 70), (60, 30));
-        assert_eq!(probe.apply_host_cap(100, 10), (60, 0));
+        // Host memory is system-wide: the budget bounds what is available,
+        // and memory other processes use is not charged against it.
+        assert_eq!(probe.apply_host_cap(100, 70), (60, 60));
+        assert_eq!(probe.apply_host_cap(100, 10), (60, 10));
+    }
+
+    #[test]
+    fn configured_cpu_budget_is_not_charged_for_other_processes() {
+        let gib = 1024 * 1024 * 1024;
+        let probe = DeviceCapacityProbe {
+            backend: BackendKind::Cpu,
+            device: None,
+            configured_cap: Some(2 * gib),
+            configured_host_cap: None,
+            test_capacity: None,
+        };
+        // 16 GiB host with 4 GiB available: the 2 GiB budget is all available
+        // (it was 2 - 12 = 0 when other processes' 12 GiB counted against it).
+        assert_eq!(probe.apply_cap(16 * gib, 4 * gib), (2 * gib, 2 * gib));
+        // Less available than the budget: the OS figure wins.
+        assert_eq!(probe.apply_cap(16 * gib, gib), (2 * gib, gib));
+        assert_eq!(probe.apply_cap(gib, gib / 2), (gib, gib / 2));
     }
 
     #[test]
