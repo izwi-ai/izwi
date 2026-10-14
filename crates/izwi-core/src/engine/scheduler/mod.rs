@@ -1715,11 +1715,17 @@ impl Scheduler {
                 deferred_waiting.push(request_id);
                 continue;
             }
-            let prefix_start = metadata
-                .managed_prefix_cursor
-                .map(|cursor| cursor as usize)
-                .unwrap_or(0)
-                .min(metadata.prefill_tokens().saturating_sub(1));
+            // A full-prefill adapter always runs the whole prompt from position
+            // 0, so a probed prefix cursor only applies to resumable prefill.
+            let prefix_start = if full_prefill {
+                0
+            } else {
+                metadata
+                    .managed_prefix_cursor
+                    .map(|cursor| cursor as usize)
+                    .unwrap_or(0)
+                    .min(metadata.prefill_tokens().saturating_sub(1))
+            };
             let mut target_tokens = metadata.prefill_tokens().saturating_sub(prefix_start);
             let (chunk_threshold, prefill_budget) = self.prefill_chunk_for(
                 &metadata,
@@ -2370,6 +2376,15 @@ impl Scheduler {
     /// `None` when no prefix was probed, the probe was lost before prepare,
     /// or the request is no longer tracked — callers must treat absence as
     /// "no cached-prefix measurement", never as a zero measurement.
+    /// Shared prefix pages may only be attached to a request whose loaded
+    /// adapter resumes prefill above a non-zero cursor; a full-prefill request
+    /// recomputes its whole prompt from position 0.
+    pub(crate) fn admits_prefix_attach(&self, request_id: &RequestId) -> bool {
+        self.requests
+            .get(request_id)
+            .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental)
+    }
+
     pub(crate) fn managed_prefix_cursor(&self, request_id: &RequestId) -> Option<u32> {
         self.requests
             .get(request_id)
@@ -3730,6 +3745,51 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    #[test]
+    fn full_prefill_requests_ignore_a_probed_prefix_cursor() {
+        // H10: a probed cursor makes the first span start above zero. Only a
+        // resumable (incremental) adapter can run that span; a full-prefill
+        // adapter recomputes the whole prompt, so it must start at 0 and never
+        // be offered for prefix attach.
+        for (prefill, expected_start) in [(PrefillMode::Full, 0), (PrefillMode::Incremental, 64)] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 1,
+                max_tokens_per_step: 1024,
+                enable_chunked_prefill: false,
+                enable_adaptive_batching: false,
+                ..Default::default()
+            });
+            let mut request = build_request(TaskType::Chat, "probed", Priority::Normal);
+            request.prompt_tokens = (0..100).collect();
+            request.set_managed_prefix_cursor(Some(64));
+            assert!(scheduler.add_request(&request));
+            let epoch = scheduler
+                .get_sequence_id(&request.id)
+                .expect("request epoch");
+            let mut profile =
+                ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+            profile.prefill = prefill;
+            profile.incremental_decode = true;
+            assert!(scheduler
+                .update_execution_profile(&SessionKey::new(request.id.clone(), epoch), &profile));
+            assert_eq!(
+                scheduler.admits_prefix_attach(&request.id),
+                prefill == PrefillMode::Incremental
+            );
+
+            let scheduled = scheduler.schedule();
+            let prefill_row = scheduled
+                .prefill_requests
+                .iter()
+                .find(|row| row.request_id == request.id)
+                .unwrap_or_else(|| panic!("{prefill:?} prefill is scheduled"));
+            assert_eq!(
+                prefill_row.num_computed_tokens, expected_start,
+                "{prefill:?}"
+            );
+        }
     }
 
     #[test]

@@ -2922,24 +2922,18 @@ impl EngineCore {
                 continue;
             }
             let planned_work = plan.work.clone();
+            let incremental_admission = self.uses_incremental_chat_capacity(&request);
+            let prefix_attach = self.scheduler.admits_prefix_attach(&scheduled.request_id);
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
-                if self.uses_incremental_chat_capacity(&request) {
-                    self.managed_kv_cache.prepare_incremental(
-                        runtime,
-                        plan.plan_id,
-                        &plan.session,
-                        &planned_work,
-                        Some(&request),
-                    )
-                } else {
-                    self.managed_kv_cache.prepare(
-                        runtime,
-                        plan.plan_id,
-                        &plan.session,
-                        &planned_work,
-                        Some(&request),
-                    )
-                }
+                self.managed_kv_cache.prepare_row(
+                    runtime,
+                    plan.plan_id,
+                    &plan.session,
+                    &planned_work,
+                    Some(&request),
+                    incremental_admission,
+                    prefix_attach,
+                )
             }) {
                 Some(Ok(reservation)) => reservation,
                 None => None,
@@ -10328,7 +10322,11 @@ mod tests {
             .expect("healthy request committed its prefill");
         // The healthy row kept running while the oversized one failed: its
         // whole prompt is committed (decode steps may have advanced further).
-        assert!(snapshot.committed_tokens >= 4, "{}", snapshot.committed_tokens);
+        assert!(
+            snapshot.committed_tokens >= 4,
+            "{}",
+            snapshot.committed_tokens
+        );
     }
 
     #[tokio::test]

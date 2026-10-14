@@ -1629,7 +1629,32 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, false)
+        self.prepare_with_admission(runtime, txn_id, session, work, request, false, true)
+    }
+
+    /// Prepare one scheduled row. `prefix_attach` is false when the row's
+    /// adapter cannot resume prefill above a non-zero cursor: a full-prefill
+    /// row always runs its whole prompt from position 0, so attaching shared
+    /// prefix pages would hand it a cache that does not start empty.
+    pub(crate) fn prepare_row(
+        &mut self,
+        runtime: &ManagedKvModelRuntime,
+        txn_id: PlanId,
+        session: &SessionKey,
+        work: &WorkUnit,
+        request: Option<&EngineCoreRequest>,
+        incremental: bool,
+        prefix_attach: bool,
+    ) -> Result<Option<ManagedCacheReservation>> {
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            incremental,
+            prefix_attach,
+        )
     }
 
     /// DS1.5: read-only admission probe for the managed prefix cursor.
@@ -1736,7 +1761,7 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, true)
+        self.prepare_with_admission(runtime, txn_id, session, work, request, true, true)
     }
 
     fn prepare_with_admission(
@@ -1747,13 +1772,22 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
         incremental: bool,
+        prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let previous_claim = self
             .models
             .get(&runtime.plan.model_instance)
             .and_then(|state| state.capacity_claims.get(session))
             .cloned();
-        let result = self.prepare_inner(runtime, txn_id, session, work, request, incremental);
+        let result = self.prepare_inner(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            incremental,
+            prefix_attach,
+        );
         if result.is_ok() && incremental && matches!(work, WorkUnit::SequenceStep { .. }) {
             if let Some(state) = self.models.get_mut(&runtime.plan.model_instance) {
                 if state.capacity_claims.contains_key(session) {
@@ -1845,6 +1879,7 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
         incremental: bool,
+        prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let (
             sequence_input,
@@ -2078,7 +2113,8 @@ impl ManagedKvCacheManager {
                 }
                 continue;
             }
-            let prefix_eligible = snapshot.committed_tokens == 0
+            let prefix_eligible = prefix_attach
+                && snapshot.committed_tokens == 0
                 && domain_sequence_input.is_some_and(|input| input.start == 0)
                 // Prefix reuse is bounded by this transaction's committed
                 // target below, so the first scheduler-visible chunk does not
@@ -8254,6 +8290,65 @@ mod tests {
         assert_eq!(telemetry.avoided_prefill_tokens, 64);
         manager.finalize(&second, None, false).expect("abort");
         assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn full_prefill_rows_never_attach_shared_prefix_pages() {
+        // H10: a full-prefill adapter runs its whole prompt from position 0.
+        // Attaching published pages would hand it a non-empty cache and the
+        // model start would reject the row (or the engine would replan it as a
+        // partial quantum forever), so preparation must recompute instead.
+        let model = ModelInstanceId::new(452);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([11; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let first_session = SessionKey::new("full-first".into(), 1);
+        let first = manager
+            .prepare(
+                &runtime,
+                31,
+                &first_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("first prepare")
+            .expect("first reservation");
+        manager
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
+            .expect("first commit");
+        manager
+            .release_session(&first_session)
+            .expect("first release");
+
+        let second_session = SessionKey::new("full-second".into(), 1);
+        let second = manager
+            .prepare_row(
+                &runtime,
+                32,
+                &second_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+                false,
+                false,
+            )
+            .expect("second prepare")
+            .expect("second reservation");
+        assert_eq!(second.domains[0].execution_start_tokens, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_hits, 0);
+        manager.finalize(&second, None, false).expect("abort");
     }
 
     #[test]
