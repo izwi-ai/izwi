@@ -619,6 +619,70 @@ fn lfm25_batched_projection_shapes_cpu() {
     batched_projection_shapes(&candle_core::Device::Cpu);
 }
 
+/// izwi's Metal k-quant mat-vec against Candle's per-row mat-vec on the
+/// checkpoint's own Q4_K and Q6_K weights, for 1..=8 decode rows. Synthetic
+/// quantized weights missed a half-precision scale bug that these catch.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_kquant_mat_vec_matches_candle_on_real_weights() {
+    use candle_core::quantized::{QMatMul, QStorage, QTensor};
+    use candle_core::Module;
+    let path = models_dir_for_bench()
+        .join("LFM2.5-1.2B-Instruct-GGUF")
+        .join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf");
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let loader = GgufLoader::from_path(&path).unwrap();
+    for name in [
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.2.ffn_down.weight",
+        "blk.2.attn_v.weight",
+        "token_embd.weight",
+    ] {
+        let host = loader
+            .load_qtensor(name, &candle_core::Device::Cpu)
+            .unwrap();
+        let dtype = host.dtype();
+        let (rows, cols) = host.shape().dims2().unwrap();
+        let storage = QStorage::from_data(host.data().unwrap(), &device, dtype).unwrap();
+        let QStorage::Metal(metal) = &storage else {
+            unreachable!("Metal storage")
+        };
+        let kernel = crate::kernels::metal_kquant_mv::MetalKQuantMatVec::new(
+            metal.buffer().clone(),
+            dtype,
+            rows,
+            cols,
+        )
+        .unwrap();
+        let matmul = QMatMul::from_qtensor(QTensor::new(storage, (rows, cols)).unwrap()).unwrap();
+        for batch in [2usize, 5, 8] {
+            let x = Tensor::randn(0f32, 1f32, (batch, 1, cols), &device).unwrap();
+            let expected = matmul.forward(&x).unwrap().flatten_all().unwrap();
+            let actual = kernel.forward(&x).unwrap().flatten_all().unwrap();
+            let expected = expected.to_vec1::<f32>().unwrap();
+            let actual = actual.to_vec1::<f32>().unwrap();
+            let scale = expected.iter().fold(0f32, |max, e| max.max(e.abs()));
+            let worst = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, e)| (a - e).abs())
+                .fold(0f32, f32::max);
+            eprintln!("{name} {dtype:?} batch {batch}: worst {worst:.3e} of scale {scale:.3e}");
+            assert!(
+                worst <= 1e-5 * scale,
+                "{name} batch {batch}: {worst} vs scale {scale}"
+            );
+        }
+    }
+}
+
 /// Aggregate decode throughput by batch width: B rows decode together in one
 /// batched step, for B = 1, 2 and 4, interleaved step by step.
 fn batch_width_scaling(profile: DeviceProfile) {

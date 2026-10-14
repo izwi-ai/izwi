@@ -1,21 +1,28 @@
-//! Small-batch Q4_K / Q6_K mat-vec for Metal.
+//! Q4_K / Q6_K mat-vec for Metal decode batches (2..=8 activation rows).
 //!
 //! Candle's Metal mat-vec issues one dispatch per activation row, and each
-//! one streams the whole quantized weight again, so a decode batch of B rows
-//! reads the weights B times. These kernels walk each weight block once for
-//! up to [`MAX_ROWS`] rows. They are Candle's `kernel_mul_mv_q4_K_f32` and
-//! `kernel_mul_mv_q6_K_f32` with the activation rows looped inside the block
-//! walk.
-//! - Q4_K: one simdgroup per four weight rows, as in Candle. The per-row
-//!   weight words are reread from cache for each activation row, and the
-//!   results are bit-identical to Candle's.
-//! - Q6_K: two simdgroups per threadgroup, one weight row each. Each block's
-//!   sixteen quants per lane are decoded once and reused for every row; the
-//!   results match Candle's to an ulp.
+//! one streams the whole quantized weight again. This kernel follows
+//! llama.cpp's `mul_mv_ext` structure (ggml, MIT): eight lanes share a weight
+//! row (four rows per simdgroup), each lane dequantizes one 16-weight chunk
+//! per step into a float4x4 with ggml's dequantizers and dots it with up to
+//! five activation rows read straight from device memory, and the row's
+//! lanes reduce with simd_shuffle_down. Six to eight rows run as two
+//! threadgroups of vectors.
 //!
-//! Decoding the Q4_K quants once per block as well (scales folded into F32
-//! weights) was slower: 215 against 121 µs at two rows of an 8192 x 2048
-//! weight, from register pressure.
+//! Measured on an M1 Pro (µs per call, Candle per-row mat-vec -> this):
+//! - Q4_K 8192 x 2048: 1 row 131-229 -> 85-109, 4 rows 275 -> 180,
+//!   8 rows 546 -> 337;
+//! - Q6_K 2048 x 8192: 1 row 213-217 -> 117-156, 4 rows 468 -> 225;
+//! - Q6_K 65536 x 2048 (LM head): 1 row 885-922 -> 808, 4 rows 3,336 ->
+//!   1,626, 8 rows 6,670 -> 3,215.
+//!
+//! Two, sixteen and thirty-two lanes per row were slower (four was close),
+//! and the earlier Candle-derived kernel that looped the rows inside
+//! Candle's block walk reached only 4 rows 242, 8 rows 480 on Q4_K.
+//! In the LFM2.5 decode step (ms per step, Candle -> this): 2 rows 14.0 ->
+//! 12.8, 4 rows 23.9 -> 16.9; a single row was slower in the model (7.3 ->
+//! 7.9) despite the isolated timing, so one row stays on Candle.
+//! Results match Candle's to float rounding (sums regroup).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -29,6 +36,21 @@ use super::metal_encoder::IzwiMetalCommandEncoderExt;
 
 /// Most activation rows one dispatch serves.
 pub(crate) const MAX_ROWS: usize = 8;
+/// Simdgroups per threadgroup (`IZWI_KQ_NSG`).
+const SIMDGROUPS: usize = 2;
+/// Lanes sharing one weight row (`IZWI_KQ_NXPSG`).
+const LANES_PER_ROW: usize = 8;
+
+/// Activation vectors one threadgroup takes: all of them up to five, else
+/// half (rounded up), so a batch of six to eight runs as two groups.
+fn vectors_per_group(batch: usize) -> usize {
+    if batch <= 5 {
+        batch
+    } else {
+        batch.div_ceil(2)
+    }
+}
+
 const QK_K: usize = 256;
 
 /// A Q4_K or Q6_K weight `[rows, cols]` resident in a Metal buffer, in GGUF
@@ -54,12 +76,10 @@ impl std::fmt::Debug for MetalKQuantMatVec {
 impl MetalKQuantMatVec {
     /// `None` for a type or geometry the kernels do not cover.
     pub(crate) fn new(buffer: Buffer, dtype: GgmlDType, rows: usize, cols: usize) -> Option<Self> {
-        let rows_per_group = match dtype {
-            GgmlDType::Q4K => 4,
-            GgmlDType::Q6K => 2,
-            _ => return None,
-        };
-        (cols > 0 && cols.is_multiple_of(QK_K) && rows > 0 && rows.is_multiple_of(rows_per_group))
+        (matches!(dtype, GgmlDType::Q4K | GgmlDType::Q6K)
+            && cols > 0
+            && cols.is_multiple_of(QK_K)
+            && rows > 0)
             .then_some(Self {
                 buffer,
                 dtype,
@@ -122,18 +142,18 @@ impl CustomOp1 for MetalKQuantMatVec {
         if !(2..=MAX_ROWS).contains(&batch) {
             bail!("izwi-kquant-mat-vec serves 2..={MAX_ROWS} rows, got {batch}")
         }
-        let (kind, rows_per_group, threads) = match self.dtype {
-            GgmlDType::Q4K => ("q4_K", 4, 32),
-            GgmlDType::Q6K => ("q6_K", 2, 64),
+        let kind = match self.dtype {
+            GgmlDType::Q4K => "q4_K",
+            GgmlDType::Q6K => "q6_K",
             dtype => bail!("izwi-kquant-mat-vec does not serve {dtype:?}"),
         };
+        let vectors = vectors_per_group(batch);
+        let rows_per_group = (32 / LANES_PER_ROW) * SIMDGROUPS;
+        let function = format!("izwi_kq_ext_{kind}_r{vectors}");
         let device = storage.device().clone();
         let elements = batch * self.rows;
         let output = device.new_buffer(elements, DType::F32, "izwi-kquant-mat-vec")?;
-        let pipeline = pipeline(
-            device.metal_device(),
-            &format!("izwi_mul_mv_ext_{kind}_f32_r{batch}"),
-        )?;
+        let pipeline = pipeline(device.metal_device(), &function)?;
         let encoder = device.command_encoder()?;
         encoder.set_label("izwi-kquant-mat-vec");
         encoder.set_compute_pipeline_state(&pipeline);
@@ -146,14 +166,15 @@ impl CustomOp1 for MetalKQuantMatVec {
         encoder.set_output_buffer(2, Some(&output), 0);
         encoder.set_bytes(3, &(self.cols as u32));
         encoder.set_bytes(4, &(self.rows as u32));
+        encoder.set_bytes(5, &(batch as u32));
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
-                width: self.rows / rows_per_group,
-                height: 1,
+                width: self.rows.div_ceil(rows_per_group),
+                height: batch.div_ceil(vectors),
                 depth: 1,
             },
             objc2_metal::MTLSize {
-                width: threads,
+                width: 32 * SIMDGROUPS,
                 height: 1,
                 depth: 1,
             },
@@ -221,202 +242,147 @@ typedef struct {
     half d;
 } block_q6_K;
 
-// Candle's kernel_mul_mv_q4_K_f32 with R activation rows: one simdgroup
-// computes N_DST weight rows for every activation row.
-template <int R>
-kernel void izwi_mul_mv_ext_q4_K_f32(
-        device const void  * src0 [[buffer(0)]],
-        device const float * src1 [[buffer(1)]],
-        device       float * dst  [[buffer(2)]],
-        constant uint & ne00 [[buffer(3)]],
-        constant uint & ne01 [[buffer(4)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint  tiisg [[thread_index_in_simdgroup]]) {
-    const uint16_t kmask1 = 0x3f3f;
-    const uint16_t kmask2 = 0x0f0f;
-    const uint16_t kmask3 = 0xc0c0;
+// llama.cpp's `mul_mv_ext` structure (ggml, MIT): NXPSG lanes share one
+// weight row, each lane dequantizes one 16-weight chunk per step into a
+// float4x4 and dots it with R activation vectors read straight from device
+// memory; a threadgroup covers R vectors (grid y covers the rest), and the
+// lanes of a row reduce with simd_shuffle_down. The dequantizers are ggml's
+// (as vendored by Candle): chunk `il` of a 256-weight block is its weights
+// 16 il .. 16 il + 15.
+constant constexpr short IZWI_KQ_NSG = 2;
 
-    const int ix = tiisg/8;
-    const int it = tiisg%8;
-    const int iq = it/4;
-    const int ir = it%4;
+static inline uchar2 izwi_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
 
-    const int nb = ne00/QK_K;
-    const int first_row = tgpig.x * N_DST;
-
-    device const block_q4_K * x = (device const block_q4_K *) src0 + first_row * nb;
-
-    float yl[16];
-    float yh[16];
-    float sumf[R][N_DST];
-    for (int b = 0; b < R; ++b) {
-        for (int row = 0; row < N_DST; ++row) {
-            sumf[b][row] = 0.f;
-        }
-    }
-
-    const int step = sizeof(block_q4_K) * nb / 2;
-
-    uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
-
-    for (int ib = ix; ib < nb; ib += 4) {
-        for (int b = 0; b < R; ++b) {
-            device const float * y4 = src1 + b * ne00 + ib * QK_K + 64 * iq + 8 * ir;
-
-            float4 sumy = {0.f, 0.f, 0.f, 0.f};
-            for (int i = 0; i < 8; ++i) {
-                yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-                yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-                yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-                yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
-            }
-
-            device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
-            device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
-            device const half     * dh = &x[ib].d;
-
-            for (int row = 0; row < N_DST; row++) {
-                sc16[0] = sc[0] & kmask1;
-                sc16[1] = sc[2] & kmask1;
-                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-                device const uint16_t * q2 = q1 + 32;
-
-                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-                for (int i = 0; i < 8; i += 2) {
-                    acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
-                    acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
-                    acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
-                    acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
-                    acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
-                    acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
-                    acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
-                    acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
-                }
-
-                float dall = dh[0];
-                float dmin = dh[1];
-                sumf[b][row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                        (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                        (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                        (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                                dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-
-                q1 += step;
-                sc += step;
-                dh += step;
-            }
-        }
-    }
-
-    for (int b = 0; b < R; ++b) {
-        for (int row = 0; row < N_DST; ++row) {
-            const float all_sum = simd_sum(sumf[b][row]);
-            if (tiisg == 0) {
-                dst[b * ne01 + first_row + row] = all_sum;
-            }
-        }
+void izwi_dequantize_q4_K(device const block_q4_K * xb, short il, thread float4x4 & reg) {
+    device const uchar * q = xb->qs;
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = izwi_scale_min_k4_just2(is, il/2, xb->scales);
+    // In F32: ggml divides the half scale by 16 in half precision, which
+    // lost bits on the LFM2.5 checkpoint's scales (logit error 0.47 instead
+    // of 0.19 against the F32 reference; see the real-weight parity test).
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.0f;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
     }
 }
 
-// Candle's kernel_mul_mv_q6_K_f32 with R activation rows: one simdgroup per
-// weight row; each lane decodes its sixteen quants of a block once.
-template <int R>
-kernel void izwi_mul_mv_ext_q6_K_f32(
-        device const void  * src0 [[buffer(0)]],
-        device const float * src1 [[buffer(1)]],
-        device       float * dst  [[buffer(2)]],
-        constant uint & ne00 [[buffer(3)]],
-        constant uint & ne01 [[buffer(4)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        uint  tiisg [[thread_index_in_simdgroup]],
-        uint  sgitg [[simdgroup_index_in_threadgroup]]) {
-    const uint8_t kmask1 = 0x03;
-    const uint8_t kmask2 = 0x0C;
-    const uint8_t kmask3 = 0x30;
-    const uint8_t kmask4 = 0xC0;
+void izwi_dequantize_q6_K(device const block_q6_K * xb, short il, thread float4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint8_t * ql = (device const uint8_t *)xb->ql;
+    device const uint8_t * qh = (device const uint8_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+    ql = ql + 64*(il/8) + 32*((il/2)&1) + 16*(il&1);
+    qh = qh + 32*(il/8) + 16*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+    const uint16_t kmask1 = il>1 ? (il>2 ? 192 : 48) : (il>0 ? 12 : 3);
+    const uint16_t kmask2 = il>1 ? 0xF0 : 0x0F;
+    const float coef = il>1 ? 1.f/16.f : 1.f;
+    const float ml = d_all * sc * 32.f;
+    const float dl = d_all * sc * coef;
+    for (int i = 0; i < 16; ++i) {
+        const half q = il&1 ? ((ql[i] & kmask2) | ((qh[i] & kmask1) << 2))
+                            : ((ql[i] & kmask2) | ((qh[i] & kmask1) << 4));
+        reg[i/4][i%4] = dl * q - ml;
+    }
+}
 
-    const int nb = ne00/QK_K;
-    const int row = 2 * tgpig.x + sgitg;
+template <typename block_q, short R, short NXPSG,
+          void (*deq)(device const block_q *, short, thread float4x4 &)>
+void izwi_kq_ext_impl(
+        device const char  * src0,
+        device const float * src1,
+        device       float * dst,
+        uint ne00, uint ne01, uint ne11,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    constexpr short NYPSG = 32 / NXPSG;
+    const short tx = tiisg % NXPSG;
+    const short ty = tiisg / NXPSG;
+    const uint i01 = tgpig.x * (NYPSG * IZWI_KQ_NSG) + NYPSG * sgitg + ty;
+    const uint i11 = tgpig.y * R;
+    const uint nb = ne00 / QK_K;
 
-    device const block_q6_K * x = (device const block_q6_K *) src0 + row * nb;
-
+    device const block_q * xq = (device const block_q *)src0 + (i01 < ne01 ? i01 : 0) * nb;
+    device const float4x4 * y4x4[R];
+    for (short ir = 0; ir < R; ++ir) {
+        const uint vector = i11 + ir < ne11 ? i11 + ir : 0;
+        y4x4[ir] = (device const float4x4 *)(src1 + (ulong)vector * ne00) + tx;
+    }
     float sumf[R];
-    for (int b = 0; b < R; ++b) {
-        sumf[b] = 0.f;
+    for (short ir = 0; ir < R; ++ir) {
+        sumf[ir] = 0.0f;
     }
-
-    const int tid  = tiisg/2;
-    const int ix   = tiisg%2;
-    const int ip   = tid/8;
-    const int il   = tid%8;
-    const int n    = 4;
-    const int l0   = n*il;
-    const int is   = 8*ip + l0/16;
-
-    const int y_offset = 128*ip + l0;
-    const int q_offset_l = 64*ip + l0;
-    const int q_offset_h = 32*ip + l0;
-
-    for (int i = ix; i < nb; i += 2) {
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
-        device const int8_t  * sc = x[i].scales + is;
-
-        const float dall = x[i].d;
-
-        float w[4][4];
-        for (int l = 0; l < n; ++l) {
-            w[0][l] = (int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32;
-            w[1][l] = (int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32;
-            w[2][l] = (int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32;
-            w[3][l] = (int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32;
+    short cch = tx % 16;
+    xq += tx / 16;
+    for (uint ich = tx; 16 * ich < ne00; ich += NXPSG) {
+        float4x4 lx;
+        deq(xq, cch, lx);
+        cch += NXPSG;
+        if (cch >= 16) {
+            xq += cch / 16;
+            cch %= 16;
         }
-        const float s0 = sc[0];
-        const float s2 = sc[2];
-        const float s4 = sc[4];
-        const float s6 = sc[6];
-
-        for (int b = 0; b < R; ++b) {
-            device const float * y = src1 + b * ne00 + i * QK_K + y_offset;
-            float4 sums = {0.f, 0.f, 0.f, 0.f};
-            for (int l = 0; l < n; ++l) {
-                sums[0] += y[l+ 0] * w[0][l];
-                sums[1] += y[l+32] * w[1][l];
-                sums[2] += y[l+64] * w[2][l];
-                sums[3] += y[l+96] * w[3][l];
+        for (short ir = 0; ir < R; ++ir) {
+            const float4x4 y = *y4x4[ir];
+            sumf[ir] += dot(lx[0], y[0]) + dot(lx[1], y[1]) + dot(lx[2], y[2]) + dot(lx[3], y[3]);
+            y4x4[ir] += NXPSG;
+        }
+    }
+    for (short ir = 0; ir < R; ++ir) {
+        float s = sumf[ir];
+        if (NXPSG >= 32) { s += simd_shuffle_down(s, 16); }
+        if (NXPSG >= 16) { s += simd_shuffle_down(s,  8); }
+        if (NXPSG >=  8) { s += simd_shuffle_down(s,  4); }
+        if (NXPSG >=  4) { s += simd_shuffle_down(s,  2); }
+        if (NXPSG >=  2) { s += simd_shuffle_down(s,  1); }
+        sumf[ir] = s;
+    }
+    if (tx == 0 && i01 < ne01) {
+        for (short ir = 0; ir < R; ++ir) {
+            if (i11 + ir < ne11) {
+                dst[(ulong)(i11 + ir) * ne01 + i01] = sumf[ir];
             }
-            sumf[b] += dall * (sums[0] * s0 + sums[1] * s2 + sums[2] * s4 + sums[3] * s6);
-        }
-    }
-
-    for (int b = 0; b < R; ++b) {
-        const float tot = simd_sum(sumf[b]);
-        if (tiisg == 0) {
-            dst[b * ne01 + row] = tot;
         }
     }
 }
 
-#define IZWI_KQUANT_MV_EXT(R) \
-template [[host_name("izwi_mul_mv_ext_q4_K_f32_r" #R)]] kernel void izwi_mul_mv_ext_q4_K_f32<R>( \
-    device const void *, device const float *, device float *, constant uint &, constant uint &, \
-    uint3, uint); \
-template [[host_name("izwi_mul_mv_ext_q6_K_f32_r" #R)]] kernel void izwi_mul_mv_ext_q6_K_f32<R>( \
-    device const void *, device const float *, device float *, constant uint &, constant uint &, \
-    uint3, uint, uint);
+template <typename block_q, short R, short NXPSG,
+          void (*deq)(device const block_q *, short, thread float4x4 &)>
+kernel void izwi_kq_ext(
+        device const char  * src0 [[buffer(0)]],
+        device const float * src1 [[buffer(1)]],
+        device       float * dst  [[buffer(2)]],
+        constant uint & ne00 [[buffer(3)]],
+        constant uint & ne01 [[buffer(4)]],
+        constant uint & ne11 [[buffer(5)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    izwi_kq_ext_impl<block_q, R, NXPSG, deq>(src0, src1, dst, ne00, ne01, ne11, tgpig, tiisg, sgitg);
+}
 
-IZWI_KQUANT_MV_EXT(2)
-IZWI_KQUANT_MV_EXT(3)
-IZWI_KQUANT_MV_EXT(4)
-IZWI_KQUANT_MV_EXT(5)
-IZWI_KQUANT_MV_EXT(6)
-IZWI_KQUANT_MV_EXT(7)
-IZWI_KQUANT_MV_EXT(8)
+typedef decltype(izwi_kq_ext<block_q4_K, 2, 8, izwi_dequantize_q4_K>) izwi_kq_ext_t;
+
+constant constexpr short IZWI_KQ_NXPSG = 8;
+
+#define IZWI_KQ_EXT(R) \
+template [[host_name("izwi_kq_ext_q4_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q4_K, R, IZWI_KQ_NXPSG, izwi_dequantize_q4_K>; \
+template [[host_name("izwi_kq_ext_q6_K_r" #R)]] kernel izwi_kq_ext_t izwi_kq_ext<block_q6_K, R, IZWI_KQ_NXPSG, izwi_dequantize_q6_K>;
+
+IZWI_KQ_EXT(2)
+IZWI_KQ_EXT(3)
+IZWI_KQ_EXT(4)
+IZWI_KQ_EXT(5)
 "#;
 
 #[cfg(test)]
@@ -489,26 +455,34 @@ mod tests {
                 assert_eq!(actual.dims(), &[batch, 1, rows]);
                 let expected = expected.flatten_all().unwrap().to_vec1::<f32>().unwrap();
                 let actual = actual.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                // Relative to the output scale: the sums only regroup, so
+                // the difference is float rounding.
+                let scale = expected.iter().fold(0f32, |max, e| max.max(e.abs()));
                 for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
                     assert!(
-                        (a - e).abs() <= 1e-4 * e.abs().max(1.0),
-                        "{dtype:?} {rows}x{cols} batch {batch} [{index}]: {a} vs {e}"
+                        (a - e).abs() <= 2e-6 * scale,
+                        "{dtype:?} {rows}x{cols} batch {batch} [{index}]: {a} vs {e} (scale {scale})"
                     );
                 }
             }
         }
     }
 
-    /// Timing against Candle's per-row mat-vec on an LFM2.5-sized weight.
+    /// Timing against Candle's per-row mat-vec on LFM2.5-sized weights.
     #[test]
     #[ignore = "timing"]
     fn small_batch_timing() {
         let Some(device) = crate::backends::metal_device_if_available(0) else {
             return;
         };
-        for (dtype, rows, cols) in [(GgmlDType::Q4K, 8192, 2048), (GgmlDType::Q6K, 2048, 8192)] {
+        for (dtype, rows, cols) in [
+            (GgmlDType::Q4K, 8192, 2048),
+            (GgmlDType::Q4K, 2048, 8192),
+            (GgmlDType::Q6K, 2048, 8192),
+            (GgmlDType::Q6K, 65536, 2048),
+        ] {
             let (ext, matmul) = weight(&device, dtype, rows, cols);
-            for batch in [1usize, 2, 4, 8] {
+            for batch in [2usize, 4, 8] {
                 let x = Tensor::from_vec(xorshift(7, batch * cols, 2.0), (batch, 1, cols), &device)
                     .unwrap();
                 let time = |f: &dyn Fn() -> Tensor| {
@@ -517,19 +491,17 @@ mod tests {
                     }
                     device.synchronize().unwrap();
                     let started = std::time::Instant::now();
-                    for _ in 0..200 {
+                    for _ in 0..100 {
                         f();
                     }
                     device.synchronize().unwrap();
-                    started.elapsed().as_secs_f64() * 1e6 / 200.0
+                    started.elapsed().as_secs_f64() * 1e6 / 100.0
                 };
                 let candle = time(&|| matmul.forward(&x).unwrap());
-                let small = if batch >= 2 {
-                    time(&|| ext.forward(&x).unwrap())
-                } else {
-                    f64::NAN
-                };
-                eprintln!("{dtype:?} {rows}x{cols} batch {batch}: candle {candle:7.1} us, small-batch {small:7.1} us");
+                let ext = time(&|| ext.forward(&x).unwrap());
+                eprintln!(
+                    "{dtype:?} {rows}x{cols} batch {batch}: candle {candle:7.1} us, izwi {ext:7.1} us"
+                );
             }
         }
     }
@@ -550,7 +522,6 @@ mod tests {
         }
         let buffer = ext.buffer.clone();
         assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q8_0, 8, 256).is_none());
-        assert!(MetalKQuantMatVec::new(buffer.clone(), GgmlDType::Q4K, 6, 256).is_none());
         assert!(MetalKQuantMatVec::new(buffer, GgmlDType::Q6K, 8, 300).is_none());
     }
 }

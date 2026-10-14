@@ -2390,11 +2390,11 @@ struct Lfm2QuantizedWeight {
 }
 
 /// A quantized projection. Candle runs a `[rows, 1, k]` input (a decode
-/// batch) as one mat-vec dispatch per row, each streaming the whole weight.
-/// On Metal, 2..=8 such rows take the small-batch mat-vec instead: the same
-/// per-row arithmetic in one dispatch that reads the weight once. Every other
-/// input (one row, prefill spans, CPU, CUDA) takes Candle's `QMatMul`
-/// unchanged.
+/// step) as one mat-vec dispatch per row, each streaming the whole weight.
+/// On Metal, 2..=8 such rows take izwi's k-quant mat-vec instead
+/// (`kernels::metal_kquant_mv`): one dispatch that reads the weight once.
+/// Every other input (one row, prefill spans, CPU, CUDA) takes Candle's
+/// `QMatMul` unchanged.
 #[derive(Debug, Clone)]
 struct Lfm2Linear {
     matmul: QMatMul,
