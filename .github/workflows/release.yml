@@ -104,6 +104,15 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # The workspace .cargo/config.toml sets an extensionless python
+      # rustc-wrapper that only matters to Apple's linker. Windows cannot
+      # execute it, and an empty RUSTC_WRAPPER overrides the configured one
+      # for every later cargo call, including `cargo tauri build`.
+      - name: Disable the macOS rustc wrapper (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
