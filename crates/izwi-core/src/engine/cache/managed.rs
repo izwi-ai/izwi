@@ -4659,6 +4659,16 @@ fn managed_prefix_namespace(
         b"izwi.kv.position-semantics.v1\0",
         &[&runtime.plan.contract_fingerprint],
     );
+    // One process serves many tenants behind a gateway. Without the tenant in
+    // the salt, a tenant could time another tenant's prompts through prefix
+    // hits, so a trusted tenant key scopes every page to its own namespace.
+    let cache_salt = match request.tenant_key {
+        Some(tenant_key) => digest_parts(
+            b"izwi.kv.tenant-prefix-salt.v1\0",
+            &[&cache_salt, &tenant_key],
+        ),
+        None => cache_salt,
+    };
     Ok(Some(KvPrefixNamespace {
         model_instance: runtime.plan.model_instance,
         model_revision,
@@ -8353,6 +8363,65 @@ mod tests {
         assert_eq!(telemetry.avoided_prefill_tokens, 64);
         manager.finalize(&second, None, false).expect("abort");
         assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn prefix_reuse_is_scoped_to_the_trusted_tenant() {
+        // H9: a worker serves many gateway tenants from one process salt. A
+        // tenant must never hit (and so time) another tenant's prefix pages.
+        let model = ModelInstanceId::new(453);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([14; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let tenant_request = |tenant: u8| {
+            let mut request = prefix_request(model, tokens.clone());
+            request.tenant_key = Some([tenant; 32]);
+            request
+        };
+        let run = |manager: &mut ManagedKvCacheManager, txn_id, name: &str, tenant| {
+            let session = SessionKey::new(name.into(), 1);
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn_id,
+                    &session,
+                    &sequence_work(0, tokens.len()),
+                    Some(&tenant_request(tenant)),
+                )
+                .expect("prepare")
+                .expect("reservation");
+            let start = reservation.domains[0].execution_start_tokens;
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+            manager.release_session(&session).expect("release");
+            start
+        };
+
+        assert_eq!(run(&mut manager, 61, "tenant-a-first", 1), 0);
+        assert_eq!(
+            run(&mut manager, 62, "tenant-b", 2),
+            0,
+            "no cross-tenant hit"
+        );
+        assert_eq!(
+            run(&mut manager, 63, "tenant-a-again", 1),
+            64,
+            "same tenant reuses"
+        );
     }
 
     #[test]
