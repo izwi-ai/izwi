@@ -299,6 +299,7 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
         return;
     }
     let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
+    assert_eq!(model.max_context_tokens().unwrap(), 32_768, "{key}: model-card context");
     for (name, case) in &model_fixture.template_cases {
         let ids = model.prompt_token_ids(&messages(&case.messages)).unwrap();
         assert_eq!(ids, case.prompt_ids, "{key}/{name}: template prompt ids");

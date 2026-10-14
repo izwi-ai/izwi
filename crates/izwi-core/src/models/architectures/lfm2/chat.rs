@@ -385,7 +385,8 @@ impl Lfm2ChatModel {
         let tokenizer = ChatTokenizer::load(model_dir)?;
         let loader =
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
-        let config = parse_lfm2_backbone_config(&loader)?;
+        let mut config = parse_lfm2_backbone_config(&loader)?;
+        config.context_length = lfm25_chat_context_limit(config.context_length);
         let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         if tokenizer.vocab_size == 0 || tokenizer.vocab_size > text_model.vocab_size() {
             return Err(Error::ModelLoadError(
@@ -854,6 +855,18 @@ fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
         && config.presence_penalty.abs() <= f32::EPSILON
 }
 
+/// Context the LFM2.5-1.2B chat checkpoints support.
+///
+/// The GGUF metadata says 128,000, but Liquid's model cards and docs give
+/// 32,768, and vLLM's recipe caps the model there; quality past it is
+/// unverified. Capping at load also bounds the RoPE tables and every
+/// backend's KV reservation (CUDA otherwise reserved a 128K arena).
+const LFM25_CHAT_CONTEXT_TOKENS: usize = 32_768;
+
+fn lfm25_chat_context_limit(checkpoint_context: usize) -> usize {
+    checkpoint_context.min(LFM25_CHAT_CONTEXT_TOKENS)
+}
+
 fn generation_mask(
     logits_width: usize,
     tokenizer_vocab: usize,
@@ -946,6 +959,12 @@ mod tests {
             super::argmax_batch(&logits.narrow(0, 1, 1).unwrap()).unwrap(),
             vec![2]
         );
+    }
+
+    #[test]
+    fn lfm25_chat_context_is_capped_at_the_model_card_length() {
+        assert_eq!(super::lfm25_chat_context_limit(128_000), 32_768);
+        assert_eq!(super::lfm25_chat_context_limit(32), 32);
     }
 
     #[test]
