@@ -172,6 +172,7 @@ pub(crate) struct InvocationPagedWorkspaceKeyV2 {
     pub(crate) domain: StateDomainId,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct InvocationPagedWorkspaceBindingV2 {
     pub(crate) key: InvocationPagedWorkspaceKeyV2,
@@ -194,6 +195,9 @@ pub(crate) struct InvocationPagedLeaseSetV2 {
 }
 
 #[derive(Debug)]
+// Release authenticates every completion; production consumes the set
+// for its success, while tests inspect the individual receipts.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InvocationPagedDomainCompletionV2 {
     pub(crate) stage: StageId,
     pub(crate) domain: StateDomainId,
@@ -201,6 +205,7 @@ pub(crate) struct InvocationPagedDomainCompletionV2 {
 }
 
 impl InvocationPagedLeaseSetV2 {
+    #[cfg(test)]
     pub(crate) const fn stage(&self) -> StageId {
         self.stage
     }
@@ -209,6 +214,7 @@ impl InvocationPagedLeaseSetV2 {
         self.leases.iter().map(|(domain, _)| *domain)
     }
 
+    #[cfg(test)]
     pub(crate) fn cache(
         &self,
         domain: StateDomainId,
@@ -233,38 +239,6 @@ impl InvocationPagedLeaseSetV2 {
             .ok_or_else(|| {
                 invalid("atomic invocation lease set does not contain the requested domain")
             })
-    }
-
-    pub(crate) fn cache_pair_mut(
-        &mut self,
-        first: StateDomainId,
-        second: StateDomainId,
-    ) -> Result<(
-        &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
-        &mut crate::models::shared::attention::physical::PhysicalPagedKvCache,
-    )> {
-        if first == second {
-            return Err(invalid(
-                "invocation cache pair requires two distinct domains",
-            ));
-        }
-        let first_index = self
-            .leases
-            .iter()
-            .position(|(domain, _)| *domain == first)
-            .ok_or_else(|| invalid("invocation lease set is missing its first cache domain"))?;
-        let second_index = self
-            .leases
-            .iter()
-            .position(|(domain, _)| *domain == second)
-            .ok_or_else(|| invalid("invocation lease set is missing its second cache domain"))?;
-        if first_index < second_index {
-            let (left, right) = self.leases.split_at_mut(second_index);
-            Ok((left[first_index].1.cache_mut(), right[0].1.cache_mut()))
-        } else {
-            let (left, right) = self.leases.split_at_mut(first_index);
-            Ok((right[0].1.cache_mut(), left[second_index].1.cache_mut()))
-        }
     }
 
     /// Release every domain even if one completion fails authentication. A
@@ -292,6 +266,7 @@ impl InvocationPagedLeaseSetV2 {
 }
 
 impl InvocationPagedWorkspaceRuntimeV2 {
+    #[cfg(test)]
     pub(crate) fn new(bindings: Vec<InvocationPagedWorkspaceBindingV2>) -> Result<Self> {
         let mut pools = HashMap::with_capacity(bindings.len());
         for binding in bindings {
@@ -312,76 +287,7 @@ impl InvocationPagedWorkspaceRuntimeV2 {
         Ok(Self { pools })
     }
 
-    fn validate_for(
-        &self,
-        descriptor: &CapabilityStateDescriptorV2,
-        stages: &[crate::engine::StageDescriptor],
-    ) -> Result<()> {
-        let graph = stage_graph_fingerprint(stages)?;
-        let expected = match &descriptor.invocation {
-            InvocationWorkspaceSet::None { .. } => HashMap::new(),
-            InvocationWorkspaceSet::Bounded { profiles } => profiles
-                .iter()
-                .find(|profile| profile.stage_graph_fingerprint == graph)
-                .ok_or_else(|| invalid("invocation runtime has no selected descriptor profile"))?
-                .stages
-                .iter()
-                .flat_map(|stage| {
-                    stage.domains.iter().filter_map(move |domain| match domain {
-                        InvocationWorkspaceDomain::State {
-                            state: super::StateDomainSpec::PagedAttention(_),
-                            ..
-                        } => Some((
-                            InvocationPagedWorkspaceKeyV2 {
-                                stage_graph: graph,
-                                stage: stage.stage,
-                                domain: domain.id(),
-                            },
-                            domain,
-                        )),
-                        _ => None,
-                    })
-                })
-                .collect::<HashMap<_, _>>(),
-        };
-        let actual = self
-            .pools
-            .iter()
-            .filter(|(key, _)| key.stage_graph == graph)
-            .collect::<HashMap<_, _>>();
-        if actual.len() != expected.len() {
-            return Err(invalid(
-                "invocation paged workspace backing does not cover the selected descriptor",
-            ));
-        }
-        for (key, domain) in expected {
-            let pool = self.pools.get(&key).ok_or_else(|| {
-                invalid("invocation paged workspace is missing a graph/stage/domain pool")
-            })?;
-            pool.validate_live()?;
-            if pool.workspace_domain() != domain {
-                return Err(invalid(
-                    "invocation paged workspace pool does not match its authored domain",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn pool_ids_for_graph(
-        &self,
-        graph: [u8; 32],
-    ) -> Vec<(InvocationPagedWorkspaceKeyV2, InvocationPagedKvPoolId)> {
-        let mut ids = self
-            .pools
-            .iter()
-            .filter(|(key, _)| key.stage_graph == graph)
-            .map(|(key, pool)| (*key, pool.id()))
-            .collect::<Vec<_>>();
-        ids.sort_unstable_by_key(|(key, _)| (key.stage, key.domain));
-        ids
-    }
-
+    #[cfg(test)]
     fn lease(
         &self,
         graph: [u8; 32],
@@ -398,6 +304,7 @@ impl InvocationPagedWorkspaceRuntimeV2 {
             .lease()
     }
 
+    #[cfg(test)]
     fn lease_set(
         &self,
         graph: [u8; 32],
@@ -560,6 +467,7 @@ pub(crate) trait InvocationWorkspacePhysicalLeaseV2: std::fmt::Debug + Send {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 
+    #[cfg(test)]
     fn paged_cache(
         &self,
     ) -> Option<&crate::models::shared::attention::physical::PhysicalPagedKvCache> {
@@ -683,6 +591,7 @@ impl InvocationWorkspacePhysicalLeaseV2 for InvocationPagedWorkspacePhysicalLeas
         self
     }
 
+    #[cfg(test)]
     fn paged_cache(
         &self,
     ) -> Option<&crate::models::shared::attention::physical::PhysicalPagedKvCache> {
@@ -724,14 +633,11 @@ pub(crate) struct InvocationWorkspaceLeaseV2 {
 }
 
 impl InvocationWorkspaceLeaseV2 {
-    pub(crate) const fn key(&self) -> InvocationWorkspaceKeyV2 {
-        self.key
-    }
-
     pub(crate) const fn kind(&self) -> InvocationStateBackingKindV2 {
         self.backing_identity.kind()
     }
 
+    #[cfg(test)]
     pub(crate) fn paged_cache(
         &self,
     ) -> Result<&crate::models::shared::attention::physical::PhysicalPagedKvCache> {
@@ -750,15 +656,6 @@ impl InvocationWorkspaceLeaseV2 {
             .expect("active invocation workspace lease")
             .paged_cache_mut()
             .ok_or_else(|| invalid("invocation workspace lease is not paged attention"))
-    }
-
-    pub(crate) fn typed<T: Any>(&self) -> Result<&T> {
-        self.physical
-            .as_ref()
-            .expect("active invocation workspace lease")
-            .as_any()
-            .downcast_ref()
-            .ok_or_else(|| invalid("invocation workspace lease has a different physical type"))
     }
 
     pub(crate) fn typed_mut<T: Any>(&mut self) -> Result<&mut T> {
@@ -846,16 +743,15 @@ pub(crate) struct InvocationWorkspaceLeaseSetV2 {
 }
 
 #[derive(Debug)]
+// Release authenticates every completion; production consumes the set
+// for its success, while tests inspect the individual receipts.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InvocationWorkspaceDomainCompletionV2 {
     pub(crate) key: InvocationWorkspaceKeyV2,
     pub(crate) physical: InvocationWorkspacePhysicalCompletionV2,
 }
 
 impl InvocationWorkspaceLeaseSetV2 {
-    pub(crate) const fn stage(&self) -> StageId {
-        self.stage
-    }
-
     pub(crate) fn domains(&self) -> impl ExactSizeIterator<Item = StateDomainId> + '_ {
         self.leases.iter().map(|(domain, _)| *domain)
     }
@@ -1834,6 +1730,7 @@ impl ManagedCapabilityRuntimeV2 {
 }
 
 impl InvocationCapabilityRuntimeV2 {
+    #[cfg(test)]
     pub(crate) fn seal(
         backend: BackendKind,
         execution: &ExecutionAdapterBinding,
