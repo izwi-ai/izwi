@@ -4552,6 +4552,21 @@ impl NativeChatPreparedPrompt {
         }
     }
 
+    /// The end of the prompt's first turn (the system turn, with any tools,
+    /// when there is one): what requests sharing a system prompt share. The
+    /// history boundary opens the final turn on an `<|im_start|>`, so the
+    /// first turn ends at that token's first later occurrence. `None` when no
+    /// turn ends before the history boundary.
+    pub fn managed_preamble_boundary(&self) -> Option<usize> {
+        let history = self.managed_snapshot_boundary()?;
+        let ids = self.prompt_ids();
+        let turn_start = *ids.get(history)?;
+        ids.get(1..history)?
+            .iter()
+            .position(|id| *id == turn_start)
+            .map(|offset| offset + 1)
+    }
+
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),

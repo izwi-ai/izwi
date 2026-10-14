@@ -2646,8 +2646,16 @@ impl ManagedKvCacheManager {
             // publishes the pages of every later prefill span inside its
             // prompt, so a conversation's chain keeps growing turn by turn
             // instead of stopping at the first chunk.
-            let declared_boundary = request.and_then(|request| request.managed_snapshot_boundary());
-            let boundary_publication = declared_boundary.is_some()
+            let declared_boundaries = request
+                .map(|request| {
+                    [
+                        request.managed_preamble_boundary(),
+                        request.managed_snapshot_boundary(),
+                    ]
+                })
+                .unwrap_or_default();
+            let declared_boundary = declared_boundaries.iter().any(Option::is_some);
+            let boundary_publication = declared_boundary
                 && session_generation == ManagedSessionGeneration::INITIAL
                 && target_committed_tokens > 1
                 && request.is_some_and(|request| {
@@ -2674,15 +2682,18 @@ impl ManagedKvCacheManager {
                 )?;
                 if !publications.is_empty() {
                     // Without a declared boundary keep the DS1.2b rule (any
-                    // aligned commit of an eligible span). With one, only
-                    // the span ending on the boundary's interval floor
-                    // snapshots: each snapshot is the full hybrid state.
+                    // aligned commit of an eligible span). With them, only a
+                    // span ending on a boundary's interval floor (first turn
+                    // or history) snapshots: each snapshot is the full
+                    // hybrid state.
                     let snapshot = match (declared_boundary, &snapshot_sharing) {
-                        (None, _) => true,
-                        (Some(boundary), Some((_, _, interval))) if *interval > 0 => {
-                            target_committed_tokens == boundary - boundary % *interval
+                        (false, _) => true,
+                        (true, Some((_, _, interval))) if *interval > 0 => {
+                            declared_boundaries.iter().flatten().any(|boundary| {
+                                target_committed_tokens == boundary - boundary % *interval
+                            })
                         }
-                        (Some(_), _) => false,
+                        (true, _) => false,
                     };
                     pending_prefixes.push(PendingPrefixCommit {
                         arena: group.arena,
