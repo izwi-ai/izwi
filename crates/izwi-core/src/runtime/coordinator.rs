@@ -22,6 +22,7 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::runtime::adapters::{LoadedCapabilityBinding, LoadedExecutionContract};
+use crate::runtime::health::{fatal_device_fault, RuntimeHealth};
 
 static NEXT_EXECUTION_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_DIRECT_BATCH_ID: AtomicU64 = AtomicU64::new(1);
@@ -718,6 +719,24 @@ impl InferenceCoordinator {
             // load fence); probes and the desktop must see both.
             poisoned: self.execution.poison_reason().is_some()
                 || self.resources.poison_reason().is_some(),
+        }
+    }
+
+    /// Latch `error` as a fatal device fault when it is one, exactly as
+    /// device execution does. Returns whether the runtime is now poisoned.
+    pub(crate) fn latch_fatal_device_fault(&self, error: &Error) -> bool {
+        latch_fatal_device_fault(error, &self.execution, &self.resources)
+    }
+
+    /// Execution admission poison is permanent for this process; a resource
+    /// authority poison alone clears once the backend fully drains.
+    pub fn health(&self) -> RuntimeHealth {
+        if let Some(reason) = self.execution.poison_reason() {
+            RuntimeHealth::Failed { reason }
+        } else if let Some(reason) = self.resources.poison_reason() {
+            RuntimeHealth::Degraded { reason }
+        } else {
+            RuntimeHealth::Healthy
         }
     }
 
@@ -1823,7 +1842,12 @@ impl InferenceCoordinator {
                 .then(crate::engine::metrics::begin_engine_physical_dispatch);
             if task_kind == "inference" {
                 return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Err(error) = &result {
+                            latch_fatal_device_fault(error, &poison_admission, &poison_resources);
+                        }
+                        result
+                    }
                     Err(payload) => {
                         let reason = "blocking inference task panicked after entry";
                         poison_admission.poison(reason);
@@ -1857,6 +1881,27 @@ impl InferenceCoordinator {
         }
         result
     }
+}
+
+/// A sticky device error poisons physical admission for the life of the
+/// process, like a panic after native entry: the device cannot run later work.
+fn latch_fatal_device_fault(
+    error: &Error,
+    execution: &PhysicalExecutionAdmission,
+    resources: &ResourceAuthority,
+) -> bool {
+    let Some(fault) = fatal_device_fault(error) else {
+        return false;
+    };
+    let reason = format!("fatal device fault ({fault}) during inference");
+    tracing::error!(
+        fault,
+        error = %error,
+        "{reason}; physical admission fails closed until the process is recreated"
+    );
+    execution.poison(reason.clone());
+    resources.poison(reason);
+    true
 }
 
 fn validate_device_identity(
@@ -3950,6 +3995,48 @@ Pages free: 10.\n";
         assert!(coordinator.snapshot().poisoned);
         coordinator.resources.clear_poison();
         assert!(!coordinator.snapshot().poisoned);
+    }
+
+    #[tokio::test]
+    async fn fatal_device_error_in_blocking_inference_latches_failed_health() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
+        assert_eq!(coordinator.health(), RuntimeHealth::Healthy);
+        coordinator.resources.poison("simulated authority poison");
+        assert!(matches!(
+            coordinator.health(),
+            RuntimeHealth::Degraded { .. }
+        ));
+        coordinator.resources.clear_poison();
+
+        let ordinary = coordinator.admit(job("ordinary-error")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage(&ordinary, || {
+                Err::<(), _>(Error::InferenceError("shape mismatch in matmul".into()))
+            })
+            .await;
+        assert!(matches!(result, Err(Error::InferenceError(_))));
+        drop(ordinary);
+        assert_eq!(coordinator.health(), RuntimeHealth::Healthy);
+
+        let faulting = coordinator.admit(job("device-fault")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage(&faulting, || {
+                Err::<(), _>(Error::InferenceError(
+                    "DriverError(CUDA_ERROR_LAUNCH_FAILED, \"unspecified launch failure\")".into(),
+                ))
+            })
+            .await;
+        assert!(matches!(result, Err(Error::InferenceError(_))));
+        drop(faulting);
+        assert!(matches!(
+            coordinator.health(),
+            RuntimeHealth::Failed { reason } if reason.contains("CUDA_ERROR_LAUNCH_FAILED")
+        ));
+        assert!(coordinator.snapshot().poisoned);
+        assert!(matches!(
+            coordinator.admit(job("after-fault")).await,
+            Err(Error::Overloaded(message)) if message.contains("poisoned")
+        ));
     }
 
     #[test]

@@ -101,6 +101,7 @@ use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
     JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome,
 };
+use crate::runtime::health::RuntimeHealth;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
@@ -7643,6 +7644,19 @@ impl RuntimeService {
 
     pub fn coordinator_snapshot(&self) -> CoordinatorSnapshot {
         self.coordinator.snapshot()
+    }
+
+    /// Physical execution health: admission poison and latched device faults.
+    /// Cheap enough for liveness and worker status polling.
+    pub fn health(&self) -> RuntimeHealth {
+        self.coordinator.health()
+    }
+
+    /// Fault injection for probe and status tests in dependent crates: latch
+    /// `error` through the same classification device execution uses.
+    #[doc(hidden)]
+    pub fn latch_device_fault_for_test(&self, error: &Error) -> bool {
+        self.coordinator.latch_fatal_device_fault(error)
     }
 
     pub fn is_draining(&self) -> bool {

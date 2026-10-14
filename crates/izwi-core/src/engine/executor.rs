@@ -4311,6 +4311,36 @@ impl UnifiedExecutor {
         }
     }
 
+    /// A sticky device error (CUDA illegal address, launch failure, ECC; a
+    /// Metal command-buffer fault) leaves the device unusable for this
+    /// process, so it poisons physical admission like a post-entry panic:
+    /// later requests fail fast and health reports `Failed` instead of every
+    /// request failing on device entry.
+    fn latch_fatal_device_fault(
+        &self,
+        batch: &PhysicalBatch,
+        result: &std::result::Result<Vec<ExecutorStepResult>, PhysicalDispatchError>,
+    ) {
+        let fault = match result {
+            Err(failure) => crate::runtime::fatal_device_fault(&failure.error),
+            Ok(rows) => rows.iter().find_map(|row| {
+                row.output
+                    .error
+                    .as_deref()
+                    .and_then(crate::runtime::fatal_device_fault_message)
+            }),
+        };
+        if let Some(fault) = fault {
+            error!(
+                batch_id = batch.batch_id.get(),
+                fault, "Fatal device fault during physical model execution"
+            );
+            self.poison_physical_runtime(format!(
+                "fatal device fault ({fault}) during physical model execution"
+            ));
+        }
+    }
+
     /// Acquire physical execution capacity for one validated batch envelope.
     /// Workspace and stream state must not be acquired until this returns.
     pub(super) async fn acquire_physical_execution(
@@ -4450,6 +4480,7 @@ impl UnifiedExecutor {
             Ok(result) => {
                 drop(executor);
                 drop(admitted);
+                self.latch_fatal_device_fault(batch, &result);
                 result
             }
             Err(payload) => {
@@ -5983,29 +6014,15 @@ mod tests {
         assert!(panic_payload_to_string(payload.as_ref()).contains("executor panic sentinel"));
     }
 
-    #[tokio::test]
-    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
-        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
-            capacity: ResourceVector {
-                host_bytes: ResourceAmount::Known(64),
-                ..ResourceVector::zero()
-            },
-        })));
-        let admission = PhysicalExecutionAdmission::standalone(1);
-        let executor = UnifiedExecutor::new_for_test_with_physical_context(
-            Box::new(PanickingPhysicalExecutor),
-            BackendKind::Cpu,
-            authority.clone(),
-            admission.clone(),
-        );
-        let mut request = EngineCoreRequest::tts("panic containment");
-        request.id = "panic-containment".to_string();
+    fn single_row_physical_batch(
+        request: &EngineCoreRequest,
+    ) -> (PhysicalBatch, ScheduledRequest, super::super::BatchLaneKey) {
         let lane = super::super::BatchLaneKey {
             execution_group: super::super::ExecutionGroupId::new(27),
             model_instance: super::super::ModelInstanceId::new(28),
             adapter_instance: super::super::AdapterInstanceId::new(29),
             adapter_abi: super::super::AdapterAbiRevision::new(1),
-            capability_id: "panic-test".to_string(),
+            capability_id: "physical-test".to_string(),
             stage_id: super::super::StageId::new(1),
             backend: BackendKind::Cpu,
             device_ordinal: None,
@@ -6019,7 +6036,7 @@ mod tests {
             shape_bucket: "exact.1".to_string(),
         };
         let work = super::super::WorkUnit::AtomicJob {
-            kind: "panic-test".to_string(),
+            kind: "physical-test".to_string(),
         };
         let batch = PhysicalBatch {
             batch_id: super::super::BatchId::new(30),
@@ -6046,6 +6063,27 @@ mod tests {
             num_computed_tokens: 0,
             work,
         };
+        (batch, scheduled, lane)
+    }
+
+    #[tokio::test]
+    async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+            capacity: ResourceVector {
+                host_bytes: ResourceAmount::Known(64),
+                ..ResourceVector::zero()
+            },
+        })));
+        let admission = PhysicalExecutionAdmission::standalone(1);
+        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+            Box::new(PanickingPhysicalExecutor),
+            BackendKind::Cpu,
+            authority.clone(),
+            admission.clone(),
+        );
+        let mut request = EngineCoreRequest::tts("panic containment");
+        request.id = "panic-containment".to_string();
+        let (batch, scheduled, lane) = single_row_physical_batch(&request);
 
         let failure = executor
             .execute_physical_batch(&batch, &[&request], &[scheduled])
@@ -6079,6 +6117,100 @@ mod tests {
                 .await,
             Err(Error::Overloaded(message)) if message.contains("poisoned")
         ));
+    }
+
+    struct FailingPhysicalExecutor {
+        message: &'static str,
+    }
+
+    impl ModelExecutor for FailingPhysicalExecutor {
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Err(Error::InferenceError(self.message.to_string()))
+        }
+
+        fn execute_decode(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.execute_prefill(requests, scheduled)
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_device_errors_latch_physical_runtime_and_ordinary_errors_do_not() {
+        for (message, fatal) in [
+            (
+                "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")",
+                true,
+            ),
+            (
+                "Metal error Command buffer had following error: Caused GPU Address Fault Error (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)",
+                true,
+            ),
+            ("shape mismatch in matmul", false),
+        ] {
+            let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
+                capacity: ResourceVector {
+                    host_bytes: ResourceAmount::Known(64),
+                    ..ResourceVector::zero()
+                },
+            })));
+            let admission = PhysicalExecutionAdmission::standalone(1);
+            let executor = UnifiedExecutor::new_for_test_with_physical_context(
+                Box::new(FailingPhysicalExecutor { message }),
+                BackendKind::Cpu,
+                authority.clone(),
+                admission.clone(),
+            );
+            let mut request = EngineCoreRequest::tts("device fault");
+            request.id = "device-fault".to_string();
+            let (batch, scheduled, lane) = single_row_physical_batch(&request);
+
+            let failure = executor
+                .execute_physical_batch(&batch, &[&request], &[scheduled])
+                .await
+                .expect_err("a model error must fail the dispatch");
+            assert_eq!(failure.provenance.failure_origin, Some(FailureOrigin::Model));
+            assert_eq!(admission.active(), 0);
+            assert_eq!(admission.poison_reason().is_some(), fatal, "{message}");
+            assert_eq!(authority.poison_reason().is_some(), fatal, "{message}");
+            assert_eq!(executor.is_ready().await, !fatal, "{message}");
+            if fatal {
+                assert!(admission
+                    .poison_reason()
+                    .is_some_and(|reason| reason.contains("fatal device fault")));
+                assert!(matches!(
+                    admission
+                        .acquire_dispatch(
+                            lane.execution_group,
+                            lane.model_instance,
+                            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+                            NativeBatchMode::None,
+                            1,
+                            None,
+                        )
+                        .await,
+                    Err(Error::Overloaded(message)) if message.contains("poisoned")
+                ));
+            }
+        }
     }
 
     #[test]

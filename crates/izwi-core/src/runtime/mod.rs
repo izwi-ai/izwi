@@ -15,6 +15,7 @@ mod conformance;
 mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
+mod health;
 mod kokoro;
 mod lifecycle;
 mod pipeline;
@@ -46,6 +47,8 @@ pub use conformance::{
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
+pub use health::RuntimeHealth;
+pub(crate) use health::{fatal_device_fault, fatal_device_fault_message};
 pub use service::{
     RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
     RuntimeChatTeardown, RuntimeChatTeardownDisposition, RuntimeService,
