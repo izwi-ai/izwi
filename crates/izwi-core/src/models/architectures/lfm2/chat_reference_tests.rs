@@ -16,11 +16,10 @@
 //! Run: `cargo test -p izwi-core --features metal --lib lfm2::chat::reference_tests -- --ignored --nocapture`
 use super::*;
 use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig};
-use crate::backends::{BackendPreference, DeviceProfile, DeviceSelector};
+use crate::backends::DeviceProfile;
 use crate::engine::ModelInstanceId;
 use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::models::architectures::lfm2::physical::Lfm2StateLayout;
-use candle_core::Device;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -430,6 +429,8 @@ fn lfm25_chat_matches_the_f32_reference_on_cpu() {
 #[test]
 #[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
 fn lfm25_chat_matches_the_f32_reference_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !matches!(profile.device, Device::Metal(_)) {
         eprintln!("skipping: no Metal device");
@@ -449,6 +450,8 @@ fn lfm25_chat_matches_the_f32_reference_on_metal() {
 #[test]
 #[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
 fn lfm25_chat_matches_the_f32_reference_on_cuda() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Cuda).unwrap();
     if !matches!(profile.device, Device::Cuda(_)) {
         eprintln!("skipping: no CUDA device");
