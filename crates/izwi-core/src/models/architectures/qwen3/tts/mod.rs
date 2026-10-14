@@ -69,7 +69,6 @@ use crate::kv::v2::{
 use crate::models::architectures::qwen3::core::{
     qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
 };
-use crate::models::shared::attention::paged::{default_kv_page_size, KvCacheQuantization};
 use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
@@ -1095,8 +1094,6 @@ pub struct Qwen3TtsModel {
     config: Qwen3TtsConfig,
     /// Decode-time KV page size.
     kv_page_size: usize,
-    /// KV cache quantization mode.
-    kv_quantization: KvCacheQuantization,
     /// Whether the talker and predictor projections loaded as weight-only
     /// F16, why, and the self-check that decided.
     weight_precision: WeightOnlyF16Load,
@@ -2066,7 +2063,6 @@ impl Qwen3TtsModel {
             talker_state_dtype,
             predictor_state_dtype,
         );
-        let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
         let speaker_encoder = if layout.speaker_encoder {
             load_speaker_encoder(&config, &weights_path, &device.device)?
         } else {
@@ -2089,7 +2085,6 @@ impl Qwen3TtsModel {
             config,
             weight_precision,
             kv_page_size: kv_page_size.max(1),
-            kv_quantization,
             reference_cache: reference_cache::ReferenceCache::default(),
         })
     }
@@ -2383,7 +2378,9 @@ impl Qwen3TtsModel {
             code_predictor_dtype: format!("{:?}", self.code_predictor_dtype),
             speech_tokenizer_dtype: format!("{:?}", self.speech_tokenizer_dtype),
             kv_page_size: self.kv_page_size,
-            kv_quantization: format!("{:?}", self.kv_quantization).to_ascii_lowercase(),
+            // Quantized KV is rejected at policy resolution, so stored KV is
+            // always dense; the key stays for diagnostics compatibility.
+            kv_quantization: "none".to_string(),
             speaker_count: self.config.talker_config.spk_id.len(),
             vocab_size: self.config.talker_config.vocab_size,
             text_vocab_size: self.config.talker_config.text_vocab_size,
@@ -4690,13 +4687,6 @@ fn finish_decoded_audio(samples: &mut [f32]) {
             *sample = 0.0;
         }
     }
-}
-
-/// Load a Qwen3-TTS model
-pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsModel> {
-    let kv_cache_dtype =
-        std::env::var("IZWI_KV_CACHE_DTYPE").unwrap_or_else(|_| "float16".to_string());
-    Qwen3TtsModel::load(model_path, device, default_kv_page_size(), &kv_cache_dtype)
 }
 
 #[cfg(test)]

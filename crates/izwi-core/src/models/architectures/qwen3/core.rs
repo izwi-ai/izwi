@@ -4,11 +4,7 @@
 //! (used for audio-conditioned ASR).
 
 use candle_core::quantized::{ggml_file, GgmlDType, QMatMul, QTensor};
-#[cfg(test)]
-use candle_core::D;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
-#[cfg(test)]
-use candle_nn::kv_cache::Cache;
 use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
@@ -33,26 +29,13 @@ use crate::kv::v2::{
 use crate::kv::KvDecodeBatchMetadata;
 #[cfg(test)]
 use crate::kv::{CacheBlockRef, KvLayerBinding};
-#[cfg(test)]
-use crate::models::shared::attention::batched::{
-    batched_scaled_dot_product_attention, BatchedAttentionConfig, BatchedAttentionInput,
-};
 use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
 use crate::models::shared::moe::{
     ExpertSet, ExpertActivationCounters, SparseMoeConfig, SparseMoeDispatcher,
 };
-#[cfg(test)]
-use crate::models::shared::attention::paged::{
-    append_to_pages, default_kv_page_size, default_kv_quantization, materialize_pages,
-    paged_decode_attention, KvCacheQuantization, KvPage,
-};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
-#[cfg(test)]
-use crate::models::shared::memory::accounting::TensorStorageAccounting;
-#[cfg(test)]
-use crate::models::shared::telemetry::{record_decode_attention_path, DecodeAttentionPath};
 use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::models::shared::weights::mlx;
@@ -289,492 +272,6 @@ pub(crate) fn qwen3_decoder_cache_domain(
         },
         accepted_dtypes: vec![storage_dtype],
     })
-}
-
-#[cfg(test)]
-pub struct Qwen3Cache {
-    k_pages: Vec<Vec<KvPage>>,
-    v_pages: Vec<Vec<KvPage>>,
-    dense_k_cache_h: Vec<Option<Cache>>,
-    dense_v_cache_h: Vec<Option<Cache>>,
-    dense_kv_tokens: Vec<usize>,
-    dense_decode_overflowed: Vec<bool>,
-    rope_cache: Vec<Qwen3RopeCacheEntry>,
-    dense_decode_max_tokens: usize,
-    dense_decode_initial_capacity: usize,
-    page_size: usize,
-    quantization: KvCacheQuantization,
-}
-
-#[cfg(test)]
-struct Qwen3RopeCacheEntry {
-    seq_len: usize,
-    start_pos: usize,
-    head_dim: usize,
-    dtype: DType,
-    use_mrope: bool,
-    mrope_section: Vec<usize>,
-    cos_half: Tensor,
-    sin_half: Tensor,
-}
-
-#[cfg(test)]
-impl Qwen3Cache {
-    pub fn paged_storage_bytes(&self) -> usize {
-        self.k_pages
-            .iter()
-            .chain(self.v_pages.iter())
-            .flat_map(|pages| pages.iter())
-            .map(KvPage::storage_bytes)
-            .sum()
-    }
-
-    /// Backing allocations currently retained by this session cache.
-    ///
-    /// Includes paged KV, dense Candle KV capacity, and session-local RoPE
-    /// windows. Returns `None` if a backend allocation cannot be observed or
-    /// the total cannot be represented as `u64`.
-    pub fn allocated_bytes(&self) -> Option<u64> {
-        let mut accounting = TensorStorageAccounting::default();
-        self.account_storage(&mut accounting)?;
-        Some(accounting.bytes())
-    }
-
-    pub(crate) fn account_storage(&self, accounting: &mut TensorStorageAccounting) -> Option<()> {
-        for page in self
-            .k_pages
-            .iter()
-            .chain(self.v_pages.iter())
-            .flat_map(|pages| pages.iter())
-        {
-            page.account_storage(accounting)?;
-        }
-
-        for cache in self
-            .dense_k_cache_h
-            .iter()
-            .chain(self.dense_v_cache_h.iter())
-            .flatten()
-        {
-            if let Some(tensor) = cache.all_data().as_ref() {
-                accounting.add_tensor(tensor)?;
-            }
-        }
-
-        for entry in &self.rope_cache {
-            accounting.add_tensor(&entry.cos_half)?;
-            accounting.add_tensor(&entry.sin_half)?;
-        }
-
-        Some(())
-    }
-
-    pub fn new(num_layers: usize) -> Self {
-        Self::with_page_size_and_quantization(
-            num_layers,
-            default_kv_page_size(),
-            default_kv_quantization(),
-        )
-    }
-
-    pub fn with_page_size(num_layers: usize, page_size: usize) -> Self {
-        Self::with_page_size_and_quantization(num_layers, page_size, default_kv_quantization())
-    }
-
-    pub fn page_size(&self) -> usize {
-        self.page_size
-    }
-
-    pub fn dense_decode_max_tokens(&self) -> usize {
-        self.dense_decode_max_tokens
-    }
-
-    pub fn with_page_size_and_dense_decode(
-        num_layers: usize,
-        page_size: usize,
-        device: &Device,
-    ) -> Self {
-        let quantization = default_kv_quantization();
-        let dense_decode_max_tokens =
-            qwen3_dense_decode_max_tokens(device, page_size, quantization);
-        Self::with_page_size_quantization_and_dense_decode_tokens(
-            num_layers,
-            page_size,
-            quantization,
-            dense_decode_max_tokens,
-        )
-    }
-
-    pub fn with_page_size_and_dense_decode_initial_capacity(
-        num_layers: usize,
-        page_size: usize,
-        device: &Device,
-        dense_decode_initial_capacity: usize,
-    ) -> Self {
-        let quantization = default_kv_quantization();
-        let dense_decode_max_tokens =
-            qwen3_dense_decode_max_tokens(device, page_size, quantization);
-        Self::with_page_size_quantization_dense_decode_tokens_initial_capacity(
-            num_layers,
-            page_size,
-            quantization,
-            dense_decode_max_tokens,
-            dense_decode_initial_capacity,
-        )
-    }
-
-    pub fn with_page_size_and_dense_decode_tokens(
-        num_layers: usize,
-        page_size: usize,
-        device: &Device,
-        dense_decode_max_tokens: usize,
-    ) -> Self {
-        let quantization = default_kv_quantization();
-        let dense_decode_max_tokens = if qwen3_use_dense_decode_attention_feature(device) {
-            dense_decode_max_tokens
-        } else {
-            0
-        };
-        Self::with_page_size_quantization_and_dense_decode_tokens(
-            num_layers,
-            page_size,
-            quantization,
-            dense_decode_max_tokens,
-        )
-    }
-
-    pub fn with_page_size_and_quantization(
-        num_layers: usize,
-        page_size: usize,
-        quantization: KvCacheQuantization,
-    ) -> Self {
-        Self::with_page_size_quantization_and_dense_decode_tokens(
-            num_layers,
-            page_size,
-            quantization,
-            0,
-        )
-    }
-
-    pub fn with_page_size_quantization_and_dense_decode_tokens(
-        num_layers: usize,
-        page_size: usize,
-        quantization: KvCacheQuantization,
-        dense_decode_max_tokens: usize,
-    ) -> Self {
-        Self::with_page_size_quantization_dense_decode_tokens_initial_capacity(
-            num_layers,
-            page_size,
-            quantization,
-            dense_decode_max_tokens,
-            0,
-        )
-    }
-
-    fn with_page_size_quantization_dense_decode_tokens_initial_capacity(
-        num_layers: usize,
-        page_size: usize,
-        quantization: KvCacheQuantization,
-        dense_decode_max_tokens: usize,
-        dense_decode_initial_capacity: usize,
-    ) -> Self {
-        let dense_decode_max_tokens = if quantization == KvCacheQuantization::None {
-            dense_decode_max_tokens
-        } else {
-            0
-        };
-        let dense_decode_initial_capacity = if dense_decode_max_tokens > 0 {
-            dense_decode_initial_capacity.min(dense_decode_max_tokens)
-        } else {
-            0
-        };
-        Self {
-            k_pages: vec![Vec::new(); num_layers],
-            v_pages: vec![Vec::new(); num_layers],
-            dense_k_cache_h: vec![None; num_layers],
-            dense_v_cache_h: vec![None; num_layers],
-            dense_kv_tokens: vec![0; num_layers],
-            dense_decode_overflowed: vec![false; num_layers],
-            rope_cache: Vec::new(),
-            dense_decode_max_tokens,
-            dense_decode_initial_capacity,
-            page_size: page_size.max(1),
-            quantization,
-        }
-    }
-
-    pub fn append(&mut self, layer: usize, k: Tensor, v: Tensor) -> Result<()> {
-        if self.should_append_dense(layer, k.dim(1)?) {
-            self.append_dense(layer, &k, &v)?;
-            return Ok(());
-        }
-        if self.has_dense_cache(layer) {
-            self.materialize_dense_to_pages(layer)?;
-            self.dense_decode_overflowed[layer] = true;
-        }
-        append_to_pages(
-            self.page_size,
-            &mut self.k_pages[layer],
-            &k,
-            self.quantization,
-        )?;
-        append_to_pages(
-            self.page_size,
-            &mut self.v_pages[layer],
-            &v,
-            self.quantization,
-        )?;
-        Ok(())
-    }
-
-    fn should_append_dense(&self, layer: usize, append_tokens: usize) -> bool {
-        self.dense_decode_max_tokens > 0
-            && !self.dense_decode_overflowed[layer]
-            && self.k_pages[layer].is_empty()
-            && self.v_pages[layer].is_empty()
-            && self.dense_kv_tokens[layer].saturating_add(append_tokens)
-                <= self.dense_decode_max_tokens
-    }
-
-    fn append_dense(&mut self, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
-        let append_tokens = k.dim(1)?;
-        if append_tokens == 0 {
-            return Ok(());
-        }
-
-        let k_h = k.transpose(1, 2)?.contiguous()?;
-        let v_h = v.transpose(1, 2)?.contiguous()?;
-        let initial_capacity = dense_cache_initial_capacity(
-            append_tokens,
-            self.page_size,
-            self.dense_decode_max_tokens,
-            self.dense_decode_initial_capacity,
-        );
-        self.dense_k_cache_h[layer]
-            .get_or_insert_with(|| Cache::new(2, initial_capacity))
-            .append(&k_h)?;
-        self.dense_v_cache_h[layer]
-            .get_or_insert_with(|| Cache::new(2, initial_capacity))
-            .append(&v_h)?;
-        self.dense_kv_tokens[layer] = self.dense_kv_tokens[layer].saturating_add(append_tokens);
-        Ok(())
-    }
-
-    fn has_dense_cache(&self, layer: usize) -> bool {
-        self.dense_kv_tokens[layer] > 0
-    }
-
-    fn materialize_dense_to_pages(&mut self, layer: usize) -> Result<()> {
-        if !self.has_dense_cache(layer) {
-            return Ok(());
-        }
-        let k_cache = self.dense_k_cache_h[layer].take().ok_or_else(|| {
-            Error::InferenceError("Qwen3 missing dense key cache during page migration".to_string())
-        })?;
-        let v_cache = self.dense_v_cache_h[layer].take().ok_or_else(|| {
-            Error::InferenceError(
-                "Qwen3 missing dense value cache during page migration".to_string(),
-            )
-        })?;
-        let k_cache_h = k_cache.current_data()?.ok_or_else(|| {
-            Error::InferenceError("Qwen3 empty dense key cache during page migration".to_string())
-        })?;
-        let v_cache_h = v_cache.current_data()?.ok_or_else(|| {
-            Error::InferenceError("Qwen3 empty dense value cache during page migration".to_string())
-        })?;
-        let k_dense = k_cache_h.transpose(1, 2)?.contiguous()?;
-        let v_dense = v_cache_h.transpose(1, 2)?.contiguous()?;
-        append_to_pages(
-            self.page_size,
-            &mut self.k_pages[layer],
-            &k_dense,
-            self.quantization,
-        )?;
-        append_to_pages(
-            self.page_size,
-            &mut self.v_pages[layer],
-            &v_dense,
-            self.quantization,
-        )?;
-        self.dense_kv_tokens[layer] = 0;
-        Ok(())
-    }
-
-    pub fn pages(&self, layer: usize) -> Option<(&[KvPage], &[KvPage])> {
-        let k = self.k_pages.get(layer)?;
-        let v = self.v_pages.get(layer)?;
-        if k.is_empty() || v.is_empty() {
-            None
-        } else {
-            Some((k.as_slice(), v.as_slice()))
-        }
-    }
-
-    pub fn materialize(&self, layer: usize) -> Result<(Tensor, Tensor)> {
-        let k = self.k_pages.get(layer).ok_or_else(|| {
-            Error::InferenceError(format!("Invalid Qwen3Cache layer index: {layer}"))
-        })?;
-        let v = self.v_pages.get(layer).ok_or_else(|| {
-            Error::InferenceError(format!("Invalid Qwen3Cache layer index: {layer}"))
-        })?;
-        if k.is_empty() && v.is_empty() {
-            if let Some((k_dense_h, v_dense_h)) = self.dense_heads(layer)? {
-                return Ok((
-                    k_dense_h.transpose(1, 2)?.contiguous()?,
-                    v_dense_h.transpose(1, 2)?.contiguous()?,
-                ));
-            }
-        }
-        Ok((materialize_pages(k)?, materialize_pages(v)?))
-    }
-
-    pub fn dense_heads(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
-        if self.dense_decode_max_tokens == 0 || self.dense_decode_overflowed[layer] {
-            return Ok(None);
-        }
-        let Some(k_cache) = self
-            .dense_k_cache_h
-            .get(layer)
-            .and_then(|cache| cache.as_ref())
-        else {
-            return Ok(None);
-        };
-        let Some(v_cache) = self
-            .dense_v_cache_h
-            .get(layer)
-            .and_then(|cache| cache.as_ref())
-        else {
-            return Ok(None);
-        };
-        let Some(k) = k_cache.current_data()? else {
-            return Ok(None);
-        };
-        let Some(v) = v_cache.current_data()? else {
-            return Ok(None);
-        };
-        Ok(Some((k, v)))
-    }
-
-    fn cached_rope_pair(
-        &mut self,
-        seq_len: usize,
-        start_pos: usize,
-        head_dim: usize,
-        device: &Device,
-        dtype: DType,
-        use_mrope: bool,
-        mrope_section: &[usize],
-        inv_freqs: &[f32],
-    ) -> Result<(Tensor, Tensor)> {
-        if let Some(entry) = self.rope_cache.iter().find(|entry| {
-            entry.seq_len == seq_len
-                && entry.start_pos == start_pos
-                && entry.head_dim == head_dim
-                && entry.dtype == dtype
-                && entry.use_mrope == use_mrope
-                && entry.mrope_section == mrope_section
-        }) {
-            return Ok((entry.cos_half.clone(), entry.sin_half.clone()));
-        }
-
-        let (cos_half, sin_half) = if use_mrope {
-            let mut data = Vec::with_capacity(3 * seq_len);
-            let base = start_pos as i64;
-            for _axis in 0..3 {
-                for idx in 0..seq_len {
-                    data.push(base + idx as i64);
-                }
-            }
-            let position_ids = Tensor::from_vec(data, (3, seq_len), device)?;
-            build_mrope_cache_with_inv_freqs(
-                seq_len,
-                head_dim,
-                device,
-                dtype,
-                &position_ids,
-                mrope_section,
-                inv_freqs,
-            )?
-        } else {
-            build_rope_cache_with_inv_freqs(seq_len, start_pos, device, dtype, inv_freqs)?
-        };
-
-        self.rope_cache.push(Qwen3RopeCacheEntry {
-            seq_len,
-            start_pos,
-            head_dim,
-            dtype,
-            use_mrope,
-            mrope_section: mrope_section.to_vec(),
-            cos_half: cos_half.clone(),
-            sin_half: sin_half.clone(),
-        });
-        Ok((cos_half, sin_half))
-    }
-}
-
-#[cfg(test)]
-fn dense_cache_initial_capacity(
-    append_tokens: usize,
-    page_size: usize,
-    dense_decode_max_tokens: usize,
-    requested_initial_capacity: usize,
-) -> usize {
-    let page_size = page_size.max(1);
-    requested_initial_capacity
-        .max(append_tokens)
-        .saturating_add(page_size - 1)
-        .saturating_div(page_size)
-        .saturating_mul(page_size)
-        .max(append_tokens)
-        .max(1)
-        .min(dense_decode_max_tokens.max(1))
-}
-
-#[cfg(test)]
-pub(crate) fn qwen3_dense_decode_max_tokens(
-    device: &Device,
-    page_size: usize,
-    quantization: KvCacheQuantization,
-) -> usize {
-    if quantization != KvCacheQuantization::None {
-        return 0;
-    }
-    if !qwen3_use_dense_decode_attention_feature(device) {
-        return 0;
-    }
-    page_size
-        .max(1)
-        .saturating_mul(qwen3_dense_decode_max_pages())
-}
-
-#[cfg(test)]
-fn qwen3_use_dense_decode_attention_feature(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_DENSE_DECODE_ATTENTION")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    qwen3_use_dense_decode_attention_policy(device.is_metal(), device.is_cuda(), override_enabled)
-}
-
-#[cfg(test)]
-fn qwen3_use_dense_decode_attention_policy(
-    is_metal: bool,
-    is_cuda: bool,
-    override_enabled: Option<bool>,
-) -> bool {
-    if !is_metal && !is_cuda {
-        return false;
-    }
-    override_enabled.unwrap_or(true)
-}
-
-#[cfg(test)]
-fn qwen3_dense_decode_max_pages() -> usize {
-    std::env::var("IZWI_QWEN3_DENSE_DECODE_MAX_PAGES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128)
 }
 
 fn parse_env_bool(raw: &str) -> Option<bool> {
@@ -1991,156 +1488,6 @@ impl Qwen3Attention {
         self.o_proj.forward(&output).map_err(Error::from)
     }
 
-    #[cfg(test)]
-    fn forward(
-        &self,
-        x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        let bsz = x.dim(0)?;
-        let seq_len = x.dim(1)?;
-        let use_batched = cache.is_none() && start_pos == 0 && bsz > 1;
-
-        let (q, k, v) = self.qkv_proj.forward(x)?;
-        let mut q = q.reshape((bsz, seq_len, self.num_heads, self.head_dim))?;
-        let mut k = k.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = v.reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
-
-        (q, k) = self.apply_qk_norm_pair(q, k, seq_len)?;
-
-        (q, k) = self.apply_rope_pair(q, k, start_pos, position_ids)?;
-
-        let (k, v) = if let Some(cache) = cache {
-            cache.append(layer_idx, k.clone(), v.clone())?;
-
-            // Decode path hot loop: for single-token decode, avoid rematerializing full KV.
-            if seq_len == 1 && start_pos > 0 {
-                if let Some((k_dense_h, v_dense_h)) = cache.dense_heads(layer_idx)? {
-                    record_decode_attention_path(DecodeAttentionPath::Dense);
-                    let out = dense_decode_attention(
-                        &q,
-                        &k_dense_h,
-                        &v_dense_h,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    )?;
-                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
-                }
-                if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
-                    let out = paged_decode_attention(
-                        &q,
-                        k_pages,
-                        v_pages,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    )?;
-                    let out = out.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-                    return self.o_proj.forward(&out).map_err(Error::from);
-                }
-            }
-
-            cache.materialize(layer_idx)?
-        } else {
-            (k, v)
-        };
-
-        if use_batched {
-            let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-            let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-            let q = q.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let k = k.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let v = v.reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-            let attention_mask = if seq_len > 1 {
-                Some(causal_mask(
-                    seq_len,
-                    seq_len,
-                    start_pos,
-                    q.device(),
-                    q.dtype(),
-                )?)
-            } else {
-                None
-            };
-            let input = BatchedAttentionInput {
-                queries: q,
-                keys: k,
-                values: v,
-                attention_mask,
-                seq_lengths: vec![seq_len; bsz],
-            };
-            let config = BatchedAttentionConfig::new(self.num_heads, self.head_dim);
-            let out = batched_scaled_dot_product_attention(&input, &config)?;
-            return self.o_proj.forward(&out).map_err(Error::from);
-        }
-
-        let q = q.transpose(1, 2)?; // [b, h, s, d]
-        let k_kv = k.transpose(1, 2)?; // [b, kv_h, t, d]
-        let v_kv = v.transpose(1, 2)?;
-
-        let total_len = k_kv.dim(2)?;
-        if start_pos == 0 && total_len == seq_len {
-            if let Some(fused_out) =
-                try_fused_self_attention(&q, &k_kv, &v_kv, None, self.head_dim, true)?
-            {
-                let out = fused_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
-            }
-        }
-
-        let k = repeat_kv(&k, self.num_heads, self.num_kv_heads)?;
-        let v = repeat_kv(&v, self.num_heads, self.num_kv_heads)?;
-        let k = k.transpose(1, 2)?; // [b, h, t, d]
-        let v = v.transpose(1, 2)?;
-
-        let total_len = k.dim(2)?;
-        if seq_len == 1 {
-            let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-            if let Ok(sdpa_out) = ops::sdpa(&q, &k, &v, None, false, scale, 1.0) {
-                let out = sdpa_out.transpose(1, 2)?.reshape((
-                    bsz,
-                    seq_len,
-                    self.num_heads * self.head_dim,
-                ))?;
-                return self.o_proj.forward(&out).map_err(Error::from);
-            }
-        }
-
-        let q = q.reshape((bsz * self.num_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-        let v = v.reshape((bsz * self.num_heads, total_len, self.head_dim))?;
-
-        let mut att = q.matmul(&k.transpose(1, 2)?)?;
-        let scale = (self.head_dim as f64).sqrt();
-        let scale_t =
-            Tensor::from_vec(vec![scale as f32], (1,), att.device())?.to_dtype(att.dtype())?;
-        att = att.broadcast_div(&scale_t)?;
-
-        if seq_len > 1 {
-            let mask = causal_mask(seq_len, total_len, start_pos, att.device(), att.dtype())?;
-            att = att.broadcast_add(&mask)?;
-        }
-
-        let att = ops::softmax(&att, D::Minus1)?;
-        let out = att.matmul(&v)?;
-        let out = out.reshape((bsz, self.num_heads, seq_len, self.head_dim))?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((bsz, seq_len, self.num_heads * self.head_dim))?;
-
-        let out = self.o_proj.forward(&out)?;
-        Ok(out)
-    }
-
     fn forward_managed(
         &self,
         x: &Tensor,
@@ -2262,86 +1609,6 @@ impl Qwen3Attention {
         })?;
         completions.collect(completion)?;
         let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&out).map_err(Error::from)
-    }
-
-    #[cfg(test)]
-    fn forward_decode_batch(
-        &self,
-        x: &Tensor,
-        start_positions: &[usize],
-        caches: &mut [&mut Qwen3Cache],
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        let bsz = x.dim(0)?;
-        let seq_len = x.dim(1)?;
-        if seq_len != 1 || bsz == 0 {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3 continuous decode expects [batch,1,hidden], got {:?}",
-                x.dims()
-            )));
-        }
-        if start_positions.len() != bsz || caches.len() != bsz {
-            return Err(Error::InvalidInput(
-                "Qwen3 continuous decode state count does not match tensor width".to_string(),
-            ));
-        }
-
-        // Projection and normalization remain true batch-dimension tensor
-        // operations. Ragged attention consumes each session's independently
-        // owned cache, then the output projection rejoins the physical batch.
-        let (q, k, v) = self.qkv_proj.forward(x)?;
-        let q = q.reshape((bsz, 1, self.num_heads, self.head_dim))?;
-        let k = k.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
-        let v = v.reshape((bsz, 1, self.num_kv_heads, self.head_dim))?;
-        let (q, k) = self.apply_qk_norm_pair(q, k, 1)?;
-
-        let mut row_outputs = Vec::with_capacity(bsz);
-        for row_idx in 0..bsz {
-            let cache = &mut *caches[row_idx];
-            let q_row = q.i(row_idx)?.unsqueeze(0)?;
-            let k_row = k.i(row_idx)?.unsqueeze(0)?;
-            let v_row = v.i(row_idx)?.unsqueeze(0)?;
-            let (q_row, k_row) =
-                self.apply_rope_pair(q_row, k_row, start_positions[row_idx], None)?;
-            cache.append(layer_idx, k_row, v_row)?;
-
-            let attention = if let Some((k_heads, v_heads)) = cache.dense_heads(layer_idx)? {
-                record_decode_attention_path(DecodeAttentionPath::Dense);
-                dense_decode_attention(
-                    &q_row,
-                    &k_heads,
-                    &v_heads,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?
-            } else if let Some((k_pages, v_pages)) = cache.pages(layer_idx) {
-                paged_decode_attention(
-                    &q_row,
-                    k_pages,
-                    v_pages,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?
-            } else {
-                let (k_all, v_all) = cache.materialize(layer_idx)?;
-                dense_decode_attention(
-                    &q_row,
-                    &k_all.transpose(1, 2)?.contiguous()?,
-                    &v_all.transpose(1, 2)?.contiguous()?,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                )?
-            };
-            row_outputs.push(attention);
-        }
-
-        let row_outputs = row_outputs.iter().collect::<Vec<_>>();
-        let out =
-            Tensor::cat(&row_outputs, 0)?.reshape((bsz, 1, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
 }
@@ -2731,46 +1998,6 @@ impl Qwen3Layer {
         hidden.broadcast_add(&mlp).map_err(Error::from)
     }
 
-    #[cfg(test)]
-    fn forward(
-        &self,
-        x: &Tensor,
-        start_pos: usize,
-        position_ids: Option<&Tensor>,
-        cache: Option<&mut Qwen3Cache>,
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward(&normed, start_pos, position_ids, cache, layer_idx)?;
-        let x = x.broadcast_add(&attn_out)?;
-
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        let x = x.broadcast_add(&mlp_out)?;
-        Ok(x)
-    }
-
-    #[cfg(test)]
-    fn forward_decode_batch(
-        &self,
-        x: &Tensor,
-        start_positions: &[usize],
-        caches: &mut [&mut Qwen3Cache],
-        layer_idx: usize,
-    ) -> Result<Tensor> {
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out =
-            self.self_attn
-                .forward_decode_batch(&normed, start_positions, caches, layer_idx)?;
-        let x = x.broadcast_add(&attn_out)?;
-
-        let normed = self.post_attention_layernorm.forward(&x)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        x.broadcast_add(&mlp_out).map_err(Error::from)
-    }
-
     fn forward_managed(
         &self,
         x: &Tensor,
@@ -3072,48 +2299,6 @@ impl Qwen3Model {
                 Qwen3FeedForward::Dense(_) => None,
             })
             .collect()
-    }
-
-    #[cfg(test)]
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
-    ) -> Result<Tensor> {
-        let embeds = self.embeddings(input_ids)?;
-        self.forward_with_embeds(&embeds, start_pos, cache, None)
-    }
-
-    /// Execute one token for a changing set of independently cached sessions.
-    /// Dense projections and MLPs use one real batch dimension; attention
-    /// remains ragged and writes back into each exact session cache.
-    #[cfg(test)]
-    pub fn forward_decode_batch(
-        &self,
-        input_ids: &Tensor,
-        start_positions: &[usize],
-        caches: &mut [&mut Qwen3Cache],
-    ) -> Result<Tensor> {
-        let (batch_size, sequence_len) = input_ids.dims2()?;
-        if sequence_len != 1 || batch_size == 0 {
-            return Err(Error::InvalidInput(format!(
-                "Qwen3 continuous decode expects token IDs shaped [batch,1], got {:?}",
-                input_ids.dims()
-            )));
-        }
-        if start_positions.len() != batch_size || caches.len() != batch_size {
-            return Err(Error::InvalidInput(
-                "Qwen3 continuous decode state count does not match token batch".to_string(),
-            ));
-        }
-
-        let mut x = self.embeddings(input_ids)?;
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_decode_batch(&x, start_positions, &mut *caches, layer_idx)?;
-        }
-        let hidden = self.norm.forward(&x)?;
-        self.logits_from_hidden(&hidden)
     }
 
     /// Execute native Qwen3 against backend-owned authoritative KV pages.
@@ -3421,36 +2606,6 @@ impl Qwen3Model {
         self.logits_from_hidden(&self.norm.forward(&hidden)?)
     }
 
-    #[cfg(test)]
-    pub fn forward_with_embeds(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut Qwen3Cache>,
-        position_ids: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let hidden = self.forward_hidden_with_embeds(embeds, start_pos, cache, position_ids)?;
-        self.logits_from_hidden(&hidden)
-    }
-
-    #[cfg(test)]
-    pub fn forward_hidden_with_embeds(
-        &self,
-        embeds: &Tensor,
-        start_pos: usize,
-        mut cache: Option<&mut Qwen3Cache>,
-        position_ids: Option<&Tensor>,
-    ) -> Result<Tensor> {
-        let position_ids =
-            self.elide_sequential_mrope_positions(start_pos, embeds.dim(1)?, position_ids)?;
-        let mut x = embeds.clone();
-        for (idx, layer) in self.layers.iter().enumerate() {
-            let cache_ref = cache.as_deref_mut();
-            x = layer.forward(&x, start_pos, position_ids, cache_ref, idx)?;
-        }
-        self.norm.forward(&x).map_err(Error::from)
-    }
-
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
         if !qwen3_runtime_profiling_enabled() {
             return self.lm_head.forward(hidden).map_err(Error::from);
@@ -3524,51 +2679,6 @@ fn qwen3_join_prefix(prefix: &str, suffix: &str) -> String {
     } else {
         format!("{prefix}.{suffix}")
     }
-}
-
-pub(crate) fn dense_decode_attention(
-    q: &Tensor,
-    k_heads: &Tensor,
-    v_heads: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> Result<Tensor> {
-    let bsz = q.dim(0)?;
-    let seq_len = q.dim(1)?;
-    if seq_len != 1 {
-        return Err(Error::InvalidInput(format!(
-            "Qwen3 dense decode attention expects q_len=1, got {seq_len}"
-        )));
-    }
-
-    let q_heads = q.transpose(1, 2)?.contiguous()?;
-    if let Some(out) = try_fused_self_attention(&q_heads, k_heads, v_heads, None, head_dim, false)?
-    {
-        return out.transpose(1, 2).map_err(Error::from);
-    }
-
-    if q_heads.dim(1)? != num_heads
-        || k_heads.dim(1)? != num_kv_heads
-        || v_heads.dim(1)? != num_kv_heads
-    {
-        return Err(Error::InvalidInput(format!(
-            "Qwen3 dense decode head geometry does not match config: q={:?}, k={:?}, v={:?}, expected query_heads={num_heads}, kv_heads={num_kv_heads}",
-            q_heads.dims(),
-            k_heads.dims(),
-            v_heads.dims()
-        )));
-    }
-    compact_gqa_sdpa_bhsd(
-        &q_heads,
-        k_heads,
-        v_heads,
-        None,
-        1.0 / (head_dim as f64).sqrt(),
-    )?
-    .transpose(1, 2)?
-    .reshape((bsz, seq_len, num_heads, head_dim))
-    .map_err(Error::from)
 }
 
 pub fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Tensor> {
@@ -4236,8 +3346,20 @@ mod tests {
         assert_eq!(bitwise(&expected), bitwise(&actual));
     }
 
-    fn test_cache() -> Qwen3Cache {
-        Qwen3Cache::with_page_size_and_quantization(1, 2, KvCacheQuantization::None)
+    /// Cache-free reference: logits for every position of `ids`, computed by
+    /// the production stateless path with a causal mask over the whole span.
+    fn stateless_logits(model: &Qwen3Model, ids: &[u32]) -> Tensor {
+        let ids = Tensor::from_vec(ids.to_vec(), (1, ids.len()), &model.device).unwrap();
+        model
+            .forward_stateless_with_embeds(&model.embeddings(&ids).unwrap(), 0, None)
+            .unwrap()
+    }
+
+    /// Reference logits for the last token of `ids`, shaped like a decode step.
+    fn stateless_last_logits(model: &Qwen3Model, ids: &[u32]) -> Tensor {
+        stateless_logits(model, ids)
+            .narrow(1, ids.len() - 1, 1)
+            .unwrap()
     }
 
     /// Tiny sparse-MoE twin of [`tiny_qwen3_model`]: identical embeddings,
@@ -4450,87 +3572,15 @@ mod tests {
     }
 
     #[test]
-    fn continuous_decode_batch_matches_ragged_scalar_cache_updates() {
+    fn managed_qwen3_prefill_and_decode_match_stateless_reference() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
-        let mut serial_a = test_cache();
-        let mut serial_b = test_cache();
-        let mut batch_a = test_cache();
-        let mut batch_b = test_cache();
-        let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
-        let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
-        for cache in [&mut serial_a, &mut batch_a] {
-            model.forward(&prompt_a, 0, Some(cache)).unwrap();
-        }
-        for cache in [&mut serial_b, &mut batch_b] {
-            model.forward(&prompt_b, 0, Some(cache)).unwrap();
-        }
-
-        let scalar_a = model
-            .forward(
-                &Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap(),
-                2,
-                Some(&mut serial_a),
-            )
-            .unwrap();
-        let scalar_b = model
-            .forward(
-                &Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap(),
-                3,
-                Some(&mut serial_b),
-            )
-            .unwrap();
-        let mut caches = [&mut batch_a, &mut batch_b];
-        let batched = model
-            .forward_decode_batch(
-                &Tensor::from_vec(vec![5u32, 6], (2, 1), &device).unwrap(),
-                &[2, 3],
-                &mut caches,
-            )
-            .unwrap();
-
-        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
-        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
-
-        let scalar_a = model
-            .forward(
-                &Tensor::from_vec(vec![7u32], (1, 1), &device).unwrap(),
-                3,
-                Some(&mut serial_a),
-            )
-            .unwrap();
-        let scalar_b = model
-            .forward(
-                &Tensor::from_vec(vec![0u32], (1, 1), &device).unwrap(),
-                4,
-                Some(&mut serial_b),
-            )
-            .unwrap();
-        let mut caches = [&mut batch_a, &mut batch_b];
-        let batched = model
-            .forward_decode_batch(
-                &Tensor::from_vec(vec![7u32, 0], (2, 1), &device).unwrap(),
-                &[3, 4],
-                &mut caches,
-            )
-            .unwrap();
-
-        assert_tensor_close(&scalar_a, &batched.i(0).unwrap().unsqueeze(0).unwrap());
-        assert_tensor_close(&scalar_b, &batched.i(1).unwrap().unsqueeze(0).unwrap());
-    }
-
-    #[test]
-    fn managed_qwen3_prefill_and_decode_match_model_owned_cache() {
-        let device = Device::Cpu;
-        let model = tiny_qwen3_model(&device);
-        let mut owned = test_cache();
         let (arena, bindings) = test_managed_arena();
         let mut managed = test_managed_cache(arena.clone(), bindings, 0);
         let prompt = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
 
-        let owned_prefill = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
         let managed_prefill = model.forward_managed(&prompt, 0, &mut managed).unwrap();
-        assert_tensor_close(&owned_prefill, &managed_prefill);
+        assert_tensor_close(&stateless_logits(&model, &[0, 1, 2]), &managed_prefill);
         assert_eq!(managed.context_len(), 3);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 1);
         assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
@@ -4544,9 +3594,11 @@ mod tests {
         assert_eq!(prefill_completions[0].slots_per_layer(), 3);
 
         let token = Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap();
-        let owned_decode = model.forward(&token, 3, Some(&mut owned)).unwrap();
         let managed_decode = model.forward_managed(&token, 3, &mut managed).unwrap();
-        assert_tensor_close(&owned_decode, &managed_decode);
+        assert_tensor_close(
+            &stateless_last_logits(&model, &[0, 1, 2, 5]),
+            &managed_decode,
+        );
         assert_eq!(managed.context_len(), 4);
         assert_eq!(arena.operation_stats().slot_write_dispatches, 2);
         assert_eq!(arena.operation_stats().paged_prefill_dispatches, 1);
@@ -4567,28 +3619,22 @@ mod tests {
         let sparse = tiny_qwen3_moe_model(&device, 4);
         let (arena, bindings) = test_managed_arena();
         let mut managed = test_managed_cache(arena, bindings, 0);
-        let mut owned = test_cache();
-        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 5], (1, 4), &device).unwrap();
+        let mut history = vec![0u32, 1, 2, 5];
+        let prompt = Tensor::from_vec(history.clone(), (1, 4), &device).unwrap();
 
         // Prefill: the sparse layer's convex combination of identical experts
         // must reduce to the dense MLP's function.
-        let dense_prefill = dense.forward(&prompt, 0, Some(&mut owned)).unwrap();
         let sparse_prefill = sparse
             .forward_managed(&prompt, 0, &mut managed)
             .unwrap();
-        assert_tensor_close(&dense_prefill, &sparse_prefill);
+        assert_tensor_close(&stateless_logits(&dense, &history), &sparse_prefill);
         assert_eq!(managed.context_len(), 4);
 
-        // Decode steps continue to agree on fresh tokens; the dense side keeps
-        // its own model-owned cache with the same prefill history.
-        for (owned_position, token) in (managed.context_len()..).zip([3u32, 6]) {
-            let dense_step = dense
-                .forward(
-                    &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
-                    owned_position,
-                    Some(&mut owned),
-                )
-                .unwrap();
+        // Decode steps continue to agree on fresh tokens against the dense
+        // model's cache-free reference over the same history.
+        for token in [3u32, 6] {
+            history.push(token);
+            let dense_step = stateless_last_logits(&dense, &history);
             let sparse_step = sparse
                 .forward_managed(
                     &Tensor::from_vec(vec![token], (1, 1), &device).unwrap(),
@@ -4742,34 +3788,18 @@ mod tests {
     fn managed_qwen3_decode_batches_ragged_rows_in_one_arena() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
-        let mut owned_a = test_cache();
-        let mut owned_b = test_cache();
         let (arena, bindings) = test_managed_arena();
         let mut managed_a = test_managed_cache(arena.clone(), bindings.clone(), 0);
         let mut managed_b = test_managed_cache(arena.clone(), bindings, 4);
         let prompt_a = Tensor::from_vec(vec![0u32, 1], (1, 2), &device).unwrap();
         let prompt_b = Tensor::from_vec(vec![2u32, 3, 4], (1, 3), &device).unwrap();
-        model.forward(&prompt_a, 0, Some(&mut owned_a)).unwrap();
-        model.forward(&prompt_b, 0, Some(&mut owned_b)).unwrap();
         model.forward_managed(&prompt_a, 0, &mut managed_a).unwrap();
         model.forward_managed(&prompt_b, 0, &mut managed_b).unwrap();
         assert_eq!(managed_a.take_completed_writes().len(), 1);
         assert_eq!(managed_b.take_completed_writes().len(), 1);
 
-        let scalar_a = model
-            .forward(
-                &Tensor::from_vec(vec![5u32], (1, 1), &device).unwrap(),
-                2,
-                Some(&mut owned_a),
-            )
-            .unwrap();
-        let scalar_b = model
-            .forward(
-                &Tensor::from_vec(vec![6u32], (1, 1), &device).unwrap(),
-                3,
-                Some(&mut owned_b),
-            )
-            .unwrap();
+        let scalar_a = stateless_last_logits(&model, &[0, 1, 5]);
+        let scalar_b = stateless_last_logits(&model, &[2, 3, 4, 6]);
         let mut caches = [&mut managed_a, &mut managed_b];
         let batched = model
             .forward_managed_decode_batch(
@@ -4797,15 +3827,11 @@ mod tests {
     }
 
     #[test]
-    fn managed_hidden_forward_matches_owned_and_exposes_early_release_receipt() {
+    fn managed_hidden_forward_matches_stateless_and_exposes_early_release_receipt() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
         let input_ids = Tensor::from_vec(vec![0u32, 1, 2], (1, 3), &device).unwrap();
         let embeds = model.embeddings(&input_ids).unwrap();
-        let mut owned = test_cache();
-        let owned_hidden = model
-            .forward_hidden_with_embeds(&embeds, 0, Some(&mut owned), None)
-            .unwrap();
 
         let (arena, bindings) = test_managed_arena();
         let mut managed = test_managed_cache(arena, bindings, 0);
@@ -4813,7 +3839,12 @@ mod tests {
             .forward_managed_hidden_with_embeds(&embeds, 0, &mut managed, None)
             .unwrap();
 
-        assert_tensor_close(&owned_hidden, &managed_hidden);
+        // The managed path returns final-norm hidden states; projecting them
+        // must reproduce the cache-free reference logits.
+        assert_tensor_close(
+            &stateless_logits(&model, &[0, 1, 2]),
+            &model.logits_from_hidden(&managed_hidden).unwrap(),
+        );
         assert_eq!(managed.context_len(), 3);
         let completions = managed.take_completed_writes();
         assert_eq!(completions.len(), 1);
@@ -4825,9 +3856,7 @@ mod tests {
     fn managed_full_page_prefix_reuse_matches_full_prefill_logits() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
-        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
-        let mut owned = test_cache();
-        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+        let full_logits = stateless_logits(&model, &[0, 1, 2, 3, 4]);
 
         let (arena, bindings) = test_managed_arena();
         let mut publisher = test_managed_cache(arena.clone(), bindings.clone(), 0);
@@ -4852,9 +3881,7 @@ mod tests {
     fn managed_multi_token_prefix_extension_matches_full_prefill_logits() {
         let device = Device::Cpu;
         let model = tiny_qwen3_model(&device);
-        let prompt = Tensor::from_vec(vec![0u32, 1, 2, 3, 4], (1, 5), &device).unwrap();
-        let mut owned = test_cache();
-        let full_logits = model.forward(&prompt, 0, Some(&mut owned)).unwrap();
+        let full_logits = stateless_logits(&model, &[0, 1, 2, 3, 4]);
 
         let (arena, bindings) = test_managed_arena();
         let mut managed = test_managed_cache(arena, bindings, 0);
@@ -5193,277 +4220,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_cache_dense_decode_accumulates_head_major_kv() {
-        let device = Device::Cpu;
-        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            4,
-            KvCacheQuantization::None,
-            4,
-        );
-        let k = Tensor::from_vec(
-            (0..8).map(|value| value as f32).collect::<Vec<_>>(),
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("k");
-        let v = Tensor::from_vec(
-            (0..8).map(|value| (value as f32) * 0.5).collect::<Vec<_>>(),
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("v");
-
-        cache.append(0, k, v).expect("append");
-        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads").expect("dense");
-        assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 2, 4));
-        assert_eq!(v_dense.dims4().expect("v dims"), (1, 1, 2, 4));
-        assert!(cache.pages(0).is_none());
-
-        let k_next =
-            Tensor::from_vec(vec![8.0f32, 9.0, 10.0, 11.0], (1, 1, 1, 4), &device).expect("k next");
-        let v_next =
-            Tensor::from_vec(vec![4.0f32, 4.5, 5.0, 5.5], (1, 1, 1, 4), &device).expect("v next");
-        cache.append(0, k_next, v_next).expect("append next");
-        let (k_dense, _) = cache
-            .dense_heads(0)
-            .expect("dense heads after append")
-            .expect("dense");
-        assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 3, 4));
-    }
-
-    #[test]
-    fn qwen3_cache_dense_decode_uses_bounded_initial_capacity() {
-        let device = Device::Cpu;
-        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            4,
-            KvCacheQuantization::None,
-            16,
-        );
-        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
-        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
-
-        cache.append(0, k, v).expect("append");
-
-        assert_eq!(
-            cache.dense_k_cache_h[0]
-                .as_ref()
-                .expect("dense key cache")
-                .max_seq_len(),
-            4
-        );
-        assert_eq!(
-            cache.dense_v_cache_h[0]
-                .as_ref()
-                .expect("dense value cache")
-                .max_seq_len(),
-            4
-        );
-
-        let k_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next k");
-        let v_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next v");
-        cache.append(0, k_next, v_next).expect("append next");
-
-        assert_eq!(
-            cache.dense_k_cache_h[0]
-                .as_ref()
-                .expect("dense key cache")
-                .max_seq_len(),
-            8
-        );
-        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads").expect("dense");
-        assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 5, 4));
-        assert_eq!(v_dense.dims4().expect("v dims"), (1, 1, 5, 4));
-    }
-
-    #[test]
-    fn qwen3_cache_dense_decode_honors_initial_capacity_hint() {
-        let device = Device::Cpu;
-        let mut cache =
-            Qwen3Cache::with_page_size_quantization_dense_decode_tokens_initial_capacity(
-                1,
-                4,
-                KvCacheQuantization::None,
-                16,
-                5,
-            );
-        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
-        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
-
-        cache.append(0, k, v).expect("append");
-
-        assert_eq!(
-            cache.dense_k_cache_h[0]
-                .as_ref()
-                .expect("dense key cache")
-                .max_seq_len(),
-            8
-        );
-        let k_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next k");
-        let v_next = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("next v");
-        cache.append(0, k_next, v_next).expect("append next");
-
-        assert_eq!(
-            cache.dense_k_cache_h[0]
-                .as_ref()
-                .expect("dense key cache")
-                .max_seq_len(),
-            8
-        );
-        let (k_dense, v_dense) = cache.dense_heads(0).expect("dense heads").expect("dense");
-        assert_eq!(k_dense.dims4().expect("k dims"), (1, 1, 5, 4));
-        assert_eq!(v_dense.dims4().expect("v dims"), (1, 1, 5, 4));
-    }
-
-    #[test]
-    fn qwen3_cache_reuses_rope_windows() {
-        let device = Device::Cpu;
-        let mut cache = Qwen3Cache::new(1);
-        let head_dim = 8usize;
-        let inv_freqs = build_rope_inv_freqs(head_dim, 10000.0);
-
-        let (first_cos, first_sin) = cache
-            .cached_rope_pair(2, 4, head_dim, &device, DType::F32, false, &[], &inv_freqs)
-            .expect("first rope cache");
-        let (second_cos, second_sin) = cache
-            .cached_rope_pair(2, 4, head_dim, &device, DType::F32, false, &[], &inv_freqs)
-            .expect("cached rope cache");
-
-        assert_eq!(cache.rope_cache.len(), 1);
-        assert_eq!(
-            first_cos.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            second_cos.flatten_all().unwrap().to_vec1::<f32>().unwrap()
-        );
-        assert_eq!(
-            first_sin.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            second_sin.flatten_all().unwrap().to_vec1::<f32>().unwrap()
-        );
-
-        cache
-            .cached_rope_pair(2, 5, head_dim, &device, DType::F32, false, &[], &inv_freqs)
-            .expect("new rope window");
-        assert_eq!(cache.rope_cache.len(), 2);
-    }
-
-    #[test]
-    fn qwen3_cache_accounting_includes_dense_capacity_and_rope() {
-        let device = Device::Cpu;
-        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            4,
-            KvCacheQuantization::None,
-            8,
-        );
-        assert_eq!(cache.allocated_bytes(), Some(0));
-
-        let k = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("k");
-        let v = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).expect("v");
-        cache.append(0, k, v).expect("append");
-        let dense_bytes = cache.allocated_bytes().expect("dense bytes");
-        assert!(dense_bytes >= 2 * 4 * 4 * 2);
-        assert_eq!(cache.paged_storage_bytes(), 0);
-
-        let inv_freqs = build_rope_inv_freqs(8, 10_000.0);
-        cache
-            .cached_rope_pair(3, 0, 8, &device, DType::F32, false, &[], &inv_freqs)
-            .expect("rope");
-        assert!(cache.allocated_bytes().expect("total bytes") > dense_bytes);
-    }
-
-    #[test]
-    fn qwen3_cache_dense_decode_disables_after_threshold_or_quantization() {
-        let device = Device::Cpu;
-        let k = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("k");
-        let v = Tensor::zeros((1, 3, 1, 4), DType::F32, &device).expect("v");
-        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            4,
-            KvCacheQuantization::None,
-            2,
-        );
-        cache
-            .append(0, k.clone(), v.clone())
-            .expect("append beyond threshold");
-        assert!(cache.dense_heads(0).expect("dense heads").is_none());
-
-        let mut quantized_cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            4,
-            KvCacheQuantization::Int8,
-            8,
-        );
-        quantized_cache.append(0, k, v).expect("append quantized");
-        assert!(quantized_cache
-            .dense_heads(0)
-            .expect("dense heads")
-            .is_none());
-    }
-
-    #[test]
-    fn qwen3_cache_dense_decode_migrates_to_pages_after_threshold() {
-        let device = Device::Cpu;
-        let mut cache = Qwen3Cache::with_page_size_quantization_and_dense_decode_tokens(
-            1,
-            2,
-            KvCacheQuantization::None,
-            2,
-        );
-        let first_k = Tensor::from_vec(
-            (0..8).map(|value| value as f32).collect::<Vec<_>>(),
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("first k");
-        let first_v = Tensor::from_vec(
-            (0..8).map(|value| value as f32 + 20.0).collect::<Vec<_>>(),
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("first v");
-        cache.append(0, first_k, first_v).expect("append first");
-        assert!(cache.dense_heads(0).expect("dense heads").is_some());
-        assert!(cache.pages(0).is_none());
-
-        let next_k =
-            Tensor::from_vec(vec![8.0f32, 9.0, 10.0, 11.0], (1, 1, 1, 4), &device).expect("next k");
-        let next_v = Tensor::from_vec(vec![28.0f32, 29.0, 30.0, 31.0], (1, 1, 1, 4), &device)
-            .expect("next v");
-        cache.append(0, next_k, next_v).expect("append next");
-
-        assert!(cache.dense_heads(0).expect("dense heads").is_none());
-        let (k_pages, v_pages) = cache.pages(0).expect("pages after migration");
-        assert_eq!(k_pages.len(), 2);
-        assert_eq!(v_pages.len(), 2);
-        let (k_dense, v_dense) = cache.materialize(0).expect("materialized");
-        assert_eq!(k_dense.dims4().expect("k dims"), (1, 3, 1, 4));
-        assert_eq!(v_dense.dims4().expect("v dims"), (1, 3, 1, 4));
-    }
-
-    #[test]
-    fn qwen3_dense_decode_policy_enables_only_metal_and_cuda() {
-        assert!(!qwen3_use_dense_decode_attention_policy(false, false, None));
-        assert!(qwen3_use_dense_decode_attention_policy(true, false, None));
-        assert!(qwen3_use_dense_decode_attention_policy(false, true, None));
-        assert!(qwen3_use_dense_decode_attention_policy(true, true, None));
-        assert!(!qwen3_use_dense_decode_attention_policy(
-            true,
-            false,
-            Some(false)
-        ));
-        assert!(!qwen3_use_dense_decode_attention_policy(
-            false,
-            true,
-            Some(false)
-        ));
-        assert!(!qwen3_use_dense_decode_attention_policy(
-            false,
-            false,
-            Some(true)
-        ));
-    }
-
-    #[test]
     fn qwen3_qmatmul_uses_f32_input_for_accelerated_lower_precision_activations() {
         assert_eq!(
             qwen3_qmatmul_input_dtype_policy(true, false, DType::BF16),
@@ -5564,141 +4320,5 @@ mod tests {
         .unwrap();
 
         assert_tensor_close(&packed_out, &expected);
-    }
-
-    #[test]
-    fn dense_decode_attention_matches_manual_gqa() {
-        let device = Device::Cpu;
-        let q = Tensor::from_vec(
-            vec![0.2f32, -0.1, 0.3, 0.4, -0.5, 0.6, 0.7, -0.2],
-            (1, 1, 2, 4),
-            &device,
-        )
-        .expect("q");
-        let k = Tensor::from_vec(
-            vec![0.1f32, 0.2, -0.1, 0.3, -0.2, 0.5, 0.4, 0.1],
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("k");
-        let v = Tensor::from_vec(
-            vec![0.7f32, -0.3, 0.2, 0.5, 0.1, 0.4, -0.6, 0.8],
-            (1, 2, 1, 4),
-            &device,
-        )
-        .expect("v");
-        let k_heads = k
-            .transpose(1, 2)
-            .expect("k heads")
-            .contiguous()
-            .expect("k contig");
-        let v_heads = v
-            .transpose(1, 2)
-            .expect("v heads")
-            .contiguous()
-            .expect("v contig");
-
-        let dense = dense_decode_attention(&q, &k_heads, &v_heads, 2, 1, 4).expect("dense");
-        let q_heads = q.transpose(1, 2).expect("q heads");
-        let k_repeated = repeat_kv(&k, 2, 1).expect("repeat k");
-        let v_repeated = repeat_kv(&v, 2, 1).expect("repeat v");
-        let k_repeated = k_repeated.transpose(1, 2).expect("k repeated heads");
-        let v_repeated = v_repeated.transpose(1, 2).expect("v repeated heads");
-        let mut att = q_heads
-            .matmul(&k_repeated.transpose(2, 3).expect("k t"))
-            .expect("scores");
-        att = (att / 2.0f64).expect("scale");
-        let expected = ops::softmax(&att, D::Minus1)
-            .expect("softmax")
-            .matmul(&v_repeated)
-            .expect("expected")
-            .transpose(1, 2)
-            .expect("expected transpose");
-
-        let dense_vals = dense
-            .flatten_all()
-            .expect("dense flat")
-            .to_vec1::<f32>()
-            .expect("dense vals");
-        let expected_vals = expected
-            .flatten_all()
-            .expect("expected flat")
-            .to_vec1::<f32>()
-            .expect("expected vals");
-        assert_eq!(dense_vals.len(), expected_vals.len());
-        for (lhs, rhs) in dense_vals.iter().zip(expected_vals.iter()) {
-            assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
-        }
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    fn dense_decode_attention_matches_manual_gqa_on_metal_decode_window() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            return;
-        };
-        let num_heads = 2usize;
-        let num_kv_heads = 1usize;
-        let head_dim = 64usize;
-        let kv_len = 4usize;
-        let q_values = (0..(num_heads * head_dim))
-            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.025)
-            .collect::<Vec<_>>();
-        let k_values = (0..(kv_len * num_kv_heads * head_dim))
-            .map(|idx| ((idx % 23) as f32 - 11.0) * 0.02)
-            .collect::<Vec<_>>();
-        let v_values = (0..(kv_len * num_kv_heads * head_dim))
-            .map(|idx| ((idx % 19) as f32 - 9.0) * 0.03)
-            .collect::<Vec<_>>();
-
-        let q = Tensor::from_vec(q_values, (1, 1, num_heads, head_dim), &device).expect("q");
-        let k =
-            Tensor::from_vec(k_values, (1, kv_len, num_kv_heads, head_dim), &device).expect("k");
-        let v =
-            Tensor::from_vec(v_values, (1, kv_len, num_kv_heads, head_dim), &device).expect("v");
-        let k_heads = k
-            .transpose(1, 2)
-            .expect("k heads")
-            .contiguous()
-            .expect("k contig");
-        let v_heads = v
-            .transpose(1, 2)
-            .expect("v heads")
-            .contiguous()
-            .expect("v contig");
-
-        let dense =
-            dense_decode_attention(&q, &k_heads, &v_heads, num_heads, num_kv_heads, head_dim)
-                .expect("dense");
-        let q_heads = q.transpose(1, 2).expect("q heads");
-        let k_repeated = repeat_kv(&k, num_heads, num_kv_heads).expect("repeat k");
-        let v_repeated = repeat_kv(&v, num_heads, num_kv_heads).expect("repeat v");
-        let k_repeated = k_repeated.transpose(1, 2).expect("k repeated heads");
-        let v_repeated = v_repeated.transpose(1, 2).expect("v repeated heads");
-        let mut att = q_heads
-            .matmul(&k_repeated.transpose(2, 3).expect("k t"))
-            .expect("scores");
-        att = (att / (head_dim as f64).sqrt()).expect("scale");
-        let expected = ops::softmax(&att, D::Minus1)
-            .expect("softmax")
-            .matmul(&v_repeated)
-            .expect("expected")
-            .transpose(1, 2)
-            .expect("expected transpose");
-
-        let dense_vals = dense
-            .flatten_all()
-            .expect("dense flat")
-            .to_vec1::<f32>()
-            .expect("dense vals");
-        let expected_vals = expected
-            .flatten_all()
-            .expect("expected flat")
-            .to_vec1::<f32>()
-            .expect("expected vals");
-        assert_eq!(dense_vals.len(), expected_vals.len());
-        for (lhs, rhs) in dense_vals.iter().zip(expected_vals.iter()) {
-            assert!((lhs - rhs).abs() < 5e-3, "{lhs} != {rhs}");
-        }
     }
 }
