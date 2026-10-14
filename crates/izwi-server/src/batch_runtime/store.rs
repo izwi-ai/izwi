@@ -289,6 +289,10 @@ const MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 512;
 /// live owner renews a cancelling lease every lease/3 (at most 30 s) and
 /// heartbeats at least as often, so this is several missed renewals.
 const ABANDONED_CANCELLATION_GRACE_MS: i64 = 2 * 60 * 1000;
+/// Non-atomic enqueue paths create the job, then its artifacts and stages, in
+/// separate transactions within one request. A job still stageless after this
+/// long was orphaned by a crash or error in between and can never be claimed.
+const STAGELESS_JOB_GRACE_MS: i64 = 5 * 60 * 1000;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACTS: usize = 64;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES: usize = 64;
 const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
@@ -5937,6 +5941,44 @@ impl BatchRuntimeStore {
             remaining = remaining.saturating_sub(result.rows_affected() as usize);
         }
 
+        let stageless = if remaining == 0 {
+            0
+        } else {
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                UPDATE runtime_jobs
+                SET
+                    status = 'failed',
+                    updated_at = ?1,
+                    finished_at = COALESCE(finished_at, ?1),
+                    error_code = 'enqueue_incomplete',
+                    error_message = 'Runtime job was accepted but its stages were never created'
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status IN ('created', 'queued')
+                      AND candidate.created_at <= ?3
+                      AND NOT EXISTS (
+                          SELECT 1 FROM job_stages WHERE job_stages.job_id = candidate.id
+                      )
+                    ORDER BY candidate.created_at ASC, candidate.id ASC
+                    LIMIT ?2
+                  )
+                "#,
+                vec![
+                    now.into(),
+                    i64::try_from(remaining)?.into(),
+                    now.saturating_sub(STAGELESS_JOB_GRACE_MS).into(),
+                ],
+            )?)
+            .await
+            .context("Failed to reconcile stageless runtime jobs")?
+            .rows_affected()
+        };
+        report.jobs_repaired = report.jobs_repaired.saturating_add(stageless);
+        remaining = remaining.saturating_sub(stageless as usize);
+
         let cancelled = if remaining == 0 {
             0
         } else {
@@ -11319,6 +11361,67 @@ mod tests {
                 .expect("job exists")
                 .status,
             RuntimeJobStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_jobs_orphaned_without_stages_and_releases_admission() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        store.test_tts_admission_limits = Some((1, 1));
+        let orphan = store.create_job(admission_job(1)).await.expect("job");
+        assert!(store.create_job(admission_job(2)).await.is_err());
+
+        // An enqueue still inside its grace may be about to create stages.
+        clock.store(1_000 + STAGELESS_JOB_GRACE_MS - 1, Ordering::SeqCst);
+        let report = store
+            .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+            .await
+            .expect("reconcile");
+        assert_eq!(report.jobs_repaired, 0);
+
+        clock.store(1_000 + STAGELESS_JOB_GRACE_MS, Ordering::SeqCst);
+        let report = store
+            .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+            .await
+            .expect("reconcile");
+        assert_eq!(report.jobs_repaired, 1);
+        let failed = store
+            .get_job(&orphan.id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(failed.status, RuntimeJobStatus::Failed);
+        assert_eq!(failed.error_code.as_deref(), Some("enqueue_incomplete"));
+        assert!(failed.finished_at.is_some());
+        store
+            .create_job(admission_job(2))
+            .await
+            .expect("admission released");
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_old_jobs_that_have_stages() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
+
+        clock.store(1_000 + 10 * STAGELESS_JOB_GRACE_MS, Ordering::SeqCst);
+        let report = store
+            .reconcile_inconsistent_states(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+            .await
+            .expect("reconcile");
+        assert_eq!(report.jobs_repaired, 0);
+        assert_eq!(
+            store
+                .get_job(&job.id)
+                .await
+                .expect("job")
+                .expect("job exists")
+                .status,
+            RuntimeJobStatus::Queued
         );
     }
 
