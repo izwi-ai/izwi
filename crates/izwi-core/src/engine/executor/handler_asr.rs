@@ -800,7 +800,8 @@ fn with_single_invocation_cache<T>(
             domains.len()
         )));
     };
-    let output = run(leases.cache_mut(*domain)?)?;
+    let result = run(leases.cache_mut(*domain)?);
+    let output = leases.fence_on_error(result)?;
     let _completions = leases.release()?;
     Ok(output)
 }
@@ -821,8 +822,9 @@ fn with_whisper_invocation_state<T>(
         )?;
         let cache = paged.paged_cache_mut()?;
         let cross = cross.typed_mut::<crate::engine::InvocationStaticAttentionLease>()?;
-        run(cache, cross)?
+        run(cache, cross)
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 2 {
         return Err(Error::InferenceError(
@@ -838,7 +840,8 @@ fn with_vibevoice_invocation_state<T>(
     run: impl FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T>,
 ) -> Result<T> {
     let mut leases = super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
-    let output = run(&mut leases)?;
+    let result = run(&mut leases);
+    let output = leases.fence_on_error(result)?;
     let completions = leases.release()?;
     if completions.len() != 3 {
         return Err(Error::InferenceError(
@@ -857,8 +860,9 @@ fn with_single_invocation_tensor<T>(
     let output = {
         let tensor =
             leases.lease_exact_kind_mut(crate::kv::v2::InvocationStateBackingKindV2::Tensor)?;
-        run(tensor.typed_mut::<crate::engine::InvocationTensorLease>()?)?
+        run(tensor.typed_mut::<crate::engine::InvocationTensorLease>()?)
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 1 {
         return Err(Error::InferenceError(
@@ -885,8 +889,9 @@ fn with_nemotron_offline_state<T>(
         run(
             predictor.typed_mut::<crate::engine::InvocationTensorLease>()?,
             acoustic.typed_mut::<crate::engine::InvocationTensorLease>()?,
-        )?
+        )
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 2 {
         return Err(Error::InferenceError(
@@ -3818,6 +3823,7 @@ impl NativeExecutor {
                 diagnostics,
             })
         });
+        let transcription = leases.fence_on_error(transcription);
         let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                 request.id.clone(),
@@ -8735,6 +8741,94 @@ mod tests {
                     if message.contains("has no retained or long-form route")),
                 "streaming={streaming}: {error}"
             );
+        }
+    }
+
+    /// Mirrors the coordinator's failed-invocation fence test for the
+    /// executor's own lease helpers: every lease of a failed operation is
+    /// fenced before the helper returns, and the operation's error wins.
+    #[test]
+    fn failed_invocation_operation_fences_every_lease_before_returning() {
+        use crate::engine::{
+            AdapterAbiRevision, AdapterInstanceId, ExecutionAdapterBinding, ExecutionGroupId,
+            ExecutionMode, ExecutionProfile, ModelInstanceId, NativeBatchMode, StageDescriptor,
+            StageId, StageWorkSelector,
+        };
+        use crate::error::{Error, Result};
+
+        let variant = ModelVariant::VibeVoiceAsr;
+        let profile = ExecutionProfile::fail_closed(
+            crate::backends::BackendKind::Cpu,
+            Some(variant),
+            ExecutionMode::Atomic,
+        );
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(0),
+            "asr.atomic",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        let execution = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(1),
+            model_instance_id: ModelInstanceId::new(9),
+            adapter_instance_id: AdapterInstanceId::new(2),
+            adapter_abi_revision: AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "asr".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let scheduled = |request: &EngineCoreRequest| ScheduledRequest {
+            plan_id: 1,
+            request_id: request.id.clone(),
+            sequence_id: 1,
+            num_tokens: 1,
+            is_prefill: true,
+            num_computed_tokens: 0,
+            work: WorkUnit::AtomicJob { kind: "asr".into() },
+        };
+
+        for (fail_operation, fail_fence) in [(false, false), (true, false), (true, true)] {
+            // VibeVoice's helper expects exactly three state domains.
+            let (state, probe) =
+                crate::kv::v2::fence_probe::fence_probe_state_runtime(&execution, 3);
+            probe.fail_fence.store(fail_fence, Ordering::Release);
+            let mut request =
+                EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+            request.bind_execution_adapter(execution.clone()).unwrap();
+            request
+                .bind_v2_state_runtime(
+                    state.clone(),
+                    state.state_fingerprint,
+                    crate::backends::BackendKind::Cpu,
+                )
+                .unwrap();
+
+            let result = super::with_vibevoice_invocation_state(
+                &request,
+                &scheduled(&request),
+                |_leases| -> Result<()> {
+                    if fail_operation {
+                        return Err(Error::InvalidInput("enqueued work then failed".into()));
+                    }
+                    Ok(())
+                },
+            );
+
+            if fail_operation {
+                let error = result.expect_err("the operation error must propagate");
+                assert!(
+                    matches!(&error, Error::InvalidInput(message)
+                        if message == "enqueued work then failed"),
+                    "the original operation error must win over the fence: {error:?}"
+                );
+                assert_eq!(probe.fences.load(Ordering::Acquire), 3);
+                assert_eq!(probe.aborts.load(Ordering::Acquire), 3);
+            } else {
+                result.expect("a successful operation releases its leases");
+                assert_eq!(probe.fences.load(Ordering::Acquire), 0);
+                assert_eq!(probe.aborts.load(Ordering::Acquire), 0);
+            }
         }
     }
 

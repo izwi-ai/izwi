@@ -553,6 +553,16 @@ impl Drop for PhysicalExecutionLease {
     }
 }
 
+/// Waits for device work that a failed loaded stage may still have queued.
+#[derive(Clone)]
+struct StageDeviceFence(Arc<dyn Fn() -> Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for StageDeviceFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StageDeviceFence")
+    }
+}
+
 #[derive(Debug)]
 pub struct InferenceCoordinator {
     execution_group_id: ExecutionGroupId,
@@ -571,6 +581,8 @@ pub struct InferenceCoordinator {
     rejected_total: AtomicU64,
     expired_total: AtomicU64,
     draining: AtomicBool,
+    /// Present for a Metal or CUDA device; CPU work is complete on return.
+    failed_stage_fence: Option<StageDeviceFence>,
 }
 
 impl InferenceCoordinator {
@@ -596,14 +608,21 @@ impl InferenceCoordinator {
         max_queued_jobs: usize,
     ) -> Result<Self> {
         let location = validate_device_identity(backend, &device)?;
+        let failed_stage_fence =
+            matches!(backend, BackendKind::Metal | BackendKind::Cuda).then(|| {
+                let device = device.device.clone();
+                StageDeviceFence(Arc::new(move || device.synchronize().map_err(Error::from)))
+            });
         let provider = Arc::new(DeviceCapacityProvider::new(backend, device)?);
         let resources = shared_resource_authority(location, provider)?;
-        Ok(Self::with_resource_authority(
+        let mut coordinator = Self::with_resource_authority(
             backend,
             execution_parallelism,
             max_queued_jobs,
             resources,
-        ))
+        );
+        coordinator.failed_stage_fence = failed_stage_fence;
+        Ok(coordinator)
     }
 
     fn with_resource_authority(
@@ -642,6 +661,7 @@ impl InferenceCoordinator {
             rejected_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
             draining: AtomicBool::new(false),
+            failed_stage_fence: None,
         }
     }
 
@@ -1260,6 +1280,7 @@ impl InferenceCoordinator {
             ));
         }
         let launch_policy = stage.physical_launch_policy;
+        let failed_stage_fence = self.failed_stage_fence.clone();
 
         self.run_blocking_stage_inner_with_policy(
             job,
@@ -1269,7 +1290,19 @@ impl InferenceCoordinator {
             move || {
                 let _contract = contract;
                 let _work = work;
-                operation()
+                let result = operation();
+                if let (Err(error), Some(fence)) = (&result, &failed_stage_fence) {
+                    // A failed stage may have queued device work; wait for it
+                    // while this task still holds the execution permit and job.
+                    if let Err(fence_error) = (fence.0)() {
+                        tracing::warn!(
+                            error = %fence_error,
+                            operation_error = %error,
+                            "failed to fence the device after a failed loaded stage"
+                        );
+                    }
+                }
+                result
             },
         )
         .await
@@ -1698,16 +1731,10 @@ impl InferenceCoordinator {
                 let mut leases = capability
                     .state
                     .lease_complete_invocation_workspace_set(stage_id)?;
-                let output = match operation(&mut leases) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        // The failed operation may have queued device work;
-                        // wait for it while this task still holds the
-                        // execution permit and the job.
-                        fence_failed_invocation(leases.abort_and_fence(), &error);
-                        return Err(error);
-                    }
-                };
+                // A failed operation may have queued device work; fence it
+                // while this task still holds the execution permit and the job.
+                let result = operation(&mut leases);
+                let output = leases.fence_on_error(result)?;
                 let _completions = leases.release()?;
                 Ok(output)
             },
@@ -1760,16 +1787,10 @@ impl InferenceCoordinator {
                 let mut leases = capability
                     .state
                     .lease_complete_invocation_paged_set(stage_id)?;
-                let output = match operation(&mut leases) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        // The failed operation may have queued device work;
-                        // wait for it while this task still holds the
-                        // execution permit and the job.
-                        fence_failed_invocation(leases.abort_and_fence(), &error);
-                        return Err(error);
-                    }
-                };
+                // A failed operation may have queued device work; fence it
+                // while this task still holds the execution permit and the job.
+                let result = operation(&mut leases);
+                let output = leases.fence_on_error(result)?;
                 let _completions = leases.release()?;
                 Ok(output)
             },
@@ -1901,18 +1922,6 @@ impl InferenceCoordinator {
             return Err(Error::Timeout(request_id));
         }
         result
-    }
-}
-
-/// Log a fence failure after a failed invocation operation; the caller still
-/// returns the operation's own error.
-fn fence_failed_invocation(fenced: Result<()>, operation_error: &Error) {
-    if let Err(fence_error) = fenced {
-        tracing::warn!(
-            error = %fence_error,
-            operation_error = %operation_error,
-            "failed to fence the device after a failed invocation stage"
-        );
     }
 }
 
@@ -5213,125 +5222,16 @@ Pages free: 10.\n";
         assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
-    /// Typed invocation backing whose error-path fence records how often it
-    /// ran and how many executions the coordinator held at that moment.
-    #[derive(Debug)]
-    struct FenceProbeBacking {
-        identity: crate::kv::v2::InvocationWorkspaceBackingIdentityV2,
-        workspace_domain: crate::kv::v2::InvocationWorkspaceDomain,
-        probe: Arc<FenceProbe>,
-    }
-
-    #[derive(Debug)]
-    struct FenceProbe {
-        coordinator: Mutex<Option<Arc<InferenceCoordinator>>>,
-        fences: AtomicUsize,
-        active_executions_during_fence: AtomicUsize,
-        aborts: AtomicUsize,
-        fail_fence: AtomicBool,
-    }
-
-    #[derive(Debug)]
-    struct FenceProbeLease {
-        identity: crate::kv::v2::InvocationWorkspaceBackingIdentityV2,
-        probe: Arc<FenceProbe>,
-    }
-
-    impl crate::kv::v2::InvocationWorkspaceBackingV2 for FenceProbeBacking {
-        fn identity(&self) -> crate::kv::v2::InvocationWorkspaceBackingIdentityV2 {
-            self.identity
-        }
-
-        fn workspace_domain(&self) -> &crate::kv::v2::InvocationWorkspaceDomain {
-            &self.workspace_domain
-        }
-
-        fn validate_live(&self) -> Result<()> {
-            Ok(())
-        }
-
-        fn lease(&self) -> Result<Box<dyn crate::kv::v2::InvocationWorkspacePhysicalLeaseV2>> {
-            Ok(Box::new(FenceProbeLease {
-                identity: self.identity,
-                probe: self.probe.clone(),
-            }))
-        }
-
-        fn authenticate_completion(
-            &self,
-            _completion: &crate::kv::v2::InvocationWorkspacePhysicalCompletionV2,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    impl crate::kv::v2::InvocationWorkspacePhysicalLeaseV2 for FenceProbeLease {
-        fn backing_identity(&self) -> crate::kv::v2::InvocationWorkspaceBackingIdentityV2 {
-            self.identity
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-
-        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
-            self
-        }
-
-        fn complete(&mut self) -> Result<crate::kv::v2::InvocationWorkspacePhysicalCompletionV2> {
-            Ok(
-                crate::kv::v2::InvocationWorkspacePhysicalCompletionV2::Typed {
-                    backing: self.identity,
-                    authentication: [0x5a; 32],
-                },
-            )
-        }
-
-        fn abort(&mut self) {
-            self.probe.aborts.fetch_add(1, Ordering::AcqRel);
-        }
-
-        fn abort_and_fence(&mut self) -> Result<()> {
-            let active = self
-                .probe
-                .coordinator
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(0, |coordinator| coordinator.snapshot().active_executions);
-            self.probe
-                .active_executions_during_fence
-                .store(active, Ordering::Release);
-            self.probe.fences.fetch_add(1, Ordering::AcqRel);
-            self.abort();
-            if self.probe.fail_fence.load(Ordering::Acquire) {
-                return Err(Error::InferenceError("injected fence failure".to_string()));
-            }
-            Ok(())
-        }
-    }
-
     /// A Kokoro TTS contract bound to `coordinator`'s execution group, with
-    /// one typed invocation tensor domain published through a fence probe.
+    /// one typed invocation tensor domain published through a fence probe
+    /// that samples the coordinator's active executions at each fence.
     fn fence_probe_invocation_binding(
         coordinator: &Arc<InferenceCoordinator>,
     ) -> (
         LoadedExecutionContract,
         crate::runtime::adapters::LoadedCapabilityBinding,
-        Arc<FenceProbe>,
+        Arc<crate::kv::v2::fence_probe::FenceProbe>,
     ) {
-        use crate::kv::v2::{
-            BoundedShape, CheckpointPolicy, InferenceStateContract, InvocationWorkspaceSet,
-            PlacementPolicy, PrefixPolicy, ShapeAxis, ShapeDimension, ShapeExtent, StateClock,
-            StateComponentId, StateDType, StateDomainHeader, StateDomainId, StateDomainSpec,
-            StateGroupId, StateGroupSpec, StateScope, TensorComponentSpec, TensorRole,
-            TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
-        };
-
         let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 2).unwrap();
         let bundle = LoadedModelBundle::bind(
             &adapters,
@@ -5353,85 +5253,14 @@ Pages free: 10.\n";
         scalar.selector = crate::engine::StageWorkSelector::Atomic;
         contract.stages = Arc::from([scalar]);
         let execution = contract.adapter_binding().unwrap();
-        let domain = StateDomainId::new(1);
-        let state = InferenceStateContract {
-            abi: CURRENT_INFERENCE_STATE_ABI,
-            domains: vec![StateDomainSpec::Tensor(TensorStateDomainSpec {
-                header: StateDomainHeader {
-                    id: domain,
-                    scope: StateScope::Invocation,
-                    clock: StateClock::DecoderTokens,
-                    placement: PlacementPolicy::BackendLocal,
-                    prefix: PrefixPolicy::Disabled,
-                    checkpoint: CheckpointPolicy::None,
-                },
-                components: vec![TensorComponentSpec {
-                    id: StateComponentId::new(1),
-                    role: TensorRole::Control,
-                    shape: BoundedShape {
-                        dimensions: vec![ShapeDimension {
-                            axis: ShapeAxis::Hidden,
-                            extent: ShapeExtent::Fixed { value: 4 },
-                        }],
-                    },
-                    accepted_dtypes: vec![StateDType::F32],
-                }],
-            })],
-            groups: vec![StateGroupSpec {
-                id: StateGroupId::new(1),
-                domains: vec![domain],
-                prefix_shareable: false,
-            }],
-        };
-        let descriptor = crate::models::shared::state::typed_invocation_descriptor(
-            &[execution.stages.as_ref()],
-            &state,
-        )
-        .unwrap();
-        let InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
-            panic!("typed invocation descriptor must be bounded");
-        };
-        let probe = Arc::new(FenceProbe {
-            coordinator: Mutex::new(Some(coordinator.clone())),
-            fences: AtomicUsize::new(0),
-            active_executions_during_fence: AtomicUsize::new(usize::MAX),
-            aborts: AtomicUsize::new(0),
-            fail_fence: AtomicBool::new(false),
-        });
-        let bindings = profiles[0]
-            .stages
-            .iter()
-            .map(|stage| crate::kv::v2::InvocationWorkspaceBindingV2 {
-                key: crate::kv::v2::InvocationWorkspaceKeyV2 {
-                    stage_graph: profiles[0].stage_graph_fingerprint,
-                    stage: stage.stage,
-                    domain,
-                },
-                backing: Arc::new(FenceProbeBacking {
-                    identity: crate::kv::v2::InvocationWorkspaceBackingIdentityV2::Typed {
-                        kind: crate::kv::v2::InvocationStateBackingKindV2::Tensor,
-                        model_instance: execution.model_instance_id,
-                        backend: BackendKind::Cpu,
-                        domain,
-                        allocation_generation: 1,
-                    },
-                    workspace_domain: stage.domains[0].clone(),
-                    probe: probe.clone(),
-                }),
-            })
-            .collect();
-        let runtime = crate::kv::v2::InvocationWorkspaceRuntimeV2::new(bindings).unwrap();
-        let sealed = crate::kv::v2::InvocationCapabilityRuntimeV2::seal_with_invocation_workspace(
-            BackendKind::Cpu,
-            &execution,
-            descriptor,
-            runtime,
-        )
-        .unwrap();
-        let capability = crate::runtime::adapters::LoadedCapabilityBinding {
-            execution,
-            state: Arc::new(crate::kv::v2::CapabilityStateRuntimeV2::invocation(sealed)),
-        };
+        let (state, probe) = crate::kv::v2::fence_probe::fence_probe_state_runtime(&execution, 1);
+        let observed = Arc::downgrade(coordinator);
+        *probe.observer.lock().unwrap() = Some(Box::new(move || {
+            observed
+                .upgrade()
+                .map_or(0, |coordinator| coordinator.snapshot().active_executions)
+        }));
+        let capability = crate::runtime::adapters::LoadedCapabilityBinding { execution, state };
         (contract, capability, probe)
     }
 
@@ -5464,14 +5293,118 @@ Pages free: 10.\n";
             );
             assert_eq!(probe.fences.load(Ordering::Acquire), 1);
             assert_eq!(
-                probe.active_executions_during_fence.load(Ordering::Acquire),
+                probe.observed_during_fence.load(Ordering::Acquire),
                 1,
                 "the fence must run while the stage still holds its execution permit"
             );
             assert_eq!(probe.aborts.load(Ordering::Acquire), 1);
             assert_eq!(coordinator.snapshot().active_executions, 0);
-            probe.coordinator.lock().unwrap().take();
         }
+    }
+
+    #[tokio::test]
+    async fn failed_loaded_stage_fences_the_device_before_releasing_its_permit() {
+        // CPU work is complete on return, so a CPU coordinator has no fence.
+        let cpu = InferenceCoordinator::new_with_device(
+            BackendKind::Cpu,
+            crate::backends::DeviceProfile::cpu(),
+            1,
+            4,
+        )
+        .unwrap();
+        assert!(cpu.failed_stage_fence.is_none());
+
+        for (fail_operation, fail_fence) in [(false, false), (true, false), (true, true)] {
+            let observed = Arc::new(OnceLock::<Weak<InferenceCoordinator>>::new());
+            let fences = Arc::new(AtomicUsize::new(0));
+            let active_during_fence = Arc::new(AtomicUsize::new(usize::MAX));
+            let mut coordinator = InferenceCoordinator::new(BackendKind::Cpu, 2, 4);
+            coordinator.failed_stage_fence = Some(StageDeviceFence(Arc::new({
+                let observed = observed.clone();
+                let fences = fences.clone();
+                let active_during_fence = active_during_fence.clone();
+                move || {
+                    let active = observed
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .map_or(0, |coordinator| coordinator.snapshot().active_executions);
+                    active_during_fence.store(active, Ordering::Release);
+                    fences.fetch_add(1, Ordering::AcqRel);
+                    if fail_fence {
+                        return Err(Error::InferenceError("injected fence failure".into()));
+                    }
+                    Ok(())
+                }
+            })));
+            let coordinator = Arc::new(coordinator);
+            observed.set(Arc::downgrade(&coordinator)).unwrap();
+            let job = coordinator.admit(job("fenced-loaded-stage")).await.unwrap();
+            let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
+            let contract = LoadedModelBundle::bind(
+                &adapters,
+                coordinator.execution_group_id(),
+                crate::engine::ModelInstanceId::new(1),
+                ModelVariant::Kokoro82M,
+                BackendKind::Cpu,
+            )
+            .unwrap()
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+
+            let result = coordinator
+                .run_loaded_blocking_stage(
+                    &job,
+                    contract,
+                    WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    move || -> Result<()> {
+                        if fail_operation {
+                            return Err(Error::InvalidInput("enqueued work then failed".into()));
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if fail_operation {
+                let error = result.expect_err("the operation error must propagate");
+                assert!(
+                    matches!(&error, Error::InvalidInput(message)
+                        if message == "enqueued work then failed"),
+                    "the original operation error must win over the fence: {error:?}"
+                );
+                assert_eq!(fences.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    active_during_fence.load(Ordering::Acquire),
+                    1,
+                    "the fence must run while the stage still holds its execution permit"
+                );
+            } else {
+                result.expect("a successful stage needs no fence");
+                assert_eq!(fences.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(coordinator.snapshot().active_executions, 0);
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_coordinator_fences_its_own_device_after_a_failed_loaded_stage() {
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Metal,
+        )
+        .expect("device profile");
+        if profile.kind != DeviceKind::Metal {
+            return;
+        }
+        let coordinator =
+            InferenceCoordinator::new_with_device(BackendKind::Metal, profile, 1, 4).unwrap();
+        let fence = coordinator
+            .failed_stage_fence
+            .as_ref()
+            .expect("a Metal coordinator must fence failed stages");
+        (fence.0)().expect("synchronizing an idle Metal device succeeds");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -76,7 +76,8 @@ impl NativeExecutor {
                 &mut leases,
                 &mut |_delta| {},
             )
-        })?;
+        });
+        let input_transcription = leases.fence_on_error(input_transcription)?;
         let output = Self::run_blocking(|| {
             if let Some(tx) = stream_tx.as_ref() {
                 let stream_sequence = std::cell::Cell::new(0usize);
@@ -169,7 +170,8 @@ impl NativeExecutor {
                     &mut no_audio,
                 )
             }
-        })?;
+        });
+        let output = leases.fence_on_error(output)?;
         let completions = leases.release()?;
         if completions.len() != 3 {
             return Err(Error::InferenceError(
