@@ -5,6 +5,13 @@ use izwi_core::{GenerationRequest, GenerationResult, ModelVariant, RuntimeServic
 const DEFAULT_CHUNK_MAX_CHARS: usize = 480;
 const CHUNK_MAX_CHARS_MIN: usize = 80;
 const CHUNK_MAX_CHARS_MAX: usize = 4000;
+/// Qwen3-TTS long-form segments: whole sentences packed up to about the
+/// medium test paragraph (45 words, 260 characters), which ends on EOS on
+/// every backend. A 460-character segment of the 250-word paragraph ran to
+/// its 663-frame budget and babbled (WER 0.32 on CPU); the reference model
+/// generates sentence by sentence. Text longer than this splits even when
+/// one request could hold it.
+const QWEN_SEGMENT_MAX_CHARS: usize = 300;
 
 /// Silence between two long-form segments: a sentence pause, not the raw
 /// back-to-back concatenation that ran sentences together (TPIPE-5).
@@ -51,11 +58,35 @@ pub(crate) fn append_segment(joined: &mut Vec<f32>, segment: &[f32], sample_rate
 }
 
 fn chunk_max_chars() -> usize {
+    configured_chunk_max_chars().unwrap_or(DEFAULT_CHUNK_MAX_CHARS)
+}
+
+fn configured_chunk_max_chars() -> Option<usize> {
     std::env::var("IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .map(|value| value.clamp(CHUNK_MAX_CHARS_MIN, CHUNK_MAX_CHARS_MAX))
-        .unwrap_or(DEFAULT_CHUNK_MAX_CHARS)
+}
+
+/// The most characters one long-form segment of `variant` packs: the
+/// configured cap, else Qwen3-TTS's segment size or the default.
+fn segment_max_chars(variant: ModelVariant) -> usize {
+    configured_chunk_max_chars().unwrap_or(
+        if variant.family() == izwi_core::ModelFamily::Qwen3Tts {
+            QWEN_SEGMENT_MAX_CHARS
+        } else {
+            DEFAULT_CHUNK_MAX_CHARS
+        },
+    )
+}
+
+/// Whether text under an automatic budget splits into long-form segments:
+/// when one request cannot speak it, or (Qwen3-TTS) when it is longer than
+/// one segment.
+fn splits_into_segments(variant: ModelVariant, text: &str) -> bool {
+    crate::api::tts_policy::tts_text_exceeds_one_request(variant, text)
+        || (variant.family() == izwi_core::ModelFamily::Qwen3Tts
+            && text.trim().chars().count() > segment_max_chars(variant))
 }
 
 /// A stable, versioned partition of the original UTF-8 input. Audio limits are
@@ -210,10 +241,11 @@ pub fn split_tts_text_for_long_form(
 
     // Whole sentences, packed up to the character cap and what one request
     // of this family can speak (TPIPE-5).
-    let chunks =
-        crate::api::sentence_split::pack_sentences(trimmed, chunk_max_chars(), &|segment| {
-            !crate::api::tts_policy::tts_text_exceeds_one_request(variant, segment)
-        });
+    let chunks = crate::api::sentence_split::pack_sentences(
+        trimmed,
+        segment_max_chars(variant),
+        &|segment| !crate::api::tts_policy::tts_text_exceeds_one_request(variant, segment),
+    );
 
     if chunks.is_empty() {
         vec![trimmed.to_string()]
@@ -232,9 +264,7 @@ pub fn expand_generation_requests_for_long_form(
 ) -> Vec<GenerationRequest> {
     let requested = base_request.config.options.max_tokens;
     let automatic = requested == 0 && variant != ModelVariant::FishAudioS2Pro;
-    let chunks = if automatic
-        && !crate::api::tts_policy::tts_text_exceeds_one_request(variant, &base_request.text)
-    {
+    let chunks = if automatic && !splits_into_segments(variant, &base_request.text) {
         vec![base_request.text.trim().to_string()]
     } else {
         split_tts_text_for_long_form(variant, requested, base_request.text.as_str())
@@ -283,7 +313,7 @@ pub(crate) fn defer_automatic_budget_to_long_form(
 ) {
     if explicit_frames.unwrap_or(0) == 0
         && variant != ModelVariant::FishAudioS2Pro
-        && crate::api::tts_policy::tts_text_exceeds_one_request(variant, &request.text)
+        && splits_into_segments(variant, &request.text)
     {
         request.config.options.max_tokens = 0;
     }
@@ -295,6 +325,7 @@ pub async fn generate_long_form_tts(
     mut request: GenerationRequest,
 ) -> Result<GenerationResult, izwi_core::Error> {
     request.model_variant.get_or_insert(variant);
+    let retry_runaways = retries_runaway_segments(variant, &request);
     let planned_requests = expand_generation_requests_for_long_form(&request, variant);
     if planned_requests.len() == 1 {
         return runtime
@@ -310,9 +341,34 @@ pub async fn generate_long_form_tts(
     let mut total_tokens = 0usize;
     let mut total_time_ms = 0f32;
     let mut stop_reasons = Vec::with_capacity(split_request_count);
+    let mut retried_segments = Vec::new();
+    let mut budget_segments = Vec::new();
 
-    for chunk_request in planned_requests {
-        let output = runtime.generate(chunk_request).await?;
+    for (index, chunk_request) in planned_requests.into_iter().enumerate() {
+        let retry = retry_runaways.then(|| chunk_request.clone());
+        let mut output = runtime.generate(chunk_request).await?;
+        if let Some(retry) = retry.filter(|_| ran_to_budget(&output)) {
+            // A sampled segment that ran to its budget without ending
+            // speech babbled (TPIPE-27); one fresh sample usually ends.
+            tracing::warn!(
+                request_id = %request.id,
+                segment = index + 1,
+                "Long-form segment ran to its budget without end of speech; sampling it again"
+            );
+            retried_segments.push(index + 1);
+            let again = runtime.generate(retry).await?;
+            if !ran_to_budget(&again) {
+                output = again;
+            }
+        }
+        if ran_to_budget(&output) {
+            tracing::warn!(
+                request_id = %request.id,
+                segment = index + 1,
+                "Long-form segment ended at its budget"
+            );
+            budget_segments.push(index + 1);
+        }
         stop_reasons.push(output.stop_reason);
         if let Some(existing_rate) = sample_rate {
             if existing_rate != output.sample_rate {
@@ -345,9 +401,32 @@ pub async fn generate_long_form_tts(
             "split_request_count": split_request_count,
             "request_wall_ms": started.elapsed().as_secs_f64() * 1000.0,
             "constituents": constituent_diagnostics,
+            // 1-based segments sampled again, and those that still ended
+            // at their budget (the reason for a `length` stop).
+            "retried_segments": retried_segments,
+            "budget_segments": budget_segments,
         })),
         stop_reason: TtsStopReason::combine(stop_reasons),
     })
+}
+
+/// Whether long form samples a Qwen3-TTS segment again when it runs to its
+/// automatic budget: only for unseeded sampling, where a second draw differs
+/// (greedy or a fixed seed would repeat the runaway).
+fn retries_runaway_segments(variant: ModelVariant, request: &GenerationRequest) -> bool {
+    let options = &request.config.options;
+    variant.family() == izwi_core::ModelFamily::Qwen3Tts
+        && options.max_tokens == 0
+        && options.speech.seed.is_none()
+        && options
+            .speech
+            .temperature
+            .is_none_or(|temperature| temperature > 0.0)
+        && options.speech.top_k != Some(1)
+}
+
+fn ran_to_budget(output: &GenerationResult) -> bool {
+    output.stop_reason == Some(TtsStopReason::OutputBudget)
 }
 
 /// One live inference segment per job. Consumers receive one ordered stream and
@@ -764,6 +843,105 @@ mod tests {
                 variant, chunk
             ));
         }
+    }
+
+    /// TPIPE-27: the 250-word scoring paragraph used to split into 480-char
+    /// segments only because it exceeded one request, and one 460-char
+    /// segment ran to its 663-frame budget and babbled. Qwen3-TTS segments
+    /// are now whole sentences packed up to 300 characters, so it splits
+    /// into short segments, each with its own automatic budget, while the
+    /// 45-word medium paragraph (EOS on every backend) stays one request.
+    #[test]
+    fn qwen_long_form_speaks_short_sentence_segments() {
+        let _env = crate::test_support::env_lock();
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let long = "The old lighthouse stood at the edge of the harbor for more than a century. \
+            Every evening, the keeper climbed one hundred and twelve steps to light the lamp, \
+            and every morning he climbed them again to put it out. Ships from distant ports \
+            used its beam to find the narrow channel between the rocks. In winter, storms \
+            pushed waves high enough to wash over the lower windows, and the keeper would sit \
+            by the stove, listening to the wind and writing in his logbook. He recorded the \
+            weather, the ships that passed, and the small events of each day. One entry \
+            describes a fishing boat that lost its engine in a gale and drifted toward the \
+            cliffs until the crew saw the light and rowed to safety. Another mentions a family \
+            of seals that slept on the breakwater every spring. When the lighthouse was finally \
+            automated, the logbooks were sent to the town library, where students still read \
+            them today. They show how a single person, doing the same careful work every night, \
+            kept hundreds of strangers safe. The building is now a small museum. Visitors can \
+            climb the stairs, look out over the water, and imagine what it was like to watch \
+            the sea alone for so many years. On clear nights, the automated lamp still turns, \
+            sweeping its light across the dark water just as it always has.";
+        let mut request = GenerationRequest::new(long).with_model_variant(variant);
+        request.config.options.max_tokens =
+            crate::api::tts_policy::resolve_tts_output_frames(variant, long, None).unwrap();
+        defer_automatic_budget_to_long_form(&mut request, variant, None);
+        assert_eq!(request.config.options.max_tokens, 0);
+        let planned = expand_generation_requests_for_long_form(&request, variant);
+        assert!(planned.len() >= 5, "{} segments", planned.len());
+        for segment in &planned {
+            assert!(
+                segment.text.chars().count() <= QWEN_SEGMENT_MAX_CHARS,
+                "{}",
+                segment.text
+            );
+            assert!(segment.text.ends_with('.'), "{}", segment.text);
+            let budget = segment.config.options.max_tokens;
+            assert!(budget > 0 && budget < 663, "{budget}: {}", segment.text);
+        }
+        assert_eq!(
+            planned
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+            long.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+
+        let medium = "Good morning. Today we are testing a speech synthesis system on a laptop. \
+            The goal is to measure how fast it runs, how much memory it uses, and whether \
+            every word in this paragraph comes out clearly, without skipping, repeating, \
+            or adding anything at the end.";
+        let mut request = GenerationRequest::new(medium).with_model_variant(variant);
+        request.config.options.max_tokens =
+            crate::api::tts_policy::resolve_tts_output_frames(variant, medium, None).unwrap();
+        defer_automatic_budget_to_long_form(&mut request, variant, None);
+        assert_eq!(
+            expand_generation_requests_for_long_form(&request, variant).len(),
+            1
+        );
+    }
+
+    /// A segment that runs to its budget is sampled once more only when a
+    /// second draw can differ: unseeded, non-greedy Qwen3-TTS sampling.
+    #[test]
+    fn only_unseeded_sampled_qwen_segments_are_retried() {
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let request = |configure: &dyn Fn(&mut GenerationRequest)| {
+            let mut request = GenerationRequest::new("text").with_model_variant(qwen);
+            configure(&mut request);
+            request
+        };
+        assert!(retries_runaway_segments(qwen, &request(&|_| {})));
+        assert!(!retries_runaway_segments(
+            qwen,
+            &request(&|r| r.config.options.speech.seed = Some(7))
+        ));
+        assert!(!retries_runaway_segments(
+            qwen,
+            &request(&|r| r.config.options.speech.temperature = Some(0.0))
+        ));
+        assert!(!retries_runaway_segments(
+            qwen,
+            &request(&|r| r.config.options.speech.top_k = Some(1))
+        ));
+        assert!(!retries_runaway_segments(
+            qwen,
+            &request(&|r| r.config.options.max_tokens = 300)
+        ));
+        assert!(!retries_runaway_segments(
+            ModelVariant::VibeVoice15BTts,
+            &request(&|_| {})
+        ));
     }
 
     /// Segments join with a faded tail, a 120 ms pause and a faded head, not
