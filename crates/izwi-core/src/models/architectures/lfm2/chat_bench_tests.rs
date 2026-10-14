@@ -322,7 +322,7 @@ fn scalar_vs_batched(profile: DeviceProfile) {
     let device = model.device.device.clone();
     let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
     let config = ChatGenerationConfig::default();
-    let mut new_state = |index| {
+    let new_state = |index| {
         let mut state = model
             .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(index))
             .unwrap();
@@ -478,4 +478,70 @@ fn lfm25_one_sync_vs_three_metal() {
     if profile.device.is_metal() {
         one_sync_vs_three(profile);
     }
+}
+
+/// Fused ShortConv decode step vs the op-by-op path, interleaved step by
+/// step on two rows of the same model (everything else identical).
+fn fused_vs_unfused_shortconv(profile: DeviceProfile) {
+    use super::super::backbone::FORCE_UNFUSED_SHORTCONV;
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let sessions = Sessions::new(&model);
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+    let config = ChatGenerationConfig::default();
+    let new_state = |index| {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(index))
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        model.decode_step(&mut state).unwrap();
+        state
+    };
+    let mut fused = new_state(0);
+    let mut unfused = new_state(1);
+    let (mut fused_time, mut unfused_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let steps = steps();
+    for step in 0..steps + 8 {
+        FORCE_UNFUSED_SHORTCONV.with(|flag| flag.set(true));
+        let started = Instant::now();
+        model.decode_step_batch(&mut [&mut unfused]).unwrap();
+        if step >= 8 {
+            unfused_time += started.elapsed();
+        }
+        FORCE_UNFUSED_SHORTCONV.with(|flag| flag.set(false));
+        let started = Instant::now();
+        model.decode_step_batch(&mut [&mut fused]).unwrap();
+        if step >= 8 {
+            fused_time += started.elapsed();
+        }
+    }
+    let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+    eprintln!(
+        "{:?}: op-by-op ShortConv {:.2} ms/token, fused ShortConv {:.2} ms/token",
+        model.device_kind(),
+        per(unfused_time),
+        per(fused_time)
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_fused_vs_unfused_shortconv_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        fused_vs_unfused_shortconv(profile);
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_fused_vs_unfused_shortconv_cpu() {
+    fused_vs_unfused_shortconv(DeviceProfile::cpu());
 }

@@ -3382,6 +3382,71 @@ impl CustomOp3 for CudaPagedDecodeOp {
     }
 }
 
+/// Launch the fused LFM2 ShortConv decode step (`lfm_shortconv_step.rs`):
+/// a `[capacity + 1, hidden]` F32 output holding the next ring and `y`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_lfm_shortconv_gated_ring_step(
+    projected: &candle_core::CudaStorage,
+    projected_layout: &Layout,
+    ring: &candle_core::CudaStorage,
+    ring_layout: &Layout,
+    weight: &candle_core::CudaStorage,
+    weight_layout: &Layout,
+    hidden: usize,
+    capacity: usize,
+    cursor: u64,
+    valid: u64,
+) -> candle_core::Result<candle_core::CudaStorage> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::{CudaStorageSlice, WrapErr};
+
+    fn contiguous_f32<'a>(
+        storage: &'a CudaStorageSlice,
+        layout: &Layout,
+        name: &str,
+    ) -> candle_core::Result<candle_core::cuda_backend::cudarc::driver::CudaView<'a, f32>> {
+        let CudaStorageSlice::F32(slice) = storage else {
+            candle_core::bail!("{name} must use F32 storage")
+        };
+        let Some((start, end)) = layout.contiguous_offsets() else {
+            candle_core::bail!("{name} must be contiguous")
+        };
+        Ok(slice.slice(start..end))
+    }
+
+    let device = projected.device();
+    let projected = contiguous_f32(&projected.slice, projected_layout, "ShortConv projection")?;
+    let ring = contiguous_f32(&ring.slice, ring_layout, "ShortConv ring")?;
+    let weight = contiguous_f32(&weight.slice, weight_layout, "ShortConv weight")?;
+    let elements = (capacity + 1)
+        .checked_mul(hidden)
+        .ok_or_else(|| candle_core::Error::Msg("ShortConv step output overflow".to_string()))?;
+    // SAFETY: the kernel writes every output element (each of `hidden`
+    // threads writes its column of all `capacity + 1` rows).
+    let output = unsafe { device.alloc::<f32>(elements)? };
+    let function = device.get_or_load_custom_func(
+        "lfm_shortconv_gated_ring_step_f32",
+        "izwi_physical_state",
+        cuda_ptx::PHYSICAL_STATE,
+    )?;
+    let config = LaunchConfig::for_num_elems(hidden as u32);
+    let mut builder = function.builder();
+    builder.arg(&projected);
+    builder.arg(&ring);
+    builder.arg(&weight);
+    builder.arg(&output);
+    candle_core::builder_arg!(builder, hidden as i32, capacity as i32, cursor, valid);
+    // SAFETY: argument types and bounds match the kernel signature and the
+    // geometry validated by the caller.
+    unsafe { builder.launch(config) }.w()?;
+    Ok(candle_core::CudaStorage {
+        slice: CudaStorageSlice::F32(output),
+        device: device.clone(),
+    })
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_ptx {
     include!(concat!(env!("OUT_DIR"), "/qwen35_ptx.rs"));

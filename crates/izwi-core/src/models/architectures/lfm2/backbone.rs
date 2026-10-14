@@ -263,6 +263,62 @@ impl Lfm2ShortConvRuntimeState {
         Ok(output)
     }
 
+    /// One decode token through the fused ShortConv step
+    /// (`kernels::lfm_shortconv_step`): `projected` is the token's
+    /// in-projection output `[1, 1, 3 * hidden]`; returns the gated
+    /// convolution `[1, 1, hidden]` and installs the next ring. `None` when
+    /// fused kernels are switched off, so the caller runs the op-by-op path.
+    /// Like [`Self::apply`], the cursor advances only through
+    /// [`Self::advance`].
+    fn apply_fused_step(
+        &mut self,
+        component: crate::kv::v2::StateComponentId,
+        projected: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(test)]
+        if FORCE_UNFUSED_SHORTCONV.with(std::cell::Cell::get) {
+            return Ok(None);
+        }
+        let device = projected.device();
+        let enabled = if device.is_cpu() {
+            crate::kernels::fused_kernels_enabled_by_env()
+        } else {
+            crate::kernels::use_fused_kernels_for_device(device)
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        if weight.dims2()? != (self.hidden, self.capacity) {
+            return Err(Error::InvalidInput(
+                "LFM2 retained ShortConv geometry mismatch".into(),
+            ));
+        }
+        let cursor = self.cursor;
+        let capacity = self.capacity;
+        let hidden = self.hidden;
+        let (_, ring) = self
+            .components
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == component)
+            .ok_or_else(|| Error::InferenceError("LFM2 ShortConv component is absent".into()))?;
+        let current = match ring.as_ref() {
+            Some(ring) => ring.clone(),
+            None if cursor == 0 => Tensor::zeros((capacity, 1, hidden), DType::F32, device)?,
+            None => {
+                return Err(Error::InferenceError(
+                    "LFM2 ShortConv state is absent after cursor zero".into(),
+                ))
+            }
+        };
+        let valid = cursor.min(capacity as u64);
+        let (y, next) = crate::kernels::lfm_shortconv_step::lfm_shortconv_gated_ring_step(
+            projected, &current, weight, cursor, valid,
+        )?;
+        *ring = Some(next);
+        Ok(Some(y))
+    }
+
     fn advance(&mut self, steps: usize) -> Result<()> {
         self.cursor =
             self.cursor
@@ -323,6 +379,14 @@ fn direct_shortconv_ring(
         })?);
     }
     Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2).map_err(Error::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch that sends this thread's ShortConv decode steps down
+    /// the op-by-op path, for parity and A/B timing against the fused step.
+    pub(crate) static FORCE_UNFUSED_SHORTCONV: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// One decode step's KV writes and next ShortConv states, not yet
@@ -1026,8 +1090,25 @@ impl ShortConvLayer {
         hidden_states: &Tensor,
         state: &mut Lfm2ShortConvRuntimeState,
     ) -> Result<Tensor> {
-        let (_, _, hidden_size) = hidden_states.dims3()?;
-        let projected = self.in_proj.forward(hidden_states)?.transpose(1, 2)?;
+        let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
+        if batch == 1 && seq_len == 1 {
+            let projected = self.in_proj.forward(hidden_states)?;
+            if let Some(y) = state.apply_fused_step(self.component, &projected, &self.conv)? {
+                return self.out_proj.forward(&y).map_err(Error::from);
+            }
+            return self.forward_retained_unfused(projected, hidden_size, state);
+        }
+        let projected = self.in_proj.forward(hidden_states)?;
+        self.forward_retained_unfused(projected, hidden_size, state)
+    }
+
+    fn forward_retained_unfused(
+        &self,
+        projected: Tensor,
+        hidden_size: usize,
+        state: &mut Lfm2ShortConvRuntimeState,
+    ) -> Result<Tensor> {
+        let projected = projected.transpose(1, 2)?;
         let b = projected.narrow(1, 0, hidden_size)?;
         let c = projected.narrow(1, hidden_size, hidden_size)?;
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
@@ -1048,7 +1129,32 @@ impl ShortConvLayer {
                 "LFM2 ShortConv decode batch dimensions do not match".into(),
             ));
         }
-        let projected = self.in_proj.forward(hidden_states)?.transpose(1, 2)?;
+        let projected = self.in_proj.forward(hidden_states)?;
+        let mut fused = Vec::with_capacity(batch);
+        for row in 0..batch {
+            match states[row].apply_fused_step(
+                self.component,
+                &projected.narrow(0, row, 1)?,
+                &self.conv,
+            )? {
+                Some(y) => fused.push(y),
+                None => break,
+            }
+        }
+        if fused.len() == batch {
+            let y = if batch == 1 {
+                fused.pop().expect("one fused row")
+            } else {
+                Tensor::cat(&fused.iter().collect::<Vec<_>>(), 0)?
+            };
+            return self.out_proj.forward(&y).map_err(Error::from);
+        }
+        if !fused.is_empty() {
+            return Err(Error::InferenceError(
+                "LFM2 fused ShortConv switched off mid-batch".into(),
+            ));
+        }
+        let projected = projected.transpose(1, 2)?;
         let b = projected.narrow(1, 0, hidden_size)?;
         let c = projected.narrow(1, hidden_size, hidden_size)?;
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
