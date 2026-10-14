@@ -1928,8 +1928,6 @@ impl KvArena for CandleAcceleratorKvArena {
             .write()
             .map_err(|_| Error::InferenceError("accelerator KV layer map was poisoned".into()))?;
         let mut replacements = HashMap::with_capacity(layers.len());
-        let current_rows = (0..current as usize).collect::<Vec<_>>();
-        let current_indices = accelerator_indices(&current_rows, &self.device)?;
         for (binding, layer) in layers.iter() {
             let common = (target, self.config.page_tokens as usize, layer.num_kv_heads);
             let keys = exact_zeros(
@@ -1942,8 +1940,8 @@ impl KvArena for CandleAcceleratorKvArena {
                 self.storage_dtype,
                 &self.device,
             )?;
-            scatter_rows(&keys, &current_indices, &layer.keys)?;
-            scatter_rows(&values, &current_indices, &layer.values)?;
+            copy_resident_pages(&keys, &layer.keys)?;
+            copy_resident_pages(&values, &layer.values)?;
             replacements.insert(*binding, (keys, values));
         }
         // The old backing must remain alive until every device copy into the
@@ -2974,6 +2972,14 @@ fn scatter_rows(destination: &Tensor, indices: &Tensor, source: &Tensor) -> Resu
     Ok(())
 }
 
+/// Copy every resident page of `source` into the leading pages of the larger
+/// `destination` (both page-major). A contiguous slice copy needs no index
+/// tensor; scattering through a broadcast row index materialized a u32 tensor
+/// as large as the whole old layer, a transient growth never priced.
+fn copy_resident_pages(destination: &Tensor, source: &Tensor) -> Result<()> {
+    destination.slice_set(source, 0, 0).map_err(Error::from)
+}
+
 fn update_u32_tensor(
     destination: &Tensor,
     previous: &[u32],
@@ -3710,6 +3716,32 @@ mod tests {
         assert_eq!(cache_stats.evictions, 0);
         assert_eq!(cache_stats.device_uploads, 4);
         assert!(cache_stats.resident_bytes > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero() -> Result<()> {
+        let mut devices = vec![Device::Cpu];
+        if let Some(metal) = crate::backends::metal_device_if_available(0) {
+            devices.push(metal);
+        }
+        for device in devices {
+            for dtype in [DType::F32, DType::F16] {
+                // [pages, page_tokens, kv_heads, head_dim]
+                let old = Tensor::arange(1f32, 13f32, &device)?
+                    .reshape((3, 2, 1, 2))?
+                    .to_dtype(dtype)?;
+                let grown = exact_zeros((5, 2, 1, 2), dtype, &device)?;
+                copy_resident_pages(&grown, &old)?;
+                let values = grown
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let mut expected = (1..13).map(|value| value as f32).collect::<Vec<_>>();
+                expected.extend([0.0; 8]);
+                assert_eq!(values, expected, "{:?} {dtype:?}", device.location());
+            }
+        }
         Ok(())
     }
 
