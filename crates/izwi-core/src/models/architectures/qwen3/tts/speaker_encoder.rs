@@ -392,8 +392,10 @@ impl AttentiveStatisticsPooling {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, channels, time) = x.dims3()?;
+        // Built in F32: Metal has no F64 storage, so an F64 fill on the
+        // device fails with "unsupported const-set f64".
         let uniform =
-            Tensor::full(1.0 / time as f64, (batch, 1, time), x.device())?.to_dtype(x.dtype())?;
+            Tensor::full(1.0f32 / time as f32, (batch, 1, time), x.device())?.to_dtype(x.dtype())?;
         let (mean, std) = Self::statistics(x, &uniform)?;
         let context = Tensor::cat(
             &[
@@ -612,6 +614,45 @@ mod tests {
         ];
         let error = max_abs_diff(&output, &golden);
         assert!(error < 1e-5, "x-vector max abs error {error}: {output:?}");
+    }
+
+    /// The x-vector also runs on Metal, which has no F64 storage: the same
+    /// small encoder on the device matches the PyTorch golden.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn speaker_encoder_runs_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; speaker encoder Metal leg not run");
+            return;
+        };
+        let config = SpeakerEncoderConfig {
+            mel_dim: 8,
+            enc_dim: 6,
+            enc_channels: vec![16, 16, 16, 32],
+            enc_kernel_sizes: vec![5, 3, 3, 1],
+            enc_dilations: vec![1, 2, 3, 1],
+            enc_attention_channels: 8,
+            enc_res2net_scale: 4,
+            enc_se_channels: 8,
+            sample_rate: 24_000,
+        };
+        let vb = VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, device.clone());
+        let encoder = SpeakerEncoder::load(config, vb).unwrap();
+        let mel = xorshift_tensor(&[1, 20, 8], 99, 1.0, &Device::Cpu)
+            .unwrap()
+            .to_device(&device)
+            .unwrap();
+        let output = host_f32(&encoder.forward(&mel).unwrap()).unwrap();
+        let golden = [
+            5.626647267e-03f32,
+            -2.657077089e-02,
+            2.953370288e-02,
+            5.000360310e-03,
+            -1.108159572e-01,
+            4.901552945e-02,
+        ];
+        let error = max_abs_diff(&output, &golden);
+        assert!(error < 1e-4, "Metal x-vector max abs error {error}: {output:?}");
     }
 
     /// QTTS-7: the mel front end matches the reference `mel_spectrogram`
