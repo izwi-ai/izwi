@@ -28,14 +28,10 @@ use crate::kernels::numeric_check::{
     NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
 };
 use crate::kernels::{
-    try_fused_decode_gqa_attention, try_fused_rms_norm, try_fused_rope_pair_bshd,
-    try_fused_silu_mul_with_status,
+    try_fused_rms_norm, try_fused_rope_pair_bshd, try_fused_silu_mul_with_status,
 };
 use crate::kv::KvDecodeBatchMetadata;
-use crate::models::architectures::qwen3::core::{causal_mask, repeat_kv};
-use crate::models::shared::attention::flash::{
-    try_fused_self_attention, try_fused_self_attention_scaled,
-};
+use crate::models::shared::attention::flash::try_fused_self_attention;
 use crate::models::shared::attention::geometry::AttentionGeometry;
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{
@@ -397,28 +393,6 @@ fn granite_residual_prescale_enabled(device: &Device) -> bool {
 
 fn granite_residual_prescale_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal)
-}
-
-fn granite_dense_decode_preallocate_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_DENSE_CACHE_PREALLOCATE")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    granite_dense_decode_preallocate_policy(device.is_metal(), override_enabled)
-}
-
-fn granite_dense_decode_preallocate_policy(is_metal: bool, override_enabled: Option<bool>) -> bool {
-    override_enabled.unwrap_or(is_metal)
-}
-
-fn granite_dense_decode_initial_capacity(
-    device: &Device,
-    prompt_tokens: usize,
-    max_new_tokens: usize,
-) -> usize {
-    if !granite_dense_decode_preallocate_enabled(device) {
-        return 0;
-    }
-    prompt_tokens.saturating_add(max_new_tokens.max(1))
 }
 
 fn granite_deferred_stop_check_enabled(decode_each_step: bool) -> bool {
@@ -3804,34 +3778,6 @@ impl GraniteTextAttention {
     }
 }
 
-fn granite_dense_head_decode_allowed(device: &Device) -> bool {
-    granite_dense_head_decode_policy(device.is_metal(), device.is_cuda())
-}
-
-fn granite_dense_head_decode_policy(is_metal: bool, is_cuda: bool) -> bool {
-    is_metal || is_cuda
-}
-
-fn granite_decode_gqa_kernel_enabled(device: &Device, dtype: DType, total_len: usize) -> bool {
-    let override_enabled = std::env::var("IZWI_GRANITE_DECODE_GQA_KERNEL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
-    if !granite_decode_gqa_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled) {
-        return false;
-    }
-    total_len > 0
-        && total_len <= 2048
-        && (matches!(dtype, DType::F16 | DType::F32) || (device.is_cuda() && dtype == DType::BF16))
-}
-
-fn granite_decode_gqa_kernel_policy(
-    is_metal: bool,
-    is_cuda: bool,
-    override_enabled: Option<bool>,
-) -> bool {
-    override_enabled.unwrap_or(is_metal || is_cuda)
-}
-
 fn granite_qformer_fused_attention_allowed(device: &Device) -> bool {
     device.is_cuda()
 }
@@ -3978,134 +3924,6 @@ fn last_hidden_for_logits(hidden: &Tensor) -> Result<Tensor> {
             "Granite Speech hidden states expected [batch,seq,dim], got {dims:?}"
         ))),
     }
-}
-
-fn text_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    start_pos: usize,
-    total_len: usize,
-    attention_multiplier: f32,
-) -> Result<Tensor> {
-    let q_heads = q.transpose(1, 2)?.contiguous()?;
-    let k = repeat_kv(k, num_heads, num_kv_heads)?;
-    let v = repeat_kv(v, num_heads, num_kv_heads)?;
-    let k_heads = k.transpose(1, 2)?.contiguous()?;
-    let v_heads = v.transpose(1, 2)?.contiguous()?;
-    let mut attn = q_heads.matmul(&k_heads.t()?)?;
-    attn = (attn * attention_multiplier as f64)?;
-    let mask = causal_mask(q.dim(1)?, total_len, start_pos, q.device(), attn.dtype())?;
-    attn = attn.broadcast_add(&mask)?;
-    let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-    attn.matmul(&v_heads)?
-        .transpose(1, 2)
-        .map_err(Error::from)
-        .and_then(|out| {
-            out.reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-                .map_err(Error::from)
-        })
-}
-
-fn dense_decode_attention_scaled(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    attention_multiplier: f32,
-) -> Result<Tensor> {
-    let k = repeat_kv(k, num_heads, num_kv_heads)?;
-    let v = repeat_kv(v, num_heads, num_kv_heads)?;
-    let q_heads = q.transpose(1, 2)?.contiguous()?;
-    let k_heads = k.transpose(1, 2)?.contiguous()?;
-    let v_heads = v.transpose(1, 2)?.contiguous()?;
-    let mut attn = q_heads.matmul(&k_heads.t()?)?;
-    attn = (attn * attention_multiplier as f64)?;
-    let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-    let out = attn.matmul(&v_heads)?;
-    out.transpose(1, 2)?
-        .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-        .map_err(Error::from)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraniteDenseDecodeAttentionKernel {
-    Fused,
-    Fallback,
-}
-
-fn dense_decode_attention_heads_scaled(
-    q: &Tensor,
-    k_heads: &Tensor,
-    v_heads: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    attention_multiplier: f32,
-) -> Result<(Tensor, GraniteDenseDecodeAttentionKernel)> {
-    let q_heads = q.transpose(1, 2)?.contiguous()?;
-    if granite_decode_gqa_kernel_enabled(q.device(), q_heads.dtype(), k_heads.dim(2)?) {
-        if let Some(out) = try_fused_decode_gqa_attention(
-            &q_heads,
-            k_heads,
-            v_heads,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            attention_multiplier,
-        ) {
-            let out = out
-                .transpose(1, 2)?
-                .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-                .map_err(Error::from)?;
-            return Ok((out, GraniteDenseDecodeAttentionKernel::Fused));
-        }
-    }
-    if let Some(out) = try_fused_self_attention_scaled(
-        &q_heads,
-        k_heads,
-        v_heads,
-        None,
-        head_dim,
-        false,
-        attention_multiplier,
-    )? {
-        let out = out
-            .transpose(1, 2)?
-            .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-            .map_err(Error::from)?;
-        return Ok((out, GraniteDenseDecodeAttentionKernel::Fused));
-    }
-    let k_heads = if num_heads == num_kv_heads {
-        k_heads.clone()
-    } else {
-        let k = k_heads.transpose(1, 2)?.contiguous()?;
-        repeat_kv(&k, num_heads, num_kv_heads)?
-            .transpose(1, 2)?
-            .contiguous()?
-    };
-    let v_heads = if num_heads == num_kv_heads {
-        v_heads.clone()
-    } else {
-        let v = v_heads.transpose(1, 2)?.contiguous()?;
-        repeat_kv(&v, num_heads, num_kv_heads)?
-            .transpose(1, 2)?
-            .contiguous()?
-    };
-    let mut attn = q_heads.matmul(&k_heads.t()?)?;
-    attn = (attn * attention_multiplier as f64)?;
-    let attn = ops::softmax(&attn.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-    let out = attn.matmul(&v_heads)?;
-    let out = out
-        .transpose(1, 2)?
-        .reshape((q.dim(0)?, q.dim(1)?, num_heads, head_dim))
-        .map_err(Error::from)?;
-    Ok((out, GraniteDenseDecodeAttentionKernel::Fallback))
 }
 
 struct GraniteTextFusedGateUpProjection {
@@ -5266,14 +5084,6 @@ mod tests {
     }
 
     #[test]
-    fn granite_dense_decode_preallocate_defaults_to_metal_only() {
-        assert!(granite_dense_decode_preallocate_policy(true, None));
-        assert!(!granite_dense_decode_preallocate_policy(false, None));
-        assert!(granite_dense_decode_preallocate_policy(false, Some(true)));
-        assert!(!granite_dense_decode_preallocate_policy(true, Some(false)));
-    }
-
-    #[test]
     fn residual_prescaled_linear_matches_post_projection_scale() {
         let device = Device::Cpu;
         let weight = Tensor::from_vec(
@@ -5524,97 +5334,6 @@ mod tests {
         assert!(heads.is_contiguous());
         assert_eq!(heads.stride(), &[15360, 960, 64, 1]);
         assert_eq!(heads.t().unwrap().stride(), &[15360, 960, 1, 64]);
-    }
-
-    #[test]
-    fn dense_head_decode_matches_materialized_scaled_attention() {
-        let device = Device::Cpu;
-        let num_heads = 4;
-        let num_kv_heads = 2;
-        let head_dim = 2;
-        let attention_multiplier = 0.37;
-        let q = Tensor::from_vec(
-            vec![0.2f32, -0.4, 0.1, 0.8, -0.3, 0.7, 0.5, -0.6],
-            (1, 1, num_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let k = Tensor::from_vec(
-            vec![
-                0.1f32, 0.2, -0.3, 0.4, 0.5, -0.2, //
-                -0.6, 0.7, 0.2, -0.1, 0.3, 0.9,
-            ],
-            (1, 3, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let v = Tensor::from_vec(
-            vec![
-                -0.2f32, 0.4, 0.6, -0.1, 0.8, 0.3, //
-                0.5, -0.7, -0.4, 0.2, 0.1, 0.9,
-            ],
-            (1, 3, num_kv_heads, head_dim),
-            &device,
-        )
-        .unwrap();
-        let k_heads = k.transpose(1, 2).unwrap().contiguous().unwrap();
-        let v_heads = v.transpose(1, 2).unwrap().contiguous().unwrap();
-
-        let materialized = dense_decode_attention_scaled(
-            &q,
-            &k,
-            &v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            attention_multiplier,
-        )
-        .unwrap();
-        let (dense_heads, _path) = dense_decode_attention_heads_scaled(
-            &q,
-            &k_heads,
-            &v_heads,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            attention_multiplier,
-        )
-        .unwrap();
-        let lhs = materialized
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        let rhs = dense_heads.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let max_diff = lhs
-            .iter()
-            .zip(rhs.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-
-        assert!(max_diff < 1e-6, "max diff {max_diff}");
-    }
-
-    #[test]
-    fn dense_head_decode_policy_skips_cpu() {
-        assert!(!granite_dense_head_decode_allowed(&Device::Cpu));
-    }
-
-    #[test]
-    fn dense_head_decode_policy_enables_accelerated_backends() {
-        assert!(!granite_dense_head_decode_policy(false, false));
-        assert!(granite_dense_head_decode_policy(true, false));
-        assert!(granite_dense_head_decode_policy(false, true));
-        assert!(granite_dense_head_decode_policy(true, true));
-    }
-
-    #[test]
-    fn granite_decode_gqa_kernel_defaults_to_accelerators() {
-        assert!(granite_decode_gqa_kernel_policy(true, false, None));
-        assert!(granite_decode_gqa_kernel_policy(false, true, None));
-        assert!(!granite_decode_gqa_kernel_policy(false, false, None));
-        assert!(granite_decode_gqa_kernel_policy(false, false, Some(true)));
-        assert!(!granite_decode_gqa_kernel_policy(true, false, Some(false)));
     }
 
     #[test]
