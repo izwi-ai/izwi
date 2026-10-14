@@ -88,7 +88,10 @@ impl StoreFaults {
     }
 
     fn trip(&self, point: StoreFaultPoint) -> bool {
-        let mut armed = self.armed.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut armed = self
+            .armed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let Some((skip, fail)) = armed.get_mut(&point) else {
             return false;
         };
@@ -11330,7 +11333,10 @@ mod tests {
         );
 
         // A still-heartbeating owner is never settled, however old its lease.
-        clock.store(11_001 + 2 * ABANDONED_CANCELLATION_GRACE_MS, Ordering::SeqCst);
+        clock.store(
+            11_001 + 2 * ABANDONED_CANCELLATION_GRACE_MS,
+            Ordering::SeqCst,
+        );
         record_test_worker_heartbeat(&store, "worker-1").await;
         assert_eq!(
             store
@@ -11345,7 +11351,10 @@ mod tests {
         );
 
         // The owner process died: no renewal and no heartbeat for the grace.
-        clock.store(11_002 + 3 * ABANDONED_CANCELLATION_GRACE_MS, Ordering::SeqCst);
+        clock.store(
+            11_002 + 3 * ABANDONED_CANCELLATION_GRACE_MS,
+            Ordering::SeqCst,
+        );
         assert_eq!(
             store
                 .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
@@ -11369,7 +11378,10 @@ mod tests {
             .expect("job exists");
         assert_eq!(settled_job.status, RuntimeJobStatus::Cancelled);
         assert_eq!(settled_job.cancellation_state, None);
-        assert_eq!(settled_job.cancellation_reason.as_deref(), Some("user cancel"));
+        assert_eq!(
+            settled_job.cancellation_reason.as_deref(),
+            Some("user cancel")
+        );
 
         // The dead attempt stays fenced, and admission capacity is released.
         assert!(store
