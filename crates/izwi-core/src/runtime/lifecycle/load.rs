@@ -1368,6 +1368,7 @@ impl ModelLifecycleController {
             };
             self.model_registry
                 .publish_effective_context(variant, retained.logical_token_reach())?;
+            self.model_registry.publish_kv_storage(variant, &retained);
             crate::runtime::rollout::validate_managed_state_plan_eligibility(
                 variant,
                 capability,
@@ -2556,6 +2557,7 @@ impl ModelLifecycleController {
                             variant,
                             physical.maximum_sequence_tokens(),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &physical);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Chat,
@@ -2634,6 +2636,7 @@ impl ModelLifecycleController {
                             variant,
                             retained.logical_token_reach(),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &retained);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
@@ -2773,6 +2776,7 @@ impl ModelLifecycleController {
                                 .logical_token_reach()
                                 .min(physical_spec.sequence_tokens as u64),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &physical);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
@@ -2878,6 +2882,7 @@ impl ModelLifecycleController {
                             variant,
                             retained.logical_token_reach().max(invocation_ceiling),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &retained);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
@@ -3234,6 +3239,7 @@ impl ModelLifecycleController {
                             variant,
                             retained.logical_token_reach(),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &retained);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Asr,
@@ -3305,6 +3311,7 @@ impl ModelLifecycleController {
                             variant,
                             retained.logical_token_reach(),
                         )?;
+                        self.model_registry.publish_kv_storage(variant, &retained);
                         crate::runtime::rollout::validate_managed_state_plan_eligibility(
                             variant,
                             CapabilityKind::Tts,
@@ -3411,6 +3418,7 @@ impl ModelLifecycleController {
                         variant,
                         retained.logical_token_reach(),
                     )?;
+                    self.model_registry.publish_kv_storage(variant, &retained);
                     crate::runtime::rollout::validate_managed_state_plan_eligibility(
                         variant,
                         capability,
@@ -3507,6 +3515,7 @@ impl ModelLifecycleController {
                     variant,
                     retained.logical_token_reach(),
                 )?;
+                self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(
                     variant,
                     CapabilityKind::Tts,
@@ -3617,6 +3626,7 @@ impl ModelLifecycleController {
                     variant,
                     retained.logical_token_reach(),
                 )?;
+                self.model_registry.publish_kv_storage(variant, &retained);
                 crate::runtime::rollout::validate_managed_state_plan_eligibility(
                     variant,
                     CapabilityKind::Tts,
