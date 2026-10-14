@@ -20,6 +20,7 @@ use crate::runtime::audio_io::{
     MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
+use crate::runtime::forced_alignment::{AlignmentSource, SampleWindow, WindowedAlignment};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
 use crate::runtime::service::{
     copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
@@ -929,73 +930,62 @@ impl RuntimeService {
         let asr_words = extract_words(&asr_text);
 
         let mut model_aligned_words = 0usize;
+        let mut warnings = Vec::new();
         let mut alignments = if asr_text.is_empty() {
             Vec::new()
-        } else if use_single_pass_asr {
-            match (aligner_model, aligner_binding) {
-                (Some(model), Some((aligner_lease, aligner_contract))) => {
-                    let audio_for_task = audio.clone();
-                    let text_for_task = asr_text.clone();
-                    let language_for_task = detected_language.clone();
-                    match self
-                        .coordinator
-                        .run_loaded_blocking_stage(
-                            &pipeline_job,
-                            aligner_contract,
-                            WorkUnit::AtomicJob {
-                                kind: "diarization.force_align".to_string(),
-                            },
-                            move || {
-                                let _aligner_lease = aligner_lease;
-                                model.force_align(
-                                    &audio_for_task.samples,
-                                    audio_for_task.sample_rate,
-                                    &text_for_task,
-                                    language_for_task.as_deref(),
-                                )
-                            },
-                        )
-                        .await
-                    {
-                        Ok(aligned) => {
-                            model_aligned_words = aligned.len();
-                            aligned
-                        }
-                        Err(err) => {
-                            warn!("Forced alignment failed, using heuristic timings: {err}");
-                            fallback_word_timings_from_words(&asr_words, audio.duration_secs)
-                        }
-                    }
-                }
-                _ => fallback_word_timings_from_words(&asr_words, audio.duration_secs),
-            }
         } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
             (aligner_model, aligner_binding)
         {
-            let audio_for_task = audio.clone();
-            let chunks_for_task = chunk_texts.clone();
-            let (aligned, aligned_word_count) = self
-                .coordinator
-                .run_loaded_blocking_stage(
-                    &pipeline_job,
-                    aligner_contract,
-                    WorkUnit::AtomicJob {
-                        kind: "diarization.force_align_chunks".to_string(),
-                    },
-                    move || {
-                        let _aligner_lease = aligner_lease;
-                        Ok(force_align_audio_chunks(
-                            model,
-                            &audio_for_task,
-                            &chunks_for_task,
-                        ))
-                    },
-                )
-                .await?;
-            model_aligned_words = aligned_word_count;
-            aligned
+            // One aligner stage per window: the whole file after a single ASR
+            // pass, otherwise each ASR chunk with its own text.
+            let windows = if use_single_pass_asr {
+                vec![SampleWindow {
+                    start_sample: 0,
+                    end_sample: audio.samples.len(),
+                    text: asr_text.clone(),
+                }]
+            } else {
+                chunk_texts
+                    .iter()
+                    .map(|chunk| SampleWindow {
+                        start_sample: chunk.range.start_sample,
+                        end_sample: chunk.range.end_sample,
+                        text: chunk.text.clone(),
+                    })
+                    .collect()
+            };
+            let alignment = WindowedAlignment {
+                windows: self
+                    .align_sample_windows(
+                        &pipeline_job,
+                        aligner_contract,
+                        model,
+                        audio.samples.clone(),
+                        audio.sample_rate,
+                        windows,
+                        detected_language.clone(),
+                        "diarization.force_align",
+                    )
+                    .await?,
+                duration_ms: secs_to_ms(audio.duration_secs),
+            };
+            drop(aligner_lease);
+            warnings.extend(alignment.warnings());
+            let mut merged = Vec::new();
+            for window in alignment.windows {
+                if window.source == AlignmentSource::Model {
+                    model_aligned_words += window.words.len();
+                }
+                append_chunk_alignments(&mut merged, window.words);
+            }
+            merged
         } else {
-            fallback_word_timings_from_chunks(&chunk_texts, audio.sample_rate)
+            warnings.push("Forced aligner unavailable; word timings are evenly spaced".to_string());
+            if use_single_pass_asr {
+                fallback_word_timings_from_words(&asr_words, audio.duration_secs)
+            } else {
+                fallback_word_timings_from_chunks(&chunk_texts, audio.sample_rate)
+            }
         };
 
         if alignment_is_suspicious(&alignments, asr_words.len(), diarization.duration_secs) {
@@ -1095,6 +1085,7 @@ impl RuntimeService {
             alignment_coverage,
             unattributed_words,
             llm_refined,
+            warnings,
         })
     }
 
@@ -1266,62 +1257,6 @@ fn transcribe_audio_chunks(
     Ok((assembler.finish().trim().to_string(), transcribed))
 }
 
-fn force_align_audio_chunks(
-    model: Arc<NativeAsrModel>,
-    audio: &PipelineAudio,
-    chunks: &[TranscribedChunk],
-) -> (Vec<(String, u32, u32)>, usize) {
-    let mut merged = Vec::new();
-    let mut model_aligned_words = 0usize;
-
-    for chunk in chunks {
-        let words = extract_words(&chunk.text);
-        if words.is_empty()
-            || chunk.range.end_sample <= chunk.range.start_sample
-            || chunk.range.end_sample > audio.samples.len()
-        {
-            continue;
-        }
-
-        let chunk_audio = &audio.samples[chunk.range.start_sample..chunk.range.end_sample];
-        let chunk_duration_secs = chunk_audio.len() as f32 / audio.sample_rate.max(1) as f32;
-        let chunk_start_ms = samples_to_ms(chunk.range.start_sample, audio.sample_rate);
-        let aligned = match model.force_align(
-            chunk_audio,
-            PIPELINE_SAMPLE_RATE,
-            &chunk.text,
-            chunk.language.as_deref(),
-        ) {
-            Ok(aligned)
-                if !aligned.is_empty()
-                    && !alignment_is_suspicious(&aligned, words.len(), chunk_duration_secs) =>
-            {
-                model_aligned_words += aligned.len();
-                aligned
-            }
-            Ok(_) => fallback_word_timings_from_words(&words, chunk_duration_secs),
-            Err(err) => {
-                warn!("Forced alignment failed for one chunk, using interval fallback: {err}");
-                fallback_word_timings_from_words(&words, chunk_duration_secs)
-            }
-        };
-
-        let rebased = aligned
-            .into_iter()
-            .map(|(word, start, end)| {
-                (
-                    word,
-                    chunk_start_ms.saturating_add(start),
-                    chunk_start_ms.saturating_add(end),
-                )
-            })
-            .collect::<Vec<_>>();
-        append_chunk_alignments(&mut merged, rebased);
-    }
-
-    (merged, model_aligned_words)
-}
-
 fn fallback_word_timings_from_chunks(
     chunks: &[TranscribedChunk],
     sample_rate: u32,
@@ -1356,7 +1291,7 @@ fn fallback_word_timings(text: &str, duration_secs: f32) -> Vec<(String, u32, u3
     fallback_word_timings_from_words(&words, duration_secs)
 }
 
-fn fallback_word_timings_from_words(
+pub(super) fn fallback_word_timings_from_words(
     words: &[String],
     duration_secs: f32,
 ) -> Vec<(String, u32, u32)> {
@@ -1507,7 +1442,7 @@ fn extract_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn alignment_is_suspicious(
+pub(super) fn alignment_is_suspicious(
     alignments: &[(String, u32, u32)],
     expected_word_count: usize,
     duration_secs: f32,
@@ -2317,7 +2252,7 @@ fn trim_timing_overlap_prefix_len(
         .count()
 }
 
-fn samples_to_ms(sample_index: usize, sample_rate: u32) -> u32 {
+pub(super) fn samples_to_ms(sample_index: usize, sample_rate: u32) -> u32 {
     if sample_rate == 0 {
         return 0;
     }

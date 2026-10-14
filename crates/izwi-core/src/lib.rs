@@ -138,9 +138,10 @@ pub use runtime::{
     TRACE_STREAMING_MODE,
 };
 pub use runtime::{
-    validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,
-    DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult, TtsStopReason, TtsStreamingMode,
+    validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
+    ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult, DiarizationSegment,
+    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
+    GenerationResult, TtsStopReason, TtsStreamingMode, WindowedAlignment,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 

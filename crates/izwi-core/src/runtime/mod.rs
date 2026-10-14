@@ -15,6 +15,7 @@ mod conformance;
 mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
+mod forced_alignment;
 mod kokoro;
 mod lifecycle;
 mod pipeline;
@@ -46,6 +47,7 @@ pub use conformance::{
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
+pub use forced_alignment::{AlignedWindow, AlignmentSource, AlignmentWindow, WindowedAlignment};
 pub use service::{
     RuntimeChatInvocation, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
     RuntimeChatTeardown, RuntimeChatTeardownDisposition, RuntimeService,

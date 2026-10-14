@@ -158,6 +158,10 @@ pub struct DiarizationTranscriptResult {
     pub alignment_coverage: f32,
     pub unattributed_words: usize,
     pub llm_refined: bool,
+    /// Degraded steps the transcript went through (aligner windows with
+    /// interval timings, a missing aligner, a truncated ASR decode).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

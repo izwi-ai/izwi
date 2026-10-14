@@ -1513,8 +1513,23 @@ fn qwen3_aligner_max_window_samples(maximum_frames: usize, hop_length: usize) ->
         .saturating_mul(hop_length.max(1))
 }
 
+/// Words of one forced alignment as (word, start_ms, end_ms), and whether
+/// they are interval-based timings that replaced degenerate model output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedAlignmentOutput {
+    pub words: Vec<(String, u32, u32)>,
+    pub interval_fallback: bool,
+}
+
+/// The words the aligner times in `text`, in order: runs of letters, digits,
+/// `'` and `-`, with each CJK or Hangul character a word of its own.
+/// Re-joining them with spaces yields the same words.
+pub(crate) fn forced_alignment_words(text: &str) -> Vec<String> {
+    extract_alignment_words(text)
+}
+
 /// Most alignable words one aligner window of `audio_seconds` accepts.
-fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
+pub(crate) fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
     let proportional = if audio_seconds.is_finite() && audio_seconds > 0.0 {
         (audio_seconds * QWEN3_ALIGNER_MAX_WORDS_PER_SECOND).ceil() as usize
     } else {
@@ -2768,8 +2783,21 @@ impl Qwen3AsrModel {
         audio: &[f32],
         sample_rate: u32,
         reference_text: &str,
-        _language: Option<&str>,
+        language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.force_align_detailed(audio, sample_rate, reference_text, language)
+            .map(|output| output.words)
+    }
+
+    /// Forced alignment that also reports whether the model's timings were
+    /// replaced by interval-based ones because they were degenerate.
+    pub fn force_align_detailed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        reference_text: &str,
+        _language: Option<&str>,
+    ) -> Result<ForcedAlignmentOutput> {
         if !self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Forced alignment requires a Qwen3-ForcedAligner model; Qwen3 ASR does not expose an autoregressive alignment capability"
@@ -2784,7 +2812,7 @@ impl Qwen3AsrModel {
         audio: &[f32],
         sample_rate: u32,
         reference_text: &str,
-    ) -> Result<Vec<(String, u32, u32)>> {
+    ) -> Result<ForcedAlignmentOutput> {
         let audio = if sample_rate != 16_000 {
             resample(audio, sample_rate, 16_000)?
         } else {
@@ -2899,14 +2927,19 @@ impl Qwen3AsrModel {
         let audio_duration_ms =
             ((encoded_samples as f64 * 1000.0) / f64::from(QWEN3_ASR_SAMPLE_RATE)).round() as u32;
         normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        if alignment_distribution_is_degenerate(&alignments, audio_duration_ms) {
+        let interval_fallback =
+            alignment_distribution_is_degenerate(&alignments, audio_duration_ms);
+        if interval_fallback {
             warn!(
                 "Forced aligner produced degenerate timestamp distribution; falling back to interval-based alignment"
             );
             alignments = distribute_words_over_interval(&words, 0, audio_duration_ms.max(1));
             normalize_alignment_bounds(&mut alignments, audio_duration_ms);
         }
-        Ok(alignments)
+        Ok(ForcedAlignmentOutput {
+            words: alignments,
+            interval_fallback,
+        })
     }
 
     fn build_forced_aligner_prompt(

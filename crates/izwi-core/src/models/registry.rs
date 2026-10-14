@@ -71,6 +71,7 @@ use crate::models::architectures::nemotron::asr::{
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
+pub(crate) use crate::models::architectures::qwen3::asr::ForcedAlignmentOutput;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
@@ -2331,8 +2332,21 @@ impl NativeAsrModel {
         reference_text: &str,
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.force_align_detailed(audio, sample_rate, reference_text, language)
+            .map(|output| output.words)
+    }
+
+    pub(crate) fn force_align_detailed(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        reference_text: &str,
+        language: Option<&str>,
+    ) -> Result<ForcedAlignmentOutput> {
         match self {
-            Self::Qwen3(model) => model.force_align(audio, sample_rate, reference_text, language),
+            Self::Qwen3(model) => {
+                model.force_align_detailed(audio, sample_rate, reference_text, language)
+            }
             Self::Parakeet(_) => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
