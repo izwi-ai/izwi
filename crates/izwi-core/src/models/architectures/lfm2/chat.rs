@@ -548,6 +548,11 @@ impl ChatTokenizer {
 pub struct Lfm2ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
+    /// Additive logits mask: 0 for generatable ids, -inf for control tokens
+    /// and ids past the tokenizer vocabulary. Applied before greedy argmax
+    /// and before sampling, so neither path can select an id the decoder
+    /// must reject.
+    generation_mask: Tensor,
     prompt_scaffold: PromptScaffoldTokens,
     config: Lfm2BackboneConfig,
     text_model: QuantizedLfm2Backbone,
@@ -592,6 +597,12 @@ impl Lfm2ChatModel {
             ));
         }
         let prompt_scaffold = PromptScaffoldTokens::load(&tokenizer)?;
+        let generation_mask = generation_mask(
+            text_model.vocab_size(),
+            tokenizer.vocab_size,
+            &tokenizer.non_generatable,
+            &device.device,
+        )?;
 
         info!(
             "Loaded LFM2 GGUF chat model on {:?} from {}",
@@ -616,6 +627,7 @@ impl Lfm2ChatModel {
         Ok(Self {
             device,
             tokenizer,
+            generation_mask,
             prompt_scaffold,
             config,
             text_model,
@@ -681,7 +693,9 @@ impl Lfm2ChatModel {
                 .flatten()
                 .collect(),
             ),
-            greedy: is_plain_greedy(config),
+            // A JSON-constrained row must sample through the grammar, so it
+            // never takes the batched argmax shortcut.
+            greedy: is_plain_greedy(config) && !config.constrain_json_object,
             decoder: IncrementalDecoder::new(true),
             stop_reason: None,
             assembled: String::new(),
@@ -772,8 +786,21 @@ impl Lfm2ChatModel {
             Error::InferenceError("LFM2 decode state has no sampleable output".into())
         })?;
         self.tokenizer.validate_logits(&logits)?;
+        let logits = self.mask_non_generatable(&logits)?;
         let (next, entry) = self.sample_token(state, &logits)?;
         self.accept_token(state, next, committed, entry)
+    }
+
+    /// Mask control tokens out of finite, validated logits (`[V]` or `[B, V]`).
+    fn mask_non_generatable(&self, logits: &Tensor) -> Result<Tensor> {
+        if logits.dim(D::Minus1)? != self.generation_mask.dim(0)? {
+            return Err(Error::InferenceError(
+                "LFM2 logits width does not match the generation mask".into(),
+            ));
+        }
+        logits
+            .broadcast_add(&self.generation_mask)
+            .map_err(Error::from)
     }
 
     /// DS9.3: sample one token, resolving raw logprobs into the public
@@ -918,6 +945,7 @@ impl Lfm2ChatModel {
         drop(shortconv);
         drop(caches);
         self.tokenizer.validate_logits(&logits)?;
+        let logits = self.mask_non_generatable(&logits)?;
         // DS9.3: rows collecting logprobs must sample through the resolving
         // path, which forfeits the batched argmax for the whole envelope.
         let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
@@ -1228,6 +1256,24 @@ fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
         && config.top_p >= 1.0
         && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
         && config.presence_penalty.abs() <= f32::EPSILON
+}
+
+fn generation_mask(
+    logits_width: usize,
+    tokenizer_vocab: usize,
+    non_generatable: &[u32],
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let mut mask = vec![0f32; logits_width];
+    for value in mask.iter_mut().skip(tokenizer_vocab) {
+        *value = f32::NEG_INFINITY;
+    }
+    for &id in non_generatable {
+        if let Some(value) = mask.get_mut(id as usize) {
+            *value = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_vec(mask, logits_width, device).map_err(Error::from)
 }
 
 fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<()> {
