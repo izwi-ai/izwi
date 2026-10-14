@@ -182,6 +182,62 @@ fn demotion_moves_the_lru_subtree_to_the_host_pool() {
 }
 
 #[test]
+fn a_failed_capture_unpins_and_returns_every_host_slot() {
+    let physical = arena();
+    let mut coordinator = KvCacheCoordinator::new(arena_id(), 4);
+    let mut index = CoordinatedPrefixIndex::new(8);
+    let (keys, blocks, _seeds, _snapshot) =
+        publish_seeded_prefix(&mut coordinator, &mut index, &physical);
+    coordinator
+        .release_table(
+            &SessionKey::new("session-a".to_string(), 0),
+            CacheDomainId::new(0),
+        )
+        .unwrap();
+
+    // A host page size the arena rejects makes every capture fail after
+    // the transfer pin and a host slot were taken.
+    let wrong_page_bytes = arena_page_bytes(physical.config()) + 4;
+    let mut offload = ArenaOffload::new(wrong_page_bytes, 4096).unwrap();
+    let error = demote_step(
+        &mut coordinator,
+        &mut index,
+        &physical,
+        &mut offload,
+        &Default::default(),
+    )
+    .expect_err("capture into a wrong-sized host page must fail");
+    assert!(error.to_string().contains("host page buffer"), "{error}");
+
+    // Device authority is untouched and nothing stays pinned or resident.
+    let stats = coordinator.stats();
+    assert_eq!(stats.transfer_pins, 0);
+    assert_eq!(stats.prefix_refs, 2);
+    assert_eq!(stats.allocated_pages, 2);
+    coordinator.check_invariants().unwrap();
+    assert_eq!(index.len(), 2);
+    assert_eq!(offload.pool.resident_pages(), 0);
+    assert!(offload.chain.is_empty());
+    for (key, block) in keys.iter().zip(&blocks) {
+        assert!(offload.chain.lookup(key).is_none());
+        assert!(coordinator.page_is_offload_candidate(*block).unwrap());
+    }
+}
+
+#[test]
+fn host_chain_insert_hands_back_the_replaced_slot() {
+    let mut pool = crate::backends::kv::KvHostPool::new(16, 2 * 16).unwrap();
+    let mut chain = HostChainIndex::default();
+    let key = KvPrefixPageKey::new(&namespace(), None, 0, vec![1, 2]).unwrap();
+    let first = pool.allocate_slot().unwrap();
+    let second = pool.allocate_slot().unwrap();
+    assert_eq!(chain.insert(key.clone(), first), None);
+    assert_eq!(chain.insert(key.clone(), second), Some(first));
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain.lookup(&key), Some(second));
+}
+
+#[test]
 fn demotion_skips_subtrees_with_referenced_pages() {
     let physical = arena();
     let mut coordinator = KvCacheCoordinator::new(arena_id(), 4);
@@ -262,7 +318,7 @@ fn host_chain_eviction_frees_slots_until_the_pool_fits() {
         // Independent roots: each subtree is exactly one page.
         let key = KvPrefixPageKey::new(&ns, None, page * 2, vec![1, 2]).unwrap();
         let slot = pool.allocate_slot().expect("slot fits");
-        chain.insert(key.clone(), slot);
+        assert_eq!(chain.insert(key.clone(), slot), None);
         keys.push(key);
     }
     assert_eq!(chain.len(), 3);
