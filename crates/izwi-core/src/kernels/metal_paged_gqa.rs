@@ -14,8 +14,13 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use candle_core::{bail, DType, Result as CandleResult};
+use candle_core::backend::BackendStorage;
+use candle_core::{
+    bail, CpuStorage, DType, InplaceOp3, Layout, MetalStorage, Result as CandleResult, Tensor,
+};
 use candle_metal_kernels::metal::{ComputePipeline, Device as MetalDevice};
+
+use super::metal_encoder::IzwiMetalCommandEncoderExt;
 
 /// Simdgroups per threadgroup; the kernel is written for 32-lane simdgroups.
 pub(crate) const GQA_DECODE_SIMDGROUPS: usize = 4;
@@ -155,6 +160,193 @@ pub(crate) fn gqa_decode_enabled() -> bool {
         )
     })
 }
+
+/// Copy `source` rows `[rows, row_elements]` into the `destination` rows
+/// named by `slots`, in place and in one dispatch. Replaces scatter through a
+/// broadcast index tensor, which materialized a u32 index as large as the
+/// written K/V (twice its bytes in F16) and cost an extra copy dispatch.
+/// Callers must have bounds-checked every slot against the destination rows.
+pub(crate) fn write_kv_rows(
+    destination: &Tensor,
+    source: &Tensor,
+    slots: &Tensor,
+) -> CandleResult<()> {
+    if destination.rank() == 0
+        || source.rank() != destination.rank()
+        || source.dims()[1..] != destination.dims()[1..]
+        || source.dim(0)? != slots.elem_count()
+    {
+        bail!(
+            "izwi-kv-write-rows-metal shape mismatch: destination {:?}, source {:?}, {} slots",
+            destination.dims(),
+            source.dims(),
+            slots.elem_count()
+        )
+    }
+    destination.inplace_op3(&source.contiguous()?, &slots.contiguous()?, &KvWriteRowsOp)
+}
+
+struct KvWriteRowsOp;
+
+impl InplaceOp3 for KvWriteRowsOp {
+    fn name(&self) -> &'static str {
+        "izwi-kv-write-rows-metal"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &mut CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> CandleResult<()> {
+        bail!("izwi-kv-write-rows-metal requires Metal tensors")
+    }
+
+    fn metal_fwd(
+        &self,
+        destination: &mut MetalStorage,
+        destination_layout: &Layout,
+        source: &MetalStorage,
+        source_layout: &Layout,
+        slots: &MetalStorage,
+        slots_layout: &Layout,
+    ) -> CandleResult<()> {
+        let dtype = destination.dtype();
+        if source.dtype() != dtype || slots.dtype() != DType::U32 {
+            bail!("izwi-kv-write-rows-metal requires matching K/V dtypes and u32 slots")
+        }
+        if !destination_layout.is_contiguous()
+            || !source_layout.is_contiguous()
+            || !slots_layout.is_contiguous()
+        {
+            bail!("izwi-kv-write-rows-metal requires contiguous tensors")
+        }
+        let rows = slots_layout.shape().elem_count();
+        let source_elements = source_layout.shape().elem_count();
+        if rows == 0 || source_elements == 0 || !source_elements.is_multiple_of(rows) {
+            bail!("izwi-kv-write-rows-metal source does not split into slot rows")
+        }
+        let row_elements = source_elements / rows;
+        if !destination_layout
+            .shape()
+            .elem_count()
+            .is_multiple_of(row_elements)
+            || rows > u32::MAX as usize
+            || row_elements > u32::MAX as usize
+        {
+            bail!("izwi-kv-write-rows-metal destination rows do not match the source")
+        }
+        let function = match dtype.size_in_bytes() {
+            2 => "izwi_kv_write_rows_b16",
+            4 => "izwi_kv_write_rows_b32",
+            _ => bail!("izwi-kv-write-rows-metal supports 16- and 32-bit elements"),
+        };
+        let device = destination.device().clone();
+        let pipeline = kv_write_pipeline(device.metal_device(), function)?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("izwi-kv-write-rows");
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_output_buffer(
+            0,
+            Some(destination.buffer()),
+            destination_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            1,
+            Some(source.buffer()),
+            source_layout.start_offset() * dtype.size_in_bytes(),
+        );
+        encoder.set_input_buffer(
+            2,
+            Some(slots.buffer()),
+            slots_layout.start_offset() * DType::U32.size_in_bytes(),
+        );
+        encoder.set_bytes(3, &(rows as u32));
+        encoder.set_bytes(4, &(row_elements as u32));
+        encoder.dispatch_threads(
+            objc2_metal::MTLSize {
+                width: source_elements,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: pipeline.max_total_threads_per_threadgroup().clamp(1, 256),
+                height: 1,
+                depth: 1,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn kv_write_pipeline(device: &MetalDevice, function: &str) -> CandleResult<ComputePipeline> {
+    static PIPELINES: OnceLock<Mutex<HashMap<(u64, String), ComputePipeline>>> = OnceLock::new();
+    let key = (device.registry_id(), function.to_string());
+    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(pipeline) = pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(pipeline);
+    }
+    let library = device
+        .new_library_with_source(KV_WRITE_SOURCE, None)
+        .map_err(candle_core::Error::wrap)?;
+    let function = library
+        .get_function(function, None)
+        .map_err(candle_core::Error::wrap)?;
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(candle_core::Error::wrap)?;
+    pipelines
+        .lock()
+        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
+        .insert(key, pipeline.clone());
+    Ok(pipeline)
+}
+
+const KV_WRITE_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+template <typename E>
+kernel void izwi_kv_write_rows(
+    device E* destination [[buffer(0)]],
+    device const E* source [[buffer(1)]],
+    device const uint* slots [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& row_elements [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint row = gid / row_elements;
+    if (row >= rows) {
+        return;
+    }
+    const uint element = gid - row * row_elements;
+    destination[slots[row] * row_elements + element] = source[gid];
+}
+
+template [[host_name("izwi_kv_write_rows_b16")]] kernel void izwi_kv_write_rows<ushort>(
+    device ushort* destination [[buffer(0)]],
+    device const ushort* source [[buffer(1)]],
+    device const uint* slots [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& row_elements [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]);
+
+template [[host_name("izwi_kv_write_rows_b32")]] kernel void izwi_kv_write_rows<uint>(
+    device uint* destination [[buffer(0)]],
+    device const uint* source [[buffer(1)]],
+    device const uint* slots [[buffer(2)]],
+    constant uint& rows [[buffer(3)]],
+    constant uint& row_elements [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]);
+"#;
 
 const GQA_DECODE_SOURCE: &str = r#"
 #include <metal_stdlib>

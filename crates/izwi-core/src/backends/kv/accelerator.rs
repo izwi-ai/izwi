@@ -2422,8 +2422,36 @@ impl KvArena for CandleAcceleratorKvArena {
             } else {
                 args.values.to_dtype(self.storage_dtype)?
             };
-            scatter_rows(&flat_keys, &slots.device_indices, &stored_keys)?;
-            scatter_rows(&flat_values, &slots.device_indices, &stored_values)?;
+            #[cfg(feature = "metal")]
+            let fused_metal_write = self.backend == BackendKind::Metal;
+            #[cfg(not(feature = "metal"))]
+            let fused_metal_write = false;
+            if fused_metal_write {
+                #[cfg(feature = "metal")]
+                {
+                    // The fused kernel writes unchecked; scatter bounds-checked
+                    // nothing either, but keep the resident envelope explicit.
+                    if let Some(slot) = slots.flat_slots.iter().find(|slot| **slot >= flat_capacity)
+                    {
+                        return Err(Error::InferenceError(format!(
+                            "KV slot {slot} is outside the resident capacity {flat_capacity}"
+                        )));
+                    }
+                    crate::kernels::metal_paged_gqa::write_kv_rows(
+                        &flat_keys,
+                        &stored_keys,
+                        &slots.device_indices,
+                    )?;
+                    crate::kernels::metal_paged_gqa::write_kv_rows(
+                        &flat_values,
+                        &stored_values,
+                        &slots.device_indices,
+                    )?;
+                }
+            } else {
+                scatter_rows(&flat_keys, &slots.device_indices, &stored_keys)?;
+                scatter_rows(&flat_values, &slots.device_indices, &stored_values)?;
+            }
             let mut clean = self.clean_pages.lock().map_err(|_| {
                 Error::InferenceError("accelerator KV cleanliness was poisoned".into())
             })?;
