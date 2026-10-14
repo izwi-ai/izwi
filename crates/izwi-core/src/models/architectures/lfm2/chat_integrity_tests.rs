@@ -303,6 +303,31 @@ fn lfm2_prefill_quantum_rollback_restores_progress_and_can_retry() {
     assert_eq!(state.prefill_progress(), 1);
 }
 
+#[test]
+fn lfm2_repetition_loop_finishes_with_its_text_instead_of_failing() {
+    let model = tiny_lfm_model();
+    let mut state = model
+        .begin_resumable_prefill_state_managed(
+            &[3],
+            1024,
+            &ChatGenerationConfig::default(),
+            cache(),
+        )
+        .unwrap();
+    let mut last = None;
+    for step in 0..1024 {
+        let result = select(&model, &mut state, 3 + step % 2).expect("a loop is not an error");
+        if result.finished {
+            last = Some(result);
+            break;
+        }
+    }
+    let last = last.expect("the loop guard stops the reply");
+    assert_eq!(state.stop_reason(), Some("repetition"));
+    assert!(last.tokens_generated >= 256 && last.tokens_generated < 1024);
+    assert!(last.text.starts_with("abab"), "{}", last.text);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]

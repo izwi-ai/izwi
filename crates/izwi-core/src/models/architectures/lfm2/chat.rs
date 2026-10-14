@@ -1231,7 +1231,7 @@ fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
 }
 
 fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<()> {
-    if text.trim().is_empty() || reason == "repetition" {
+    if text.trim().is_empty() {
         return Err(Error::InferenceError(format!(
             "LFM2 generation did not produce a valid answer: stop_reason={reason}, generated_tokens={generated}, raw_chars={}", text.chars().count()
         )));
@@ -1285,32 +1285,30 @@ fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
     }
 }
 
-fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
-    if span == 0 || repeats < 2 || ids.len() < span * repeats {
-        return false;
-    }
-    let tail_start = ids.len() - span;
-    let tail = &ids[tail_start..];
-    (2..=repeats).all(|rep| {
-        let start = ids.len() - (span * rep);
-        &ids[start..start + span] == tail
-    })
-}
+/// Tokens of exactly periodic output that count as a degenerate loop.
+///
+/// The guard exists because a looping reply (most often a reasoning model's
+/// `<think>` block) would otherwise run to `max_tokens`, which defaults to the
+/// remaining context. It must never cut legitimate repetitive output short,
+/// so it fires only when the whole recent window repeats one short span.
+const REPETITION_WINDOW: usize = 256;
+/// Longest repeating span the guard looks for.
+const REPETITION_MAX_PERIOD: usize = 64;
+const REPETITION_CHECK_INTERVAL: usize = 16;
 
 fn should_check_repetition_loop(len: usize) -> bool {
-    len >= 48 && len.is_multiple_of(4)
+    len >= REPETITION_WINDOW && len.is_multiple_of(REPETITION_CHECK_INTERVAL)
 }
 
+/// True when the last [`REPETITION_WINDOW`] ids repeat with a period of at
+/// most [`REPETITION_MAX_PERIOD`].
 fn has_token_repetition_loop(ids: &[u32]) -> bool {
-    // Catch common degenerate loops from greedy decode where the same token span
-    // is emitted repeatedly (frequent in tiny reasoning models).
-    if ids.len() < 48 {
+    if ids.len() < REPETITION_WINDOW {
         return false;
     }
-    const PATTERNS: &[(usize, usize)] = &[(24, 3), (16, 3), (12, 3), (8, 4), (6, 5)];
-    PATTERNS
-        .iter()
-        .any(|(span, repeats)| has_suffix_repeat(ids, *span, *repeats))
+    let window = &ids[ids.len() - REPETITION_WINDOW..];
+    (1..=REPETITION_MAX_PERIOD)
+        .any(|period| (period..window.len()).all(|i| window[i] == window[i - period]))
 }
 
 #[cfg(test)]
@@ -1359,28 +1357,40 @@ mod tests {
     }
 
     #[test]
-    fn detects_token_repetition_loop() {
-        let mut ids = Vec::new();
-        let phrase = [1, 2, 3, 4, 5, 6, 7, 8];
-        for _ in 0..5 {
+    fn detects_a_window_of_periodic_output() {
+        let phrase: Vec<u32> = (1..=40).collect();
+        let mut ids = vec![42; 16];
+        while ids.len() < 16 + 256 {
             ids.extend(phrase.iter().copied());
         }
-        ids.splice(0..0, vec![42; 16]);
         assert!(has_token_repetition_loop(&ids));
     }
 
     #[test]
-    fn does_not_flag_short_sequences_as_loop() {
-        let ids: Vec<u32> = (1..30).collect();
+    fn legitimate_repetitive_lists_are_not_loops() {
+        // "list 40 zeros": a period-2 run of 80 tokens after a preamble.
+        let mut ids: Vec<u32> = (100..300).collect();
+        for _ in 0..40 {
+            ids.extend([7_u32, 8]);
+        }
         assert!(!has_token_repetition_loop(&ids));
+        // A table whose rows share a 6-token separator but differ in content.
+        let mut table = Vec::new();
+        for row in 0..60_u32 {
+            table.extend([1, 2, 3, 1000 + row, 4, 5]);
+        }
+        assert!(!has_token_repetition_loop(&table));
+        // A period longer than the guard looks for.
+        let long: Vec<u32> = (0..300).map(|i| i % 65).collect();
+        assert!(!has_token_repetition_loop(&long));
     }
 
     #[test]
     fn repetition_loop_check_interval_skips_between_boundaries() {
-        assert!(!should_check_repetition_loop(47));
-        assert!(should_check_repetition_loop(48));
-        assert!(!should_check_repetition_loop(49));
-        assert!(should_check_repetition_loop(52));
+        assert!(!should_check_repetition_loop(255));
+        assert!(should_check_repetition_loop(256));
+        assert!(!should_check_repetition_loop(257));
+        assert!(should_check_repetition_loop(272));
     }
 
     #[test]
