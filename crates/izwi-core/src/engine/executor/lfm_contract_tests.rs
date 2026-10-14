@@ -222,3 +222,38 @@ fn lfm_chat_prompt_carries_request_tools_in_its_system_turn() {
     let starts = |ids: &[u32]| ids.iter().filter(|id| **id == 1).count();
     assert_eq!(starts(&with_tools), starts(&plain) + 1);
 }
+
+#[test]
+fn sealed_lfm_chat_prefill_is_bounded_and_priced_per_token() {
+    let variant = ModelVariant::Lfm2512BInstructGguf;
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    draft.seal_chat_workspace(8192).unwrap();
+    let prefill_of = |draft: &LoadedModelBundleDraft| {
+        draft
+            .execution_contracts(CapabilityKind::Chat)
+            .unwrap()
+            .into_iter()
+            .flat_map(|contract| contract.stages.to_vec())
+            .find(|stage| stage.selector == crate::engine::StageWorkSelector::SequencePrefill)
+            .expect("chat prefill stage")
+    };
+    // Unsealed: the adapter's prefill stays unbounded and unpriced.
+    let unsealed = prefill_of(&draft);
+    assert_eq!(unsealed.max_work_units, u64::MAX);
+    assert_eq!(unsealed.workspace_per_work_unit_bytes, 0);
+
+    draft.seal_chat_prefill_workspace(147_456, 1_024).unwrap();
+    draft.seal_chat_prefill_workspace(147_456, 1_024).unwrap();
+    assert!(draft.seal_chat_prefill_workspace(147_456, 512).is_err());
+    let sealed = prefill_of(&draft);
+    assert_eq!(sealed.max_work_units, 1_024);
+    assert_eq!(sealed.workspace_per_work_unit_bytes, 147_456);
+    assert_eq!(sealed.max_workspace_bytes, 147_456 * 1_024);
+}

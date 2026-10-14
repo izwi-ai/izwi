@@ -302,6 +302,13 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
     }
     let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
     assert_eq!(model.max_context_tokens().unwrap(), 32_768, "{key}: model-card context");
+    // Workspace pricing on the real geometry: 6 x 2048 + 3 x 8192 F32 per
+    // prefill token; a decode row adds the 65,536-entry logits row.
+    assert_eq!(model.prefill_workspace_per_token_bytes().unwrap(), 147_456);
+    assert_eq!(
+        model.continuous_decode_batch_workspace_per_row_bytes().unwrap(),
+        147_456 + 65_536 * 4
+    );
     for (name, case) in &model_fixture.template_cases {
         let ids = model
             .prompt_token_ids_with_tools(&messages(&case.messages), &case.tools)

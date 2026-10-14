@@ -416,11 +416,43 @@ impl Lfm2ChatModel {
         true
     }
 
+    /// One decode row's live F32 activations: the token's per-layer
+    /// activations plus its full-vocabulary logits row.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.config.embedding_length)
-            .ok()
-            .and_then(|hidden| hidden.checked_mul(4))
-            .ok_or_else(|| Error::InvalidInput("LFM2 decode workspace overflow".into()))
+        let vocab = u64::try_from(self.text_model.vocab_size())
+            .map_err(|_| Error::InvalidInput("LFM2 vocabulary exceeds u64".into()))?;
+        self.prefill_workspace_per_token_bytes()?
+            .checked_add(vocab.checked_mul(4).ok_or_else(workspace_overflow)?)
+            .ok_or_else(workspace_overflow)
+    }
+
+    /// Live F32 activations of one prefill token in the widest block: the
+    /// residual, its norm and the mixer output (3 x hidden), the ShortConv
+    /// in-projection (3 x hidden), and the MLP gate, up and gated product
+    /// (3 x ffn). Attention scratch is the KV arena's own workspace.
+    pub(crate) fn prefill_workspace_per_token_bytes(&self) -> Result<u64> {
+        let hidden = self.config.embedding_length as u64;
+        let ffn = self
+            .config
+            .feed_forward_length
+            .unwrap_or(self.config.embedding_length * 4) as u64;
+        hidden
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(ffn.checked_mul(3)?))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(workspace_overflow)
+    }
+
+    /// Prefill span: long prompts run in spans of this many tokens on every
+    /// backend, bounding activation memory (a 32K prompt in one pass held
+    /// ~4.6 GB), and an isolated request uses the whole span rather than the
+    /// engine's 192-token chunk. CPU spans are shorter because CPU prefill is
+    /// matrix-vector bound and long spans only add latency spikes.
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        match self.device_kind() {
+            BackendKind::Cpu => 512,
+            BackendKind::Metal | BackendKind::Cuda => 1024,
+        }
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -934,6 +966,10 @@ pub(crate) fn lfm2_chat_load_layout(
         rope_table: super::backbone::rope_table_geometry(&config)?,
         gguf,
     })
+}
+
+fn workspace_overflow() -> Error {
+    Error::InvalidInput("LFM2 workspace estimate overflow".into())
 }
 
 /// Context the LFM2.5-1.2B chat checkpoints support.

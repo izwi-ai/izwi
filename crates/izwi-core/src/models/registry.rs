@@ -3790,7 +3790,21 @@ impl NativeChatModel {
             Self::Qwen35(model) => model.preferred_prefill_tokens(),
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
             Self::Qwen38(model) => model.preferred_prefill_tokens(),
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
+            Self::Lfm2(model) => model.preferred_prefill_tokens(),
+            Self::Qwen3(_) | Self::Gemma3(_) => 0,
+        }
+    }
+
+    /// `(per_token_bytes, max_span_tokens)` for a model that bounds and
+    /// prices its prefill activations; `None` keeps the chat adapter's
+    /// unbounded, unpriced prefill stage.
+    pub fn prefill_workspace(&self) -> Result<Option<(u64, u64)>> {
+        match self {
+            Self::Lfm2(model) => Ok(Some((
+                model.prefill_workspace_per_token_bytes()?,
+                model.preferred_prefill_tokens() as u64,
+            ))),
+            _ => Ok(None),
         }
     }
 
