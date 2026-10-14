@@ -3780,8 +3780,8 @@ impl Qwen3TtsModel {
             }
         }
         if force && *emitted_frames == 0 {
-            // Nothing streamed: one whole-utterance decode, normalized as the
-            // non-streaming output always has been.
+            // Nothing streamed: one whole-utterance decode, finished exactly
+            // as streamed audio is.
             self.fill_raw_codec_scratch(codec_groups, total_frames, decode_raw_token_scratch)?;
             let decoded = self.decode_raw_codec_tokens(decode_raw_token_scratch)?;
             *emitted_frames = total_frames;
@@ -3794,8 +3794,8 @@ impl Qwen3TtsModel {
         // Streaming (QTTS-5): the decoder is causal, so each emission decodes
         // only its new frames against bounded contexts and returns exactly
         // the whole decode's samples for them: no prefix re-decode, no
-        // lookahead, and no per-chunk normalization (the reference streams
-        // the raw clamped waveform).
+        // lookahead, and no loudness normalization on either path (the
+        // reference streams the raw clamped waveform).
         if codec_stream.is_none() && *emitted_frames != 0 {
             return Err(Error::InferenceError(
                 "Qwen3-TTS codec stream state is missing after emitted audio".into(),
@@ -3808,9 +3808,10 @@ impl Qwen3TtsModel {
             total_frames,
             decode_raw_token_scratch,
         )?;
-        let samples = self
+        let mut samples = self
             .speech_tokenizer
             .decode_stream_step(stream, decode_raw_token_scratch)?;
+        finish_decoded_audio(&mut samples);
         record_qwen3_tts_codec_stream_frames(total_frames - *emitted_frames);
         *emitted_frames = total_frames;
         *emitted_samples += samples.len();
@@ -4043,7 +4044,7 @@ impl Qwen3TtsModel {
             return Ok(Vec::new());
         }
         let mut audio = self.speech_tokenizer.decode(raw_codec_tokens)?;
-        normalize_audio(&mut audio);
+        finish_decoded_audio(&mut audio);
         Ok(audio)
     }
 
@@ -4642,76 +4643,16 @@ impl SimpleRng {
     }
 }
 
-fn normalize_audio(samples: &mut [f32]) {
-    if samples.is_empty() {
-        return;
-    }
-
-    // Drop non-finite values and remove DC offset.
-    let mut sum = 0.0f64;
-    let mut count = 0usize;
-    for s in samples.iter_mut() {
-        if !s.is_finite() {
-            *s = 0.0;
-            continue;
-        }
-        sum += *s as f64;
-        count += 1;
-    }
-    if count > 0 {
-        let mean = (sum / count as f64) as f32;
-        for s in samples.iter_mut() {
-            *s -= mean;
-        }
-    }
-
-    // Peak normalize to avoid hard clipping in WAV encoder.
-    let mut peak = 0.0f32;
-    for &s in samples.iter() {
-        let a = s.abs();
-        if a > peak {
-            peak = a;
-        }
-    }
-    if peak > 0.95 {
-        let scale = 0.95 / peak;
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-    }
-
-    // Keep output loudness within a practical band for WAV playback.
-    let mut power = 0.0f64;
-    for &s in samples.iter() {
-        power += (s as f64) * (s as f64);
-    }
-    let rms = (power / samples.len() as f64).sqrt() as f32;
-    let max_rms = 0.12f32;
-    let min_rms = 0.04f32;
-    if rms > max_rms && rms > 1e-6 {
-        let scale = max_rms / rms;
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-    } else if rms < min_rms && rms > 1e-6 {
-        let scale = (min_rms / rms).min(8.0);
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-
-        // Re-apply peak guard after boosting.
-        let mut peak = 0.0f32;
-        for &s in samples.iter() {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-        if peak > 0.95 {
-            let scale = 0.95 / peak;
-            for s in samples.iter_mut() {
-                *s *= scale;
-            }
+/// The treatment every decoded sample gets, streamed or not: the codec has
+/// already clamped it to [-1, 1], and a non-finite sample is silenced. No
+/// whole-utterance gain is applied to either path (a stream cannot know the
+/// utterance's peak or loudness before it ends, and the reference returns
+/// the raw clamped waveform), so a stream concatenates to exactly the
+/// non-stream output.
+fn finish_decoded_audio(samples: &mut [f32]) {
+    for sample in samples.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
         }
     }
 }
@@ -6255,6 +6196,35 @@ pub(crate) mod tests {
             sample_semantic(&logits, 4, 99, false, &params, &[0], &mut rng, true).unwrap(),
             1
         );
+    }
+
+    /// Streamed and non-stream audio get the same per-sample treatment, so
+    /// a stream concatenates to the non-stream output: a quiet utterance is
+    /// neither boosted nor DC-shifted as a whole, and only non-finite
+    /// samples change.
+    #[test]
+    fn decoded_audio_is_finished_the_same_streamed_or_whole() {
+        let utterance = (0..960)
+            .map(|index| 0.01 + 0.02 * (index as f32 * 0.05).sin())
+            .collect::<Vec<_>>();
+        let mut decoded = utterance.clone();
+        decoded[7] = f32::NAN;
+        decoded[500] = f32::INFINITY;
+
+        let mut whole = decoded.clone();
+        finish_decoded_audio(&mut whole);
+        let mut streamed = Vec::new();
+        for chunk in decoded.chunks(320) {
+            let mut chunk = chunk.to_vec();
+            finish_decoded_audio(&mut chunk);
+            streamed.extend(chunk);
+        }
+        assert_eq!(streamed, whole);
+
+        let mut expected = utterance;
+        expected[7] = 0.0;
+        expected[500] = 0.0;
+        assert_eq!(whole, expected);
     }
 
     #[test]
