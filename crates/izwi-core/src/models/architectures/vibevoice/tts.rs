@@ -1580,49 +1580,13 @@ impl VibeVoiceTtsModel {
         plan: &VibeVoiceDiffusionPlan,
         noise: &Tensor,
     ) -> Result<Tensor> {
-        let condition = self.prediction_head.condition_projection(condition)?;
-        let negative_condition = if plan.cfg_tensor.is_some() {
-            negative_condition
-                .map(|condition| self.prediction_head.condition_projection(condition))
-                .transpose()?
-        } else {
-            None
-        };
-        let mut speech = noise.clone();
-        let mut solver = DpmSolverState::default();
-        for step in &plan.steps {
-            let model_output = if let (Some(negative), Some(cfg)) =
-                (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
-            {
-                let conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
-                let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
-                let timestep = Tensor::cat(
-                    &[
-                        step.timestep_embedding.clone(),
-                        step.timestep_embedding.clone(),
-                    ],
-                    0,
-                )?;
-                let outputs = self.prediction_head.forward_with_precomputed(
-                    &latents,
-                    &timestep,
-                    &conditions,
-                )?;
-                let positive = outputs.narrow(0, 0, 1)?;
-                let negative = outputs.narrow(0, 1, 1)?;
-                negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
-            } else {
-                self.prediction_head.forward_with_precomputed(
-                    &speech,
-                    &step.timestep_embedding,
-                    &condition,
-                )?
-            };
-            speech = plan
-                .scheduler
-                .step(&model_output, &speech, &step.tensors, &mut solver)?;
-        }
-        Ok(speech)
+        sample_latent_from_noise(
+            &self.prediction_head,
+            condition,
+            negative_condition,
+            plan,
+            noise,
+        )
     }
 
     fn sample_speech_latent_cross_request_batch(
@@ -1888,6 +1852,58 @@ const STATE_PROMPT_TOKENS: usize = 512;
 /// refuses the load; live memory caps only growth above it.
 pub(crate) fn vibevoice_tts_state_floor_tokens() -> usize {
     STATE_PROMPT_TOKENS + AUTO_MAX_OUTPUT_FRAMES
+}
+
+/// One speech latent from `noise`, conditioned on the LM's last hidden
+/// state (and the negative one under CFG), through `plan`'s DPM-Solver++
+/// steps.
+fn sample_latent_from_noise(
+    prediction_head: &VibeVoiceDiffusionHead,
+    condition: &Tensor,
+    negative_condition: Option<&Tensor>,
+    plan: &VibeVoiceDiffusionPlan,
+    noise: &Tensor,
+) -> Result<Tensor> {
+    let condition = prediction_head.condition_projection(condition)?;
+    let negative_condition = if plan.cfg_tensor.is_some() {
+        negative_condition
+            .map(|condition| prediction_head.condition_projection(condition))
+            .transpose()?
+    } else {
+        None
+    };
+    let mut speech = noise.clone();
+    let mut solver = DpmSolverState::default();
+    for step in &plan.steps {
+        let model_output = if let (Some(negative), Some(cfg)) =
+            (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
+        {
+            let conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
+            let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+            let timestep = Tensor::cat(
+                &[
+                    step.timestep_embedding.clone(),
+                    step.timestep_embedding.clone(),
+                ],
+                0,
+            )?;
+            let outputs =
+                prediction_head.forward_with_precomputed(&latents, &timestep, &conditions)?;
+            let positive = outputs.narrow(0, 0, 1)?;
+            let negative = outputs.narrow(0, 1, 1)?;
+            negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
+        } else {
+            prediction_head.forward_with_precomputed(
+                &speech,
+                &step.timestep_embedding,
+                &condition,
+            )?
+        };
+        speech = plan
+            .scheduler
+            .step(&model_output, &speech, &step.tensors, &mut solver)?;
+    }
+    Ok(speech)
 }
 
 fn vibevoice_diffusion_plan(
@@ -3027,5 +3043,61 @@ mod tests {
             name.to_string(),
             Tensor::from_vec(values, (rows, cols), device).unwrap(),
         );
+    }
+
+    /// Speech latents on Metal, where the TTS runs in F16, match an F32 CPU
+    /// reference on the checkpoint: one 10-step CFG 1.3 DPM-Solver++
+    /// trajectory from the same noise and conditions. The final layer's F16
+    /// norm overflowed (its input reaches about 480), which left every Metal
+    /// latent about 95% off (relative L2) and the speech unrelated to the
+    /// text.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires VibeVoice-1.5B weights (IZWI_VIBEVOICE_MODEL_DIR) and Metal"]
+    fn metal_f16_latent_sampling_matches_f32_on_the_checkpoint() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+
+        let dir = PathBuf::from(std::env::var("IZWI_VIBEVOICE_MODEL_DIR").unwrap());
+        let config = VibeVoiceConfig::load(&dir).unwrap();
+        let head_config = config.diffusion_head_config.clone().unwrap();
+        let files = safetensors_weight_files(&dir).unwrap();
+        let sample = |device: &Device, kind: DeviceKind, dtype: DType| {
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device) }.unwrap();
+            let head =
+                VibeVoiceDiffusionHead::load(head_config.clone(), vb.pp("model.prediction_head"))
+                    .unwrap();
+            let plan = vibevoice_diffusion_plan(
+                &head,
+                VibeVoiceDiffusionScheduler::new(head_config.ddpm_num_steps, 10),
+                device,
+                dtype,
+                VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
+                kind,
+            )
+            .unwrap();
+            let input = |seed, width, scale| {
+                xorshift_tensor(&[1, width], seed, scale, &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .to_device(device)
+                    .unwrap()
+            };
+            let condition = input(7, head_config.hidden_size, 3.0);
+            let negative = input(9, head_config.hidden_size, 3.0);
+            let noise = input(8, head_config.latent_size, 1.7);
+            let latent =
+                sample_latent_from_noise(&head, &condition, Some(&negative), &plan, &noise)
+                    .unwrap();
+            host_f32(&latent).unwrap()
+        };
+        let reference = sample(&Device::Cpu, DeviceKind::Cpu, DType::F32);
+        let metal = sample(
+            &Device::new_metal(0).unwrap(),
+            DeviceKind::Metal,
+            DType::F16,
+        );
+        let relative = relative_l2(&metal, &reference);
+        assert!(relative < 1e-2, "Metal F16 latent relative L2 {relative}");
     }
 }

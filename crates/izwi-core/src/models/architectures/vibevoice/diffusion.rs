@@ -289,6 +289,12 @@ fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
     scaled.broadcast_add(shift).map_err(Error::from)
 }
 
+/// The final layer's `RMSNorm(elementwise_affine=False)`. The reference
+/// normalizes `x.float()` and casts back (`_norm(x.float()).type_as(x)`),
+/// and so does this: the final layer's input reaches about 480 on the
+/// VibeVoice-1.5B checkpoint, so `x²` in F16 overflowed to infinity and
+/// zeroed the normalized row, which made every F16 (Metal) speech latent
+/// wrong.
 fn rms_norm_no_affine(x: &Tensor, eps: f64, unit_weight: &Tensor) -> Result<Tensor> {
     if x.device().is_cuda() {
         let unit_weight = unit_weight.to_device(x.device())?.to_dtype(x.dtype())?;
@@ -296,11 +302,12 @@ fn rms_norm_no_affine(x: &Tensor, eps: f64, unit_weight: &Tensor) -> Result<Tens
             return Ok(output);
         }
     }
-    let squared = x.sqr()?;
-    let mean = squared.mean_keepdim(D::Minus1)?;
-    let eps = Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?;
-    let denom = mean.broadcast_add(&eps)?.sqrt()?.recip()?;
-    x.broadcast_mul(&denom).map_err(Error::from)
+    let dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let denom = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?.recip()?;
+    x.broadcast_mul(&denom)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
 }
 
 fn classifier_free_guidance(
@@ -754,6 +761,27 @@ mod tests {
             &Tensor::from_vec(vec![0.84852815f32, 1.1313709], (1, 2), &device).unwrap(),
             1e-2,
         );
+    }
+
+    /// The final-layer norm keeps its statistics in F32: an F16 row whose
+    /// squares overflow F16 (|x| about 480, as the checkpoint's final-layer
+    /// input) normalizes like the F32 row instead of collapsing.
+    #[test]
+    fn rms_norm_no_affine_does_not_overflow_in_f16() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+        let device = Device::Cpu;
+        let x = xorshift_tensor(&[2, 64], 11, 480.0, &device).unwrap();
+        let f32_out =
+            rms_norm_no_affine(&x, 1e-5, &Tensor::ones(64, DType::F32, &device).unwrap()).unwrap();
+        let f16_out = rms_norm_no_affine(
+            &x.to_dtype(DType::F16).unwrap(),
+            1e-5,
+            &Tensor::ones(64, DType::F16, &device).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(f16_out.dtype(), DType::F16);
+        let relative = relative_l2(&host_f32(&f16_out).unwrap(), &host_f32(&f32_out).unwrap());
+        assert!(relative < 1e-3, "relative L2 {relative}");
     }
 
     fn tiny_diffusion_head(device: &Device) -> VibeVoiceDiffusionHead {
