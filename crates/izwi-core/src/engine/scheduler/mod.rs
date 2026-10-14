@@ -27,6 +27,9 @@ use crate::model::ModelVariant;
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL: usize = 8;
 pub(super) const MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE: usize = 8;
+/// Least common multiple of the workload weights: one class service unit is
+/// worth `CLASS_VIRTUAL_TIME_UNITS / weight` units of weighted virtual time.
+const CLASS_VIRTUAL_TIME_UNITS: u64 = 120;
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -387,6 +390,10 @@ pub struct Scheduler {
     telemetry: SchedulerTelemetry,
     /// Completed scheduling quanta by workload class for weighted service.
     class_service: HashMap<WorkloadClass, u64>,
+    /// Classes that held waiting or running work at the last schedule.
+    active_service_classes: HashSet<WorkloadClass>,
+    /// Weighted virtual time reached by every active class; never decreases.
+    class_virtual_floor: u64,
     tenant_service: HashMap<TenantServiceKey, TenantService>,
     tenant_service_floor: HashMap<WorkloadClass, u64>,
     /// Decode-only transactions observed while an indivisible full prefill was
@@ -654,6 +661,8 @@ impl Scheduler {
             next_realtime_service_clock: 1,
             telemetry,
             class_service: HashMap::new(),
+            active_service_classes: HashSet::new(),
+            class_virtual_floor: 0,
             tenant_service: HashMap::new(),
             tenant_service_floor: HashMap::new(),
             decode_only_steps_with_waiting_full_prefill: 0,
@@ -1042,6 +1051,7 @@ impl Scheduler {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
         self.refresh_tenant_service();
+        self.refresh_class_service();
         let scheduling_now = Instant::now();
         let mut remaining_batch = self.config.max_batch_size;
         self.refresh_queue_age_sample();
@@ -3083,6 +3093,54 @@ impl Scheduler {
         weighted_a
             .cmp(&weighted_b)
             .then_with(|| Self::workload_order(a).cmp(&Self::workload_order(b)))
+    }
+
+    fn class_virtual_time(&self, workload_class: WorkloadClass) -> u64 {
+        self.class_service
+            .get(&workload_class)
+            .copied()
+            .unwrap_or_default()
+            .saturating_mul(CLASS_VIRTUAL_TIME_UNITS / Self::workload_weight(workload_class))
+    }
+
+    /// Start-time fair queuing across workload classes. Class service only
+    /// grows, so a class returning from idle would otherwise win every
+    /// comparison until its total caught up with long-served classes. A class
+    /// that becomes active instead starts at the weighted virtual time the
+    /// active classes have already reached. An idle realtime session holds no
+    /// work and does not keep its class active. The floor is read before this
+    /// step charges any service, so refunding unexecuted quanta returns a
+    /// class to a total that is still at or above it.
+    fn refresh_class_service(&mut self) {
+        if self.config.policy != SchedulingPolicy::WeightedFair {
+            return;
+        }
+        let active = self
+            .requests
+            .iter()
+            .filter(|(request_id, _)| {
+                self.realtime_sessions
+                    .get(*request_id)
+                    .is_none_or(|state| state.in_flight.is_some() || !state.pending.is_empty())
+            })
+            .map(|(_, metadata)| metadata.workload_class)
+            .collect::<HashSet<_>>();
+        for workload_class in &active {
+            if !self.active_service_classes.contains(workload_class) {
+                let floor = self.class_virtual_floor
+                    / (CLASS_VIRTUAL_TIME_UNITS / Self::workload_weight(*workload_class));
+                let service = self.class_service.entry(*workload_class).or_default();
+                *service = (*service).max(floor);
+            }
+        }
+        if let Some(reached) = active
+            .iter()
+            .map(|workload_class| self.class_virtual_time(*workload_class))
+            .min()
+        {
+            self.class_virtual_floor = self.class_virtual_floor.max(reached);
+        }
+        self.active_service_classes = active;
     }
 
     fn workload_weight(workload_class: WorkloadClass) -> u64 {
@@ -6089,6 +6147,49 @@ mod tests {
         }
 
         assert!(selected.iter().any(|id| id == "background"));
+    }
+
+    #[test]
+    fn newly_active_class_starts_at_the_served_classes_virtual_time() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 8,
+            policy: SchedulingPolicy::WeightedFair,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut interactive = build_request(TaskType::Chat, "interactive", Priority::Normal);
+        interactive.workload_class = WorkloadClass::Interactive;
+        interactive.params.max_tokens = 1_000;
+        scheduler.add_request(&interactive);
+        assert_eq!(scheduler.schedule().prefill_requests.len(), 1);
+        scheduler.update_after_step(&interactive.id, 1, 0, 1.0);
+        // An hour of interactive traffic.
+        scheduler
+            .class_service
+            .insert(WorkloadClass::Interactive, 6_000_000);
+        assert_eq!(scheduler.schedule().decode_requests.len(), 1);
+
+        let mut background = build_request(TaskType::Chat, "background", Priority::Normal);
+        background.workload_class = WorkloadClass::Background;
+        background.params.max_tokens = 1_000;
+        scheduler.add_request(&background);
+        let admitted = scheduler.schedule();
+        assert_eq!(admitted.prefill_requests[0].request_id, background.id);
+        scheduler.update_after_step(&background.id, 1, 0, 1.0);
+
+        let mut served = HashMap::<RequestId, usize>::new();
+        for _ in 0..14 {
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 1);
+            *served
+                .entry(step.decode_requests[0].request_id.clone())
+                .or_default() += 1;
+        }
+        // Weights 6:1 share the slot; history accrued while background was
+        // idle buys it nothing.
+        assert!(served.get(&background.id).copied().unwrap_or(0) >= 1);
+        assert!(served.get(&interactive.id).copied().unwrap_or(0) >= 11);
     }
 
     #[test]
