@@ -4868,8 +4868,22 @@ fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<
         position_ids.push(position as i64);
     }
 
-    let positions = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
-    let token_logits = logits.i(0)?.index_select(&positions, 0)?;
+    let position_index = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
+    let token_logits = logits.i(0)?.index_select(&position_index, 0)?;
+    // A NaN row argmaxes to class 0, which would read as a fabricated 0 ms
+    // timestamp; a device fault must surface as an error instead.
+    let rows = token_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    if let Some(row) = rows
+        .iter()
+        .position(|row| row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(Error::InferenceError(format!(
+            "Forced aligner produced non-finite timestamp logits at prompt position {} \
+             (timestamp {row} of {})",
+            positions[row],
+            positions.len()
+        )));
+    }
     let indices = token_logits.argmax(D::Minus1)?.to_dtype(DType::U32)?;
     indices.to_vec1::<u32>().map_err(Error::from)
 }
@@ -6539,9 +6553,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
-    fn forced_aligner_local_checkpoint_loads_and_aligns() {
-        let models_root = std::env::var("IZWI_MODELS_DIR")
+    fn batched_timestamp_argmax_rejects_non_finite_logits() {
+        let device = candle_core::Device::Cpu;
+        for poison in [f32::NAN, f32::INFINITY] {
+            let mut values = vec![0.1f32; 12];
+            values[2] = 0.9;
+            values[5] = poison;
+            let logits = Tensor::from_vec(values, (1, 3, 4), &device).expect("logits");
+
+            let err = batched_timestamp_argmax(&logits, &[0, 1, 2])
+                .expect_err("a non-finite timestamp row must not become class 0");
+            assert!(format!("{err}").contains("non-finite"), "{err}");
+            // Rows that are not timestamp positions are not inspected.
+            assert_eq!(
+                batched_timestamp_argmax(&logits, &[0, 2]).expect("finite rows"),
+                vec![2, 0]
+            );
+        }
+    }
+
+    fn local_models_root() -> PathBuf {
+        std::env::var("IZWI_MODELS_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
@@ -6550,8 +6582,13 @@ mod tests {
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join("izwi")
                     .join("models")
-            });
-        let model_dir = models_root.join("Qwen3-ForcedAligner-0.6B");
+            })
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
+    fn forced_aligner_local_checkpoint_loads_and_aligns() {
+        let model_dir = local_models_root().join("Qwen3-ForcedAligner-0.6B");
         if !model_dir.join("model.safetensors").exists() {
             eprintln!(
                 "Skipping forced aligner local checkpoint test, model not found at {}",
@@ -6571,6 +6608,73 @@ mod tests {
             !alignment.is_empty(),
             "forced aligner should return timestamps"
         );
+    }
+
+    /// fox.wav gives a 77-token prompt (77 % 32 = 13), which hit Candle's
+    /// causal Metal SDPA over-read in the dense text model; the 4-bit audio
+    /// tower's OHWI conv kernels hit the strided-kernel conv bug. Metal must
+    /// match CPU per word boundary and must not fall back to uniform spacing.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires local Qwen3-ForcedAligner checkpoints and a Metal device (~5 GB)"]
+    fn forced_aligner_metal_matches_cpu() {
+        const MAX_BOUNDARY_DRIFT_MS: u32 = 80;
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let bytes = std::fs::read(data.join("fox.wav")).expect("fox.wav");
+        let (audio, sample_rate) =
+            crate::audio::decode_audio_bytes_to_mono(&bytes).expect("decode fox.wav");
+        let text = std::fs::read_to_string(data.join("fox.md")).expect("fox.md");
+        let text = text.trim();
+        let duration_ms = ((audio.len() as f64 / f64::from(sample_rate)) * 1000.0).round() as u32;
+        let mut uniform =
+            distribute_words_over_interval(&extract_alignment_words(text), 0, duration_ms.max(1));
+        normalize_alignment_bounds(&mut uniform, duration_ms);
+
+        for (dir_name, variant) in [
+            (
+                "Qwen3-ForcedAligner-0.6B",
+                ModelVariant::Qwen3ForcedAligner06B,
+            ),
+            (
+                "Qwen3-ForcedAligner-0.6B-4bit",
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+            ),
+        ] {
+            let model_dir = local_models_root().join(dir_name);
+            if !model_dir.join("model.safetensors").exists() {
+                eprintln!("Skipping {dir_name}: not found at {}", model_dir.display());
+                continue;
+            }
+            // One model resident at a time.
+            let align_on = |device: &str| {
+                let device = DeviceSelector::detect_with_preference(Some(device)).expect(device);
+                let model = Qwen3AsrModel::load(&model_dir, variant, device).expect("load");
+                model
+                    .force_align(&audio, sample_rate, text, None)
+                    .expect("force_align")
+            };
+            let cpu = align_on("cpu");
+            let metal = align_on("metal");
+            eprintln!("{dir_name} cpu:   {cpu:?}\n{dir_name} metal: {metal:?}");
+
+            assert_ne!(cpu, uniform, "{dir_name}: CPU fell back to uniform spacing");
+            assert_ne!(
+                metal, uniform,
+                "{dir_name}: Metal fell back to uniform spacing"
+            );
+            assert_eq!(cpu.len(), metal.len(), "{dir_name}: word count");
+            for (c, m) in cpu.iter().zip(&metal) {
+                assert_eq!(c.0, m.0, "{dir_name}: word order");
+                let drift = c.1.abs_diff(m.1).max(c.2.abs_diff(m.2));
+                assert!(
+                    drift <= MAX_BOUNDARY_DRIFT_MS,
+                    "{dir_name}: '{}' Metal {:?} vs CPU {:?}",
+                    c.0,
+                    (m.1, m.2),
+                    (c.1, c.2)
+                );
+            }
+        }
     }
 }
 
