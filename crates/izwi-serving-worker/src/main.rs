@@ -313,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         attempt_retention: process.attempt_retention,
         event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
         max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
+        slow_consumer_timeout: izwi_core::stream_slow_consumer_timeout(),
         realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
     };
     let result = match process.task {

@@ -222,6 +222,7 @@ fn realtime_config(limits: RuntimeRealtimeSessionLimits) -> WorkerConfig {
         max_retained_attempts: 4,
         attempt_retention: Duration::from_secs(300),
         event_channel_capacity: 4,
+        slow_consumer_timeout: izwi_serving_worker::DEFAULT_SLOW_CONSUMER_TIMEOUT,
         max_event_bytes: 4096,
         realtime_session_limits: limits,
     }

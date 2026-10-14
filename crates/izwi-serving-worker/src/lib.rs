@@ -44,6 +44,7 @@ pub const DEFAULT_MAX_RETAINED_ATTEMPTS: usize = 1024;
 pub const DEFAULT_ATTEMPT_RETENTION: Duration = Duration::from_secs(300);
 pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 4;
 pub const DEFAULT_MAX_EVENT_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_SLOW_CONSUMER_TIMEOUT: Duration = izwi_core::DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT;
 pub const WORKER_METRICS_PATH: &str = "/internal/v1/metrics/prometheus";
 const EVENT_ENVELOPE_ALLOWANCE: usize = 1024;
 const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 8192;
@@ -60,6 +61,10 @@ pub struct WorkerConfig {
     pub attempt_retention: Duration,
     pub event_channel_capacity: usize,
     pub max_event_bytes: usize,
+    /// How long a streaming reader may leave text unaccepted before the
+    /// invocation is cancelled. Until then a lagging reader's deltas are
+    /// coalesced, never dropped.
+    pub slow_consumer_timeout: Duration,
     /// Per-realtime-session transport bounds; always within the protocol's
     /// hard caps. Ignored by deployments that do not serve realtime.
     pub realtime_session_limits: RuntimeRealtimeSessionLimits,
@@ -169,6 +174,9 @@ impl WorkerConfig {
         if self.max_event_bytes < EVENT_ENVELOPE_ALLOWANCE * 2 {
             return Err(WorkerConfigError::EventLimit);
         }
+        if self.slow_consumer_timeout.is_zero() {
+            return Err(WorkerConfigError::SlowConsumerTimeout);
+        }
         Ok(())
     }
 }
@@ -193,6 +201,8 @@ pub enum WorkerConfigError {
     AttemptRetentionWindow,
     #[error("event channel capacity must hold accepted, delta, and terminal events")]
     EventChannelCapacity,
+    #[error("slow_consumer_timeout must be non-zero")]
+    SlowConsumerTimeout,
     #[error("max_event_bytes must be at least 2048")]
     EventLimit,
     #[error("realtime session limits must be non-zero and within the protocol caps")]
@@ -1635,6 +1645,8 @@ async fn run_invocation<E: InvocationExecutor>(
     let mut cancellation_requested = !accepted_delivered || *cancel.borrow();
     let mut cancellation_started_at = None;
     let mut terminal = None;
+    let mut outbox = TextOutbox::new(state.config.slow_consumer_timeout);
+    let mut consumer_stalled = false;
     if cancellation_requested {
         mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
         execution.request_cancel();
@@ -1642,7 +1654,10 @@ async fn run_invocation<E: InvocationExecutor>(
     }
 
     while terminal.is_none() && !cancellation_requested {
-        tokio::select! {
+        let stall_deadline = outbox.stall_deadline();
+        // Every arm yields the delivery result of any text it emitted; a
+        // failed delivery stops the invocation below.
+        let delivery = tokio::select! {
             biased;
             () = &mut deadline, if !timed_out => {
                 timed_out = true;
@@ -1654,6 +1669,7 @@ async fn run_invocation<E: InvocationExecutor>(
                     AttemptState::ExecutionStopping,
                     None,
                 );
+                EventSendResult::Sent
             }
             () = tx.closed(), if !cancellation_requested => {
                 cancellation_requested = true;
@@ -1664,6 +1680,7 @@ async fn run_invocation<E: InvocationExecutor>(
                     AttemptState::ExecutionStopping,
                     None,
                 );
+                EventSendResult::Sent
             }
             changed = cancel.changed(), if !cancellation_requested => {
                 if changed.is_ok() && *cancel.borrow() {
@@ -1676,6 +1693,19 @@ async fn run_invocation<E: InvocationExecutor>(
                         None,
                     );
                 }
+                EventSendResult::Sent
+            }
+            _ = async { tx.reserve().await.is_ok() }, if outbox.has_pending() => {
+                outbox.flush(&state, &request, &tx, &mut sequence)
+            }
+            () = async {
+                match stall_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if stall_deadline.is_some() => {
+                consumer_stalled = true;
+                EventSendResult::Unavailable
             }
             event = execution.next_event() => {
                 match event {
@@ -1698,42 +1728,9 @@ async fn run_invocation<E: InvocationExecutor>(
                             );
                             continue;
                         }
-                        let event = InvocationEvent {
-                            schema_version: PROTOCOL_V1,
-                            request_id: request.request_id.clone(),
-                            attempt_id: request.attempt_id.clone(),
-                            sequence,
-                            event: InvocationEventKind::TextDelta {
-                                text,
-                                logprobs: protocol_logprobs(&logprobs),
-                            },
-                        };
-                        match try_send_event(&state.config, &state.metrics, &tx, event) {
-                            EventSendResult::Sent => {
-                                state.update_attempt(
-                                    &request.attempt_id,
-                                    AttemptState::Running,
-                                    Some(sequence),
-                                );
-                                sequence = sequence.saturating_add(1);
-                            }
-                            EventSendResult::Oversized => {
-                                terminal = Some(TerminalEvent::Failed(ExecutionFailure {
-                                    code: InvocationErrorCode::OutputLimitExceeded,
-                                    message: "encoded output event exceeded the worker limit".into(),
-                                }));
-                                cancellation_requested = true;
-                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                execution.request_cancel();
-                            }
-                            EventSendResult::Unavailable => {
-                                cancellation_requested = true;
-                                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                execution.request_cancel();
-                            }
-                        }
+                        outbox.offer(&state, &request, &tx, &mut sequence, text, logprobs)
                     }
-                    Some(ExecutionEvent::TextDelta { .. }) => {}
+                    Some(ExecutionEvent::TextDelta { .. }) => EventSendResult::Sent,
                     Some(ExecutionEvent::Completed {
                         text,
                         finish_reason,
@@ -1741,6 +1738,7 @@ async fn run_invocation<E: InvocationExecutor>(
                         output_tokens,
                         cached_input_tokens,
                     }) => {
+                        let mut delivery = EventSendResult::Sent;
                         if let Some(text) = text.filter(|text| !text.is_empty()) {
                             output_bytes = output_bytes.saturating_add(text.len());
                             if output_bytes as u64 > request.output_limits.max_bytes {
@@ -1752,60 +1750,51 @@ async fn run_invocation<E: InvocationExecutor>(
                                 execution.request_cancel();
                                 continue;
                             }
-                            let delta = InvocationEvent {
-                                schema_version: PROTOCOL_V1,
-                                request_id: request.request_id.clone(),
-                                attempt_id: request.attempt_id.clone(),
-                                sequence,
-                                event: InvocationEventKind::TextDelta {
-                                text,
-                                logprobs: None,
-                            },
-                            };
-                            match try_send_event(&state.config, &state.metrics, &tx, delta) {
-                                EventSendResult::Sent => {
-                                    state.update_attempt(
-                                        &request.attempt_id,
-                                        AttemptState::Running,
-                                        Some(sequence),
-                                    );
-                                    sequence = sequence.saturating_add(1);
-                                }
-                                EventSendResult::Oversized => {
-                                    terminal = Some(TerminalEvent::Failed(ExecutionFailure {
-                                        code: InvocationErrorCode::OutputLimitExceeded,
-                                        message: "encoded output event exceeded the worker limit".into(),
-                                    }));
-                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                    execution.request_cancel();
-                                    continue;
-                                }
-                                EventSendResult::Unavailable => {
-                                    cancellation_requested = true;
-                                    mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
-                                    execution.request_cancel();
-                                }
-                            }
+                            delivery =
+                                outbox.offer(&state, &request, &tx, &mut sequence, text, Vec::new());
                         }
                         state
                             .metrics
                             .inner
                             .tokens_out_ema
                             .record(output_tokens, execution_started_at.elapsed());
-                        terminal = Some(TerminalEvent::Completed {
-                            finish_reason,
-                            usage: Usage {
-                                input_tokens,
-                                output_tokens,
-                                cached_tokens: cached_input_tokens,
-                            },
-                        });
+                        if delivery == EventSendResult::Sent {
+                            terminal = Some(TerminalEvent::Completed {
+                                finish_reason,
+                                usage: Usage {
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens: cached_input_tokens,
+                                },
+                            });
+                        }
+                        delivery
                     }
                     Some(ExecutionEvent::Failed(failure)) => {
                         terminal = Some(TerminalEvent::Failed(failure));
+                        EventSendResult::Sent
                     }
                     None => break,
                 }
+            }
+        };
+        match delivery {
+            EventSendResult::Sent => {}
+            EventSendResult::Oversized => {
+                terminal = Some(TerminalEvent::Failed(ExecutionFailure {
+                    code: InvocationErrorCode::OutputLimitExceeded,
+                    message: "encoded output event exceeded the worker limit".into(),
+                }));
+                cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
+                execution.request_cancel();
+            }
+            // The reader is gone, stalled past the slow-consumer timeout, or
+            // owes more text than one event can carry.
+            EventSendResult::Unavailable => {
+                cancellation_requested = true;
+                mark_execution_cancellation(&state.metrics, &mut cancellation_started_at);
+                execution.request_cancel();
             }
         }
     }
@@ -1856,7 +1845,22 @@ async fn run_invocation<E: InvocationExecutor>(
             })
         })
     };
-    publish_terminal(&state, &request, &tx, sequence, terminal);
+    // A reader that already stalled past its budget gets no further wait.
+    let publish_deadline = if consumer_stalled {
+        Instant::now()
+    } else {
+        outbox.publish_deadline()
+    };
+    publish_terminal(
+        &state,
+        &request,
+        &tx,
+        &mut outbox,
+        sequence,
+        terminal,
+        publish_deadline,
+    )
+    .await;
 }
 
 async fn settle_abandoned_admission<E: InvocationExecutor>(
@@ -1956,6 +1960,149 @@ fn protocol_logprobs(
     )
 }
 
+/// Text deltas on their way to the NDJSON reader. While the reader lags (the
+/// bounded event channel is full), deltas and their logprobs merge, in
+/// order, into one pending delta that is flushed as a single event when the
+/// reader frees a slot. A slow reader therefore costs bytes, not queued
+/// events, and only a reader stalled past the slow-consumer timeout, or one
+/// owing more text than one event can carry, stops the invocation.
+struct TextOutbox {
+    pending: Option<PendingDelta>,
+    slow_consumer_timeout: Duration,
+}
+
+struct PendingDelta {
+    text: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    /// Upper bound on the encoded size of the merged delta.
+    encoded_bytes: usize,
+    since: Instant,
+}
+
+impl TextOutbox {
+    fn new(slow_consumer_timeout: Duration) -> Self {
+        Self {
+            pending: None,
+            slow_consumer_timeout,
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// When a reader that has not accepted the pending delta is stalled.
+    fn stall_deadline(&self) -> Option<Instant> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.since + self.slow_consumer_timeout)
+    }
+
+    /// How long the terminal event may wait for the reader.
+    fn publish_deadline(&self) -> Instant {
+        self.stall_deadline()
+            .unwrap_or_else(|| Instant::now() + self.slow_consumer_timeout)
+    }
+
+    /// Send a delta now, or merge it into the pending delta while the reader
+    /// lags. `run_invocation` is the channel's only sender, so free capacity
+    /// observed here is still free when the event is sent.
+    fn offer<E>(
+        &mut self,
+        state: &WorkerState<E>,
+        request: &InvocationRequest,
+        tx: &mpsc::Sender<Bytes>,
+        sequence: &mut u64,
+        text: String,
+        logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    ) -> EventSendResult {
+        if self.pending.is_none() && tx.capacity() > 0 {
+            return send_text_delta(state, request, tx, sequence, text, logprobs);
+        }
+        if tx.is_closed() {
+            return EventSendResult::Unavailable;
+        }
+        let encoded_bytes = encoded_delta_bytes(&text, &logprobs);
+        let pending = self.pending.get_or_insert_with(|| PendingDelta {
+            text: String::new(),
+            logprobs: Vec::new(),
+            encoded_bytes: 0,
+            since: Instant::now(),
+        });
+        pending.text.push_str(&text);
+        pending.logprobs.extend(logprobs);
+        pending.encoded_bytes = pending.encoded_bytes.saturating_add(encoded_bytes);
+        if pending
+            .encoded_bytes
+            .saturating_add(EVENT_ENVELOPE_ALLOWANCE)
+            > state.config.max_event_bytes
+        {
+            state
+                .metrics
+                .inner
+                .event_delivery_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return EventSendResult::Unavailable;
+        }
+        EventSendResult::Sent
+    }
+
+    /// Send the pending delta if the reader has room; otherwise keep it.
+    fn flush<E>(
+        &mut self,
+        state: &WorkerState<E>,
+        request: &InvocationRequest,
+        tx: &mpsc::Sender<Bytes>,
+        sequence: &mut u64,
+    ) -> EventSendResult {
+        if tx.capacity() == 0 {
+            return EventSendResult::Unavailable;
+        }
+        match self.pending.take() {
+            Some(pending) => {
+                send_text_delta(state, request, tx, sequence, pending.text, pending.logprobs)
+            }
+            None => EventSendResult::Sent,
+        }
+    }
+}
+
+/// Encoded size of one delta's payload, an upper bound on what it adds to a
+/// merged delta.
+fn encoded_delta_bytes(text: &str, logprobs: &[izwi_core::engine::TokenLogprob]) -> usize {
+    serde_json::to_vec(&InvocationEventKind::TextDelta {
+        text: text.to_owned(),
+        logprobs: protocol_logprobs(logprobs),
+    })
+    .map_or(usize::MAX, |encoded| encoded.len())
+}
+
+fn send_text_delta<E>(
+    state: &WorkerState<E>,
+    request: &InvocationRequest,
+    tx: &mpsc::Sender<Bytes>,
+    sequence: &mut u64,
+    text: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+) -> EventSendResult {
+    let event = InvocationEvent {
+        schema_version: PROTOCOL_V1,
+        request_id: request.request_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        sequence: *sequence,
+        event: InvocationEventKind::TextDelta {
+            text,
+            logprobs: protocol_logprobs(&logprobs),
+        },
+    };
+    let result = try_send_event(&state.config, &state.metrics, tx, event);
+    if result == EventSendResult::Sent {
+        state.update_attempt(&request.attempt_id, AttemptState::Running, Some(*sequence));
+        *sequence = sequence.saturating_add(1);
+    }
+    result
+}
+
 enum TerminalEvent {
     Completed {
         finish_reason: FinishReason,
@@ -1965,13 +2112,22 @@ enum TerminalEvent {
     Failed(ExecutionFailure),
 }
 
-fn publish_terminal<E>(
+/// Publish the terminal event after any pending text, waiting for the
+/// reader until `deadline`. A terminal event is never dropped just because
+/// the channel is momentarily full, and never overtakes text.
+async fn publish_terminal<E>(
     state: &WorkerState<E>,
     request: &InvocationRequest,
     tx: &mpsc::Sender<Bytes>,
-    sequence: u64,
+    outbox: &mut TextOutbox,
+    mut sequence: u64,
     terminal: TerminalEvent,
+    deadline: Instant,
 ) {
+    if outbox.has_pending() {
+        let _ = tokio::time::timeout_at(deadline, tx.reserve()).await;
+        let _ = outbox.flush(state, request, tx, &mut sequence);
+    }
     let (attempt_state, event) = match terminal {
         TerminalEvent::Completed {
             finish_reason,
@@ -2021,10 +2177,12 @@ fn publish_terminal<E>(
         sequence,
         event,
     };
-    let published = matches!(
-        try_send_event(&state.config, &state.metrics, tx, event),
-        EventSendResult::Sent
-    );
+    let _ = tokio::time::timeout_at(deadline, tx.reserve()).await;
+    let published = !outbox.has_pending()
+        && matches!(
+            try_send_event(&state.config, &state.metrics, tx, event),
+            EventSendResult::Sent
+        );
     state.update_attempt(
         &request.attempt_id,
         attempt_state,
@@ -2356,6 +2514,7 @@ mod tests {
             attempt_retention: Duration::from_secs(300),
             event_channel_capacity: 4,
             max_event_bytes: 4096,
+            slow_consumer_timeout: DEFAULT_SLOW_CONSUMER_TIMEOUT,
             realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
         }
     }
@@ -2687,12 +2846,23 @@ mod tests {
             .all(|line| !line.contains('{')));
     }
 
+    fn ndjson_events(body: &[u8]) -> Vec<InvocationEvent> {
+        body.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<InvocationEvent>(line).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn bounded_output_backpressure_requests_cancel_without_holding_more_events() {
+    async fn paused_reader_receives_the_full_text_once_it_resumes() {
         let cancel_calls = Arc::new(AtomicUsize::new(0));
-        let mut events = (0..8)
-            .map(|index| ExecutionEvent::TextDelta {
-                text: format!("delta-{index}"),
+        let words = (0..64)
+            .map(|index| format!("w{index} "))
+            .collect::<Vec<_>>();
+        let mut events = words
+            .iter()
+            .map(|word| ExecutionEvent::TextDelta {
+                text: word.clone(),
                 logprobs: Vec::new(),
             })
             .collect::<VecDeque<_>>();
@@ -2700,7 +2870,7 @@ mod tests {
             text: None,
             finish_reason: FinishReason::Stop,
             input_tokens: 1,
-            output_tokens: 8,
+            output_tokens: 64,
             cached_input_tokens: None,
         });
         let executor = ScriptExecutor {
@@ -2720,16 +2890,114 @@ mod tests {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // The reader stays paused while the execution emits far more deltas
+        // than the three-slot channel holds and completes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cancel_calls.load(Ordering::Acquire), 0);
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let events = ndjson_events(&body);
+        let text = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                InvocationEventKind::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, words.concat());
+        assert!(events.len() < words.len() + 2, "deltas were coalesced");
+        assert!(matches!(
+            events.last().unwrap().event,
+            InvocationEventKind::Completed { .. }
+        ));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(cancel_calls.load(Ordering::Acquire), 0);
+        assert_eq!(service.active_invocations(), 0);
+    }
+
+    struct StallingExecutor {
+        deltas: usize,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InvocationExecutor for StallingExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Ok(AdmittedInvocation::new(Box::new(StallingExecution {
+                remaining: self.deltas,
+                cancel_calls: Arc::clone(&self.cancel_calls),
+            })))
+        }
+    }
+
+    /// Emits its deltas, then keeps generating (never finishes on its own).
+    struct StallingExecution {
+        remaining: usize,
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AdmittedExecution for StallingExecution {
+        async fn next_event(&mut self) -> Option<ExecutionEvent> {
+            if self.remaining == 0 {
+                return std::future::pending().await;
+            }
+            self.remaining -= 1;
+            Some(ExecutionEvent::TextDelta {
+                text: "x".into(),
+                logprobs: Vec::new(),
+            })
+        }
+
+        fn request_cancel(&self) {
+            self.cancel_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn wait_for_teardown(self: Box<Self>) -> ExecutionTeardown {
+            ExecutionTeardown::Cancelled
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_paused_past_the_slow_consumer_timeout_cancels_the_invocation() {
+        let cancel_calls = Arc::new(AtomicUsize::new(0));
+        let mut worker_config = config();
+        worker_config.event_channel_capacity = 3;
+        worker_config.slow_consumer_timeout = Duration::from_millis(50);
+        let service = WorkerService::new(
+            worker_config,
+            StallingExecutor {
+                deltas: 8,
+                cancel_calls: Arc::clone(&cancel_calls),
+            },
+        )
+        .unwrap();
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(&invocation()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
             while cancel_calls.load(Ordering::Acquire) == 0 || service.active_invocations() != 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("a reader stalled past the timeout cancels the invocation");
         assert_eq!(cancel_calls.load(Ordering::Acquire), 1);
         let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
-        assert!(body.len() <= 3 * config().max_event_bytes);
+        assert!(ndjson_events(&body)
+            .iter()
+            .all(|event| !matches!(event.event, InvocationEventKind::Completed { .. })));
     }
 
     #[tokio::test]
