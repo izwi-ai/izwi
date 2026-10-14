@@ -99,30 +99,7 @@ fn qwen3_tts_plan(
     let Some(files) = census_of(&paths)? else {
         return Ok(None);
     };
-    price_qwen3_tts_with_fallback(&files, backend, &layout).map(Some)
-}
-
-/// The Qwen3-TTS plan as loaded: with weight-only F16, its F16 residency
-/// and a load peak that also fits the dense reload a failed load-time
-/// self-check falls back to.
-fn price_qwen3_tts_with_fallback(
-    files: &[CensusFile],
-    backend: BackendKind,
-    layout: &Qwen3TtsLoadLayout,
-) -> Result<AsrResidencyPlan> {
-    let plan = price_qwen3_tts(files, backend, layout)?;
-    if !layout.weight_only_f16 {
-        return Ok(plan);
-    }
-    let dense = price_qwen3_tts(
-        files,
-        backend,
-        &Qwen3TtsLoadLayout {
-            weight_only_f16: false,
-            ..*layout
-        },
-    )?;
-    Ok(plan.with_fallback_peak(&dense))
+    price_qwen3_tts(&files, backend, &layout).map(Some)
 }
 
 /// Whether a Qwen3-TTS tensor loads as weight-only F16 when the layout asks
@@ -143,6 +120,14 @@ const QWEN3_TTS_TEXT_EMBEDDING: &str = "talker.model.text_embedding.weight";
 /// speech tokenizer at its dtype, its reference encoder for voice clone
 /// only. On Metal the BF16 checkpoint is cast to F32 on the host and
 /// uploaded at its exact size.
+///
+/// With weight-only F16 this is the F16 residency and the staged loader's
+/// peak for that form. A failed load-time self-check drops the F16 model
+/// and reloads dense, which is not priced: pricing every load at the dense
+/// reload (2.3 times the F16 residency at 0.6B) refused 1.7B on a 16 GB Mac
+/// for a fallback that almost never runs. A fallback that does not fit
+/// fails closed at the load's observed-growth reconciliation (or Metal's
+/// OOM retry).
 fn price_qwen3_tts(
     files: &[CensusFile],
     backend: BackendKind,
@@ -359,7 +344,7 @@ mod tests {
     }
 
     fn qwen(files: &[CensusFile], voice_clone: bool, backend: BackendKind) -> AsrResidencyPlan {
-        price_qwen3_tts_with_fallback(files, backend, &qwen_layout(voice_clone, backend)).unwrap()
+        price_qwen3_tts(files, backend, &qwen_layout(voice_clone, backend)).unwrap()
     }
 
     fn kokoro(backend: BackendKind) -> AsrResidencyPlan {
@@ -384,8 +369,7 @@ mod tests {
     ///   projections and the text embedding load as weight-only F16 (F32
     ///   compute), host-cast and uploaded at exact size: 2.48 GiB, against
     ///   the 5.29 GiB the report saw from device F32 casts into
-    ///   power-of-two buffers. Its load peak also fits the dense reload a
-    ///   failed self-check falls back to. CUDA keeps the talker and
+    ///   power-of-two buffers. CUDA keeps the talker and
     ///   predictor BF16 beside an F32 speech tokenizer. CustomVoice skips the
     ///   speech-tokenizer encoder (0.24 GiB) it never runs.
     /// - Kokoro is its 0.305 GiB F32 checkpoint read from the nested
@@ -447,29 +431,81 @@ mod tests {
         }
     }
 
-    /// Weight-only F16 on Metal prices the F16 residency, and a load peak
-    /// that still fits the dense F32 reload its load-time self-check falls
-    /// back to.
+    /// Weight-only F16 on Metal prices what the staged loader holds: the F16
+    /// residency, plus the one host transient above it, the text embedding
+    /// read at F32 and converted to F16 (every other tensor is converted
+    /// and uploaded one at a time at its exact size). The final Metal run
+    /// measured 0.6B Base's whole process footprint peaking at 3,945 MiB
+    /// over this load; the price must cover it without the dense reload
+    /// (6.21 GB) a failed self-check falls back to, which refused 1.7B
+    /// CustomVoice at 9.99 GB.
     #[test]
-    fn qwen_weight_only_f16_prices_f16_residency_and_the_dense_fallback_peak() {
+    fn qwen_weight_only_f16_prices_the_staged_f16_load() {
         let _env = env_lock();
-        let files = census!("qwen3_tts_12hz_0_6b_custom_voice.json");
+        for (file, files, voice_clone, measured_peak) in [
+            (
+                "0.6B Base",
+                census!("qwen3_tts_12hz_0_6b_base.json"),
+                true,
+                Some(3_945u64 << 20),
+            ),
+            (
+                "0.6B CustomVoice",
+                census!("qwen3_tts_12hz_0_6b_custom_voice.json"),
+                false,
+                None,
+            ),
+            (
+                "1.7B CustomVoice",
+                census!("qwen3_tts_12hz_1_7b_custom_voice.json"),
+                false,
+                None,
+            ),
+        ] {
+            let layout = qwen_layout(voice_clone, BackendKind::Metal);
+            assert!(layout.weight_only_f16);
+            let f16 = price_qwen3_tts(&files, BackendKind::Metal, &layout)
+                .unwrap()
+                .estimate()
+                .unwrap();
+            let dense = price_qwen3_tts(
+                &files,
+                BackendKind::Metal,
+                &Qwen3TtsLoadLayout {
+                    weight_only_f16: false,
+                    ..layout
+                },
+            )
+            .unwrap()
+            .estimate()
+            .unwrap();
+            assert!(f16.resident_bytes * 3 < dense.resident_bytes * 2, "{file}");
+            let embedding = files[0]
+                .tensors
+                .iter()
+                .find(|tensor| tensor.name == QWEN3_TTS_TEXT_EMBEDDING)
+                .unwrap()
+                .elements();
+            let f32_and_f16 = embedding * (4 + 2);
+            assert_eq!(
+                f16.load_peak_bytes - f16.resident_bytes,
+                f32_and_f16,
+                "{file}"
+            );
+            assert!(f16.load_peak_bytes < dense.load_peak_bytes, "{file}");
+            if let Some(measured) = measured_peak {
+                assert!(f16.load_peak_bytes >= measured, "{file}");
+            }
+        }
+        // 1.7B CustomVoice now asks for 6.38 GB, not 9.99.
+        let files = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
         let layout = qwen_layout(false, BackendKind::Metal);
-        assert!(layout.weight_only_f16);
-        let dense_layout = Qwen3TtsLoadLayout {
-            weight_only_f16: false,
-            ..layout
-        };
-        let f16 = price_qwen3_tts_with_fallback(&files, BackendKind::Metal, &layout)
+        let peak = price_qwen3_tts(&files, BackendKind::Metal, &layout)
             .unwrap()
             .estimate()
-            .unwrap();
-        let dense = price_qwen3_tts(&files, BackendKind::Metal, &dense_layout)
             .unwrap()
-            .estimate()
-            .unwrap();
-        assert!(f16.resident_bytes * 3 < dense.resident_bytes * 2);
-        assert!(f16.load_peak_bytes >= dense.load_peak_bytes);
+            .load_peak_bytes;
+        assert!(peak < 6_400_000_000, "{peak}");
     }
 
     /// The reference-audio components load only for voice cloning: a
@@ -568,44 +604,57 @@ mod tests {
 
     /// TTS loads are reconciled like ASR loads (6f60b6be): the weight load's
     /// observed growth must stay within its authorized peak plus tolerance.
-    /// Fed the Qwen3-TTS 0.6B Metal footprint the admission report measured
-    /// (about 5.2 GB of weights), the plan passes, while the 2.49 GB the
-    /// checkpoint inventory used to charge would have failed the load.
+    /// The final Metal run's 0.6B CustomVoice weight load grew the device
+    /// 2,408,677,376 bytes and passes. A dense reload after a failed F16
+    /// self-check, which admission no longer prices, passes only when it
+    /// fits what was authorized (0.6B's does); 1.7B's does not and fails the
+    /// load closed instead of running unpriced.
     #[test]
-    fn reconciliation_accepts_the_planned_qwen_weights_and_catches_the_old_price() {
+    fn reconciliation_accepts_the_f16_load_and_fails_an_unpriced_dense_reload() {
         let _env = env_lock();
-        let plan = qwen(
-            &census!("qwen3_tts_12hz_0_6b_custom_voice.json"),
-            false,
-            BackendKind::Metal,
-        );
-        let authorized = plan.estimate().unwrap().load_peak_bytes;
-        let sample = |observed| super::super::DeviceUsageSample {
-            observed,
-            reserved: 0,
-        };
-        let observed = 5_200_000_000;
-        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        assert!(super::super::reconciles_device_usage(variant));
-        assert_eq!(
+        let reconcile = |files: &[CensusFile], variant: ModelVariant, dense_observed: bool| {
+            let layout = qwen_layout(false, BackendKind::Metal);
+            let price = |weight_only_f16| {
+                price_qwen3_tts(
+                    files,
+                    BackendKind::Metal,
+                    &Qwen3TtsLoadLayout {
+                        weight_only_f16,
+                        ..layout
+                    },
+                )
+                .unwrap()
+                .estimate()
+                .unwrap()
+            };
+            let observed = if dense_observed {
+                price(false).resident_bytes
+            } else {
+                2_408_677_376
+            };
+            let sample = |observed| super::super::DeviceUsageSample {
+                observed,
+                reserved: 0,
+            };
+            assert!(super::super::reconciles_device_usage(variant));
             super::super::reconcile_observed_growth(
                 variant,
                 "weight load",
                 sample(0),
                 sample(observed),
-                authorized,
+                price(true).load_peak_bytes,
             )
-            .unwrap(),
-            observed
+        };
+        let small = census!("qwen3_tts_12hz_0_6b_custom_voice.json");
+        let large = census!("qwen3_tts_12hz_1_7b_custom_voice.json");
+        let small_variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let large_variant = ModelVariant::Qwen3Tts12Hz17BCustomVoice;
+        assert_eq!(
+            reconcile(&small, small_variant, false).unwrap(),
+            2_408_677_376
         );
-        assert!(super::super::reconcile_observed_growth(
-            variant,
-            "weight load",
-            sample(0),
-            sample(observed),
-            2_493_807_108,
-        )
-        .is_err());
+        assert!(reconcile(&small, small_variant, true).is_ok());
+        assert!(reconcile(&large, large_variant, true).is_err());
     }
 
     /// Fish keeps its own plan, and the Metal OOM retry now reads it too

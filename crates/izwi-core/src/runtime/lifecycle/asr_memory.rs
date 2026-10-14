@@ -789,9 +789,12 @@ impl Ledger {
         self.host_converted_through(tensor, None, dtype)
     }
 
-    /// [`Self::host_converted`] for a weight the loader converts through an
-    /// `intermediate` host form first (Qwen3-TTS's F16 text embedding is read
-    /// at F32, then converted): that form is alive beside the others.
+    /// [`Self::host_converted`] for a weight the loader reads at an
+    /// `intermediate` host dtype first (Qwen3-TTS's F16 text embedding is
+    /// read at F32, then converted). The read converts the stored copy and
+    /// drops it, so the intermediate is alive with the stored copy while it
+    /// is read and with the converted form after: the larger pair, not all
+    /// three.
     pub(super) fn host_converted_through(
         &mut self,
         tensor: &CensusTensor,
@@ -799,11 +802,13 @@ impl Ledger {
         dtype: DType,
     ) -> Result<()> {
         let bytes = dense_bytes(tensor.elements(), dtype)?;
-        let intermediate = match intermediate {
-            Some(form) => dense_bytes(tensor.elements(), form)?,
-            None => 0,
+        let host = match intermediate {
+            Some(form) => {
+                let intermediate = dense_bytes(tensor.elements(), form)?;
+                sum(&[tensor.stored_bytes, intermediate])?.max(sum(&[intermediate, bytes])?)
+            }
+            None => sum(&[tensor.stored_bytes, bytes])?,
         };
-        let host = sum(&[tensor.stored_bytes, intermediate, bytes])?;
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {
                 logical: bytes,
