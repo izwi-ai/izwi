@@ -9,8 +9,8 @@ use izwi_core::{
     AudioChunk, ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError,
     GenerationConfig, GenerationParams, GenerationRequest, ModelVariant, RuntimeAsrRealtimeEvent,
     RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
-    RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition, RuntimeRequestContext,
-    RuntimeService, RuntimeTelemetrySnapshot,
+    RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition, RuntimeHealth,
+    RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
 };
 use izwi_serving_protocol::{
     ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest,
@@ -147,6 +147,10 @@ impl RuntimeChatExecutor {
 impl InvocationExecutor for RuntimeChatExecutor {
     async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
         Some(self.runtime.telemetry_snapshot().await)
+    }
+
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
     }
 
     async fn admit(
@@ -396,6 +400,10 @@ impl InvocationExecutor for RuntimeRealtimeAsrExecutor {
         Some(self.runtime.telemetry_snapshot().await)
     }
 
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
+    }
+
     async fn admit(
         &self,
         _request: &InvocationRequest,
@@ -597,6 +605,10 @@ impl RuntimeRealtimeTtsExecutor {
 impl InvocationExecutor for RuntimeRealtimeTtsExecutor {
     async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
         Some(self.runtime.telemetry_snapshot().await)
+    }
+
+    fn runtime_health(&self) -> RuntimeHealth {
+        self.runtime.health()
     }
 
     async fn admit(

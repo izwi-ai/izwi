@@ -1,5 +1,7 @@
 use anyhow::{bail, Context};
-use izwi_core::{backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeService};
+use izwi_core::{
+    backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeHealth, RuntimeService,
+};
 use izwi_serving_protocol::*;
 use izwi_serving_supervisor::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
@@ -354,6 +356,9 @@ async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
         process.drain_grace,
         process.cancellation_grace,
     );
+    if process.exit_on_runtime_failure {
+        tokio::spawn(exit_on_runtime_failure(worker.clone()));
+    }
     tracing::info!(
         address = %process.bind,
         model = %process.public_model,
@@ -376,6 +381,32 @@ async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
             .with_graceful_shutdown(shutdown)
             .await
             .context("serve private worker")
+    }
+}
+
+/// Exit status for a worker whose runtime failed permanently (EX_SOFTWARE).
+const RUNTIME_FAILURE_EXIT_CODE: i32 = 70;
+const RUNTIME_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Watch runtime health and exit once it fails permanently. Every invocation
+/// is already rejected, so in-flight work cannot complete; exiting directly
+/// (not through runtime teardown) avoids waiting on a blocking task stuck in
+/// a faulted device call. The supervisor treats any exit as a failure and
+/// restarts the worker with its bounded backoff.
+async fn exit_on_runtime_failure<E: izwi_serving_worker::InvocationExecutor>(
+    worker: WorkerService<E>,
+) {
+    let mut poll = tokio::time::interval(RUNTIME_HEALTH_POLL_INTERVAL);
+    loop {
+        poll.tick().await;
+        if let RuntimeHealth::Failed { reason } = worker.runtime_health() {
+            tracing::error!(
+                %reason,
+                exit_code = RUNTIME_FAILURE_EXIT_CODE,
+                "worker runtime failed permanently; exiting so the supervisor restarts it"
+            );
+            std::process::exit(RUNTIME_FAILURE_EXIT_CODE);
+        }
     }
 }
 
@@ -548,6 +579,10 @@ struct WorkerProcessConfig {
     managed: bool,
     drain_grace: Duration,
     cancellation_grace: Duration,
+    /// Exit after the runtime fails permanently (a post-entry panic or a
+    /// latched fatal device fault) so the supervisor restarts the worker
+    /// with its bounded backoff instead of leaving a Failed process up.
+    exit_on_runtime_failure: bool,
 }
 
 impl WorkerProcessConfig {
@@ -682,6 +717,7 @@ impl WorkerProcessConfig {
                 "IZWI_WORKER_CANCELLATION_GRACE_MS",
                 10_000,
             )?),
+            exit_on_runtime_failure: parse_env("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
         })
     }
 

@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use izwi_core::{ManagedKvRuntimeSnapshot, RuntimeTelemetrySnapshot};
+use izwi_core::{ManagedKvRuntimeSnapshot, RuntimeHealth, RuntimeTelemetrySnapshot};
 use izwi_serving_protocol::*;
 use std::{
     collections::{HashMap, VecDeque},
@@ -303,6 +303,13 @@ pub trait InvocationExecutor: Send + Sync + 'static {
     /// gateway/worker topology. Executors without an engine return `None`.
     async fn runtime_telemetry(&self) -> Option<RuntimeTelemetrySnapshot> {
         None
+    }
+
+    /// Physical execution health of the embedded runtime: admission poison
+    /// and latched fatal device faults. Status reports it instead of the
+    /// static startup readiness. Executors without an engine stay healthy.
+    fn runtime_health(&self) -> RuntimeHealth {
+        RuntimeHealth::Healthy
     }
 
     /// Realtime stage runner when the executor embeds a runtime able to serve
@@ -1054,6 +1061,10 @@ impl<E: InvocationExecutor> WorkerService<E> {
     pub fn active_invocations(&self) -> usize {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
     }
+
+    pub fn runtime_health(&self) -> RuntimeHealth {
+        self.state.executor.runtime_health()
+    }
 }
 
 async fn observe_worker_body_limit<E: InvocationExecutor>(
@@ -1139,8 +1150,21 @@ async fn status<E: InvocationExecutor>(
     }
     let active = state.config.max_active_invocations - state.capacity.available_permits();
     let draining = state.draining.load(Ordering::Acquire);
+    let health = state.executor.runtime_health();
     let mut deployment = state.config.deployment.clone();
-    if draining {
+    // A poisoned runtime rejects every invocation, so it must never be
+    // advertised as ready: a permanent failure fails the whole process, and
+    // a drain-recoverable poison fails only the deployment's readiness.
+    let process_state = if health.is_failed() {
+        WorkerProcessState::Failed
+    } else if draining {
+        WorkerProcessState::Draining
+    } else {
+        WorkerProcessState::Running
+    };
+    if !health.is_healthy() {
+        deployment.readiness = ModelReadiness::Failed;
+    } else if draining {
         deployment.readiness = ModelReadiness::Draining;
     }
     // Optional routing signals: populated only while the executor embeds an
@@ -1160,11 +1184,7 @@ async fn status<E: InvocationExecutor>(
         node_id: state.config.descriptor.node_id.clone(),
         incarnation_id: state.config.descriptor.incarnation_id.clone(),
         status_sequence: state.status_sequence.fetch_add(1, Ordering::Relaxed) + 1,
-        process_state: if draining {
-            WorkerProcessState::Draining
-        } else {
-            WorkerProcessState::Running
-        },
+        process_state,
         deployments: vec![deployment],
         capacity: CapacitySnapshot {
             max_active_invocations: state.config.max_active_invocations as u32,
@@ -2484,6 +2504,105 @@ mod tests {
             InvocationEventKind::Completed { .. }
         ));
         assert_eq!(service.active_invocations(), 0);
+    }
+
+    struct HealthExecutor {
+        health: Arc<Mutex<RuntimeHealth>>,
+    }
+
+    #[async_trait]
+    impl InvocationExecutor for HealthExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Err(AdmissionFailure::new(
+                RejectionCode::CapacityExhausted,
+                "health-only executor",
+            ))
+        }
+
+        fn runtime_health(&self) -> RuntimeHealth {
+            self.health.lock().unwrap().clone()
+        }
+    }
+
+    async fn worker_status<E: InvocationExecutor>(service: &WorkerService<E>) -> WorkerStatus {
+        let response = service
+            .router()
+            .oneshot(authorized_request("GET", WORKER_STATUS_PATH, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_reports_runtime_health_instead_of_static_readiness() {
+        let health = Arc::new(Mutex::new(RuntimeHealth::Healthy));
+        let service = WorkerService::new(
+            config(),
+            HealthExecutor {
+                health: Arc::clone(&health),
+            },
+        )
+        .unwrap();
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Ready);
+
+        *health.lock().unwrap() = RuntimeHealth::Degraded {
+            reason: "Metal command buffer OOM".into(),
+        };
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+
+        *health.lock().unwrap() = RuntimeHealth::Failed {
+            reason: "fatal device fault".into(),
+        };
+        service.begin_draining().await;
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Failed);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+    }
+
+    #[tokio::test]
+    async fn status_fails_after_the_real_runtime_latches_a_device_fault() {
+        let models_dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(
+            izwi_core::RuntimeService::new_assigned(
+                izwi_core::EngineConfig {
+                    models_dir: models_dir.path().to_path_buf(),
+                    ..izwi_core::EngineConfig::default()
+                },
+                izwi_core::backends::RuntimeDeviceAssignment::Cpu,
+            )
+            .unwrap(),
+        );
+        let service = WorkerService::new(
+            config(),
+            RuntimeChatExecutor::new(
+                Arc::clone(&runtime),
+                izwi_core::ModelVariant::Lfm2512BInstructGguf,
+                true,
+            ),
+        )
+        .unwrap();
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Running);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Ready);
+        assert!(service.runtime_health().is_healthy());
+
+        assert!(runtime.latch_device_fault_for_test(&izwi_core::Error::InferenceError(
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"
+                .into(),
+        )));
+        let status = worker_status(&service).await;
+        assert_eq!(status.process_state, WorkerProcessState::Failed);
+        assert_eq!(status.deployments[0].readiness, ModelReadiness::Failed);
+        assert!(service.runtime_health().is_failed());
     }
 
     #[tokio::test]
