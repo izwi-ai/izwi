@@ -683,6 +683,12 @@ impl<T: ResidentAttentionPlan> ResidentAttentionPlanCache<T> {
         self.entries.back()
     }
 
+    fn remove(&mut self, index: usize) -> Option<T> {
+        let entry = self.entries.remove(index)?;
+        self.resident_bytes = self.resident_bytes.saturating_sub(entry.resident_bytes());
+        Some(entry)
+    }
+
     fn insert(&mut self, entry: T) -> usize {
         let entry_bytes = entry.resident_bytes();
         if entry_bytes > ATTENTION_PLAN_CACHE_BYTES_PER_KIND {
@@ -1360,28 +1366,52 @@ impl CandleAcceleratorKvArena {
             .iter()
             .position(|cached| cached.shape_compatible(batch_size, max_blocks))
         {
-            let cached = cache.entries.get_mut(index).ok_or_else(|| {
+            let mut cached = cache.entries.get_mut(index).ok_or_else(|| {
                 Error::InferenceError("accelerator decode plan cache lost an entry".into())
             })?;
-            let mut updated = false;
-            updated |= update_u32_tensor(
-                &cached.cumulative_contexts,
-                &cached.host_cumulative_contexts,
-                cumulative_contexts,
-                &self.device,
-            )?;
-            updated |= update_u32_tensor(
-                &cached.block_table,
-                &cached.host_block_table,
-                block_table,
-                &self.device,
-            )?;
-            updated |= update_u32_tensor(
-                &cached.native_metadata,
-                &cached.host_native_metadata,
-                native_metadata,
-                &self.device,
-            )?;
+            let refreshed = (|| -> Result<bool> {
+                let mut updated = false;
+                updated |= update_u32_tensor(
+                    &cached.cumulative_contexts,
+                    &cached.host_cumulative_contexts,
+                    cumulative_contexts,
+                    &self.device,
+                )?;
+                updated |= update_u32_tensor(
+                    &cached.block_table,
+                    &cached.host_block_table,
+                    block_table,
+                    &self.device,
+                )?;
+                updated |= update_u32_tensor(
+                    &cached.native_metadata,
+                    &cached.host_native_metadata,
+                    native_metadata,
+                    &self.device,
+                )?;
+                Ok(updated)
+            })();
+            let updated = match refreshed {
+                Ok(updated) => updated,
+                Err(error) => {
+                    // The tensors are updated in place one after another, so a
+                    // failure can leave some holding the new batch while the
+                    // key and host mirrors still describe the old one. Any
+                    // later exact hit or diff would then serve mixed tables;
+                    // drop the entry so the next request lowers from scratch.
+                    let before_bytes = cache.resident_bytes;
+                    cache.remove(index);
+                    update_resident_byte_gauge(
+                        &self.attention_plan_resident_bytes,
+                        before_bytes,
+                        cache.resident_bytes,
+                    );
+                    return Err(error);
+                }
+            };
+            cached = cache.entries.get_mut(index).ok_or_else(|| {
+                Error::InferenceError("accelerator decode plan cache lost an entry".into())
+            })?;
             cached.key = batch.clone();
             cached.host_cumulative_contexts.clear();
             cached
@@ -2966,6 +2996,12 @@ fn update_u32_tensor(
     if indices.is_empty() {
         return Ok(false);
     }
+    #[cfg(test)]
+    if tests::take_injected_metadata_update_failure() {
+        return Err(Error::InferenceError(
+            "injected attention metadata update failure".into(),
+        ));
+    }
     let indices = accelerator_indices(&indices, device)?;
     let value_count = values.len();
     let values = Tensor::from_vec(values, value_count, device)?;
@@ -3020,6 +3056,27 @@ mod tests {
     use super::*;
     use crate::engine::ModelInstanceId;
     use crate::kv::KvGroupId;
+
+    thread_local! {
+        /// Fails the Nth subsequent non-empty attention-metadata upload on this
+        /// thread (1-based); 0 disables injection.
+        static FAIL_METADATA_UPDATE_AT: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn take_injected_metadata_update_failure() -> bool {
+        FAIL_METADATA_UPDATE_AT.with(|remaining| match remaining.get() {
+            0 => false,
+            1 => {
+                remaining.set(0);
+                true
+            }
+            n => {
+                remaining.set(n - 1);
+                false
+            }
+        })
+    }
 
     #[derive(Debug)]
     struct MockResidentPlan(usize);
@@ -3653,6 +3710,91 @@ mod tests {
         assert_eq!(cache_stats.evictions, 0);
         assert_eq!(cache_stats.device_uploads, 4);
         assert!(cache_stats.resident_bytes > 0);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn failed_in_place_plan_update_never_serves_mixed_device_tables() -> Result<()> {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return Ok(());
+        };
+        let arena_id = KvArenaId {
+            model_instance: ModelInstanceId::new(7),
+            backend: BackendKind::Metal,
+            device_ordinal: Some(0),
+            generation: 1,
+        };
+        let group = KvGroupId::new(0);
+        let arena = CandleAcceleratorKvArena::new_mutation_only(
+            KvArenaConfig {
+                id: arena_id,
+                group,
+                page_tokens: 2,
+                capacity_pages: 4,
+                growth: None,
+                dtype: DType::F32,
+                layers: vec![super::super::KvLayerConfig {
+                    binding: KvLayerBinding {
+                        model_layer: 0,
+                        physical_layer: 0,
+                    },
+                    num_kv_heads: 1,
+                    key_head_dim: 2,
+                    value_head_dim: 2,
+                }],
+            },
+            device.clone(),
+        )?;
+        let block = |index| CacheBlockRef {
+            arena: arena_id,
+            group,
+            index,
+            slot_generation: 1,
+        };
+        let sequence = |blocks: Vec<CacheBlockRef>, context_len| crate::kv::KvSequenceBlockTable {
+            blocks,
+            first_page_offset: 0,
+            context_len,
+        };
+        let original = KvDecodeBatchMetadata {
+            sequences: vec![
+                sequence(vec![block(0), block(1)], 3),
+                sequence(vec![block(2)], 2),
+            ],
+        };
+        // Same shape (two rows, two blocks max) but different contexts and
+        // tables, so the cached entry is refreshed in place.
+        let next = KvDecodeBatchMetadata {
+            sequences: vec![
+                sequence(vec![block(0), block(1)], 4),
+                sequence(vec![block(3)], 2),
+            ],
+        };
+        let expected = |batch: &KvDecodeBatchMetadata| -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+            let (table, cumulative, offsets, _, _) = arena.lower_decode_tables(batch)?;
+            let native = packed_decode_metadata(&cumulative, &offsets, &table);
+            Ok((cumulative, table, native))
+        };
+        let read = |plan: &DecodeDeviceMetadata| -> Result<(Vec<u32>, Vec<u32>, Vec<u32>)> {
+            Ok((
+                plan.cumulative_contexts.to_vec1::<u32>()?,
+                plan.block_table.flatten_all()?.to_vec1::<u32>()?,
+                plan.native_metadata.to_vec1::<u32>()?,
+            ))
+        };
+
+        arena.cached_decode_plan(&original)?;
+        // The first upload (contexts) lands, the second (block table) fails.
+        FAIL_METADATA_UPDATE_AT.with(|remaining| remaining.set(2));
+        assert!(arena.cached_decode_plan(&next).is_err());
+        FAIL_METADATA_UPDATE_AT.with(|remaining| remaining.set(0));
+
+        assert_eq!(
+            read(&arena.cached_decode_plan(&original)?)?,
+            expected(&original)?
+        );
+        assert_eq!(read(&arena.cached_decode_plan(&next)?)?, expected(&next)?);
         Ok(())
     }
 
