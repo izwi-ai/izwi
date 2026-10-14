@@ -284,6 +284,11 @@ const DEFAULT_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 64;
 const MAX_STAGE_CLAIM_CANDIDATE_LIMIT: usize = 512;
 pub(crate) const DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 64;
 const MAX_RUNTIME_MAINTENANCE_BATCH_LIMIT: usize = 512;
+/// How long a cancelling attempt must go without lease renewal, and its owner
+/// without a heartbeat, before recovery treats the owning process as gone. A
+/// live owner renews a cancelling lease every lease/3 (at most 30 s) and
+/// heartbeats at least as often, so this is several missed renewals.
+const ABANDONED_CANCELLATION_GRACE_MS: i64 = 2 * 60 * 1000;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACTS: usize = 64;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES: usize = 64;
 const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
@@ -683,6 +688,48 @@ impl LeaseValidity {
             Self::Any => "1 = 1",
         }
     }
+}
+
+/// Who may settle a cancelling attempt as `cancelled`.
+#[derive(Debug, Clone, Copy)]
+enum CancellationSettlement {
+    /// The exact owner observed its executor resolve.
+    OwnerTeardown,
+    /// Recovery: the owner stopped renewing and heartbeating before
+    /// `stale_before`, so its process (and executor) is gone.
+    AbandonedOwner { stale_before: i64 },
+}
+
+impl CancellationSettlement {
+    fn stale_before(self) -> i64 {
+        match self {
+            Self::OwnerTeardown => 0,
+            Self::AbandonedOwner { stale_before } => stale_before,
+        }
+    }
+
+    fn sql_predicate(self, stale_before_param: usize) -> String {
+        match self {
+            Self::OwnerTeardown => "1 = 1".to_string(),
+            Self::AbandonedOwner { .. } => abandoned_cancellation_predicate(stale_before_param),
+        }
+    }
+}
+
+/// The attempt's lease lapsed before the cutoff and no incarnation that could
+/// own it has heartbeated since. A heartbeat row whose incarnation started
+/// after the stage's last owner write belongs to a restarted process reusing
+/// the worker id, not to the attempt's owner.
+fn abandoned_cancellation_predicate(stale_before_param: usize) -> String {
+    format!(
+        r#"job_stages.lease_expires_at <= ?{stale_before_param}
+           AND NOT EXISTS (
+               SELECT 1 FROM runtime_worker_heartbeats
+               WHERE runtime_worker_heartbeats.worker_id = job_stages.worker_id
+                 AND runtime_worker_heartbeats.last_heartbeat_at > ?{stale_before_param}
+                 AND runtime_worker_heartbeats.started_at <= job_stages.updated_at
+           )"#
+    )
 }
 
 impl BatchRuntimeStore {
@@ -4223,7 +4270,12 @@ impl BatchRuntimeStore {
             .context("Failed to start stage cancellation finalization transaction")?;
         let now = self.now_millis();
         let finalized = self
-            .finalize_stage_cancellation_with(&tx, lease, now)
+            .finalize_stage_cancellation_with(
+                &tx,
+                lease,
+                now,
+                CancellationSettlement::OwnerTeardown,
+            )
             .await?;
         if finalized.is_none() {
             tx.rollback().await?;
@@ -4242,7 +4294,7 @@ impl BatchRuntimeStore {
         // A wall-clock expiry does not prove that requested cancellation tore
         // down execution. Only ordinary leases are eligible for retry here;
         // cancelling attempts stay owner-fenced until exact-attempt settlement
-        // or a future supervisor-confirmed process teardown transition.
+        // or until their owner is provably gone (see below).
         let rows = db
             .query_all_raw(raw::statement(
                 db,
@@ -4261,6 +4313,7 @@ impl BatchRuntimeStore {
             .await
             .context("Failed to list expired runtime stage leases")?;
 
+        let scanned = rows.len();
         let mut recovered = 0_u64;
         for row in rows {
             let stage_id: String = row.try_get_by_index(0)?;
@@ -4323,7 +4376,82 @@ impl BatchRuntimeStore {
             }
         }
 
+        recovered = recovered.saturating_add(
+            self.settle_abandoned_cancellations(db, now, limit.saturating_sub(scanned))
+                .await?,
+        );
         Ok(recovered)
+    }
+
+    /// A cancelling attempt whose owner process died can never be settled by
+    /// that owner: its attempt token lived only in the dead process. Once the
+    /// lease has lapsed by the grace period and no incarnation that could own
+    /// the attempt has heartbeated since, the executor is gone too, so the
+    /// requested cancellation is complete. The settlement stays fenced on the
+    /// exact attempt and re-checks abandonment inside the write transaction.
+    async fn settle_abandoned_cancellations(
+        &self,
+        db: &DatabaseConnection,
+        now: i64,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let settlement = CancellationSettlement::AbandonedOwner {
+            stale_before: now.saturating_sub(ABANDONED_CANCELLATION_GRACE_MS),
+        };
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                format!(
+                    r#"
+                    SELECT id, worker_id, attempt_count, attempt_token
+                    FROM job_stages
+                    WHERE status IN ('running', 'postprocessing')
+                      AND cancellation_state IN ('requested', 'execution_stopping')
+                      AND worker_id IS NOT NULL
+                      AND lease_expires_at IS NOT NULL
+                      AND {}
+                    ORDER BY lease_expires_at ASC, id ASC
+                    LIMIT ?2
+                    "#,
+                    settlement.sql_predicate(1)
+                ),
+                vec![
+                    settlement.stale_before().into(),
+                    i64::try_from(limit)?.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to list abandoned runtime stage cancellations")?;
+
+        let mut settled = 0_u64;
+        for row in rows {
+            let lease = StageLease {
+                stage_id: row.try_get_by_index(0)?,
+                worker_id: row.try_get_by_index(1)?,
+                attempt_count: i64_to_u32(row.try_get_by_index(2)?)?,
+                attempt_token: row.try_get_by_index(3)?,
+            };
+            let tx = db
+                .begin_with_options(write_transaction_options())
+                .await
+                .context("Failed to start abandoned cancellation settlement transaction")?;
+            if self
+                .finalize_stage_cancellation_with(&tx, &lease, now, settlement)
+                .await?
+                .is_some()
+            {
+                tx.commit()
+                    .await
+                    .context("Failed to commit abandoned cancellation settlement transaction")?;
+                settled = settled.saturating_add(1);
+            } else {
+                tx.rollback().await?;
+            }
+        }
+        Ok(settled)
     }
 
     pub async fn queued_stage_count(&self) -> anyhow::Result<u64> {
@@ -5507,11 +5635,10 @@ impl BatchRuntimeStore {
         db: &C,
         lease: &StageLease,
         now: i64,
+        settlement: CancellationSettlement,
     ) -> anyhow::Result<Option<JobStage>> {
-        let result = db
-            .execute_raw(raw::statement(
-                db,
-                r#"
+        let sql = format!(
+            r#"
                     UPDATE job_stages
                     SET
                         status = 'cancelled',
@@ -5530,13 +5657,21 @@ impl BatchRuntimeStore {
                       AND attempt_count = ?4
                       AND (attempt_token = ?5 OR (attempt_token IS NULL AND ?5 IS NULL))
                       AND lease_expires_at IS NOT NULL
+                      AND {}
                     "#,
+            settlement.sql_predicate(6)
+        );
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                sql,
                 vec![
                     now.into(),
                     lease.stage_id.clone().into(),
                     lease.worker_id.clone().into(),
                     u32_to_i64_value(lease.attempt_count).into(),
                     opt_string(lease.attempt_token.clone()),
+                    settlement.stale_before().into(),
                 ],
             )?)
             .await
@@ -11026,6 +11161,165 @@ mod tests {
         );
         assert_eq!(stopping.lease_expires_at, Some(2_100));
         assert_eq!(stopping.worker_id.as_deref(), Some("worker-1"));
+    }
+
+    async fn record_test_worker_heartbeat(store: &BatchRuntimeStore, worker_id: &str) {
+        store
+            .upsert_worker_heartbeat(WorkerHeartbeatUpdate {
+                worker_id: worker_id.to_string(),
+                status: "running".to_string(),
+                queue_names: vec![],
+                current_job_id: None,
+                current_stage_id: None,
+                diagnostic_json: json!({}),
+            })
+            .await
+            .expect("worker heartbeat");
+    }
+
+    #[tokio::test]
+    async fn abandoned_cancellation_settles_only_after_owner_stops_renewing_and_heartbeating() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        store.test_tts_admission_limits = Some((1, 1));
+        let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
+        record_test_worker_heartbeat(&store, "worker-1").await;
+        let claimed = store
+            .claim_next_stage("worker-1", 10_000)
+            .await
+            .expect("claim")
+            .expect("active attempt");
+        let lease = claimed.lease().expect("lease");
+        store
+            .cancel_job(&job.id, Some("user cancel".to_string()))
+            .await
+            .expect("cancel")
+            .expect("cancellation requested");
+        assert!(store.create_job(admission_job(2)).await.is_err());
+
+        // Lease lapsed and the heartbeat is stale, but not yet by the grace.
+        clock.store(10_999 + ABANDONED_CANCELLATION_GRACE_MS, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recovery"),
+            0
+        );
+
+        // A still-heartbeating owner is never settled, however old its lease.
+        clock.store(11_001 + 2 * ABANDONED_CANCELLATION_GRACE_MS, Ordering::SeqCst);
+        record_test_worker_heartbeat(&store, "worker-1").await;
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recovery"),
+            0
+        );
+        assert_eq!(
+            store.stage_lease_state(&lease).await.expect("lease state"),
+            Some(StageLeaseState::CancellationRequested)
+        );
+
+        // The owner process died: no renewal and no heartbeat for the grace.
+        clock.store(11_002 + 3 * ABANDONED_CANCELLATION_GRACE_MS, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recovery"),
+            1
+        );
+        let settled = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(settled.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(settled.cancellation_state, None);
+        assert_eq!(settled.worker_id, None);
+        assert_eq!(settled.lease_expires_at, None);
+        let settled_job = store
+            .get_job(&job.id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(settled_job.status, RuntimeJobStatus::Cancelled);
+        assert_eq!(settled_job.cancellation_state, None);
+        assert_eq!(settled_job.cancellation_reason.as_deref(), Some("user cancel"));
+
+        // The dead attempt stays fenced, and admission capacity is released.
+        assert!(store
+            .finalize_stage_cancellation(&lease)
+            .await
+            .expect("late owner settlement")
+            .is_none());
+        assert!(!store
+            .renew_stage_lease(&lease, 10_000)
+            .await
+            .expect("late owner renewal"));
+        store
+            .create_job(admission_job(2))
+            .await
+            .expect("admission released");
+    }
+
+    #[tokio::test]
+    async fn abandoned_cancellation_ignores_a_restarted_incarnation_reusing_the_worker_id() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
+        record_test_worker_heartbeat(&store, "worker-1").await;
+        store
+            .claim_next_stage("worker-1", 10_000)
+            .await
+            .expect("claim")
+            .expect("active attempt");
+        store
+            .cancel_job(&job.id, None)
+            .await
+            .expect("cancel")
+            .expect("cancellation requested");
+
+        let now = 11_001 + ABANDONED_CANCELLATION_GRACE_MS;
+        clock.store(now, Ordering::SeqCst);
+        let db = store.connection().await.expect("database");
+        db.execute_raw(
+            crate::db::raw::statement(
+                db,
+                "UPDATE runtime_worker_heartbeats SET started_at = ?1, last_heartbeat_at = ?1 WHERE worker_id = ?2",
+                vec![now.into(), "worker-1".into()],
+            )
+            .expect("statement"),
+        )
+        .await
+        .expect("restarted incarnation heartbeat");
+
+        assert_eq!(
+            store
+                .recover_expired_stage_leases(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)
+                .await
+                .expect("recovery"),
+            1
+        );
+        let settled = store
+            .get_stage(&stage.id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(settled.status, RuntimeStageStatus::Cancelled);
+        assert_eq!(
+            store
+                .get_job(&job.id)
+                .await
+                .expect("job")
+                .expect("job exists")
+                .status,
+            RuntimeJobStatus::Cancelled
+        );
     }
 
     #[tokio::test]
