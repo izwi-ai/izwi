@@ -546,6 +546,173 @@ fn lfm25_fused_vs_unfused_shortconv_cpu() {
     fused_vs_unfused_shortconv(DeviceProfile::cpu());
 }
 
+/// B decode rows through one quantized projection, shaped `(B, 1, k)` (Candle
+/// mat-vec, one dispatch per row) against `(1, B, k)` (Candle mat-mat, one
+/// dispatch), with the largest difference between the two results.
+fn batched_projection_shapes(device: &candle_core::Device) {
+    use candle_core::quantized::QMatMul;
+    use candle_core::Module;
+    let path = models_dir_for_bench()
+        .join("LFM2.5-1.2B-Instruct-GGUF")
+        .join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf");
+    if !path.exists() {
+        return;
+    }
+    let loader = GgufLoader::from_path(&path).unwrap();
+    for name in [
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.2.ffn_down.weight",
+        "blk.0.shortconv.out_proj.weight",
+        "blk.2.attn_k.weight",
+        "token_embd.weight",
+    ] {
+        let qtensor = loader.load_qtensor(name, device).unwrap();
+        let dtype = qtensor.dtype();
+        let (_, cols) = qtensor.shape().dims2().unwrap();
+        let matmul = QMatMul::from_qtensor(qtensor).unwrap();
+        for batch in [1usize, 2, 4, 8] {
+            let rows = Tensor::randn(0f32, 1f32, (batch, 1, cols), device).unwrap();
+            let seq = rows.reshape((1, batch, cols)).unwrap();
+            let time = |input: &Tensor| {
+                for _ in 0..4 {
+                    let _ = matmul.forward(input).unwrap();
+                }
+                device.synchronize().unwrap();
+                let started = Instant::now();
+                for _ in 0..100 {
+                    let _ = matmul.forward(input).unwrap();
+                }
+                device.synchronize().unwrap();
+                started.elapsed().as_secs_f64() * 1e6 / 100.0
+            };
+            let (mv, mm) = (time(&rows), time(&seq));
+            let a = matmul.forward(&rows).unwrap().flatten_all().unwrap();
+            let b = matmul.forward(&seq).unwrap().flatten_all().unwrap();
+            let diff = (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!(
+                "{name:32} {dtype:?} B={batch}: rows {mv:8.1} us, sequence {mm:8.1} us, max diff {diff:.2e}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_batched_projection_shapes_metal() {
+    if let Some(device) = crate::backends::metal_device_if_available(0) {
+        batched_projection_shapes(&device);
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_batched_projection_shapes_cpu() {
+    batched_projection_shapes(&candle_core::Device::Cpu);
+}
+
+/// Aggregate decode throughput by batch width: B rows decode together in one
+/// batched step, for B = 1, 2 and 4, interleaved step by step.
+fn batch_width_scaling(profile: DeviceProfile) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let widths = [1usize, 2, 4];
+    let sessions: Vec<Sessions> = widths.iter().map(|_| Sessions::new(&model)).collect();
+    let config = ChatGenerationConfig::default();
+    let mut groups: Vec<Vec<ChatDecodeState>> = widths
+        .iter()
+        .zip(&sessions)
+        .map(|(&width, sessions)| {
+            (0..width)
+                .map(|row| {
+                    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i + row as u32 * 50).collect();
+                    let mut state = model
+                        .begin_resumable_prefill_state_managed(
+                            &prompt,
+                            1024,
+                            &config,
+                            sessions.session(row as u32),
+                        )
+                        .unwrap();
+                    model
+                        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+                        .unwrap();
+                    model.decode_step(&mut state).unwrap();
+                    state
+                })
+                .collect()
+        })
+        .collect();
+    // Each width runs with the small-batch mat-vec (where the backend has
+    // it) and with Candle's per-row mat-vec, interleaved.
+    use super::super::backbone::FORCE_CANDLE_MATVEC;
+    let mut times = vec![[std::time::Duration::ZERO; 2]; widths.len()];
+    let steps = steps();
+    for step in 0..steps + 8 {
+        for (group, time) in groups.iter_mut().zip(&mut times) {
+            for (candle, slot) in [(false, 0), (true, 1)] {
+                FORCE_CANDLE_MATVEC.with(|flag| flag.set(candle));
+                let mut rows: Vec<&mut ChatDecodeState> = group.iter_mut().collect();
+                let started = Instant::now();
+                model.decode_step_batch(&mut rows).unwrap();
+                if step >= 8 {
+                    time[slot] += started.elapsed();
+                }
+            }
+        }
+    }
+    FORCE_CANDLE_MATVEC.with(|flag| flag.set(false));
+    for (&width, time) in widths.iter().zip(&times) {
+        let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+        let (small, candle) = (per(time[0]), per(time[1]));
+        eprintln!(
+            "{:?}: batch {width}: small-batch {small:.2} ms/step ({:.1} tok/s), Candle per-row {candle:.2} ms/step ({:.1} tok/s)",
+            model.device_kind(),
+            width as f64 * 1000.0 / small,
+            width as f64 * 1000.0 / candle
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_batch_width_scaling_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        batch_width_scaling(profile);
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_batch_width_scaling_cpu() {
+    batch_width_scaling(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF and an NVIDIA GPU"]
+fn lfm25_batch_width_scaling_cuda() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Cuda).unwrap();
+    if profile.device.is_cuda() {
+        batch_width_scaling(profile);
+    }
+}
+
 /// Decode time with F32 against F16 KV storage, interleaved token by token,
 /// at a short and a `IZWI_BENCH_CONTEXT`-token (default 4,096) context.
 fn kv_dtype_decode(profile: DeviceProfile) {

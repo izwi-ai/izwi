@@ -2,7 +2,7 @@ use super::diagnostics;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
@@ -387,6 +387,10 @@ thread_local! {
     /// the op-by-op path, for parity and A/B timing against the fused step.
     pub(crate) static FORCE_UNFUSED_SHORTCONV: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test-only switch that sends this thread's projections to Candle's
+    /// `QMatMul`, for A/B timing against the small-batch mat-vec.
+    pub(crate) static FORCE_CANDLE_MATVEC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// One decode step's KV writes and next ShortConv states, not yet
@@ -436,17 +440,17 @@ impl Lfm2PendingDecodeCommit {
 
 #[derive(Debug)]
 struct Mlp {
-    gate: QMatMul,
-    down: QMatMul,
-    up: QMatMul,
+    gate: Lfm2Linear,
+    down: Lfm2Linear,
+    up: Lfm2Linear,
 }
 
 #[derive(Debug)]
 struct AttentionLayer {
-    wq: QMatMul,
-    wk: QMatMul,
-    wv: QMatMul,
-    wo: QMatMul,
+    wq: Lfm2Linear,
+    wk: Lfm2Linear,
+    wv: Lfm2Linear,
+    wo: Lfm2Linear,
     q_norm: LfmRmsNorm,
     k_norm: LfmRmsNorm,
     qk_norm_weight: Tensor,
@@ -464,8 +468,8 @@ struct AttentionLayer {
 
 #[derive(Debug)]
 struct ShortConvLayer {
-    in_proj: QMatMul,
-    out_proj: QMatMul,
+    in_proj: Lfm2Linear,
+    out_proj: Lfm2Linear,
     conv: Tensor,
     l_cache: usize,
     component: crate::kv::v2::StateComponentId,
@@ -487,7 +491,7 @@ struct LayerWeights {
 
 #[derive(Debug)]
 struct ProjectionHead {
-    weight: QMatMul,
+    weight: Lfm2Linear,
     bias: Option<Tensor>,
 }
 
@@ -569,9 +573,9 @@ impl Mlp {
         }
 
         Ok(Self {
-            gate: load_qmatmul_any(loader, device, &gate_names)?,
-            down: load_qmatmul_any(loader, device, &down_names)?,
-            up: load_qmatmul_any(loader, device, &up_names)?,
+            gate: load_linear_any(loader, device, &gate_names)?,
+            down: load_linear_any(loader, device, &down_names)?,
+            up: load_linear_any(loader, device, &up_names)?,
         })
     }
 
@@ -1232,7 +1236,7 @@ impl ProjectionHead {
     fn load(
         loader: &GgufLoader,
         device: &Device,
-        token_embeddings: Option<&Arc<candle_core::quantized::QTensor>>,
+        token_embeddings: Option<&Lfm2QuantizedWeight>,
     ) -> Result<Self> {
         let untied = [
             "output.weight",
@@ -1248,12 +1252,12 @@ impl ProjectionHead {
         .map(String::from);
         let weight = match token_embeddings {
             Some(tied) if !untied.iter().any(|name| loader.has_tensor(name)) => {
-                QMatMul::from_weights(tied.clone()).map_err(Error::from)?
+                Lfm2Linear::new(tied.clone())?
             }
             _ => {
                 let mut names = untied.to_vec();
                 names.extend(["token_embd.weight", "tok_embeddings.weight"].map(String::from));
-                load_qmatmul_any(loader, device, &names)?
+                load_linear_any(loader, device, &names)?
             }
         };
         let bias = load_optional_bias_any(
@@ -1334,8 +1338,8 @@ impl QuantizedLfm2Backbone {
         // no dequantized copy (512 MiB F32 for LFM2.5's 65,536 x 2,048
         // vocabulary) and no second quantized read for the head.
         let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
-            let token_embedding_q = Arc::new(load_qtensor_any(loader, device, &embedding_names)?);
-            let (vocab_size, hidden_size) = token_embedding_q.shape().dims2()?;
+            let token_embedding_q = load_weight_any(loader, device, &embedding_names)?;
+            let (vocab_size, hidden_size) = token_embedding_q.tensor.shape().dims2()?;
             (Some(token_embedding_q), vocab_size, hidden_size)
         } else {
             let shape = embedding_names
@@ -1452,7 +1456,7 @@ impl QuantizedLfm2Backbone {
                 let qk_norm_weight =
                     Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
                 LayerKind::Attention(AttentionLayer {
-                    wq: load_qmatmul_any(
+                    wq: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1461,7 +1465,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.q_proj.weight"),
                         ],
                     )?,
-                    wk: load_qmatmul_any(
+                    wk: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1470,7 +1474,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.k_proj.weight"),
                         ],
                     )?,
-                    wv: load_qmatmul_any(
+                    wv: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1479,7 +1483,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.v_proj.weight"),
                         ],
                     )?,
-                    wo: load_qmatmul_any(
+                    wo: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1504,7 +1508,7 @@ impl QuantizedLfm2Backbone {
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {
-                    in_proj: load_qmatmul_any(
+                    in_proj: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1513,7 +1517,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.conv.in_proj.weight"),
                         ],
                     )?,
-                    out_proj: load_qmatmul_any(
+                    out_proj: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1552,7 +1556,7 @@ impl QuantizedLfm2Backbone {
 
         Ok(Self {
             cfg,
-            token_embeddings,
+            token_embeddings: token_embeddings.map(|weight| weight.tensor),
             output_head,
             layers,
             norm,
@@ -2377,9 +2381,103 @@ fn rope_tables_f64(head_dim: usize, freq_base: f64, context_length: usize) -> (V
     (cos, sin)
 }
 
-fn load_qmatmul_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<QMatMul> {
-    let weights = Arc::new(load_qtensor_any(loader, device, names)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
+/// A quantized weight and, on Metal, the small-batch k-quant mat-vec over
+/// the same buffer.
+#[derive(Clone)]
+struct Lfm2QuantizedWeight {
+    tensor: Arc<candle_core::quantized::QTensor>,
+    small_batch: Option<SmallBatchMatVec>,
+}
+
+/// A quantized projection. Candle runs a `[rows, 1, k]` input (a decode
+/// batch) as one mat-vec dispatch per row, each streaming the whole weight.
+/// On Metal, 2..=8 such rows take the small-batch mat-vec instead: the same
+/// per-row arithmetic in one dispatch that reads the weight once. Every other
+/// input (one row, prefill spans, CPU, CUDA) takes Candle's `QMatMul`
+/// unchanged.
+#[derive(Debug, Clone)]
+struct Lfm2Linear {
+    matmul: QMatMul,
+    small_batch: Option<SmallBatchMatVec>,
+}
+
+impl Lfm2Linear {
+    fn new(weight: Lfm2QuantizedWeight) -> Result<Self> {
+        Ok(Self {
+            matmul: QMatMul::from_weights(weight.tensor)?,
+            small_batch: weight.small_batch,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        let per_row_mat_vec = input.rank() >= 2 && input.dim(D::Minus2)? == 1;
+        #[cfg(test)]
+        let per_row_mat_vec = per_row_mat_vec && !FORCE_CANDLE_MATVEC.with(std::cell::Cell::get);
+        match &self.small_batch {
+            Some(small_batch) if per_row_mat_vec && small_batch.accepts(input) => {
+                small_batch.forward(input)
+            }
+            _ => self.matmul.forward(input),
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+type SmallBatchMatVec = crate::kernels::metal_kquant_mv::MetalKQuantMatVec;
+
+/// Without Metal there is no small-batch kernel.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Clone)]
+enum SmallBatchMatVec {}
+
+#[cfg(not(feature = "metal"))]
+impl SmallBatchMatVec {
+    fn accepts(&self, _: &Tensor) -> bool {
+        match *self {}
+    }
+
+    fn forward(&self, _: &Tensor) -> candle_core::Result<Tensor> {
+        match *self {}
+    }
+}
+
+fn load_linear_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Lfm2Linear> {
+    Lfm2Linear::new(load_weight_any(loader, device, names)?)
+}
+
+/// On Metal with fused kernels on, the weight is read on the host and
+/// uploaded here (as Candle's GGUF load does) so the small-batch mat-vec can
+/// share its buffer; elsewhere it loads as usual.
+fn load_weight_any(
+    loader: &GgufLoader,
+    device: &Device,
+    names: &[String],
+) -> Result<Lfm2QuantizedWeight> {
+    #[cfg(feature = "metal")]
+    if device.is_metal() && crate::kernels::use_fused_kernels_for_device(device) {
+        use candle_core::quantized::{QStorage, QTensor};
+        let host = load_qtensor_any(loader, &Device::Cpu, names)?;
+        let dtype = host.dtype();
+        let (rows, cols) = host.shape().dims2()?;
+        let storage = QStorage::from_data(host.data()?, device, dtype)?;
+        let small_batch = match &storage {
+            QStorage::Metal(metal) => crate::kernels::metal_kquant_mv::MetalKQuantMatVec::new(
+                metal.buffer().clone(),
+                dtype,
+                rows,
+                cols,
+            ),
+            _ => None,
+        };
+        return Ok(Lfm2QuantizedWeight {
+            tensor: Arc::new(QTensor::new(storage, (rows, cols))?),
+            small_batch,
+        });
+    }
+    Ok(Lfm2QuantizedWeight {
+        tensor: Arc::new(load_qtensor_any(loader, device, names)?),
+        small_batch: None,
+    })
 }
 
 fn load_qtensor_any(
