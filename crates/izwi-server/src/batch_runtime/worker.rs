@@ -20,6 +20,7 @@ use izwi_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -40,6 +41,12 @@ const HEARTBEAT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// First retry delay after a lease renewal fails with a store error. It
 /// doubles per consecutive failure, capped at the regular renewal interval.
 const LEASE_RENEWAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Settlement after a claim is retried this many times in all. Each write is
+/// fenced on the exact attempt token, so a retry after an error whose write
+/// had in fact committed finds the attempt already settled and no-ops.
+const SETTLEMENT_ATTEMPTS: u32 = 5;
+const SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn lease_renewal_retry_delay(consecutive_failures: u32, renewal_interval: Duration) -> Duration {
     LEASE_RENEWAL_RETRY_DELAY
@@ -692,22 +699,32 @@ impl BatchWorkerRunner {
         drop(claim_lock);
         self.health.record_claim(claimed.stage.id.clone());
         self.record_stage_observation(&claimed, RuntimeStageOutcome::Claimed, None, None, None);
-        self.record_heartbeat(
-            "running",
-            Some((claimed.job.id.clone(), claimed.stage.id.clone())),
-        )
-        .await?;
+        // The claim is durable now. A missed heartbeat only delays liveness
+        // reporting; returning here would strand the claimed stage until its
+        // lease expired and burn an attempt.
+        if let Err(error) = self
+            .record_heartbeat(
+                "running",
+                Some((claimed.job.id.clone(), claimed.stage.id.clone())),
+            )
+            .await
+        {
+            self.health.record_error(format!(
+                "Failed to record batch worker heartbeat after claim: {error:#}"
+            ));
+        }
         let lease = claimed
             .lease()
             .ok_or_else(|| anyhow!("Claimed stage is missing worker lease ownership"))?;
         if self.drain.is_draining() {
             let relinquished = self
-                .store
-                .relinquish_stage_lease(
-                    &lease,
-                    "worker_draining",
-                    "Worker began draining before execution",
-                )
+                .settle_with_retry("relinquish draining stage", || {
+                    self.store.relinquish_stage_lease(
+                        &lease,
+                        "worker_draining",
+                        "Worker began draining before execution",
+                    )
+                })
                 .await?;
             self.record_stage_observation(
                 &claimed,
@@ -738,13 +755,14 @@ impl BatchWorkerRunner {
             );
             self.health.record_error(message.clone());
             let failed = self
-                .store
-                .fail_stage(
-                    &lease,
-                    false,
-                    Some("missing_executor".to_string()),
-                    Some(message),
-                )
+                .settle_with_retry("fail stage without executor", || {
+                    self.store.fail_stage(
+                        &lease,
+                        false,
+                        Some("missing_executor".to_string()),
+                        Some(message.clone()),
+                    )
+                })
                 .await?;
             self.record_stage_observation(
                 &claimed,
@@ -907,10 +925,17 @@ impl BatchWorkerRunner {
                 }
             }
         };
-        let persisted_state = self.store.stage_lease_state(&lease).await?;
+        let persisted_state = self
+            .settle_with_retry("read settled stage lease", || {
+                self.store.stage_lease_state(&lease)
+            })
+            .await?;
         let cancellation_reason = match persisted_state {
             Some(super::store::StageLeaseState::CancellationRequested) => {
-                self.store.mark_stage_execution_stopping(&lease).await?;
+                self.settle_with_retry("mark stage execution stopping", || {
+                    self.store.mark_stage_execution_stopping(&lease)
+                })
+                .await?;
                 Some(StageCancellationReason::UserRequested)
             }
             Some(super::store::StageLeaseState::ExecutionStopping) => {
@@ -925,9 +950,12 @@ impl BatchWorkerRunner {
         match execution_result {
             StageExecutionResolution::Finished(Ok(outcome)) => {
                 let output_artifact_count = outcome.output_artifact_count();
+                let output_artifact_ids = outcome.into_output_artifact_ids();
                 let completed = self
-                    .store
-                    .complete_stage(&lease, outcome.into_output_artifact_ids())
+                    .settle_with_retry("complete stage", || {
+                        self.store
+                            .complete_stage(&lease, output_artifact_ids.clone())
+                    })
                     .await?;
                 self.record_stage_observation(
                     &claimed,
@@ -944,7 +972,8 @@ impl BatchWorkerRunner {
             }
             StageExecutionResolution::Finished(Err(err)) => {
                 if err.downcast_ref::<SpeechStageYield>().is_some() {
-                    self.store.yield_stage(&lease).await?;
+                    self.settle_with_retry("yield stage", || self.store.yield_stage(&lease))
+                        .await?;
                     drop(_active_execution);
                     self.record_heartbeat("idle", None).await?;
                     return Ok(true);
@@ -952,21 +981,20 @@ impl BatchWorkerRunner {
                 let message = err.to_string();
                 self.health.record_error(message.clone());
                 let deterministic = err.downcast_ref::<DeterministicStageFailure>().is_some();
+                let error_code = if deterministic {
+                    "invalid_request"
+                } else {
+                    "executor_failed"
+                };
                 let failed = self
-                    .store
-                    .fail_stage(
-                        &lease,
-                        !deterministic,
-                        Some(
-                            if deterministic {
-                                "invalid_request"
-                            } else {
-                                "executor_failed"
-                            }
-                            .to_string(),
-                        ),
-                        Some(message),
-                    )
+                    .settle_with_retry("fail stage", || {
+                        self.store.fail_stage(
+                            &lease,
+                            !deterministic,
+                            Some(error_code.to_string()),
+                            Some(message.clone()),
+                        )
+                    })
                     .await?;
                 self.record_stage_observation(
                     &claimed,
@@ -990,7 +1018,11 @@ impl BatchWorkerRunner {
             }
             StageExecutionResolution::Cancelled(reason) => {
                 if reason == StageCancellationReason::UserRequested {
-                    let finalized = self.store.finalize_stage_cancellation(&lease).await?;
+                    let finalized = self
+                        .settle_with_retry("finalize stage cancellation", || {
+                            self.store.finalize_stage_cancellation(&lease)
+                        })
+                        .await?;
                     self.record_stage_observation(
                         &claimed,
                         RuntimeStageOutcome::Cancelled,
@@ -1020,12 +1052,13 @@ impl BatchWorkerRunner {
                 // still ours to retry, while a reclaimed attempt safely no-ops
                 // on its attempt token. Skipping here orphaned `Running` rows.
                 let relinquished = self
-                    .store
-                    .relinquish_stage_lease(
-                        &lease,
-                        reason.as_error_code(),
-                        format!("Stage execution cancelled: {}", reason.as_error_code()),
-                    )
+                    .settle_with_retry("relinquish cancelled stage", || {
+                        self.store.relinquish_stage_lease(
+                            &lease,
+                            reason.as_error_code(),
+                            format!("Stage execution cancelled: {}", reason.as_error_code()),
+                        )
+                    })
                     .await?;
                 let outcome = match relinquished.as_ref().map(|stage| stage.status) {
                     Some(super::types::RuntimeStageStatus::Retrying) => {
@@ -1064,6 +1097,41 @@ impl BatchWorkerRunner {
         )
         .await?;
         Ok(true)
+    }
+
+    /// Retry a settlement call through transient store errors, so one failed
+    /// write does not strand a claimed stage until lease expiry or discard a
+    /// finished result.
+    async fn settle_with_retry<T, F, Fut>(&self, operation: &str, mut call: F) -> anyhow::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let mut attempt = 1;
+        loop {
+            match call().await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < SETTLEMENT_ATTEMPTS => {
+                    warn!(
+                        worker_id = %self.config.worker_id,
+                        operation,
+                        attempt,
+                        error = %format!("{error:#}"),
+                        "Batch stage settlement failed; retrying"
+                    );
+                    self.health
+                        .record_error(format!("Failed to {operation}: {error:#}"));
+                    tokio::time::sleep(SETTLEMENT_RETRY_DELAY.saturating_mul(1 << (attempt - 1)))
+                        .await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Failed to {operation} after {SETTLEMENT_ATTEMPTS} attempts"
+                    )))
+                }
+            }
+        }
     }
 
     async fn run_maintenance_if_due(&self) -> anyhow::Result<()> {
@@ -1969,6 +2037,103 @@ mod tests {
             health.snapshot().last_claimed_stage_id.as_deref(),
             Some(stage_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_failure_after_claim_does_not_strand_the_claimed_stage() {
+        let (store, faults) = build_store_with_faults();
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
+        let health = BatchWorkerHealth::new("worker-test");
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            BatchWorkerConfig::local("worker-test"),
+            health.clone(),
+        );
+        // The polling heartbeat succeeds; the one right after the claim fails.
+        faults.arm(StoreFaultPoint::WorkerHeartbeat, 1, 1);
+
+        assert!(runner.run_once().await.expect("run once"));
+
+        assert_eq!(faults.pending_failures(StoreFaultPoint::WorkerHeartbeat), 0);
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Completed);
+        let job = store
+            .get_job(&job_id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, RuntimeJobStatus::Completed);
+        assert!(health
+            .snapshot()
+            .last_error
+            .is_some_and(|error| error.contains("heartbeat after claim")));
+    }
+
+    #[tokio::test]
+    async fn transient_completion_errors_are_retried_instead_of_discarding_the_result() {
+        let (store, faults) = build_store_with_faults();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let executor = Arc::new(FakeExecutor {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        });
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![executor.clone()],
+            BatchWorkerConfig::local("worker-test"),
+            BatchWorkerHealth::new("worker-test"),
+        );
+        faults.arm(StoreFaultPoint::CompleteStage, 0, 2);
+
+        assert!(runner.run_once().await.expect("run once"));
+
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Completed);
+        assert_eq!(stage.attempt_count, 1);
+        assert_eq!(stage.output_artifact_ids.len(), 1);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_settlement_errors_give_up_after_bounded_retries() {
+        let (store, faults) = build_store_with_faults();
+        let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            BatchWorkerConfig::local("worker-test"),
+            BatchWorkerHealth::new("worker-test"),
+        );
+        faults.arm(StoreFaultPoint::CompleteStage, 0, u32::MAX);
+
+        let error = runner.run_once().await.expect_err("settlement gives up");
+
+        assert!(format!("{error:#}").contains("complete stage after 5 attempts"));
+        assert_eq!(
+            faults.pending_failures(StoreFaultPoint::CompleteStage),
+            u32::MAX - SETTLEMENT_ATTEMPTS
+        );
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Running);
     }
 
     #[tokio::test]
