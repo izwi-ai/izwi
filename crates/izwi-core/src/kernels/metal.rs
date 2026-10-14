@@ -1789,11 +1789,11 @@ impl CustomOp3 for QkRmsNormOp {
         encoder.set_bytes(6, &(self.head_dim as u32));
         encoder.set_bytes(7, &self.eps);
 
-        let threads_per_threadgroup = self
-            .head_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 256);
+        let threads_per_threadgroup = reduction_threads(
+            self.head_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            256,
+        );
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: rows,
@@ -1935,11 +1935,11 @@ impl CustomOp2 for RmsNormOp {
         encoder.set_bytes(4, &(self.hidden_dim as u32));
         encoder.set_bytes(5, &self.eps);
 
-        let threads_per_threadgroup = self
-            .hidden_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 1024);
+        let threads_per_threadgroup = reduction_threads(
+            self.hidden_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            1024,
+        );
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.rows,
@@ -2454,7 +2454,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: max_partitions,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        split_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2479,7 +2483,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        reduce_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2521,7 +2529,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2534,6 +2546,20 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
         ))
     }
+}
+
+/// Threads for a kernel that tree-reduces across its threadgroup: the largest
+/// power of two that covers no more than `requested` lanes' next power of two
+/// and fits both the pipeline's limit and `cap`. A pipeline limit that is not
+/// a power of two (register pressure can lower it) must never become the
+/// width, because the halving reductions would then skip lanes.
+fn reduction_threads(requested: usize, pipeline_limit: usize, cap: usize) -> usize {
+    let bound = requested
+        .max(1)
+        .next_power_of_two()
+        .min(pipeline_limit.max(1))
+        .min(cap.max(1));
+    1 << (usize::BITS - 1 - bound.leading_zeros())
 }
 
 #[cfg(feature = "metal")]
@@ -2853,7 +2879,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: max_partitions,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        split_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2878,7 +2908,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        reduce_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2922,7 +2956,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width.min(pipeline.max_total_threads_per_threadgroup()),
+                    width: reduction_threads(
+                        reduction_width,
+                        pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -3913,11 +3951,11 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
         encoder.set_bytes(10, &(output_elem_count as u32));
         encoder.set_bytes(11, &self.query_scale);
 
-        let threads_per_threadgroup = self
-            .head_v_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 256);
+        let threads_per_threadgroup = reduction_threads(
+            self.head_v_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            256,
+        );
         let threadgroups = objc2_metal::MTLSize {
             width: self.num_v_heads,
             height: 1,
@@ -4937,6 +4975,24 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     #[cfg(all(feature = "metal", target_os = "macos"))]
     use candle_nn::Module;
+
+    #[test]
+    fn reduction_threads_are_always_a_power_of_two_within_every_limit() {
+        assert_eq!(reduction_threads(128, 1024, 256), 128);
+        assert_eq!(reduction_threads(80, 1024, 256), 128);
+        assert_eq!(reduction_threads(512, 1024, 256), 256);
+        // A non-power-of-two pipeline limit rounds down, never up.
+        assert_eq!(reduction_threads(256, 192, 256), 128);
+        assert_eq!(reduction_threads(128, 96, 256), 64);
+        assert_eq!(reduction_threads(0, 1024, 256), 1);
+        for requested in 1..600 {
+            for limit in [1, 3, 96, 192, 448, 768, 896, 1024] {
+                let threads = reduction_threads(requested, limit, 256);
+                assert!(threads.is_power_of_two());
+                assert!(threads <= limit && threads <= 256);
+            }
+        }
+    }
 
     #[cfg(feature = "metal")]
     #[test]
