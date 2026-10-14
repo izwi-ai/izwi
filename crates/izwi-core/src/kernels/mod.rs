@@ -18,9 +18,11 @@ pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
-pub mod numeric_check;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
+pub mod numeric_check;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};

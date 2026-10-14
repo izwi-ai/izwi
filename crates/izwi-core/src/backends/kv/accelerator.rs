@@ -4035,6 +4035,193 @@ mod tests {
         Ok(crate::backends::device::private_metal_device_for_tests(0)?)
     }
 
+    /// The simdgroup GQA decode kernel against the CPU reference, across the
+    /// geometries production families use (head dims 32/64/128/256, groups 1
+    /// to 8), both dtypes, softcap, non-zero first-page offsets, shuffled page
+    /// tables and a long row that forces context partitions and the reduce.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_gqa_paged_decode_matches_cpu_across_family_geometries() -> Result<()> {
+        let Some(device) = private_metal_device()? else {
+            return Ok(());
+        };
+        let _env = EagerFenceEnv::set(None);
+        let page_tokens = 16_usize;
+        let capacity_pages = 160_usize;
+        let rows = [(1_usize, 3_usize), (77, 0), (2100, 5)];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        for (head_dim, num_kv_heads, num_heads) in [
+            (32_usize, 4_usize, 28_usize),
+            (64, 4, 4),
+            (128, 4, 16),
+            (128, 2, 14),
+            (256, 2, 16),
+            (256, 4, 24),
+        ] {
+            assert!(
+                crate::kernels::metal_paged_gqa::GqaDecodeVariant::select(
+                    head_dim,
+                    head_dim,
+                    num_heads,
+                    num_kv_heads
+                )
+                .is_some(),
+                "geometry must exercise the GQA kernel"
+            );
+            for dtype in [DType::F32, DType::F16] {
+                for softcap in [None, Some(30.0_f32)] {
+                    let binding = KvLayerBinding {
+                        model_layer: 0,
+                        physical_layer: 0,
+                    };
+                    let metal_id = KvArenaId {
+                        model_instance: ModelInstanceId::new(41),
+                        backend: BackendKind::Metal,
+                        device_ordinal: Some(0),
+                        generation: 1,
+                    };
+                    let cpu_id = KvArenaId {
+                        backend: BackendKind::Cpu,
+                        device_ordinal: None,
+                        ..metal_id
+                    };
+                    let group = KvGroupId::new(0);
+                    let config = KvArenaConfig {
+                        id: metal_id,
+                        group,
+                        page_tokens: page_tokens as u32,
+                        capacity_pages: capacity_pages as u32,
+                        growth: None,
+                        dtype,
+                        layers: vec![super::super::KvLayerConfig {
+                            binding,
+                            num_kv_heads: num_kv_heads as u32,
+                            key_head_dim: head_dim as u32,
+                            value_head_dim: head_dim as u32,
+                        }],
+                    };
+                    let metal_arena = CandleAcceleratorKvArena::new_mutation_only(
+                        config.clone(),
+                        device.clone(),
+                    )?;
+                    let cpu_arena = super::super::CpuKvArena::new(KvArenaConfig {
+                        id: cpu_id,
+                        ..config
+                    })?;
+                    let block = |arena, index| CacheBlockRef {
+                        arena,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    };
+                    let slots = |arena| {
+                        (0..capacity_pages as u32)
+                            .flat_map(|page| {
+                                (0..page_tokens as u32).map(move |offset| KvSlotRef {
+                                    block: block(arena, page),
+                                    offset,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let elements = capacity_pages * page_tokens * num_kv_heads * head_dim;
+                    let keys = (0..elements).map(|_| next()).collect::<Vec<_>>();
+                    let values = (0..elements).map(|_| next()).collect::<Vec<_>>();
+                    let shape = (capacity_pages * page_tokens, num_kv_heads, head_dim);
+                    let targets: [(&dyn KvArena, KvArenaId, &Device); 2] = [
+                        (&metal_arena, metal_id, &device),
+                        (&cpu_arena, cpu_id, &Device::Cpu),
+                    ];
+                    for (arena, on, target) in targets {
+                        let lowered = arena.lower_slots(&slots(on))?;
+                        arena.write_slots(
+                            binding,
+                            KvWriteArgs {
+                                keys: &Tensor::from_vec(keys.clone(), shape, target)?
+                                    .to_dtype(dtype)?,
+                                values: &Tensor::from_vec(values.clone(), shape, target)?
+                                    .to_dtype(dtype)?,
+                                slots: lowered.as_ref(),
+                            },
+                        )?;
+                    }
+                    // Disjoint shuffled pages per row (a fixed odd stride over 160).
+                    let tables = |arena| {
+                        let mut cursor = 0_u32;
+                        rows.iter()
+                            .map(|&(context_len, first_page_offset)| {
+                                let pages = (context_len + first_page_offset).div_ceil(page_tokens);
+                                let blocks = (0..pages)
+                                    .map(|_| {
+                                        let index = (cursor * 37) % capacity_pages as u32;
+                                        cursor += 1;
+                                        block(arena, index)
+                                    })
+                                    .collect::<Vec<_>>();
+                                crate::kv::KvSequenceBlockTable {
+                                    blocks,
+                                    first_page_offset: first_page_offset as u32,
+                                    context_len: context_len as u32,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let metal_batch = KvDecodeBatchMetadata {
+                        sequences: tables(metal_id),
+                    };
+                    let cpu_batch = KvDecodeBatchMetadata {
+                        sequences: tables(cpu_id),
+                    };
+                    let queries = (0..rows.len() * num_heads * head_dim)
+                        .map(|_| next())
+                        .collect::<Vec<_>>();
+                    let query_shape = (rows.len(), num_heads, head_dim);
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+                    let decode =
+                        |arena: &dyn KvArena, batch, target: &Device| -> Result<Vec<f32>> {
+                            arena
+                                .paged_decode(
+                                    binding,
+                                    PagedKvDecodeArgs {
+                                        queries: &Tensor::from_vec(
+                                            queries.clone(),
+                                            query_shape,
+                                            target,
+                                        )?
+                                        .to_dtype(dtype)?,
+                                        batch,
+                                        softmax_scale: scale,
+                                        softcap,
+                                    },
+                                )?
+                                .to_device(&Device::Cpu)?
+                                .to_dtype(DType::F32)?
+                                .flatten_all()?
+                                .to_vec1::<f32>()
+                                .map_err(Into::into)
+                        };
+                    let metal = decode(&metal_arena, &metal_batch, &device)?;
+                    let cpu = decode(&cpu_arena, &cpu_batch, &Device::Cpu)?;
+                    let tolerance = if dtype == DType::F32 { 2e-4 } else { 4e-3 };
+                    for (index, (actual, expected)) in metal.iter().zip(&cpu).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+                            "hd {head_dim} heads {num_heads}/{num_kv_heads} {dtype:?} \
+                             softcap {softcap:?} element {index}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn metal_paged_decode_and_prefill_match_cpu_for_ragged_shuffled_mha_gqa_mqa() -> Result<()> {

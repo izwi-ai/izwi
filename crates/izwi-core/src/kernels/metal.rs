@@ -2386,6 +2386,136 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             .max(self.value_head_dim)
             .next_power_of_two()
             .clamp(1, 256);
+
+        // Simdgroup GQA decode: one threadgroup per (row, KV head, partition)
+        // for every query head of the group. Geometries it does not cover
+        // keep the scalar kernels below.
+        if let Some(variant) = super::metal_paged_gqa::gqa_decode_enabled()
+            .then(|| {
+                super::metal_paged_gqa::GqaDecodeVariant::select(
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
+            })
+            .flatten()
+        {
+            let pipeline =
+                super::metal_paged_gqa::gqa_decode_pipeline(device.metal_device(), dtype, variant)?;
+            if pipeline.max_total_threads_per_threadgroup()
+                >= super::metal_paged_gqa::GQA_DECODE_THREADS
+            {
+                let (partitions, partition_tokens) = super::metal_paged_gqa::gqa_decode_partitions(
+                    self.batch_size,
+                    self.num_kv_heads,
+                    max_context_len,
+                );
+                let partial_count = if partitions > 1 {
+                    self.batch_size
+                        .checked_mul(self.num_heads)
+                        .and_then(|value| value.checked_mul(partitions))
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg("paged attention split overflow".into())
+                        })?
+                } else {
+                    1
+                };
+                let partial_value_count = partial_count
+                    .checked_mul(self.value_head_dim)
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("paged attention split overflow".into())
+                    })?;
+                let partial_values =
+                    device.new_buffer(partial_value_count, DType::F32, "izwi-paged-gqa-parts")?;
+                let partial_maxes =
+                    device.new_buffer(partial_count, DType::F32, "izwi-paged-gqa-maxes")?;
+                let partial_sums =
+                    device.new_buffer(partial_count, DType::F32, "izwi-paged-gqa-sums")?;
+
+                encoder.set_label("izwi-paged-decode-gqa");
+                encoder.set_compute_pipeline_state(&pipeline);
+                encoder.set_input_buffer(
+                    0,
+                    Some(q_storage.buffer()),
+                    q_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_input_buffer(
+                    1,
+                    Some(k_storage.buffer()),
+                    k_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_input_buffer(
+                    2,
+                    Some(v_storage.buffer()),
+                    v_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_output_buffer(3, Some(&output), 0);
+                encoder.set_output_buffer(4, Some(&partial_values), 0);
+                encoder.set_output_buffer(5, Some(&partial_maxes), 0);
+                encoder.set_output_buffer(6, Some(&partial_sums), 0);
+                encoder.set_input_buffer(7, Some(metadata_storage.buffer()), metadata_offset);
+                encoder.set_bytes(8, &(self.batch_size as u32));
+                encoder.set_bytes(9, &(self.num_heads as u32));
+                encoder.set_bytes(10, &(self.num_kv_heads as u32));
+                encoder.set_bytes(11, &(self.page_tokens as u32));
+                encoder.set_bytes(12, &(self.max_blocks as u32));
+                encoder.set_bytes(13, &(self.key_head_dim as u32));
+                encoder.set_bytes(14, &self.scale);
+                encoder.set_bytes(15, &self.softcap.unwrap_or(0.0));
+                encoder.set_bytes(16, &(partition_tokens as u32));
+                encoder.set_bytes(17, &(partitions as u32));
+                encoder.dispatch_thread_groups(
+                    objc2_metal::MTLSize {
+                        width: self.num_kv_heads,
+                        height: self.batch_size,
+                        depth: partitions,
+                    },
+                    objc2_metal::MTLSize {
+                        width: super::metal_paged_gqa::GQA_DECODE_THREADS,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                if partitions > 1 {
+                    let (_, reduce_pipeline) =
+                        paged_decode_attention_split_pipelines(device.metal_device(), dtype)?;
+                    encoder.insert_memory_barrier();
+                    encoder.set_label("izwi-paged-decode-gqa-reduce");
+                    encoder.set_compute_pipeline_state(&reduce_pipeline);
+                    encoder.set_input_buffer(0, Some(&partial_values), 0);
+                    encoder.set_input_buffer(1, Some(&partial_maxes), 0);
+                    encoder.set_input_buffer(2, Some(&partial_sums), 0);
+                    encoder.set_output_buffer(3, Some(&output), 0);
+                    encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
+                    encoder.set_bytes(5, &(self.num_heads as u32));
+                    encoder.set_bytes(6, &(self.value_head_dim as u32));
+                    encoder.set_bytes(7, &(partition_tokens as u32));
+                    encoder.set_bytes(8, &(partitions as u32));
+                    encoder.dispatch_thread_groups(
+                        objc2_metal::MTLSize {
+                            width: self.num_heads,
+                            height: self.batch_size,
+                            depth: 1,
+                        },
+                        objc2_metal::MTLSize {
+                            width: reduction_threads(
+                                reduction_width,
+                                reduce_pipeline.max_total_threads_per_threadgroup(),
+                                256,
+                            ),
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+                drop(encoder);
+                return Ok((
+                    MetalStorage::new(output, device, elem_count, dtype),
+                    Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
+                ));
+            }
+        }
         let base_workgroups = self.batch_size.saturating_mul(self.num_heads);
         let use_split_kv = max_context_len > METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT
             && base_workgroups <= METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS;
