@@ -4886,10 +4886,12 @@ fn prefix_enabled_for_domain(
     domain_id: crate::kv::CacheDomainId,
 ) -> bool {
     // Only paged-attention domains route through the token-page index below.
-    // For a hybrid contract the paged attach is sound only when the tensor
-    // domains can fork their committed snapshots at the same cursor, so the
-    // strict sharing gate must accept the whole contract; contracts without
-    // tensor domains keep the plain paged behavior.
+    // For a hybrid contract the paged attach is sound only when every other
+    // domain can fork its committed state at the same cursor, so the strict
+    // sharing gate must accept the whole contract; only paged-only contracts
+    // keep the plain paged behavior. A ring (LFM2 ShortConv), append or
+    // static domain has no snapshot fork path, so attaching pages beside it
+    // would continue from a reset ring at cursor N.
     let paged_shareable = contract.domains.iter().any(|domain| {
         if domain.id() != domain_id {
             return false;
@@ -4902,12 +4904,12 @@ fn prefix_enabled_for_domain(
     if !paged_shareable {
         return false;
     }
-    let tensor_domains = contract
+    let stateful_domains = contract
         .domains
         .iter()
-        .filter(|domain| matches!(domain, StateDomainSpec::Tensor(_)))
+        .filter(|domain| !matches!(domain, StateDomainSpec::PagedAttention(_)))
         .count();
-    tensor_domains == 0 || tensor_snapshot_prefix_policy(contract).is_some()
+    stateful_domains == 0 || tensor_snapshot_prefix_policy(contract).is_some()
 }
 
 fn sliding_window_for_domain(
@@ -6894,6 +6896,51 @@ mod tests {
             cuda_contiguous_replacement_required_bytes(65_536, &paged, TENSOR_BYTES).unwrap()
                 > exact_resident
         );
+    }
+
+    /// A paged attach beside an un-snapshotted ShortConv ring would restart
+    /// the ring at zero at cursor N. Even if LFM2's attention domain opted
+    /// into committed-page sharing, the gate must refuse it.
+    #[test]
+    fn prefix_gate_rejects_paged_attach_beside_an_unsnapshotted_ring() {
+        let config = crate::models::architectures::lfm2::config::Lfm2BackboneConfig {
+            architecture: "lfm2".into(),
+            block_count: 4,
+            context_length: 64,
+            embedding_length: 16,
+            embedding_length_out: None,
+            feed_forward_length: Some(32),
+            attention_head_count: 4,
+            attention_head_count_kv: vec![0, 2, 0, 2],
+            attention_layer_norm_rms_epsilon: 1e-5,
+            attention_sliding_window: None,
+            rope_freq_base: 1_000_000.0,
+            shortconv_l_cache: 3,
+        };
+        let mut contract =
+            crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(&config)
+                .unwrap();
+        let mut attention = None;
+        for domain in &mut contract.domains {
+            if let StateDomainSpec::PagedAttention(spec) = domain {
+                spec.header.prefix = PrefixPolicy::CommittedPages {
+                    positions: crate::kv::v2::PositionSemantics::Absolute,
+                };
+                attention = Some(spec.header.id);
+            }
+        }
+        let attention = attention.expect("LFM2 has a paged attention domain");
+        assert!(contract
+            .domains
+            .iter()
+            .any(|domain| matches!(domain, StateDomainSpec::Ring(_))));
+        assert!(!prefix_enabled_for_domain(&contract, attention));
+        // A paged-only contract keeps plain paged sharing.
+        let paged_only = crate::kv::v2::test_contract();
+        assert!(prefix_enabled_for_domain(
+            &paged_only,
+            paged_only.domains[0].id()
+        ));
     }
 
     /// LFM2.5 chat on CUDA fits one 32K context (6 attention layers x 8 KV
