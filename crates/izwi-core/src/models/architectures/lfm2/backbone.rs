@@ -1092,8 +1092,7 @@ impl QuantizedLfm2Backbone {
     ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (context_length, head_dim) = rope_table_geometry(&cfg)?;
-        let (cos, sin) =
-            precompute_freqs(head_dim, cfg.rope_freq_base as f32, context_length, device)?;
+        let (cos, sin) = precompute_freqs(head_dim, cfg.rope_freq_base, context_length, device)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -2057,22 +2056,42 @@ pub(crate) fn rope_table_geometry(cfg: &Lfm2BackboneConfig) -> Result<(usize, us
     Ok((cfg.context_length, head_dim))
 }
 
+/// NEOX RoPE `cos`/`sin` tables, `[context_length, head_dim / 2]` F32.
+///
+/// Angles and their cosines are computed on the host in F64 and uploaded
+/// once. On the device, an F32 `position × inv_freq` loses about 0.008 rad at
+/// position 128K before `cos` runs, and Candle's Metal kernels evaluate
+/// `cos`/`sin` with fast math, so device tables drift with position on every
+/// backend.
 fn precompute_freqs(
     head_dim: usize,
-    freq_base: f32,
+    freq_base: f64,
     context_length: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<f32> = (0..head_dim)
+    let (cos, sin) = rope_tables_f64(head_dim, freq_base, context_length);
+    let half = head_dim / 2;
+    Ok((
+        Tensor::from_vec(cos, (context_length, half), device)?,
+        Tensor::from_vec(sin, (context_length, half), device)?,
+    ))
+}
+
+fn rope_tables_f64(head_dim: usize, freq_base: f64, context_length: usize) -> (Vec<f32>, Vec<f32>) {
+    let inv_freq: Vec<f64> = (0..head_dim)
         .step_by(2)
-        .map(|idx| 1.0f32 / freq_base.powf(idx as f32 / head_dim as f32))
+        .map(|index| 1.0 / freq_base.powf(index as f64 / head_dim as f64))
         .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let angles = Tensor::arange(0u32, context_length as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    Ok((angles.cos()?, angles.sin()?))
+    let mut cos = Vec::with_capacity(context_length * inv_freq.len());
+    let mut sin = Vec::with_capacity(context_length * inv_freq.len());
+    for position in 0..context_length {
+        for frequency in &inv_freq {
+            let (s, c) = (position as f64 * frequency).sin_cos();
+            cos.push(c as f32);
+            sin.push(s as f32);
+        }
+    }
+    (cos, sin)
 }
 
 fn load_qmatmul_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<QMatMul> {
@@ -2136,11 +2155,55 @@ fn load_optional_bias_any(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        lfm25_cuda_flash_attention_options, lfm2_attention_position_masked,
+        lfm25_cuda_flash_attention_options, lfm2_attention_position_masked, precompute_freqs,
         Lfm2ShortConvRuntimeState,
     };
     use crate::kv::v2::StateComponentId;
     use candle_core::{DType, Device, Tensor};
+
+    /// The tables on `device` match F64 `cos`/`sin` at far positions.
+    fn assert_rope_tables_exact(device: &Device) {
+        const HEAD_DIM: usize = 64;
+        const BASE: f64 = 1_000_000.0;
+        const CONTEXT: usize = 128_000;
+        let (cos, sin) = precompute_freqs(HEAD_DIM, BASE, CONTEXT, device).unwrap();
+        for position in [4_095_usize, 65_535, 127_999] {
+            let cos_row: Vec<f32> = cos.get(position).unwrap().to_vec1().unwrap();
+            let sin_row: Vec<f32> = sin.get(position).unwrap().to_vec1().unwrap();
+            for (index, (c, s)) in cos_row.iter().zip(&sin_row).enumerate() {
+                let inv = 1.0 / BASE.powf((2 * index) as f64 / HEAD_DIM as f64);
+                let angle = position as f64 * inv;
+                let cos_err = (f64::from(*c) - angle.cos()).abs();
+                let sin_err = (f64::from(*s) - angle.sin()).abs();
+                // `<` is false for NaN, so a non-finite entry fails.
+                assert!(
+                    cos_err < 1e-6 && sin_err < 1e-6,
+                    "position {position} frequency {index}: cos {cos_err} sin {sin_err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rope_tables_match_f64_at_far_positions_on_cpu() {
+        assert_rope_tables_exact(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn rope_tables_match_f64_at_far_positions_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        assert_rope_tables_exact(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
+    fn rope_tables_match_f64_at_far_positions_on_cuda() {
+        assert_rope_tables_exact(&Device::new_cuda(0).expect("CUDA device required"));
+    }
 
     #[test]
     fn embeds_only_backbone_skips_the_token_table_and_matches_the_full_load() {
