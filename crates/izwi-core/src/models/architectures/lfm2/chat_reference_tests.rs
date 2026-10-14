@@ -6,7 +6,8 @@
 //! The tests are ignored because they need the published GGUFs. They look in
 //! `IZWI_LFM25_MODELS_DIR`, else the default models directory, and skip a
 //! model whose folder is missing. Each backend leg checks:
-//! * prompt ids equal the reference template rendering;
+//! * prompt ids equal the checkpoint chat template's rendering, including
+//!   whitespace, empty-turn and past-thinking cases;
 //! * one-shot and two-span (5 + rest) prefill agree;
 //! * teacher-forced decode, scalar and two-row batched, tracks the reference
 //!   top-8 logits, and the argmax equals the reference token wherever the
@@ -46,6 +47,14 @@ struct Fixture {
 struct FixtureModel {
     folder: String,
     prompts: std::collections::BTreeMap<String, FixturePrompt>,
+    /// Prompt-id-only cases rendered by the checkpoint's chat template.
+    template_cases: std::collections::BTreeMap<String, FixtureTemplateCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct FixtureTemplateCase {
+    messages: Vec<(String, String)>,
+    prompt_ids: Vec<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -290,6 +299,10 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
         return;
     }
     let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
+    for (name, case) in &model_fixture.template_cases {
+        let ids = model.prompt_token_ids(&messages(&case.messages)).unwrap();
+        assert_eq!(ids, case.prompt_ids, "{key}/{name}: template prompt ids");
+    }
     let sessions = Sessions::new(&model);
     let device = model.device.device.clone();
     let backend = format!("{:?}", model.device_kind());

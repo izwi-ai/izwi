@@ -24,10 +24,17 @@ tokens, so one early disagreement cannot cascade, and asserts:
   * izwi's argmax equals the reference token wherever the reference margin is
     not a near tie.
 
+Prompts are rendered with the checkpoint's own GGUF chat template (jinja2,
+HF's sandboxed environment settings) and must equal the hand-written
+`render` below. `TEMPLATE_CASES` add prompt-id-only cases (whitespace,
+empty turns, think-only past turns, a mid-conversation system message) that
+pin izwi's prompt builder to the template.
+
 Before writing, the script checks itself: a two-chunk prefill must reproduce
 the one-shot prefill logits.
 
-Usage (needs numpy, torch, gguf, tokenizers; ~6 GB RSS, ~1 min per model):
+Usage (needs numpy, torch, gguf, tokenizers, jinja2; ~6 GB RSS, ~1 min per
+model):
 
     python3 -I scripts/fixtures/generate_lfm25_reference.py \
         "$HOME/Library/Application Support/izwi/models" \
@@ -39,6 +46,7 @@ import json
 import math
 import sys
 
+import jinja2.sandbox
 import numpy as np
 import torch
 from gguf import GGUFReader
@@ -70,7 +78,57 @@ PROMPTS = {
     ],
 }
 
+# Prompt-id-only cases: (role, content) lists rendered by the template.
+TEMPLATE_CASES = {
+    "untrimmed_user": [("user", "  Hi there \n")],
+    "code_block": [("user", "```python\nprint('x')\n```\n")],
+    "leading_newlines": [("user", "\n\nleading newlines")],
+    "empty_past_assistant": [("user", "Hi"), ("assistant", ""), ("user", "Again")],
+    "think_only_past_assistant": [
+        ("user", "Q"),
+        ("assistant", "<think>only thinking</think>"),
+        ("user", "Next"),
+    ],
+    "unclosed_think_past_assistant": [
+        ("user", "Q"),
+        ("assistant", " <think>never closed "),
+        ("user", "Next"),
+    ],
+    "empty_system": [("system", ""), ("user", "Hi")],
+    "last_assistant_keeps_thinking": [
+        ("user", "Q"),
+        ("assistant", "<think>r</think>\n\nA"),
+    ],
+    "second_system_message": [
+        ("system", "S1"),
+        ("user", "u"),
+        ("system", "S2"),
+        ("user", "v"),
+    ],
+}
+
 TOP_K = 8
+
+
+def template_renderer(gguf_path):
+    """The checkpoint's chat template, rendered like HF `apply_chat_template`."""
+    reader = GGUFReader(gguf_path)
+    field = reader.fields["tokenizer.chat_template"]
+    source = bytes(field.parts[field.data[0]]).decode("utf-8")
+    env = jinja2.sandbox.ImmutableSandboxedEnvironment(
+        trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
+    )
+    env.filters["tojson"] = lambda value, **_: json.dumps(value, ensure_ascii=False)
+    template = env.from_string(source)
+
+    def render_template(messages):
+        return template.render(
+            messages=[{"role": role, "content": content} for role, content in messages],
+            bos_token="<|startoftext|>",
+            add_generation_prompt=True,
+        )
+
+    return render_template
 
 
 def render(messages):
@@ -187,11 +245,21 @@ def main():
     root, out_path = sys.argv[1], sys.argv[2]
     fixture = {"generator": "scripts/fixtures/generate_lfm25_reference.py", "models": {}}
     for key, (folder, gguf, max_steps) in MODELS.items():
-        model = Model(f"{root}/{folder}/{gguf}")
+        render_template = template_renderer(f"{root}/{folder}/{gguf}")
         tok = Tokenizer.from_file(f"{root}/{folder}/tokenizer.json")
+        template_cases = {}
+        for name, messages in TEMPLATE_CASES.items():
+            text = render_template(messages)
+            template_cases[name] = {
+                "messages": [[role, content] for role, content in messages],
+                "prompt_ids": tok.encode(text, add_special_tokens=False).ids,
+            }
+        model = Model(f"{root}/{folder}/{gguf}")
         prompts = {}
         for name, messages in PROMPTS.items():
-            ids = tok.encode(render(messages), add_special_tokens=False).ids
+            text = render(messages)
+            assert text == render_template(messages), f"{key}/{name}: render drifts from the template"
+            ids = tok.encode(text, add_special_tokens=False).ids
             st = model.new_state()
             logits = model.forward(ids, st)
             split = model.new_state()
@@ -216,7 +284,12 @@ def main():
                 ),
             }
             print(f"{key}/{name}: {len(ids)} prompt ids, {len(steps)} steps, chunk drift {drift:.2e}")
-        fixture["models"][key] = {"folder": folder, "gguf": gguf, "prompts": prompts}
+        fixture["models"][key] = {
+            "folder": folder,
+            "gguf": gguf,
+            "prompts": prompts,
+            "template_cases": template_cases,
+        }
         del model
     with open(out_path, "w") as f:
         json.dump(fixture, f, indent=1)

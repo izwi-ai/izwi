@@ -1861,6 +1861,316 @@
      ],
      "greedy_text": "Jupiter's diameter is about 140,000 kilometers, which is roughly 11 times the diameter of Earth. Therefore, approximately 11 Earths could fit across its diameter."
     }
+   },
+   "template_cases": {
+    "untrimmed_user": {
+     "messages": [
+      [
+       "user",
+       "  Hi there \n"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      730,
+      30690,
+      1413,
+      970,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "code_block": {
+     "messages": [
+      [
+       "user",
+       "```python\nprint('x')\n```\n"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      26298,
+      64014,
+      708,
+      5677,
+      2839,
+      597,
+      8999,
+      18868,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "leading_newlines": {
+     "messages": [
+      [
+       "user",
+       "\n\nleading newlines"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      508,
+      35992,
+      1361,
+      10890,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "empty_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Hi"
+      ],
+      [
+       "assistant",
+       ""
+      ],
+      [
+       "user",
+       "Again"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      42120,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      41808,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "think_only_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       "<think>only thinking</think>"
+      ],
+      [
+       "user",
+       "Next"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      64400,
+      15634,
+      6917,
+      64401,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      13304,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "unclosed_think_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       " <think>never closed "
+      ],
+      [
+       "user",
+       "Next"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      730,
+      64400,
+      58942,
+      8557,
+      730,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      13304,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "empty_system": {
+     "messages": [
+      [
+       "system",
+       ""
+      ],
+      [
+       "user",
+       "Hi"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      42120,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "last_assistant_keeps_thinking": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       "<think>r</think>\n\nA"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      64400,
+      591,
+      64401,
+      509,
+      542,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "second_system_message": {
+     "messages": [
+      [
+       "system",
+       "S1"
+      ],
+      [
+       "user",
+       "u"
+      ],
+      [
+       "system",
+       "S2"
+      ],
+      [
+       "user",
+       "v"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      24131,
+      708,
+      560,
+      526,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      594,
+      7,
+      708,
+      6,
+      24131,
+      708,
+      560,
+      527,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      595,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    }
    }
   },
   "thinking": {
@@ -6876,6 +7186,316 @@
       }
      ],
      "greedy_text": "<think> Okay, let's tackle this. The user asked how many Earths would fit across Jupiter's diameter. First, I need to recall Jupiter's diameter. Jupiter's diameter is about 142,984 km. An Earth's diameter is roughly 12,742 km. So dividing Jupiter's diameter by Earth's"
+    }
+   },
+   "template_cases": {
+    "untrimmed_user": {
+     "messages": [
+      [
+       "user",
+       "  Hi there \n"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      730,
+      30690,
+      1413,
+      970,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "code_block": {
+     "messages": [
+      [
+       "user",
+       "```python\nprint('x')\n```\n"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      26298,
+      64014,
+      708,
+      5677,
+      2839,
+      597,
+      8999,
+      18868,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "leading_newlines": {
+     "messages": [
+      [
+       "user",
+       "\n\nleading newlines"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      508,
+      35992,
+      1361,
+      10890,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "empty_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Hi"
+      ],
+      [
+       "assistant",
+       ""
+      ],
+      [
+       "user",
+       "Again"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      42120,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      41808,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "think_only_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       "<think>only thinking</think>"
+      ],
+      [
+       "user",
+       "Next"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      64400,
+      15634,
+      6917,
+      64401,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      13304,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "unclosed_think_past_assistant": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       " <think>never closed "
+      ],
+      [
+       "user",
+       "Next"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      730,
+      64400,
+      58942,
+      8557,
+      730,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      13304,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "empty_system": {
+     "messages": [
+      [
+       "system",
+       ""
+      ],
+      [
+       "user",
+       "Hi"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      42120,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "last_assistant_keeps_thinking": {
+     "messages": [
+      [
+       "user",
+       "Q"
+      ],
+      [
+       "assistant",
+       "<think>r</think>\n\nA"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      6423,
+      708,
+      558,
+      7,
+      708,
+      6,
+      64015,
+      708,
+      64400,
+      591,
+      64401,
+      509,
+      542,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
+    },
+    "second_system_message": {
+     "messages": [
+      [
+       "system",
+       "S1"
+      ],
+      [
+       "user",
+       "u"
+      ],
+      [
+       "system",
+       "S2"
+      ],
+      [
+       "user",
+       "v"
+      ]
+     ],
+     "prompt_ids": [
+      1,
+      6,
+      24131,
+      708,
+      560,
+      526,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      594,
+      7,
+      708,
+      6,
+      24131,
+      708,
+      560,
+      527,
+      7,
+      708,
+      6,
+      6423,
+      708,
+      595,
+      7,
+      708,
+      6,
+      64015,
+      708
+     ]
     }
    }
   }

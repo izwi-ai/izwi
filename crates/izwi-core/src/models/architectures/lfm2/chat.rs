@@ -217,28 +217,26 @@ struct ChatTokenizer {
 }
 
 struct PromptScaffoldTokens {
-    system_header: Vec<u32>,
-    user_header: Vec<u32>,
+    /// The generation prompt's text after `<|im_start|>`.
     assistant_header: Vec<u32>,
+    /// The separator after each turn's `<|im_end|>`.
     newline: Vec<u32>,
 }
 
 impl PromptScaffoldTokens {
     fn load(tokenizer: &ChatTokenizer) -> Result<Self> {
         Ok(Self {
-            system_header: tokenizer.encode_text("system\n")?,
-            user_header: tokenizer.encode_text("user\n")?,
             assistant_header: tokenizer.encode_text("assistant\n")?,
             newline: tokenizer.encode_text("\n")?,
         })
     }
+}
 
-    fn role_header(&self, role: &ChatRole) -> &[u32] {
-        match role {
-            ChatRole::System => &self.system_header,
-            ChatRole::User => &self.user_header,
-            ChatRole::Assistant => &self.assistant_header,
-        }
+fn template_role(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
     }
 }
 
@@ -757,6 +755,20 @@ impl Lfm2ChatModel {
         self.build_prompt(messages)
     }
 
+    /// Render `messages` exactly like the checkpoint's chat template:
+    ///
+    /// * one BOS;
+    /// * a leading system message becomes the system turn, emitted only when
+    ///   it is non-empty;
+    /// * every other turn is `<|im_start|>{role}\n{content}<|im_end|>\n` with
+    ///   its content verbatim (empty turns included), except that an
+    ///   assistant turn before the last one keeps only the text after its
+    ///   final `</think>`, trimmed;
+    /// * the generation prompt `<|im_start|>assistant\n`.
+    ///
+    /// The text between two special tokens is tokenized as one string, as
+    /// the template's rendering is, so a content's leading characters merge
+    /// with its role header exactly as they would there.
     fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
@@ -769,18 +781,28 @@ impl Lfm2ChatModel {
             ids.push(bos);
         }
 
-        let last_assistant_index = messages
+        let (system, turns) = match messages.split_first() {
+            Some((first, rest)) if matches!(first.role, ChatRole::System) => {
+                (Some(first.content.as_str()), rest)
+            }
+            _ => (None, messages),
+        };
+        if let Some(system) = system.filter(|system| !system.is_empty()) {
+            self.append_prompt_turn(&mut ids, "system", system)?;
+        }
+
+        let last_assistant_index = turns
             .iter()
             .rposition(|message| matches!(message.role, ChatRole::Assistant));
-
-        for (prompt_index, message) in messages.iter().enumerate() {
-            self.append_prompt_message(
-                &mut ids,
-                prompt_index,
-                &message.role,
-                message.content.as_str(),
-                last_assistant_index,
-            )?;
+        for (index, message) in turns.iter().enumerate() {
+            let content = if matches!(message.role, ChatRole::Assistant)
+                && Some(index) != last_assistant_index
+            {
+                strip_past_assistant_thinking(&message.content)
+            } else {
+                Cow::Borrowed(message.content.as_str())
+            };
+            self.append_prompt_turn(&mut ids, template_role(&message.role), &content)?;
         }
 
         ids.push(self.tokenizer.specials.im_start);
@@ -789,32 +811,9 @@ impl Lfm2ChatModel {
         Ok(ids)
     }
 
-    fn append_prompt_message(
-        &self,
-        ids: &mut Vec<u32>,
-        prompt_index: usize,
-        role: &ChatRole,
-        content: &str,
-        last_assistant_index: Option<usize>,
-    ) -> Result<()> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
-        let normalized =
-            if matches!(role, ChatRole::Assistant) && Some(prompt_index) != last_assistant_index {
-                strip_past_assistant_thinking(trimmed)
-            } else {
-                Cow::Borrowed(trimmed)
-            };
-        if normalized.is_empty() {
-            return Ok(());
-        }
-
+    fn append_prompt_turn(&self, ids: &mut Vec<u32>, role: &str, content: &str) -> Result<()> {
         ids.push(self.tokenizer.specials.im_start);
-        ids.extend_from_slice(self.prompt_scaffold.role_header(role));
-        ids.extend(self.tokenizer.encode_text(normalized.as_ref())?);
+        ids.extend(self.tokenizer.encode_text(&format!("{role}\n{content}"))?);
         ids.push(self.tokenizer.specials.im_end);
         ids.extend_from_slice(&self.prompt_scaffold.newline);
         Ok(())
@@ -891,11 +890,13 @@ fn argmax_batch(logits: &Tensor) -> Result<Vec<u32>> {
         .map_err(Error::from)
 }
 
+/// The template's `content.split("</think>")[-1] | trim` for past assistant
+/// turns; content without `</think>` is kept verbatim.
 fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
     if let Some((_reasoning, tail)) = input.rsplit_once("</think>") {
         Cow::Owned(tail.trim().to_string())
     } else {
-        Cow::Borrowed(input.trim())
+        Cow::Borrowed(input)
     }
 }
 
@@ -954,12 +955,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_past_assistant_thinking_keeps_unclosed_content() {
-        let input = "<think>still reasoning";
-        assert_eq!(
-            strip_past_assistant_thinking(input),
-            "<think>still reasoning"
-        );
+    fn strip_past_assistant_thinking_keeps_unclosed_content_verbatim() {
+        let input = "  <think>still reasoning\n";
+        assert_eq!(strip_past_assistant_thinking(input), input);
     }
 
     #[test]
