@@ -526,6 +526,13 @@ impl InvocationTensorArena {
         self.reset()
     }
 
+    /// Wait for device work a failed operation may still have queued against
+    /// this arena, and mark it dirty so it is reset before any reuse.
+    pub(crate) fn fence_after_error(&mut self) -> Result<()> {
+        self.dirty = true;
+        self.device.synchronize().map_err(Error::from)
+    }
+
     /// Fence every write issued through this exact arena before the pool
     /// publishes an authenticated completion receipt.
     pub(crate) fn prepare_completion(&mut self) -> Result<()> {
@@ -1828,6 +1835,20 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn fence_after_error_leaves_the_arena_dirty_until_reset() {
+        let mut arena = arena(StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: header(1),
+            components: vec![fixed_component(4)],
+        }));
+        arena.fence_after_error().unwrap();
+        assert!(arena.is_dirty());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+        assert!(!arena.is_dirty());
+        arena.prepare_completion().unwrap();
     }
 
     #[test]

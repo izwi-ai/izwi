@@ -241,6 +241,18 @@ impl InvocationPagedLeaseSetV2 {
             })
     }
 
+    /// Fence the device behind every lease of a failed operation, then
+    /// abandon them. Every lease is dropped; the first fence error returns.
+    pub(crate) fn abort_and_fence(mut self) -> Result<()> {
+        let mut first_error = None;
+        for (_, lease) in std::mem::take(&mut self.leases) {
+            if let Err(error) = lease.fence() {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Release every domain even if one completion fails authentication. A
     /// failed set never exposes a partial collection of completions.
     pub(crate) fn release(mut self) -> Result<Vec<InvocationPagedDomainCompletionV2>> {
@@ -488,6 +500,11 @@ pub(crate) trait InvocationWorkspacePhysicalLeaseV2: std::fmt::Debug + Send {
     /// to the load-owned pool. Runtime-owned guards invoke this on every
     /// partial acquisition, operation error, and unwind path.
     fn abort(&mut self);
+
+    /// Wait for device work a failed operation may still have queued against
+    /// this state, then abort. The slot is abandoned even when the fence
+    /// fails; the fence error is returned.
+    fn abort_and_fence(&mut self) -> Result<()>;
 }
 
 /// A load-owned physical backing published for one typed invocation domain.
@@ -616,6 +633,15 @@ impl InvocationWorkspacePhysicalLeaseV2 for InvocationPagedWorkspacePhysicalLeas
 
     fn abort(&mut self) {
         drop(self.lease.take());
+    }
+
+    fn abort_and_fence(&mut self) -> Result<()> {
+        let fenced = self
+            .lease
+            .as_ref()
+            .map_or(Ok(()), InvocationPagedKvLease::fence);
+        self.abort();
+        fenced
     }
 }
 
@@ -931,6 +957,20 @@ impl InvocationWorkspaceLeaseSetV2 {
             Some(error) => Err(error),
             None => Ok(completions),
         }
+    }
+
+    /// Fence the device behind every lease of a failed operation, then
+    /// abandon them. Every lease is aborted; the first fence error returns.
+    pub(crate) fn abort_and_fence(mut self) -> Result<()> {
+        let mut first_error = None;
+        for (_, mut lease) in std::mem::take(&mut self.leases) {
+            if let Some(mut physical) = lease.physical.take() {
+                if let Err(error) = physical.abort_and_fence() {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn into_paged(self) -> Result<InvocationPagedLeaseSetV2> {
@@ -2273,6 +2313,11 @@ mod tests {
         fn abort(&mut self) {
             self.finish();
         }
+
+        fn abort_and_fence(&mut self) -> Result<()> {
+            self.abort();
+            Ok(())
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -2425,6 +2470,11 @@ mod tests {
 
         fn abort(&mut self) {
             self.abort_once();
+        }
+
+        fn abort_and_fence(&mut self) -> Result<()> {
+            self.abort();
+            Ok(())
         }
     }
 
