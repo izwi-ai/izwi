@@ -1752,7 +1752,10 @@ fn try_cuda_paged_decode_graph(
                     ));
                     return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 }
-                let result = output.clone();
+                // The graph writes into one static output buffer, so a clone
+                // would alias it: a second same-shape decode on this layer in
+                // the same step would overwrite this result before it is read.
+                let result = output.copy();
                 cache.push_back((
                     key,
                     CudaPagedDecodeGraphState::Captured {
@@ -1764,7 +1767,7 @@ fn try_cuda_paged_decode_graph(
                         graph,
                     },
                 ));
-                (Some(result), CudaPagedDecodeGraphOutcome::Replayed)
+                (Some(result?), CudaPagedDecodeGraphOutcome::Replayed)
             }
             CudaPagedDecodeGraphState::Warm {
                 queries: stable_queries,
@@ -1843,7 +1846,10 @@ fn try_cuda_paged_decode_graph(
                     ));
                     return Ok((None, CudaPagedDecodeGraphOutcome::EagerFallback));
                 }
-                let result = output.clone();
+                // The graph writes into one static output buffer, so a clone
+                // would alias it: a second same-shape decode on this layer in
+                // the same step would overwrite this result before it is read.
+                let result = output.copy();
                 cache.push_back((
                     key,
                     CudaPagedDecodeGraphState::Captured {
@@ -1855,7 +1861,7 @@ fn try_cuda_paged_decode_graph(
                         graph,
                     },
                 ));
-                (Some(result), CudaPagedDecodeGraphOutcome::Captured)
+                (Some(result?), CudaPagedDecodeGraphOutcome::Captured)
             }
             CudaPagedDecodeGraphState::Backoff { remaining_calls } => {
                 if remaining_calls > 1 {
