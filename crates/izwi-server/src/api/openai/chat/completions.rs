@@ -346,7 +346,7 @@ fn now_unix_secs() -> u64 {
 }
 
 fn to_core_messages_with_media(
-    _variant: ModelVariant,
+    variant: ModelVariant,
     messages: Vec<OpenAiInboundMessage>,
     _enable_thinking: Option<bool>,
     _tools: Option<Vec<serde_json::Value>>,
@@ -354,6 +354,8 @@ fn to_core_messages_with_media(
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut core = Vec::with_capacity(messages.len());
     let mut media_inputs = Vec::new();
+    // LFM2.5 has its own tool-call wire format and a native `tool` turn.
+    let lfm_tools = variant.family() == ModelFamily::Lfm2Chat;
 
     for message in messages {
         let role = parse_role(&message.role)?;
@@ -366,13 +368,18 @@ fn to_core_messages_with_media(
                 .as_ref()
                 .is_some_and(|tool_calls| !tool_calls.is_empty())
         {
-            let tool_call_xml =
-                render_tool_calls_xml(message.tool_calls.as_deref().unwrap_or(&[]))?;
-            if !tool_call_xml.is_empty() {
-                if !content.trim().is_empty() {
-                    content.push_str("\n\n");
+            let tool_calls = message.tool_calls.as_deref().unwrap_or(&[]);
+            if lfm_tools {
+                // The upstream template writes the calls right after the text.
+                content.push_str(&super::lfm_tools::render_tool_calls(tool_calls)?);
+            } else {
+                let tool_call_xml = render_tool_calls_xml(tool_calls)?;
+                if !tool_call_xml.is_empty() {
+                    if !content.trim().is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&tool_call_xml);
                 }
-                content.push_str(&tool_call_xml);
             }
         }
 
@@ -431,11 +438,19 @@ fn to_core_messages_with_media(
                 }
                 media_inputs.extend(flattened.media_inputs);
 
-                let wrapped = format!("<tool_response>\n{}\n</tool_response>", content.trim());
-                core.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: wrapped,
-                });
+                if lfm_tools {
+                    core.push(ChatMessage {
+                        role: ChatRole::Tool,
+                        content,
+                    });
+                } else {
+                    let wrapped =
+                        format!("<tool_response>\n{}\n</tool_response>", content.trim());
+                    core.push(ChatMessage {
+                        role: ChatRole::User,
+                        content: wrapped,
+                    });
+                }
             }
         }
     }
@@ -647,6 +662,26 @@ fn build_assistant_response_parts(
     Option<Vec<OpenAiOutputToolCall>>,
     &'static str,
 ) {
+    let (lfm_text, lfm_calls) = super::lfm_tools::extract_tool_calls(&text);
+    if !lfm_calls.is_empty() {
+        let tool_calls = lfm_calls
+            .into_iter()
+            .map(|call| OpenAiOutputToolCall {
+                id: new_uuid(),
+                kind: "function",
+                function: OpenAiOutputToolFunction {
+                    name: call.name,
+                    arguments: serde_json::Value::Object(call.arguments).to_string(),
+                },
+            })
+            .collect();
+        let content = lfm_text.trim();
+        return (
+            (!content.is_empty()).then(|| content.to_string()),
+            Some(tool_calls),
+            "tool_calls",
+        );
+    }
     let parsed = parse_assistant_tool_output(&text);
     if parsed.tool_calls.is_empty() {
         (Some(text), None, "stop")
@@ -1734,6 +1769,63 @@ mod tests {
         assert!(content.is_none());
         assert_eq!(finish_reason, "tool_calls");
         assert_eq!(tool_calls.map(|calls| calls.len()), Some(1));
+    }
+
+    #[test]
+    fn lfm25_tool_turns_use_the_lfm_wire_format() {
+        let text = |role: &str, content: &str| OpenAiInboundMessage {
+            role: role.to_string(),
+            content: Some(OpenAiInboundContent::Text(content.to_string())),
+            tool_calls: None,
+        };
+        let messages = vec![
+            text("user", "Weather in Paris?"),
+            OpenAiInboundMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![json!({
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                })]),
+            },
+            text("tool", "{\"temperature_c\": 21}"),
+        ];
+        let (lfm, _) = to_core_messages_with_media(
+            ModelVariant::Lfm2512BInstructGguf,
+            messages.clone(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            lfm[1].content,
+            "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
+        );
+        assert_eq!(lfm[2].role, ChatRole::Tool);
+        assert_eq!(lfm[2].content, "{\"temperature_c\": 21}");
+
+        // Other families keep the Qwen tool format.
+        let (qwen, _) =
+            to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages, None, None, None)
+                .unwrap();
+        assert!(qwen[1].content.contains("<function=get_weather>"));
+        assert_eq!(qwen[2].role, ChatRole::User);
+        assert!(qwen[2].content.starts_with("<tool_response>"));
+    }
+
+    #[test]
+    fn parses_lfm25_tool_call_output_into_openai_shape() {
+        let (content, tool_calls, finish_reason) = build_assistant_response_parts(
+            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>Checking.".to_string(),
+        );
+        assert_eq!(finish_reason, "tool_calls");
+        assert_eq!(content.as_deref(), Some("Checking."));
+        let calls = tool_calls.expect("tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! `IZWI_LFM25_MODELS_DIR`, else the default models directory, and skip a
 //! model whose folder is missing. Each backend leg checks:
 //! * prompt ids equal the checkpoint chat template's rendering, including
-//!   whitespace, empty-turn and past-thinking cases;
+//!   whitespace, empty-turn, past-thinking, tool-list and tool-turn cases;
 //! * one-shot and two-span (5 + rest) prefill agree;
 //! * teacher-forced decode, scalar and two-row batched, tracks the reference
 //!   top-8 logits, and the argmax equals the reference token wherever the
@@ -53,6 +53,8 @@ struct FixtureModel {
 #[derive(serde::Deserialize)]
 struct FixtureTemplateCase {
     messages: Vec<(String, String)>,
+    #[serde(default)]
+    tools: Vec<serde_json::Value>,
     prompt_ids: Vec<u32>,
 }
 
@@ -102,6 +104,7 @@ fn messages(raw: &[(String, String)]) -> Vec<ChatMessage> {
                 "system" => ChatRole::System,
                 "user" => ChatRole::User,
                 "assistant" => ChatRole::Assistant,
+                "tool" => ChatRole::Tool,
                 other => panic!("unknown fixture role {other}"),
             },
             content: content.clone(),
@@ -300,7 +303,9 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
     let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
     assert_eq!(model.max_context_tokens().unwrap(), 32_768, "{key}: model-card context");
     for (name, case) in &model_fixture.template_cases {
-        let ids = model.prompt_token_ids(&messages(&case.messages)).unwrap();
+        let ids = model
+            .prompt_token_ids_with_tools(&messages(&case.messages), &case.tools)
+            .unwrap();
         assert_eq!(ids, case.prompt_ids, "{key}/{name}: template prompt ids");
     }
     let sessions = Sessions::new(&model);

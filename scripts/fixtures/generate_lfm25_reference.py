@@ -107,6 +107,44 @@ TEMPLATE_CASES = {
     ],
 }
 
+# Tool definitions keep their keys sorted at every level, so serde_json's
+# sorted maps and Python's insertion order serialize identically.
+WEATHER_TOOL = {
+    "function": {
+        "description": "Get the current weather for a city.",
+        "name": "get_weather",
+        "parameters": {
+            "properties": {"city": {"description": "City name.", "type": "string"}},
+            "required": ["city"],
+            "type": "object",
+        },
+    },
+    "type": "function",
+}
+TIME_TOOL = {
+    "function": {"description": "Current UTC time.", "name": "get_time", "parameters": {}},
+    "type": "function",
+}
+
+# Prompt-id-only cases with tools: name -> (messages, tools).
+TOOL_CASES = {
+    "tools_without_system": ([("user", "What's the weather in Paris?")], [WEATHER_TOOL]),
+    "tools_with_system": (
+        [("system", "Answer briefly."), ("user", "What's the weather in Paris?")],
+        [WEATHER_TOOL, TIME_TOOL],
+    ),
+    "tool_round_trip": (
+        [
+            ("system", "Answer briefly."),
+            ("user", "What's the weather in Paris?"),
+            ("assistant", '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>'),
+            ("tool", '{"temperature_c": 21}'),
+        ],
+        [WEATHER_TOOL],
+    ),
+    "string_tool": ([("user", "Time?")], ["get_time() -> str"]),
+}
+
 TOP_K = 8
 
 
@@ -121,9 +159,10 @@ def template_renderer(gguf_path):
     env.filters["tojson"] = lambda value, **_: json.dumps(value, ensure_ascii=False)
     template = env.from_string(source)
 
-    def render_template(messages):
+    def render_template(messages, tools=None):
         return template.render(
             messages=[{"role": role, "content": content} for role, content in messages],
+            tools=tools,
             bos_token="<|startoftext|>",
             add_generation_prompt=True,
         )
@@ -252,6 +291,13 @@ def main():
             text = render_template(messages)
             template_cases[name] = {
                 "messages": [[role, content] for role, content in messages],
+                "prompt_ids": tok.encode(text, add_special_tokens=False).ids,
+            }
+        for name, (messages, tools) in TOOL_CASES.items():
+            text = render_template(messages, tools)
+            template_cases[name] = {
+                "messages": [[role, content] for role, content in messages],
+                "tools": tools,
                 "prompt_ids": tok.encode(text, add_special_tokens=False).ids,
             }
         model = Model(f"{root}/{folder}/{gguf}")

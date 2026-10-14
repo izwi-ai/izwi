@@ -2704,7 +2704,7 @@ fn render_fallback_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str("<|im_start|>");
         prompt.push_str(match message.role {
             ChatRole::System => "system",
-            ChatRole::User => "user",
+            ChatRole::User | ChatRole::Tool => "user",
             ChatRole::Assistant => "assistant",
         });
         prompt.push('\n');
@@ -2771,6 +2771,12 @@ fn render_prompt(
                 prompt.push_str("<|im_start|>user\n");
                 prompt.push_str(message.content.trim());
                 prompt.push_str("<|im_end|>\n");
+            }
+            // The template's tool turn: a user turn wrapping the result.
+            ChatRole::Tool => {
+                prompt.push_str("<|im_start|>user\n<tool_response>\n");
+                prompt.push_str(message.content.trim());
+                prompt.push_str("\n</tool_response><|im_end|>\n");
             }
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);

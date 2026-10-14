@@ -1,6 +1,7 @@
 //! OpenAI-compatible chat resources.
 
 pub mod completions;
+mod lfm_tools;
 
 use axum::{routing::post, Router};
 

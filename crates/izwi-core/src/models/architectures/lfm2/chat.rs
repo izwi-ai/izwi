@@ -237,6 +237,7 @@ fn template_role(role: &ChatRole) -> &'static str {
         ChatRole::System => "system",
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
     }
 }
 
@@ -753,14 +754,25 @@ impl Lfm2ChatModel {
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        self.build_prompt(messages)
+        self.build_prompt(messages, &[])
+    }
+
+    /// Prompt ids with the request's tool definitions in the system turn.
+    pub fn prompt_token_ids_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<Vec<u32>> {
+        self.build_prompt(messages, tools)
     }
 
     /// Render `messages` exactly like the checkpoint's chat template:
     ///
     /// * one BOS;
-    /// * a leading system message becomes the system turn, emitted only when
-    ///   it is non-empty;
+    /// * a leading system message becomes the system turn; tools append
+    ///   `List of tools: [...]` to it (after a newline when it has text), each
+    ///   tool serialized like Python's `json.dumps`; the turn is emitted only
+    ///   when non-empty;
     /// * every other turn is `<|im_start|>{role}\n{content}<|im_end|>\n` with
     ///   its content verbatim (empty turns included), except that an
     ///   assistant turn before the last one keeps only the text after its
@@ -770,7 +782,7 @@ impl Lfm2ChatModel {
     /// The text between two special tokens is tokenized as one string, as
     /// the template's rendering is, so a content's leading characters merge
     /// with its role header exactly as they would there.
-    fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+    fn build_prompt(&self, messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one message".to_string(),
@@ -788,8 +800,25 @@ impl Lfm2ChatModel {
             }
             _ => (None, messages),
         };
-        if let Some(system) = system.filter(|system| !system.is_empty()) {
-            self.append_prompt_turn(&mut ids, "system", system)?;
+        let mut system = system.unwrap_or_default().to_string();
+        if !tools.is_empty() {
+            if !system.is_empty() {
+                system.push('\n');
+            }
+            system.push_str("List of tools: [");
+            for (index, tool) in tools.iter().enumerate() {
+                if index > 0 {
+                    system.push_str(", ");
+                }
+                match tool {
+                    serde_json::Value::String(text) => system.push_str(text),
+                    other => write_python_json(other, &mut system),
+                }
+            }
+            system.push(']');
+        }
+        if !system.is_empty() {
+            self.append_prompt_turn(&mut ids, "system", &system)?;
         }
 
         let last_assistant_index = turns
@@ -853,6 +882,37 @@ fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
         && config.top_p >= 1.0
         && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
         && config.presence_penalty.abs() <= f32::EPSILON
+}
+
+/// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
+/// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
+/// kept. Object keys follow `serde_json`'s map order.
+fn write_python_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&serde_json::Value::String(key.clone()).to_string());
+                out.push_str(": ");
+                write_python_json(item, out);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
 }
 
 /// Context the LFM2.5-1.2B chat checkpoints support.
@@ -958,6 +1018,21 @@ mod tests {
         assert_eq!(
             super::argmax_batch(&logits.narrow(0, 1, 1).unwrap()).unwrap(),
             vec![2]
+        );
+    }
+
+    #[test]
+    fn tool_json_uses_python_json_dumps_spacing() {
+        let tool = serde_json::json!({
+            "function": {"name": "get_weather", "parameters": {"required": ["city"], "x": [1, 2.5, true, null]}},
+            "type": "function",
+            "u": "é\n\"q\""
+        });
+        let mut out = String::new();
+        super::write_python_json(&tool, &mut out);
+        assert_eq!(
+            out,
+            r#"{"function": {"name": "get_weather", "parameters": {"required": ["city"], "x": [1, 2.5, true, null]}}, "type": "function", "u": "é\n\"q\""}"#
         );
     }
 

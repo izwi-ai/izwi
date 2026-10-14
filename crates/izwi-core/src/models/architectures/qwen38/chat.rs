@@ -3822,6 +3822,12 @@ fn render_prompt(
                 prompt.push_str(message.content.trim());
                 prompt.push_str("<|im_end|>\n");
             }
+            // The template's tool turn: a user turn wrapping the result.
+            ChatRole::Tool => {
+                prompt.push_str("<|im_start|>user\n<tool_response>\n");
+                prompt.push_str(message.content.trim());
+                prompt.push_str("\n</tool_response><|im_end|>\n");
+            }
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);
                 prompt.push_str("<|im_start|>assistant\n");

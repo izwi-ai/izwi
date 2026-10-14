@@ -4858,7 +4858,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
-            Self::Lfm2(model) => model.prompt_token_ids(messages),
+            Self::Lfm2(model) => model.prompt_token_ids_with_tools(messages, &config.request.tools),
         }
     }
 

@@ -1072,6 +1072,7 @@ fn build_remote_chat_invocation(
                         izwi_core::ChatRole::System => WorkerChatRole::System,
                         izwi_core::ChatRole::User => WorkerChatRole::User,
                         izwi_core::ChatRole::Assistant => WorkerChatRole::Assistant,
+                        izwi_core::ChatRole::Tool => WorkerChatRole::Tool,
                     },
                     content: message.content,
                 })

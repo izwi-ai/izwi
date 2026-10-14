@@ -200,3 +200,25 @@ fn lfm_audio_profiles_report_actual_f32_despite_global_bf16_preference() {
         assert!(profile.cache_namespace.unwrap().ends_with(":f32:f32"));
     }
 }
+
+#[test]
+fn lfm_chat_prompt_carries_request_tools_in_its_system_turn() {
+    use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+    let model = tiny_lfm_model(ModelVariant::Lfm2512BInstructGguf);
+    let messages = [ChatMessage {
+        role: ChatRole::User,
+        content: "Hello".into(),
+    }];
+    let plain = model
+        .prompt_token_ids_with_config(&messages, &ChatGenerationConfig::default())
+        .unwrap();
+    let mut config = ChatGenerationConfig::default();
+    config.request.tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+    let with_tools = model
+        .prompt_token_ids_with_config(&messages, &config)
+        .unwrap();
+    // One more turn (the system turn holding the tool list), so one more
+    // <|im_start|> (id 1) than the plain prompt.
+    let starts = |ids: &[u32]| ids.iter().filter(|id| **id == 1).count();
+    assert_eq!(starts(&with_tools), starts(&plain) + 1);
+}
