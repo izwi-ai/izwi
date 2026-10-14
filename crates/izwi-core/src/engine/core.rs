@@ -4993,7 +4993,9 @@ impl EngineCore {
 
             let decode_transaction = batch.phase == ExecutionPhase::Decode;
             let mut committed_service_requests = Vec::new();
+            let mut committed_decode_work = Vec::new();
             for result in batch.results {
+                let plan_id = result.plan_id;
                 let provenance = result.provenance;
                 let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
                 let step_time_ms = if entered_model {
@@ -5025,14 +5027,24 @@ impl EngineCore {
                 }
                 match self.commit_executor_result(result, step_time_ms).await {
                     Some(committed) => {
+                        let progressed = matches!(
+                            committed.disposition,
+                            ExecutionDisposition::Progress
+                                | ExecutionDisposition::Yielded(_)
+                                | ExecutionDisposition::Finished(_)
+                        );
+                        if decode_transaction && progressed {
+                            committed_decode_work.extend(
+                                in_flight
+                                    .scheduled
+                                    .iter()
+                                    .filter(|row| row.plan_id == plan_id)
+                                    .map(|row| &row.work),
+                            );
+                        }
                         if (committed.output.tokens_processed > 0
                             || committed.output.tokens_generated > 0)
-                            && matches!(
-                                committed.disposition,
-                                ExecutionDisposition::Progress
-                                    | ExecutionDisposition::Yielded(_)
-                                    | ExecutionDisposition::Finished(_)
-                            )
+                            && progressed
                         {
                             if let Some(timing) = self
                                 .request_phase_timings
@@ -5053,6 +5065,8 @@ impl EngineCore {
             }
             self.scheduler
                 .record_committed_batch_service(&committed_service_requests, decode_transaction);
+            self.scheduler
+                .record_committed_decode_service(&committed_decode_work);
         }
         // Terminal events are a durable outbox until all fallible work for the
         // step has completed. Draining earlier can lose an abort/deadline event

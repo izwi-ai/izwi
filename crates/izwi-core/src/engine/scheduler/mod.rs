@@ -404,10 +404,12 @@ pub struct Scheduler {
     /// scheduler slot. Unlike a full prefill, one incremental span can share
     /// the transaction once this bounded wait expires.
     decode_only_steps_with_waiting_incremental_prefill: usize,
-    /// Transactions in which realtime rows consumed every decode slot while an
-    /// ordinary decode row was ready. One ordinary slot is reserved once this
-    /// bounded debt is reached.
+    /// Committed decode transactions that served only realtime rows while an
+    /// ordinary decode row was ready. Once this bounded debt is reached the
+    /// next decode transaction is left to ordinary rows.
     realtime_only_steps_with_ready_decode: usize,
+    /// Committed decode transactions that served only codec or finalization
+    /// rows while an AR decode row was ready; bounded the same way.
     audio_only_steps_with_ready_decode: usize,
 }
 
@@ -1123,20 +1125,12 @@ impl Scheduler {
         }
         let mut remaining_decode_budget = decode_budget;
 
-        let ordinary_decode_ready = self.running.iter().any(|(request_id, running)| {
-            if !running.prefill_complete || self.realtime_sessions.contains_key(request_id) {
-                return false;
-            }
-            self.requests.get(request_id).is_some_and(|metadata| {
-                metadata
-                    .retry_not_before
-                    .is_none_or(|not_before| not_before <= scheduling_now)
-                    && metadata.max_tokens > running.num_tokens_generated
-            })
-        });
-        let reserve_ordinary_decode = ordinary_decode_ready
-            && self.realtime_only_steps_with_ready_decode
-                >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+        // Realtime and ordinary rows never share a physical batch, and the
+        // core launches the first-formed lane. Once committed realtime-only
+        // transactions reach the bound, yield this transaction entirely.
+        let reserve_ordinary_decode = self.realtime_only_steps_with_ready_decode
+            >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE
+            && self.ordinary_decode_ready(scheduling_now, false);
 
         // Realtime operations are already admitted, session-fenced quanta.
         // Schedule at most one FIFO head per session and keep their source
@@ -1158,7 +1152,7 @@ impl Scheduler {
             if remaining_batch == 0 || remaining_decode_budget == 0 {
                 break;
             }
-            if reserve_ordinary_decode && (remaining_batch <= 1 || remaining_decode_budget <= 1) {
+            if reserve_ordinary_decode {
                 break;
             }
             let Some(state) = self.realtime_sessions.get_mut(&request_id) else {
@@ -1198,23 +1192,11 @@ impl Scheduler {
         // Finalization is a distinct, cache-free model stage. Schedule it
         // ahead of ordinary decode so a completed acoustic row cannot consume
         // another decoder quantum or be stranded by its output-token ceiling.
-        let ready_ordinary_decode = self.running.iter().any(|(id, running)| {
-            running.prefill_complete
-                && !running.finalize_pending
-                && running.audio_decode_pending.is_none()
-                && !self.realtime_sessions.contains_key(id)
-                && self.requests.get(id).is_some_and(|metadata| {
-                    running.num_tokens_generated < metadata.max_tokens
-                        && !self.capacity_waiting(metadata)
-                        && metadata
-                            .retry_not_before
-                            .is_none_or(|until| until <= scheduling_now)
-                })
-        });
-        // At width one a sustained supply of codec work must still leave a
-        // bounded opportunity for AR to refill other streams' audio buffers.
-        let reserve_ordinary_decode =
-            ready_ordinary_decode && self.audio_only_steps_with_ready_decode >= 4;
+        // A sustained supply of codec work must still leave a bounded
+        // opportunity for AR to refill other streams' audio buffers. Codec and
+        // AR rows form separate lanes, so the reserved transaction is AR-only.
+        let reserve_ordinary_decode = self.audio_only_steps_with_ready_decode >= 4
+            && self.ordinary_decode_ready(scheduling_now, true);
         let mut finalize_candidates = self
             .running
             .iter()
@@ -1264,8 +1246,8 @@ impl Scheduler {
                 finalize_candidates.remove(0);
             if remaining_batch == 0
                 || remaining_decode_budget == 0
-                || (remaining_batch <= 1
-                    && (force_incremental_prefill_service || reserve_ordinary_decode))
+                || reserve_ordinary_decode
+                || (remaining_batch <= 1 && force_incremental_prefill_service)
             {
                 break;
             }
@@ -1512,33 +1494,6 @@ impl Scheduler {
             remaining_batch -= 1;
             result.total_tokens += num_tokens;
             self.record_scheduled_service(&request_id, num_tokens);
-        }
-
-        let served_realtime = result.decode_requests.iter().any(|row| {
-            matches!(
-                &row.work,
-                WorkUnit::RealtimePush { .. }
-                    | WorkUnit::RealtimeFinish { .. }
-                    | WorkUnit::RealtimePreparation { .. }
-                    | WorkUnit::RealtimePromptPrefill { .. }
-                    | WorkUnit::RealtimeDecodeContinuation { .. }
-                    | WorkUnit::RealtimeCompletion { .. }
-            )
-        });
-        let served_ordinary_decode = result.decode_requests.iter().any(|row| {
-            matches!(
-                &row.work,
-                WorkUnit::SequenceStep {
-                    phase: SequencePhase::Decode,
-                    ..
-                }
-            )
-        });
-        if !ordinary_decode_ready || served_ordinary_decode {
-            self.realtime_only_steps_with_ready_decode = 0;
-        } else if served_realtime {
-            self.realtime_only_steps_with_ready_decode =
-                self.realtime_only_steps_with_ready_decode.saturating_add(1);
         }
 
         // Phase 2: schedule prefill requests.
@@ -1849,25 +1804,25 @@ impl Scheduler {
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
         }
-        if ready_ordinary_decode
-            && !result
-                .decode_requests
-                .iter()
-                .any(|row| matches!(row.work, WorkUnit::SequenceStep { .. }))
-            && result.decode_requests.iter().any(|row| {
-                matches!(
-                    row.work,
-                    WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
-                )
-            })
-        {
-            self.audio_only_steps_with_ready_decode =
-                self.audio_only_steps_with_ready_decode.saturating_add(1);
-        } else {
-            self.audio_only_steps_with_ready_decode = 0;
-        }
 
         result
+    }
+
+    /// Whether a non-realtime row can take a token decode step now.
+    /// `token_rows_only` excludes rows whose next quantum is codec or
+    /// finalization work.
+    fn ordinary_decode_ready(&self, now: Instant, token_rows_only: bool) -> bool {
+        self.running.iter().any(|(request_id, running)| {
+            running.prefill_complete
+                && !(token_rows_only
+                    && (running.finalize_pending || running.audio_decode_pending.is_some()))
+                && !self.realtime_sessions.contains_key(request_id)
+                && self.requests.get(request_id).is_some_and(|metadata| {
+                    running.num_tokens_generated < metadata.max_tokens
+                        && !self.capacity_waiting(metadata)
+                        && metadata.retry_not_before.is_none_or(|until| until <= now)
+                })
+        })
     }
 
     /// Update request state after a step.
@@ -2293,6 +2248,50 @@ impl Scheduler {
             self.decode_only_steps_with_waiting_incremental_prefill = self
                 .decode_only_steps_with_waiting_incremental_prefill
                 .saturating_add(1);
+        }
+    }
+
+    /// Advance the realtime and codec starvation debts once per committed
+    /// decode transaction, keyed on the rows that committed. The core defers
+    /// scheduled rows whose lane does not own the physical slot, so a row
+    /// that was merely scheduled is not service.
+    pub(crate) fn record_committed_decode_service(&mut self, committed: &[&WorkUnit]) {
+        if committed.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let realtime = |work: &WorkUnit| {
+            matches!(
+                work,
+                WorkUnit::RealtimePush { .. }
+                    | WorkUnit::RealtimeFinish { .. }
+                    | WorkUnit::RealtimePreparation { .. }
+                    | WorkUnit::RealtimePromptPrefill { .. }
+                    | WorkUnit::RealtimeDecodeContinuation { .. }
+                    | WorkUnit::RealtimeCompletion { .. }
+            )
+        };
+        let served_ordinary = committed.iter().any(|work| !realtime(work));
+        if served_ordinary || !self.ordinary_decode_ready(now, false) {
+            self.realtime_only_steps_with_ready_decode = 0;
+        } else {
+            self.realtime_only_steps_with_ready_decode =
+                self.realtime_only_steps_with_ready_decode.saturating_add(1);
+        }
+        let served_token_decode = committed
+            .iter()
+            .any(|work| matches!(work, WorkUnit::SequenceStep { .. }));
+        let served_codec = committed.iter().any(|work| {
+            matches!(
+                work,
+                WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
+            )
+        });
+        if served_token_decode || !self.ordinary_decode_ready(now, true) {
+            self.audio_only_steps_with_ready_decode = 0;
+        } else if served_codec {
+            self.audio_only_steps_with_ready_decode =
+                self.audio_only_steps_with_ready_decode.saturating_add(1);
         }
     }
 
@@ -4299,8 +4298,8 @@ mod tests {
     #[test]
     fn ready_ordinary_decode_receives_bounded_service_amid_realtime_demand() {
         let mut scheduler = Scheduler::new(SchedulerConfig {
-            max_batch_size: 1,
-            max_tokens_per_step: 1,
+            max_batch_size: 2,
+            max_tokens_per_step: 2,
             min_tokens_per_step: 1,
             policy: SchedulingPolicy::Priority,
             enable_adaptive_batching: false,
@@ -4321,22 +4320,61 @@ mod tests {
             realtime.id.clone(),
             scheduler.get_sequence_id(&realtime.id).expect("epoch"),
         );
-        scheduler
-            .enqueue_realtime_push(&session, 80, 1, 2)
-            .expect("realtime push");
-        scheduler.realtime_only_steps_with_ready_decode = MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE;
+        for _ in 0..=MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE {
+            scheduler
+                .enqueue_realtime_push(&session, 80, 1, 2)
+                .expect("realtime push");
+        }
 
-        let scheduled = scheduler.schedule();
-        assert_eq!(scheduled.decode_requests.len(), 1);
-        assert_eq!(scheduled.decode_requests[0].request_id, ordinary.id);
+        // Both rows fit the width, but realtime forms its own lane first and
+        // the core defers the ordinary row. Only committed rows are service.
+        for _ in 0..MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE {
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 2);
+            let (realtime_rows, deferred): (Vec<_>, Vec<_>) = step
+                .decode_requests
+                .iter()
+                .partition(|row| row.request_id == realtime.id);
+            for row in deferred {
+                scheduler.release_unexecuted_quantum(row);
+            }
+            let WorkUnit::RealtimePreparation { operation_id, .. } = realtime_rows[0].work else {
+                panic!("realtime push starts with preparation");
+            };
+            scheduler
+                .commit_realtime_stage_outcome(
+                    &session,
+                    RealtimeStageOutcome {
+                        plan_id: realtime_rows[0].plan_id,
+                        operation_id,
+                        completed: RealtimeSubphase::Preparation,
+                        next: None,
+                        input_consumed: 80,
+                        output_steps: 0,
+                        cache_append: 0,
+                    },
+                )
+                .expect("realtime commit");
+            scheduler.record_committed_decode_service(&[&realtime_rows[0].work]);
+        }
+
+        let reserved = scheduler.schedule();
+        assert_eq!(reserved.decode_requests.len(), 1);
+        assert_eq!(reserved.decode_requests[0].request_id, ordinary.id);
         assert!(matches!(
-            scheduled.decode_requests[0].work,
+            reserved.decode_requests[0].work,
             WorkUnit::SequenceStep {
                 phase: SequencePhase::Decode,
                 ..
             }
         ));
+        scheduler.record_committed_decode_service(&[&reserved.decode_requests[0].work]);
         assert_eq!(scheduler.realtime_only_steps_with_ready_decode, 0);
+        assert!(scheduler
+            .schedule()
+            .decode_requests
+            .iter()
+            .any(|row| row.request_id == realtime.id));
     }
 
     fn allow_incremental_prefill(scheduler: &mut Scheduler, request_id: &str) {
@@ -6424,7 +6462,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_rows_rotate_and_sustained_codec_work_preserves_ar_progress_at_width_one() {
+    fn audio_rows_rotate_and_sustained_codec_work_preserves_ar_progress() {
         let (mut scheduler, first, second) = two_ready_audio_requests();
         for request in [&first, &second] {
             scheduler
@@ -6441,19 +6479,36 @@ mod tests {
             served.request_id
         );
 
+        // Codec and AR rows fit the width together, but form separate lanes:
+        // the core launches the codec lane and defers AR. Only committed
+        // codec-only transactions build the debt that reserves AR service.
         let (mut scheduler, codec, ar) = two_ready_audio_requests();
+        scheduler.config.max_batch_size = 2;
         scheduler
             .request_sequence_audio_decode(&codec.id, 4)
             .unwrap();
         for _ in 0..4 {
-            let row = scheduler.schedule().decode_requests.remove(0);
+            let step = scheduler.schedule();
+            assert_eq!(step.decode_requests.len(), 2);
+            let row = &step.decode_requests[0];
             assert_eq!(row.request_id, codec.id);
+            assert!(matches!(row.work, WorkUnit::SequenceAudioDecode { .. }));
+            scheduler.release_unexecuted_quantum(&step.decode_requests[1]);
             scheduler.update_after_step(&codec.id, 0, 0, 1.0);
+            scheduler.record_committed_decode_service(&[&row.work]);
             scheduler
                 .request_sequence_audio_decode(&codec.id, 4)
                 .unwrap();
         }
-        assert_eq!(scheduler.schedule().decode_requests[0].request_id, ar.id);
+        let reserved = scheduler.schedule();
+        assert!(reserved
+            .decode_requests
+            .iter()
+            .all(|row| matches!(row.work, WorkUnit::SequenceStep { .. })));
+        assert!(reserved
+            .decode_requests
+            .iter()
+            .any(|row| row.request_id == ar.id));
 
         let (mut scheduler, high, low) = two_ready_audio_requests();
         scheduler.running.get_mut(&high.id).unwrap().priority = Priority::High;
