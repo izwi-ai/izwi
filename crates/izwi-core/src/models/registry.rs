@@ -3278,6 +3278,17 @@ impl NativeAudioChatModel {
         }
     }
 
+    /// The audio of the codes committed since the last call (LFT-5), for a
+    /// streamed request in place of the whole-utterance detokenize.
+    pub(crate) fn stream_lfm25_audio_retained_tts_audio(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Lfm25Audio(model) => model.stream_retained_tts_audio(state),
+        }
+    }
+
     pub(crate) fn lfm25_audio_tts_output_sample_rate(&self) -> u32 {
         match self {
             Self::Lfm25Audio(model) => model.decoder_config().output_sample_rate,

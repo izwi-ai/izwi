@@ -527,6 +527,43 @@ fn accepted_tts_talker_tokens(
     Ok(accepted)
 }
 
+/// Publishes the audio a streamed request committed in this quantum and,
+/// once it has finished, the final marker. The executor output then
+/// carries only the streamed count: the stream already holds the waveform,
+/// so a streamed request never also takes its model's whole-utterance
+/// finalize.
+#[allow(clippy::too_many_arguments)]
+fn stream_committed_tts_audio(
+    tx: &super::super::request::StreamStagingBuffer,
+    policy: super::super::request::EngineStreamPolicy,
+    request_id: &str,
+    sequence: &mut usize,
+    streamed_samples: &mut usize,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    finished: bool,
+) -> Result<AudioOutput> {
+    let published = samples.len();
+    if published > 0 {
+        NativeExecutor::stream_audio_with_policy(
+            tx,
+            policy,
+            request_id,
+            sequence,
+            samples,
+            sample_rate,
+            false,
+        )?;
+    }
+    *streamed_samples = streamed_samples.saturating_add(published);
+    if finished {
+        NativeExecutor::stream_final_marker_with_policy(tx, policy, request_id, sequence)?;
+        Ok(AudioOutput::streamed(*streamed_samples, sample_rate))
+    } else {
+        Ok(AudioOutput::new(Vec::new(), sample_rate))
+    }
+}
+
 #[derive(Clone)]
 struct ActiveTtsOuterCheckpoint {
     last_frames_generated: usize,
@@ -929,6 +966,7 @@ impl NativeExecutor {
                 state,
                 last_frames_generated: 0,
                 stream_sequence: 0,
+                streamed_samples: 0,
             })?;
             checkpoint
         } else {
@@ -1007,11 +1045,22 @@ impl NativeExecutor {
             let _ = active.state.take_staged_step();
         }
         let finished = step.as_ref().is_some_and(|step| step.finished);
-        let (samples, sample_rate) = if finished {
-            let output = model.finalize_retained_state(&active.state)?;
-            (output.samples, output.sample_rate)
-        } else {
-            (Vec::new(), 24_000)
+        let audio = match Self::stream_sender(request) {
+            Some(tx) if step.is_some() => stream_committed_tts_audio(
+                &tx,
+                request.stream_policy,
+                &request.id,
+                &mut active.stream_sequence,
+                &mut active.streamed_samples,
+                model.stream_retained_audio(&mut active.state)?,
+                model.output_sample_rate(),
+                finished,
+            )?,
+            _ if finished => {
+                let output = model.finalize_retained_state(&active.state)?;
+                AudioOutput::new(output.samples, output.sample_rate)
+            }
+            _ => AudioOutput::new(Vec::new(), model.output_sample_rate()),
         };
         lease.mark_clean();
         if finished {
@@ -1021,7 +1070,7 @@ impl NativeExecutor {
         }
         let result = ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
-            audio: Some(AudioOutput::new(samples, sample_rate)),
+            audio: Some(audio),
             text: None,
             input_transcription: None,
             tokens_processed: scheduled.num_tokens,
@@ -1088,6 +1137,7 @@ impl NativeExecutor {
                 state,
                 last_frames_generated: 0,
                 stream_sequence: 0,
+                streamed_samples: 0,
             })?;
         }
         let prior_stream_sequence = lease.require_state_mut()?.stream_sequence;
@@ -1145,11 +1195,23 @@ impl NativeExecutor {
         let active = lease.require_state_mut()?;
         let generated = frames.saturating_sub(active.last_frames_generated);
         active.last_frames_generated = frames;
-        let audio = AudioOutput::new(
-            Vec::new(),
-            u32::try_from(model.codec_config.sample_rate)
-                .map_err(|_| Error::InferenceError("Voxtral TTS sample rate exceeds u32".into()))?,
-        );
+        let sample_rate = u32::try_from(model.codec_config.sample_rate)
+            .map_err(|_| Error::InferenceError("Voxtral TTS sample rate exceeds u32".into()))?;
+        let audio = match Self::stream_sender(request) {
+            // A terminal row's last partial chunk is decoded by its
+            // SequenceFinalize quantum.
+            Some(tx) if !scheduled.is_prefill && !codec_ready => stream_committed_tts_audio(
+                &tx,
+                request.stream_policy,
+                &request.id,
+                &mut active.stream_sequence,
+                &mut active.streamed_samples,
+                model.stream_retained_codec_chunks(&mut active.state)?,
+                sample_rate,
+                false,
+            )?,
+            _ => AudioOutput::new(Vec::new(), sample_rate),
+        };
         lease.mark_clean();
         lease.restore()?;
         let output = ExecutorOutput {
@@ -1266,6 +1328,7 @@ impl NativeExecutor {
                     state: model.new_retained_state(artifact, params)?,
                     last_frames_generated: 0,
                     stream_sequence: 0,
+                    streamed_samples: 0,
                 })?;
             }
             let active = lease.require_state_mut()?;
@@ -1449,13 +1512,26 @@ impl NativeExecutor {
             if !is_prefill {
                 active.last_frames_generated = progress;
             }
+            let audio = match Self::stream_sender(requests[index]) {
+                Some(tx) if !is_prefill && !codec_ready => stream_committed_tts_audio(
+                    &tx,
+                    requests[index].stream_policy,
+                    &requests[index].id,
+                    &mut active.stream_sequence,
+                    &mut active.streamed_samples,
+                    model.stream_retained_codec_chunks(&mut active.state)?,
+                    sample_rate,
+                    false,
+                )?,
+                _ => AudioOutput::new(Vec::new(), sample_rate),
+            };
             row.checkpoint = None;
             lease.mark_clean();
             let lease = row.lease.take().expect("armed Voxtral lease");
             lease.restore()?;
             let output = ExecutorOutput {
                 request_id: requests[index].id.clone(),
-                audio: Some(AudioOutput::new(Vec::new(), sample_rate)),
+                audio: Some(audio),
                 text: None,
                 input_transcription: None,
                 tokens_processed: scheduled[index].num_tokens,
@@ -1528,35 +1604,39 @@ impl NativeExecutor {
             ));
         }
         let prior_stream_sequence = active.stream_sequence;
+        let prior_streamed_samples = active.streamed_samples;
         let checkpoint = active.state.begin_codec_quantum()?;
         lease.mark_dirty();
         let result = (|| -> Result<AudioOutput> {
             let active = lease.require_state_mut()?;
-            let output = model.retained_codec_finalize(&mut active.state)?;
-            let sample_rate = u32::try_from(output.sample_rate)
-                .map_err(|_| Error::InferenceError("Voxtral sample rate exceeds u32".into()))?;
-            if let Some(tx) = Self::stream_sender(request) {
-                Self::stream_audio_with_policy(
+            let audio = match Self::stream_sender(request) {
+                // The decode quanta streamed every whole chunk; this decodes
+                // the last partial one and finishes the state.
+                Some(tx) => stream_committed_tts_audio(
                     &tx,
                     request.stream_policy,
                     &request.id,
                     &mut active.stream_sequence,
-                    output.samples.clone(),
-                    sample_rate,
-                    false,
-                )?;
-                Self::stream_final_marker_with_policy(
-                    &tx,
-                    request.stream_policy,
-                    &request.id,
-                    &mut active.stream_sequence,
-                )?;
-            }
+                    &mut active.streamed_samples,
+                    model.stream_retained_codec_chunks(&mut active.state)?,
+                    u32::try_from(model.codec_config.sample_rate).map_err(|_| {
+                        Error::InferenceError("Voxtral sample rate exceeds u32".into())
+                    })?,
+                    true,
+                )?,
+                None => {
+                    let output = model.retained_codec_finalize(&mut active.state)?;
+                    let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
+                        Error::InferenceError("Voxtral sample rate exceeds u32".into())
+                    })?;
+                    AudioOutput::new(output.samples, sample_rate)
+                }
+            };
             if request.is_cancelled() {
                 return Err(Error::Cancelled(request.id.clone()));
             }
             active.state.commit_codec_quantum(&checkpoint)?;
-            Ok(AudioOutput::new(output.samples, sample_rate))
+            Ok(audio)
         })();
         let audio = match result {
             Ok(audio) => audio,
@@ -1565,6 +1645,7 @@ impl NativeExecutor {
                 let active = lease.require_state_mut()?;
                 active.state.rollback_codec_quantum(&checkpoint);
                 active.stream_sequence = prior_stream_sequence;
+                active.streamed_samples = prior_streamed_samples;
                 lease.mark_clean();
                 lease.restore()?;
                 return Err(error);
@@ -2228,6 +2309,7 @@ impl NativeExecutor {
                 state,
                 last_tokens_generated: 0,
                 stream_sequence: 0,
+                streamed_samples: 0,
             })?;
         }
         let prior = {
@@ -2316,7 +2398,7 @@ impl NativeExecutor {
         if let Some(depth) = depth {
             let _ = depth.release()?;
         }
-        let (text, generated, finished, samples, sample_rate) = {
+        let (text, generated, finished, audio) = {
             let active = lease.require_state_mut()?;
             let generated = step.as_ref().map_or(0, |step| {
                 step.tokens_generated
@@ -2326,18 +2408,25 @@ impl NativeExecutor {
                 active.last_tokens_generated = step.tokens_generated;
             }
             let finished = step.as_ref().is_some_and(|step| step.finished);
-            let samples = if finished {
-                model.detokenize_lfm25_audio_retained_tts_state(&active.state)?
-            } else {
-                Vec::new()
+            let sample_rate = model.lfm25_audio_tts_output_sample_rate();
+            let audio = match Self::stream_sender(request) {
+                Some(tx) if step.is_some() => stream_committed_tts_audio(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active.stream_sequence,
+                    &mut active.streamed_samples,
+                    model.stream_lfm25_audio_retained_tts_audio(&mut active.state)?,
+                    sample_rate,
+                    finished,
+                )?,
+                _ if finished => AudioOutput::new(
+                    model.detokenize_lfm25_audio_retained_tts_state(&active.state)?,
+                    sample_rate,
+                ),
+                _ => AudioOutput::new(Vec::new(), sample_rate),
             };
-            (
-                active.state.text().to_string(),
-                generated,
-                finished,
-                samples,
-                model.lfm25_audio_tts_output_sample_rate(),
-            )
+            (active.state.text().to_string(), generated, finished, audio)
         };
         lease.mark_clean();
         if finished {
@@ -2350,12 +2439,7 @@ impl NativeExecutor {
         })?;
         Ok(ModelSessionResult::sequence(ExecutorOutput {
             request_id: request.id.clone(),
-            audio: Some(AudioOutput {
-                streamed_samples: None,
-                duration_secs: samples.len() as f32 / sample_rate as f32,
-                samples,
-                sample_rate,
-            }),
+            audio: Some(audio),
             text: Some(text),
             input_transcription: None,
             tokens_processed: scheduled.num_tokens,
@@ -2982,6 +3066,7 @@ impl NativeExecutor {
                     state,
                     last_tokens_generated: 0,
                     stream_sequence: 0,
+                    streamed_samples: 0,
                 })?;
             }
             let active = lease.require_state_mut()?;
@@ -3462,12 +3547,24 @@ impl NativeExecutor {
                 .tokens_generated
                 .saturating_sub(active.last_tokens_generated);
             active.last_tokens_generated = step.tokens_generated;
-            let samples = if step.finished {
-                model.detokenize_lfm25_audio_retained_tts_state(&active.state)?
-            } else {
-                Vec::new()
-            };
             let sample_rate = model.lfm25_audio_tts_output_sample_rate();
+            let audio = match Self::stream_sender(requests[index]) {
+                Some(tx) => stream_committed_tts_audio(
+                    &tx,
+                    requests[index].stream_policy,
+                    &requests[index].id,
+                    &mut active.stream_sequence,
+                    &mut active.streamed_samples,
+                    model.stream_lfm25_audio_retained_tts_audio(&mut active.state)?,
+                    sample_rate,
+                    step.finished,
+                )?,
+                None if step.finished => AudioOutput::new(
+                    model.detokenize_lfm25_audio_retained_tts_state(&active.state)?,
+                    sample_rate,
+                ),
+                None => AudioOutput::new(Vec::new(), sample_rate),
+            };
             let text = step.text;
             row.lease_mut()?.mark_clean();
             if step.finished {
@@ -3484,7 +3581,7 @@ impl NativeExecutor {
             outputs[index] = Some(
                 ModelSessionResult::sequence(ExecutorOutput {
                     request_id: requests[index].id.clone(),
-                    audio: Some(AudioOutput::new(samples, sample_rate)),
+                    audio: Some(audio),
                     text: Some(text),
                     input_transcription: None,
                     tokens_processed: 1,
@@ -3693,11 +3790,22 @@ impl NativeExecutor {
                     .saturating_sub(active.last_frames_generated);
                 active.last_frames_generated = step.frames_generated;
                 let _ = active.state.take_staged_step();
-                let (samples, sample_rate) = if step.finished {
-                    let output = model.finalize_retained_state(&active.state)?;
-                    (output.samples, output.sample_rate)
-                } else {
-                    (Vec::new(), 24_000)
+                let audio = match Self::stream_sender(requests[index]) {
+                    Some(tx) => stream_committed_tts_audio(
+                        &tx,
+                        requests[index].stream_policy,
+                        &requests[index].id,
+                        &mut active.stream_sequence,
+                        &mut active.streamed_samples,
+                        model.stream_retained_audio(&mut active.state)?,
+                        model.output_sample_rate(),
+                        step.finished,
+                    )?,
+                    None if step.finished => {
+                        let output = model.finalize_retained_state(&active.state)?;
+                        AudioOutput::new(output.samples, output.sample_rate)
+                    }
+                    None => AudioOutput::new(Vec::new(), model.output_sample_rate()),
                 };
                 row.lease
                     .as_mut()
@@ -3711,7 +3819,7 @@ impl NativeExecutor {
                 outputs[index] = Some(
                     ModelSessionResult::sequence(ExecutorOutput {
                         request_id: requests[index].id.clone(),
-                        audio: Some(AudioOutput::new(samples, sample_rate)),
+                        audio: Some(audio),
                         text: None,
                         input_transcription: None,
                         tokens_processed: 1,
@@ -4209,6 +4317,55 @@ fn fish_execution_timing(
 
 #[cfg(test)]
 mod tests {
+    /// A streamed LFM, VibeVoice or Voxtral request publishes each
+    /// quantum's committed audio as it lands and a final marker when it
+    /// finishes, and its terminal output holds only the streamed count,
+    /// not a second whole-utterance waveform.
+    #[test]
+    fn streamed_tts_publishes_committed_audio_then_a_final_marker() {
+        use crate::engine::request::{EngineStreamPolicy, StreamStagingBuffer};
+        let staging = StreamStagingBuffer::default();
+        let (mut sequence, mut streamed) = (0usize, 0usize);
+        let mut publish = |samples: Vec<f32>, finished: bool| {
+            super::stream_committed_tts_audio(
+                &staging,
+                EngineStreamPolicy::FailOnFull,
+                "req",
+                &mut sequence,
+                &mut streamed,
+                samples,
+                24_000,
+                finished,
+            )
+            .unwrap()
+        };
+
+        let audio = publish(vec![0.25, 0.5], false);
+        assert!(audio.samples.is_empty());
+        assert_eq!(audio.streamed_samples, None);
+        // A quantum that completed no audio publishes nothing.
+        publish(Vec::new(), false);
+        let terminal = publish(vec![0.75], true);
+        assert!(terminal.samples.is_empty());
+        assert_eq!(terminal.streamed_samples, Some(3));
+        assert_eq!(terminal.sample_rate, 24_000);
+
+        let staged = staging.take().unwrap();
+        let shapes = staged
+            .iter()
+            .map(|output| (output.sequence, output.samples.clone(), output.is_final))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            vec![
+                (0, vec![0.25, 0.5], false),
+                (1, vec![0.75], false),
+                (2, Vec::new(), true),
+            ]
+        );
+        assert_eq!(sequence, 3);
+    }
+
     /// Chunked Kokoro rows synthesize chunk `i` of every row in one batch
     /// (never wider than the cohort) and join each row's chunks in order
     /// with a 40 ms pause.

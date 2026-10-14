@@ -310,6 +310,7 @@ mod tests {
         if variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_streaming)
+            && !variant.streams_on_its_tts_route()
         {
             expected.insert(ConformanceCapability::StreamingTts);
         }

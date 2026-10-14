@@ -404,14 +404,6 @@ fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
     };
     if capabilities.supports_streaming {
         StreamingMode::Chunked
-    } else if matches!(
-        model_variant.family(),
-        crate::catalog::ModelFamily::Lfm25Audio
-            | crate::catalog::ModelFamily::VoxtralTts
-            | crate::catalog::ModelFamily::VibeVoiceTts
-            | crate::catalog::ModelFamily::FishS2Tts
-    ) {
-        StreamingMode::FinalOnly
     } else {
         StreamingMode::None
     }
@@ -472,7 +464,10 @@ struct StreamingTtsCapabilityAdapter;
 impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
     fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
         let capabilities = model_variant.speech_capabilities()?;
-        capabilities.supports_streaming.then_some(AdapterMetadata {
+        if !capabilities.supports_streaming || model_variant.streams_on_its_tts_route() {
+            return None;
+        }
+        Some(AdapterMetadata {
             id: "builtin.streaming_tts",
             capability: CapabilityKind::StreamingTts,
             model_variant,
@@ -684,6 +679,7 @@ mod tests {
         if model_variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_streaming)
+            && !model_variant.streams_on_its_tts_route()
         {
             expected.insert(CapabilityKind::StreamingTts);
         }
@@ -756,7 +752,7 @@ mod tests {
         let lfm = registry
             .require(CapabilityKind::Tts, ModelVariant::Lfm25Audio15BGguf)
             .expect("lfm audio tts adapter");
-        assert_eq!(lfm.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(lfm.streaming_mode, StreamingMode::Chunked);
         assert_eq!(lfm.execution_target, ExecutionTargetKind::TokenEngine);
     }
 
@@ -1090,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_registry_routes_voxtral_tts_through_the_engine_with_final_only_streaming() {
+    fn built_in_registry_routes_voxtral_tts_through_the_engine_with_chunked_streaming() {
         let registry = RuntimeAdapterRegistry::built_in();
         let variant = ModelVariant::Voxtral4BTts2603;
 
@@ -1098,11 +1094,13 @@ mod tests {
             .require(CapabilityKind::Tts, variant)
             .expect("voxtral tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
-        assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
         assert_eq!(
             adapter.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
+        // A streamed request runs on the TTS adapter's native-streaming
+        // graph; no second streaming capability is loaded.
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());
@@ -1117,11 +1115,13 @@ mod tests {
             .require(CapabilityKind::Tts, variant)
             .expect("vibevoice tts adapter");
         assert_eq!(adapter.execution_target, ExecutionTargetKind::TokenEngine);
-        assert_eq!(adapter.streaming_mode, StreamingMode::FinalOnly);
+        assert_eq!(adapter.streaming_mode, StreamingMode::Chunked);
         assert_eq!(
             adapter.state_requirement,
             InferenceStateRequirement::RetainedAndInvocation
         );
+        // A streamed request runs on the TTS adapter's native-streaming
+        // graph; no second streaming capability is loaded.
         assert!(registry
             .require(CapabilityKind::StreamingTts, variant)
             .is_err());

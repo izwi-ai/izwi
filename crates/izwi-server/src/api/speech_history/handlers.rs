@@ -3167,7 +3167,7 @@ mod tests {
     }
 
     /// TPIPE-8: a stream notices the client leaving while the model is still
-    /// generating (a final-only model sends nothing until it finishes).
+    /// generating, before its next chunk arrives.
     #[tokio::test]
     async fn a_departed_client_is_noticed_before_the_next_chunk() {
         let (_chunk_tx, mut chunk_rx) = mpsc::channel::<AudioChunk>(1);

@@ -110,8 +110,7 @@ pub struct AdminSpeechModelCapabilities {
     pub supports_voice_description: bool,
     pub supports_streaming: bool,
     /// What a streaming request delivers on this server (TPIPE-3):
-    /// `chunked`, `final_only` (the whole utterance as one chunk) or
-    /// `unsupported`.
+    /// `chunked` (audio as the model commits it) or `unsupported`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming_mode: Option<&'static str>,
     pub supports_speed_control: bool,

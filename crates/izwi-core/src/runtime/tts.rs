@@ -14,7 +14,6 @@ use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
 use crate::models::architectures::kokoro::kokoro_output_budget;
-use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use crate::models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
@@ -344,50 +343,26 @@ pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Re
     Ok(total)
 }
 
-/// Streaming requests that run the non-stream engine route and send the
-/// whole utterance as one final chunk. LFM and VibeVoice executors publish
-/// no streamed audio and no final marker, so an engine stream for them
-/// always failed after the full compute (TPIPE-4); Qwen streams
-/// progressively only with the opt-in CUDA chunked codec.
-fn tts_streaming_uses_final_only(
-    is_cuda: bool,
-    variant: ModelVariant,
-    chunked_codec_stream_enabled: bool,
-) -> bool {
-    match variant.family() {
-        ModelFamily::Qwen3Tts => !(is_cuda && chunked_codec_stream_enabled),
-        ModelFamily::Lfm25Audio | ModelFamily::VibeVoiceTts => true,
-        _ => false,
-    }
-}
-
-/// The streaming mode `variant` actually delivers on a CUDA or non-CUDA
-/// runtime: the same policy the streaming route follows.
-fn tts_streaming_mode(
-    is_cuda: bool,
-    variant: ModelVariant,
-    chunked_codec_stream_enabled: bool,
-) -> TtsStreamingMode {
-    if !variant
+/// The streaming mode `variant` delivers (TPIPE-3). Every streaming family
+/// publishes audio as it commits it: Qwen3-TTS per codec frame, LFM2.5
+/// Audio per detokenized code run (LFT-5), VibeVoice per frame (VVT-10),
+/// Voxtral per codec chunk, Fish per decoded frame batch and Kokoro per
+/// sentence chunk.
+fn tts_streaming_mode(variant: ModelVariant) -> TtsStreamingMode {
+    if variant
         .speech_capabilities()
         .is_some_and(|capabilities| capabilities.supports_streaming)
     {
-        TtsStreamingMode::Unsupported
-    } else if tts_streaming_uses_final_only(is_cuda, variant, chunked_codec_stream_enabled) {
-        TtsStreamingMode::FinalOnly
-    } else {
         TtsStreamingMode::Chunked
+    } else {
+        TtsStreamingMode::Unsupported
     }
 }
 
 impl RuntimeService {
     /// How a streaming request for `variant` delivers audio here (TPIPE-3).
     pub fn tts_streaming_mode(&self, variant: ModelVariant) -> TtsStreamingMode {
-        tts_streaming_mode(
-            self.device.kind.is_cuda(),
-            variant,
-            qwen_tts_cuda_chunked_codec_stream_enabled(),
-        )
+        tts_streaming_mode(variant)
     }
 }
 
@@ -502,45 +477,6 @@ impl RuntimeService {
                     .require(CapabilityKind::Tts, variant)
                     .map(|_| variant)
             })
-    }
-    async fn final_only_tts_streaming(
-        &self,
-        mut request: GenerationRequest,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let deadline = request.runtime_context.deadline;
-        let request_id = request.id.clone();
-        request.config.streaming = false;
-        let result = self.generate(request).await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-            stop_reason: result.stop_reason,
-        });
-        let send = chunk_tx.send(chunk);
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), send)
-                .await
-                .map_err(|_| Error::Timeout(request_id))?
-                .map_err(|_| {
-                    Error::InferenceError("Streaming output channel closed".to_string())
-                })?,
-            None => send.await.map_err(|_| {
-                Error::InferenceError("Streaming output channel closed".to_string())
-            })?,
-        }
-
-        info!(
-            "TTS streaming emitted final-only audio in {:.1}ms (RTF {:.3})",
-            generation_time_ms, rtf
-        );
-        Ok(())
     }
 }
 
@@ -679,13 +615,6 @@ impl RuntimeService {
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
             return result;
         }
-        if tts_streaming_uses_final_only(
-            self.device.kind.is_cuda(),
-            resolved_variant,
-            qwen_tts_cuda_chunked_codec_stream_enabled(),
-        ) {
-            return self.final_only_tts_streaming(request, chunk_tx).await;
-        }
         let core_params = core_params_from_generation(&request.config);
         let mut core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
@@ -807,106 +736,60 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// TPIPE-3: the advertised streaming mode of every enabled TTS variant
-    /// is what its streaming route does on each backend: Qwen3-TTS streams
-    /// progressively only with the CUDA chunked codec, Kokoro and Fish
-    /// stream in chunks, and families without streaming say so.
+    /// is what its streaming route does. Every streaming family publishes
+    /// audio as it commits it, so none is final-only: Qwen3-TTS on every
+    /// backend (its per-frame stream replaced the CUDA-only chunked codec),
+    /// and LFM2.5 Audio, VibeVoice and Voxtral, which used to run the
+    /// non-stream route and send one final chunk.
     #[test]
     fn advertised_streaming_mode_is_what_the_route_does() {
+        use crate::runtime::adapters::{RuntimeAdapterRegistry, StreamingMode};
+        let registry = RuntimeAdapterRegistry::built_in();
         for variant in ModelVariant::all()
             .iter()
             .copied()
             .filter(|variant| variant.is_enabled() && variant.speech_capabilities().is_some())
         {
-            for (is_cuda, chunked) in [(false, false), (true, false), (true, true)] {
-                let mode = tts_streaming_mode(is_cuda, variant, chunked);
-                let streams = variant.speech_capabilities().unwrap().supports_streaming;
-                let expected = if !streams {
-                    TtsStreamingMode::Unsupported
-                } else if tts_streaming_uses_final_only(is_cuda, variant, chunked) {
-                    TtsStreamingMode::FinalOnly
-                } else {
-                    TtsStreamingMode::Chunked
-                };
-                assert_eq!(mode, expected, "{variant} cuda={is_cuda} chunked={chunked}");
-            }
+            // A stream runs on a streaming capability, or on the TTS
+            // capability's own native-streaming graph, which the loader
+            // seals only for a TTS adapter that streams in chunks.
+            let streams = registry
+                .require(CapabilityKind::StreamingTts, variant)
+                .is_ok()
+                || (variant.streams_on_its_tts_route()
+                    && registry
+                        .require(CapabilityKind::Tts, variant)
+                        .is_ok_and(|tts| tts.streaming_mode == StreamingMode::Chunked));
+            let expected = if streams {
+                TtsStreamingMode::Chunked
+            } else {
+                TtsStreamingMode::Unsupported
+            };
+            assert_eq!(tts_streaming_mode(variant), expected, "{variant}");
         }
-        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
-        assert_eq!(
-            tts_streaming_mode(false, qwen, false),
-            TtsStreamingMode::FinalOnly
-        );
-        assert_eq!(
-            tts_streaming_mode(true, qwen, true),
-            TtsStreamingMode::Chunked
-        );
-        assert_eq!(
-            tts_streaming_mode(false, ModelVariant::Kokoro82M, false),
-            TtsStreamingMode::Chunked
-        );
-        assert_eq!(
-            tts_streaming_mode(false, ModelVariant::Voxtral4BTts2603, false),
-            TtsStreamingMode::Unsupported
-        );
-    }
-
-    #[test]
-    fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
-        assert!(tts_streaming_uses_final_only(
-            true,
+        for variant in [
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            false,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_cuda_streaming_respects_chunked_codec_opt_in() {
-        assert!(!tts_streaming_uses_final_only(
-            true,
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            true,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_non_cuda_streaming_defaults_to_final_only() {
-        assert!(tts_streaming_uses_final_only(
-            false,
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            false,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_final_only_streaming_policy_does_not_affect_non_qwen() {
-        assert!(!tts_streaming_uses_final_only(
-            true,
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
             ModelVariant::Kokoro82M,
-            false,
-        ));
-    }
-
-    /// TPIPE-4: LFM and VibeVoice streams went through the engine stream,
-    /// whose executors emit neither audio nor a final marker, so every
-    /// OpenAI SSE request ended in `audio.failed` after the full compute.
-    /// Their streams now run the non-stream route and send one final
-    /// chunk; Fish and Voxtral keep the engine stream (their executors
-    /// publish audio and the final marker), Kokoro its direct stream.
-    #[test]
-    fn engine_tts_families_without_streamed_audio_stream_final_only() {
-        for is_cuda in [false, true] {
-            for variant in [
-                ModelVariant::Lfm25Audio15BGguf,
-                ModelVariant::VibeVoice15BTts,
-            ] {
-                assert!(tts_streaming_uses_final_only(is_cuda, variant, true));
-                assert_eq!(
-                    tts_route_target(variant, true),
+            ModelVariant::FishAudioS2Pro,
+            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Voxtral4BTts2603,
+        ] {
+            assert_eq!(
+                tts_streaming_mode(variant),
+                TtsStreamingMode::Chunked,
+                "{variant}"
+            );
+            assert_eq!(
+                tts_route_target(variant, true),
+                if variant.is_kokoro() {
+                    ExecutionTargetKind::DirectModel
+                } else {
                     ExecutionTargetKind::TokenEngine
-                );
-            }
-            for variant in [ModelVariant::FishAudioS2Pro, ModelVariant::Voxtral4BTts2603] {
-                assert!(!tts_streaming_uses_final_only(is_cuda, variant, false));
-            }
+                },
+                "{variant}"
+            );
         }
     }
 
@@ -1033,7 +916,7 @@ mod tests {
     /// registry advertises (VXT-1); streaming is advertised exactly when a
     /// streaming capability is published; a streamed request that runs on
     /// the engine belongs to a family whose executor publishes audio and a
-    /// final marker, or it runs final-only (TPIPE-3/4); and the automatic
+    /// final marker (TPIPE-3/4); and the automatic
     /// frame budget grows with text and stays inside the model's maximum
     /// (TPIPE-2).
     #[test]
@@ -1041,12 +924,14 @@ mod tests {
         use crate::models::architectures::qwen3::tts::qwen3_tts_auto_max_frames_for_text;
         use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
         use crate::runtime::adapters::RuntimeAdapterRegistry;
-        // Families whose engine executors call `stream_audio` and publish
+        // Families whose engine executors stream committed audio and publish
         // the final marker.
-        const ENGINE_STREAM_EMITTERS: [ModelFamily; 3] = [
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 5] = [
             ModelFamily::Qwen3Tts,
             ModelFamily::FishS2Tts,
             ModelFamily::VoxtralTts,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::VibeVoiceTts,
         ];
         let registry = RuntimeAdapterRegistry::built_in();
         let short = "Hello there.";
@@ -1076,19 +961,17 @@ mod tests {
                         "{variant}: stream route"
                     );
                 }
-                Err(_) => assert!(!capabilities.supports_streaming, "{variant}"),
+                Err(_) => assert!(
+                    !capabilities.supports_streaming || variant.streams_on_its_tts_route(),
+                    "{variant}"
+                ),
             }
-            for is_cuda in [false, true] {
-                for chunked in [false, true] {
-                    let engine_stream = tts_route_target(variant, true)
-                        == ExecutionTargetKind::TokenEngine
-                        && !tts_streaming_uses_final_only(is_cuda, variant, chunked);
-                    assert!(
-                        !engine_stream || ENGINE_STREAM_EMITTERS.contains(&variant.family()),
-                        "{variant}: an engine stream would end without audio"
-                    );
-                }
-            }
+            let engine_stream = capabilities.supports_streaming
+                && tts_route_target(variant, true) == ExecutionTargetKind::TokenEngine;
+            assert!(
+                !engine_stream || ENGINE_STREAM_EMITTERS.contains(&variant.family()),
+                "{variant}: an engine stream would end without audio"
+            );
             let budget: Option<fn(&str) -> usize> = match variant.family() {
                 ModelFamily::Qwen3Tts => Some(qwen3_tts_auto_max_frames_for_text),
                 ModelFamily::VibeVoiceTts => Some(vibevoice_tts_auto_max_frames_for_text),

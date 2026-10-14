@@ -2545,8 +2545,8 @@ fn realtime_speech_segments(text: &str) -> Vec<String> {
 
 /// Realtime voice speaks with a built-in voice and streams its audio: a
 /// reference-only model (Qwen Base, VibeVoice, Fish) has no voice to speak
-/// with here, and a final-only one delays the first audio to the end
-/// (TPIPE-21).
+/// with here, and one that does not stream would delay the first audio to
+/// the end (TPIPE-21).
 fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
     let capabilities = variant
         .speech_capabilities()
@@ -3533,8 +3533,9 @@ mod tests {
         assert_eq!(realtime_speech_segments("Hello"), vec!["Hello"]);
     }
 
-    /// Realtime voice refuses a reference-only TTS model and one that
-    /// cannot stream, at session configuration.
+    /// Realtime voice refuses a reference-only TTS model at session
+    /// configuration and takes every built-in-voice model, all of which
+    /// stream.
     #[test]
     fn realtime_tts_needs_a_built_in_streaming_voice() {
         use izwi_core::ModelVariant;
@@ -3545,9 +3546,9 @@ mod tests {
                 .unwrap_err()
                 .contains("reference voice")
         );
-        assert!(validate_realtime_tts_model(ModelVariant::Voxtral4BTts2603)
-            .unwrap_err()
-            .contains("does not stream"));
+        // Voxtral and LFM2.5 Audio stream committed audio now.
+        assert!(validate_realtime_tts_model(ModelVariant::Voxtral4BTts2603).is_ok());
+        assert!(validate_realtime_tts_model(ModelVariant::Lfm25Audio15BGguf).is_ok());
     }
 
     /// TPIPE-22: an utterance is labelled with its first chunk's rate (44.1

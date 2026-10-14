@@ -1028,6 +1028,11 @@ impl VibeVoiceTtsModel {
         })
     }
 
+    /// The rate of the audio [`Self::stream_retained_audio`] returns.
+    pub(crate) fn output_sample_rate(&self) -> u32 {
+        self.preprocessor.target_sample_rate()
+    }
+
     /// Progressive audio (VVT-10): the waveforms of the frames committed
     /// since the last call, read back in one copy. They are the samples
     /// [`Self::finalize_retained_state`] concatenates (the streaming decode

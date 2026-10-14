@@ -697,6 +697,19 @@ impl ModelVariant {
         }
     }
 
+    /// Whether a streamed request runs on the TTS capability's own
+    /// native-streaming graph instead of a separately loaded streaming
+    /// capability. The engine binds every TTS request to its TTS adapter, so
+    /// these families stream without a second copy of their retained state.
+    pub fn streams_on_its_tts_route(&self) -> bool {
+        matches!(
+            self.family(),
+            crate::catalog::ModelFamily::Lfm25Audio
+                | crate::catalog::ModelFamily::VibeVoiceTts
+                | crate::catalog::ModelFamily::VoxtralTts
+        )
+    }
+
     pub fn speech_capabilities(&self) -> Option<SpeechModelCapabilities> {
         let capabilities = match self {
             Self::Qwen3Tts12Hz06BBase
@@ -756,7 +769,7 @@ impl ModelVariant {
                 built_in_voice_count: Some(Self::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
@@ -765,7 +778,7 @@ impl ModelVariant {
                 built_in_voice_count: Some(Self::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
@@ -774,7 +787,7 @@ impl ModelVariant {
                 built_in_voice_count: None,
                 supports_reference_voice: true,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
@@ -1499,7 +1512,7 @@ mod tests {
                 built_in_voice_count: Some(ModelVariant::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             })
@@ -1538,7 +1551,7 @@ mod tests {
                 built_in_voice_count: None,
                 supports_reference_voice: true,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             })
@@ -1697,7 +1710,7 @@ mod tests {
                 built_in_voice_count: Some(ModelVariant::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             })
