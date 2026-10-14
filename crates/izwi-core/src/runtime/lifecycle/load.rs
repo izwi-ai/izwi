@@ -116,6 +116,28 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
     }
 }
 
+/// Parakeet's retained predictor is owned by the exact executor session, so
+/// no graph activates managed retained state: sequence graphs read it through
+/// their session and the atomic long-form graph leases invocation tensors.
+fn parakeet_retained_uses(
+    contracts: &[LoadedExecutionContract],
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    contracts
+        .iter()
+        .map(|contract| {
+            let graph = stage_graph_fingerprint(&contract.stages)?;
+            match contract.execution_profile.mode {
+                crate::engine::ExecutionMode::Sequence | crate::engine::ExecutionMode::Atomic => {
+                    Ok((graph, RetainedStateUseV2::Inactive))
+                }
+                _ => Err(Error::ModelLoadError(
+                    "Parakeet graph has an incompatible execution mode".into(),
+                )),
+            }
+        })
+        .collect()
+}
+
 fn uses_asr_model_registry(variant: ModelVariant) -> bool {
     matches!(
         variant.family(),
@@ -3004,33 +3026,23 @@ impl ModelLifecycleController {
                                 )
                             })?,
                         )?;
-                        let retained_uses = contracts
-                            .iter()
-                            .map(|contract| {
-                                let graph = stage_graph_fingerprint(&contract.stages)?;
-                                if contract.execution_profile.mode
-                                    != crate::engine::ExecutionMode::Sequence
-                                {
-                                    return Err(Error::ModelLoadError(
-                                        "Parakeet retained graph has an incompatible execution mode"
-                                            .into(),
-                                    ));
-                                }
-                                Ok((graph, RetainedStateUseV2::Inactive))
-                            })
-                            .collect::<Result<HashMap<_, _>>>()?;
-                        if physical_spec.invocation.is_some() {
-                            return Err(Error::ModelLoadError(
-                                "Parakeet sequence graph unexpectedly published invocation predictor state"
-                                    .into(),
-                            ));
-                        }
-                        let publication = self.load_scratch_only_workspace_publication(
-                            &contracts,
-                            physical_spec.descriptor,
-                            Some(retained.into()),
-                            retained_uses,
-                        )?;
+                        let invocation_contract =
+                            physical_spec.invocation.as_ref().ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "Parakeet long-form graph did not author invocation predictor state"
+                                        .into(),
+                                )
+                            })?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                invocation_contract,
+                                Some(retained.into()),
+                                parakeet_retained_uses(&contracts)?,
+                            )
+                            .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);
                     } else if publication_route
                         == LoadedAsrStatePublicationRoute::NemotronOffline
@@ -4779,6 +4791,146 @@ mod tests {
             loaded_asr_state_publication_route(ModelVariant::Nemotron35AsrStreaming06B),
             LoadedAsrStatePublicationRoute::NemotronOffline
         );
+    }
+
+    #[test]
+    fn parakeet_load_route_publishes_long_form_predictor_beside_retained_state() {
+        use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceBindingV2};
+        use crate::models::architectures::parakeet::asr::{
+            parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE_DOMAIN,
+        };
+        use crate::runtime::adapters::{
+            LoadedModelBundleDraft, LoadedStatePublication, RuntimeAdapterRegistry,
+            StreamingRequirements,
+        };
+
+        let model = ModelInstanceId::new(91);
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            model,
+            crate::model::ModelVariant::ParakeetTdt06BV3,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
+        let graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let spec = parakeet_physical_state_spec(&graphs).unwrap();
+        let invocation = spec
+            .invocation
+            .as_ref()
+            .expect("long-form predictor contract");
+        let mut core = crate::engine::EngineCore::new(crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..crate::engine::EngineCoreConfig::default()
+        })
+        .unwrap();
+        let retained = core
+            .load_retained_tensor_state(model, spec.retained.as_ref().unwrap(), 1)
+            .unwrap();
+        let retained_uses = super::parakeet_retained_uses(&contracts).unwrap();
+        let retained: crate::kv::v2::RetainedStateRuntimeV2 = retained.into();
+        super::validate_physical_publication_backing(
+            &spec.descriptor,
+            &contracts,
+            Some(&retained),
+            &retained_uses,
+        )
+        .unwrap();
+
+        // Only the two atomic long-form graphs (with and without transport
+        // output) allocate typed state: one predictor slot each.
+        let allocations =
+            plan_invocation_allocations(&spec.descriptor, invocation, &contracts).unwrap();
+        assert_eq!(allocations.len(), 2);
+        let mut bindings = Vec::new();
+        for allocation in allocations {
+            assert_eq!(allocation.key.domain, PARAKEET_PREDICTOR_STATE_DOMAIN);
+            assert_eq!(allocation.slot_count, 1);
+            // Four [1, 640] LSTM tensors plus one [1, 1, 640] output, F32.
+            assert_eq!(allocation.domain.maximum_bytes().unwrap(), 5 * 640 * 4);
+            let backing = core
+                .resolve_and_load_invocation_workspace(
+                    model,
+                    allocation.adapter_instance,
+                    allocation.key.stage_graph,
+                    allocation.key.stage,
+                    invocation,
+                    &allocation.domain,
+                    allocation.slot_count,
+                )
+                .unwrap();
+            bindings.push(InvocationWorkspaceBindingV2 {
+                key: allocation.key,
+                backing,
+            });
+        }
+        let bundle = draft
+            .seal(HashMap::from([(
+                CapabilityKind::Asr,
+                LoadedStatePublication::PhysicalV2 {
+                    descriptor: spec.descriptor,
+                    retained: Some(retained),
+                    retained_uses,
+                    invocation_workspace: crate::kv::v2::InvocationWorkspaceRuntimeV2::new(
+                        bindings,
+                    )
+                    .unwrap(),
+                },
+            )]))
+            .unwrap();
+
+        let long_form = StreamingRequirements::NONE.with_asr_long_form(true);
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, long_form)
+            .unwrap();
+        let stage = contract
+            .adapter_binding()
+            .unwrap()
+            .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                kind: "diarization.transcribe".into(),
+            })
+            .unwrap()
+            .id;
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, long_form)
+            .unwrap();
+        binding
+            .state
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+        let mut leases = binding
+            .state
+            .lease_complete_invocation_workspace_set(stage)
+            .unwrap();
+        let predictor = leases
+            .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)
+            .unwrap()
+            .typed_mut::<crate::engine::InvocationTensorLease>()
+            .unwrap();
+        assert_eq!(predictor.domain(), PARAKEET_PREDICTOR_STATE_DOMAIN);
+        leases.release().unwrap();
+
+        // Ordinary requests keep the retained sequence graph and lease nothing.
+        let normal = bundle
+            .contract_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        let normal_binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
+        for stage in normal.stages.iter() {
+            assert!(normal_binding
+                .state
+                .lease_complete_invocation_workspace_set(stage.id)
+                .unwrap()
+                .domains()
+                .next()
+                .is_none());
+        }
     }
 
     #[test]
