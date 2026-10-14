@@ -124,10 +124,19 @@ fn assert_quiescent_and_bounded(manager: &ManagedKvCacheManager) {
         coordinator.allocated_pages + coordinator.free_pages,
         coordinator.capacity_pages
     );
-    assert_eq!(
-        snapshot.counters.prefix_retained_pages,
-        coordinator.prefix_refs
-    );
+    // Each published page holds exactly one prefix ref through exactly one
+    // index entry; the telemetry counter is a copy of the coordinator total,
+    // so check the coordinators against the indexes themselves.
+    for state in manager.models.values() {
+        for (arena, coordinator) in &state.coordinators {
+            coordinator.check_invariants().unwrap();
+            let indexed = state
+                .prefix_indexes
+                .get(arena)
+                .map_or(0, |index| index.len());
+            assert_eq!(coordinator.stats().prefix_refs, indexed);
+        }
+    }
     let exact_backing = snapshot
         .models
         .iter()
@@ -303,6 +312,7 @@ fn exercise_windowed_ragged_rows(
     next_txn: &mut u64,
 ) {
     let window_tokens = 31usize;
+    let page_tokens = runtime.plan().groups[0].page_tokens as usize;
     let lengths = [67usize, 131, 257];
     let sessions = lengths
         .iter()
@@ -366,16 +376,20 @@ fn exercise_windowed_ragged_rows(
                     true,
                 )
                 .expect("commit ragged window row");
+            let start = committed[row];
             committed[row] = end;
             let snapshot = manager
                 .snapshot(model, session, CacheDomainId::new(1))
                 .expect("window snapshot");
             assert_eq!(snapshot.committed_tokens as usize, committed[row]);
-            assert_eq!(
-                snapshot.window_start as usize,
-                committed[row].saturating_sub(window_tokens)
-            );
-            assert!(snapshot.groups[0].blocks.len() <= 3);
+            // The span's earliest query keeps its own lookback until the
+            // next step advances the window.
+            let window_start = end
+                .saturating_sub(window_tokens)
+                .min((start + 1).saturating_sub(window_tokens));
+            assert_eq!(snapshot.window_start as usize, window_start);
+            let visible = end - window_start + window_start % page_tokens;
+            assert!(snapshot.groups[0].blocks.len() <= visible.div_ceil(page_tokens));
         }
         manager
             .release_session(session)
