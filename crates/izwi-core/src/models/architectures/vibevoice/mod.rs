@@ -29,6 +29,8 @@ pub mod diffusion;
 pub mod prompt;
 pub mod tokenizer;
 pub mod tts;
+#[cfg(test)]
+mod tts_smoke;
 
 pub(crate) const VIBEVOICE_ASR_DECODER_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const VIBEVOICE_ASR_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
