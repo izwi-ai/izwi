@@ -828,7 +828,12 @@ fn reserve_next_vacant<A: InvocationSlotArena>(
     let slot_count = state.slots.len();
     let slot_index = (0..slot_count)
         .map(|offset| (state.admission_cursor + offset) % slot_count)
-        .find(|index| !attempted[*index] && state.slots[*index].is_vacant());
+        // Exhausted slots retire instead of failing every later admission.
+        .find(|index| {
+            !attempted[*index]
+                && state.slots[*index].is_vacant()
+                && state.slots[*index].generation() < u32::MAX
+        });
     let Some(slot_index) = slot_index else {
         return Ok(None);
     };

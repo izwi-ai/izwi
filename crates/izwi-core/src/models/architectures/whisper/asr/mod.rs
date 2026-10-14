@@ -331,7 +331,9 @@ impl WhisperCrossSequenceOwner {
 impl Drop for WhisperCrossSequenceOwner {
     fn drop(&mut self) {
         if let Some(sequence) = self.sequence.take() {
-            let _ = self.runtime.release_sequence(sequence);
+            if let Err(error) = self.runtime.release_sequence(sequence) {
+                tracing::warn!(%error, "Whisper cross-attention release did not reset its slot");
+            }
         }
     }
 }
@@ -640,7 +642,9 @@ impl WhisperDecodeState {
 impl Drop for WhisperDecodeState {
     fn drop(&mut self) {
         if let Some(sequence) = self.cross_sequence.take() {
-            let _ = self.cross_runtime.release_sequence(sequence);
+            if let Err(error) = self.cross_runtime.release_sequence(sequence) {
+                tracing::warn!(%error, "Whisper cross-attention release did not reset its slot");
+            }
         }
     }
 }

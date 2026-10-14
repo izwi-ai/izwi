@@ -161,11 +161,33 @@ these runtime fields:
   budget of each arena;
 - `counters.prefix_hits`, `prefix_misses`, `prefix_evictions`,
   `prefix_copy_on_write_pages`, `prefix_rejections`, and
-  `prefix_retained_pages`;
+  `prefix_retained_pages`. Hits and misses count one lookup per request
+  preparation (admission probes are not counted), across the device and host
+  tiers;
+- `counters.prefix_query_tokens` and `prefix_hit_tokens`, the prompt tokens
+  offered to prefix lookups and the tokens served from the cache. Their ratio
+  is the token hit rate;
 - `totals.coordinator.allocated_pages`, `free_pages`, `prefix_refs`,
   `execution_pins`, and `active_transactions`;
 - `totals.physical_bytes` and `memory_accounting`, which should read
   `physical_arena_backing`.
+
+The same signals are on `/metrics`:
+
+- `izwi_engine_kv_cache_prefix_query_tokens_total` and
+  `izwi_engine_kv_cache_prefix_hit_tokens_total`.
+- Per arena, with `model`, `backend`, `domain` and `storage_format` labels:
+  `izwi_engine_kv_cache_model_capacity_pages`, `model_allocated_pages`,
+  `model_prefix_retained_pages`, `model_admission_claimed_pages` and
+  `model_admission_available_pages`. Allocated pages include prefix-only
+  pages that admission can evict. Admission is bound by available pages, not
+  free pages.
+- `izwi_engine_scheduler_preemptions_total{kind}`: `replay` (a published
+  request suspended and replayed later), `recompute` (an unpublished request
+  restarted) and `abort` (the youngest request failed because every claim
+  holder was waiting to grow).
+- `izwi_engine_scheduler_kv_blocked_requests`, the requests the last engine
+  step deferred for KV capacity.
 
 High rejection or eviction rates with low reuse mean the prefix budget or
 workload grouping should be reconsidered. Monotonic retained pages after

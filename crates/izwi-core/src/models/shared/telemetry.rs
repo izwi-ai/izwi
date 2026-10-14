@@ -201,6 +201,46 @@ pub fn record_rope_kernel() {
     ROPE_KERNEL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Describe why a guarded fused kernel did not produce a result: its error,
+/// or the panic payload when the kernel unwound.
+pub(crate) fn describe_kernel_failure<T>(
+    result: &std::thread::Result<candle_core::Result<T>>,
+) -> String {
+    match result {
+        Ok(Ok(_)) => "succeeded".to_string(),
+        Ok(Err(error)) => error.to_string(),
+        Err(panic) => panic
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked with a non-string payload".to_string()),
+    }
+}
+
+/// Log the first fallback from a guarded fused kernel at `site`, with its
+/// cause. Fallbacks are counted on every call, but a failing kernel used to be
+/// silent, so a broken fast path (or a sticky device error) went unnoticed.
+pub(crate) fn report_kernel_fallback<T>(
+    site: &'static str,
+    result: &std::thread::Result<candle_core::Result<T>>,
+) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static REPORTED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let first = REPORTED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut reported| reported.insert(site))
+        .unwrap_or(false);
+    if first {
+        tracing::warn!(
+            site,
+            cause = %describe_kernel_failure(result),
+            "Fused kernel failed; using the reference path (reported once per site)"
+        );
+    }
+}
+
 pub fn record_rope_manual() {
     ROPE_MANUAL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }

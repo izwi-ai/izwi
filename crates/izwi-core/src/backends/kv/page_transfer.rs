@@ -33,7 +33,7 @@ fn encode_block<T: WithDType>(
     page: usize,
     destination: &mut [u8],
     element_size: usize,
-    encode: impl Fn(T) -> Vec<u8>,
+    encode: impl Fn(T, &mut [u8]),
 ) -> Result<usize> {
     let values = tensor.narrow(0, page, 1)?.flatten_all()?.to_vec1::<T>()?;
     let needed = values.len() * element_size;
@@ -43,9 +43,13 @@ fn encode_block<T: WithDType>(
             destination.len()
         )));
     }
-    for (index, value) in values.iter().enumerate() {
-        let bytes = encode(*value);
-        destination[index * element_size..(index + 1) * element_size].copy_from_slice(&bytes);
+    // Encode in place: one heap allocation per element made a 64-token page
+    // cost hundreds of thousands of allocations.
+    for (value, bytes) in values
+        .iter()
+        .zip(destination[..needed].chunks_exact_mut(element_size))
+    {
+        encode(*value, bytes);
     }
     Ok(needed)
 }
@@ -54,14 +58,14 @@ fn encode_block<T: WithDType>(
 /// written. `tensor` must have shape `[capacity_pages, ...]`.
 pub fn capture_block(tensor: &Tensor, page: usize, destination: &mut [u8]) -> Result<usize> {
     match tensor.dtype() {
-        DType::F32 => encode_block(tensor, page, destination, 4, |v: f32| {
-            v.to_ne_bytes().to_vec()
+        DType::F32 => encode_block(tensor, page, destination, 4, |v: f32, out| {
+            out.copy_from_slice(&v.to_ne_bytes())
         }),
-        DType::F16 => encode_block(tensor, page, destination, 2, |v: half::f16| {
-            v.to_ne_bytes().to_vec()
+        DType::F16 => encode_block(tensor, page, destination, 2, |v: half::f16, out| {
+            out.copy_from_slice(&v.to_ne_bytes())
         }),
-        DType::BF16 => encode_block(tensor, page, destination, 2, |v: half::bf16| {
-            v.to_ne_bytes().to_vec()
+        DType::BF16 => encode_block(tensor, page, destination, 2, |v: half::bf16, out| {
+            out.copy_from_slice(&v.to_ne_bytes())
         }),
         other => Err(Error::InferenceError(format!(
             "KV host page transfer does not support {other:?} storage"
@@ -83,12 +87,10 @@ fn decode_block<T: WithDType>(
             source.len()
         )));
     }
-    let mut values = Vec::with_capacity(elements);
-    for index in 0..elements {
-        values.push(decode(
-            &source[index * element_size..(index + 1) * element_size],
-        ));
-    }
+    let values = source[..needed]
+        .chunks_exact(element_size)
+        .map(decode)
+        .collect::<Vec<_>>();
     let (_, page_tokens, heads, head_dim) = shape;
     Ok(Tensor::from_vec(
         values,
@@ -141,13 +143,8 @@ pub fn restore_block(tensor: &Tensor, page: usize, source: &[u8]) -> Result<usiz
     let page_tensor = decoded_page(tensor, source)?
         .reshape((1, dims[1], dims[2], dims[3]))?
         .to_device(tensor.device())?;
-    let destination = tensor.narrow(0, page, 1)?;
-    let index_shape = vec![1; page_tensor.rank()];
-    let indices = Tensor::from_vec(vec![0_u32], (1,), destination.device())?
-        .reshape(index_shape)?
-        .broadcast_as(page_tensor.shape())?
-        .contiguous()?;
-    destination.scatter_set(&indices, &page_tensor, 0)?;
+    // A contiguous page copy; no broadcast index tensor is materialized.
+    tensor.slice_set(&page_tensor, 0, page)?;
     Ok(elements * tensor.dtype().size_in_bytes())
 }
 

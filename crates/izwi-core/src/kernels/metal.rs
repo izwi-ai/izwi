@@ -329,158 +329,6 @@ kernel void izwi_rope_pair_bshd_f16(
     }
 }
 
-kernel void izwi_decode_gqa_attention_f32(
-    device const float* q [[buffer(0)]],
-    device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]],
-    device float* output [[buffer(3)]],
-    constant uint& num_heads [[buffer(4)]],
-    constant uint& num_kv_heads [[buffer(5)]],
-    constant uint& total_len [[buffer(6)]],
-    constant uint& head_dim [[buffer(7)]],
-    constant float& scale [[buffer(8)]],
-    constant uint& kv_capacity_len [[buffer(9)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]],
-    uint threads_per_threadgroup [[threads_per_threadgroup]]
-) {
-    threadgroup float scores[2048];
-    threadgroup float scratch[256];
-
-    if (head >= num_heads || total_len > 2048) {
-        return;
-    }
-
-    const uint kv_group = num_heads / num_kv_heads;
-    const uint kv_head = head / kv_group;
-    float local_max = -INFINITY;
-    for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
-        float dot = 0.0f;
-        const uint q_base = head * head_dim;
-        const uint k_base = (kv_head * kv_capacity_len + pos) * head_dim;
-        for (uint dim = 0; dim < head_dim; dim++) {
-            dot += q[q_base + dim] * k[k_base + dim];
-        }
-        const float score = dot * scale;
-        scores[pos] = score;
-        local_max = max(local_max, score);
-    }
-    scratch[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float max_score = scratch[0];
-
-    float local_sum = 0.0f;
-    for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
-        const float value = exp(scores[pos] - max_score);
-        scores[pos] = value;
-        local_sum += value;
-    }
-    scratch[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float inv_sum = 1.0f / scratch[0];
-
-    const uint out_base = head * head_dim;
-    for (uint dim = tid; dim < head_dim; dim += threads_per_threadgroup) {
-        float acc = 0.0f;
-        for (uint pos = 0; pos < total_len; pos++) {
-            const float prob = scores[pos] * inv_sum;
-            const uint v_base = (kv_head * kv_capacity_len + pos) * head_dim;
-            acc += prob * v[v_base + dim];
-        }
-        output[out_base + dim] = acc;
-    }
-}
-
-kernel void izwi_decode_gqa_attention_f16(
-    device const half* q [[buffer(0)]],
-    device const half* k [[buffer(1)]],
-    device const half* v [[buffer(2)]],
-    device half* output [[buffer(3)]],
-    constant uint& num_heads [[buffer(4)]],
-    constant uint& num_kv_heads [[buffer(5)]],
-    constant uint& total_len [[buffer(6)]],
-    constant uint& head_dim [[buffer(7)]],
-    constant float& scale [[buffer(8)]],
-    constant uint& kv_capacity_len [[buffer(9)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]],
-    uint threads_per_threadgroup [[threads_per_threadgroup]]
-) {
-    threadgroup float scores[2048];
-    threadgroup float scratch[256];
-
-    if (head >= num_heads || total_len > 2048) {
-        return;
-    }
-
-    const uint kv_group = num_heads / num_kv_heads;
-    const uint kv_head = head / kv_group;
-    float local_max = -INFINITY;
-    for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
-        float dot = 0.0f;
-        const uint q_base = head * head_dim;
-        const uint k_base = (kv_head * kv_capacity_len + pos) * head_dim;
-        for (uint dim = 0; dim < head_dim; dim++) {
-            dot += float(q[q_base + dim]) * float(k[k_base + dim]);
-        }
-        const float score = dot * scale;
-        scores[pos] = score;
-        local_max = max(local_max, score);
-    }
-    scratch[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] = max(scratch[tid], scratch[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float max_score = scratch[0];
-
-    float local_sum = 0.0f;
-    for (uint pos = tid; pos < total_len; pos += threads_per_threadgroup) {
-        const float value = exp(scores[pos] - max_score);
-        scores[pos] = value;
-        local_sum += value;
-    }
-    scratch[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = threads_per_threadgroup >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float inv_sum = 1.0f / scratch[0];
-
-    const uint out_base = head * head_dim;
-    for (uint dim = tid; dim < head_dim; dim += threads_per_threadgroup) {
-        float acc = 0.0f;
-        for (uint pos = 0; pos < total_len; pos++) {
-            const float prob = scores[pos] * inv_sum;
-            const uint v_base = (kv_head * kv_capacity_len + pos) * head_dim;
-            acc += prob * float(v[v_base + dim]);
-        }
-        output[out_base + dim] = half(acc);
-    }
-}
-
 kernel void izwi_paged_decode_attention_f32(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
@@ -1941,11 +1789,11 @@ impl CustomOp3 for QkRmsNormOp {
         encoder.set_bytes(6, &(self.head_dim as u32));
         encoder.set_bytes(7, &self.eps);
 
-        let threads_per_threadgroup = self
-            .head_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 256);
+        let threads_per_threadgroup = reduction_threads(
+            self.head_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            256,
+        );
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: rows,
@@ -2087,11 +1935,11 @@ impl CustomOp2 for RmsNormOp {
         encoder.set_bytes(4, &(self.hidden_dim as u32));
         encoder.set_bytes(5, &self.eps);
 
-        let threads_per_threadgroup = self
-            .hidden_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 1024);
+        let threads_per_threadgroup = reduction_threads(
+            self.hidden_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            1024,
+        );
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
                 width: self.rows,
@@ -2333,17 +2181,6 @@ fn rope_pair_bshd_pipeline(device: &MetalDevice, dtype: DType) -> CandleResult<C
 }
 
 #[cfg(feature = "metal")]
-#[derive(Debug, Clone, Copy)]
-struct DecodeGqaAttentionOp {
-    num_heads: usize,
-    num_kv_heads: usize,
-    kv_len: usize,
-    kv_capacity_len: usize,
-    head_dim: usize,
-    scale: f32,
-}
-
-#[cfg(feature = "metal")]
 #[derive(Debug, Clone)]
 struct PagedDecodeAttentionOp {
     metadata: Vec<u32>,
@@ -2407,173 +2244,6 @@ struct LfmShortConvRingOp {
     capacity: usize,
     expected_cursor: u64,
     valid_length: u64,
-}
-
-#[cfg(feature = "metal")]
-impl CustomOp3 for DecodeGqaAttentionOp {
-    fn name(&self) -> &'static str {
-        "izwi-decode-gqa-attention-metal"
-    }
-
-    fn cpu_fwd(
-        &self,
-        _s1: &CpuStorage,
-        _l1: &Layout,
-        _s2: &CpuStorage,
-        _l2: &Layout,
-        _s3: &CpuStorage,
-        _l3: &Layout,
-    ) -> CandleResult<(CpuStorage, Shape)> {
-        bail!("izwi-decode-gqa-attention-metal requires Metal tensors")
-    }
-
-    fn metal_fwd(
-        &self,
-        q_storage: &MetalStorage,
-        q_layout: &Layout,
-        k_storage: &MetalStorage,
-        k_layout: &Layout,
-        v_storage: &MetalStorage,
-        v_layout: &Layout,
-    ) -> CandleResult<(MetalStorage, Shape)> {
-        let dtype = q_storage.dtype();
-        if k_storage.dtype() != dtype || v_storage.dtype() != dtype {
-            bail!("izwi-decode-gqa-attention-metal requires matching dtypes")
-        }
-        if !matches!(dtype, DType::F32 | DType::F16) {
-            bail!("izwi-decode-gqa-attention-metal only supports F32 and F16 tensors")
-        }
-        if !q_layout.is_contiguous() || !k_layout.is_contiguous() || !v_layout.is_contiguous() {
-            bail!("izwi-decode-gqa-attention-metal requires contiguous tensors")
-        }
-        if self.num_heads == 0
-            || self.num_kv_heads == 0
-            || self.kv_len == 0
-            || self.kv_len > self.kv_capacity_len
-            || self.kv_len > 2048
-            || self.head_dim == 0
-            || !self.num_heads.is_multiple_of(self.num_kv_heads)
-        {
-            bail!("izwi-decode-gqa-attention-metal unsupported shape")
-        }
-        if q_layout.shape().elem_count() != self.num_heads.saturating_mul(self.head_dim) {
-            bail!("izwi-decode-gqa-attention-metal q shape mismatch")
-        }
-        let kv_elems = self
-            .num_kv_heads
-            .saturating_mul(self.kv_capacity_len)
-            .saturating_mul(self.head_dim);
-        if k_layout.shape().elem_count() != kv_elems || v_layout.shape().elem_count() != kv_elems {
-            bail!("izwi-decode-gqa-attention-metal k/v shape mismatch")
-        }
-        let elem_count = self.num_heads.saturating_mul(self.head_dim);
-        if elem_count > u32::MAX as usize
-            || self.num_heads > u32::MAX as usize
-            || self.num_kv_heads > u32::MAX as usize
-            || self.kv_len > u32::MAX as usize
-            || self.kv_capacity_len > u32::MAX as usize
-            || self.head_dim > u32::MAX as usize
-        {
-            bail!("izwi-decode-gqa-attention-metal tensor is too large")
-        }
-
-        let device = q_storage.device().clone();
-        let output = device.new_buffer(elem_count, dtype, "izwi-decode-gqa-attention")?;
-        let encoder = device.command_encoder()?;
-        encoder.set_label("izwi-decode-gqa-attention");
-        let pipeline = decode_gqa_attention_pipeline(device.metal_device(), dtype)?;
-        encoder.set_compute_pipeline_state(&pipeline);
-
-        encoder.set_input_buffer(
-            0,
-            Some(q_storage.buffer()),
-            q_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_input_buffer(
-            1,
-            Some(k_storage.buffer()),
-            k_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_input_buffer(
-            2,
-            Some(v_storage.buffer()),
-            v_layout.start_offset() * dtype.size_in_bytes(),
-        );
-        encoder.set_output_buffer(3, Some(&output), 0);
-        encoder.set_bytes(4, &(self.num_heads as u32));
-        encoder.set_bytes(5, &(self.num_kv_heads as u32));
-        encoder.set_bytes(6, &(self.kv_len as u32));
-        encoder.set_bytes(7, &(self.head_dim as u32));
-        encoder.set_bytes(8, &self.scale);
-        encoder.set_bytes(9, &(self.kv_capacity_len as u32));
-
-        let threads_per_threadgroup = self
-            .head_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 256);
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: self.num_heads,
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: threads_per_threadgroup,
-                height: 1,
-                depth: 1,
-            },
-        );
-
-        drop(encoder);
-
-        Ok((
-            MetalStorage::new(output, device, elem_count, dtype),
-            Shape::from((1, self.num_heads, 1, self.head_dim)),
-        ))
-    }
-}
-
-#[cfg(feature = "metal")]
-fn decode_gqa_attention_pipeline(
-    device: &MetalDevice,
-    dtype: DType,
-) -> CandleResult<ComputePipeline> {
-    static PIPELINES: OnceLock<Mutex<HashMap<(u64, DType), ComputePipeline>>> = OnceLock::new();
-    let registry_id = device.registry_id();
-    let pipelines = PIPELINES.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (registry_id, dtype);
-
-    if let Some(pipeline) = pipelines
-        .lock()
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(pipeline);
-    }
-
-    let function_name = match dtype {
-        DType::F32 => "izwi_decode_gqa_attention_f32",
-        DType::F16 => "izwi_decode_gqa_attention_f16",
-        _ => bail!("izwi-decode-gqa-attention-metal only supports F32 and F16 tensors"),
-    };
-    let library = device
-        .new_library_with_source(IZWI_METAL_SOURCE, None)
-        .map_err(candle_core::Error::wrap)?;
-    let function = library
-        .get_function(function_name, None)
-        .map_err(candle_core::Error::wrap)?;
-    let pipeline = device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(candle_core::Error::wrap)?;
-
-    pipelines
-        .lock()
-        .map_err(|err| candle_core::Error::Msg(err.to_string()))?
-        .insert(key, pipeline.clone());
-
-    Ok(pipeline)
 }
 
 #[cfg(feature = "metal")]
@@ -2716,6 +2386,136 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             .max(self.value_head_dim)
             .next_power_of_two()
             .clamp(1, 256);
+
+        // Simdgroup GQA decode: one threadgroup per (row, KV head, partition)
+        // for every query head of the group. Geometries it does not cover
+        // keep the scalar kernels below.
+        if let Some(variant) = super::metal_paged_gqa::gqa_decode_enabled()
+            .then(|| {
+                super::metal_paged_gqa::GqaDecodeVariant::select(
+                    self.key_head_dim,
+                    self.value_head_dim,
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
+            })
+            .flatten()
+        {
+            let pipeline =
+                super::metal_paged_gqa::gqa_decode_pipeline(device.metal_device(), dtype, variant)?;
+            if pipeline.max_total_threads_per_threadgroup()
+                >= super::metal_paged_gqa::GQA_DECODE_THREADS
+            {
+                let (partitions, partition_tokens) = super::metal_paged_gqa::gqa_decode_partitions(
+                    self.batch_size,
+                    self.num_kv_heads,
+                    max_context_len,
+                );
+                let partial_count = if partitions > 1 {
+                    self.batch_size
+                        .checked_mul(self.num_heads)
+                        .and_then(|value| value.checked_mul(partitions))
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg("paged attention split overflow".into())
+                        })?
+                } else {
+                    1
+                };
+                let partial_value_count = partial_count
+                    .checked_mul(self.value_head_dim)
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("paged attention split overflow".into())
+                    })?;
+                let partial_values =
+                    device.new_buffer(partial_value_count, DType::F32, "izwi-paged-gqa-parts")?;
+                let partial_maxes =
+                    device.new_buffer(partial_count, DType::F32, "izwi-paged-gqa-maxes")?;
+                let partial_sums =
+                    device.new_buffer(partial_count, DType::F32, "izwi-paged-gqa-sums")?;
+
+                encoder.set_label("izwi-paged-decode-gqa");
+                encoder.set_compute_pipeline_state(&pipeline);
+                encoder.set_input_buffer(
+                    0,
+                    Some(q_storage.buffer()),
+                    q_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_input_buffer(
+                    1,
+                    Some(k_storage.buffer()),
+                    k_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_input_buffer(
+                    2,
+                    Some(v_storage.buffer()),
+                    v_layout.start_offset() * dtype.size_in_bytes(),
+                );
+                encoder.set_output_buffer(3, Some(&output), 0);
+                encoder.set_output_buffer(4, Some(&partial_values), 0);
+                encoder.set_output_buffer(5, Some(&partial_maxes), 0);
+                encoder.set_output_buffer(6, Some(&partial_sums), 0);
+                encoder.set_input_buffer(7, Some(metadata_storage.buffer()), metadata_offset);
+                encoder.set_bytes(8, &(self.batch_size as u32));
+                encoder.set_bytes(9, &(self.num_heads as u32));
+                encoder.set_bytes(10, &(self.num_kv_heads as u32));
+                encoder.set_bytes(11, &(self.page_tokens as u32));
+                encoder.set_bytes(12, &(self.max_blocks as u32));
+                encoder.set_bytes(13, &(self.key_head_dim as u32));
+                encoder.set_bytes(14, &self.scale);
+                encoder.set_bytes(15, &self.softcap.unwrap_or(0.0));
+                encoder.set_bytes(16, &(partition_tokens as u32));
+                encoder.set_bytes(17, &(partitions as u32));
+                encoder.dispatch_thread_groups(
+                    objc2_metal::MTLSize {
+                        width: self.num_kv_heads,
+                        height: self.batch_size,
+                        depth: partitions,
+                    },
+                    objc2_metal::MTLSize {
+                        width: super::metal_paged_gqa::GQA_DECODE_THREADS,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                if partitions > 1 {
+                    let (_, reduce_pipeline) =
+                        paged_decode_attention_split_pipelines(device.metal_device(), dtype)?;
+                    encoder.insert_memory_barrier();
+                    encoder.set_label("izwi-paged-decode-gqa-reduce");
+                    encoder.set_compute_pipeline_state(&reduce_pipeline);
+                    encoder.set_input_buffer(0, Some(&partial_values), 0);
+                    encoder.set_input_buffer(1, Some(&partial_maxes), 0);
+                    encoder.set_input_buffer(2, Some(&partial_sums), 0);
+                    encoder.set_output_buffer(3, Some(&output), 0);
+                    encoder.set_input_buffer(4, Some(metadata_storage.buffer()), metadata_offset);
+                    encoder.set_bytes(5, &(self.num_heads as u32));
+                    encoder.set_bytes(6, &(self.value_head_dim as u32));
+                    encoder.set_bytes(7, &(partition_tokens as u32));
+                    encoder.set_bytes(8, &(partitions as u32));
+                    encoder.dispatch_thread_groups(
+                        objc2_metal::MTLSize {
+                            width: self.num_heads,
+                            height: self.batch_size,
+                            depth: 1,
+                        },
+                        objc2_metal::MTLSize {
+                            width: reduction_threads(
+                                reduction_width,
+                                reduce_pipeline.max_total_threads_per_threadgroup(),
+                                256,
+                            ),
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+                drop(encoder);
+                return Ok((
+                    MetalStorage::new(output, device, elem_count, dtype),
+                    Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
+                ));
+            }
+        }
         let base_workgroups = self.batch_size.saturating_mul(self.num_heads);
         let use_split_kv = max_context_len > METAL_PAGED_ATTENTION_SPLIT_MIN_CONTEXT
             && base_workgroups <= METAL_PAGED_ATTENTION_SPLIT_MAX_BASE_WORKGROUPS;
@@ -2784,7 +2584,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: max_partitions,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        split_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2809,7 +2613,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        reduce_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2851,7 +2659,11 @@ impl CustomOp3 for PagedDecodeAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -2864,6 +2676,20 @@ impl CustomOp3 for PagedDecodeAttentionOp {
             Shape::from((self.batch_size, self.num_heads, self.value_head_dim)),
         ))
     }
+}
+
+/// Threads for a kernel that tree-reduces across its threadgroup: the largest
+/// power of two that covers no more than `requested` lanes' next power of two
+/// and fits both the pipeline's limit and `cap`. A pipeline limit that is not
+/// a power of two (register pressure can lower it) must never become the
+/// width, because the halving reductions would then skip lanes.
+fn reduction_threads(requested: usize, pipeline_limit: usize, cap: usize) -> usize {
+    let bound = requested
+        .max(1)
+        .next_power_of_two()
+        .min(pipeline_limit.max(1))
+        .min(cap.max(1));
+    1 << (usize::BITS - 1 - bound.leading_zeros())
 }
 
 #[cfg(feature = "metal")]
@@ -3183,7 +3009,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: max_partitions,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        split_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -3208,7 +3038,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width,
+                    width: reduction_threads(
+                        reduction_width,
+                        reduce_pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -3252,7 +3086,11 @@ impl CustomOp3 for PagedPrefillAttentionOp {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: reduction_width.min(pipeline.max_total_threads_per_threadgroup()),
+                    width: reduction_threads(
+                        reduction_width,
+                        pipeline.max_total_threads_per_threadgroup(),
+                        256,
+                    ),
                     height: 1,
                     depth: 1,
                 },
@@ -4243,11 +4081,11 @@ impl CustomOp3 for Qwen35GatedDeltaSequenceOp {
         encoder.set_bytes(10, &(output_elem_count as u32));
         encoder.set_bytes(11, &self.query_scale);
 
-        let threads_per_threadgroup = self
-            .head_v_dim
-            .next_power_of_two()
-            .min(pipeline.max_total_threads_per_threadgroup())
-            .clamp(1, 256);
+        let threads_per_threadgroup = reduction_threads(
+            self.head_v_dim,
+            pipeline.max_total_threads_per_threadgroup(),
+            256,
+        );
         let threadgroups = objc2_metal::MTLSize {
             width: self.num_v_heads,
             height: 1,
@@ -4682,106 +4520,6 @@ pub fn try_fused_rope_pair_bshd(
             .reshape((k_bsz, k_seq, k_heads, k_head_dim))
             .ok()?;
         return Some((q_out, k_out));
-    }
-
-    #[allow(unreachable_code)]
-    None
-}
-
-/// Try fused single-token grouped-query attention for decode.
-///
-/// Inputs are head-major: q `[1, heads, 1, head_dim]`, k/v
-/// `[1, kv_heads, total_len, head_dim]`.
-pub fn try_fused_decode_gqa_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    scale: f32,
-) -> Option<Tensor> {
-    let total_len = k.dims4().ok()?.2;
-    try_fused_decode_gqa_attention_with_kv_len(
-        q,
-        k,
-        v,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        total_len,
-        scale,
-    )
-}
-
-pub fn try_fused_decode_gqa_attention_with_kv_len(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    kv_len: usize,
-    scale: f32,
-) -> Option<Tensor> {
-    #[cfg(not(feature = "metal"))]
-    let _ = (q, k, v, num_heads, num_kv_heads, head_dim, kv_len, scale);
-
-    if !use_fused_kernels() {
-        return None;
-    }
-
-    #[cfg(feature = "metal")]
-    {
-        let (q_bsz, q_heads, q_seq, q_head_dim) = q.dims4().ok()?;
-        let (k_bsz, k_heads, kv_capacity_len, k_head_dim) = k.dims4().ok()?;
-        let (v_bsz, v_heads, v_capacity_len, v_head_dim) = v.dims4().ok()?;
-        if q_bsz != 1
-            || k_bsz != 1
-            || v_bsz != 1
-            || q_seq != 1
-            || q_heads != num_heads
-            || k_heads != num_kv_heads
-            || v_heads != num_kv_heads
-            || q_head_dim != head_dim
-            || k_head_dim != head_dim
-            || v_head_dim != head_dim
-            || kv_capacity_len != v_capacity_len
-            || kv_len == 0
-            || kv_len > kv_capacity_len
-            || kv_len > 2048
-            || num_heads == 0
-            || num_kv_heads == 0
-            || !num_heads.is_multiple_of(num_kv_heads)
-            || head_dim == 0
-            || !q.device().is_metal()
-            || !k.device().is_metal()
-            || !v.device().is_metal()
-            || !q.device().same_device(k.device())
-            || !q.device().same_device(v.device())
-            || q.dtype() != k.dtype()
-            || q.dtype() != v.dtype()
-            || !matches!(q.dtype(), DType::F32 | DType::F16)
-            || !q.is_contiguous()
-            || !k.is_contiguous()
-            || !v.is_contiguous()
-        {
-            return None;
-        }
-        return q
-            .apply_op3_no_bwd(
-                k,
-                v,
-                &DecodeGqaAttentionOp {
-                    num_heads,
-                    num_kv_heads,
-                    kv_len,
-                    kv_capacity_len,
-                    head_dim,
-                    scale,
-                },
-            )
-            .ok();
     }
 
     #[allow(unreachable_code)]
@@ -5322,139 +5060,6 @@ pub fn try_tiled_deltanet_recurrence(
     None
 }
 
-/// Try SIMD-group softmax for attention.
-///
-/// Uses Metal's simd_shuffle and simd_sum instructions to perform
-/// parallel softmax computation within a threadgroup. This is more
-/// efficient for small models with fewer attention heads.
-///
-/// The SIMD-group approach allows one threadgroup to handle multiple
-/// heads simultaneously, keeping GPU Execution Units busy.
-///
-/// # Arguments
-/// * `scores` - Attention scores [batch, heads, q_len, kv_len]
-/// * `scale` - Scale factor (typically 1/sqrt(head_dim))
-///
-/// # Returns
-/// Softmax-normalized attention weights
-pub fn try_simd_softmax(scores: &Tensor, scale: f32) -> Option<Tensor> {
-    if !use_fused_kernels() {
-        return None;
-    }
-
-    // Only supported for F32 on Metal devices
-    if scores.dtype() != DType::F32 {
-        return None;
-    }
-
-    if !scores.device().is_metal() {
-        return None;
-    }
-
-    // For now, use standard softmax
-    // A true SIMD-group implementation would require custom Metal kernels
-    // using threadgroup_barrier, simd_shuffle, and simd_sum
-
-    // The ideal Metal kernel would:
-    // 1. Load scores into threadgroup memory
-    // 2. Use simd_max to find max score per SIMD group
-    // 3. Use simd_sum to compute exp sum per SIMD group
-    // 4. Normalize and write output
-
-    // Current: use standard operations
-    let scaled = (scores * scale as f64).ok()?;
-    candle_nn::ops::softmax(&scaled, candle_core::D::Minus1).ok()
-}
-
-/// Try SIMD-group RMS normalization.
-///
-/// Uses Metal's simd_sum for parallel reduction across head dimensions.
-/// More efficient for small head dimensions common in 4B/9B models.
-pub fn try_simd_rms_norm(input: &Tensor, weight: &Tensor, eps: f64) -> Option<Tensor> {
-    if !use_fused_kernels() {
-        return None;
-    }
-
-    // Only supported for F32 on Metal devices
-    if input.dtype() != DType::F32 {
-        return None;
-    }
-
-    if !input.device().is_metal() {
-        return None;
-    }
-
-    // For now, use standard RMS norm
-    // A SIMD-group implementation would:
-    // 1. Use simd_sum for parallel sum of squares
-    // 2. Compute RMS per SIMD group
-    // 3. Apply normalization and weight
-
-    // Current: use standard operations
-    try_fused_rms_norm(input, weight, eps)
-}
-
-/// Try 3:1 DeltaNet block fusion.
-///
-/// Qwen 3.5 uses a 3:1 ratio of Gated DeltaNet to Gated Attention blocks.
-/// This function merges 3 consecutive DeltaNet blocks into a single GPU
-/// command, reducing CPU/GPU synchronization overhead by 66%.
-///
-/// In llama.cpp, this is done by kernel fusion to combine the 3x DeltaNet
-/// blocks. By merging the three consecutive linear attention passes, we
-/// reduce the "Round Trip Time" (RTT) to the GPU significantly.
-///
-/// # Arguments
-/// * `input` - Input tensor for the first block
-/// * `block_configs` - Configuration for each of the 3 blocks
-/// * `states` - Mutable runtime states for each block (type-erased)
-///
-/// # Returns
-/// Output tensor after processing all 3 blocks
-pub fn try_fused_deltanet_blocks_3x1(
-    input: &Tensor,
-    block_configs: &[DeltaNetBlockConfig],
-    _states: &mut [&mut dyn std::any::Any],
-) -> Option<Tensor> {
-    if !use_fused_kernels() {
-        return None;
-    }
-
-    // Only supported for F32 on Metal devices
-    if input.dtype() != DType::F32 {
-        return None;
-    }
-
-    if !input.device().is_metal() {
-        return None;
-    }
-
-    // Require exactly 3 blocks for 3:1 fusion
-    if block_configs.len() != 3 || _states.len() != 3 {
-        return None;
-    }
-
-    // For now, process sequentially
-    // A true fused implementation would dispatch all 3 blocks in one kernel
-
-    // The ideal Metal kernel would:
-    // 1. Load input into threadgroup memory
-    // 2. For each of 3 blocks:
-    //    - Compute qkv projections
-    //    - Apply depthwise conv
-    //    - Run gated delta recurrence with tile memory
-    //    - Apply output projection
-    // 3. Return final output without intermediate VRAM writes
-
-    // Current: fall back to sequential processing
-    tracing::debug!(
-        "3:1 DeltaNet block fusion not yet implemented, processing {} blocks sequentially",
-        block_configs.len()
-    );
-
-    None
-}
-
 /// Configuration for a single DeltaNet block in fused execution.
 #[derive(Debug, Clone)]
 pub struct DeltaNetBlockConfig {
@@ -5489,23 +5094,6 @@ pub fn use_block_fusion() -> bool {
         .unwrap_or(true)
 }
 
-/// Check if SIMD-group optimizations should be used.
-pub fn use_simd_optimizations() -> bool {
-    if !use_fused_kernels() {
-        return false;
-    }
-
-    std::env::var("IZWI_SIMD_OPTIMIZATIONS")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
-
 /// Check if fused kernels should be used.
 pub fn use_fused_kernels() -> bool {
     crate::kernels::use_fused_kernels()
@@ -5517,6 +5105,24 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     #[cfg(all(feature = "metal", target_os = "macos"))]
     use candle_nn::Module;
+
+    #[test]
+    fn reduction_threads_are_always_a_power_of_two_within_every_limit() {
+        assert_eq!(reduction_threads(128, 1024, 256), 128);
+        assert_eq!(reduction_threads(80, 1024, 256), 128);
+        assert_eq!(reduction_threads(512, 1024, 256), 256);
+        // A non-power-of-two pipeline limit rounds down, never up.
+        assert_eq!(reduction_threads(256, 192, 256), 128);
+        assert_eq!(reduction_threads(128, 96, 256), 64);
+        assert_eq!(reduction_threads(0, 1024, 256), 1);
+        for requested in 1..600 {
+            for limit in [1, 3, 96, 192, 448, 768, 896, 1024] {
+                let threads = reduction_threads(requested, limit, 256);
+                assert!(threads.is_power_of_two());
+                assert!(threads <= limit && threads <= 256);
+            }
+        }
+    }
 
     #[cfg(feature = "metal")]
     #[test]
@@ -6230,16 +5836,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_gqa_attention_returns_none_on_cpu() {
-        let device = Device::Cpu;
-        let q = Tensor::zeros((1, 2, 1, 4), DType::F32, &device).unwrap();
-        let k = Tensor::zeros((1, 1, 3, 4), DType::F32, &device).unwrap();
-        let v = Tensor::zeros((1, 1, 3, 4), DType::F32, &device).unwrap();
-
-        assert!(try_fused_decode_gqa_attention(&q, &k, &v, 2, 1, 4, 0.5).is_none());
-    }
-
-    #[test]
     fn lfm_shortconv_decode3_returns_none_on_cpu() {
         let device = Device::Cpu;
         let cache = Tensor::zeros((1, 2, 3), DType::F32, &device).unwrap();
@@ -6767,134 +6363,6 @@ mod tests {
                 assert!(
                     (actual - expected).abs() <= tolerance,
                     "{dtype:?} k mismatch at {idx}: {actual} != {expected}"
-                );
-            }
-        }
-    }
-
-    #[cfg(all(feature = "metal", target_os = "macos"))]
-    #[test]
-    fn metal_decode_gqa_attention_kernel_matches_reference_if_available() {
-        let Some(device) = metal_test_device() else {
-            return;
-        };
-        for dtype in [DType::F32, DType::F16] {
-            let q = Tensor::from_vec(
-                vec![
-                    0.2f32, -0.4, 0.6, 0.8, //
-                    -1.0, 1.2, -1.4, 1.6,
-                ],
-                (1, 2, 1, 4),
-                &device,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let k = Tensor::from_vec(
-                vec![
-                    0.3f32, -0.5, 0.7, -0.9, //
-                    1.1, -1.3, 1.5, -1.7, //
-                    1.9, -2.1, 2.3, -2.5,
-                ],
-                (1, 1, 3, 4),
-                &device,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let v = Tensor::from_vec(
-                vec![
-                    -0.2f32, 0.4, -0.6, 0.8, //
-                    1.0, -1.2, 1.4, -1.6, //
-                    -1.8, 2.0, -2.2, 2.4,
-                ],
-                (1, 1, 3, 4),
-                &device,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let scale = 0.5f32;
-
-            let out = try_fused_decode_gqa_attention(&q, &k, &v, 2, 1, 4, scale)
-                .expect("fused decode GQA attention should run on Metal");
-            let k_rep = Tensor::cat(&[&k, &k], 1).unwrap();
-            let v_rep = Tensor::cat(&[&v, &v], 1).unwrap();
-            let scores = (q.matmul(&k_rep.t().unwrap()).unwrap() * scale as f64).unwrap();
-            let probs = candle_nn::ops::softmax(
-                &scores.to_dtype(DType::F32).unwrap(),
-                candle_core::D::Minus1,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let reference = probs.matmul(&v_rep).unwrap();
-
-            let out = out
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            let reference = reference
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            let tolerance = if dtype == DType::F16 { 5e-3 } else { 1e-5 };
-            for (idx, (actual, expected)) in out.iter().zip(reference.iter()).enumerate() {
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "{dtype:?} mismatch at {idx}: {actual} != {expected}"
-                );
-            }
-
-            let k_padded = Tensor::from_vec(
-                vec![
-                    0.3f32, -0.5, 0.7, -0.9, //
-                    1.1, -1.3, 1.5, -1.7, //
-                    1.9, -2.1, 2.3, -2.5, //
-                    90.0, 91.0, 92.0, 93.0, //
-                    -90.0, -91.0, -92.0, -93.0,
-                ],
-                (1, 1, 5, 4),
-                &device,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let v_padded = Tensor::from_vec(
-                vec![
-                    -0.2f32, 0.4, -0.6, 0.8, //
-                    1.0, -1.2, 1.4, -1.6, //
-                    -1.8, 2.0, -2.2, 2.4, //
-                    80.0, 81.0, 82.0, 83.0, //
-                    -80.0, -81.0, -82.0, -83.0,
-                ],
-                (1, 1, 5, 4),
-                &device,
-            )
-            .unwrap()
-            .to_dtype(dtype)
-            .unwrap();
-            let padded_out = try_fused_decode_gqa_attention_with_kv_len(
-                &q, &k_padded, &v_padded, 2, 1, 4, 3, scale,
-            )
-            .expect("fused decode GQA attention should ignore padded cache tail");
-            let padded_out = padded_out
-                .to_dtype(DType::F32)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap();
-            for (idx, (actual, expected)) in padded_out.iter().zip(reference.iter()).enumerate() {
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "{dtype:?} padded mismatch at {idx}: {actual} != {expected}"
                 );
             }
         }

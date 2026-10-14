@@ -251,6 +251,22 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_enable_preemption")]
     pub enable_preemption: bool,
 
+    /// Output tokens a chat request claims in managed KV beyond its prompt and
+    /// current step. Claims grow by this quantum as generation proceeds
+    /// instead of reserving the whole output budget up front, so concurrent
+    /// requests are admitted together; zero restores full up-front claims.
+    #[serde(default = "default_managed_chat_claim_quantum_tokens")]
+    pub managed_chat_claim_quantum_tokens: usize,
+
+    /// Largest chat context fitted automatically on CPU/Metal when no explicit
+    /// `max_sequence_length` is configured. Portable arenas are allocated in
+    /// full at load, so fitting the model's whole advertised context (262,144
+    /// tokens for Qwen3.5) pinned gigabytes of unified memory for an idle
+    /// model. An explicit `max_sequence_length` still selects any length the
+    /// memory budget can hold; zero disables the cap.
+    #[serde(default = "default_portable_auto_context_cap_tokens")]
+    pub portable_auto_context_cap_tokens: usize,
+
     /// Enable adaptive scheduling heuristics driven by runtime latency feedback.
     #[serde(default = "default_enable_adaptive_batching")]
     pub enable_adaptive_batching: bool,
@@ -423,6 +439,14 @@ fn default_num_threads() -> usize {
         .unwrap_or(4)
         .min(8)
 }
+fn default_managed_chat_claim_quantum_tokens() -> usize {
+    1024
+}
+
+fn default_portable_auto_context_cap_tokens() -> usize {
+    32 * 1024
+}
+
 fn default_enable_preemption() -> bool {
     false
 }
@@ -592,6 +616,8 @@ impl Default for EngineCoreConfig {
             backend: default_backend_kind(),
             num_threads: default_num_threads(),
             enable_preemption: default_enable_preemption(),
+            managed_chat_claim_quantum_tokens: default_managed_chat_claim_quantum_tokens(),
+            portable_auto_context_cap_tokens: default_portable_auto_context_cap_tokens(),
             enable_adaptive_batching: default_enable_adaptive_batching(),
             min_tokens_per_step: default_min_tokens_per_step(),
             target_ttft_ms: default_target_ttft_ms(),

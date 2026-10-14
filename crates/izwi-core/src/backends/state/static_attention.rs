@@ -522,6 +522,11 @@ impl InvocationStaticAttentionArena {
     }
 
     pub(crate) fn reset_for_reuse(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_RESET.with(|fail| fail.replace(false)) {
+            self.dirty = true;
+            return Err(invalid("injected static-attention reset failure"));
+        }
         for layer in &mut self.layers {
             if let Err(error) = layer.keys.zero_set() {
                 self.dirty = true;
@@ -1234,6 +1239,12 @@ fn contiguous_range(layout: &Layout, operation: &str) -> Result<(usize, usize)> 
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidInput(message.into())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails the next `reset_for_reuse` on this thread, leaving the arena dirty.
+    pub(crate) static FAIL_NEXT_RESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]

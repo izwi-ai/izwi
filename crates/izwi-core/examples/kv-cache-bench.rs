@@ -383,29 +383,33 @@ fn run(options: &Options) -> Result<(), String> {
 
     let mutation_source = block(runtime.arena.id(), 0);
     let mutation_destination = block(runtime.arena.id(), workload.used_pages);
+    let copy_mutation_page = || {
+        runtime
+            .arena
+            .copy_pages(&[KvPageCopy {
+                source: mutation_source,
+                destination: mutation_destination,
+            }])
+            .map_err(|error| error.to_string())?
+            .wait()
+            .map_err(|error| error.to_string())
+    };
     benchmark_operation(
         options,
         &workload,
         &runtime,
         "page_copy",
         exact_error(),
-        || {
-            let fence = runtime
-                .arena
-                .copy_pages(&[KvPageCopy {
-                    source: mutation_source,
-                    destination: mutation_destination,
-                }])
-                .map_err(|error| error.to_string())?;
-            fence.wait().map_err(|error| error.to_string())
-        },
+        copy_mutation_page,
     )?;
-    benchmark_operation(
+    benchmark_operation_with_setup(
         options,
         &workload,
         &runtime,
         "page_zero",
         exact_error(),
+        // Zeroing a clean page is a no-op; dirty it again, untimed.
+        copy_mutation_page,
         || {
             let fence = runtime
                 .arena
@@ -1108,14 +1112,39 @@ fn benchmark_operation(
     runtime: &Runtime,
     operation: &str,
     correctness: ErrorMetrics,
+    run_once: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    benchmark_operation_with_setup(
+        options,
+        workload,
+        runtime,
+        operation,
+        correctness,
+        || Ok(()),
+        run_once,
+    )
+}
+
+/// `setup` runs untimed before every iteration, for operations that consume
+/// the state they act on (zeroing skips a page that is already clean). Its
+/// arena work still counts toward the reported synchronization totals.
+fn benchmark_operation_with_setup(
+    options: &Options,
+    workload: &Workload,
+    runtime: &Runtime,
+    operation: &str,
+    correctness: ErrorMetrics,
+    mut setup: impl FnMut() -> Result<(), String>,
     mut run_once: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     for _ in 0..options.warmup {
+        setup()?;
         run_once()?;
     }
     let before = runtime.arena.operation_stats();
     let mut samples = Vec::with_capacity(options.iterations);
     for _ in 0..options.iterations {
+        setup()?;
         let start = Instant::now();
         run_once()?;
         samples.push(start.elapsed());

@@ -22,7 +22,6 @@
 //! let request = EngineCoreRequest::tts("Hello, world!");
 //! let output = engine.generate(request).await?;
 //! ```
-#![allow(dead_code)]
 // Inference entry points intentionally expose the complete tensor/state contract,
 // model registries intentionally store heterogeneous implementations inline, and
 // numerical kernels use explicit index loops where coordinates participate in
@@ -36,23 +35,43 @@
     clippy::type_complexity
 )]
 
+// Dead-code analysis is restored module by module. Every module below that
+// still carries `#[allow(dead_code)]` has not been audited yet; remove the
+// attribute once a module compiles warning-free on every feature lane.
+#[allow(dead_code)]
 pub mod artifacts;
+#[allow(dead_code)]
 pub mod audio;
+#[allow(dead_code)]
 pub mod backends;
+#[allow(dead_code)]
 pub mod catalog;
+#[allow(dead_code)]
 pub mod codecs;
+#[allow(dead_code)]
 pub mod config;
+#[allow(dead_code)]
 pub mod engine;
+#[allow(dead_code)]
 pub mod error;
+#[allow(dead_code)]
 pub mod kernels;
 pub mod kv;
+#[allow(dead_code)]
 pub mod model;
+#[allow(dead_code)]
 mod models;
+#[allow(dead_code)]
 pub mod performance;
+#[allow(dead_code)]
 pub mod residency;
+#[allow(dead_code)]
 pub mod runtime;
+#[allow(dead_code)]
 pub mod runtime_models;
+#[allow(dead_code)]
 pub mod serve_runtime;
+#[allow(dead_code)]
 pub mod tokenizer;
 
 // Re-export main types from the new engine module

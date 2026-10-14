@@ -207,6 +207,8 @@ pub struct ManagedKvArenaRuntimeSnapshot {
     pub domain_id: u32,
     pub device_ordinal: Option<u32>,
     pub page_tokens: u32,
+    /// Resolved page storage dtype (`f32`, `f16`, `bf16`).
+    pub storage_dtype: String,
     pub token_capacity: u64,
     pub bytes_per_page: u64,
     pub physical_bytes: u64,
@@ -1037,6 +1039,8 @@ impl ManagedKvCacheManager {
                             domain_id: group.domain.get(),
                             device_ordinal: group.arena.device_ordinal,
                             page_tokens: group.page_tokens,
+                            storage_dtype: format!("{:?}", group.storage.dtype())
+                                .to_ascii_lowercase(),
                             token_capacity: u64::from(group.capacity_pages)
                                 .saturating_mul(u64::from(group.page_tokens)),
                             bytes_per_page: group.bytes_per_page,
@@ -1457,12 +1461,16 @@ impl ManagedKvCacheManager {
                 let mut offload = offload::ModelOffload {
                     arenas: HashMap::with_capacity(plan.groups.len()),
                 };
+                // The model lease is charged one budget, so the arenas share
+                // it: giving each arena the whole budget let a multi-domain
+                // model keep `arenas x budget` bytes resident on the host.
+                let per_arena_budget = split_host_offload_budget(policy.budget_bytes, arenas.len());
                 for arena in arenas.values() {
                     offload.arenas.insert(
                         arena.id(),
                         offload::ArenaOffload::new(
                             crate::backends::kv::arena_page_bytes(arena.config()),
-                            policy.budget_bytes,
+                            per_arena_budget,
                         )?,
                     );
                 }
@@ -1500,6 +1508,14 @@ impl ManagedKvCacheManager {
                     .interval_steps
                     .is_multiple_of(u64::from(group.page_tokens))
             {
+                // Hybrid prefix reuse is unusable without snapshots, so say
+                // why instead of silently serving every turn cold.
+                tracing::warn!(
+                    ?model_instance,
+                    snapshot_interval_tokens = policy.interval_steps,
+                    page_tokens = group.page_tokens,
+                    "Recurrent-state snapshot interval is not a multiple of the KV page size; hybrid prefix reuse is disabled for this model"
+                );
                 return None;
             }
             Some(TensorSnapshotSharing {
@@ -1629,7 +1645,40 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, false)
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            ManagedClaimPolicy::Full,
+            true,
+        )
+    }
+
+    /// Prepare one scheduled row. `prefix_attach` is false when the row's
+    /// adapter cannot resume prefill above a non-zero cursor: a full-prefill
+    /// row always runs its whole prompt from position 0, so attaching shared
+    /// prefix pages would hand it a cache that does not start empty.
+    pub(crate) fn prepare_row(
+        &mut self,
+        runtime: &ManagedKvModelRuntime,
+        txn_id: PlanId,
+        session: &SessionKey,
+        work: &WorkUnit,
+        request: Option<&EngineCoreRequest>,
+        claim: ManagedClaimPolicy,
+        prefix_attach: bool,
+    ) -> Result<Option<ManagedCacheReservation>> {
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            claim,
+            prefix_attach,
+        )
     }
 
     /// DS1.5: read-only admission probe for the managed prefix cursor.
@@ -1716,12 +1765,7 @@ impl ManagedKvCacheManager {
                         if sharing.index.lookup(digest, boundary)?.is_some() {
                             return Ok(Some(matched.reused_tokens));
                         }
-                        matched.page_digests.pop();
-                        matched.blocks.pop();
-                        matched.reused_tokens = matched
-                            .reused_tokens
-                            .checked_sub(group.page_tokens)
-                            .expect("matched chain holds complete pages");
+                        matched.pop_last_page(group.page_tokens);
                     }
                     continue;
                 }
@@ -1741,7 +1785,15 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, true)
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            ManagedClaimPolicy::Incremental,
+            true,
+        )
     }
 
     fn prepare_with_admission(
@@ -1751,15 +1803,27 @@ impl ManagedKvCacheManager {
         session: &SessionKey,
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
-        incremental: bool,
+        claim: ManagedClaimPolicy,
+        prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let previous_claim = self
             .models
             .get(&runtime.plan.model_instance)
             .and_then(|state| state.capacity_claims.get(session))
             .cloned();
-        let result = self.prepare_inner(runtime, txn_id, session, work, request, incremental);
-        if result.is_ok() && incremental && matches!(work, WorkUnit::SequenceStep { .. }) {
+        let result = self.prepare_inner(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            claim,
+            prefix_attach,
+        );
+        if result.is_ok()
+            && claim != ManagedClaimPolicy::Full
+            && matches!(work, WorkUnit::SequenceStep { .. })
+        {
             if let Some(state) = self.models.get_mut(&runtime.plan.model_instance) {
                 if state.capacity_claims.contains_key(session) {
                     state.incremental_claim_sessions.insert(session.clone());
@@ -1849,7 +1913,8 @@ impl ManagedKvCacheManager {
         session: &SessionKey,
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
-        incremental: bool,
+        claim: ManagedClaimPolicy,
+        prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let (
             sequence_input,
@@ -1995,10 +2060,14 @@ impl ManagedKvCacheManager {
             .map(|policy| policy.max_promotion_pages)
             .unwrap_or(0);
         let installed_claim = if let Some(request) = request {
-            if incremental && sequence_input.is_some() {
-                ensure_incremental_capacity_claim(state, session, request, work)?
-            } else {
-                ensure_capacity_claim(state, session, request)?
+            match claim {
+                ManagedClaimPolicy::Incremental if sequence_input.is_some() => {
+                    ensure_incremental_capacity_claim(state, session, request, work)?
+                }
+                ManagedClaimPolicy::Chunked { quantum_tokens } if sequence_input.is_some() => {
+                    ensure_chunked_capacity_claim(state, session, request, work, quantum_tokens)?
+                }
+                _ => ensure_capacity_claim(state, session, request)?,
             }
         } else {
             false
@@ -2083,7 +2152,8 @@ impl ManagedKvCacheManager {
                 }
                 continue;
             }
-            let prefix_eligible = snapshot.committed_tokens == 0
+            let prefix_eligible = prefix_attach
+                && snapshot.committed_tokens == 0
                 && domain_sequence_input.is_some_and(|input| input.start == 0)
                 // Prefix reuse is bounded by this transaction's committed
                 // target below, so the first scheduler-visible chunk does not
@@ -2283,13 +2353,20 @@ impl ManagedKvCacheManager {
                 .as_ref()
                 .map(|tail| tail.device_end_tokens);
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
+            // The earliest query of this span sits at `start` and still attends
+            // the `window` keys ending at itself, so the table must keep keys
+            // from `start + 1 - window`. Keeping only `target - window` drops
+            // the lookback of every query but the last in a multi-token span
+            // (chunked prefill, speculative verification). A single-token step
+            // is unchanged, and the next step advances the window again.
             let target_window_start = sliding_window
                 .map(|window| {
-                    target_committed_tokens.saturating_sub(window).min(
-                        domain_sequence_input
-                            .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
-                            .unwrap_or(snapshot.committed_tokens),
-                    )
+                    let start = domain_sequence_input
+                        .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
+                        .unwrap_or(snapshot.committed_tokens);
+                    target_committed_tokens
+                        .saturating_sub(window)
+                        .min(start.saturating_add(1).saturating_sub(window))
                 })
                 .unwrap_or(0);
             let established_window_table = sliding_window.is_some()
@@ -3056,17 +3133,21 @@ impl ManagedKvCacheManager {
             ));
         }
         if let Some(clocked_state) = reservation.clocked_state.as_ref() {
-            let arena = state.runtime.tensor_state().ok_or_else(|| {
-                Error::InferenceError("tensor-state reservation lost its physical arena".into())
-            })?;
-            let transaction = PhysicalStateTransactionId::new(reservation.txn_id)?;
-            let committed = if clocked_state.selections().is_some() {
-                let completion = receipt
-                    .clocked_state()
-                    .expect("validated selected receipt has a completion")
-                    .completion();
-                arena.commit_selected(transaction, completion)
-            } else {
+            // Every failure below must abort the reservation; returning early
+            // with `?` would leave the coordinator transaction `Written` with
+            // its pins and reservations held, which later blocks unload.
+            let committed = (|| {
+                let arena = state.runtime.tensor_state().ok_or_else(|| {
+                    Error::InferenceError("tensor-state reservation lost its physical arena".into())
+                })?;
+                let transaction = PhysicalStateTransactionId::new(reservation.txn_id)?;
+                if clocked_state.selections().is_some() {
+                    let completion = receipt
+                        .clocked_state()
+                        .expect("validated selected receipt has a completion")
+                        .completion();
+                    return arena.commit_selected(transaction, completion);
+                }
                 let target_cursor = reservation
                     .domains
                     .first()
@@ -3082,13 +3163,12 @@ impl ManagedKvCacheManager {
                     u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
                         != target_cursor
                 }) {
-                    abort_reservation(state, reservation);
                     return Err(Error::InferenceError(
                         "one managed state transaction resolved divergent domain cursors".into(),
                     ));
                 }
                 arena.commit(transaction, target_cursor)
-            };
+            })();
             let retired = match committed {
                 Ok(retired) => retired,
                 Err(error) => {
@@ -3335,6 +3415,22 @@ impl ManagedKvCacheManager {
                 "managed KV model {} has {} runtime owners, expected {expected_runtime_owners}",
                 model_instance.get(),
                 Arc::strong_count(&state.runtime),
+            )));
+        }
+        // Physical caches clone the arena handle, not the runtime. A clone
+        // that outlived its step would keep device backing alive after the
+        // lease is released, so the runtime must be the arena's only owner.
+        if let Some((arena, owners)) = state
+            .runtime
+            .arenas
+            .iter()
+            .map(|(id, arena)| (id, Arc::strong_count(arena)))
+            .find(|(_, owners)| *owners != 1)
+        {
+            return Err(Error::InferenceError(format!(
+                "managed KV model {} arena generation {} has {owners} owners, expected 1",
+                model_instance.get(),
+                arena.generation,
             )));
         }
         for group in &state.runtime.plan.groups {
@@ -4389,6 +4485,130 @@ fn validate_reservation_session_generation(
 /// separate from physical page ownership: pages are still materialized and
 /// written incrementally, while admission cannot overbook the pool and fail at
 /// an arbitrary later decode step.
+/// How a row's logical managed-KV admission claim is sized. Claims never
+/// exceed arena capacity in total and a step runs only when its own claim
+/// covers it, so every policy keeps physical pages within capacity mid-decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedClaimPolicy {
+    /// Prompt plus the whole output budget, claimed once at admission.
+    Full,
+    /// Prompt plus a bounded output quantum, extended as generation proceeds
+    /// (vLLM-style on-demand admission). An omitted OpenAI `max_tokens`
+    /// becomes "rest of context", so a full claim let one default request
+    /// reserve the entire arena and serialize every other request behind it.
+    Chunked { quantum_tokens: u32 },
+    /// Exactly the next scheduled span, including adapter-projected
+    /// speculative spans (the CUDA Qwen3.8 replay-capable route).
+    Incremental,
+}
+
+/// Claim the prompt and the current step, plus up to `quantum_tokens` of
+/// output headroom, never more than the request's prompt-plus-output budget.
+/// Only the current step is required: if other claims leave no room for the
+/// headroom the claim grows just enough for this step, and if not even that
+/// fits the row waits for capacity (`Backpressure`). A claim never shrinks.
+fn ensure_chunked_capacity_claim(
+    state: &mut ManagedKvModelState,
+    session: &SessionKey,
+    request: &EngineCoreRequest,
+    work: &WorkUnit,
+    quantum_tokens: u32,
+) -> Result<bool> {
+    let WorkUnit::SequenceStep { input, phase, .. } = work else {
+        return ensure_capacity_claim(state, session, request);
+    };
+    let prompt = u64::try_from(request.num_prompt_tokens())
+        .map_err(|_| Error::Overloaded("chunked token demand exceeds u64".into()))?;
+    let budget = prompt
+        .checked_add(u64::try_from(request.params.max_tokens.max(1)).unwrap_or(u64::MAX))
+        .ok_or_else(|| Error::Overloaded("chunked token demand overflowed".into()))?;
+    let mut demand_by_arena = HashMap::<KvArenaId, (u64, u64)>::new();
+    for group in &state.runtime.plan.groups {
+        let projected = request.project_paged_state_input(group.domain, *phase, *input)?;
+        let needed = prompt.max(
+            u64::try_from(projected.end)
+                .map_err(|_| Error::Overloaded("chunked token demand exceeds u64".into()))?,
+        );
+        let desired = budget
+            .max(needed)
+            .min(needed.saturating_add(u64::from(quantum_tokens)));
+        // A sliding window retains at most the window, the span being written
+        // and one page of alignment, exactly as the incremental claim prices.
+        let retained = |tokens: u64| -> Result<u64> {
+            Ok(sliding_window_for_domain(&state.contract, group.domain)?
+                .map(|window| {
+                    tokens.min(
+                        u64::from(window)
+                            .saturating_add(projected.len() as u64)
+                            .saturating_add(u64::from(group.page_tokens - 1)),
+                    )
+                })
+                .unwrap_or(tokens))
+        };
+        let page_tokens = u64::from(group.page_tokens);
+        let entry = demand_by_arena.entry(group.arena).or_default();
+        entry.0 = entry
+            .0
+            .checked_add(retained(needed)?.div_ceil(page_tokens))
+            .ok_or_else(|| Error::Overloaded("chunked arena page demand overflow".into()))?;
+        entry.1 = entry
+            .1
+            .checked_add(retained(desired)?.div_ceil(page_tokens))
+            .ok_or_else(|| Error::Overloaded("chunked arena page demand overflow".into()))?;
+    }
+    let mut claims = Vec::with_capacity(demand_by_arena.len());
+    for (arena, (needed_pages, desired_pages)) in demand_by_arena {
+        let group = state
+            .runtime
+            .plan
+            .groups
+            .iter()
+            .find(|group| group.arena == arena)
+            .ok_or_else(|| Error::InferenceError("managed capacity arena disappeared".into()))?;
+        let capacity = u64::from(group.capacity_pages);
+        if needed_pages > capacity {
+            let token_capacity = capacity.saturating_mul(u64::from(group.page_tokens));
+            return Err(Error::Overloaded(format!(
+                "request {} needs {needed_pages} pages for its next step, but managed state arena {} can retain at most {token_capacity} tokens ({capacity} pages of {} tokens)",
+                request.id,
+                group.id.get(),
+                group.page_tokens
+            )));
+        }
+        let previous = state
+            .capacity_claims
+            .get(session)
+            .and_then(|claims| claims.iter().find(|(claimed, _)| *claimed == arena))
+            .map(|(_, pages)| u64::from(*pages))
+            .unwrap_or(0);
+        let others = state
+            .capacity_claims
+            .iter()
+            .filter(|(owner, _)| *owner != session)
+            .flat_map(|(_, claims)| claims)
+            .filter(|(claimed, _)| *claimed == arena)
+            .map(|(_, pages)| u64::from(*pages))
+            .sum::<u64>();
+        let available = capacity.saturating_sub(others);
+        let required = previous.max(needed_pages);
+        if required > available {
+            return Err(Error::Backpressure(format!(
+                "managed KV chunked admission is waiting: request {} needs {required} pages, {others} are claimed by other requests, capacity is {capacity}",
+                request.id
+            )));
+        }
+        let pages = required.max(desired_pages.min(available));
+        claims.push((
+            arena,
+            u32::try_from(pages)
+                .map_err(|_| Error::Overloaded("chunked page claim exceeds u32".into()))?,
+        ));
+    }
+    let newly_installed = !state.capacity_claims.contains_key(session);
+    state.capacity_claims.insert(session.clone(), claims);
+    Ok(newly_installed)
+}
+
 fn ensure_capacity_claim(
     state: &mut ManagedKvModelState,
     session: &SessionKey,
@@ -4618,6 +4838,16 @@ fn managed_prefix_namespace(
         b"izwi.kv.position-semantics.v1\0",
         &[&runtime.plan.contract_fingerprint],
     );
+    // One process serves many tenants behind a gateway. Without the tenant in
+    // the salt, a tenant could time another tenant's prompts through prefix
+    // hits, so a trusted tenant key scopes every page to its own namespace.
+    let cache_salt = match request.tenant_key {
+        Some(tenant_key) => digest_parts(
+            b"izwi.kv.tenant-prefix-salt.v1\0",
+            &[&cache_salt, &tenant_key],
+        ),
+        None => cache_salt,
+    };
     Ok(Some(KvPrefixNamespace {
         model_instance: runtime.plan.model_instance,
         model_revision,
@@ -4628,6 +4858,12 @@ fn managed_prefix_namespace(
         multimodal_artifact: None,
         cache_salt,
     }))
+}
+
+/// Evenly divide one model's host-offload budget between its arenas so the
+/// pools together never exceed the single budget charged to the model lease.
+fn split_host_offload_budget(budget_bytes: u64, arenas: usize) -> u64 {
+    budget_bytes / u64::try_from(arenas.max(1)).unwrap_or(u64::MAX)
 }
 
 fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -4734,7 +4970,8 @@ fn managed_prefix_lookup(
     tokens: &[u32],
     host_page_ceiling: usize,
 ) -> Result<KvPrefixMatch> {
-    Ok(match host_chain {
+    let telemetry = Arc::clone(prefix_index.telemetry());
+    let matched = match host_chain {
         Some(chain) => offload::lookup_longest_with_host(
             prefix_index,
             chain,
@@ -4747,7 +4984,11 @@ fn managed_prefix_lookup(
         None => prefix_index
             .lookup_longest(namespace, tokens, page_tokens)
             .map_err(prefix_error)?,
-    })
+    };
+    // Counted here, at preparation, and not in the index: admission probes
+    // look up the same prompt first and would count every request twice.
+    telemetry.record_prefix_lookup(usize_to_u64(tokens.len()), u64::from(matched.reused_tokens));
+    Ok(matched)
 }
 
 /// DS4.3: outcome of restoring a matched host tail during prepare. The
@@ -4918,6 +5159,7 @@ fn reconcile_tensor_snapshot_attach(
         telemetry.record_tensor_snapshot_truncation();
         prefix_match.blocks.clear();
         prefix_match.page_digests.clear();
+        prefix_match.host_tail = None;
         prefix_match.reused_tokens = 0;
         return Ok(None);
     }
@@ -4931,12 +5173,7 @@ fn reconcile_tensor_snapshot_attach(
         if let Some(domains) = sharing.index.lookup(digest, boundary)? {
             return Ok(Some((boundary, domains)));
         }
-        prefix_match.page_digests.pop();
-        prefix_match.blocks.pop();
-        prefix_match.reused_tokens = prefix_match
-            .reused_tokens
-            .checked_sub(page_tokens)
-            .expect("matched chain holds complete pages");
+        prefix_match.pop_last_page(page_tokens);
         telemetry.record_tensor_snapshot_truncation();
     }
     Ok(None)
@@ -5531,6 +5768,137 @@ mod tests {
         next_turn.push(7);
         let resumed = run(&mut manager, &runtime, 44, "newer-next", next_turn);
         assert_eq!(resumed.domains[0].execution_start_tokens, 32);
+    }
+
+    #[test]
+    fn prefix_telemetry_counts_each_prepare_once_and_never_the_probe() {
+        let model = ModelInstanceId::new(707);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let history = (0..64).collect::<Vec<u32>>();
+        let first = SessionKey::new("history".into(), 1);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                51,
+                &first,
+                &sequence_work(0, history.len()),
+                Some(&prefix_request(model, history.clone())),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        manager
+            .finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        manager.release_session(&first).unwrap();
+        let cold = manager.telemetry_snapshot();
+        assert_eq!((cold.prefix_hits, cold.prefix_misses), (0, 1));
+        assert_eq!(cold.prefix_query_tokens, 63);
+
+        let mut next_turn = history;
+        next_turn.push(7);
+        let request = prefix_request(model, next_turn.clone());
+        assert_eq!(
+            manager.probe_managed_prefix(&runtime, &request).unwrap(),
+            Some(64)
+        );
+        assert_eq!(
+            manager.telemetry_snapshot(),
+            cold,
+            "admission probes are not lookups"
+        );
+
+        let second = SessionKey::new("next-turn".into(), 1);
+        manager
+            .prepare(
+                &runtime,
+                52,
+                &second,
+                &sequence_work(0, next_turn.len()),
+                Some(&request),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        let warm = manager.telemetry_snapshot();
+        assert_eq!((warm.prefix_hits, warm.prefix_misses), (1, 1));
+        assert_eq!(warm.prefix_query_tokens, 63 + 64);
+        assert_eq!(warm.prefix_hit_tokens, 64);
+    }
+
+    #[test]
+    fn admission_skips_prefix_chains_whose_pages_are_still_owned() {
+        // C1: evicting a chain whose pages a live table still owns frees no
+        // memory. Admission used to drop such chains first (least recently
+        // used) and keep going, so under load it flushed the index without
+        // gaining a page. Only chains that free at least one page are evicted.
+        let model = ModelInstanceId::new(707);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                6,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let commit = |manager: &mut ManagedKvCacheManager,
+                      txn_id: PlanId,
+                      session: &SessionKey,
+                      tokens: Vec<u32>| {
+            let request = prefix_request(model, tokens.clone());
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn_id,
+                    session,
+                    &sequence_work(0, tokens.len()),
+                    Some(&request),
+                )
+                .expect("admitted")
+                .expect("managed reservation");
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+        };
+
+        // Least recently used: a live session whose published page it still owns.
+        let live = SessionKey::new("live".into(), 1);
+        commit(&mut manager, 51, &live, (0..33).collect());
+        // Newer: a finished conversation held only by the index (two pages).
+        let finished = SessionKey::new("finished".into(), 1);
+        commit(&mut manager, 52, &finished, (500..565).collect());
+        manager.release_session(&finished).expect("release");
+        let before = manager.runtime_snapshot();
+        assert_eq!(before.counters.prefix_retained_pages, 3);
+
+        // An unrelated prompt needs four pages while three are free.
+        let unrelated = SessionKey::new("unrelated".into(), 1);
+        commit(&mut manager, 53, &unrelated, (900..1000).collect());
+
+        // Only the index-only chain went; the live session's page is still
+        // published for reuse.
+        assert_eq!(manager.telemetry_snapshot().prefix_evictions, 2);
+        let after = manager.runtime_snapshot();
+        assert!(after.counters.prefix_retained_pages >= 1);
     }
 
     fn composite_tensor_contract() -> InferenceStateContract {
@@ -7998,6 +8366,55 @@ mod tests {
     }
 
     #[test]
+    fn chunked_sliding_window_span_keeps_the_earliest_querys_lookback() {
+        let model = ModelInstanceId::new(49);
+        let session = SessionKey::new("managed-window-chunks".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(sliding_contract(32)),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+
+        let chunk = 8_usize;
+        for (step, start) in (0..256_usize).step_by(chunk).enumerate() {
+            let target = start + chunk;
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    step as u64 + 1,
+                    &session,
+                    &sequence_work(start, target),
+                    None,
+                )
+                .expect("prepare")
+                .expect("reservation");
+            let row = &reservation.domains[0];
+            // The query at `start` attends keys `start + 1 - 32 ..= start`;
+            // `target - 32` would have dropped seven of them.
+            assert_eq!(
+                row.target_window_start,
+                u32::try_from((start + 1).saturating_sub(32)).unwrap()
+            );
+            assert_eq!(row.first_page_offset, row.target_window_start % 16);
+            // 32 + 8 - 1 visible tokens plus a page offset fit in four pages.
+            assert!(row.provisional_groups[0].blocks.len() <= 4);
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+        }
+    }
+
+    #[test]
     fn demoted_prefix_pages_promote_back_into_a_preparing_transaction() {
         let model = ModelInstanceId::new(49);
         let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([12; 32]));
@@ -8066,12 +8483,14 @@ mod tests {
             11,
             "host pool holds the demoted chain"
         );
-        // Device-index telemetry only ever saw the device portion: the source
-        // prepare's cold lookup and this one (the chain is fully host-resident
-        // here). The host continuation is proven by the restored execution
-        // cursor below.
-        assert_eq!(telemetry.prefix_misses, 2);
-        assert_eq!(telemetry.reused_tokens, 0);
+        // Lookups are counted once per prepare across both tiers: the source
+        // prepare's cold miss, then this hit served entirely from the host
+        // chain.
+        assert_eq!(telemetry.prefix_misses, 1);
+        assert_eq!(telemetry.prefix_hits, 1);
+        assert_eq!(telemetry.prefix_hit_tokens, 352);
+        assert_eq!(telemetry.reused_tokens, 352);
+        assert_eq!(telemetry.prefix_query_tokens, 2 * (tokens.len() as u64 - 1));
         assert_eq!(
             resumed.domains[0].execution_start_tokens, 352,
             "execution resumes above the restored host tail"
@@ -8204,6 +8623,135 @@ mod tests {
         assert_eq!(telemetry.avoided_prefill_tokens, 64);
         manager.finalize(&second, None, false).expect("abort");
         assert_eq!(manager.telemetry_snapshot().transaction_aborts, 1);
+    }
+
+    #[test]
+    fn prefix_reuse_is_scoped_to_the_trusted_tenant() {
+        // H9: a worker serves many gateway tenants from one process salt. A
+        // tenant must never hit (and so time) another tenant's prefix pages.
+        let model = ModelInstanceId::new(453);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([14; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let tenant_request = |tenant: u8| {
+            let mut request = prefix_request(model, tokens.clone());
+            request.tenant_key = Some([tenant; 32]);
+            request
+        };
+        let run = |manager: &mut ManagedKvCacheManager, txn_id, name: &str, tenant| {
+            let session = SessionKey::new(name.into(), 1);
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn_id,
+                    &session,
+                    &sequence_work(0, tokens.len()),
+                    Some(&tenant_request(tenant)),
+                )
+                .expect("prepare")
+                .expect("reservation");
+            let start = reservation.domains[0].execution_start_tokens;
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+            manager.release_session(&session).expect("release");
+            start
+        };
+
+        assert_eq!(run(&mut manager, 61, "tenant-a-first", 1), 0);
+        assert_eq!(
+            run(&mut manager, 62, "tenant-b", 2),
+            0,
+            "no cross-tenant hit"
+        );
+        assert_eq!(
+            run(&mut manager, 63, "tenant-a-again", 1),
+            64,
+            "same tenant reuses"
+        );
+    }
+
+    #[test]
+    fn host_offload_budget_is_shared_by_every_arena_of_one_model() {
+        // H5: the lease is charged one budget per model; pools may not hold
+        // more than that in total.
+        assert_eq!(split_host_offload_budget(1_000, 1), 1_000);
+        assert_eq!(split_host_offload_budget(1_000, 2), 500);
+        assert_eq!(split_host_offload_budget(1_000, 3), 333);
+        assert!(split_host_offload_budget(1_000, 3) * 3 <= 1_000);
+        assert_eq!(split_host_offload_budget(1_000, 0), 1_000);
+    }
+
+    #[test]
+    fn full_prefill_rows_never_attach_shared_prefix_pages() {
+        // H10: a full-prefill adapter runs its whole prompt from position 0.
+        // Attaching published pages would hand it a non-empty cache and the
+        // model start would reject the row (or the engine would replan it as a
+        // partial quantum forever), so preparation must recompute instead.
+        let model = ModelInstanceId::new(452);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([11; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..65).collect::<Vec<u32>>();
+        let first_session = SessionKey::new("full-first".into(), 1);
+        let first = manager
+            .prepare(
+                &runtime,
+                31,
+                &first_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("first prepare")
+            .expect("first reservation");
+        manager
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
+            .expect("first commit");
+        manager
+            .release_session(&first_session)
+            .expect("first release");
+
+        let second_session = SessionKey::new("full-second".into(), 1);
+        let second = manager
+            .prepare_row(
+                &runtime,
+                32,
+                &second_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+                ManagedClaimPolicy::Full,
+                false,
+            )
+            .expect("second prepare")
+            .expect("second reservation");
+        assert_eq!(second.domains[0].execution_start_tokens, 0);
+        assert_eq!(manager.telemetry_snapshot().prefix_hits, 0);
+        manager.finalize(&second, None, false).expect("abort");
     }
 
     #[test]
@@ -10036,6 +10584,33 @@ mod tests {
             authority.snapshot().reserved.host_bytes,
             ResourceAmount::Known(0)
         );
+    }
+
+    #[test]
+    fn unload_refuses_while_a_physical_cache_still_holds_the_arena() {
+        let model = ModelInstanceId::new(46);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                2,
+                16,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+        let arena_id = runtime.plan().groups[0].arena;
+        // What an executor step's PhysicalPagedKvCache holds.
+        let leaked = Arc::clone(runtime.arena(arena_id).expect("resolved arena"));
+        drop(runtime);
+
+        let error = manager.unload_model(model).expect_err("a live arena clone");
+        assert!(error.to_string().contains("owners, expected 1"), "{error}");
+        drop(leaked);
+        assert!(manager
+            .unload_model(model)
+            .expect("unload after the clone drops"));
     }
 
     #[test]

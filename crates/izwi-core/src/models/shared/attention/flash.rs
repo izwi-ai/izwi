@@ -13,7 +13,8 @@ use crate::error::{Error, Result};
 use crate::models::shared::telemetry::{
     record_fused_attention_attempt, record_fused_attention_fallback,
     record_fused_attention_masked_attempt, record_fused_attention_masked_fallback,
-    record_fused_attention_masked_success, record_fused_attention_success, AttentionFallbackReason,
+    record_fused_attention_masked_success, record_fused_attention_success, report_kernel_fallback,
+    AttentionFallbackReason,
 };
 
 /// Runtime policy for CUDA FlashAttention.
@@ -54,8 +55,13 @@ fn parse_flash_attention_mode(value: Option<&str>) -> FlashAttentionMode {
 }
 
 pub fn flash_attention_mode() -> FlashAttentionMode {
-    let value = std::env::var("IZWI_USE_FLASH_ATTENTION").ok();
-    parse_flash_attention_mode(value.as_deref())
+    // Read once per process: this runs for every attention call, and an env
+    // read takes the process environment lock and allocates.
+    static MODE: std::sync::OnceLock<FlashAttentionMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("IZWI_USE_FLASH_ATTENTION").ok();
+        parse_flash_attention_mode(value.as_deref())
+    })
 }
 
 /// Compatibility predicate for model diagnostics and existing call sites.
@@ -352,7 +358,8 @@ fn try_fused_self_attention_with_options_and_scale(
                             }
                             return Ok(Some(out.transpose(1, 2)?));
                         }
-                        Ok(Err(_)) | Err(_) => {
+                        failure => {
+                            report_kernel_fallback("cuda.flash_attention", &failure);
                             fallback_reason = AttentionFallbackReason::FlashRuntimeError;
                         }
                     }
@@ -394,7 +401,8 @@ fn try_fused_self_attention_with_options_and_scale(
                         }
                         return Ok(Some(out));
                     }
-                    Ok(Err(_)) | Err(_) => {
+                    failure => {
+                        report_kernel_fallback("metal.sdpa", &failure);
                         fallback_reason = AttentionFallbackReason::MetalSdpaRuntimeError;
                     }
                 }
@@ -480,7 +488,8 @@ pub fn try_fused_varlen_self_attention(
                         record_fused_attention_success();
                         return Ok(Some(out.transpose(0, 1)?.unsqueeze(0)?));
                     }
-                    Ok(Err(_)) | Err(_) => {
+                    failure => {
+                        report_kernel_fallback("cuda.flash_attention", &failure);
                         fallback_reason = AttentionFallbackReason::FlashRuntimeError;
                     }
                 }
@@ -732,11 +741,19 @@ fn should_use_metal_sdpa_f16_cast(dtype: DType, q_seq: usize) -> bool {
 }
 
 fn metal_sdpa_f32_prefill_cast_enabled() -> bool {
-    env_bool("IZWI_METAL_SDPA_F32_PREFILL_F16", true)
+    // Tests toggle this knob at runtime, so only production builds cache it.
+    #[cfg(test)]
+    return env_bool("IZWI_METAL_SDPA_F32_PREFILL_F16", true);
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| env_bool("IZWI_METAL_SDPA_F32_PREFILL_F16", true))
+    }
 }
 
 fn metal_sdpa_masked_enabled() -> bool {
-    env_bool("IZWI_METAL_SDPA_MASKED", false)
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_bool("IZWI_METAL_SDPA_MASKED", false))
 }
 
 fn env_bool(name: &str, default: bool) -> bool {

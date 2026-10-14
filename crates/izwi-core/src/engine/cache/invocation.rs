@@ -424,18 +424,29 @@ fn begin_lease(inner: &InvocationPagedKvPoolInner) -> Result<InvocationPagedKvSl
             "invocation paged workspace pool is closed for new leases",
         ));
     }
-    let (slot_index, slot_state) = state
+    // A vacant slot whose generation is exhausted is retired rather than
+    // reused; first-fit would otherwise fail every lease once slot 0 runs out.
+    let usable = |state: &InvocationPagedKvSlotState| match state {
+        InvocationPagedKvSlotState::Vacant { generation } => *generation < u32::MAX,
+        _ => false,
+    };
+    let Some((slot_index, slot_state)) = state
         .slots
         .iter_mut()
         .enumerate()
-        .find(|(_, state)| matches!(state, InvocationPagedKvSlotState::Vacant { .. }))
-        .ok_or_else(|| {
+        .find(|(_, state)| usable(state))
+    else {
+        let all_retired = state
+            .slots
+            .iter()
+            .all(|state| matches!(state, InvocationPagedKvSlotState::Vacant { .. }));
+        return Err(if all_retired {
+            invalid("invocation paged workspace slot generations are exhausted")
+        } else {
             Error::Backpressure("invocation paged workspace has no free slot".to_string())
-        })?;
-    let generation = slot_state
-        .generation()
-        .checked_add(1)
-        .ok_or_else(|| invalid("invocation paged workspace slot generation exhausted"))?;
+        });
+    };
+    let generation = slot_state.generation() + 1;
     *slot_state = InvocationPagedKvSlotState::Preparing { generation };
     let slot = u32::try_from(slot_index)
         .map_err(|_| invalid("invocation paged workspace slot index exceeds u32"))?;
@@ -928,6 +939,28 @@ mod tests {
         assert!(second.slot().slot_generation > first_slot.slot_generation);
         assert!(!pool.contains_active_lease(first_slot));
         assert_eq!(base_arena.operation_stats().page_zero_dispatches, 2);
+    }
+
+    #[test]
+    fn an_exhausted_slot_retires_instead_of_failing_every_lease() {
+        let (plan, workspace_domain) = plan();
+        let pool =
+            InvocationPagedKvPoolOwner::new(&plan, &workspace_domain, arena(&plan, 2), 0, 1, 2, 4)
+                .unwrap();
+        pool.inner.state.lock().unwrap().slots[0] = InvocationPagedKvSlotState::Vacant {
+            generation: u32::MAX,
+        };
+
+        // First-fit used to pick slot 0 and fail on its generation forever.
+        let lease = pool.lease().unwrap();
+        assert_eq!(lease.slot().slot, 1);
+        assert!(matches!(pool.lease(), Err(Error::Backpressure(_))));
+        drop(lease);
+
+        pool.inner.state.lock().unwrap().slots[1] = InvocationPagedKvSlotState::Vacant {
+            generation: u32::MAX,
+        };
+        assert!(matches!(pool.lease(), Err(Error::InvalidInput(_))));
     }
 
     #[test]

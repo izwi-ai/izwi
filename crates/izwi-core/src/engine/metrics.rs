@@ -47,6 +47,18 @@ pub const ENGINE_KV_CACHE_GPU_RESIDENT_BLOCKS: &str = "engine.kv_cache.gpu_resid
 pub const ENGINE_KV_HOST_PAGES: &str = "engine.kv_cache.host_pages";
 pub const ENGINE_KV_DEMOTIONS_TOTAL: &str = "engine.kv_cache.demotions_total";
 pub const ENGINE_KV_PROMOTIONS_TOTAL: &str = "engine.kv_cache.promotions_total";
+pub const ENGINE_KV_PREFIX_QUERY_TOKENS_TOTAL: &str = "engine.kv_cache.prefix_query_tokens_total";
+pub const ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL: &str = "engine.kv_cache.prefix_hit_tokens_total";
+pub const ENGINE_KV_MODEL_CAPACITY_PAGES: &str = "engine.kv_cache.model_capacity_pages";
+pub const ENGINE_KV_MODEL_ALLOCATED_PAGES: &str = "engine.kv_cache.model_allocated_pages";
+pub const ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES: &str =
+    "engine.kv_cache.model_prefix_retained_pages";
+pub const ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES: &str =
+    "engine.kv_cache.model_admission_claimed_pages";
+pub const ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES: &str =
+    "engine.kv_cache.model_admission_available_pages";
+pub const ENGINE_SCHEDULER_PREEMPTIONS_TOTAL: &str = "engine.scheduler.preemptions_total";
+pub const ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS: &str = "engine.scheduler.kv_blocked_requests";
 pub const ENGINE_KV_PROMOTION_LATENCY_AVG_SECONDS: &str =
     "engine.kv_cache.promotion_latency_avg_seconds";
 pub const ENGINE_STREAM_BACKPRESSURE_TOTAL: &str = "engine.stream.backpressure_total";
@@ -239,6 +251,34 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
         description: "Mean promotion copy latency in seconds across promoted pages (DS4).",
     },
     EngineMetricDescriptor {
+        name: ENGINE_KV_PREFIX_QUERY_TOKENS_TOTAL,
+        description: "Prompt tokens offered to managed prefix-cache lookups at request preparation.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL,
+        description: "Prompt tokens served from the managed prefix cache at request preparation.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_MODEL_CAPACITY_PAGES,
+        description: "Physical pages of one managed KV arena, by model, backend, domain and storage dtype.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_MODEL_ALLOCATED_PAGES,
+        description: "Allocated physical pages of one managed KV arena, including evictable prefix-only pages.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES,
+        description: "Pages of one managed KV arena held by its prefix cache.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
+        description: "Pages of one managed KV arena promised to admitted requests.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES,
+        description: "Pages of one managed KV arena still available to admission claims.",
+    },
+    EngineMetricDescriptor {
         name: ENGINE_STREAM_BACKPRESSURE_TOTAL,
         description: "Engine stream backpressure events.",
     },
@@ -357,6 +397,14 @@ pub const ENGINE_METRIC_CATALOG: &[EngineMetricDescriptor] = &[
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL,
         description: "Committed request suspensions that release model state for cache capacity recovery.",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
+        description: "Requests preempted for KV capacity: replay (suspended, replayed later), recompute (unpublished, restarted) and abort (claim deadlock, failed).",
+    },
+    EngineMetricDescriptor {
+        name: ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
+        description: "Scheduled requests the last engine step deferred for managed KV capacity.",
     },
     EngineMetricDescriptor {
         name: ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL,
@@ -1078,6 +1126,9 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
+    pub recompute_preemptions_total: u64,
+    pub claim_deadlock_aborts_total: u64,
+    pub kv_blocked_requests: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
 }
@@ -1125,6 +1176,24 @@ pub(crate) fn record_capacity_suspension() {
 }
 pub(crate) fn record_capacity_replay(tokens: usize) {
     ENGINE_CAPACITY_REPLAY_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
+}
+
+static ENGINE_RECOMPUTE_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_CLAIM_DEADLOCK_ABORTS: AtomicU64 = AtomicU64::new(0);
+static ENGINE_KV_BLOCKED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// An unpublished session released for capacity and restarted from scratch.
+pub(crate) fn record_recompute_preemption() {
+    ENGINE_RECOMPUTE_PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A request failed because every claim holder was waiting to grow.
+pub(crate) fn record_claim_deadlock_abort() {
+    ENGINE_CLAIM_DEADLOCK_ABORTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_kv_blocked_requests(requests: usize) {
+    ENGINE_KV_BLOCKED_REQUESTS.store(requests as u64, Ordering::Relaxed);
 }
 
 static ENGINE_INCREMENTAL_PREFILL_QUANTA_COMMITTED: AtomicU64 = AtomicU64::new(0);
@@ -1479,6 +1548,9 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
+        recompute_preemptions_total: ENGINE_RECOMPUTE_PREEMPTIONS.load(Ordering::Relaxed),
+        claim_deadlock_aborts_total: ENGINE_CLAIM_DEADLOCK_ABORTS.load(Ordering::Relaxed),
+        kv_blocked_requests: ENGINE_KV_BLOCKED_REQUESTS.load(Ordering::Relaxed),
         continuous_envelope_scalar_fallbacks_total: ENGINE_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS
             .load(Ordering::Relaxed),
         physical_execution: engine_physical_execution_metrics_snapshot(),
@@ -1892,6 +1964,19 @@ mod tests {
         assert!(names.contains(ENGINE_SCHEDULER_QUEUE_DEPTH));
         assert!(names.contains(ENGINE_KV_CACHE_HITS_TOTAL));
         assert!(names.contains(ENGINE_KV_CACHE_EVICTIONS_TOTAL));
+        for metric in [
+            ENGINE_KV_PREFIX_QUERY_TOKENS_TOTAL,
+            ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL,
+            ENGINE_KV_MODEL_CAPACITY_PAGES,
+            ENGINE_KV_MODEL_ALLOCATED_PAGES,
+            ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES,
+            ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
+            ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES,
+            ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
+            ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
+        ] {
+            assert!(names.contains(metric), "{metric} is not catalogued");
+        }
         assert!(names.contains(ENGINE_STREAM_BACKPRESSURE_TOTAL));
         assert!(names.contains(ENGINE_STREAM_CHECKPOINTS_COMMITTED_TOTAL));
         assert!(names.contains(ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL));

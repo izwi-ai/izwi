@@ -173,31 +173,29 @@ fn legacy_ratchet_allows_physical_provider_names_but_rejects_legacy_items() {
 }
 
 #[test]
-fn qwen_model_owned_cache_and_materializing_pages_are_test_only() {
+fn model_owned_qwen_cache_and_materializing_pages_are_gone() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let qwen_core = fs::read_to_string(manifest_dir.join("src/models/architectures/qwen3/core.rs"))
         .expect("read Qwen3 core");
     let paged = fs::read_to_string(manifest_dir.join("src/models/shared/attention/paged.rs"))
-        .expect("read legacy paged helpers");
+        .expect("read paged helpers");
     let qwen_asr =
         fs::read_to_string(manifest_dir.join("src/models/architectures/qwen3/asr/mod.rs"))
             .expect("read Qwen3 ASR");
 
+    // The dependency-owned Qwen cache and the materializing page helpers were
+    // test-only oracles; tests now use the cache-free stateless forward, so
+    // neither may exist even under `cfg(test)`.
     assert!(
-        qwen_core.contains("#[cfg(test)]\npub struct Qwen3Cache"),
-        "the dependency-owned Qwen cache must never return to production"
+        !rust_identifiers(&qwen_core).contains("Qwen3Cache"),
+        "the dependency-owned Qwen cache must not return, even as a test oracle"
     );
-    assert!(
-        paged.contains(
-            "#[cfg(test)]\npub use legacy::{append_to_pages, materialize_pages, \
-             paged_decode_attention, KvPage};"
-        ),
-        "materializing paged-attention helpers must remain test-only"
-    );
-    assert!(
-        paged.contains("#[cfg(test)]\nmod legacy"),
-        "the materializing paged-attention implementation must remain test-only"
-    );
+    for legacy in ["KvPage", "append_to_pages", "materialize_pages", "legacy"] {
+        assert!(
+            !rust_identifiers(&paged).contains(legacy),
+            "paged.rs must not reintroduce the materializing `{legacy}` path"
+        );
+    }
     assert!(
         qwen_asr.contains(".forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())"),
         "cacheless forced-alignment work must not acquire a model-owned cache"
@@ -227,8 +225,6 @@ fn legacy_state_violations(path: &Path, source: &str) -> Vec<String> {
 
     let path = path.to_string_lossy().replace('\\', "/");
     let identifiers = rust_identifiers(source);
-    let qwen_reference = path == "models/architectures/qwen3/core.rs";
-    let paged_reference = path == "models/shared/attention/paged.rs";
     let physical_provider = path.starts_with("backends/kv/")
         || path.starts_with("backends/state/")
         || path.starts_with("kernels/");
@@ -242,23 +238,19 @@ fn legacy_state_violations(path: &Path, source: &str) -> Vec<String> {
         }
     }
     for identifier in MODEL_OWNED_CACHE_IDENTIFIERS {
-        if identifiers.contains(*identifier) && !(qwen_reference && *identifier == "Qwen3Cache") {
+        if identifiers.contains(*identifier) {
             violations.push(format!("{path} contains model-owned `{identifier}`"));
         }
     }
-    if identifiers.contains("KvPage") && !qwen_reference && !paged_reference {
+    if identifiers.contains("KvPage") {
         violations.push(format!("{path} contains legacy page type `KvPage`"));
     }
     for helper in MATERIALIZING_HELPERS {
-        if identifiers.contains(*helper) && !qwen_reference && !paged_reference {
+        if identifiers.contains(*helper) {
             violations.push(format!("{path} contains materializing helper `{helper}`"));
         }
     }
-    if identifiers.contains("paged_decode_attention")
-        && !qwen_reference
-        && !paged_reference
-        && !physical_provider
-    {
+    if identifiers.contains("paged_decode_attention") && !physical_provider {
         violations.push(format!(
             "{path} bypasses the physical arena with `paged_decode_attention`"
         ));

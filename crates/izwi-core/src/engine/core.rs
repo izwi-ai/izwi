@@ -18,7 +18,8 @@ use super::cache::composite::{
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
 use super::cache::managed::{
-    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom, StateFitReserve,
+    ManagedClaimPolicy, ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+    StateFitReserve,
 };
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
@@ -133,6 +134,15 @@ fn plan_begin_attempts_exhausted(
     let count = attempts.entry(session.clone()).or_insert(0);
     *count = count.saturating_add(1);
     *count >= MAX_PLAN_BEGIN_ATTEMPTS
+}
+
+/// One scheduled row whose managed-state preparation failed with an error
+/// other than capacity backpressure.
+#[derive(Debug)]
+struct ManagedPrepareFailure {
+    scheduled: super::scheduler::ScheduledRequest,
+    session: super::SessionKey,
+    error: Error,
 }
 
 /// Why [`EngineCore::begin_execution_plan`] did not register a plan.
@@ -608,6 +618,10 @@ pub struct EngineCore {
     /// Consecutive steps on which a session's execution plan failed to
     /// begin; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`] (TPIPE-15).
     plan_begin_attempts: HashMap<super::SessionKey, u32>,
+    /// Consecutive steps whose managed-state preparation failed for a session
+    /// with a non-backpressure error; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`]
+    /// so one failing row can never stall every other row (H2).
+    managed_prepare_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
     /// Each session's current run of refused batch workspaces.
@@ -1335,6 +1349,23 @@ impl EngineCore {
         reduced
     }
 
+    /// How a request's managed-KV admission claim is sized. Chat claims grow
+    /// with generation (TTS/ASR retained sessions keep full claims so their
+    /// sealed floors and frame budgets stay guaranteed).
+    fn managed_claim_policy(&self, request: &EngineCoreRequest) -> ManagedClaimPolicy {
+        if self.uses_incremental_chat_capacity(request) {
+            return ManagedClaimPolicy::Incremental;
+        }
+        match u32::try_from(self.config.managed_chat_claim_quantum_tokens) {
+            Ok(quantum_tokens)
+                if quantum_tokens > 0 && request.task_type == super::TaskType::Chat =>
+            {
+                ManagedClaimPolicy::Chunked { quantum_tokens }
+            }
+            _ => ManagedClaimPolicy::Full,
+        }
+    }
+
     fn uses_incremental_chat_capacity(&self, request: &EngineCoreRequest) -> bool {
         self.config.cuda_incremental_chat_enabled()
             && request.task_type == super::TaskType::Chat
@@ -1412,6 +1443,85 @@ impl EngineCore {
         Ok(true)
     }
 
+    /// Chunked chat claims grow during generation, so every claim holder of a
+    /// model can end up waiting to grow at once while none can finish. When no
+    /// row ran this step, suspension and preemption freed nothing, and every
+    /// claim holder of a model is among the blocked rows, fail the youngest
+    /// lowest-priority blocked request so the others can complete.
+    async fn fail_claim_deadlocked_session(
+        &mut self,
+        blocked: &[super::scheduler::ScheduledRequest],
+    ) {
+        let mut by_model = HashMap::<ModelInstanceId, Vec<super::SessionKey>>::new();
+        for row in blocked {
+            let Some(request) = self.requests.get(&row.request_id) else {
+                continue;
+            };
+            if !matches!(
+                self.managed_claim_policy(request),
+                ManagedClaimPolicy::Chunked { .. }
+            ) {
+                continue;
+            }
+            let Some(model) = request
+                .managed_cache_runtime()
+                .map(|runtime| runtime.plan().model_instance)
+            else {
+                continue;
+            };
+            by_model.entry(model).or_default().push(row.session_key());
+        }
+        for (model, blocked_sessions) in by_model {
+            let holders = self.managed_kv_cache.capacity_claim_sessions(model);
+            let deadlocked = holders.len() > 1
+                && holders
+                    .iter()
+                    .all(|holder| blocked_sessions.contains(holder));
+            if !deadlocked {
+                continue;
+            }
+            // `blocked` keeps scheduler order (oldest first), so the last
+            // lowest-priority row is the youngest.
+            let Some(victim) = blocked_sessions
+                .iter()
+                .rev()
+                .min_by_key(|session| {
+                    self.requests
+                        .get(&session.request_id)
+                        .map(|request| request.priority)
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            warn!(
+                request_id = %victim.request_id,
+                session_epoch = victim.epoch,
+                claim_holders = holders.len(),
+                "Every managed KV claim holder is waiting to grow; failing the youngest"
+            );
+            super::metrics::record_claim_deadlock_abort();
+            let message =
+                "managed KV capacity is exhausted by concurrent requests; retry later".to_string();
+            self.terminate_request_session(
+                &victim,
+                ExecutorOutput::error(victim.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: FailureKind::ResourceExhausted,
+                    scope: FailureScope::Row,
+                    retry: RetryDisposition::Never,
+                    health: HealthImpact::None,
+                    message,
+                }),
+                OutcomeProvenance::failure(
+                    FailureOrigin::AdapterPlanning,
+                    DispatchState::NotStarted,
+                ),
+            )
+            .await;
+        }
+    }
+
     async fn preempt_unpublished_session_for_capacity(
         &mut self,
         blocked: &[super::scheduler::ScheduledRequest],
@@ -1481,6 +1591,7 @@ impl EngineCore {
             blocked_request_id = %blocked_request.id,
             "Released an unpublished lower-priority session for managed KV capacity"
         );
+        super::metrics::record_recompute_preemption();
         Ok(true)
     }
 
@@ -2804,6 +2915,7 @@ impl EngineCore {
         max_candidates: usize,
         capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
         transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
+        prepare_failures: &mut Vec<ManagedPrepareFailure>,
     ) -> Result<Vec<PreparedPhysicalDispatch>> {
         let available = requests
             .iter()
@@ -2908,24 +3020,18 @@ impl EngineCore {
                 continue;
             }
             let planned_work = plan.work.clone();
+            let claim_policy = self.managed_claim_policy(&request);
+            let prefix_attach = self.scheduler.admits_prefix_attach(&scheduled.request_id);
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
-                if self.uses_incremental_chat_capacity(&request) {
-                    self.managed_kv_cache.prepare_incremental(
-                        runtime,
-                        plan.plan_id,
-                        &plan.session,
-                        &planned_work,
-                        Some(&request),
-                    )
-                } else {
-                    self.managed_kv_cache.prepare(
-                        runtime,
-                        plan.plan_id,
-                        &plan.session,
-                        &planned_work,
-                        Some(&request),
-                    )
-                }
+                self.managed_kv_cache.prepare_row(
+                    runtime,
+                    plan.plan_id,
+                    &plan.session,
+                    &planned_work,
+                    Some(&request),
+                    claim_policy,
+                    prefix_attach,
+                )
             }) {
                 Some(Ok(reservation)) => reservation,
                 None => None,
@@ -2960,8 +3066,19 @@ impl EngineCore {
                     );
                     continue;
                 }
-                Some(Err(error)) => return Err(error),
+                Some(Err(error)) => {
+                    // Only this row failed; keep forming the others. The
+                    // caller rolls the row back and either retries it on a
+                    // later step or fails it terminally.
+                    prepare_failures.push(ManagedPrepareFailure {
+                        scheduled: scheduled.clone(),
+                        session: plan.session.clone(),
+                        error,
+                    });
+                    continue;
+                }
             };
+            self.managed_prepare_attempts.remove(&plan.session);
             if let Some(reservation) = managed_cache.as_ref() {
                 if self
                     .active_managed_cache
@@ -3286,6 +3403,7 @@ impl EngineCore {
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             plan_begin_attempts: HashMap::new(),
+            managed_prepare_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
             workspace_waits: HashMap::new(),
@@ -4455,6 +4573,7 @@ impl EngineCore {
         }
 
         if !schedule_result.has_execution_work() && self.pending_terminal_outputs.is_empty() {
+            super::metrics::record_kv_blocked_requests(0);
             return Ok(None);
         }
 
@@ -4541,11 +4660,13 @@ impl EngineCore {
             && decode_requests.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
+            super::metrics::record_kv_blocked_requests(0);
             return Ok(None);
         }
 
         let mut capacity_blocked = Vec::new();
         let mut transaction_deferred = Vec::new();
+        let mut prepare_failures = Vec::new();
         let candidate_capacity = self
             .config
             .resolved_physical_execution_capacity()
@@ -4572,6 +4693,7 @@ impl EngineCore {
                 prefill_quota,
                 &mut capacity_blocked,
                 &mut transaction_deferred,
+                &mut prepare_failures,
             ) {
                 Ok(batches) => batches,
                 Err(Error::Backpressure(reason)) => {
@@ -4595,6 +4717,7 @@ impl EngineCore {
                 decode_limit,
                 &mut capacity_blocked,
                 &mut transaction_deferred,
+                &mut prepare_failures,
             ) {
                 Ok(batches) => batches,
                 Err(Error::Backpressure(reason)) => {
@@ -4629,6 +4752,7 @@ impl EngineCore {
                             1,
                             &mut capacity_blocked,
                             &mut transaction_deferred,
+                            &mut prepare_failures,
                         ) {
                             Ok(batches) => batches,
                             Err(Error::Backpressure(reason)) => {
@@ -4650,6 +4774,7 @@ impl EngineCore {
                             1,
                             &mut capacity_blocked,
                             &mut transaction_deferred,
+                            &mut prepare_failures,
                         ) {
                             Ok(batches) => batches,
                             Err(Error::Backpressure(reason)) => {
@@ -4682,6 +4807,9 @@ impl EngineCore {
         }
         self.rollback_unexecuted_schedule(&transaction_deferred);
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
+        super::metrics::record_kv_blocked_requests(capacity_blocked.len());
+        self.resolve_managed_prepare_failures(prepare_failures)
+            .await;
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
             && (self
@@ -4692,6 +4820,9 @@ impl EngineCore {
                     .await?)
         {
             return Ok(None);
+        }
+        if decode_batches.is_empty() && prefill_batches.is_empty() {
+            self.fail_claim_deadlocked_session(&capacity_blocked).await;
         }
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
@@ -5198,6 +5329,63 @@ impl EngineCore {
     /// other terminal failure.
     /// A session whose plan failed to begin on [`MAX_PLAN_BEGIN_ATTEMPTS`]
     /// consecutive steps fails terminally instead of retrying forever.
+    /// Roll back rows whose managed-state preparation failed and decide their
+    /// fate without failing the step for every other row. `Overloaded` means
+    /// the request can never fit (or a device allocation failed after
+    /// admission), so it fails now; any other error is retried on later
+    /// steps up to [`MAX_PLAN_BEGIN_ATTEMPTS`] and then fails the request.
+    async fn resolve_managed_prepare_failures(&mut self, failures: Vec<ManagedPrepareFailure>) {
+        if failures.is_empty() {
+            return;
+        }
+        let scheduled = failures
+            .iter()
+            .map(|failure| failure.scheduled.clone())
+            .collect::<Vec<_>>();
+        self.rollback_unexecuted_schedule(&scheduled);
+        for ManagedPrepareFailure { session, error, .. } in failures {
+            let terminal = matches!(error, Error::Overloaded(_))
+                || plan_begin_attempts_exhausted(&mut self.managed_prepare_attempts, &session);
+            if !terminal {
+                debug!(
+                    request_id = %session.request_id,
+                    error = %error,
+                    "Managed KV preparation failed for one row; retrying it on a later step"
+                );
+                continue;
+            }
+            self.managed_prepare_attempts.remove(&session);
+            let resource_exhausted = matches!(error, Error::Overloaded(_));
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                error = %error,
+                "Managed KV state could not be prepared; failing the request"
+            );
+            let message = format!("managed KV state could not be prepared: {error}");
+            self.terminate_request_session(
+                &session,
+                ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: if resource_exhausted {
+                        FailureKind::ResourceExhausted
+                    } else {
+                        FailureKind::Internal
+                    },
+                    scope: FailureScope::Row,
+                    retry: RetryDisposition::Never,
+                    health: HealthImpact::None,
+                    message,
+                }),
+                OutcomeProvenance::failure(
+                    FailureOrigin::AdapterPlanning,
+                    DispatchState::NotStarted,
+                ),
+            )
+            .await;
+        }
+    }
+
     async fn fail_unstartable_plan(&mut self, session: &super::SessionKey, error: Error) {
         warn!(
             request_id = %session.request_id,
@@ -5547,6 +5735,17 @@ impl EngineCore {
                     fit.staged_transaction_rows,
                 )
             } else {
+                // An automatically fitted portable chat context is capped: the
+                // arena is fully resident from load, so an idle model would
+                // otherwise hold its whole advertised context in memory.
+                let cap = self.config.portable_auto_context_cap_tokens;
+                let logical_context_tokens =
+                    if self.config.portable_context_auto && backend != BackendKind::Cuda && cap > 0
+                    {
+                        logical_context_tokens.map(|tokens| tokens.min(cap))
+                    } else {
+                        logical_context_tokens
+                    };
                 (
                     self.resolve_managed_token_reach_for_contract(
                         backend,
@@ -8013,6 +8212,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(joined.len(), 1);
@@ -8048,6 +8248,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(split.len(), 1);
@@ -8253,6 +8454,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         let widths = batches
@@ -8422,6 +8624,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(batches.len(), 1);
@@ -8519,6 +8722,7 @@ mod tests {
                     &requests,
                     &scheduled,
                     usize::MAX,
+                    &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
                 )
@@ -10167,6 +10371,184 @@ mod tests {
             )
             .expect("waiter committed table");
         assert_eq!(snapshot.committed_tokens, 4);
+    }
+
+    fn chunked_claim_core(quantum_tokens: usize) -> EngineCore {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                max_batch_size: 2,
+                managed_chat_claim_quantum_tokens: quantum_tokens,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        core
+    }
+
+    fn committed_tokens(core: &EngineCore, model: ModelInstanceId, id: &str) -> Option<u32> {
+        let session = core.get_session_key(&id.to_string())?;
+        core.managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .map(|snapshot| snapshot.committed_tokens)
+    }
+
+    /// A1: an output budget that covers most of the arena (an omitted OpenAI
+    /// `max_tokens` becomes "rest of context") must not reserve the whole
+    /// arena up front. With chunked claims both requests prefill together;
+    /// full up-front claims serialize the second behind the first.
+    #[tokio::test]
+    async fn chunked_chat_claims_admit_concurrent_requests_that_full_claims_serialize() {
+        for (quantum, both_admitted) in [(16, true), (0, false)] {
+            let model = ModelInstanceId::new(95);
+            let mut core = chunked_claim_core(quantum);
+            for id in ["first", "second"] {
+                let mut request = managed_test_request(&mut core, model, id, (1..=8).collect());
+                // 8 prompt + 40 output tokens = three 16-token pages each, but
+                // the arena holds four pages in total.
+                request.params.max_tokens = 40;
+                core.add_request(request).expect("add");
+            }
+            // A full-prefill row cannot share a step with decode rows; the
+            // scheduler's starvation bound serves it within eight steps.
+            for _ in 0..12 {
+                core.step().await.expect("step");
+            }
+            assert!(committed_tokens(&core, model, "first").is_some_and(|tokens| tokens >= 8));
+            assert_eq!(
+                committed_tokens(&core, model, "second").is_some_and(|tokens| tokens >= 8),
+                both_admitted,
+                "quantum {quantum}"
+            );
+        }
+    }
+
+    /// A1: chunked claims grow during decode. When every claim holder needs to
+    /// grow at once and nothing can be suspended or preempted, the youngest
+    /// request fails instead of every request waiting forever.
+    #[tokio::test]
+    async fn chunked_claim_deadlock_fails_only_the_youngest_request() {
+        let model = ModelInstanceId::new(96);
+        let mut core = chunked_claim_core(16);
+        for id in ["older", "younger"] {
+            let mut request = managed_test_request(&mut core, model, id, (1..=8).collect());
+            request.params.max_tokens = 40;
+            core.add_request(request).expect("add");
+        }
+        let mut outputs = Vec::new();
+        let mut older_peak = 0;
+        for _ in 0..80 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("a claim deadlock must not fail the engine step"),
+            );
+            older_peak = older_peak.max(committed_tokens(&core, model, "older").unwrap_or(0));
+            if outputs
+                .iter()
+                .any(|output| output.request_id == "younger" && output.is_finished)
+            {
+                break;
+            }
+        }
+        let failed = outputs
+            .iter()
+            .find(|output| output.request_id == "younger" && output.is_finished)
+            .expect("the youngest blocked request is failed");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exhausted by concurrent requests")),
+            "{:?}",
+            failed.error
+        );
+        assert!(core.has_request(&"older".to_string()));
+        for _ in 0..4 {
+            outputs.extend(core.step().await.expect("survivor step"));
+            older_peak = older_peak.max(committed_tokens(&core, model, "older").unwrap_or(0));
+        }
+        // Both held two pages (32 tokens) when they deadlocked; the survivor
+        // grows past that once the younger claim is released.
+        assert!(older_peak > 32, "older peaked at {older_peak}");
+    }
+
+    /// H2: a row whose managed state can never be prepared fails alone. The
+    /// step used to return the error for every scheduled row, and the run loop
+    /// rescheduled the same row forever, starving all other requests.
+    #[tokio::test]
+    async fn managed_prepare_failure_fails_only_its_own_request() {
+        let model_instance = ModelInstanceId::new(94);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        // 40 prompt tokens need three 16-token pages; the arena holds one, so
+        // the full-request claim is `Overloaded` on every attempt.
+        let oversized =
+            managed_test_request(&mut core, model_instance, "oversized", (1..=40).collect());
+        let healthy = managed_test_request(&mut core, model_instance, "healthy", vec![1, 2, 3, 4]);
+        core.add_request(oversized).expect("add oversized");
+        core.add_request(healthy).expect("add healthy");
+
+        let mut outputs = Vec::new();
+        for _ in 0..4 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("one row's preparation failure must not fail the engine step"),
+            );
+        }
+
+        let failed = outputs
+            .iter()
+            .find(|output| output.request_id == "oversized" && output.is_finished)
+            .expect("the oversized request reaches a terminal output");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("managed KV state could not be prepared")),
+            "{:?}",
+            failed.error
+        );
+        assert!(!core.has_request(&"oversized".to_string()));
+        let healthy_session = core
+            .get_session_key(&"healthy".to_string())
+            .expect("healthy session");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &healthy_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .expect("healthy request committed its prefill");
+        // The healthy row kept running while the oversized one failed: its
+        // whole prompt is committed (decode steps may have advanced further).
+        assert!(
+            snapshot.committed_tokens >= 4,
+            "{}",
+            snapshot.committed_tokens
+        );
     }
 
     #[tokio::test]

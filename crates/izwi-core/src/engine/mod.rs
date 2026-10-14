@@ -415,6 +415,7 @@ struct OwnedStepContext {
 
 struct OwnedRunnerRecoveryGuard {
     core: Arc<RwLock<EngineCore>>,
+    step_gate: Arc<Mutex<()>>,
     recovery: Option<execution_group::PreparedStepRecovery>,
     abort: tokio::task::AbortHandle,
 }
@@ -444,9 +445,15 @@ impl Drop for OwnedRunnerRecoveryGuard {
         };
         self.abort.abort();
         let core = self.core.clone();
+        let step_gate = self.step_gate.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 recovery.wait_for_task_drain().await;
+                // Every other cache mutation happens under the step gate; the
+                // dropping step still holds it, so this waits for that step to
+                // release it and then rolls back between steps instead of
+                // racing the next step's prepare or commit.
+                let _step = step_gate.lock().await;
                 core.write()
                     .await
                     .rollback_in_flight_dispatches(recovery.batch_ids());
@@ -566,6 +573,7 @@ impl OwnedStepContext {
         });
         let mut recovery_guard = OwnedRunnerRecoveryGuard {
             core: self.core.clone(),
+            step_gate: self.step_gate.clone(),
             recovery: Some(recovery.clone()),
             abort: runner.abort_handle(),
         };

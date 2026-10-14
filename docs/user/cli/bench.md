@@ -223,11 +223,10 @@ IZWI_CUDA_FEATURES=cuda,cudnn,flash-attn scripts/ci/check-backend-truth.sh cargo
 ```
 
 Benchmark each candidate with JSON output. At minimum, compare the CUDA
-baseline, dense decode, QMatMul, and FlashAttention runtime gates:
+baseline, QMatMul, and FlashAttention runtime gates:
 
 ```bash
 IZWI_BACKEND=cuda \
-IZWI_QWEN3_DENSE_DECODE_ATTENTION=1 \
 IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT=1 \
 izwi --output-format json bench asr \
   --model Qwen3-ASR-0.6B-GGUF \
@@ -239,7 +238,6 @@ izwi --output-format json bench asr \
 ```bash
 IZWI_BACKEND=cuda \
 IZWI_USE_FLASH_ATTENTION=force \
-IZWI_QWEN3_DENSE_DECODE_ATTENTION=1 \
 IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT=1 \
 izwi --output-format json bench asr \
   --model Qwen3-ASR-0.6B-GGUF \

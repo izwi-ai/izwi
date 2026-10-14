@@ -5842,6 +5842,9 @@ pub struct ModelRegistry {
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
+    kv_storage: Arc<std::sync::RwLock<HashMap<ModelVariant, Vec<KvStorageReport>>>>,
+    /// Which loaded variant owns each managed KV model instance (metric labels).
+    kv_instances: Arc<std::sync::RwLock<HashMap<crate::engine::ModelInstanceId, ModelVariant>>>,
     /// Per loaded model: what admission priced for its weights and what the
     /// device observer saw them occupy (TADM-13).
     weight_residency: Arc<std::sync::RwLock<HashMap<ModelVariant, WeightResidency>>>,
@@ -5870,6 +5873,11 @@ pub struct LoadedModelDiagnostics {
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_context_tokens: Option<usize>,
+    /// The KV page size and storage dtype each managed paged domain actually
+    /// uses. The process-wide cache policy reports the requested dtype, but a
+    /// family may store wider KV (Qwen3.5 stores F32 on CPU/Metal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_storage: Option<Vec<KvStorageReport>>,
     /// Priced vs actual weights (TADM-13): what load admission authorized
     /// for the weights and what the device observer (Metal
     /// `currentAllocatedSize`, CUDA `mem_get_info`) saw them take.
@@ -5881,6 +5889,14 @@ pub struct LoadedModelDiagnostics {
     pub supports_realtime_stream_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family_diagnostics: Option<Value>,
+}
+
+/// One managed paged domain's physical KV geometry, as resolved at load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KvStorageReport {
+    pub domain: u32,
+    pub page_tokens: u32,
+    pub dtype: String,
 }
 
 /// A loaded model's weights, priced and observed, in the load domain's bytes.
@@ -5984,6 +6000,7 @@ fn loaded_model_diagnostics_entry(
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
         effective_context_tokens: None,
+        kv_storage: None,
         weight_residency: None,
         supports_incremental_decode,
         supports_realtime_stream_decode,
@@ -6116,6 +6133,8 @@ impl ModelRegistry {
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            kv_storage: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            kv_instances: Arc::new(std::sync::RwLock::new(HashMap::new())),
             weight_residency: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -6136,6 +6155,51 @@ impl ModelRegistry {
     /// The prefix-reuse decision mode this registry's loads apply.
     pub(crate) fn prefix_reuse_mode(&self) -> PrefixReuseMode {
         self.prefix_reuse
+    }
+
+    /// Record the page size and storage dtype of every paged domain a loaded
+    /// managed runtime resolved, for `/v1/health` model diagnostics.
+    pub(crate) fn publish_kv_storage(
+        &self,
+        variant: ModelVariant,
+        runtime: &crate::engine::ManagedKvModelRuntime,
+    ) {
+        let reports = runtime
+            .plan()
+            .groups
+            .iter()
+            .map(|group| KvStorageReport {
+                domain: group.domain.get(),
+                page_tokens: group.page_tokens,
+                dtype: format!("{:?}", group.storage.dtype()).to_ascii_lowercase(),
+            })
+            .collect::<Vec<_>>();
+        let mut storage = self
+            .kv_storage
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let entry = storage.entry(variant).or_default();
+        for report in reports {
+            if !entry.contains(&report) {
+                entry.push(report);
+            }
+        }
+        self.kv_instances
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(runtime.plan().model_instance, variant);
+    }
+
+    /// The loaded variant that owns a managed KV model instance, if any.
+    pub(crate) fn kv_instance_variant(
+        &self,
+        model_instance: crate::engine::ModelInstanceId,
+    ) -> Option<ModelVariant> {
+        self.kv_instances
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&model_instance)
+            .copied()
     }
 
     pub(crate) fn publish_effective_context(
@@ -6192,6 +6256,14 @@ impl ModelRegistry {
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&variant);
+        self.kv_storage
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
+        self.kv_instances
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|_, owner| *owner != variant);
     }
 
     pub fn device(&self) -> &DeviceProfile {
@@ -6444,6 +6516,14 @@ impl ModelRegistry {
                 .iter()
                 .find_map(|(variant, residency)| {
                     (variant.dir_name() == entry.variant_id).then_some(*residency)
+                });
+            entry.kv_storage = self
+                .kv_storage
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, storage)| {
+                    (variant.dir_name() == entry.variant_id).then(|| storage.clone())
                 });
             entry.effective_context_tokens = self
                 .effective_contexts

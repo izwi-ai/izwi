@@ -107,18 +107,22 @@ impl HostChainIndex {
         Some(entry.slot)
     }
 
-    /// Registers a demoted page under its exact identity.
-    pub fn insert(&mut self, key: super::prefix::KvPrefixPageKey, slot: usize) {
+    /// Registers a demoted page under its exact identity, returning the host
+    /// slot of any entry it replaced so the caller can release it.
+    #[must_use = "a replaced host slot must be released to its pool"]
+    pub fn insert(&mut self, key: super::prefix::KvPrefixPageKey, slot: usize) -> Option<usize> {
         self.clock = self.clock.wrapping_add(1);
         let digest = key.digest();
-        self.entries.insert(
-            digest,
-            HostChainEntry {
-                key,
-                slot,
-                last_access: self.clock,
-            },
-        );
+        self.entries
+            .insert(
+                digest,
+                HostChainEntry {
+                    key,
+                    slot,
+                    last_access: self.clock,
+                },
+            )
+            .map(|replaced| replaced.slot)
     }
 
     /// Removes one entry, returning its host slot for release.
@@ -263,50 +267,23 @@ pub(crate) fn demote_step(
 
     // Two-phase transfer: pin + mark Offloading, capture, then acknowledge
     // and swap ownership. A failed or stale step aborts back to source
-    // authority and returns the host slots.
+    // authority and returns the host slots: every error between the pin and
+    // the index swap takes the same unwind, so no `?` can strand a transfer
+    // pin (which would block recycling and unload forever).
     coordinator
         .pin_transfer(&blocks)
         .map_err(coordinator_error)?;
     let mut slots = Vec::with_capacity(keys.len());
-    let mut residency = Vec::with_capacity(keys.len());
-    let mut failure = None;
-    for (_key, block) in keys.iter().zip(&blocks) {
-        offload.next_transfer_id = offload.next_transfer_id.wrapping_add(1);
-        let transfer = KvTransferId(offload.next_transfer_id);
-        let resident = KvResidencyState::Resident {
-            tier: KvStorageTier::Device,
-        };
-        let state = match resident
-            .begin_loading(transfer, KvStorageTier::Host)
-            .and_then(|loading| loading.destination_allocated(transfer))
-        {
-            Ok(state) => state,
-            Err(_) => {
-                failure = Some(Error::InferenceError(
-                    "KV offload residency transition rejected a demotion".into(),
-                ));
-                break;
-            }
-        };
-        let Some(slot) = offload.pool.allocate_slot() else {
-            failure = Some(Error::InferenceError(
-                "KV host pool refused a demoted page".into(),
-            ));
-            break;
-        };
-        let capture = offload
-            .pool
-            .page_mut(slot)
-            .and_then(|buffer| arena.capture_page(*block, buffer));
-        if let Err(error) = capture {
-            offload.pool.release_slot(slot).ok();
-            failure = Some(error);
-            break;
-        }
-        residency.push((transfer, state));
-        slots.push(slot);
-    }
-    if let Some(error) = failure {
+    let transferred = capture_and_swap(
+        coordinator,
+        index,
+        arena,
+        offload,
+        &digests,
+        &blocks,
+        &mut slots,
+    );
+    if let Err(error) = transferred {
         for slot in slots {
             offload.pool.release_slot(slot).ok();
         }
@@ -315,16 +292,10 @@ pub(crate) fn demote_step(
             .map_err(coordinator_error)?;
         return Err(error);
     }
-    for (transfer, state) in &residency {
-        state
-            .acknowledge(*transfer)
-            .map_err(|_| Error::InferenceError("KV offload acknowledge rejected".into()))?;
-    }
-    index
-        .remove_subtree(coordinator, &digests)
-        .map_err(managed_prefix_error)?;
     for (key, slot) in keys.into_iter().zip(slots) {
-        offload.chain.insert(key, slot);
+        if let Some(replaced) = offload.chain.insert(key, slot) {
+            offload.pool.release_slot(replaced).ok();
+        }
     }
     coordinator
         .unpin_transfer(&blocks)
@@ -333,6 +304,51 @@ pub(crate) fn demote_step(
     Ok(DemoteOutcome::Demoted {
         pages: blocks.len(),
     })
+}
+
+/// Captures every pinned block into a fresh host slot (recorded in `slots` as
+/// it goes, for the caller's unwind), acknowledges the transfers, and removes
+/// the subtree from the device index. The index removal is atomic and last,
+/// so an error leaves device authority untouched.
+fn capture_and_swap(
+    coordinator: &mut KvCacheCoordinator,
+    index: &mut CoordinatedPrefixIndex,
+    arena: &dyn KvArena,
+    offload: &mut ArenaOffload,
+    digests: &[[u8; 32]],
+    blocks: &[CacheBlockRef],
+    slots: &mut Vec<usize>,
+) -> Result<()> {
+    let mut residency = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        offload.next_transfer_id = offload.next_transfer_id.wrapping_add(1);
+        let transfer = KvTransferId(offload.next_transfer_id);
+        let resident = KvResidencyState::Resident {
+            tier: KvStorageTier::Device,
+        };
+        let state = resident
+            .begin_loading(transfer, KvStorageTier::Host)
+            .and_then(|loading| loading.destination_allocated(transfer))
+            .map_err(|_| {
+                Error::InferenceError("KV offload residency transition rejected a demotion".into())
+            })?;
+        let slot = offload
+            .pool
+            .allocate_slot()
+            .ok_or_else(|| Error::InferenceError("KV host pool refused a demoted page".into()))?;
+        slots.push(slot);
+        let buffer = offload.pool.page_mut(slot)?;
+        arena.capture_page(*block, buffer)?;
+        residency.push((transfer, state));
+    }
+    for (transfer, state) in &residency {
+        state
+            .acknowledge(*transfer)
+            .map_err(|_| Error::InferenceError("KV offload acknowledge rejected".into()))?;
+    }
+    index
+        .remove_subtree(coordinator, digests)
+        .map_err(managed_prefix_error)
 }
 
 fn managed_prefix_error(error: super::prefix::KvPrefixIndexError) -> Error {
@@ -447,7 +463,6 @@ pub(crate) fn promote_tail(
             .page(slot)
             .and_then(|bytes| arena.restore_page(blocks[restored], bytes));
         if let Err(error) = copied {
-            eprintln!("DS4DBG promote copy failed page {restored}: {error}");
             tracing::debug!(
                 error = %error,
                 "KV offload promotion copy failed; truncating the host tail"

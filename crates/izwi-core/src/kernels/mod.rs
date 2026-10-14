@@ -18,9 +18,11 @@ pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
-pub mod numeric_check;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_qwen36moe;
+pub mod numeric_check;
 
 use crate::error::Error;
 use candle_core::{Device, Tensor};
@@ -214,89 +216,6 @@ pub fn try_fused_rope_pair_bshd(
 
     if q.device().is_metal() {
         return metal::try_fused_rope_pair_bshd(q, k, cos_sin);
-    }
-
-    None
-}
-
-pub fn try_fused_decode_gqa_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    scale: f32,
-) -> Option<Tensor> {
-    if !use_fused_kernels_for_device(q.device()) {
-        return None;
-    }
-
-    if q.device().is_cuda() {
-        return cuda::try_fused_decode_gqa_attention(
-            q,
-            k,
-            v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            scale,
-        );
-    }
-
-    if q.device().is_metal() {
-        return metal::try_fused_decode_gqa_attention(
-            q,
-            k,
-            v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            scale,
-        );
-    }
-
-    None
-}
-
-pub fn try_fused_decode_gqa_attention_with_kv_len(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    num_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    kv_len: usize,
-    scale: f32,
-) -> Option<Tensor> {
-    if !use_fused_kernels_for_device(q.device()) {
-        return None;
-    }
-
-    if q.device().is_cuda() {
-        return cuda::try_fused_decode_gqa_attention_with_kv_len(
-            q,
-            k,
-            v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_len,
-            scale,
-        );
-    }
-
-    if q.device().is_metal() {
-        return metal::try_fused_decode_gqa_attention_with_kv_len(
-            q,
-            k,
-            v,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            kv_len,
-            scale,
-        );
     }
 
     None

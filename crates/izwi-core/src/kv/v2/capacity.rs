@@ -159,13 +159,6 @@ impl ResolvedCapacityDomain<'_> {
             Self::NonPaged(plan) => plan.maximum_bytes(),
         }
     }
-
-    const fn placement(self) -> ResolvedPlacement {
-        match self {
-            Self::Paged(plan) => plan.placement,
-            Self::NonPaged(plan) => plan.placement(),
-        }
-    }
 }
 
 pub(crate) struct WorkspaceResourceQuery<'a> {

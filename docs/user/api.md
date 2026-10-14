@@ -354,7 +354,7 @@ Multipart fields:
       "dtype": "F32",
       "cache": {
         "page_size": 64,
-        "dense_decode_enabled": true,
+        "dense_decode_enabled": false,
         "kv_quantization": "none"
       }
     }

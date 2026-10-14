@@ -196,9 +196,13 @@ impl InvocationExecutor for RuntimeChatExecutor {
             ServiceClass::Interactive => WorkloadClass::Interactive,
             ServiceClass::Batch => WorkloadClass::Batch,
         };
-        let runtime_context = RuntimeRequestContext::new(workload_class).with_deadline(
-            std::time::Instant::now() + Duration::from_millis(request.remaining_time_ms),
-        );
+        // The gateway-attested tenant scopes fair scheduling and the managed
+        // prefix-cache namespace: tenants on one worker never share KV pages.
+        let runtime_context = RuntimeRequestContext::new(workload_class)
+            .with_deadline(
+                std::time::Instant::now() + Duration::from_millis(request.remaining_time_ms),
+            )
+            .with_tenant_id(request.caller.tenant_id.as_str());
         let invocation = self
             .runtime
             .start_chat_invocation(RuntimeChatInvocationRequest {

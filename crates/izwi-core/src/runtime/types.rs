@@ -36,6 +36,17 @@ impl RuntimeRequestContext {
         self
     }
 
+    /// Derive the opaque tenant key from a trusted tenant identity (for
+    /// example a gateway-attested tenant id). The key scopes fair scheduling
+    /// and the managed prefix-cache namespace, so tenants never share KV.
+    pub fn with_tenant_id(self, tenant_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"izwi.runtime.tenant-key.v1\0");
+        hasher.update(tenant_id.as_bytes());
+        self.with_tenant_key(hasher.finalize().into())
+    }
+
     pub fn with_admission_ms(mut self, admission_ms: f64) -> Self {
         self.admission_ms = Some(admission_ms.max(0.0));
         self

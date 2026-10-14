@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use candle_core::{DType, Device, DeviceLocation};
 use serde::Serialize;
@@ -94,6 +94,18 @@ pub(crate) struct RetainedTensorStateRuntimeV2 {
     arena: Arc<TensorStateArena>,
     next_sequence: AtomicU64,
     next_transaction: AtomicU64,
+    materialization: Mutex<RetainedTensorMaterialization>,
+}
+
+/// The model lease's record of committed tensor backing. The arena
+/// materializes rows lazily, so without it guarded admission charges committed
+/// rows twice: once as the unmaterialized remainder of the reservation and
+/// again as reduced live free memory.
+struct RetainedTensorMaterialization {
+    /// The owner holds the lease; the runtime can outlive it at unload.
+    lease: Weak<ResourceLease>,
+    backend: BackendKind,
+    recorded_bytes: u64,
 }
 
 impl std::fmt::Debug for RetainedTensorStateRuntimeV2 {
@@ -177,7 +189,10 @@ impl RetainedTensorStateRuntimeV2 {
         transaction: PhysicalStateTransactionId,
         expected_cursor: u64,
     ) -> Result<()> {
-        self.arena.commit(transaction, expected_cursor).map(drop)
+        let retired = self.arena.commit(transaction, expected_cursor)?;
+        self.reconcile_materialization();
+        drop(retired);
+        Ok(())
     }
 
     pub(crate) fn abort_transaction(&self, transaction: PhysicalStateTransactionId) -> Result<()> {
@@ -185,7 +200,47 @@ impl RetainedTensorStateRuntimeV2 {
     }
 
     pub(crate) fn release_sequence(&self, sequence: PhysicalStateSequenceId) -> Result<()> {
-        self.arena.release(sequence).map(drop)
+        // Restore the pending claim before the retired state can be freed.
+        let retired = self.arena.release(sequence)?;
+        self.reconcile_materialization();
+        drop(retired);
+        Ok(())
+    }
+
+    /// Move committed backing between the lease's pending and materialized
+    /// halves. Failures are logged, not returned: the state transition already
+    /// happened, and the record retries on the next commit or release.
+    fn reconcile_materialization(&self) {
+        let result = (|| -> Result<()> {
+            let mut record = self
+                .materialization
+                .lock()
+                .map_err(|_| invalid("retained tensor materialization record is poisoned"))?;
+            let Some(lease) = record.lease.upgrade() else {
+                return Ok(());
+            };
+            let bytes = self
+                .arena
+                .committed_backing_bytes()?
+                .min(self.maximum_bytes());
+            if bytes == record.recorded_bytes {
+                return Ok(());
+            }
+            let resources = arena_resources(record.backend, bytes);
+            if bytes > record.recorded_bytes {
+                lease.record_materialized_usage(resources)?;
+            } else {
+                lease.prepare_materialized_release(resources)?;
+            }
+            record.recorded_bytes = bytes;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::error!(
+                %error,
+                "retained tensor-state materialization could not be recorded on the model lease"
+            );
+        }
     }
 
     fn close_and_validate_drained(&self) -> Result<()> {
@@ -195,7 +250,7 @@ impl RetainedTensorStateRuntimeV2 {
 
 struct OwnedRetainedTensorState {
     runtime: Arc<RetainedTensorStateRuntimeV2>,
-    resource_lease: Option<ResourceLease>,
+    resource_lease: Option<Arc<ResourceLease>>,
     resources: ResourceVector,
 }
 
@@ -348,7 +403,8 @@ impl PhysicalStateManager {
             .map(|authority| {
                 reserve_retained_tensor(authority, model_instance, self.worker_backend, resources)
             })
-            .transpose()?;
+            .transpose()?
+            .map(Arc::new);
         let arena = Arc::new(TensorStateArena::new(
             state_plan.clone(),
             capacity,
@@ -364,6 +420,13 @@ impl PhysicalStateManager {
             arena,
             next_sequence: AtomicU64::new(1),
             next_transaction: AtomicU64::new(1),
+            materialization: Mutex::new(RetainedTensorMaterialization {
+                lease: resource_lease
+                    .as_ref()
+                    .map_or_else(Weak::new, Arc::downgrade),
+                backend: self.worker_backend,
+                recorded_bytes: 0,
+            }),
         });
         let model = self.models.entry(model_instance).or_default();
         if model
@@ -829,11 +892,16 @@ impl PhysicalStateManager {
                 )
             })
             .transpose()?;
+        if generation >= KvArenaId::INVOCATION_GENERATION_TAG {
+            return Err(invalid(
+                "physical invocation allocation generation exhausted",
+            ));
+        }
         let arena_id = KvArenaId {
             model_instance,
             backend: self.worker_backend,
             device_ordinal: self.worker_device_ordinal,
-            generation,
+            generation: generation | KvArenaId::INVOCATION_GENERATION_TAG,
         };
         let config = invocation_arena_config(
             arena_id,
@@ -1638,6 +1706,11 @@ mod tests {
         let second = handle.lease().unwrap();
         assert_eq!(first.slot().page_count, 2);
         assert_eq!(second.slot().page_count, 2);
+        // Invocation arena IDs live in their own generation range, disjoint
+        // from the managed manager's arenas for the same model instance.
+        let generation = first.cache().arena().id().generation;
+        assert_ne!(generation & KvArenaId::INVOCATION_GENERATION_TAG, 0);
+        assert_eq!(generation & !KvArenaId::INVOCATION_GENERATION_TAG, 1);
         assert_ne!(first.slot().first_page, second.slot().first_page);
         assert!(handle.lease().is_err());
         drop(first);
@@ -2152,6 +2225,56 @@ mod tests {
         runtime.release_sequence(second_sequence).unwrap();
         assert!(manager.unload_model(model).unwrap());
         assert_eq!(manager.model_count(), 0);
+    }
+
+    #[test]
+    fn committed_retained_tensor_rows_move_from_pending_to_materialized() {
+        let capacity = ResourceVector {
+            host_bytes: ResourceAmount::Known(1 << 20),
+            ..ResourceVector::zero()
+        };
+        let authority = Arc::new(ResourceAuthority::new(Arc::new(TestCapacityProvider {
+            capacity,
+        })));
+        let mut manager = PhysicalStateManager::cpu(Some(authority.clone()));
+        let model = ModelInstanceId::new(58);
+        let runtime = manager
+            .allocate_retained_tensor(model, &retained_tensor_contract(8), 2)
+            .unwrap();
+        let host = |vector: ResourceVector| match vector.host_bytes {
+            ResourceAmount::Known(bytes) => bytes,
+            other => panic!("unresolved host bytes {other:?}"),
+        };
+        let envelope = runtime.maximum_bytes();
+        assert_eq!(host(authority.snapshot().pending), envelope);
+        assert_eq!(host(authority.snapshot().materialized), 0);
+
+        let sequence = runtime.register_sequence().unwrap();
+        let transaction = runtime.begin_transaction(sequence).unwrap();
+        runtime
+            .stage_replace(
+                transaction,
+                StateDomainId::new(1),
+                0,
+                1,
+                vec![crate::backends::state::StateComponentValue {
+                    component: StateComponentId::new(1),
+                    tensor: Some(Tensor::from_slice(&[1.0_f32, 2.0], 2, &Device::Cpu).unwrap()),
+                }],
+            )
+            .unwrap();
+        runtime.commit_transaction(transaction, 1).unwrap();
+        // The committed row is allocated, so it leaves the pending claim
+        // instead of being charged again against live free memory.
+        let committed = host(authority.snapshot().materialized);
+        assert!(committed > 0);
+        assert_eq!(host(authority.snapshot().pending), envelope - committed);
+
+        runtime.release_sequence(sequence).unwrap();
+        assert_eq!(host(authority.snapshot().materialized), 0);
+        assert_eq!(host(authority.snapshot().pending), envelope);
+        assert!(manager.unload_model(model).unwrap());
+        assert_eq!(authority.snapshot().reservations, 0);
     }
 
     #[test]

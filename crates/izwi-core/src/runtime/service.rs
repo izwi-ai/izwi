@@ -21,7 +21,12 @@ use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
 use crate::engine::metrics::{
     ENGINE_EXECUTOR_MODEL_TENSOR_BATCH_WIDTH_CALLS_TOTAL,
-    ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL, ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL,
+    ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES, ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES,
+    ENGINE_KV_MODEL_ALLOCATED_PAGES, ENGINE_KV_MODEL_CAPACITY_PAGES,
+    ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES, ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL,
+    ENGINE_KV_PREFIX_QUERY_TOKENS_TOTAL, ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL,
+    ENGINE_SCHEDULER_CAPACITY_SUSPENSIONS_TOTAL, ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
+    ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
 };
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
@@ -101,7 +106,8 @@ use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 use crate::runtime::routing::RouteSource;
 use crate::runtime::telemetry::{
     push_engine_labeled_metric, push_engine_labeled_metric_f64, push_engine_metric,
-    push_engine_metric_f64, push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
+    push_engine_metric_f64, push_engine_multi_labeled_metric,
+    push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
     RuntimeTelemetrySnapshot,
@@ -345,6 +351,56 @@ fn managed_kv_used_bytes(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> 
                 .saturating_mul(arena.bytes_per_page)
         })
         .fold(0_u64, u64::saturating_add)
+}
+
+/// Per-arena page gauges labeled by model, backend, domain and storage dtype,
+/// so pools of different models are never summed into one utilization.
+fn push_managed_kv_arena_metrics(
+    payload: &mut String,
+    snapshot: &crate::engine::ManagedKvRuntimeSnapshot,
+    model_label: impl Fn(crate::engine::ModelInstanceId) -> String,
+) {
+    let arenas = snapshot
+        .models
+        .iter()
+        .flat_map(|model| {
+            let label = model_label(model.model_instance);
+            model.arenas.iter().map(move |arena| {
+                let labels = vec![
+                    ("model", label.clone()),
+                    ("backend", model.backend.as_str().to_string()),
+                    ("domain", arena.domain_id.to_string()),
+                    ("storage_format", arena.storage_dtype.clone()),
+                ];
+                (labels, arena)
+            })
+        })
+        .collect::<Vec<_>>();
+    type ArenaGauge = fn(&crate::engine::ManagedKvArenaRuntimeSnapshot) -> u64;
+    let gauges: [(&str, ArenaGauge); 5] = [
+        (ENGINE_KV_MODEL_CAPACITY_PAGES, |arena| {
+            arena.coordinator.capacity_pages
+        }),
+        (ENGINE_KV_MODEL_ALLOCATED_PAGES, |arena| {
+            arena.coordinator.allocated_pages
+        }),
+        (ENGINE_KV_MODEL_PREFIX_RETAINED_PAGES, |arena| {
+            arena.coordinator.prefix_refs
+        }),
+        (ENGINE_KV_MODEL_ADMISSION_CLAIMED_PAGES, |arena| {
+            arena.coordinator.admission_claimed_pages
+        }),
+        (ENGINE_KV_MODEL_ADMISSION_AVAILABLE_PAGES, |arena| {
+            arena.coordinator.admission_available_pages
+        }),
+    ];
+    for (name, value) in gauges {
+        let series = arenas
+            .iter()
+            .map(|(labels, arena)| (labels.clone(), value(arena)))
+            .collect::<Vec<_>>();
+        push_engine_multi_labeled_metric(payload, name, &series);
+    }
 }
 
 fn managed_kv_device_pages(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -> u64 {
@@ -3286,6 +3342,11 @@ impl RuntimeService {
         core_config.backend = selected_backend_kind;
         core_config.num_threads = config.num_threads.max(1);
         core_config.block_size = config.kv_page_size.max(1);
+        // Model contracts read the page grid when they load; publish the one
+        // the engine uses so the two can never disagree.
+        crate::models::shared::attention::paged::publish_configured_kv_page_size(
+            core_config.block_size,
+        );
         core_config.kv_cache_dtype = cache_policy.effective.dtype.to_string();
         core_config.enable_prefix_caching = config.enable_prefix_caching;
         core_config.managed_prefix_cache_salt = config.managed_prefix_cache_salt.clone();
@@ -7649,6 +7710,9 @@ impl RuntimeService {
             model_tensor_batch_width_counts: batch.model_tensor_batch_width_counts,
             capacity_suspensions_total: batch.capacity_suspensions_total,
             capacity_replay_tokens_total: batch.capacity_replay_tokens_total,
+            recompute_preemptions_total: batch.recompute_preemptions_total,
+            claim_deadlock_aborts_total: batch.claim_deadlock_aborts_total,
+            kv_blocked_requests: batch.kv_blocked_requests,
             continuous_envelope_scalar_fallbacks_total: batch
                 .continuous_envelope_scalar_fallbacks_total,
             physical_execution: batch.physical_execution,
@@ -7785,6 +7849,25 @@ impl RuntimeService {
         );
         push_engine_metric(
             payload,
+            ENGINE_KV_PREFIX_QUERY_TOKENS_TOTAL,
+            snapshot.kv_cache.counters.prefix_query_tokens,
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_KV_PREFIX_HIT_TOKENS_TOTAL,
+            snapshot.kv_cache.counters.prefix_hit_tokens,
+        );
+        let model_label = |model_instance: crate::engine::ModelInstanceId| {
+            self.model_registry
+                .kv_instance_variant(model_instance)
+                .map_or_else(
+                    || format!("instance-{}", model_instance.get()),
+                    |variant| variant.to_string(),
+                )
+        };
+        push_managed_kv_arena_metrics(payload, &snapshot.kv_cache, model_label);
+        push_engine_metric(
+            payload,
             ENGINE_STREAM_BACKPRESSURE_TOTAL,
             snapshot.stream_backpressure_total,
         );
@@ -7887,6 +7970,21 @@ impl RuntimeService {
             payload,
             ENGINE_SCHEDULER_CAPACITY_REPLAY_TOKENS_TOTAL,
             snapshot.capacity_replay_tokens_total,
+        );
+        push_engine_labeled_metric(
+            payload,
+            ENGINE_SCHEDULER_PREEMPTIONS_TOTAL,
+            "kind",
+            &[
+                ("replay", snapshot.capacity_suspensions_total),
+                ("recompute", snapshot.recompute_preemptions_total),
+                ("abort", snapshot.claim_deadlock_aborts_total),
+            ],
+        );
+        push_engine_metric(
+            payload,
+            ENGINE_SCHEDULER_KV_BLOCKED_REQUESTS,
+            snapshot.kv_blocked_requests,
         );
         push_engine_metric(
             payload,
@@ -10034,6 +10132,14 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_width_calls_total"));
         assert!(payload.contains("izwi_engine_scheduler_capacity_suspensions_total"));
         assert!(payload.contains("izwi_engine_scheduler_capacity_replay_tokens_total"));
+        for kind in ["replay", "recompute", "abort"] {
+            assert!(payload.contains(&format!(
+                "izwi_engine_scheduler_preemptions_total{{kind=\"{kind}\"}}"
+            )));
+        }
+        assert!(payload.contains("# TYPE izwi_engine_scheduler_kv_blocked_requests gauge"));
+        assert!(payload.contains("izwi_engine_kv_cache_prefix_query_tokens_total"));
+        assert!(payload.contains("izwi_engine_kv_cache_prefix_hit_tokens_total"));
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_rows_total"));
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_max_width"));
         assert!(payload.contains("izwi_engine_executor_model_scalar_row_dispatches_total"));
@@ -10142,6 +10248,7 @@ mod tests {
             domain_id: 1,
             device_ordinal: Some(0),
             page_tokens: 16,
+            storage_dtype: "f16".to_string(),
             token_capacity: 160,
             bytes_per_page: 128,
             physical_bytes: 1_280,
@@ -10189,6 +10296,23 @@ mod tests {
 
         assert_eq!(managed_kv_used_bytes(&snapshot), 12 * 128);
         assert_eq!(managed_kv_device_pages(&snapshot), 9);
+
+        // Each arena is its own series; pools are never summed across models.
+        let mut payload = String::new();
+        push_managed_kv_arena_metrics(&mut payload, &snapshot, |instance| match instance.get() {
+            2 => "qwen\"metal".to_string(),
+            other => format!("instance-{other}"),
+        });
+        assert!(payload.contains("# TYPE izwi_engine_kv_cache_model_allocated_pages gauge"));
+        assert!(payload.contains(
+            "izwi_engine_kv_cache_model_allocated_pages{model=\"instance-1\",backend=\"cpu\",domain=\"1\",storage_format=\"f16\"} 3"
+        ));
+        assert!(payload.contains(
+            "izwi_engine_kv_cache_model_capacity_pages{model=\"qwen\\\"metal\",backend=\"metal\",domain=\"1\",storage_format=\"f16\"} 10"
+        ));
+        assert!(payload.contains(
+            "izwi_engine_kv_cache_model_admission_available_pages{model=\"instance-3\",backend=\"cuda\""
+        ));
     }
 
     #[tokio::test]
