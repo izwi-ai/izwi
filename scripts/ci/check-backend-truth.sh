@@ -417,6 +417,10 @@ run_cargo_metal() {
     cargo check --locked -p izwi-server --features metal
     cargo test --locked -p izwi-core --features metal --lib --tests
     cargo test --locked -p izwi-server --features metal --lib
+    # The worker's Metal parity legs skip on a host without a GPU; this lane
+    # requires one, so a skipped leg fails here instead of reading as a pass.
+    IZWI_REQUIRE_METAL_PARITY=1 cargo test --locked -p izwi-serving-worker \
+        --features metal --test backend_parity
     scripts/bench/run_kv_cache_matrix.sh --lane metal --iterations 1 --warmup 0 --require-device
 }
 

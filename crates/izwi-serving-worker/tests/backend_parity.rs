@@ -7,7 +7,8 @@
 //! replaces this smoke fixture before any performance claim.
 //!
 //! Hardware lanes without a build/device on the executing host stay
-//! `not run` (serving plan INV-18) — they are never reported as passed.
+//! `not run` (serving plan INV-18) — they print a `SKIP` line and fail
+//! outright when the lane requires the device (`IZWI_REQUIRE_METAL_PARITY=1`).
 
 mod common;
 
@@ -185,11 +186,32 @@ fn host_metal_device_id() -> Option<String> {
     (output.status.success() && id.starts_with("metal:")).then_some(id)
 }
 
+/// The host Metal device for one Metal leg, or `None` when the leg is not
+/// run. The skip goes to the real stderr, because libtest hides captured
+/// `println!`/`eprintln!` output of a passing test and a skipped leg would
+/// read as a pass. A lane that requires Metal (`IZWI_REQUIRE_METAL_PARITY=1`)
+/// fails instead.
+#[cfg(feature = "metal")]
+fn metal_leg_device(leg: &str) -> Option<String> {
+    let device_id = host_metal_device_id();
+    if device_id.is_none() {
+        assert!(
+            std::env::var("IZWI_REQUIRE_METAL_PARITY").as_deref() != Ok("1"),
+            "{leg}: IZWI_REQUIRE_METAL_PARITY=1 but the host default GPU registryID is unavailable"
+        );
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP {leg}: host default GPU registryID unavailable (not run, not passed)"
+        );
+    }
+    device_id
+}
+
 #[cfg(feature = "metal")]
 #[tokio::test]
 async fn metal_outputs_match_cpu_outputs_on_the_parity_fixture() {
-    let Some(device_id) = host_metal_device_id() else {
-        println!("metal parity leg not run: host default GPU registryID unavailable");
+    let Some(device_id) = metal_leg_device("metal parity leg") else {
         return;
     };
     let models = tempfile::tempdir().unwrap();
@@ -586,8 +608,7 @@ async fn explicit_zero_prefix_caching_keeps_reuse_off() {
 #[cfg(feature = "metal")]
 #[tokio::test]
 async fn qwen38_shared_prefix_metal_lane_matches_cpu() {
-    let Some(device_id) = host_metal_device_id() else {
-        println!("qwen38 prefix metal leg not run: host default GPU registryID unavailable");
+    let Some(device_id) = metal_leg_device("qwen38 prefix metal leg") else {
         return;
     };
     let models = tempfile::tempdir().unwrap();
