@@ -597,24 +597,64 @@ fn rotary_decode_batch(
     sin: &Tensor,
     positions: &[usize],
 ) -> Result<(Tensor, Tensor)> {
-    let table_len = cos.dim(0)?.min(sin.dim(0)?);
-    if positions.len() != query.dim(0)? || positions.iter().any(|&position| position >= table_len) {
-        return Err(Error::InvalidInput(
-            "LFM2 rotary batch positions exceed the available tables".into(),
-        ));
+    RotaryDecodeRows::gather(cos, sin, positions, query.dim(0)?)?.rotate(query, key)
+}
+
+/// The rotary rows of one decode step. Every attention layer shares the same
+/// tables, so a step gathers them once (one position upload) instead of once
+/// per layer.
+struct RotaryDecodeRows {
+    table: candle_core::TensorId,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl RotaryDecodeRows {
+    fn gather(cos: &Tensor, sin: &Tensor, positions: &[usize], batch: usize) -> Result<Self> {
+        let table_len = cos.dim(0)?.min(sin.dim(0)?);
+        if positions.len() != batch || positions.iter().any(|&position| position >= table_len) {
+            return Err(Error::InvalidInput(
+                "LFM2 rotary batch positions exceed the available tables".into(),
+            ));
+        }
+        let positions = positions
+            .iter()
+            .map(|&position| u32::try_from(position))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("LFM2 rotary position exceeds u32".into()))?;
+        let indices = Tensor::from_vec(positions, batch, cos.device())?;
+        Ok(Self {
+            table: cos.id(),
+            cos: cos.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?,
+            sin: sin.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?,
+        })
     }
-    let positions = positions
-        .iter()
-        .map(|&position| u32::try_from(position))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| Error::InvalidInput("LFM2 rotary position exceeds u32".into()))?;
-    let indices = Tensor::from_vec(positions, query.dim(0)?, query.device())?;
-    let cos = cos.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?;
-    let sin = sin.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?;
-    Ok((
-        candle_nn::rotary_emb::rope_thd(&query.contiguous()?, &cos, &sin)?,
-        candle_nn::rotary_emb::rope_thd(&key.contiguous()?, &cos, &sin)?,
-    ))
+
+    /// This step's rows of `cos`/`sin`, gathered on first use.
+    fn for_step<'a>(
+        rows: &'a mut Option<Self>,
+        cos: &Tensor,
+        sin: &Tensor,
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<&'a Self> {
+        if rows.as_ref().is_some_and(|rows| rows.table == cos.id()) {
+            return Ok(rows.as_ref().expect("checked above"));
+        }
+        Ok(rows.insert(Self::gather(cos, sin, positions, batch)?))
+    }
+
+    fn rotate(&self, query: &Tensor, key: &Tensor) -> Result<(Tensor, Tensor)> {
+        if query.dim(0)? != self.cos.dim(0)? {
+            return Err(Error::InvalidInput(
+                "LFM2 rotary rows do not match the decode batch".into(),
+            ));
+        }
+        Ok((
+            candle_nn::rotary_emb::rope_thd(&query.contiguous()?, &self.cos, &self.sin)?,
+            candle_nn::rotary_emb::rope_thd(&key.contiguous()?, &self.cos, &self.sin)?,
+        ))
+    }
 }
 
 impl AttentionLayer {
@@ -882,6 +922,7 @@ impl AttentionLayer {
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         completions: &mut KvWriteCompletionCollector,
+        rotary_rows: &mut Option<RotaryDecodeRows>,
     ) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
         if batch == 0 || seq_len != 1 || positions.len() != batch || caches.len() != batch {
@@ -920,7 +961,9 @@ impl AttentionLayer {
         diagnostics::check_batch_layer(&query, "normalized Q", self.model_layer, positions)?;
         diagnostics::check_batch_layer(&key, "normalized K", self.model_layer, positions)?;
         let (queries, keys) = if query.device().is_cuda() {
-            let (query, key) = rotary_decode_batch(&query, &key, &self.cos, &self.sin, positions)?;
+            let (query, key) =
+                RotaryDecodeRows::for_step(rotary_rows, &self.cos, &self.sin, positions, batch)?
+                    .rotate(&query, &key)?;
             record_rope_kernel();
             record_rope_kernel();
             (
@@ -1689,6 +1732,7 @@ impl QuantizedLfm2Backbone {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Tensor> {
             let mut hidden_states = input_embeds.clone();
+            let mut rotary_rows = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 diagnostics::check_batch_layer(&hidden_states, "input", layer_idx, positions)?;
                 let residual = hidden_states.clone();
@@ -1701,6 +1745,7 @@ impl QuantizedLfm2Backbone {
                         caches,
                         lowered.as_ref(),
                         &mut completions,
+                        &mut rotary_rows,
                     )?,
                     LayerKind::ShortConv(shortconv) => {
                         let mut refs = working.iter_mut().collect::<Vec<_>>();
@@ -2880,6 +2925,30 @@ pub(crate) mod tests {
                 }
             }
         }
+
+        // One gather serves every layer of a step; another table regathers.
+        let mut rows = None;
+        let first = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        let reused = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        assert_eq!(first, reused);
+        let (cos2, sin2) = (cos.copy().unwrap(), sin.copy().unwrap());
+        let other =
+            super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3).unwrap();
+        assert_ne!(other.cos.id(), first);
+        let (q2, k2) = other.rotate(&query, &key).unwrap();
+        for (left, right) in [(&q, &q2), (&k, &k2)] {
+            assert_eq!(
+                left.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                right.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+        }
+        assert!(other.rotate(&query.narrow(0, 0, 2).unwrap(), &key).is_err());
     }
 
     #[test]
