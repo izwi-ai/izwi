@@ -104,6 +104,10 @@ pub struct ChatCompletionRequest {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// `"parsed"` moves `<think>` reasoning into `reasoning_content`;
+    /// `"none"` (the default) leaves it inside `content`.
+    #[serde(default)]
+    pub reasoning_format: Option<String>,
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
@@ -186,6 +190,8 @@ struct OpenAiChoice {
 #[derive(Debug, Serialize)]
 struct OpenAiAssistantMessage {
     role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -282,6 +288,8 @@ struct OpenAiChunkChoice {
 struct OpenAiDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -788,6 +796,7 @@ pub async fn completions(
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    let reasoning = reasoning_split_mode(&req, &execution_request)?;
 
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
@@ -803,7 +812,7 @@ pub async fn completions(
             spawn_chat_stream(state, execution_request)
         };
         let stream_response =
-            render_chat_stream(req, model_id, event_rx, compat_profile, None, None);
+            render_chat_stream(req, model_id, event_rx, compat_profile, reasoning, None, None);
         return Ok(stream_response.into_response());
     }
 
@@ -817,6 +826,7 @@ pub async fn completions(
         variant,
         generation,
         compat_profile,
+        reasoning,
     ))
 }
 
@@ -836,6 +846,7 @@ pub async fn gateway_completions(
     let compat_profile = compatibility_profile();
     validate_chat_request_compatibility(&req, compat_profile)?;
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
+    let reasoning = reasoning_split_mode(&req, &execution_request)?;
     state
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
@@ -880,6 +891,7 @@ pub async fn gateway_completions(
             model_id,
             event_rx,
             compat_profile,
+            reasoning,
             Some(admission),
             Some(stream_observation),
         )
@@ -922,6 +934,7 @@ pub async fn gateway_completions(
         variant,
         generation,
         compat_profile,
+        reasoning,
     ))
 }
 
@@ -1000,17 +1013,50 @@ fn prepare_execution_request(
     ))
 }
 
+/// `Some(opened_in_prompt)` when the request asked for `reasoning_format:
+/// "parsed"`. `opened_in_prompt` is true for chat families whose prompt
+/// opens the `<think>` block when thinking is on (Qwen3.5/3.6/3.8); the
+/// LFM2.5 Thinking model writes its own opener.
+fn reasoning_split_mode(
+    req: &ChatCompletionRequest,
+    execution: &ChatExecutionRequest,
+) -> Result<Option<bool>, ApiError> {
+    match req.reasoning_format.as_deref().map(str::trim) {
+        None | Some("none") => Ok(None),
+        Some("parsed") => {
+            let variant = execution.variant;
+            let opened_in_prompt = variant.family() != ModelFamily::Lfm2Chat
+                && variant.chat_capabilities().is_some_and(|caps| {
+                    caps.supports_thinking
+                        && execution
+                            .chat_config
+                            .enable_thinking
+                            .unwrap_or(caps.default_thinking_enabled)
+                });
+            Ok(Some(opened_in_prompt))
+        }
+        Some(other) => Err(ApiError::bad_request(format!(
+            "Unsupported `reasoning_format` {other:?}; use \"none\" or \"parsed\""
+        ))),
+    }
+}
+
 fn render_completion_response(
     variant: ModelVariant,
     generation: ChatGeneration,
     compat_profile: OpenAiCompatibilityProfile,
+    reasoning: Option<bool>,
 ) -> Response {
     let completion_id = new_uuid();
     let created = now_unix_secs();
     let completion_tokens = generation.tokens_generated;
     let prompt_tokens = generation.prompt_tokens;
+    let (reasoning_content, text) = match reasoning {
+        Some(opened_in_prompt) => super::reasoning::split_reasoning(&generation.text, opened_in_prompt),
+        None => (None, generation.text),
+    };
     let (assistant_content, assistant_tool_calls, finish_reason) =
-        build_assistant_response_parts(generation.text);
+        build_assistant_response_parts(text);
 
     let response = OpenAiChatCompletionResponse {
         id: completion_id,
@@ -1021,6 +1067,7 @@ fn render_completion_response(
             index: 0,
             message: OpenAiAssistantMessage {
                 role: "assistant",
+                reasoning_content,
                 content: assistant_content,
                 tool_calls: assistant_tool_calls,
             },
@@ -1052,6 +1099,7 @@ fn render_chat_stream(
     model_id: String,
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
+    reasoning: Option<bool>,
     admission: Option<GatewayAdmissionGuard>,
     stream_observation: Option<GatewayStreamMetricsGuard>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -1066,6 +1114,7 @@ fn render_chat_stream(
     let stream = async_stream::stream! {
         let _admission = admission;
         let mut stream_observation = stream_observation;
+        let mut splitter = reasoning.map(super::reasoning::ReasoningSplitter::new);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
@@ -1079,6 +1128,7 @@ fn render_chat_stream(
                             index: 0,
                             delta: OpenAiDelta {
                                 role: Some("assistant"),
+                                reasoning_content: None,
                                 content: None,
                                 tool_calls: None,
                                 logprobs: None,
@@ -1092,7 +1142,18 @@ fn render_chat_stream(
                     .unwrap_or_default(),
                     false,
                 ),
-                ChatStreamEvent::Delta { text, logprobs } => (
+                ChatStreamEvent::Delta { text, logprobs } => {
+                    let (reasoning_content, content) = match splitter.as_mut() {
+                        Some(splitter) => {
+                            let (reasoning, content) = splitter.push(&text);
+                            (
+                                (!reasoning.is_empty()).then_some(reasoning),
+                                (!content.is_empty()).then_some(content),
+                            )
+                        }
+                        None => (None, Some(text)),
+                    };
+                    (
                     serde_json::to_string(&OpenAiChatChunk {
                         id: completion_id.clone(),
                         object: "chat.completion.chunk",
@@ -1102,7 +1163,8 @@ fn render_chat_stream(
                             index: 0,
                             delta: OpenAiDelta {
                                 role: None,
-                                content: Some(text),
+                                reasoning_content,
+                                content,
                                 tool_calls: None,
                                 logprobs: openai_logprobs(&logprobs),
                             },
@@ -1114,13 +1176,24 @@ fn render_chat_stream(
                     })
                     .unwrap_or_default(),
                     false,
-                ),
+                    )
+                }
                 ChatStreamEvent::Completed(generation) => {
                     if let Some(observation) = stream_observation.as_mut() {
                         observation.record_completion();
                     }
-                    let (_, tool_calls, finish_reason) =
-                        build_assistant_response_parts(generation.text);
+                    // Text the splitter still held back is final now.
+                    let (tail_reasoning, tail_content) = splitter
+                        .as_mut()
+                        .map(|splitter| splitter.finish())
+                        .unwrap_or_default();
+                    let answer = match reasoning {
+                        Some(opened_in_prompt) => {
+                            super::reasoning::split_reasoning(&generation.text, opened_in_prompt).1
+                        }
+                        None => generation.text.clone(),
+                    };
+                    let (_, tool_calls, finish_reason) = build_assistant_response_parts(answer);
                     let delta_tool_calls =
                         tool_calls.as_ref().map(|calls| stream_tool_call_deltas(calls));
                     (
@@ -1133,7 +1206,9 @@ fn render_chat_stream(
                                 index: 0,
                                 delta: OpenAiDelta {
                                     role: None,
-                                    content: None,
+                                    reasoning_content: (!tail_reasoning.is_empty())
+                                        .then_some(tail_reasoning),
+                                    content: (!tail_content.is_empty()).then_some(tail_content),
                                     tool_calls: delta_tool_calls,
                                     logprobs: None,
                                 },
@@ -1896,6 +1971,7 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: None,
             chat_template_kwargs: None,
+            reasoning_format: None,
         };
 
         let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -1934,6 +2010,7 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: None,
             chat_template_kwargs: None,
+            reasoning_format: None,
         };
 
         let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -1972,6 +2049,7 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: None,
             chat_template_kwargs: None,
+            reasoning_format: None,
         };
 
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
@@ -2027,6 +2105,97 @@ fn measured_finish_reason(
 #[cfg(test)]
 mod timing_contract_tests {
     use super::*;
+
+    fn reasoning_mode_for(body: serde_json::Value) -> Result<Option<bool>, ApiError> {
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let ctx = RequestContext::new(
+            "reasoning".into(),
+            izwi_hooks::Principal::local_anonymous(),
+        );
+        let (_, execution) = prepare_execution_request(&req, &ctx).unwrap();
+        reasoning_split_mode(&req, &execution)
+    }
+
+    #[test]
+    fn reasoning_format_is_opt_in_and_knows_who_opens_the_block() {
+        let user = serde_json::json!([{"role": "user", "content": "hi"}]);
+        // Default: reasoning stays in `content`.
+        assert_eq!(
+            reasoning_mode_for(serde_json::json!({"model": "LFM2.5-1.2B-Thinking-GGUF", "messages": user}))
+                .unwrap(),
+            None
+        );
+        // LFM2.5 Thinking writes its own `<think>`.
+        assert_eq!(
+            reasoning_mode_for(serde_json::json!({
+                "model": "LFM2.5-1.2B-Thinking-GGUF", "messages": user, "reasoning_format": "parsed"
+            }))
+            .unwrap(),
+            Some(false)
+        );
+        // Qwen3.8 opens the block in its prompt unless thinking is off.
+        assert_eq!(
+            reasoning_mode_for(serde_json::json!({
+                "model": "Qwen3.8-27B-FP8", "messages": user, "reasoning_format": "parsed"
+            }))
+            .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            reasoning_mode_for(serde_json::json!({
+                "model": "Qwen3.8-27B-FP8", "messages": user, "reasoning_format": "parsed",
+                "enable_thinking": false
+            }))
+            .unwrap(),
+            Some(false)
+        );
+        assert!(reasoning_mode_for(serde_json::json!({
+            "model": "LFM2.5-1.2B-Thinking-GGUF", "messages": user, "reasoning_format": "deepseek"
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
+        let generation = |text: &str| ChatGeneration {
+            latency_breakdown: None,
+            finish_reason: None,
+            text: text.to_string(),
+            prompt_tokens: 1,
+            tokens_generated: 1,
+            generation_time_ms: 0.0,
+            cached_prompt_tokens: None,
+            logprobs: Vec::new(),
+        };
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let text = "<think>check the tool</think>\n\n<|tool_call_start|>[now()]<|tool_call_end|>";
+        let parsed = body(render_completion_response(
+            ModelVariant::Lfm2512BThinkingGguf,
+            generation(text),
+            OpenAiCompatibilityProfile::Strict,
+            Some(false),
+        ))
+        .await;
+        let message = &parsed["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "check the tool");
+        assert!(message.get("content").is_none());
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "now");
+
+        let raw = body(render_completion_response(
+            ModelVariant::Lfm2512BThinkingGguf,
+            generation("<think>r</think>A"),
+            OpenAiCompatibilityProfile::Strict,
+            None,
+        ))
+        .await;
+        assert!(raw["choices"][0]["message"].get("reasoning_content").is_none());
+        assert_eq!(raw["choices"][0]["message"]["content"], "<think>r</think>A");
+    }
 
     #[test]
     fn budget_termination_is_length_without_overriding_tool_calls() {
@@ -2127,6 +2296,7 @@ mod timing_contract_tests {
             reasoning_effort: None,
             preserve_thinking: None,
             chat_template_kwargs: None,
+            reasoning_format: None,
         };
         assert!(validate_chat_request_compatibility(&req(Some(true), Some(20)), profile()).is_ok());
         assert!(validate_chat_request_compatibility(&req(Some(true), None), profile()).is_ok());
@@ -2170,6 +2340,7 @@ mod timing_contract_tests {
             reasoning_effort: None,
             preserve_thinking: None,
             chat_template_kwargs: None,
+            reasoning_format: None,
         };
         assert!(validate_chat_request_compatibility(&req("json_object"), profile()).is_ok());
         assert!(
