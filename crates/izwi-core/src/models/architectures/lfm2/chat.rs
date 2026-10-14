@@ -1537,3 +1537,7 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_integrity_tests.rs"]
 mod integrity_tests;
+
+#[cfg(test)]
+#[path = "chat_reference_tests.rs"]
+mod reference_tests;
