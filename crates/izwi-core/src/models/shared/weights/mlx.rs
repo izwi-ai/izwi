@@ -306,7 +306,9 @@ pub fn load_conv2d(
     let expected_ohwi = (out_channels, kernel_size, kernel_size, in_channels);
 
     if dims == expected_ohwi {
-        ws = ws.permute((0, 3, 1, 2))?;
+        // Candle 0.11's Metal and non-cudnn CUDA im2col conv2d copy a strided
+        // kernel to a contiguous buffer and then multiply the original one.
+        ws = ws.permute((0, 3, 1, 2))?.contiguous()?;
     } else if dims != expected_oihw {
         return Err(Error::ModelLoadError(format!(
             "Conv2d weight shape mismatch: got={dims:?}, expected OIHW={expected_oihw:?} or OHWI={expected_ohwi:?}"
@@ -342,7 +344,9 @@ pub fn load_conv1d_no_bias(
     let mut ws = vb.get_unchecked_dtype("weight", vb.dtype())?;
     if let Ok(dims) = ws.dims3() {
         if dims == expected_oki {
-            ws = ws.permute((0, 2, 1))?;
+            // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a
+            // strided kernel to a contiguous buffer and then multiply the original.
+            ws = ws.permute((0, 2, 1))?.contiguous()?;
         } else if dims != expected_oik {
             return Err(Error::ModelLoadError(format!(
                 "Conv1d weight shape mismatch: got={dims:?}, expected OIK={expected_oik:?} or OKI={expected_oki:?}"
@@ -385,7 +389,9 @@ pub fn load_conv1d(
     let mut ws = vb.get_unchecked_dtype("weight", vb.dtype())?;
     if let Ok(dims) = ws.dims3() {
         if dims == expected_oki {
-            ws = ws.permute((0, 2, 1))?;
+            // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a
+            // strided kernel to a contiguous buffer and then multiply the original.
+            ws = ws.permute((0, 2, 1))?.contiguous()?;
         } else if dims != expected_oik {
             return Err(Error::ModelLoadError(format!(
                 "Conv1d weight shape mismatch: got={dims:?}, expected OIK={expected_oik:?} or OKI={expected_oki:?}"
@@ -483,5 +489,137 @@ mod tests {
         for (a, b) in out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    /// MLX OHWI / OKI conv weights for the loaders, with a bias.
+    fn mlx_conv_weights(
+        out_channels: usize,
+        kernel: &[usize],
+        in_channels: usize,
+    ) -> std::collections::HashMap<String, Tensor> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let mut shape = vec![out_channels];
+        shape.extend_from_slice(kernel);
+        shape.push(in_channels);
+        let device = candle_core::Device::Cpu;
+        std::collections::HashMap::from([
+            (
+                "weight".to_string(),
+                xorshift_tensor(&shape, 9, 0.05, &device).expect("weight"),
+            ),
+            (
+                "bias".to_string(),
+                xorshift_tensor(&[out_channels], 11, 0.5, &device).expect("bias"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn mlx_conv_loaders_return_contiguous_oihw_kernels() {
+        let device = candle_core::Device::Cpu;
+        let vb = |weights| VarBuilder::from_tensors(weights, DType::F32, &device);
+        let conv2d = load_conv2d(
+            8,
+            6,
+            3,
+            Conv2dConfig::default(),
+            vb(mlx_conv_weights(6, &[3, 3], 8)),
+        )
+        .expect("conv2d");
+        assert_eq!(conv2d.weight().dims(), &[6, 8, 3, 3]);
+        assert!(conv2d.weight().is_contiguous());
+
+        let weights = mlx_conv_weights(6, &[3], 8);
+        let conv1d =
+            load_conv1d(8, 6, 3, Conv1dConfig::default(), vb(weights.clone())).expect("conv1d");
+        let no_bias = load_conv1d_no_bias(8, 6, 3, Conv1dConfig::default(), vb(weights))
+            .expect("conv1d without bias");
+        for weight in [conv1d.weight(), no_bias.weight()] {
+            assert_eq!(weight.dims(), &[6, 8, 3]);
+            assert!(weight.is_contiguous());
+        }
+    }
+
+    /// Candle 0.11's Metal im2col conv multiplies the caller's strided kernel
+    /// instead of its own contiguous copy, so a permuted MLX kernel was read in
+    /// the wrong layout (relative error ~1 in the 4-bit aligner's audio CNN);
+    /// its CPU conv1d ignores kernel strides too. The reference is a CPU conv
+    /// over an explicitly contiguous OIHW/OIK kernel; Metal legs run when present.
+    #[test]
+    fn mlx_conv2d_ohwi_kernel_matches_cpu() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+        use candle_core::{Device, Module};
+
+        let cpu = Device::Cpu;
+        let mut devices = vec![("cpu", cpu.clone())];
+        match crate::backends::metal_device_if_available(0) {
+            Some(metal) => devices.push(("metal", metal)),
+            None => eprintln!("mlx_conv2d_ohwi_kernel_matches_cpu: no Metal device, CPU only"),
+        }
+
+        let conv2d_weights = mlx_conv_weights(480, &[3, 3], 480);
+        let conv2d_input = xorshift_tensor(&[2, 480, 32, 25], 7, 1.0, &cpu).unwrap();
+        let conv2d_cfg = Conv2dConfig {
+            padding: 1,
+            stride: 2,
+            ..Default::default()
+        };
+        let conv2d_on = |device: &Device| {
+            let vb = VarBuilder::from_tensors(conv2d_weights.clone(), DType::F32, device);
+            let conv = load_conv2d(480, 480, 3, conv2d_cfg, vb).expect("conv2d");
+            host_f32(
+                &conv
+                    .forward(&conv2d_input.to_device(device).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let oihw = conv2d_weights["weight"].permute((0, 3, 1, 2)).unwrap();
+        let conv2d_reference = Conv2d::new(
+            oihw.contiguous().unwrap(),
+            Some(conv2d_weights["bias"].clone()),
+            conv2d_cfg,
+        );
+        let conv2d_want = host_f32(&conv2d_reference.forward(&conv2d_input).unwrap()).unwrap();
+
+        let conv1d_weights = mlx_conv_weights(256, &[3], 128);
+        let conv1d_input = xorshift_tensor(&[2, 128, 50], 5, 1.0, &cpu).unwrap();
+        let conv1d_cfg = Conv1dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let conv1d_on = |device: &Device| {
+            let vb = VarBuilder::from_tensors(conv1d_weights.clone(), DType::F32, device);
+            let conv = load_conv1d(128, 256, 3, conv1d_cfg, vb).expect("conv1d");
+            host_f32(
+                &conv
+                    .forward(&conv1d_input.to_device(device).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let oik = conv1d_weights["weight"].permute((0, 2, 1)).unwrap();
+        let conv1d_reference = Conv1d::new(
+            oik.contiguous().unwrap(),
+            Some(conv1d_weights["bias"].clone()),
+            conv1d_cfg,
+        );
+        let conv1d_want = host_f32(&conv1d_reference.forward(&conv1d_input).unwrap()).unwrap();
+
+        let mut failures = Vec::new();
+        for (device_name, device) in &devices {
+            for (conv, want, got) in [
+                ("conv2d", &conv2d_want, conv2d_on(device)),
+                ("conv1d", &conv1d_want, conv1d_on(device)),
+            ] {
+                let err = max_abs_diff(&got, want);
+                eprintln!("{conv} {device_name}: max|d|={err:e} vs contiguous-kernel reference");
+                if err >= 1e-3 {
+                    failures.push(format!("{conv} {device_name}: max|d|={err:e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "MLX conv loaders: {failures:?}");
     }
 }
