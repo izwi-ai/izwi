@@ -1217,6 +1217,17 @@ impl KvCacheCoordinator {
     }
 
     /// Atomically release a set of durable prefix-index references.
+    /// True when the prefix index holds the only references to `block`, so
+    /// releasing them returns the page to the free list. A page that a table,
+    /// pin or reservation still owns frees nothing when its prefix ref drops.
+    pub fn is_prefix_only(&self, block: CacheBlockRef) -> bool {
+        if self.validate_block(block, None).is_err() {
+            return false;
+        }
+        let slot = &self.slots[block.index as usize];
+        slot.allocated && slot.prefix_refs > 0 && slot.ownership_count() == slot.prefix_refs
+    }
+
     pub fn release_prefixes(&mut self, blocks: &[CacheBlockRef]) -> KvCoordinatorResult<()> {
         let blocks = unique_blocks(blocks)?;
         for block in &blocks {

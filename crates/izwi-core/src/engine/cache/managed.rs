@@ -5570,6 +5570,69 @@ mod tests {
         assert_eq!(resumed.domains[0].execution_start_tokens, 32);
     }
 
+    #[test]
+    fn admission_skips_prefix_chains_whose_pages_are_still_owned() {
+        // C1: evicting a chain whose pages a live table still owns frees no
+        // memory. Admission used to drop such chains first (least recently
+        // used) and keep going, so under load it flushed the index without
+        // gaining a page. Only chains that free at least one page are evicted.
+        let model = ModelInstanceId::new(707);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                6,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let commit = |manager: &mut ManagedKvCacheManager,
+                      txn_id: PlanId,
+                      session: &SessionKey,
+                      tokens: Vec<u32>| {
+            let request = prefix_request(model, tokens.clone());
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    txn_id,
+                    session,
+                    &sequence_work(0, tokens.len()),
+                    Some(&request),
+                )
+                .expect("admitted")
+                .expect("managed reservation");
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+        };
+
+        // Least recently used: a live session whose published page it still owns.
+        let live = SessionKey::new("live".into(), 1);
+        commit(&mut manager, 51, &live, (0..33).collect());
+        // Newer: a finished conversation held only by the index (two pages).
+        let finished = SessionKey::new("finished".into(), 1);
+        commit(&mut manager, 52, &finished, (500..565).collect());
+        manager.release_session(&finished).expect("release");
+        let before = manager.runtime_snapshot();
+        assert_eq!(before.counters.prefix_retained_pages, 3);
+
+        // An unrelated prompt needs four pages while three are free.
+        let unrelated = SessionKey::new("unrelated".into(), 1);
+        commit(&mut manager, 53, &unrelated, (900..1000).collect());
+
+        // Only the index-only chain went; the live session's page is still
+        // published for reuse.
+        assert_eq!(manager.telemetry_snapshot().prefix_evictions, 2);
+        let after = manager.runtime_snapshot();
+        assert!(after.counters.prefix_retained_pages >= 1);
+    }
+
     fn composite_tensor_contract() -> InferenceStateContract {
         let mut contract = test_contract();
         let domain = CacheDomainId::new(2);

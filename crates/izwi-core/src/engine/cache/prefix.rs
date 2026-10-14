@@ -526,9 +526,12 @@ impl CoordinatedPrefixIndex {
     }
 
     /// Evict the least-recently-used chain that does not contain any block in
-    /// `protected`. Admission uses this after a prefix hit so reclaiming old
-    /// prefixes cannot invalidate the exact shared pages it is about to
-    /// reserve.
+    /// `protected` and that frees at least one page. Admission uses this after
+    /// a prefix hit so reclaiming old prefixes cannot invalidate the exact
+    /// shared pages it is about to reserve. Chains whose pages are all still
+    /// owned by live tables or pins are kept: dropping them would empty the
+    /// index without returning a single page, so an empty result means no
+    /// eviction can relieve capacity right now.
     pub fn evict_lru_excluding(
         &mut self,
         coordinator: &mut KvCacheCoordinator,
@@ -544,7 +547,12 @@ impl CoordinatedPrefixIndex {
         for (digest, _) in candidates {
             let mut staged = self.index.clone();
             let blocks = staged.remove_chain_from(digest);
-            if blocks.is_empty() || blocks.iter().any(|block| protected.contains(block)) {
+            if blocks.is_empty()
+                || blocks.iter().any(|block| protected.contains(block))
+                || !blocks
+                    .iter()
+                    .any(|block| coordinator.is_prefix_only(*block))
+            {
                 continue;
             }
             coordinator.release_prefixes(&blocks)?;
