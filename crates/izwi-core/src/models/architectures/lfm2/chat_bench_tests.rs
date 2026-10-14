@@ -545,3 +545,123 @@ fn lfm25_fused_vs_unfused_shortconv_metal() {
 fn lfm25_fused_vs_unfused_shortconv_cpu() {
     fused_vs_unfused_shortconv(DeviceProfile::cpu());
 }
+
+/// Prefill time for a long prompt, one span, so CPU prefill can be split
+/// between matmuls and the ShortConv ring path.
+fn prefill_timing(profile: DeviceProfile, tokens: usize) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let backend = format!("{:?}", model.device_kind());
+    let device = model.device.device.clone();
+    let layout = super::super::physical::Lfm2StateLayout::from_config(&model.config).unwrap();
+    let bindings: Vec<crate::kv::KvLayerBinding> = layout
+        .attention_model_layers
+        .iter()
+        .enumerate()
+        .map(|(physical, model_layer)| crate::kv::KvLayerBinding {
+            model_layer: *model_layer,
+            physical_layer: physical as u32,
+        })
+        .collect();
+    let _ = (&bindings, &device);
+    let sessions = Sessions::new(&model);
+    let prompt: Vec<u32> = (0..tokens as u32)
+        .map(|i| 1000 + (i * 7919) % 50_000)
+        .collect();
+    let config = ChatGenerationConfig::default();
+    for round in 0..2 + profile_rounds() {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(
+                &prompt,
+                16,
+                &config,
+                sessions.session(round as u32 % 2),
+            )
+            .unwrap();
+        let started = Instant::now();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        let _ = state
+            .unconsumed_output
+            .take()
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "{backend}: prefill {tokens} tokens in {:.0} ms ({:.0} tok/s), round {round}",
+            seconds * 1000.0,
+            tokens as f64 / seconds
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_prefill_timing_cpu() {
+    prefill_timing(DeviceProfile::cpu(), 200);
+}
+
+/// CPU prefill matmul: Candle's quantized `QMatMul` vs expanding the weight
+/// to F32 tile by tile and using the F32 GEMM, at prefill row counts.
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_cpu_prefill_matmul_strategies() {
+    use candle_core::quantized::{ggml_file::qtensor_from_ggml, QMatMul};
+    use candle_core::Module;
+    let path = models_dir_for_bench()
+        .join("LFM2.5-1.2B-Instruct-GGUF")
+        .join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf");
+    if !path.exists() {
+        return;
+    }
+    let device = candle_core::Device::Cpu;
+    let loader = GgufLoader::from_path(&path).unwrap();
+    for name in ["blk.2.ffn_gate.weight", "blk.0.ffn_down.weight"] {
+        let qtensor = loader.load_qtensor(name, &device).unwrap();
+        let dtype = qtensor.dtype();
+        let (n, k) = qtensor.shape().dims2().unwrap();
+        let data = qtensor.data().unwrap().to_vec();
+        let matmul = QMatMul::from_qtensor(qtensor).unwrap();
+        for m in [16usize, 64, 256, 512] {
+            let x = Tensor::randn(0f32, 1f32, (m, k), &device).unwrap();
+            let started = Instant::now();
+            let reference = matmul.forward(&x).unwrap();
+            let quantized_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            let tile_rows = 512;
+            let row_bytes = data.len() / n;
+            let mut tiles = Vec::new();
+            for start in (0..n).step_by(tile_rows) {
+                let rows = tile_rows.min(n - start);
+                let tile = qtensor_from_ggml(
+                    dtype,
+                    &data[start * row_bytes..(start + rows) * row_bytes],
+                    vec![rows, k],
+                    &device,
+                )
+                .unwrap()
+                .dequantize(&device)
+                .unwrap();
+                tiles.push(x.matmul(&tile.t().unwrap()).unwrap());
+            }
+            let tiled = Tensor::cat(&tiles, 1).unwrap();
+            let tiled_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let err = (&tiled - &reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!(
+                "{name} {dtype:?} m={m:4}: QMatMul {quantized_ms:7.1} ms, F32 tiles {tiled_ms:7.1} ms, max diff {err:.4}"
+            );
+        }
+    }
+}
