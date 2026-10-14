@@ -3056,17 +3056,21 @@ impl ManagedKvCacheManager {
             ));
         }
         if let Some(clocked_state) = reservation.clocked_state.as_ref() {
-            let arena = state.runtime.tensor_state().ok_or_else(|| {
-                Error::InferenceError("tensor-state reservation lost its physical arena".into())
-            })?;
-            let transaction = PhysicalStateTransactionId::new(reservation.txn_id)?;
-            let committed = if clocked_state.selections().is_some() {
-                let completion = receipt
-                    .clocked_state()
-                    .expect("validated selected receipt has a completion")
-                    .completion();
-                arena.commit_selected(transaction, completion)
-            } else {
+            // Every failure below must abort the reservation; returning early
+            // with `?` would leave the coordinator transaction `Written` with
+            // its pins and reservations held, which later blocks unload.
+            let committed = (|| {
+                let arena = state.runtime.tensor_state().ok_or_else(|| {
+                    Error::InferenceError("tensor-state reservation lost its physical arena".into())
+                })?;
+                let transaction = PhysicalStateTransactionId::new(reservation.txn_id)?;
+                if clocked_state.selections().is_some() {
+                    let completion = receipt
+                        .clocked_state()
+                        .expect("validated selected receipt has a completion")
+                        .completion();
+                    return arena.commit_selected(transaction, completion);
+                }
                 let target_cursor = reservation
                     .domains
                     .first()
@@ -3082,13 +3086,12 @@ impl ManagedKvCacheManager {
                     u64::from(accepted_prefix.unwrap_or(domain.target_committed_tokens))
                         != target_cursor
                 }) {
-                    abort_reservation(state, reservation);
                     return Err(Error::InferenceError(
                         "one managed state transaction resolved divergent domain cursors".into(),
                     ));
                 }
                 arena.commit(transaction, target_cursor)
-            };
+            })();
             let retired = match committed {
                 Ok(retired) => retired,
                 Err(error) => {
