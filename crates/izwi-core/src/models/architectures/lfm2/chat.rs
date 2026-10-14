@@ -366,16 +366,7 @@ impl Lfm2ChatModel {
     }
 
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        let gguf_name = match variant {
-            ModelVariant::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-            ModelVariant::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-Q4_K_M.gguf",
-            _ => {
-                return Err(Error::ModelLoadError(format!(
-                    "Unsupported LFM2 GGUF chat variant: {variant}"
-                )));
-            }
-        };
-        let gguf_path = model_dir.join(gguf_name);
+        let gguf_path = model_dir.join(lfm2_chat_gguf_name(variant)?);
         if !gguf_path.exists() {
             return Err(Error::ModelLoadError(format!(
                 "GGUF checkpoint not found: {}",
@@ -913,6 +904,36 @@ fn write_python_json(value: &serde_json::Value, out: &mut String) {
         }
         scalar => out.push_str(&scalar.to_string()),
     }
+}
+
+fn lfm2_chat_gguf_name(variant: ModelVariant) -> Result<&'static str> {
+    match variant {
+        ModelVariant::Lfm2512BInstructGguf => Ok("LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
+        ModelVariant::Lfm2512BThinkingGguf => Ok("LFM2.5-1.2B-Thinking-Q4_K_M.gguf"),
+        _ => Err(Error::ModelLoadError(format!(
+            "Unsupported LFM2 GGUF chat variant: {variant}"
+        ))),
+    }
+}
+
+/// What a chat load reads and builds, for load admission.
+pub(crate) struct Lfm2ChatLoadLayout {
+    pub(crate) gguf: std::path::PathBuf,
+    /// (positions, head dim) of the backbone's RoPE tables.
+    pub(crate) rope_table: (usize, usize),
+}
+
+pub(crate) fn lfm2_chat_load_layout(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<Lfm2ChatLoadLayout> {
+    let gguf = model_dir.join(lfm2_chat_gguf_name(variant)?);
+    let mut config = parse_lfm2_backbone_config(&GgufLoader::from_path(&gguf)?)?;
+    config.context_length = lfm25_chat_context_limit(config.context_length);
+    Ok(Lfm2ChatLoadLayout {
+        rope_table: super::backbone::rope_table_geometry(&config)?,
+        gguf,
+    })
 }
 
 /// Context the LFM2.5-1.2B chat checkpoints support.

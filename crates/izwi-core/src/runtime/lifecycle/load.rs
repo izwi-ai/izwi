@@ -536,7 +536,9 @@ fn admit_asr_request_floor(
 /// the families whose admission is a residency plan (ASR and TTS), so an
 /// observed excess means the plan under-prices the loader.
 fn reconciles_device_usage(variant: ModelVariant) -> bool {
-    asr_memory::is_asr_variant(variant) || tts_memory::has_plan(variant)
+    asr_memory::is_asr_variant(variant)
+        || tts_memory::has_plan(variant)
+        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat
 }
 
 /// A request envelope in `backend`'s ledger domains: host and accelerator
@@ -634,7 +636,7 @@ fn reconcile_observed_growth(
 }
 
 /// The residency plan first admission prices for a checkpoint-planned
-/// family (Fish, ASR, TTS), or `None` for one without a plan. The Metal OOM
+/// family (Fish, ASR, TTS, LFM2.5 chat), or `None` for one without a plan. The Metal OOM
 /// retry judges futility by the same plan.
 fn checkpoint_resource_plan(
     variant: ModelVariant,
@@ -647,10 +649,17 @@ fn checkpoint_resource_plan(
         )?;
         return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
     }
-    // ASR and TTS families price what their loader allocates on every
+    // ASR, TTS and LFM2.5 chat price what their loader allocates on every
     // backend; the catalog figure stays a display value for them.
     if let Some(plan) = asr_memory::resource_plan(variant, model_path, device)? {
         return Ok(Some(plan));
+    }
+    if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
+        return asr_memory::lfm2_chat_resource_plan(
+            variant,
+            model_path,
+            BackendKind::from(device.kind),
+        );
     }
     tts_memory::resource_plan(variant, model_path, device)
 }

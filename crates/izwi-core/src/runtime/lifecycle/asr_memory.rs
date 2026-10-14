@@ -1733,37 +1733,9 @@ fn price_lfm25_audio(
         "audio_embedding.to_logits.weight",
         "audio_embedding.embedding_norm.weight",
     ];
-    let quantized = |tensor: &CensusTensor| {
-        !matches!(
-            tensor.dtype,
-            StoredDType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
-        )
-    };
     let mut ledger = Ledger::new(backend);
-    for (backbone, embeds_tokens) in [(&census.main, true), (&census.tokenizer, false)] {
-        let tensors = by_name(std::slice::from_ref(backbone));
-        let embedding = tensor(&tensors, "token_embd.weight")?;
-        if embeds_tokens {
-            ledger.gguf_dense(embedding, DType::F32)?;
-            ledger.hold(embedding.stored_bytes)?;
-        }
-        for (name, tensor) in &tensors {
-            if *name == "token_embd.weight" {
-                continue;
-            }
-            if quantized(tensor) {
-                ledger.gguf_stored(tensor)?;
-            } else {
-                ledger.gguf_dense(tensor, DType::F32)?;
-            }
-        }
-        if !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight") {
-            ledger.gguf_stored(embedding)?;
-        }
-        if embeds_tokens {
-            ledger.release(embedding.stored_bytes)?;
-        }
-    }
+    price_lfm2_backbone(&mut ledger, &census.main, true)?;
+    price_lfm2_backbone(&mut ledger, &census.tokenizer, false)?;
     for tensor in &census.mmproj.tensors {
         if !MMPROJ_UNREAD.contains(&tensor.name.as_str()) {
             ledger.gguf_dense(tensor, DType::F32)?;
@@ -1775,27 +1747,109 @@ fn price_lfm25_audio(
             continue;
         }
         let embedding = name.ends_with(".embedding.weight") || name == "emb.emb.weight";
-        if quantized(tensor) && !embedding {
+        if gguf_quantized(tensor) && !embedding {
             ledger.gguf_stored(tensor)?;
         } else {
             ledger.gguf_dense(tensor, DType::F32)?;
         }
     }
-    for (positions, head_dim) in rope_tables {
-        let positions = positions as u64;
-        let half = positions
-            .checked_mul(head_dim as u64 / 2)
-            .ok_or_else(overflow)?;
-        // arange (U32), its F32 cast, and the angle matrix.
-        let angles = [
-            dense_bytes(positions, DType::U32)?,
-            dense_bytes(positions, DType::F32)?,
-            dense_bytes(half, DType::F32)?,
-        ];
-        ledger.derived(half, DType::F32, &angles)?;
-        ledger.derived(half, DType::F32, &[])?;
-        ledger.derived(sum(&[half, half])?, DType::F32, &[])?;
+    for table in rope_tables {
+        price_lfm2_rope_table(&mut ledger, table)?;
     }
+    AsrResidencyPlan::from_ledger(ledger, 0)
+}
+
+fn gguf_quantized(tensor: &CensusTensor) -> bool {
+    !matches!(
+        tensor.dtype,
+        StoredDType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+    )
+}
+
+/// One LFM2 backbone GGUF (`lfm2/backbone.rs`): quantized projections stay
+/// quantized and F32 tensors load dense. With `embeds_tokens`, `token_embd`
+/// is dequantized to an F32 table, and its stored read stays alive until the
+/// backbone finishes loading. Without `output.weight`, the head reads
+/// `token_embd` a second time as a quantized projection.
+fn price_lfm2_backbone(
+    ledger: &mut Ledger,
+    backbone: &CensusFile,
+    embeds_tokens: bool,
+) -> Result<()> {
+    let tensors = by_name(std::slice::from_ref(backbone));
+    let embedding = tensor(&tensors, "token_embd.weight")?;
+    if embeds_tokens {
+        ledger.gguf_dense(embedding, DType::F32)?;
+        ledger.hold(embedding.stored_bytes)?;
+    }
+    for (name, tensor) in &tensors {
+        if *name == "token_embd.weight" {
+            continue;
+        }
+        if gguf_quantized(tensor) {
+            ledger.gguf_stored(tensor)?;
+        } else {
+            ledger.gguf_dense(tensor, DType::F32)?;
+        }
+    }
+    if !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight") {
+        ledger.gguf_stored(embedding)?;
+    }
+    if embeds_tokens {
+        ledger.release(embedding.stored_bytes)?;
+    }
+    Ok(())
+}
+
+/// An LFM2 backbone's RoPE tables over `(positions, head_dim)`: `cos` and
+/// `sin` (`[positions, head_dim / 2]` F32) built on the host and uploaded,
+/// then concatenated on the device for the fused path.
+fn price_lfm2_rope_table(ledger: &mut Ledger, (positions, head_dim): (usize, usize)) -> Result<()> {
+    let half = (positions as u64)
+        .checked_mul(head_dim as u64 / 2)
+        .ok_or_else(overflow)?;
+    ledger.uploaded(half, DType::F32)?;
+    ledger.uploaded(half, DType::F32)?;
+    ledger.derived(sum(&[half, half])?, DType::F32, &[])
+}
+
+/// LFM2.5-1.2B chat (`lfm2/chat.rs`): one GGUF on the LFM2 backbone loader,
+/// with RoPE tables over the capped chat context. `None` when the checkpoint
+/// is missing (the loader reports that).
+pub(super) fn lfm2_chat_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<ModelResourcePlan>> {
+    let Ok(layout) =
+        crate::models::architectures::lfm2::chat::lfm2_chat_load_layout(model_path, variant)
+    else {
+        return Ok(None);
+    };
+    let Some(files) = census_of(std::slice::from_ref(&layout.gguf))? else {
+        return Ok(None);
+    };
+    let plan = price_lfm2_chat(&files[0], backend, layout.rope_table)?;
+    tracing::info!(
+        model = %variant,
+        backend = ?plan.backend,
+        logical_resident_bytes = plan.logical_resident_bytes,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        host_staging_bytes = plan.host_staging_bytes,
+        "Priced LFM2.5 chat load from its residency plan"
+    );
+    plan.resource_plan().map(Some)
+}
+
+fn price_lfm2_chat(
+    gguf: &CensusFile,
+    backend: BackendKind,
+    rope_table: (usize, usize),
+) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    price_lfm2_backbone(&mut ledger, gguf, true)?;
+    price_lfm2_rope_table(&mut ledger, rope_table)?;
     AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
@@ -1863,6 +1917,7 @@ pub(super) mod tests {
                 "BF16" => GgmlDType::BF16,
                 "Q8_0" => GgmlDType::Q8_0,
                 "Q4_0" => GgmlDType::Q4_0,
+                "Q4_K" => GgmlDType::Q4K,
                 "Q6_K" => GgmlDType::Q6K,
                 other => panic!("unexpected GGUF dtype {other}"),
             })
@@ -2075,6 +2130,43 @@ pub(super) mod tests {
     /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
     /// over 128,000 positions; head dims 2048 / 32 and 512 / 16.
     const LFM_ROPE_TABLES: [(usize, usize); 2] = [(128_000, 64), (128_000, 32)];
+
+    /// LFM2.5-1.2B chat prices the F32 token table beside the quantized
+    /// checkpoint (its Q6_K `token_embd` is read twice: once dequantized,
+    /// once as the tied LM head) and RoPE tables over the 32K chat context.
+    /// The generic estimate priced the GGUF bytes alone (728.5 MB on CPU and
+    /// Metal) and the 2 GiB catalog figure on CUDA.
+    #[test]
+    fn lfm25_chat_prices_the_f32_embedding_head_and_rope_tables() {
+        let files = census!("lfm2_5_1_2b_instruct_q4_k_m.json");
+        let gguf = &files[0];
+        assert_eq!(gguf.tensors.len(), 148);
+        let stored: u64 = gguf.tensors.iter().map(|tensor| tensor.stored_bytes).sum();
+        assert_eq!(stored, 728_509_440);
+        let embedding_f32 = 65_536 * 2_048 * 4;
+        let rope = 32_768 * 32 * 4 * 4;
+        let logical = stored + embedding_f32 + rope;
+        for backend in BACKENDS {
+            let plan = price_lfm2_chat(gguf, backend, (32_768, 64)).unwrap();
+            assert_eq!(plan.logical_resident_bytes, logical, "{backend:?}");
+            assert!(plan.resident_bytes >= logical, "{backend:?}");
+            assert!(
+                plan.resident_bytes < logical + logical / 16,
+                "{backend:?}: {}",
+                plan.resident_bytes
+            );
+            assert!(plan.load_peak_bytes >= plan.resident_bytes, "{backend:?}");
+            // Metal holds each load's upload copies until its fence; live
+            // Metal loads peaked at 2.6 GB process footprint, runtime and the
+            // KV arena included.
+            let peak_bound = if backend == BackendKind::Metal { 2.5 } else { 1.5 };
+            assert!(
+                gib(plan.load_peak_bytes) < peak_bound,
+                "{backend:?}: {}",
+                plan.load_peak_bytes
+            );
+        }
+    }
 
     fn lfm25_audio(backend: BackendKind) -> AsrResidencyPlan {
         let files = census!("lfm2_5_audio_1_5b_q4_0.json");
