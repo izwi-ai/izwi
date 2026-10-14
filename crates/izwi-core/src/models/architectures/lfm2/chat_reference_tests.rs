@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const PAGE_TOKENS: u32 = 16;
-const PAGES_PER_SESSION: u32 = 16;
+/// 512 tokens per session: a fixture prompt plus 256 decoded tokens.
+const PAGES_PER_SESSION: u32 = 32;
 const SESSIONS: u32 = 4;
 /// Reference steps whose top-2 margin is below this are near ties; any
 /// quantized backend may legitimately pick either token there.
@@ -121,10 +122,25 @@ pub(super) struct Sessions {
     id: KvArenaId,
     group: KvGroupId,
     bindings: Vec<KvLayerBinding>,
+    pages_per_session: u32,
 }
 
 impl Sessions {
+    /// Sessions with the KV storage the model declares in production.
     pub(super) fn new(model: &Lfm2ChatModel) -> Self {
+        let dtype = match super::lfm2_chat_kv_dtype(model.device_kind()) {
+            crate::kv::v2::StateDType::F16 => DType::F16,
+            _ => DType::F32,
+        };
+        Self::with_kv_dtype(model, dtype)
+    }
+
+    pub(super) fn with_kv_dtype(model: &Lfm2ChatModel, dtype: DType) -> Self {
+        Self::sized(model, dtype, PAGES_PER_SESSION)
+    }
+
+    /// `SESSIONS` sessions of `pages_per_session` pages of `PAGE_TOKENS`.
+    pub(super) fn sized(model: &Lfm2ChatModel, dtype: DType, pages_per_session: u32) -> Self {
         let layout = Lfm2StateLayout::from_config(&model.config).unwrap();
         let bindings: Vec<KvLayerBinding> = layout
             .attention_model_layers
@@ -149,9 +165,9 @@ impl Sessions {
             id,
             group,
             page_tokens: PAGE_TOKENS,
-            capacity_pages: PAGES_PER_SESSION * SESSIONS,
+            capacity_pages: pages_per_session * SESSIONS,
             growth: None,
-            dtype: DType::F32,
+            dtype,
             layers: bindings
                 .iter()
                 .map(|binding| KvLayerConfig {
@@ -179,12 +195,14 @@ impl Sessions {
             id,
             group,
             bindings,
+            pages_per_session,
         }
     }
 
     pub(super) fn session(&self, index: u32) -> PhysicalPagedKvCache {
         assert!(index < SESSIONS);
-        let blocks = (index * PAGES_PER_SESSION..(index + 1) * PAGES_PER_SESSION)
+        let pages = self.pages_per_session;
+        let blocks = (index * pages..(index + 1) * pages)
             .map(|block| CacheBlockRef {
                 arena: self.id,
                 group: self.group,
@@ -305,12 +323,18 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
         return;
     }
     let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
-    assert_eq!(model.max_context_tokens().unwrap(), 32_768, "{key}: model-card context");
+    assert_eq!(
+        model.max_context_tokens().unwrap(),
+        32_768,
+        "{key}: model-card context"
+    );
     // Workspace pricing on the real geometry: 6 x 2048 + 3 x 8192 F32 per
     // prefill token; a decode row adds the 65,536-entry logits row.
     assert_eq!(model.prefill_workspace_per_token_bytes().unwrap(), 147_456);
     assert_eq!(
-        model.continuous_decode_batch_workspace_per_row_bytes().unwrap(),
+        model
+            .continuous_decode_batch_workspace_per_row_bytes()
+            .unwrap(),
         147_456 + 65_536 * 4
     );
     for (name, case) in &model_fixture.template_cases {
@@ -420,6 +444,90 @@ fn run_model(profile: &DeviceProfile, key: &str, model_fixture: &FixtureModel, t
     }
 }
 
+/// The production KV storage (F16 on Metal/CUDA) against F32 KV on the same
+/// device: decode 256 greedy tokens with F32 KV, teacher-force them through
+/// F16 KV, and compare each step's argmax and top-8 logits. Non-finite logits
+/// (an F16 overflow of V) fail the finite check inside the forward.
+fn run_kv_dtype_leg(profile: DeviceProfile, max_logit_delta: f32) {
+    const STEPS: usize = 256;
+    let fixture = fixture();
+    for (key, model_fixture) in &fixture.models {
+        let dir = models_dir().join(&model_fixture.folder);
+        if !dir.exists() {
+            eprintln!("skipping {key}: {} is missing", dir.display());
+            continue;
+        }
+        let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
+        let production = Sessions::new(&model);
+        assert_eq!(production.arena.config().dtype, DType::F16);
+        let reference = Sessions::with_kv_dtype(&model, DType::F32);
+        let device = model.device.device.clone();
+        for (index, (name, prompt)) in model_fixture.prompts.iter().enumerate() {
+            let label = format!("{:?}/{key}/{name}", model.device_kind());
+            let ids = &prompt.prompt_ids;
+            let mut f32_state = prefill(&model, ids, reference.session(index as u32), &[]);
+            let mut f16_state = prefill(&model, ids, production.session(index as u32), &[]);
+            let mut f32_logits = f32_state.unconsumed_output.take().unwrap();
+            let mut f16_logits = f16_state.unconsumed_output.take().unwrap();
+            let (mut steps, mut agreed, mut decisive, mut decisive_agreed) = (0, 0, 0, 0);
+            let mut worst = 0f32;
+            for step in 0..STEPS {
+                let expected = row(&f32_logits);
+                let actual = row(&f16_logits);
+                let next = argmax_of(&expected);
+                let mut order: Vec<usize> = (0..expected.len()).collect();
+                order.select_nth_unstable_by(8, |l, r| expected[*r].total_cmp(&expected[*l]));
+                order.truncate(8);
+                order.sort_by(|l, r| expected[*r].total_cmp(&expected[*l]));
+                for id in &order {
+                    worst = worst.max(abs_err(actual[*id], expected[*id]));
+                }
+                steps += 1;
+                let same = argmax_of(&actual) == next;
+                agreed += usize::from(same);
+                if expected[order[0]] - expected[order[1]] >= NEAR_TIE {
+                    decisive += 1;
+                    decisive_agreed += usize::from(same);
+                }
+                if is_eos(next) {
+                    break;
+                }
+                let input = Tensor::from_slice(&[next], (1, 1), &device).unwrap();
+                let position = ids.len() + step;
+                for (state, logits) in [
+                    (&mut f32_state, &mut f32_logits),
+                    (&mut f16_state, &mut f16_logits),
+                ] {
+                    *logits = model
+                        .text_model
+                        .forward_tokens_retained(
+                            &input,
+                            position,
+                            &mut state.physical_kv,
+                            &mut state.shortconv,
+                            true,
+                        )
+                        .unwrap()
+                        .unwrap();
+                }
+            }
+            eprintln!(
+                "{label}: F16 vs F32 KV over {steps} steps: {agreed}/{steps} argmax agree, \
+                 {decisive_agreed}/{decisive} decisive, worst top-8 logit delta {worst:.4}"
+            );
+            assert_eq!(
+                decisive_agreed, decisive,
+                "{label}: a decisive step changed"
+            );
+            assert!(
+                agreed * 100 >= steps * 99,
+                "{label}: argmax agreement below 99%"
+            );
+            assert!(worst <= max_logit_delta, "{label}: logit delta {worst}");
+        }
+    }
+}
+
 fn run_leg(profile: DeviceProfile, tol: Tolerance) {
     let fixture = fixture();
     for (key, model_fixture) in &fixture.models {
@@ -481,4 +589,33 @@ fn lfm25_chat_matches_the_f32_reference_on_cuda() {
             chunked: 1e-2,
         },
     );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_f16_kv_tracks_f32_kv_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    // Measured worst delta 0.015 over 256 Thinking tokens.
+    run_kv_dtype_leg(profile, 0.1);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_f16_kv_tracks_f32_kv_on_cuda() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Cuda).unwrap();
+    if !matches!(profile.device, Device::Cuda(_)) {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    run_kv_dtype_leg(profile, 0.25);
 }

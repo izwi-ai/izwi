@@ -135,7 +135,7 @@ pub(crate) fn lfm2_main_invocation_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
 ) -> Result<InferenceStateContract> {
-    lfm2_main_contract(config, layout, ids, invocation_header)
+    lfm2_main_contract(config, layout, ids, invocation_header, StateDType::F32)
 }
 
 /// Scheduler-owned cache contract for incremental LFM2 chat.
@@ -143,12 +143,20 @@ pub(crate) fn lfm2_main_invocation_contract(
 /// The semantic domains intentionally remain identical to the invocation
 /// contract shared with LFM2.5 Audio. Only their lifetime, placement, and
 /// checkpoint policy change so paged attention and ShortConv advance under one
-/// retained row transaction.
+/// retained row transaction. `kv_dtype` is the paged KV storage; activations
+/// stay F32 and the attention call sites cast to and from it.
 pub(crate) fn lfm2_managed_cache_contract(
     config: &Lfm2BackboneConfig,
+    kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
     let layout = Lfm2StateLayout::from_config(config)?;
-    lfm2_main_contract(config, &layout, Lfm2StateIds::CANONICAL, retained_header)
+    lfm2_main_contract(
+        config,
+        &layout,
+        Lfm2StateIds::CANONICAL,
+        retained_header,
+        kv_dtype,
+    )
 }
 
 fn lfm2_main_contract(
@@ -156,6 +164,7 @@ fn lfm2_main_contract(
     layout: &Lfm2StateLayout,
     ids: Lfm2StateIds,
     header: fn(StateDomainId, StateClock) -> StateDomainHeader,
+    kv_dtype: StateDType,
 ) -> Result<InferenceStateContract> {
     let head_dim = config.embedding_length / config.attention_head_count;
     let query_heads = u32::try_from(config.attention_head_count)
@@ -201,7 +210,7 @@ fn lfm2_main_contract(
             max_tokens: preferred_tokens.max(256),
             multiple_of: 1,
         },
-        accepted_dtypes: vec![StateDType::F32],
+        accepted_dtypes: vec![kv_dtype],
     });
     let hidden = u64::try_from(config.embedding_length)
         .map_err(|_| Error::ModelLoadError("LFM2 hidden width exceeds u64".into()))?;
@@ -417,7 +426,7 @@ mod tests {
 
     #[test]
     fn managed_contract_declares_one_transactional_retained_paged_ring_group() {
-        let contract = lfm2_managed_cache_contract(&config()).unwrap();
+        let contract = lfm2_managed_cache_contract(&config(), StateDType::F32).unwrap();
         assert_eq!(contract.domains.len(), 2);
         assert_eq!(contract.groups.len(), 1);
         assert_eq!(

@@ -546,6 +546,84 @@ fn lfm25_fused_vs_unfused_shortconv_cpu() {
     fused_vs_unfused_shortconv(DeviceProfile::cpu());
 }
 
+/// Decode time with F32 against F16 KV storage, interleaved token by token,
+/// at a short and a `IZWI_BENCH_CONTEXT`-token (default 4,096) context.
+fn kv_dtype_decode(profile: DeviceProfile) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let long = std::env::var("IZWI_BENCH_CONTEXT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4096);
+    let pages = (long + steps() + 64).div_ceil(16) as u32;
+    let f32_sessions = Sessions::sized(&model, DType::F32, pages);
+    let f16_sessions = Sessions::sized(&model, DType::F16, pages);
+    let config = ChatGenerationConfig::default();
+    for context in [32, long] {
+        let prompt: Vec<u32> = (0..context)
+            .map(|i| 1000 + (i as u32 * 7) % 20_000)
+            .collect();
+        let new_state = |sessions: &Sessions| {
+            let mut state = model
+                .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(0))
+                .unwrap();
+            model
+                .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+                .unwrap();
+            model.decode_step(&mut state).unwrap();
+            state
+        };
+        let mut f32_state = new_state(&f32_sessions);
+        let mut f16_state = new_state(&f16_sessions);
+        let (mut f32_time, mut f16_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let steps = steps();
+        for step in 0..steps + 8 {
+            let started = Instant::now();
+            model.decode_step_batch(&mut [&mut f32_state]).unwrap();
+            if step >= 8 {
+                f32_time += started.elapsed();
+            }
+            let started = Instant::now();
+            model.decode_step_batch(&mut [&mut f16_state]).unwrap();
+            if step >= 8 {
+                f16_time += started.elapsed();
+            }
+        }
+        let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+        eprintln!(
+            "{:?} context {context}: F32 KV {:.2} ms/token, F16 KV {:.2} ms/token",
+            model.device_kind(),
+            per(f32_time),
+            per(f16_time)
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_kv_dtype_decode_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        kv_dtype_decode(profile);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF and an NVIDIA GPU"]
+fn lfm25_kv_dtype_decode_cuda() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Cuda).unwrap();
+    if profile.device.is_cuda() {
+        kv_dtype_decode(profile);
+    }
+}
+
 /// Prefill time for a long prompt, one span, so CPU prefill can be split
 /// between matmuls and the ShortConv ring path.
 fn prefill_timing(profile: DeviceProfile, tokens: usize) {

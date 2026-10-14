@@ -6918,8 +6918,11 @@ mod tests {
             shortconv_l_cache: 3,
         };
         let mut contract =
-            crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(&config)
-                .unwrap();
+            crate::models::architectures::lfm2::physical::lfm2_managed_cache_contract(
+                &config,
+                crate::kv::v2::StateDType::F32,
+            )
+            .unwrap();
         let mut attention = None;
         for domain in &mut contract.domains {
             if let StateDomainSpec::PagedAttention(spec) = domain {
@@ -6944,7 +6947,7 @@ mod tests {
     }
 
     /// LFM2.5 chat on CUDA fits one 32K context (6 attention layers x 8 KV
-    /// heads x 64 x K/V x F32 = 24,576 B/token, 64-token pages) instead of
+    /// heads x 64 x K/V x F16 = 12,288 B/token, 64-token pages) instead of
     /// growing a 128K arena: the whole context fits a small GPU after the
     /// context reserve, and a tighter budget yields a smaller reach rather
     /// than an overcommitted arena.
@@ -6952,12 +6955,12 @@ mod tests {
     fn lfm25_chat_cuda_fit_is_bounded_by_one_context() {
         let paged = [CudaContiguousPagedGeometry {
             page_tokens: 64,
-            bytes_per_page: 64 * 24_576,
+            bytes_per_page: 64 * 12_288,
         }];
         // Ring state for 95 retained + 8 staged rows (10 layers x 3 x 2048 x F32).
         let fixed = 103 * 245_760;
         let one_context = cuda_resident_required_bytes(32_768, &paged, fixed).unwrap();
-        assert_eq!(one_context, 805_306_368 + fixed);
+        assert_eq!(one_context, 402_653_184 + fixed);
         // A 6 GiB GPU after ~1.4 GB of weights and a 1 GiB context reserve.
         let roomy = 6 * 1024 * 1024 * 1024 - 1_400_000_000 - 1024 * 1024 * 1024;
         assert_eq!(

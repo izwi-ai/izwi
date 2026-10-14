@@ -882,9 +882,15 @@ impl AttentionLayer {
             ));
         }
         let (queries, keys, values) = self.project_qkv(hidden_states, index_pos)?;
-        let queries = queries.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let keys = keys.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let values = values.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let kv_dtype = cache.arena().config().dtype;
+        let [queries, keys, values] = [queries, keys, values].map(|tensor| {
+            tensor
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .to_dtype(kv_dtype)
+        });
+        let (queries, keys, values) = (queries?, keys?, values?);
         let softmax_scale = (1.0f64 / (self.head_dim as f64).sqrt()) as f32;
         let output = match self.sliding_window {
             Some(window_tokens) => cache.write_and_attend_with_window(
@@ -905,6 +911,7 @@ impl AttentionLayer {
                 softmax_scale,
             )?,
         };
+        let output = output.to_dtype(hidden_states.dtype())?;
         diagnostics::check_layer(
             &output,
             "paged attention output",
@@ -1013,6 +1020,11 @@ impl AttentionLayer {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
+        // The arena may store KV narrower than the F32 activations.
+        let kv_dtype = first.arena().config().dtype;
+        let queries = queries.to_dtype(kv_dtype)?;
+        let keys = keys.to_dtype(kv_dtype)?;
+        let values = values.to_dtype(kv_dtype)?;
         let binding = first.layer_binding(self.physical_layer)?;
         let completion = first.arena().write_slots(
             binding,
@@ -1034,6 +1046,7 @@ impl AttentionLayer {
             )
         })?;
         completions.collect(completion)?;
+        let output = output.to_dtype(hidden_states.dtype())?;
         diagnostics::check_batch_layer(
             &output,
             "paged attention output",

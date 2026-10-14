@@ -767,13 +767,16 @@ impl Lfm2ChatModel {
         // the next tokens are read back: by then the device has drained, so
         // the whole step costs one synchronization.
         let (logits, pending) = {
-            let shortconv = states.iter().map(|state| &state.shortconv).collect::<Vec<_>>();
-            let caches = states.iter().map(|state| &state.physical_kv).collect::<Vec<_>>();
+            let shortconv = states
+                .iter()
+                .map(|state| &state.shortconv)
+                .collect::<Vec<_>>();
+            let caches = states
+                .iter()
+                .map(|state| &state.physical_kv)
+                .collect::<Vec<_>>();
             self.text_model.forward_token_ids_retained_batch_deferred(
-                &tokens,
-                &positions,
-                &shortconv,
-                &caches,
+                &tokens, &positions, &shortconv, &caches,
             )?
         };
         let next_tokens = match self.select_batch_tokens(states, &logits) {
@@ -864,7 +867,11 @@ impl Lfm2ChatModel {
     /// The text between two special tokens is tokenized as one string, as
     /// the template's rendering is, so a content's leading characters merge
     /// with its role header exactly as they would there.
-    fn build_prompt(&self, messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<Vec<u32>> {
+    fn build_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one message".to_string(),
@@ -930,14 +937,25 @@ impl Lfm2ChatModel {
         ids.extend_from_slice(&self.prompt_scaffold.newline);
         Ok(())
     }
-
 }
 
 impl InferenceStateContractProvider for Lfm2ChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         Ok(InferenceStateCapability::Managed(
-            lfm2_managed_cache_contract(&self.config)?,
+            lfm2_managed_cache_contract(&self.config, lfm2_chat_kv_dtype(self.device_kind()))?,
         ))
+    }
+}
+
+/// Paged KV storage for LFM2 chat. Metal and CUDA store F16, which halves
+/// the KV bytes and their read bandwidth; queries and the attention output
+/// are cast at the call sites and scores accumulate in F32 in every kernel.
+/// CPU keeps F32: its decode is bound by the weights, and F16 would add a
+/// conversion on each read.
+pub(crate) fn lfm2_chat_kv_dtype(backend: BackendKind) -> crate::kv::v2::StateDType {
+    match backend {
+        BackendKind::Cpu => crate::kv::v2::StateDType::F32,
+        BackendKind::Metal | BackendKind::Cuda => crate::kv::v2::StateDType::F16,
     }
 }
 
