@@ -9,6 +9,7 @@ Usage: scripts/ci/check-backend-truth.sh <command>
 Commands:
   hygiene       Run repository format, Clippy, all-target, diff, and shell gates
   cargo-cpu     Run CPU-focused cargo checks and core scheduler regressions
+  cargo-serving Run the serving crates' tests and the gateway process suites
   cargo-fleet-stores
                 Run fleet/durable store execution tests against real PostgreSQL
                 (requires IZWI_TEST_FLEET_PG_URL at a disposable database)
@@ -366,9 +367,27 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
     cargo test --locked -p izwi-server --lib
-    cargo test --locked -p izwi-server --test fleet_rig -- --test-threads=1
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
+}
+
+run_cargo_serving() {
+    require_command cargo
+
+    # Every serving crate's unit and integration tests (the client's contract
+    # tests need its mock worker), plus the gateway process suites. The
+    # fleet rig's gateway pairs share one coordination database per test, so
+    # it runs serially.
+    cargo test --locked --no-fail-fast \
+        -p izwi-serving-protocol \
+        -p izwi-serving-client \
+        -p izwi-serving-supervisor \
+        -p izwi-serving-worker \
+        --features izwi-serving-client/mock-worker
+    cargo test --locked --no-fail-fast -p izwi-server \
+        --test gateway_only_process \
+        --test rollout_gateway
+    cargo test --locked -p izwi-server --test fleet_rig -- --test-threads=1
 }
 
 run_cargo_fleet_stores() {
@@ -633,6 +652,9 @@ main() {
             ;;
         cargo-cpu)
             run_cargo_cpu
+            ;;
+        cargo-serving)
+            run_cargo_serving
             ;;
         cargo-fleet-stores)
             run_cargo_fleet_stores

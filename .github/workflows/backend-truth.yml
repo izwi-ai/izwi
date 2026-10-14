@@ -101,6 +101,64 @@ jobs:
       - name: Run CPU backend validation
         run: scripts/ci/check-backend-truth.sh cargo-cpu
 
+  cargo-serving:
+    name: Cargo Validation (Serving)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libssl-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run serving crate and gateway process tests
+        run: scripts/ci/check-backend-truth.sh cargo-serving
+
+  serving-windows:
+    name: Serving Compile (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      # release.yml ships the supervisor and worker for Windows. The
+      # workspace rustc-wrapper is a python script for the macOS linker that
+      # Windows cannot execute, so this check runs without it.
+      - name: Check serving crates for Windows
+        shell: bash
+        run: >-
+          cargo --config "build.rustc-wrapper=''" check --locked
+          -p izwi-serving-supervisor
+          -p izwi-serving-worker
+          -p izwi-serving-protocol
+          -p izwi-serving-client
+
   fleet-stores:
     name: Fleet Store Validation (PostgreSQL)
     runs-on: ubuntu-latest
