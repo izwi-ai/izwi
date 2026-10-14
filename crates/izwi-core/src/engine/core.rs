@@ -566,6 +566,30 @@ fn merge_optional_phase_ms(target: &mut Option<f64>, value: Option<f64>) {
     }
 }
 
+/// A completed chat row reports `MaxTokens` when it spent its whole budget.
+///
+/// The output processor maps every completed disposition to `StopToken`, so
+/// a reply cut off at `max_tokens` would read as a natural stop. Every chat
+/// family counts only emitted tokens (stop tokens are never counted), and the
+/// request's `max_tokens` is already bounded by the remaining context, so a
+/// row whose count reached the budget was cut off.
+fn chat_budget_finish_reason(
+    reason: Option<OutputFinishReason>,
+    task_type: super::types::TaskType,
+    max_tokens: usize,
+    generated: usize,
+) -> Option<OutputFinishReason> {
+    if reason == Some(OutputFinishReason::StopToken)
+        && task_type == super::types::TaskType::Chat
+        && max_tokens > 0
+        && generated >= max_tokens
+    {
+        Some(OutputFinishReason::MaxTokens)
+    } else {
+        reason
+    }
+}
+
 /// The engine core - manages the inference loop.
 pub struct EngineCore {
     /// Configuration
@@ -5126,6 +5150,14 @@ impl EngineCore {
                     engine_output.num_tokens = resolved_total;
                     engine_output.token_stats.generated_tokens = resolved_total;
                 }
+                if let Some(request) = self.requests.get(&request_id) {
+                    engine_output.finish_reason = chat_budget_finish_reason(
+                        engine_output.finish_reason,
+                        request.task_type,
+                        request.params.max_tokens,
+                        engine_output.num_tokens,
+                    );
+                }
             }
             if Self::has_user_visible_output(&exec_output) {
                 if let Some(phase) = self.request_phase_timings.get_mut(&request_id) {
@@ -7148,6 +7180,31 @@ mod tests {
             .expect("model instance");
         bind_managed_test_state(core, &mut request, model_instance);
         request
+    }
+
+    #[test]
+    fn chat_rows_that_spend_their_budget_report_max_tokens() {
+        use super::super::types::FinishReason;
+        let stop = Some(FinishReason::StopToken);
+        assert_eq!(
+            chat_budget_finish_reason(stop, TaskType::Chat, 128, 128),
+            Some(FinishReason::MaxTokens)
+        );
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 128, 127), stop);
+        // Only chat budgets count tokens; other tasks and terminal kinds keep
+        // their reason.
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::TTS, 8, 8), stop);
+        for reason in [
+            Some(FinishReason::Aborted),
+            Some(FinishReason::Error),
+            None,
+        ] {
+            assert_eq!(
+                chat_budget_finish_reason(reason, TaskType::Chat, 8, 8),
+                reason
+            );
+        }
+        assert_eq!(chat_budget_finish_reason(stop, TaskType::Chat, 0, 0), stop);
     }
 
     #[test]
