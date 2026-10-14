@@ -246,9 +246,6 @@ async fn chat(client: &reqwest::Client, base: &str) -> (u16, serde_json::Value) 
 /// and fails spuriously on a loaded runner. Bounding the retries keeps the lane
 /// deterministic without hiding a genuine failure: a contract that never holds
 /// still panics after the window.
-// Only the `db-postgres`-gated lane drives this helper; the CPU-only build of
-// this file still compiles it.
-#[allow(dead_code)]
 async fn chat_until<F>(
     client: &reqwest::Client,
     base: &str,
@@ -273,6 +270,27 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("{what} never converged; last response: {last}");
+}
+
+/// Claim a worker's single fleet credit for the rig. A gateway releases its
+/// own dispatch claims asynchronously, so the credit may still be held for a
+/// moment after the request that took it completed; retry until it frees.
+async fn claim_until(claims: &BatchRuntimeStore, worker_id: &str, ttl_ms: u64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let claim = claims
+            .try_claim_fleet_capacity(worker_id, "mock-incarnation-1", "gateway-rig", 1, ttl_ms)
+            .await
+            .expect("rig claim");
+        if let Some(claim) = claim {
+            return claim;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{worker_id}'s only credit never became free for the rig"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn response_marker(body: &serde_json::Value) -> String {
@@ -592,28 +610,22 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
     wait_ready(&gateway).await;
 
     let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
-    let held = claims
-        .try_claim_fleet_capacity(
-            WORKER_ONE_ID,
-            "mock-incarnation-1",
-            "gateway-rig",
-            1,
-            60_000,
-        )
-        .await
-        .expect("rig claim")
-        .expect("the rig holds worker one's only credit");
-    // Let the gateway's poller refresh its fleet snapshot.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held = claim_until(&claims, WORKER_ONE_ID, 60_000).await;
 
+    // The gateway learns the rig's claim on its poller cadence, so converge
+    // on the steered dispatch first. From then on the claim stays visible, so
+    // every served request must avoid the claimed worker; only a shed (the
+    // gateway's own claim on the peer not yet released) may be retried.
     let client = reqwest::Client::new();
-    // Each dispatch to a capacity-1 worker needs more than one poll interval
-    // of spacing so the gateway's cached credits refresh between requests —
-    // otherwise a stale zero-credit snapshot sheds a 503.
+    chat_until(
+        &client,
+        &gateway.base,
+        "steering away from a claimed worker",
+        |body| response_marker(body).contains(WORKER_TWO_MARKER),
+    )
+    .await;
     for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let (status, body) = chat(&client, &gateway.base).await;
-        assert_eq!(status, 200, "steered dispatch failed: {body}");
+        let body = chat_until(&client, &gateway.base, "steered dispatch", |_| true).await;
         assert!(
             response_marker(&body).contains(WORKER_TWO_MARKER),
             "a claimed worker must be steered away from, got {:?}",
@@ -625,25 +637,16 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
         .release_fleet_capacity(&held, "gateway-rig")
         .await
         .expect("rig release");
-    // Let the gateway's async claim releases from the first leg land before
-    // claiming the peer worker's single credit.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let held_two = claims
-        .try_claim_fleet_capacity(
-            WORKER_TWO_ID,
-            "mock-incarnation-1",
-            "gateway-rig",
-            1,
-            60_000,
-        )
-        .await
-        .expect("rig claim")
-        .expect("the rig holds worker two's only credit");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held_two = claim_until(&claims, WORKER_TWO_ID, 60_000).await;
+    chat_until(
+        &client,
+        &gateway.base,
+        "dispatch to released capacity",
+        |body| response_marker(body).contains(WORKER_ONE_MARKER),
+    )
+    .await;
     for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let (status, body) = chat(&client, &gateway.base).await;
-        assert_eq!(status, 200, "post-release dispatch failed: {body}");
+        let body = chat_until(&client, &gateway.base, "post-release dispatch", |_| true).await;
         assert!(
             response_marker(&body).contains(WORKER_ONE_MARKER),
             "capacity freed by a release must be dispatchable again, got {:?}",
@@ -689,46 +692,44 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
     wait_ready(&gateway_b).await;
 
     // A gateway that dies without releasing leaves exactly this store state:
-    // a live claim under its own identity. Forge it with an 800ms TTL so it
-    // is live for the steering assertion and expired for the recovery one.
+    // a live claim under its own identity. Forge it with a TTL long enough
+    // for the survivor's poller to observe it on a loaded runner; nothing
+    // ever releases it, so only TTL expiry can free worker one again.
     let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
     let _dead_claim = claims
-        .try_claim_fleet_capacity(WORKER_ONE_ID, "mock-incarnation-1", "gateway-a", 1, 800)
+        .try_claim_fleet_capacity(WORKER_ONE_ID, "mock-incarnation-1", "gateway-a", 1, 3_000)
         .await
         .expect("forged claim")
         .expect("the crashed gateway's claim holds");
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let client = reqwest::Client::new();
-    let (status, body) = chat(&client, &gateway_b.base).await;
-    assert_eq!(status, 200);
-    assert!(
-        response_marker(&body).contains(WORKER_TWO_MARKER),
-        "dispatch must avoid the worker shadowed by the dead gateway's claim, got {:?}",
-        response_marker(&body)
+    chat_until(
+        &client,
+        &gateway_b.base,
+        "steering away from the dead gateway's claim",
+        |body| response_marker(body).contains(WORKER_TWO_MARKER),
+    )
+    .await;
+    assert_eq!(
+        claims
+            .count_live_fleet_claims(WORKER_ONE_ID)
+            .await
+            .expect("live claims"),
+        1,
+        "the steered dispatch must be observed while the dead gateway's claim is still live"
     );
 
-    // No release protocol exists: TTL expiry is the crash recovery.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let _shadow_two = claims
-        .try_claim_fleet_capacity(
-            WORKER_TWO_ID,
-            "mock-incarnation-1",
-            "gateway-rig",
-            1,
-            60_000,
-        )
-        .await
-        .expect("rig claim")
-        .expect("the rig now shadows worker two");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let (status, body) = chat(&client, &gateway_b.base).await;
-    assert_eq!(status, 200);
-    assert!(
-        response_marker(&body).contains(WORKER_ONE_MARKER),
-        "capacity freed by TTL expiry must be dispatchable without any release protocol, got {:?}",
-        response_marker(&body)
-    );
+    // No release protocol exists: TTL expiry is the crash recovery. With the
+    // rig shadowing worker two, worker one can only serve again once the
+    // dead claim expires.
+    let _shadow_two = claim_until(&claims, WORKER_TWO_ID, 60_000).await;
+    chat_until(
+        &client,
+        &gateway_b.base,
+        "capacity freed by TTL expiry without any release protocol",
+        |body| response_marker(body).contains(WORKER_ONE_MARKER),
+    )
+    .await;
 
     // With one gateway dead, the survivor keeps serving through the fleet.
     gateway_a.kill();
@@ -736,9 +737,13 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
         .release_gateway_claims("gateway-rig")
         .await
         .expect("rig releases its shadow claim");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let (status, body) = chat(&client, &gateway_b.base).await;
-    assert_eq!(status, 200, "the surviving gateway must keep serving");
+    let body = chat_until(
+        &client,
+        &gateway_b.base,
+        "the surviving gateway must keep serving",
+        |_| true,
+    )
+    .await;
     let marker = response_marker(&body);
     assert!(
         marker.contains(WORKER_ONE_MARKER) || marker.contains(WORKER_TWO_MARKER),

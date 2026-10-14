@@ -175,10 +175,29 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
             stderr: stderr_buffer,
             stdout: stdout_buffer,
         };
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        if matches!(gateway.child.try_wait(), Ok(Some(_)))
-            && gateway.stderr_tail().contains("Address already in use")
-        {
+        // The bind-learn-release port probe can lose its port before the
+        // gateway binds it. Poll until the gateway is ready or has died on
+        // that race, instead of checking once after a fixed wait that a slow
+        // boot outlasts.
+        let client = reqwest::Client::new();
+        let ready_url = format!("{}/readyz", gateway.base);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut address_in_use = false;
+        while Instant::now() < deadline {
+            if matches!(gateway.child.try_wait(), Ok(Some(_)))
+                && gateway.stderr_tail().contains("Address already in use")
+            {
+                address_in_use = true;
+                break;
+            }
+            if let Ok(response) = client.get(&ready_url).send().await {
+                if response.status().is_success() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if address_in_use {
             assert!(attempt < 2, "gateway spawn kept losing its port race");
             continue;
         }
