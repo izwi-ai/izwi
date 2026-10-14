@@ -561,6 +561,26 @@ fn request_envelope_resources(
     Ok(resources)
 }
 
+/// The short refusal of a load whose per-slot request envelope does not
+/// fit beside its weights: what the envelope needs in the load's domain and
+/// what planning has left (a 503; the terms are logged by the caller).
+fn request_envelope_shortfall(
+    variant: ModelVariant,
+    backend: BackendKind,
+    envelope: super::asr_envelope::AsrRequestEnvelope,
+    available_bytes: u64,
+) -> Result<Error> {
+    let need = match backend {
+        BackendKind::Cuda => envelope.accelerator_bytes,
+        BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+    };
+    Ok(Error::Overloaded(capacity_shortfall_reason(
+        format_args!("not enough memory to run {variant} requests"),
+        need,
+        available_bytes,
+    )))
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1985,13 +2005,35 @@ impl ModelLifecycleController {
                 },
             };
         let resources = request_envelope_resources(backend, envelope)?;
-        let lease = self.coordinator.resource_authority().reserve(
+        let authority = self.coordinator.resource_authority();
+        let lease = match authority.reserve(
             ReservationOwner::new(
                 ReservationClass::Model,
                 format!("{variant}:{label}-request-envelope"),
             ),
             resources,
-        )?;
+        ) {
+            Ok(lease) => lease,
+            Err(Error::Overloaded(detail)) => {
+                let available = match authority.planning_headroom_bytes(backend)? {
+                    ResourceAmount::Known(bytes) => bytes,
+                    ResourceAmount::Unknown => 0,
+                };
+                tracing::warn!(
+                    model = %variant,
+                    request_slots = slots,
+                    host_bytes = envelope.host_bytes,
+                    accelerator_bytes = envelope.accelerator_bytes,
+                    planning_headroom = available,
+                    %detail,
+                    "The {label} request envelope does not fit beside the loaded weights"
+                );
+                return Err(request_envelope_shortfall(
+                    variant, backend, envelope, available,
+                )?);
+            }
+            Err(error) => return Err(error),
+        };
         info!(
             model = %variant,
             request_slots = slots,
@@ -6575,6 +6617,88 @@ mod tests {
         fn observed_device_usage_bytes(&self) -> Option<u64> {
             Some(self.observed)
         }
+    }
+
+    /// The final Metal run's Qwen3-TTS-0.6B-Base load (about 11.4 GB of
+    /// planning capacity, 10 GB live, 2.67 GB of weights) reserves its one
+    /// request slot's envelope: CustomVoice's live envelope plus a 30 s
+    /// reference encode on the shipped encoder. The reference term was
+    /// 47 GB and refused the load with the generic capacity error; a
+    /// refusal now names what the envelope needs and what is available.
+    #[test]
+    fn qwen_base_request_envelope_fits_beside_its_weights() {
+        use crate::models::architectures::qwen3::tts::speech_tokenizer::{
+            reference_encode_workspace_upper_bound_bytes, EncoderConfig,
+            QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON,
+        };
+        let encoder: EncoderConfig =
+            serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        let reference =
+            reference_encode_workspace_upper_bound_bytes(&encoder, 24_000, 1_920, 30, 4).unwrap();
+        // CustomVoice's envelope from the same run (no reference encode).
+        let envelope = super::super::asr_envelope::AsrRequestEnvelope {
+            host_bytes: 46_377_456,
+            accelerator_bytes: 471_076_352 + reference,
+        };
+        /// Metal as the server builds it: a configured planning budget
+        /// beside a live sample.
+        #[derive(Debug)]
+        struct BudgetedUnifiedProvider;
+        impl PhysicalCapacityProvider for BudgetedUnifiedProvider {
+            fn snapshot(&self) -> PhysicalCapacitySnapshot {
+                let unified = |bytes| ResourceVector {
+                    unified_bytes: ResourceAmount::Known(bytes),
+                    ..ResourceVector::zero()
+                };
+                PhysicalCapacitySnapshot {
+                    capacity: unified(16_000_000_000),
+                    available: unified(10_000_000_000),
+                    source: CapacitySource::MetalWorkingSet,
+                }
+            }
+            fn configured_budget(&self) -> Option<ResourceVector> {
+                Some(ResourceVector {
+                    host_bytes: ResourceAmount::Known(11_400_000_000),
+                    unified_bytes: ResourceAmount::Known(11_400_000_000),
+                    ..ResourceVector::zero()
+                })
+            }
+            fn observed_device_usage_bytes(&self) -> Option<u64> {
+                Some(2_668_085_248)
+            }
+        }
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(BudgetedUnifiedProvider),
+        ));
+        let weights = ResourceVector {
+            unified_bytes: ResourceAmount::Known(2_667_798_788),
+            ..ResourceVector::zero()
+        };
+        let _weights = authority
+            .reserve_with_initial_materialized(
+                ReservationOwner::new(ReservationClass::Model, "weights"),
+                weights,
+                weights,
+            )
+            .unwrap();
+        authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "envelope"),
+                super::request_envelope_resources(BackendKind::Metal, envelope).unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("reference {reference} bytes: {error}"));
+
+        let refusal = super::request_envelope_shortfall(
+            ModelVariant::Qwen3Tts12Hz06BBase,
+            BackendKind::Metal,
+            envelope,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(matches!(refusal, crate::error::Error::Overloaded(_)));
+        let message = refusal.to_string();
+        assert!(message.contains("needs "), "{message}");
+        assert!(message.contains("1.00 GB available"), "{message}");
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;

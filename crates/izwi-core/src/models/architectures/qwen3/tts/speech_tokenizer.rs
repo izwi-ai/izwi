@@ -1885,67 +1885,13 @@ impl SpeechTokenizerDecoder {
         let encoder = self.encoder.as_ref().ok_or_else(|| {
             Error::ModelError("speech-tokenizer reference encoder is unavailable".into())
         })?;
-        let cfg = &encoder.config;
-        let samples = self
-            .input_sample_rate
-            .checked_mul(max_seconds)
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference sample overflow".into())
-            })?;
-        let frames = ceil_div(samples, self.encode_downsample_rate.max(1));
-        let u64_value = |value: usize, label: &str| {
-            u64::try_from(value).map_err(|_| {
-                Error::Overloaded(format!("speech-tokenizer reference {label} exceeds u64"))
-            })
-        };
-        let mul = |left: u64, right: u64| {
-            left.checked_mul(right).ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
-            })
-        };
-        let add = |left: u64, right: u64| {
-            left.checked_add(right).ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
-            })
-        };
-        let samples = u64_value(samples, "samples")?;
-        let frames = u64_value(frames, "frames")?;
-        let conv_width = [cfg.num_filters, cfg.hidden_size, cfg.intermediate_size]
-            .into_iter()
-            .max()
-            .unwrap_or(1);
-        let convolution = mul(mul(samples, u64_value(conv_width, "conv width")?)?, 8)?;
-        let attention = mul(
-            mul(u64_value(cfg.num_attention_heads, "head count")?, frames)?,
-            frames,
-        )?;
-        let transformer_width = cfg
-            .hidden_size
-            .checked_mul(8)
-            .and_then(|value| {
-                cfg.intermediate_size
-                    .checked_mul(3)
-                    .and_then(|ffn| value.checked_add(ffn))
-            })
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference transformer overflow".into())
-            })?;
-        let transformer = mul(frames, u64_value(transformer_width, "transformer width")?)?;
-        let quantizer_width = cfg
-            .codebook_size
-            .checked_add(
-                cfg.vector_quantization_hidden_dimension
-                    .checked_mul(4)
-                    .ok_or_else(|| {
-                        Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
-                    })?,
-            )
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
-            })?;
-        let quantizer = mul(frames, u64_value(quantizer_width, "quantizer width")?)?;
-        let elements = add(add(convolution, attention)?, add(transformer, quantizer)?)?;
-        mul(elements, u64_value(element_bytes, "dtype width")?)
+        reference_encode_workspace_upper_bound_bytes(
+            &encoder.config,
+            self.input_sample_rate,
+            self.encode_downsample_rate,
+            max_seconds,
+            element_bytes,
+        )
     }
 
     /// Conservative backend-temporary peak for a terminal codec/vocoder pass
@@ -2376,6 +2322,73 @@ fn causal_mask(
         .map_err(Error::from)
 }
 
+/// Backend temporaries of one reference encode of `max_seconds` of audio,
+/// following [`SpeechTokenizerEncoderNet`] and the encoder transformer: the
+/// conv stack's largest stage (its input, ELU, padded copy, the conv's
+/// im2col of `kernel x channels x length` and its output live together),
+/// the transformer at the conv stack's output rate, and the quantizer at
+/// the codec frame rate. Each downsampling stage doubles the channels and
+/// divides the length by its ratio (at least 2), so the full-rate stage
+/// with `num_filters` channels dominates. The previous bound charged every
+/// sample at the widest transformer width (`intermediate_size`) eight
+/// times: 47 GB for 30 s on Qwen3-TTS-0.6B-Base, which refused the load.
+pub(crate) fn reference_encode_workspace_upper_bound_bytes(
+    cfg: &EncoderConfig,
+    input_sample_rate: usize,
+    encode_downsample_rate: usize,
+    max_seconds: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer reference workspace overflow".into());
+    let mul = |left: usize, right: usize| left.checked_mul(right).ok_or_else(overflow);
+    let samples = mul(input_sample_rate, max_seconds)?;
+    // First conv: input, padded input, im2col and output.
+    let mut peak = mul(
+        mul(cfg.audio_channels.max(1), samples)?,
+        cfg.kernel_size.saturating_add(2),
+    )?
+    .checked_add(mul(cfg.num_filters, samples)?)
+    .ok_or_else(overflow)?;
+    let mut channels = cfg.num_filters.max(1);
+    let mut length = samples;
+    for &ratio in cfg.upsampling_ratios.iter().rev() {
+        let activation = mul(channels, length)?;
+        // Residual units: input, ELU, padded copy, conv output and sum
+        // (five activations) beside the widest unit's im2col.
+        let residual = mul(activation, cfg.residual_kernel_size.saturating_add(5))?;
+        // Downsampling conv (kernel 2 x ratio, stride ratio): ELU, padded
+        // copy and input, an im2col of 2 activations, output of 2/ratio.
+        let downsample = mul(activation, 6)?;
+        peak = peak.max(residual).max(downsample);
+        channels = mul(channels, 2)?;
+        length = ceil_div(length, ratio.max(1));
+    }
+    let activation = mul(channels, length)?;
+    peak = peak.max(
+        mul(activation, cfg.last_kernel_size.saturating_add(3))?
+            .checked_add(mul(cfg.hidden_size, length)?)
+            .ok_or_else(overflow)?,
+    );
+    // Encoder transformer at the conv output rate: attention scores and
+    // their softmax, plus the layer activations.
+    let attention = mul(mul(mul(cfg.num_attention_heads, length)?, length)?, 2)?;
+    let transformer_width = mul(cfg.hidden_size, 8)?
+        .checked_add(mul(cfg.intermediate_size, 3)?)
+        .ok_or_else(overflow)?;
+    let transformer = mul(length, transformer_width)?;
+    let frames = ceil_div(samples, encode_downsample_rate.max(1));
+    let quantizer_width = cfg
+        .codebook_size
+        .checked_add(mul(cfg.vector_quantization_hidden_dimension, 4)?)
+        .ok_or_else(overflow)?;
+    let quantizer = mul(frames, quantizer_width)?;
+    let elements = [peak, attention, transformer, quantizer]
+        .into_iter()
+        .try_fold(0usize, |total, part| total.checked_add(part))
+        .ok_or_else(overflow)?;
+    u64::try_from(mul(elements, element_bytes)?).map_err(|_| overflow())
+}
+
 fn ceil_div(n: usize, d: usize) -> usize {
     if d == 0 {
         return 0;
@@ -2448,9 +2461,42 @@ fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<
     Ok(out)
 }
 
+/// The encoder of the Qwen3-TTS-12Hz speech tokenizer as shipped (0.6B and
+/// 1.7B Base share it): `speech_tokenizer/config.json` `encoder_config`.
+#[cfg(test)]
+pub(crate) const QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON: &str = r#"{"_frame_rate": 12.5,
+    "attention_bias": false, "audio_channels": 1, "codebook_dim": 256,
+    "codebook_size": 2048, "compress": 2, "dilation_growth_rate": 2, "head_dim": 64,
+    "hidden_size": 512, "intermediate_size": 2048, "kernel_size": 7, "last_kernel_size": 3,
+    "layer_scale_initial_scale": 0.01, "max_position_embeddings": 8000, "norm_eps": 1e-05,
+    "num_attention_heads": 8, "num_filters": 64, "num_hidden_layers": 8,
+    "num_key_value_heads": 8, "num_quantizers": 32, "num_residual_layers": 1,
+    "num_semantic_quantizers": 1, "pad_mode": "constant", "residual_kernel_size": 3,
+    "rope_theta": 10000.0, "sampling_rate": 24000, "sliding_window": 250,
+    "upsampling_ratios": [8, 6, 5, 4], "use_causal_conv": true, "use_conv_shortcut": false,
+    "vector_quantization_hidden_dimension": 256}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 30 s reference on the shipped encoder: the full-rate residual
+    /// unit (64 channels x 720,000 samples, five activations beside a
+    /// kernel-3 im2col) dominates, about 1.5 GB of F32 temporaries. The old
+    /// bound charged every sample at the 2,048-wide transformer width eight
+    /// times, 47 GB.
+    #[test]
+    fn reference_encode_bound_follows_the_shipped_encoder() {
+        let cfg: EncoderConfig = serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        let bytes =
+            reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 30, 4).unwrap();
+        let full_rate_activation = 64u64 * 720_000 * 4;
+        assert!(bytes >= full_rate_activation * 8, "{bytes}");
+        assert!(bytes < 2_000_000_000, "{bytes}");
+        // Shorter references cost proportionally less.
+        let ten = reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 10, 4).unwrap();
+        assert!(ten * 2 < bytes);
+    }
 
     #[test]
     fn normalized_codec_indices_wrap_and_pad_tokens() {

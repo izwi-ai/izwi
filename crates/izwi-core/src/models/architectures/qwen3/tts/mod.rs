@@ -9,7 +9,7 @@ mod predictor;
 mod reference_cache;
 mod rope;
 mod speaker_encoder;
-mod speech_tokenizer;
+pub(crate) mod speech_tokenizer;
 
 use speaker_encoder::SpeakerEncoder;
 mod talker;
@@ -106,6 +106,10 @@ pub(crate) fn thread_qwen3_tts_host_readbacks() -> u64 {
 const NEWLINE_TOKEN_ID: u32 = 198;
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
+/// The longest reference audio a request may carry (saved voices and
+/// inline references share the limit), which prices its encode.
+const MAX_REFERENCE_AUDIO_SECS: usize =
+    crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS as usize;
 const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 
 fn validate_qwen3_tts_tensor_state_shapes(
@@ -2222,7 +2226,7 @@ impl Qwen3TtsModel {
                 .checked_add(
                     self.speech_tokenizer
                         .reference_encode_temporary_upper_bound_bytes(
-                            30,
+                            MAX_REFERENCE_AUDIO_SECS,
                             self.speech_tokenizer_dtype.size_in_bytes(),
                         )?,
                 )
@@ -2255,6 +2259,26 @@ impl Qwen3TtsModel {
             .max(decode_host)
             .checked_add(output)
             .ok_or_else(|| Error::Overloaded("Qwen3-TTS request envelope overflow".into()))?;
+        let reference_accelerator = if voice_clone {
+            self.speech_tokenizer
+                .reference_encode_temporary_upper_bound_bytes(
+                    MAX_REFERENCE_AUDIO_SECS,
+                    self.speech_tokenizer_dtype.size_in_bytes(),
+                )?
+        } else {
+            0
+        };
+        tracing::info!(
+            prompt_tokens = prompt,
+            frames,
+            prefill_host,
+            prefill_accelerator,
+            reference_accelerator,
+            decode_host,
+            decode_accelerator,
+            output_host = output,
+            "Qwen3-TTS request envelope terms (prefill includes the reference encode)"
+        );
         Ok((host, prefill_accelerator.max(decode_accelerator)))
     }
 
