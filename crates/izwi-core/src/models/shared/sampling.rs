@@ -550,21 +550,9 @@ fn sample_from_host_values<R: GrammarRng>(
             *value /= temperature;
         }
     }
-    let mut candidates = values
-        .iter()
-        .enumerate()
-        .filter_map(|(index, value)| value.is_finite().then_some(index))
-        .collect::<Vec<_>>();
+    let candidates = ranked_candidates(&values, config.top_k);
     if candidates.is_empty() {
         return finite_argmax(&values);
-    }
-    candidates.sort_by(|left, right| {
-        values[*right]
-            .partial_cmp(&values[*left])
-            .unwrap_or(Ordering::Equal)
-    });
-    if config.top_k > 0 {
-        candidates.truncate(config.top_k.min(candidates.len()));
     }
     let max_logit = candidates
         .iter()
@@ -617,6 +605,31 @@ fn sample_from_host_values<R: GrammarRng>(
             u32::try_from(index)
                 .map_err(|_| Error::InferenceError("sampled token exceeds u32".into()))
         })
+}
+
+/// Finite candidates by value descending, ties by index ascending (the order
+/// a stable sort of the index-ordered candidates gives), cut to `top_k` when
+/// it is non-zero. The comparison is total, so selecting the top-k before
+/// sorting returns exactly the full sort's prefix without sorting the whole
+/// vocabulary.
+fn ranked_candidates(values: &[f32], top_k: usize) -> Vec<usize> {
+    let mut candidates = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.is_finite().then_some(index))
+        .collect::<Vec<_>>();
+    let by_value = |left: &usize, right: &usize| {
+        values[*right]
+            .partial_cmp(&values[*left])
+            .unwrap_or(Ordering::Equal)
+            .then(left.cmp(right))
+    };
+    if top_k > 0 && top_k < candidates.len() {
+        candidates.select_nth_unstable_by(top_k - 1, by_value);
+        candidates.truncate(top_k);
+    }
+    candidates.sort_by(by_value);
+    candidates
 }
 
 fn chat_logits_row(logits: &Tensor) -> Result<Tensor> {
@@ -1333,6 +1346,48 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The partial top-k selection returns exactly the full stable sort's
+    /// prefix, ties and non-finite values included.
+    #[test]
+    fn ranked_candidates_match_a_full_stable_sort() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for trial in 0..200 {
+            let len = 1 + (next() % 300) as usize;
+            let values: Vec<f32> = (0..len)
+                .map(|_| match next() % 10 {
+                    // Coarse values force many ties at the top-k boundary.
+                    0 => f32::NEG_INFINITY,
+                    1 => f32::NAN,
+                    _ => (next() % 7) as f32 * 0.5,
+                })
+                .collect();
+            for top_k in [0usize, 1, 2, 5, 50, len, len + 3] {
+                let mut reference: Vec<usize> = (0..len)
+                    .filter(|index| values[*index].is_finite())
+                    .collect();
+                reference.sort_by(|left, right| {
+                    values[*right]
+                        .partial_cmp(&values[*left])
+                        .unwrap_or(Ordering::Equal)
+                });
+                if top_k > 0 {
+                    reference.truncate(top_k.min(reference.len()));
+                }
+                assert_eq!(
+                    ranked_candidates(&values, top_k),
+                    reference,
+                    "trial {trial} top_k {top_k}"
+                );
+            }
+        }
+    }
 
     /// Gumbel-max over the device top-k: the token is the top-k candidate
     /// with the largest score + noise, and only top-k candidates can win.
