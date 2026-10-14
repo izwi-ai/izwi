@@ -72,6 +72,18 @@ impl ChatExecutionRequest {
                 max_tokens: max_new_tokens,
                 ..Default::default()
             }
+        } else if let Some(temperature) = lfm25_sampling_temperature(self.variant) {
+            // Liquid's model cards: top-k 50 and repetition penalty 1.05,
+            // with no top-p or presence penalty.
+            GenerationParams {
+                temperature,
+                top_p: 1.0,
+                top_k: 50,
+                repetition_penalty: 1.05,
+                presence_penalty: 0.0,
+                max_tokens: max_new_tokens,
+                ..Default::default()
+            }
         } else {
             GenerationParams {
                 max_tokens: max_new_tokens,
@@ -161,6 +173,17 @@ fn qwen_sampling_profile(
                 profile(1.0, 1.0, 2.0)
             })
         }
+        _ => None,
+    }
+}
+
+/// Temperature from Liquid's LFM2.5-1.2B model cards (Instruct 0.1, Thinking
+/// 0.05), or `None` for other models. Neither the GGUF nor
+/// `generation_config.json` carries sampling values.
+fn lfm25_sampling_temperature(variant: ModelVariant) -> Option<f32> {
+    match variant {
+        ModelVariant::Lfm2512BInstructGguf => Some(0.1),
+        ModelVariant::Lfm2512BThinkingGguf => Some(0.05),
         _ => None,
     }
 }
@@ -1508,6 +1531,30 @@ mod tests {
                 ..Default::default()
             },
             correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn lfm25_models_use_their_model_card_sampling_profile() {
+        for (variant, temperature) in [
+            (ModelVariant::Lfm2512BInstructGguf, 0.1),
+            (ModelVariant::Lfm2512BThinkingGguf, 0.05),
+        ] {
+            let params = qwen_request(variant, None).resolved_generation_params();
+            assert_eq!(params.temperature, temperature, "{variant:?}");
+            assert_eq!(params.top_p, 1.0, "{variant:?}");
+            assert_eq!(params.top_k, 50, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.05, "{variant:?}");
+            assert_eq!(params.presence_penalty, 0.0, "{variant:?}");
+
+            let mut explicit = qwen_request(variant, None);
+            explicit.temperature = Some(0.0);
+            explicit.top_k = Some(1);
+            explicit.repetition_penalty = Some(1.0);
+            let params = explicit.resolved_generation_params();
+            assert_eq!(params.temperature, 0.0, "{variant:?}");
+            assert_eq!(params.top_k, 1, "{variant:?}");
+            assert_eq!(params.repetition_penalty, 1.0, "{variant:?}");
         }
     }
 
