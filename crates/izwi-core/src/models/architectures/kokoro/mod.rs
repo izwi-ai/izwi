@@ -15,6 +15,7 @@ mod text_encoder;
 mod voice;
 
 pub use config::KokoroConfig;
+pub use prosody::kokoro_fused_lstm_steps;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

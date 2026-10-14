@@ -5919,6 +5919,43 @@ fn normalize_observed_runtime_value(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_ascii_lowercase())
 }
 
+/// Process-wide TTS fast-path counters for a loaded model's diagnostics:
+/// each one counts a path that replaced a slower one, so a live server
+/// shows whether it ran.
+fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
+    use crate::models::architectures::{fish_s2, kokoro, qwen3, voxtral};
+    match family {
+        ModelFamily::Qwen3Tts => Some(serde_json::json!({
+            "codec_stream_frames_total": qwen3::tts::qwen3_tts_codec_stream_frames(),
+        })),
+        ModelFamily::VoxtralTts => Some(serde_json::json!({
+            "lm_rope_uploads_total": voxtral::lm::voxtral_lm_rope_uploads(),
+            "acoustic_step_uploads_total": voxtral::tts::acoustic::voxtral_acoustic_step_uploads(),
+        })),
+        ModelFamily::KokoroTts => Some(serde_json::json!({
+            "fused_lstm_steps_total": kokoro::kokoro_fused_lstm_steps(),
+            "checkpoint_parses_total": kokoro::kokoro_checkpoint_parses(),
+        })),
+        ModelFamily::FishS2Tts => Some(serde_json::json!({
+            "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
+        })),
+        _ => None,
+    }
+}
+
+/// `diagnostics` with `variant`'s fast-path counters added beside its own
+/// fields.
+fn with_tts_fast_path_counters(variant: ModelVariant, diagnostics: Option<Value>) -> Option<Value> {
+    let Some(counters) = tts_fast_path_counters(variant.family()) else {
+        return diagnostics;
+    };
+    let mut merged = diagnostics.unwrap_or_else(|| Value::Object(Default::default()));
+    if let (Some(fields), Value::Object(counters)) = (merged.as_object_mut(), counters) {
+        fields.extend(counters);
+    }
+    Some(merged)
+}
+
 fn loaded_model_diagnostics_entry(
     device: &DeviceProfile,
     variant: ModelVariant,
@@ -6288,7 +6325,12 @@ impl ModelRegistry {
         {
             let guard = self.voxtral_tts_models.read().await;
             for (variant, entry) in guard.iter() {
-                if entry.ready_model().is_some() {
+                if let Some(model) = entry.ready_model() {
+                    let precision = serde_json::json!({
+                        "precision": model
+                            .precision()
+                            .map(crate::kernels::numeric_check::PrecisionLoad::diagnostics),
+                    });
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -6297,7 +6339,7 @@ impl ModelRegistry {
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
-                        None,
+                        with_tts_fast_path_counters(*variant, Some(precision)),
                     ));
                 }
             }
@@ -6341,7 +6383,10 @@ impl ModelRegistry {
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
-                    serde_json::to_value(model.diagnostics()).ok(),
+                    with_tts_fast_path_counters(
+                        *variant,
+                        serde_json::to_value(model.diagnostics()).ok(),
+                    ),
                 ));
             }
         }
@@ -6365,7 +6410,10 @@ impl ModelRegistry {
                     actual_runtime,
                     None,
                     None,
-                    serde_json::to_value(model_diagnostics).ok(),
+                    with_tts_fast_path_counters(
+                        *variant,
+                        serde_json::to_value(model_diagnostics).ok(),
+                    ),
                 ));
             }
         }
@@ -6382,7 +6430,7 @@ impl ModelRegistry {
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
-                        None,
+                        with_tts_fast_path_counters(*variant, None),
                     ));
                 }
             }
@@ -7582,6 +7630,48 @@ mod tests {
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn tts_diagnostics_carry_each_familys_fast_path_counters() {
+        let counters = |variant: ModelVariant, own: Option<Value>| {
+            let merged = with_tts_fast_path_counters(variant, own).expect("diagnostics");
+            let mut keys = merged
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            counters(
+                ModelVariant::Voxtral4BTts2603,
+                Some(serde_json::json!({ "precision": null }))
+            ),
+            [
+                "acoustic_step_uploads_total",
+                "lm_rope_uploads_total",
+                "precision"
+            ]
+        );
+        assert_eq!(
+            counters(ModelVariant::Kokoro82M, None),
+            ["checkpoint_parses_total", "fused_lstm_steps_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::FishAudioS2Pro, Some(serde_json::json!({}))),
+            ["resident_fast_frames_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::Qwen3Tts12Hz06BBase, None),
+            ["codec_stream_frames_total"]
+        );
+        assert_eq!(
+            with_tts_fast_path_counters(ModelVariant::VibeVoice15BTts, None),
+            None
+        );
     }
 
     #[test]
