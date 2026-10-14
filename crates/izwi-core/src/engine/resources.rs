@@ -1146,7 +1146,8 @@ impl ResourceAuthority {
             ));
         }
         if !current.fits_within(resources) {
-            return Err(Error::InvalidInput(
+            // An owner's accounting bug, never the client's input.
+            return Err(Error::InferenceError(
                 "materialized resource usage cannot decrease through post-allocation observation; the owning runtime must restore its pending claim before freeing physical memory"
                     .to_string(),
             ));
@@ -2653,9 +2654,10 @@ mod tests {
         lease.record_materialized_usage(slots(100)).unwrap();
         provider.set_available(50);
 
+        // The owner's accounting bug, not the client's input.
         assert!(matches!(
             lease.record_materialized_usage(slots(50)),
-            Err(Error::InvalidInput(_))
+            Err(Error::InferenceError(_))
         ));
         assert_eq!(authority.snapshot().reserved, slots(100));
     }

@@ -130,6 +130,7 @@ impl RuntimeService {
         }
         let mut expected_sample_rate: Option<u32> = None;
         let mut emitted_samples = 0usize;
+        let mut materialized_output_samples = 0usize;
         // Admission reserved one chunk of output at the planning pace for
         // the largest chunk the planner can produce (KOK-8); each chunk's
         // audio is handed on before the next is synthesized.
@@ -186,9 +187,10 @@ impl RuntimeService {
                 output_budget.max_samples,
                 "streamed samples",
             )?;
-            record_kokoro_materialized_output(
+            materialized_output_samples = record_kokoro_materialized_output(
                 job,
                 retained_input_bytes,
+                materialized_output_samples,
                 synthesis.samples.capacity(),
                 chunk_sample_limit,
             )?;
@@ -340,19 +342,28 @@ fn validate_kokoro_samples(samples: &Vec<f32>, max_samples: usize, label: &str) 
     Ok(())
 }
 
+/// Records the stream's output as materialized: the input plus the largest
+/// chunk buffer so far (`recorded`, returned updated). Each chunk's buffer is
+/// handed to the client before the next is synthesized into a new one, and
+/// a later chunk is often smaller (the stream starts with a short chunk, and
+/// its last is partial), so recording each chunk's own size would lower the
+/// observation, which the authority refuses: freed memory must go back to
+/// pending first. The largest chunk stays inside the one-chunk reservation.
 fn record_kokoro_materialized_output(
     job: &JobLease,
     retained_input_bytes: u64,
+    recorded: usize,
     output_capacity_samples: usize,
     max_samples: usize,
-) -> Result<()> {
+) -> Result<usize> {
     checked_kokoro_sample_growth(
         0,
         output_capacity_samples,
         max_samples,
         "materialized sample capacity",
     )?;
-    let output_bytes = u64::try_from(output_capacity_samples)
+    let largest = recorded.max(output_capacity_samples);
+    let output_bytes = u64::try_from(largest)
         .ok()
         .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
         .ok_or_else(|| Error::Overloaded("Kokoro materialized output overflowed".to_string()))?;
@@ -365,7 +376,8 @@ fn record_kokoro_materialized_output(
     // The output ceiling is part of the job's immutable pre-admission
     // reservation. This only reclassifies authorized pending bytes after the
     // bounded Vec exists; it never grows the lease.
-    job.record_materialized_usage(JobResourceObservation::host(materialized_host_bytes))
+    job.record_materialized_usage(JobResourceObservation::host(materialized_host_bytes))?;
+    Ok(largest)
 }
 
 #[cfg(test)]
@@ -374,6 +386,47 @@ mod tests {
     use crate::backends::BackendKind;
     use crate::engine::{ExecutionGroupId, ModelInstanceId};
     use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+
+    /// A 45-word stream: a short first chunk, two full ones and a partial
+    /// last chunk, recorded through the job's real resource accounting.
+    /// Recording each chunk's own size lowered the observation at the
+    /// third chunk, and the authority's refusal ended the stream with a
+    /// 400-class "Invalid input" after most of the audio was sent.
+    #[tokio::test]
+    async fn a_stream_of_uneven_chunks_records_its_output_without_lowering_it() {
+        use crate::engine::{Priority, ResourceAmount, ResourceVector, WorkloadClass};
+        use crate::runtime::coordinator::{CoordinatorLane, InferenceCoordinator, JobSpec};
+        let (input, limit) = (4_096u64, 96_000usize);
+        let coordinator = std::sync::Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 2));
+        let mut resources = ResourceVector::zero();
+        resources.host_bytes = ResourceAmount::Known(input + limit as u64 * 4);
+        let job = coordinator
+            .admit(JobSpec {
+                request_id: "kokoro-stream".to_string(),
+                lane: CoordinatorLane::Atomic,
+                priority: Priority::Normal,
+                workload_class: WorkloadClass::Streaming,
+                deadline: None,
+                resources,
+            })
+            .await
+            .unwrap();
+        let mut recorded = 0;
+        for chunk in [18_000, 96_000, 90_000, 31_000] {
+            recorded =
+                record_kokoro_materialized_output(&job, input, recorded, chunk, limit).unwrap();
+        }
+        assert_eq!(recorded, 96_000);
+        // Lowering an observation is the owner's accounting bug: a server
+        // error, not the client's invalid input.
+        let lowered = job.record_materialized_usage(
+            crate::runtime::coordinator::JobResourceObservation::host(input),
+        );
+        assert!(
+            matches!(lowered, Err(Error::InferenceError(_))),
+            "{lowered:?}"
+        );
+    }
 
     /// A voice pack that takes one phoneme per non-space character and
     /// refuses more than 510, as the model does. Its G2P splits sentences at
