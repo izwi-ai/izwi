@@ -2278,13 +2278,20 @@ impl ManagedKvCacheManager {
                 .as_ref()
                 .map(|tail| tail.device_end_tokens);
             let sliding_window = sliding_window_for_domain(&state.contract, group.domain)?;
+            // The earliest query of this span sits at `start` and still attends
+            // the `window` keys ending at itself, so the table must keep keys
+            // from `start + 1 - window`. Keeping only `target - window` drops
+            // the lookback of every query but the last in a multi-token span
+            // (chunked prefill, speculative verification). A single-token step
+            // is unchanged, and the next step advances the window again.
             let target_window_start = sliding_window
                 .map(|window| {
-                    target_committed_tokens.saturating_sub(window).min(
-                        domain_sequence_input
-                            .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
-                            .unwrap_or(snapshot.committed_tokens),
-                    )
+                    let start = domain_sequence_input
+                        .map(|input| u32::try_from(input.start).unwrap_or(u32::MAX))
+                        .unwrap_or(snapshot.committed_tokens);
+                    target_committed_tokens
+                        .saturating_sub(window)
+                        .min(start.saturating_add(1).saturating_sub(window))
                 })
                 .unwrap_or(0);
             let established_window_table = sliding_window.is_some()
@@ -7989,6 +7996,55 @@ mod tests {
         assert_eq!(snapshot.committed_tokens, 256);
         assert_eq!(snapshot.window_start, 224);
         assert!(snapshot.groups[0].blocks.len() <= 3);
+    }
+
+    #[test]
+    fn chunked_sliding_window_span_keeps_the_earliest_querys_lookback() {
+        let model = ModelInstanceId::new(49);
+        let session = SessionKey::new("managed-window-chunks".into(), 1);
+        let mut manager = ManagedKvCacheManager::default();
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                16,
+                &CacheCapability::Managed(sliding_contract(32)),
+            )
+            .expect("bind")
+            .expect("managed runtime");
+
+        let chunk = 8_usize;
+        for (step, start) in (0..256_usize).step_by(chunk).enumerate() {
+            let target = start + chunk;
+            let reservation = manager
+                .prepare(
+                    &runtime,
+                    step as u64 + 1,
+                    &session,
+                    &sequence_work(start, target),
+                    None,
+                )
+                .expect("prepare")
+                .expect("reservation");
+            let row = &reservation.domains[0];
+            // The query at `start` attends keys `start + 1 - 32 ..= start`;
+            // `target - 32` would have dropped seven of them.
+            assert_eq!(
+                row.target_window_start,
+                u32::try_from((start + 1).saturating_sub(32)).unwrap()
+            );
+            assert_eq!(row.first_page_offset, row.target_window_start % 16);
+            // 32 + 8 - 1 visible tokens plus a page offset fit in four pages.
+            assert!(row.provisional_groups[0].blocks.len() <= 4);
+            manager
+                .finalize(
+                    &reservation,
+                    Some(&reservation.completed_write_receipt_for_test()),
+                    true,
+                )
+                .expect("commit");
+        }
     }
 
     #[test]
