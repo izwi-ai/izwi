@@ -1211,6 +1211,7 @@ pub(crate) struct InvocationCapabilityRuntimeV2 {
     pub(crate) state_fingerprint: [u8; 32],
     pub(crate) descriptor: CapabilityStateDescriptorV2,
     invocation_workspace: InvocationWorkspaceRuntimeV2,
+    validated: SealedBindingCache,
 }
 
 /// Request-facing inference-state runtime. Callers bind this model-neutral
@@ -1557,6 +1558,39 @@ impl CapabilityStateRuntimeV2 {
     }
 }
 
+/// The last execution binding whose immutable checks passed against a sealed
+/// runtime. Requests re-validate their runtime on every admission step; the
+/// structural part (descriptor, plan, stage-graph and state fingerprints, id)
+/// re-serialized and re-hashed the whole contract several times per request
+/// although none of it can change after seal. Holding a clone of the binding
+/// keeps its stage `Arc` alive, so a pointer match can never be an address
+/// reused by a different graph. Liveness checks still run on every call.
+#[derive(Debug, Clone, Default)]
+struct SealedBindingCache(Arc<std::sync::Mutex<Option<(BackendKind, ExecutionAdapterBinding)>>>);
+
+impl SealedBindingCache {
+    fn matches(&self, backend: BackendKind, execution: &ExecutionAdapterBinding) -> bool {
+        self.0.lock().is_ok_and(|cached| {
+            cached.as_ref().is_some_and(|(cached_backend, cached)| {
+                *cached_backend == backend
+                    && Arc::ptr_eq(&cached.stages, &execution.stages)
+                    && cached.execution_group_id == execution.execution_group_id
+                    && cached.model_instance_id == execution.model_instance_id
+                    && cached.adapter_instance_id == execution.adapter_instance_id
+                    && cached.adapter_abi_revision == execution.adapter_abi_revision
+                    && cached.model_variant == execution.model_variant
+                    && cached.capability_id == execution.capability_id
+            })
+        })
+    }
+
+    fn remember(&self, backend: BackendKind, execution: &ExecutionAdapterBinding) {
+        if let Ok(mut cached) = self.0.lock() {
+            *cached = Some((backend, execution.clone()));
+        }
+    }
+}
+
 /// Load-sealed proof that one exact capability owns a backend-resolved state
 /// plan and the already allocated physical retained arena implementing it.
 #[derive(Debug, Clone)]
@@ -1574,6 +1608,7 @@ pub(crate) struct ManagedCapabilityRuntimeV2 {
     /// admitted requests upgrade this weak handle while holding residency.
     retained: WeakRetainedStateRuntimeV2,
     invocation_workspace: InvocationWorkspaceRuntimeV2,
+    validated: SealedBindingCache,
 }
 
 impl ManagedCapabilityRuntimeV2 {
@@ -1657,6 +1692,7 @@ impl ManagedCapabilityRuntimeV2 {
             retained_state_use,
             retained: physical.downgrade(),
             invocation_workspace,
+            validated: SealedBindingCache::default(),
         };
         runtime.id = runtime.compute_id()?;
         runtime.validate_against(backend, execution)?;
@@ -1668,26 +1704,34 @@ impl ManagedCapabilityRuntimeV2 {
         backend: BackendKind,
         execution: &ExecutionAdapterBinding,
     ) -> Result<()> {
-        self.identity.validate_against(backend, execution)?;
-        self.descriptor.validate_against_stages(&execution.stages)?;
+        if !self.validated.matches(backend, execution) {
+            self.identity.validate_against(backend, execution)?;
+            self.descriptor.validate_against_stages(&execution.stages)?;
+            let RetainedStateCapability::Managed { contract } = &self.descriptor.retained else {
+                return Err(invalid("managed runtime lost its retained-state contract"));
+            };
+            let registry =
+                StateBackendRegistry::new(self.state_plan.backend, self.state_plan.device_ordinal)?;
+            self.state_plan.validate_against(contract, &registry)?;
+            if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
+                || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
+                || self.id != self.compute_id()?
+            {
+                return Err(invalid(
+                    "managed state ABI v2 runtime does not match the selected loaded capability",
+                ));
+            }
+            self.validated.remember(backend, execution);
+        }
         self.invocation_workspace
             .validate_for(&self.descriptor, execution, backend)?;
-        let RetainedStateCapability::Managed { contract } = &self.descriptor.retained else {
-            return Err(invalid("managed runtime lost its retained-state contract"));
-        };
-        let registry =
-            StateBackendRegistry::new(self.state_plan.backend, self.state_plan.device_ordinal)?;
-        self.state_plan.validate_against(contract, &registry)?;
         let physical = self.retained.upgrade().ok_or_else(|| {
             invalid("managed state ABI v2 runtime refers to an unloaded physical generation")
         })?;
-        if self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
-            || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
-            || self.state_plan.id != physical.state_plan_v2().id
+        if self.state_plan.id != physical.state_plan_v2().id
             || self.retained_identity != physical.identity()
             || execution.model_instance_id != physical.model_instance()
             || !retained_use_matches(self.retained_state_use, &physical)
-            || self.id != self.compute_id()?
         {
             return Err(invalid(
                 "managed state ABI v2 runtime does not match the selected loaded capability",
@@ -1770,6 +1814,7 @@ impl InvocationCapabilityRuntimeV2 {
             state_fingerprint,
             descriptor,
             invocation_workspace,
+            validated: SealedBindingCache::default(),
         };
         runtime.id = runtime.compute_id()?;
         runtime.validate_against(backend, execution)?;
@@ -1781,22 +1826,25 @@ impl InvocationCapabilityRuntimeV2 {
         backend: BackendKind,
         execution: &ExecutionAdapterBinding,
     ) -> Result<()> {
-        self.identity.validate_against(backend, execution)?;
-        self.descriptor.validate_against_stages(&execution.stages)?;
+        if !self.validated.matches(backend, execution) {
+            self.identity.validate_against(backend, execution)?;
+            self.descriptor.validate_against_stages(&execution.stages)?;
+            if !self.descriptor.is_stateless()
+                || self
+                    .descriptor
+                    .has_zero_invocation_workspace_for(&execution.stages)?
+                || self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
+                || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
+                || self.id != self.compute_id()?
+            {
+                return Err(invalid(
+                    "invocation state ABI v2 runtime does not match the selected loaded capability",
+                ));
+            }
+            self.validated.remember(backend, execution);
+        }
         self.invocation_workspace
             .validate_for(&self.descriptor, execution, backend)?;
-        if !self.descriptor.is_stateless()
-            || self
-                .descriptor
-                .has_zero_invocation_workspace_for(&execution.stages)?
-            || self.stage_graph_fingerprint != stage_graph_fingerprint(&execution.stages)?
-            || self.state_fingerprint != self.descriptor.fingerprint(&execution.stages)?
-            || self.id != self.compute_id()?
-        {
-            return Err(invalid(
-                "invocation state ABI v2 runtime does not match the selected loaded capability",
-            ));
-        }
         Ok(())
     }
 
@@ -3051,6 +3099,40 @@ mod tests {
             typed_backings,
             execution,
         )
+    }
+
+    #[test]
+    fn memoized_validation_still_rejects_a_changed_binding() {
+        // G1: once a binding validates, repeats skip the immutable checks;
+        // any change to the binding identity (same stage Arc included) must
+        // still run them and fail.
+        let (runtime, descriptor, _paged_owner, _typed, execution) =
+            all_domain_invocation_fixture(None);
+        let sealed = InvocationCapabilityRuntimeV2::seal_with_invocation_workspace(
+            BackendKind::Cpu,
+            &execution,
+            descriptor,
+            runtime,
+        )
+        .unwrap();
+        sealed
+            .validate_against(BackendKind::Cpu, &execution)
+            .unwrap();
+        sealed
+            .validate_against(BackendKind::Cpu, &execution)
+            .unwrap();
+        let mut other_adapter = execution.clone();
+        other_adapter.adapter_instance_id =
+            AdapterInstanceId::new(execution.adapter_instance_id.get() + 1);
+        assert!(sealed
+            .validate_against(BackendKind::Cpu, &other_adapter)
+            .is_err());
+        assert!(sealed
+            .validate_against(BackendKind::Metal, &execution)
+            .is_err());
+        sealed
+            .validate_against(BackendKind::Cpu, &execution)
+            .unwrap();
     }
 
     #[test]
