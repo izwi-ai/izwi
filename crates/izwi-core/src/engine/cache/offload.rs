@@ -447,7 +447,6 @@ pub(crate) fn promote_tail(
             .page(slot)
             .and_then(|bytes| arena.restore_page(blocks[restored], bytes));
         if let Err(error) = copied {
-            eprintln!("DS4DBG promote copy failed page {restored}: {error}");
             tracing::debug!(
                 error = %error,
                 "KV offload promotion copy failed; truncating the host tail"
