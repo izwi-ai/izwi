@@ -391,6 +391,30 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
     run_with_args(args, enterprise_hooks).await
 }
 
+/// How long blocking work still running after shutdown cleanup (for example a
+/// model unload waiting in `Device::synchronize` on queued GPU work) may delay
+/// process exit. Cleanup itself is bounded by its own timeout first.
+pub const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Run [`run_from_cli`] on a runtime whose shutdown is bounded, so SIGTERM
+/// exits after the cleanup budget instead of waiting on a stuck GPU drain.
+pub fn run_server_process(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    run_with_bounded_exit(run_from_cli(enterprise_hooks), PROCESS_EXIT_GRACE)
+}
+
+fn run_with_bounded_exit<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+    exit_grace: Duration,
+) -> anyhow::Result<T> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(future);
+    // Dropping a runtime waits for every blocking task without limit.
+    runtime.shutdown_timeout(exit_grace);
+    result
+}
+
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     validate_role_topology(args.role, args.gateway_topology)?;
     let serve_config = resolve_serve_runtime_config(&args)?;
@@ -2508,6 +2532,30 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn bounded_exit_does_not_wait_for_a_blocking_drain_that_never_finishes() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_with_bounded_exit(
+                async {
+                    // Stands in for an unload stuck in Device::synchronize.
+                    tokio::task::spawn_blocking(|| loop {
+                        std::thread::park();
+                    });
+                    Ok(())
+                },
+                Duration::from_millis(200),
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+        let started = Instant::now();
+        let ok = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("process exit must not wait for a never-ending blocking task");
+        assert!(ok);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn jittered_poll_interval_is_deterministic_and_bounded() {
