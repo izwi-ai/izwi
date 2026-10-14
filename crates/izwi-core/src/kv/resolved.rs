@@ -78,6 +78,14 @@ pub struct KvArenaId {
     pub generation: u32,
 }
 
+impl KvArenaId {
+    /// Load-owned invocation arenas set this generation bit and managed
+    /// arenas allocate below it. The two managers count generations
+    /// independently for the same model instance, backend and device, so
+    /// without disjoint ranges their arena IDs could coincide.
+    pub(crate) const INVOCATION_GENERATION_TAG: u32 = 1 << 31;
+}
+
 /// Capacity-bearing allocation view derived from one already-negotiated V2
 /// state plan. It introduces no second semantic or backend policy decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +134,7 @@ impl ResolvedKvPlan {
                 .map_err(|_| invalid("physical KV group count exceeds u32"))?;
             let generation = first_arena_generation
                 .checked_add(ordinal)
+                .filter(|generation| *generation < KvArenaId::INVOCATION_GENERATION_TAG)
                 .ok_or_else(|| invalid("physical KV arena generation overflow"))?;
             let layout = match resolved.layout {
                 StatePhysicalLayout::PageTokenHeadDim => KvPhysicalLayout::PageTokenHeadDim,

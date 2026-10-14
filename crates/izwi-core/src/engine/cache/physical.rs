@@ -829,11 +829,16 @@ impl PhysicalStateManager {
                 )
             })
             .transpose()?;
+        if generation >= KvArenaId::INVOCATION_GENERATION_TAG {
+            return Err(invalid(
+                "physical invocation allocation generation exhausted",
+            ));
+        }
         let arena_id = KvArenaId {
             model_instance,
             backend: self.worker_backend,
             device_ordinal: self.worker_device_ordinal,
-            generation,
+            generation: generation | KvArenaId::INVOCATION_GENERATION_TAG,
         };
         let config = invocation_arena_config(
             arena_id,
@@ -1638,6 +1643,11 @@ mod tests {
         let second = handle.lease().unwrap();
         assert_eq!(first.slot().page_count, 2);
         assert_eq!(second.slot().page_count, 2);
+        // Invocation arena IDs live in their own generation range, disjoint
+        // from the managed manager's arenas for the same model instance.
+        let generation = first.cache().arena().id().generation;
+        assert_ne!(generation & KvArenaId::INVOCATION_GENERATION_TAG, 0);
+        assert_eq!(generation & !KvArenaId::INVOCATION_GENERATION_TAG, 1);
         assert_ne!(first.slot().first_page, second.slot().first_page);
         assert!(handle.lease().is_err());
         drop(first);
