@@ -992,6 +992,29 @@ impl InferenceCoordinator {
         self.acquire_execution_units(1, deadline).await
     }
 
+    /// Reserve one pipeline stage's working set beside its job, priced by the
+    /// model the stage runs (not by the job's worst case). The claim is a
+    /// request claim, so the live-memory check applies, and it is released
+    /// when the returned lease drops at the end of the stage.
+    pub(crate) fn reserve_stage_workspace(
+        &self,
+        job: &JobLease,
+        stage: &str,
+        workspace: JobResourceObservation,
+    ) -> Result<StageWorkspaceLease> {
+        let owner = ReservationOwner::new(
+            ReservationClass::Request,
+            format!("{}:{stage}", job.spec.request_id),
+        );
+        let lease = self
+            .resources
+            .reserve(owner, observed_resources(workspace, self.backend)?)?;
+        Ok(StageWorkspaceLease {
+            backend: self.backend,
+            lease,
+        })
+    }
+
     /// Reserve scratch memory for one physical tensor dispatch. This does not
     /// acquire execution capacity; the coordinator-owned engine or direct
     /// runner retains execution capacity independently for the device work.
@@ -2185,6 +2208,35 @@ impl JobLease {
         self._inner
             .reservation
             .prepare_materialized_release(resources)
+    }
+}
+
+/// One pipeline stage's working-set reservation. Dropping it releases the
+/// claim, so nothing stage-sized outlives the stage.
+#[derive(Debug)]
+pub(crate) struct StageWorkspaceLease {
+    backend: BackendKind,
+    lease: ResourceLease,
+}
+
+impl StageWorkspaceLease {
+    /// Record the stage's allocation once it exists (see
+    /// [`JobLease::record_materialized_usage`]).
+    pub(crate) fn record_materialized_usage(
+        &self,
+        observation: JobResourceObservation,
+    ) -> Result<()> {
+        self.lease
+            .record_materialized_usage(observed_resources(observation, self.backend)?)
+    }
+
+    /// Restore the pending claim before the stage frees its allocation.
+    pub(crate) fn prepare_materialized_release(
+        &self,
+        observation: JobResourceObservation,
+    ) -> Result<()> {
+        self.lease
+            .prepare_materialized_release(observed_resources(observation, self.backend)?)
     }
 }
 

@@ -95,72 +95,59 @@ fn diarization_input_observation(
     ))
 }
 
-fn diarization_workspace_observation(
-    steady_usage: JobResourceObservation,
-    workspace: SortformerWorkspaceEstimate,
-) -> Result<JobResourceObservation> {
-    Ok(JobResourceObservation::new(
-        steady_usage
-            .host_bytes
-            .checked_add(workspace.host_bytes)
-            .ok_or_else(|| {
-                Error::Overloaded("diarization materialized host workspace overflowed".to_string())
-            })?,
-        steady_usage
-            .accelerator_bytes
-            .checked_add(workspace.accelerator_bytes)
-            .ok_or_else(|| {
-                Error::Overloaded(
-                    "diarization materialized accelerator workspace overflowed".to_string(),
-                )
-            })?,
-    ))
-}
-
-fn diarization_audio_resources(
-    backend: crate::backends::BackendKind,
-    sample_count: usize,
-) -> Result<ResourceVector> {
-    let workspace = production_workspace_authorization(
-        sample_count,
-        matches!(backend, crate::backends::BackendKind::Cuda),
-    )?;
-    let shared_workspace = workspace
-        .host_bytes
-        .checked_add(workspace.accelerator_bytes)
-        .ok_or_else(|| Error::Overloaded("diarization workspace overflowed".to_string()))?;
+/// The job's audio allowance, authorized before decode: the decoder output
+/// and up to one hour of 16 kHz samples, all host-side (unified on Metal).
+/// The Sortformer workspace is not in the job; each diarize stage reserves
+/// the loaded model's own estimate for the audio it actually decoded.
+fn diarization_decode_resources(backend: crate::backends::BackendKind) -> ResourceVector {
     let mut resources = ResourceVector::zero();
     match backend {
-        crate::backends::BackendKind::Cpu => {
-            resources.host_bytes = ResourceAmount::Known(
-                DIARIZATION_AUDIO_WORKSPACE_BYTES
-                    .checked_add(shared_workspace)
-                    .ok_or_else(|| {
-                        Error::Overloaded("diarization CPU workspace overflowed".to_string())
-                    })?,
-            )
+        crate::backends::BackendKind::Cpu | crate::backends::BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(DIARIZATION_AUDIO_WORKSPACE_BYTES)
         }
         crate::backends::BackendKind::Metal => {
-            resources.unified_bytes = ResourceAmount::Known(
-                DIARIZATION_AUDIO_WORKSPACE_BYTES
-                    .checked_add(shared_workspace)
-                    .ok_or_else(|| {
-                        Error::Overloaded("diarization Metal workspace overflowed".to_string())
-                    })?,
-            )
-        }
-        crate::backends::BackendKind::Cuda => {
-            resources.host_bytes = ResourceAmount::Known(
-                DIARIZATION_AUDIO_WORKSPACE_BYTES
-                    .checked_add(workspace.host_bytes)
-                    .ok_or_else(|| {
-                        Error::Overloaded("diarization CUDA host workspace overflowed".to_string())
-                    })?,
-            );
-            resources.device_bytes = ResourceAmount::Known(workspace.accelerator_bytes);
+            resources.unified_bytes = ResourceAmount::Known(DIARIZATION_AUDIO_WORKSPACE_BYTES)
         }
     }
-    Ok(resources)
+    resources
+}
+
+/// Run one diarize body under a stage-scoped lease on the loaded model's own
+/// workspace estimate. The lease is consumed: it is released when this
+/// returns, whether the body succeeds or fails, so no workspace claim stays
+/// pending after the stage.
+fn diarize_under_workspace_lease<T>(
+    coordinator: &crate::runtime::coordinator::InferenceCoordinator,
+    job: &JobLease,
+    workspace: SortformerWorkspaceEstimate,
+    body: impl FnOnce(&mut dyn FnMut(SortformerWorkspaceEvent) -> Result<()>) -> Result<T>,
+) -> Result<T> {
+    let observation =
+        JobResourceObservation::new(workspace.host_bytes, workspace.accelerator_bytes);
+    let lease = coordinator.reserve_stage_workspace(job, "diarization.infer", observation)?;
+    let mut observer = |event| match event {
+        SortformerWorkspaceEvent::Materialized {
+            workspace: observed,
+        } => {
+            if observed != workspace {
+                return Err(Error::InferenceError(format!(
+                    "Sortformer materialized workspace {observed:?} after estimating {workspace:?}"
+                )));
+            }
+            lease.record_materialized_usage(observation)
+        }
+        SortformerWorkspaceEvent::Releasing {
+            workspace: observed,
+        } => {
+            if observed != workspace {
+                return Err(Error::InferenceError(format!(
+                    "Sortformer released workspace {observed:?} after estimating {workspace:?}"
+                )));
+            }
+            lease.prepare_materialized_release(JobResourceObservation::default())
+        }
+    };
+    body(&mut observer)
 }
 
 fn runtime_audio_bytes(audio: &RuntimeAudioInput) -> usize {
@@ -349,7 +336,6 @@ impl RuntimeService {
         &self,
         job: &JobLease,
         audio: PipelineAudio,
-        steady_usage: JobResourceObservation,
         variant: ModelVariant,
         config: DiarizationConfig,
     ) -> Result<DiarizationResult> {
@@ -396,8 +382,10 @@ impl RuntimeService {
                 limit as f64 / 1e9
             )));
         }
-        let expected_workspace = workspace;
-        let observation_job = job.clone();
+        // The workspace is reserved under the execution permit, when the
+        // stage starts, and released when it returns.
+        let coordinator = self.coordinator.clone();
+        let stage_job = job.clone();
         self.coordinator
             .run_loaded_blocking_stage_with_invocation_workspace(
                 job,
@@ -410,36 +398,17 @@ impl RuntimeService {
                 move |leases| {
                     let _residency_lease = residency_lease;
                     let state = leases
-                        .lease_exact_kind_mut(
-                            crate::kv::v2::InvocationStateBackingKindV2::Tensor,
-                        )?
+                        .lease_exact_kind_mut(crate::kv::v2::InvocationStateBackingKindV2::Tensor)?
                         .typed_mut::<crate::engine::InvocationTensorLease>()?;
-                    model.diarize_with_workspace_observer_physical(
-                        &audio.samples,
-                        audio.sample_rate,
-                        &config,
-                        state,
-                        move |event| match event {
-                            SortformerWorkspaceEvent::Materialized { workspace } => {
-                                if workspace != expected_workspace {
-                                    return Err(Error::InferenceError(format!(
-                                        "Sortformer materialized workspace {workspace:?} after estimating {expected_workspace:?}"
-                                    )));
-                                }
-                                observation_job.record_materialized_usage(
-                                    diarization_workspace_observation(steady_usage, workspace)?,
-                                )
-                            }
-                            SortformerWorkspaceEvent::Releasing { workspace } => {
-                                if workspace != expected_workspace {
-                                    return Err(Error::InferenceError(format!(
-                                        "Sortformer released workspace {workspace:?} after estimating {expected_workspace:?}"
-                                    )));
-                                }
-                                observation_job.prepare_materialized_release(steady_usage)
-                            }
-                        },
-                    )
+                    diarize_under_workspace_lease(&coordinator, &stage_job, workspace, |observer| {
+                        model.diarize_with_workspace_observer_physical(
+                            &audio.samples,
+                            audio.sample_rate,
+                            &config,
+                            state,
+                            observer,
+                        )
+                    })
                 },
             )
             .await
@@ -467,10 +436,9 @@ impl RuntimeService {
             context,
             input_bytes,
         );
-        spec.resources = spec.resources.checked_add(diarization_audio_resources(
+        spec.resources = spec.resources.checked_add(diarization_decode_resources(
             self.backend_context().backend_kind,
-            MAX_PIPELINE_SAMPLES,
-        )?)?;
+        ))?;
         let observed_input_bytes = u64::try_from(input_bytes)
             .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
         let job = self
@@ -491,7 +459,7 @@ impl RuntimeService {
         let model_id = model_id.map(ToOwned::to_owned);
         let config = config.clone();
         let observation_job = job.clone();
-        let (runtime_request, audio, steady_usage) = self
+        let (runtime_request, audio) = self
             .coordinator
             .run_host_blocking_stage(&job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
@@ -512,10 +480,10 @@ impl RuntimeService {
                 observation_job.record_materialized_usage(peak_usage)?;
                 observation_job.prepare_materialized_release(steady_usage)?;
                 drop(retained_source);
-                Ok((runtime_request, audio, steady_usage))
+                Ok((runtime_request, audio))
             })
             .await?;
-        self.diarize_samples_stage(&job, audio, steady_usage, variant, runtime_request.config)
+        self.diarize_samples_stage(&job, audio, variant, runtime_request.config)
             .await
     }
 
@@ -635,10 +603,9 @@ impl RuntimeService {
             RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
             input_bytes,
         );
-        spec.resources = spec.resources.checked_add(diarization_audio_resources(
+        spec.resources = spec.resources.checked_add(diarization_decode_resources(
             self.backend_context().backend_kind,
-            MAX_PIPELINE_SAMPLES,
-        )?)?;
+        ))?;
         let observed_input_bytes = u64::try_from(input_bytes)
             .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
         let pipeline_job = self
@@ -662,7 +629,7 @@ impl RuntimeService {
         let llm_model_id = llm_model_id.map(ToOwned::to_owned);
         let config = config.clone();
         let observation_job = pipeline_job.clone();
-        let (runtime_request, audio, steady_usage) = self
+        let (runtime_request, audio) = self
             .coordinator
             .run_host_blocking_stage(&pipeline_job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
@@ -692,7 +659,7 @@ impl RuntimeService {
                 observation_job.record_materialized_usage(peak_usage)?;
                 observation_job.prepare_materialized_release(steady_usage)?;
                 drop(retained_source);
-                Ok((runtime_request, audio, steady_usage))
+                Ok((runtime_request, audio))
             })
             .await?;
 
@@ -700,7 +667,6 @@ impl RuntimeService {
             .diarize_samples_stage(
                 &pipeline_job,
                 audio.clone(),
-                steady_usage,
                 diarization_variant,
                 runtime_request.config.clone(),
             )
@@ -2456,13 +2422,9 @@ mod tests {
         );
         spec.resources = spec
             .resources
-            .checked_add(
-                diarization_audio_resources(
-                    runtime.backend_context().backend_kind,
-                    MAX_PIPELINE_SAMPLES,
-                )
-                .expect("diarization resources"),
-            )
+            .checked_add(diarization_decode_resources(
+                runtime.backend_context().backend_kind,
+            ))
             .expect("combined resources");
         runtime
             .coordinator
@@ -2478,41 +2440,178 @@ mod tests {
 
     #[test]
     fn diarization_decode_workspace_maps_to_physical_backend_memory() {
-        let sample_count = PIPELINE_SAMPLE_RATE as usize;
-        let shared = production_workspace_authorization(sample_count, false).unwrap();
-        let separate = production_workspace_authorization(sample_count, true).unwrap();
-        let cpu = diarization_audio_resources(crate::backends::BackendKind::Cpu, sample_count)
-            .expect("CPU workspace");
-        let metal = diarization_audio_resources(crate::backends::BackendKind::Metal, sample_count)
-            .expect("Metal workspace");
-        let cuda = diarization_audio_resources(crate::backends::BackendKind::Cuda, sample_count)
-            .expect("CUDA workspace");
+        let cpu = diarization_decode_resources(crate::backends::BackendKind::Cpu);
+        let metal = diarization_decode_resources(crate::backends::BackendKind::Metal);
+        let cuda = diarization_decode_resources(crate::backends::BackendKind::Cuda);
+        let allowance = ResourceAmount::Known(DIARIZATION_AUDIO_WORKSPACE_BYTES);
 
-        assert_eq!(
-            cpu.host_bytes,
-            ResourceAmount::Known(
-                DIARIZATION_AUDIO_WORKSPACE_BYTES + shared.host_bytes + shared.accelerator_bytes
-            )
-        );
-        assert_eq!(
-            metal.unified_bytes,
-            ResourceAmount::Known(
-                DIARIZATION_AUDIO_WORKSPACE_BYTES + shared.host_bytes + shared.accelerator_bytes
-            )
-        );
-        assert_eq!(
-            cuda.host_bytes,
-            ResourceAmount::Known(DIARIZATION_AUDIO_WORKSPACE_BYTES + separate.host_bytes)
-        );
-        assert_eq!(
-            cuda.device_bytes,
-            ResourceAmount::Known(separate.accelerator_bytes)
-        );
+        assert_eq!(cpu.host_bytes, allowance);
+        assert_eq!(metal.unified_bytes, allowance);
+        assert_eq!(cuda.host_bytes, allowance);
         assert_eq!(cpu.device_bytes, ResourceAmount::Known(0));
         assert_eq!(cpu.unified_bytes, ResourceAmount::Known(0));
         assert_eq!(metal.host_bytes, ResourceAmount::Known(0));
         assert_eq!(metal.device_bytes, ResourceAmount::Known(0));
         assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
+        assert_eq!(cuda.device_bytes, ResourceAmount::Known(0));
+    }
+
+    /// ADM-1: a diarization job is priced like an ASR job (the generic
+    /// transient plus the audio allowance). The Sortformer workspace is not
+    /// in it: a 3 s request used to carry the one-hour, max-over-topologies
+    /// v2.1 workspace (about 2.9 GiB on Metal) and was refused live.
+    #[test]
+    fn diarization_job_does_not_carry_the_one_hour_sortformer_workspace() {
+        use crate::backends::BackendKind;
+        let three_seconds = 3 * PIPELINE_SAMPLE_RATE as usize;
+        let input_bytes = 44 + three_seconds * 2;
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let transient = crate::runtime::service::transient_resources(backend, input_bytes);
+            let job = transient
+                .checked_add(diarization_decode_resources(backend))
+                .unwrap();
+            let known = |amount: ResourceAmount| match amount {
+                ResourceAmount::Known(bytes) => bytes,
+                ResourceAmount::Unknown => panic!("{backend:?} job has an unknown amount"),
+            };
+            for variant in [
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                ModelVariant::Nemotron3Diarization,
+            ] {
+                let workspace =
+                    crate::models::architectures::sortformer::diarization::checkpoint_profile_workspace_estimate(
+                        variant,
+                        three_seconds,
+                        backend == BackendKind::Cuda,
+                    )
+                    .unwrap();
+                let (job_bytes, transient_bytes, workspace_bytes) = match backend {
+                    BackendKind::Cpu => (
+                        known(job.host_bytes),
+                        known(transient.host_bytes),
+                        workspace.host_bytes + workspace.accelerator_bytes,
+                    ),
+                    BackendKind::Metal => (
+                        known(job.unified_bytes),
+                        known(transient.unified_bytes),
+                        workspace.host_bytes + workspace.accelerator_bytes,
+                    ),
+                    BackendKind::Cuda => {
+                        assert!(
+                            known(job.device_bytes)
+                                <= known(transient.device_bytes) + workspace.accelerator_bytes,
+                            "{variant}: CUDA device"
+                        );
+                        (
+                            known(job.host_bytes),
+                            known(transient.host_bytes),
+                            workspace.host_bytes,
+                        )
+                    }
+                };
+                assert!(
+                    job_bytes
+                        <= transient_bytes + DIARIZATION_AUDIO_WORKSPACE_BYTES + workspace_bytes,
+                    "{backend:?}/{variant}: job {job_bytes} B exceeds the transient \
+                     {transient_bytes} B + 512 MiB + the loaded model's 3 s workspace \
+                     {workspace_bytes} B"
+                );
+            }
+        }
+    }
+
+    /// The diarize stage reserves the loaded model's workspace, records it
+    /// while it is allocated, and releases it when the stage returns,
+    /// whether it succeeds or fails.
+    #[tokio::test]
+    async fn diarize_stage_workspace_lease_is_released_after_the_stage() {
+        use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
+        let coordinator = Arc::new(InferenceCoordinator::new(
+            crate::backends::BackendKind::Metal,
+            1,
+            4,
+        ));
+        let context = RuntimeRequestContext::default();
+        let job = coordinator
+            .admit(JobSpec {
+                request_id: "diarize-stage-lease".to_string(),
+                lane: CoordinatorLane::Pipeline,
+                priority: context.priority,
+                workload_class: context.workload_class,
+                deadline: None,
+                resources: diarization_decode_resources(crate::backends::BackendKind::Metal),
+            })
+            .await
+            .unwrap();
+        let workspace = SortformerWorkspaceEstimate {
+            host_bytes: 3 << 20,
+            accelerator_bytes: 40 << 20,
+        };
+        let workspace_bytes = workspace.host_bytes + workspace.accelerator_bytes;
+        let authority = coordinator.resource_authority();
+        let before = authority.snapshot();
+        let plus = |amount: ResourceAmount| match amount {
+            ResourceAmount::Known(bytes) => ResourceAmount::Known(bytes + workspace_bytes),
+            ResourceAmount::Unknown => panic!("unknown authority amount"),
+        };
+
+        diarize_under_workspace_lease(&coordinator, &job, workspace, |observer| {
+            let reserved = authority.snapshot();
+            assert_eq!(
+                reserved.reserved.unified_bytes,
+                plus(before.reserved.unified_bytes)
+            );
+            assert_eq!(
+                reserved.pending.unified_bytes,
+                plus(before.pending.unified_bytes)
+            );
+            observer(SortformerWorkspaceEvent::Materialized { workspace })?;
+            let allocated = authority.snapshot();
+            assert_eq!(
+                allocated.materialized.unified_bytes,
+                plus(before.materialized.unified_bytes)
+            );
+            assert_eq!(
+                allocated.pending.unified_bytes,
+                before.pending.unified_bytes
+            );
+            observer(SortformerWorkspaceEvent::Releasing { workspace })?;
+            let releasing = authority.snapshot();
+            assert_eq!(
+                releasing.materialized.unified_bytes,
+                before.materialized.unified_bytes
+            );
+            assert_eq!(
+                releasing.pending.unified_bytes,
+                plus(before.pending.unified_bytes)
+            );
+            Ok(())
+        })
+        .unwrap();
+        let after = authority.snapshot();
+        assert_eq!(after.reserved, before.reserved);
+        assert_eq!(after.pending, before.pending);
+        assert_eq!(after.reservations, before.reservations);
+
+        // A failed stage, or one whose model allocated a different workspace
+        // than it estimated, still releases the claim.
+        let failed: Result<()> =
+            diarize_under_workspace_lease(&coordinator, &job, workspace, |observer| {
+                observer(SortformerWorkspaceEvent::Materialized { workspace })?;
+                Err(Error::InferenceError("stage failed".to_string()))
+            });
+        assert!(failed.is_err());
+        let mismatched = diarize_under_workspace_lease(&coordinator, &job, workspace, |observer| {
+            observer(SortformerWorkspaceEvent::Materialized {
+                workspace: SortformerWorkspaceEstimate {
+                    host_bytes: workspace.host_bytes + 1,
+                    ..workspace
+                },
+            })
+        });
+        assert!(matches!(mismatched, Err(Error::InferenceError(_))));
+        assert_eq!(authority.snapshot().reserved, before.reserved);
+        assert_eq!(authority.snapshot().reservations, before.reservations);
     }
 
     #[tokio::test]
@@ -2648,21 +2747,6 @@ mod tests {
             cuda_limit.accelerator_bytes,
             production_limit.accelerator_bytes
         );
-    }
-
-    #[test]
-    fn sortformer_workspace_observation_preserves_steady_usage() {
-        let steady = JobResourceObservation::new(123, 7);
-        let materialized = diarization_workspace_observation(
-            steady,
-            SortformerWorkspaceEstimate {
-                host_bytes: 20,
-                accelerator_bytes: 40,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(materialized, JobResourceObservation::new(143, 47));
     }
 
     #[test]

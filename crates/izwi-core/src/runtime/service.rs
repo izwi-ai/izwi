@@ -413,7 +413,7 @@ fn managed_kv_device_pages(snapshot: &crate::engine::ManagedKvRuntimeSnapshot) -
         .fold(0_u64, u64::saturating_add)
 }
 
-fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
+pub(crate) fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
     const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
     let input_bytes = input_bytes as u64;
     let host_preparation_bytes = BASE_WORKSPACE_BYTES.saturating_add(input_bytes.saturating_mul(8));

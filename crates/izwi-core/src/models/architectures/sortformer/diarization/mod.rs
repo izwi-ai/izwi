@@ -467,10 +467,11 @@ fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
     }
 }
 
-/// Immutable pre-admission ceiling for the supported production checkpoints.
-/// The estimate uses each checkpoint's largest supported streaming profile
-/// and admits the larger of the two, while the loaded model later reports
-/// its exact profile-shaped peak.
+/// Immutable refusal ceiling for the supported production checkpoints. The
+/// estimate uses each checkpoint's largest supported streaming profile and
+/// takes the larger of the two. It is never reserved: a diarize stage
+/// reserves the loaded model's own profile-shaped estimate and refuses one
+/// above this ceiling.
 pub fn production_workspace_authorization(
     target_sample_count: usize,
     separate_device_memory: bool,
@@ -491,6 +492,41 @@ pub fn production_workspace_authorization(
         host_bytes: v21.host_bytes.max(nemotron3.host_bytes),
         accelerator_bytes: v21.accelerator_bytes.max(nemotron3.accelerator_bytes),
     })
+}
+
+/// The workspace `variant` estimates once loaded under its checkpoint's own
+/// streaming profile (no latency override), so tests can price a request
+/// without the checkpoint. v2.1's `model_config.yaml` pins chunk 188, left
+/// and right context 1, FIFO 0 and update period 188.
+#[cfg(test)]
+pub(crate) fn checkpoint_profile_workspace_estimate(
+    variant: ModelVariant,
+    target_sample_count: usize,
+    separate_device_memory: bool,
+) -> Result<SortformerWorkspaceEstimate> {
+    let (topology, cfg) = match variant {
+        ModelVariant::DiarStreamingSortformer4SpkV21 => (
+            SortformerWorkspaceTopology::v21_production(),
+            SortformerStreamingConfig {
+                chunk_len: 188,
+                chunk_left_context: 1,
+                chunk_right_context: 1,
+                fifo_len: 0,
+                spkcache_update_period: 188,
+                ..production_workspace_streaming_config()
+            },
+        ),
+        ModelVariant::Nemotron3Diarization => (
+            SortformerWorkspaceTopology::nemotron3_production(),
+            nemotron3_workspace_streaming_config(),
+        ),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "{other} is not a Sortformer diarizer"
+            )))
+        }
+    };
+    workspace_estimate_for(topology, cfg, target_sample_count, separate_device_memory)
 }
 
 fn workspace_estimate_for(
