@@ -135,6 +135,15 @@ fn plan_begin_attempts_exhausted(
     *count >= MAX_PLAN_BEGIN_ATTEMPTS
 }
 
+/// One scheduled row whose managed-state preparation failed with an error
+/// other than capacity backpressure.
+#[derive(Debug)]
+struct ManagedPrepareFailure {
+    scheduled: super::scheduler::ScheduledRequest,
+    session: super::SessionKey,
+    error: Error,
+}
+
 /// Why [`EngineCore::begin_execution_plan`] did not register a plan.
 #[derive(Debug)]
 enum PlanBeginError {
@@ -608,6 +617,10 @@ pub struct EngineCore {
     /// Consecutive steps on which a session's execution plan failed to
     /// begin; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`] (TPIPE-15).
     plan_begin_attempts: HashMap<super::SessionKey, u32>,
+    /// Consecutive steps whose managed-state preparation failed for a session
+    /// with a non-backpressure error; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`]
+    /// so one failing row can never stall every other row (H2).
+    managed_prepare_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
     /// Each session's current run of refused batch workspaces.
@@ -2804,6 +2817,7 @@ impl EngineCore {
         max_candidates: usize,
         capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
         transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
+        prepare_failures: &mut Vec<ManagedPrepareFailure>,
     ) -> Result<Vec<PreparedPhysicalDispatch>> {
         let available = requests
             .iter()
@@ -2960,8 +2974,19 @@ impl EngineCore {
                     );
                     continue;
                 }
-                Some(Err(error)) => return Err(error),
+                Some(Err(error)) => {
+                    // Only this row failed; keep forming the others. The
+                    // caller rolls the row back and either retries it on a
+                    // later step or fails it terminally.
+                    prepare_failures.push(ManagedPrepareFailure {
+                        scheduled: scheduled.clone(),
+                        session: plan.session.clone(),
+                        error,
+                    });
+                    continue;
+                }
             };
+            self.managed_prepare_attempts.remove(&plan.session);
             if let Some(reservation) = managed_cache.as_ref() {
                 if self
                     .active_managed_cache
@@ -3286,6 +3311,7 @@ impl EngineCore {
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
             plan_begin_attempts: HashMap::new(),
+            managed_prepare_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
             workspace_waits: HashMap::new(),
@@ -4546,6 +4572,7 @@ impl EngineCore {
 
         let mut capacity_blocked = Vec::new();
         let mut transaction_deferred = Vec::new();
+        let mut prepare_failures = Vec::new();
         let candidate_capacity = self
             .config
             .resolved_physical_execution_capacity()
@@ -4572,6 +4599,7 @@ impl EngineCore {
                 prefill_quota,
                 &mut capacity_blocked,
                 &mut transaction_deferred,
+                &mut prepare_failures,
             ) {
                 Ok(batches) => batches,
                 Err(Error::Backpressure(reason)) => {
@@ -4595,6 +4623,7 @@ impl EngineCore {
                 decode_limit,
                 &mut capacity_blocked,
                 &mut transaction_deferred,
+                &mut prepare_failures,
             ) {
                 Ok(batches) => batches,
                 Err(Error::Backpressure(reason)) => {
@@ -4629,6 +4658,7 @@ impl EngineCore {
                             1,
                             &mut capacity_blocked,
                             &mut transaction_deferred,
+                            &mut prepare_failures,
                         ) {
                             Ok(batches) => batches,
                             Err(Error::Backpressure(reason)) => {
@@ -4650,6 +4680,7 @@ impl EngineCore {
                             1,
                             &mut capacity_blocked,
                             &mut transaction_deferred,
+                            &mut prepare_failures,
                         ) {
                             Ok(batches) => batches,
                             Err(Error::Backpressure(reason)) => {
@@ -4682,6 +4713,8 @@ impl EngineCore {
         }
         self.rollback_unexecuted_schedule(&transaction_deferred);
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
+        self.resolve_managed_prepare_failures(prepare_failures)
+            .await;
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
             && (self
@@ -5198,6 +5231,63 @@ impl EngineCore {
     /// other terminal failure.
     /// A session whose plan failed to begin on [`MAX_PLAN_BEGIN_ATTEMPTS`]
     /// consecutive steps fails terminally instead of retrying forever.
+    /// Roll back rows whose managed-state preparation failed and decide their
+    /// fate without failing the step for every other row. `Overloaded` means
+    /// the request can never fit (or a device allocation failed after
+    /// admission), so it fails now; any other error is retried on later
+    /// steps up to [`MAX_PLAN_BEGIN_ATTEMPTS`] and then fails the request.
+    async fn resolve_managed_prepare_failures(&mut self, failures: Vec<ManagedPrepareFailure>) {
+        if failures.is_empty() {
+            return;
+        }
+        let scheduled = failures
+            .iter()
+            .map(|failure| failure.scheduled.clone())
+            .collect::<Vec<_>>();
+        self.rollback_unexecuted_schedule(&scheduled);
+        for ManagedPrepareFailure { session, error, .. } in failures {
+            let terminal = matches!(error, Error::Overloaded(_))
+                || plan_begin_attempts_exhausted(&mut self.managed_prepare_attempts, &session);
+            if !terminal {
+                debug!(
+                    request_id = %session.request_id,
+                    error = %error,
+                    "Managed KV preparation failed for one row; retrying it on a later step"
+                );
+                continue;
+            }
+            self.managed_prepare_attempts.remove(&session);
+            let resource_exhausted = matches!(error, Error::Overloaded(_));
+            warn!(
+                request_id = %session.request_id,
+                session_epoch = session.epoch,
+                error = %error,
+                "Managed KV state could not be prepared; failing the request"
+            );
+            let message = format!("managed KV state could not be prepared: {error}");
+            self.terminate_request_session(
+                &session,
+                ExecutorOutput::error(session.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: if resource_exhausted {
+                        FailureKind::ResourceExhausted
+                    } else {
+                        FailureKind::Internal
+                    },
+                    scope: FailureScope::Row,
+                    retry: RetryDisposition::Never,
+                    health: HealthImpact::None,
+                    message,
+                }),
+                OutcomeProvenance::failure(
+                    FailureOrigin::AdapterPlanning,
+                    DispatchState::NotStarted,
+                ),
+            )
+            .await;
+        }
+    }
+
     async fn fail_unstartable_plan(&mut self, session: &super::SessionKey, error: Error) {
         warn!(
             request_id = %session.request_id,
@@ -8013,6 +8103,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(joined.len(), 1);
@@ -8048,6 +8139,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(split.len(), 1);
@@ -8253,6 +8345,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         let widths = batches
@@ -8422,6 +8515,7 @@ mod tests {
                 usize::MAX,
                 &mut Vec::new(),
                 &mut deferred,
+                &mut Vec::new(),
             )
             .unwrap();
         assert_eq!(batches.len(), 1);
@@ -8519,6 +8613,7 @@ mod tests {
                     &requests,
                     &scheduled,
                     usize::MAX,
+                    &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
                 )
@@ -10167,6 +10262,73 @@ mod tests {
             )
             .expect("waiter committed table");
         assert_eq!(snapshot.committed_tokens, 4);
+    }
+
+    /// H2: a row whose managed state can never be prepared fails alone. The
+    /// step used to return the error for every scheduled row, and the run loop
+    /// rescheduled the same row forever, starving all other requests.
+    #[tokio::test]
+    async fn managed_prepare_failure_fails_only_its_own_request() {
+        let model_instance = ModelInstanceId::new(94);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 1,
+                max_batch_size: 2,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        // 40 prompt tokens need three 16-token pages; the arena holds one, so
+        // the full-request claim is `Overloaded` on every attempt.
+        let oversized =
+            managed_test_request(&mut core, model_instance, "oversized", (1..=40).collect());
+        let healthy = managed_test_request(&mut core, model_instance, "healthy", vec![1, 2, 3, 4]);
+        core.add_request(oversized).expect("add oversized");
+        core.add_request(healthy).expect("add healthy");
+
+        let mut outputs = Vec::new();
+        for _ in 0..4 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("one row's preparation failure must not fail the engine step"),
+            );
+        }
+
+        let failed = outputs
+            .iter()
+            .find(|output| output.request_id == "oversized" && output.is_finished)
+            .expect("the oversized request reaches a terminal output");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("managed KV state could not be prepared")),
+            "{:?}",
+            failed.error
+        );
+        assert!(!core.has_request(&"oversized".to_string()));
+        let healthy_session = core
+            .get_session_key(&"healthy".to_string())
+            .expect("healthy session");
+        let snapshot = core
+            .managed_kv_cache
+            .snapshot(
+                model_instance,
+                &healthy_session,
+                crate::kv::CacheDomainId::new(1),
+            )
+            .expect("healthy request committed its prefill");
+        // The healthy row kept running while the oversized one failed: its
+        // whole prompt is committed (decode steps may have advanced further).
+        assert!(snapshot.committed_tokens >= 4, "{}", snapshot.committed_tokens);
     }
 
     #[tokio::test]
