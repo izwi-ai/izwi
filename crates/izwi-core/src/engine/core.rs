@@ -559,6 +559,11 @@ impl LifecycleRetryPolicy {
     }
 }
 
+/// The context a chat model needs to be useful on CPU and Metal: below it a
+/// load is refused (503) instead of publishing, say, a 64-token context that
+/// rejects every real prompt.
+const CHAT_MINIMUM_CONTEXT_TOKENS: u64 = 4_096;
+
 /// How a chat model's CUDA KV pool is sized at load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CudaResidentPool {
@@ -5801,7 +5806,9 @@ impl EngineCore {
                         contract,
                         logical_context_tokens,
                         1,
-                        PortableFitHeadroom::Planning,
+                        PortableFitHeadroom::Planning {
+                            minimum_tokens: CHAT_MINIMUM_CONTEXT_TOKENS,
+                        },
                     )?,
                     retained_sequence_rows,
                     staged_transaction_rows,
@@ -5972,7 +5979,7 @@ impl EngineCore {
             logical_context_tokens,
             1,
             (retained_rows, staged_rows),
-            PortableFitHeadroom::Planning,
+            PortableFitHeadroom::Planning { minimum_tokens: 0 },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,

@@ -525,8 +525,11 @@ impl Default for ManagedKvCacheManager {
 /// What a portable managed-state fit may spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortableFitHeadroom {
-    /// Stable planning headroom (chat and Fish state).
-    Planning,
+    /// Stable planning headroom (chat and Fish state). `minimum_tokens` is
+    /// the context the model needs to be useful (chat: one ordinary
+    /// conversation; `0`: the page minimum). A load that cannot reach it is
+    /// refused with a capacity error instead of publishing a tiny context.
+    Planning { minimum_tokens: u64 },
     /// Planning headroom clamped to live memory
     /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR and TTS
     /// retained state, which must leave room for the requests it serves.
@@ -652,7 +655,7 @@ impl ManagedKvCacheManager {
         };
         let planning = authority.planning_headroom_bytes(self.worker_backend)?;
         let (growth_headroom, safety_reserve_bytes) = match headroom {
-            PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
+            PortableFitHeadroom::Planning { .. } => (planning, safety_reserve_bytes),
             // Retained state keeps the one reserve its invocation fit keeps
             // too: the configured floor or, for an observed load, the
             // measured untracked growth (ADM-11).
@@ -721,8 +724,8 @@ impl ManagedKvCacheManager {
         };
 
         let floor_tokens = match headroom {
-            PortableFitHeadroom::Live { minimum_tokens, .. } => minimum_tokens,
-            PortableFitHeadroom::Planning => 0,
+            PortableFitHeadroom::Live { minimum_tokens, .. }
+            | PortableFitHeadroom::Planning { minimum_tokens } => minimum_tokens,
         };
         let minimum_tokens = u64::from(page_tokens_hint)
             .max(floor_tokens)
@@ -740,11 +743,13 @@ impl ManagedKvCacheManager {
                 minimum_bytes,
                 floor_budget_bytes,
             );
-            // An ASR or TTS floor that planning headroom cannot hold is a
-            // capacity refusal (503), not a load defect.
+            // A model-authored floor (ASR, TTS, chat) that headroom cannot
+            // hold is a capacity refusal (503), not a load defect.
             return Err(match headroom {
-                PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
-                PortableFitHeadroom::Planning => Error::ModelLoadError(message),
+                PortableFitHeadroom::Planning { minimum_tokens: 0 } => {
+                    Error::ModelLoadError(message)
+                }
+                _ => Error::Overloaded(message),
             });
         }
         let budget_bytes = growth_budget_bytes.max(minimum_bytes);
@@ -6349,7 +6354,7 @@ mod tests {
                     8,
                     8,
                     1,
-                    PortableFitHeadroom::Planning,
+                    PortableFitHeadroom::Planning { minimum_tokens: 0 },
                 )
                 .unwrap(),
             4_096
@@ -6370,11 +6375,30 @@ mod tests {
                 8,
                 8,
                 2,
-                PortableFitHeadroom::Planning,
+                PortableFitHeadroom::Planning { minimum_tokens: 0 },
             )
             .unwrap();
         assert!(selected < 4_096);
         assert!(selected >= 64);
+
+        // With a chat floor the same squeeze is a capacity refusal (503),
+        // not a published sub-floor context; a floor that fits is honoured.
+        let floored = |minimum_tokens| {
+            duplicated.fit_portable_logical_token_reach(
+                ModelInstanceId::new(902),
+                &contract,
+                40_960,
+                RESERVE,
+                64,
+                8,
+                8,
+                2,
+                PortableFitHeadroom::Planning { minimum_tokens },
+            )
+        };
+        assert!(matches!(floored(4_096), Err(Error::Overloaded(_))));
+        let reach = floored(1_024).unwrap();
+        assert!((1_024..4_096).contains(&reach), "{reach}");
     }
 
     /// ASR state fits spend live memory, not only ledger headroom: with the
@@ -6447,7 +6471,7 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
+        assert_eq!(fit(PortableFitHeadroom::Planning { minimum_tokens: 0 }), 4_096);
         let live = fit(PortableFitHeadroom::Live {
             minimum_tokens: 0,
             reserve: StateFitReserve::MeasuredUntracked,
