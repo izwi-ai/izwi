@@ -21,7 +21,7 @@
 //! never read, matching the ring-sequence kernels.
 
 use candle_core::{
-    bail, CpuStorage, CustomOp3, DType, Layout, Result as CandleResult, Shape, Tensor,
+    bail, CpuStorage, CustomOp3, Layout, Result as CandleResult, Shape, Tensor,
 };
 
 use crate::error::{Error, Result};
@@ -175,6 +175,7 @@ impl CustomOp3 for GatedRingStepOp {
     ) -> CandleResult<(candle_core::MetalStorage, Shape)> {
         use super::metal_encoder::IzwiMetalCommandEncoderExt;
         use candle_core::backend::BackendStorage;
+        use candle_core::DType;
         self.check(l1, l2, l3)?;
         if [s1.dtype(), s2.dtype(), s3.dtype()]
             .iter()
@@ -322,7 +323,7 @@ kernel void izwi_lfm_shortconv_gated_ring_step_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::Device;
+    use candle_core::{DType, Device};
 
     /// Deterministic unstructured values (xorshift), per tasks/lessons.md.
     fn xorshift(seed: u32, count: usize) -> Vec<f32> {
