@@ -1,0 +1,18 @@
+{
+  "source": "English numbers fixture for TTS text normalization (TPIPE-26). Measure a family's own reading of each input before opting it in.",
+  "cases": [
+    {"input": "It costs $1,250.75 today.", "expected": "It costs one thousand two hundred fifty dollars and seventy-five cents today."},
+    {"input": "We met on March 3rd.", "expected": "We met on March third."},
+    {"input": "We met on March 3, 2025.", "expected": "We met on March third, twenty twenty-five."},
+    {"input": "The train leaves at 10:30 and arrives at 9:05 pm.", "expected": "The train leaves at ten thirty and arrives at nine oh five p m."},
+    {"input": "Doors open at 7:00.", "expected": "Doors open at seven o'clock."},
+    {"input": "Sales rose 12.5% to $5 million.", "expected": "Sales rose twelve point five percent to five million dollars."},
+    {"input": "A coffee is $1 or £3.50.", "expected": "A coffee is one dollar or three pounds and fifty pence."},
+    {"input": "Only $0.99!", "expected": "Only ninety-nine cents!"},
+    {"input": "She ran 5 km in 1999.", "expected": "She ran five kilometers in nineteen ninety-nine."},
+    {"input": "It weighs 1 kg and it is 20°C outside.", "expected": "It weighs one kilogram and it is twenty degrees Celsius outside."},
+    {"input": "Pi is 3.14 and the low was -5.", "expected": "Pi is three point one four and the low was minus five."},
+    {"input": "He finished 21st of 1,000,000 runners.", "expected": "He finished twenty-first of one million runners."},
+    {"input": "Play the MP3 in 4K on v1.2.", "expected": "Play the MP3 in 4K on v1.2."}
+  ]
+}

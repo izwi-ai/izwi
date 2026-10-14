@@ -47,7 +47,8 @@ use crate::models::architectures::lfm25_audio::{
     model::{
         Lfm25AudioAsrPreparationResourceEnvelope, Lfm25AudioAsrPreparationStageCeiling,
         Lfm25AudioAsrStepResourceEnvelope, Lfm25AudioPreparedAsrArtifact,
-        Lfm25AudioTtsStageCeiling, Lfm25AudioTtsStepResourceEnvelope,
+        Lfm25AudioTtsPreparationEnvelope, Lfm25AudioTtsStageCeiling,
+        Lfm25AudioTtsStepResourceEnvelope,
     },
     physical::{
         Lfm25AudioPhysicalStateSpec, Lfm25AudioRetainedStateSpec, Lfm25AudioStateMode,
@@ -3152,6 +3153,15 @@ impl NativeAudioChatModel {
         }
     }
 
+    pub(crate) fn lfm25_audio_tts_preparation_envelope(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Lfm25AudioTtsPreparationEnvelope> {
+        match self {
+            Self::Lfm25Audio(model) => model.tts_preparation_envelope(messages),
+        }
+    }
+
     pub(crate) fn lfm25_audio_tts_prefill_resource_envelope(
         &self,
         start: usize,
@@ -3265,6 +3275,17 @@ impl NativeAudioChatModel {
     ) -> Result<Vec<f32>> {
         match self {
             Self::Lfm25Audio(model) => model.detokenize_retained_tts_state(state),
+        }
+    }
+
+    /// The audio of the codes committed since the last call (LFT-5), for a
+    /// streamed request in place of the whole-utterance detokenize.
+    pub(crate) fn stream_lfm25_audio_retained_tts_audio(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        match self {
+            Self::Lfm25Audio(model) => model.stream_retained_tts_audio(state),
         }
     }
 
@@ -5821,6 +5842,9 @@ pub struct ModelRegistry {
     qwen_tts_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<Qwen3TtsModel>>>>>,
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
+    /// Per loaded model: what admission priced for its weights and what the
+    /// device observer saw them occupy (TADM-13).
+    weight_residency: Arc<std::sync::RwLock<HashMap<ModelVariant, WeightResidency>>>,
 }
 
 /// Explicit name for the in-memory registry of loaded native model handles.
@@ -5846,12 +5870,26 @@ pub struct LoadedModelDiagnostics {
     pub default_dtype_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_context_tokens: Option<usize>,
+    /// Priced vs actual weights (TADM-13): what load admission authorized
+    /// for the weights and what the device observer (Metal
+    /// `currentAllocatedSize`, CUDA `mem_get_info`) saw them take.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_residency: Option<WeightResidency>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_incremental_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_realtime_stream_decode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family_diagnostics: Option<Value>,
+}
+
+/// A loaded model's weights, priced and observed, in the load domain's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WeightResidency {
+    /// The load peak admission authorized.
+    pub priced_bytes: u64,
+    /// The device growth observed over the weight load (after the fence).
+    pub observed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -5879,6 +5917,43 @@ impl LoadedModelActualRuntime {
 fn normalize_observed_runtime_value(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
+/// Process-wide TTS fast-path counters for a loaded model's diagnostics:
+/// each one counts a path that replaced a slower one, so a live server
+/// shows whether it ran.
+fn tts_fast_path_counters(family: ModelFamily) -> Option<Value> {
+    use crate::models::architectures::{fish_s2, kokoro, qwen3, voxtral};
+    match family {
+        ModelFamily::Qwen3Tts => Some(serde_json::json!({
+            "codec_stream_frames_total": qwen3::tts::qwen3_tts_codec_stream_frames(),
+        })),
+        ModelFamily::VoxtralTts => Some(serde_json::json!({
+            "lm_rope_uploads_total": voxtral::lm::voxtral_lm_rope_uploads(),
+            "acoustic_step_uploads_total": voxtral::tts::acoustic::voxtral_acoustic_step_uploads(),
+        })),
+        ModelFamily::KokoroTts => Some(serde_json::json!({
+            "fused_lstm_steps_total": kokoro::kokoro_fused_lstm_steps(),
+            "checkpoint_parses_total": kokoro::kokoro_checkpoint_parses(),
+        })),
+        ModelFamily::FishS2Tts => Some(serde_json::json!({
+            "resident_fast_frames_total": fish_s2::fast::fish_s2_resident_fast_frames(),
+        })),
+        _ => None,
+    }
+}
+
+/// `diagnostics` with `variant`'s fast-path counters added beside its own
+/// fields.
+fn with_tts_fast_path_counters(variant: ModelVariant, diagnostics: Option<Value>) -> Option<Value> {
+    let Some(counters) = tts_fast_path_counters(variant.family()) else {
+        return diagnostics;
+    };
+    let mut merged = diagnostics.unwrap_or_else(|| Value::Object(Default::default()));
+    if let (Some(fields), Value::Object(counters)) = (merged.as_object_mut(), counters) {
+        fields.extend(counters);
+    }
+    Some(merged)
 }
 
 fn loaded_model_diagnostics_entry(
@@ -5909,6 +5984,7 @@ fn loaded_model_diagnostics_entry(
         default_compute_dtype: format!("{:?}", dtype_selection.dtype).to_ascii_lowercase(),
         default_dtype_reason: dtype_selection.reason.into_owned(),
         effective_context_tokens: None,
+        weight_residency: None,
         supports_incremental_decode,
         supports_realtime_stream_decode,
         family_diagnostics,
@@ -6040,6 +6116,7 @@ impl ModelRegistry {
             qwen_tts_models: Arc::new(RwLock::new(HashMap::new())),
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            weight_residency: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -6088,6 +6165,26 @@ impl ModelRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&variant)
             .copied()
+    }
+
+    /// Record what admission priced for `variant`'s weights and what the
+    /// device observer saw the load allocate.
+    pub(crate) fn publish_weight_residency(
+        &self,
+        variant: ModelVariant,
+        residency: WeightResidency,
+    ) {
+        self.weight_residency
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(variant, residency);
+    }
+
+    pub(crate) fn clear_weight_residency(&self, variant: ModelVariant) {
+        self.weight_residency
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&variant);
     }
 
     pub(crate) fn clear_effective_context(&self, variant: ModelVariant) {
@@ -6228,7 +6325,12 @@ impl ModelRegistry {
         {
             let guard = self.voxtral_tts_models.read().await;
             for (variant, entry) in guard.iter() {
-                if entry.ready_model().is_some() {
+                if let Some(model) = entry.ready_model() {
+                    let precision = serde_json::json!({
+                        "precision": model
+                            .precision()
+                            .map(crate::kernels::numeric_check::PrecisionLoad::diagnostics),
+                    });
                     diagnostics.push(loaded_model_diagnostics_entry(
                         &self.device,
                         *variant,
@@ -6237,7 +6339,7 @@ impl ModelRegistry {
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
-                        None,
+                        with_tts_fast_path_counters(*variant, Some(precision)),
                     ));
                 }
             }
@@ -6281,7 +6383,10 @@ impl ModelRegistry {
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
-                    serde_json::to_value(model.diagnostics()).ok(),
+                    with_tts_fast_path_counters(
+                        *variant,
+                        serde_json::to_value(model.diagnostics()).ok(),
+                    ),
                 ));
             }
         }
@@ -6305,7 +6410,10 @@ impl ModelRegistry {
                     actual_runtime,
                     None,
                     None,
-                    serde_json::to_value(model_diagnostics).ok(),
+                    with_tts_fast_path_counters(
+                        *variant,
+                        serde_json::to_value(model_diagnostics).ok(),
+                    ),
                 ));
             }
         }
@@ -6322,13 +6430,21 @@ impl ModelRegistry {
                         LoadedModelActualRuntime::default(),
                         None,
                         None,
-                        None,
+                        with_tts_fast_path_counters(*variant, None),
                     ));
                 }
             }
         }
 
         for entry in &mut diagnostics {
+            entry.weight_residency = self
+                .weight_residency
+                .read()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .iter()
+                .find_map(|(variant, residency)| {
+                    (variant.dir_name() == entry.variant_id).then_some(*residency)
+                });
             entry.effective_context_tokens = self
                 .effective_contexts
                 .read()
@@ -7514,6 +7630,74 @@ mod tests {
         assert_eq!(diagnostics.default_compute_dtype, "f32");
         assert_eq!(diagnostics.supports_incremental_decode, Some(true));
         assert!(diagnostics.default_dtype_reason.contains("CPU"));
+    }
+
+    #[test]
+    fn tts_diagnostics_carry_each_familys_fast_path_counters() {
+        let counters = |variant: ModelVariant, own: Option<Value>| {
+            let merged = with_tts_fast_path_counters(variant, own).expect("diagnostics");
+            let mut keys = merged
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            counters(
+                ModelVariant::Voxtral4BTts2603,
+                Some(serde_json::json!({ "precision": null }))
+            ),
+            [
+                "acoustic_step_uploads_total",
+                "lm_rope_uploads_total",
+                "precision"
+            ]
+        );
+        assert_eq!(
+            counters(ModelVariant::Kokoro82M, None),
+            ["checkpoint_parses_total", "fused_lstm_steps_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::FishAudioS2Pro, Some(serde_json::json!({}))),
+            ["resident_fast_frames_total"]
+        );
+        assert_eq!(
+            counters(ModelVariant::Qwen3Tts12Hz06BBase, None),
+            ["codec_stream_frames_total"]
+        );
+        assert_eq!(
+            with_tts_fast_path_counters(ModelVariant::VibeVoice15BTts, None),
+            None
+        );
+    }
+
+    #[test]
+    fn weight_residency_is_published_per_model_and_cleared_on_unload() {
+        let registry = ModelRegistry::new(PathBuf::new(), DeviceProfile::cpu());
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let residency = WeightResidency {
+            priced_bytes: 5_950_000_000,
+            observed_bytes: 4_080_000_000,
+        };
+        registry.publish_weight_residency(variant, residency);
+        assert_eq!(
+            registry
+                .weight_residency
+                .read()
+                .unwrap()
+                .get(&variant)
+                .copied(),
+            Some(residency)
+        );
+        assert_eq!(
+            serde_json::to_value(residency).unwrap(),
+            serde_json::json!({"priced_bytes": 5_950_000_000u64, "observed_bytes": 4_080_000_000u64})
+        );
+        registry.clear_weight_residency(variant);
+        assert!(registry.weight_residency.read().unwrap().is_empty());
     }
 
     #[test]

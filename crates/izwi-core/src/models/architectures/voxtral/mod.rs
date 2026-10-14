@@ -98,6 +98,18 @@ pub(crate) struct VoxtralPhysicalStateSpec {
     pub(crate) invocation: InferenceStateContract,
 }
 
+/// Voxtral-TTS state on the engine route: the LM's paged K/V retained per
+/// sequence (one context per request, shared by prefill and decode), and
+/// per-stage scratch only. The earlier invocation-only layout gave every
+/// stage, including preparation and the codec, its own K/V arena at the
+/// model's 128,000-token maximum (VXT-2).
+#[derive(Debug, Clone)]
+pub(crate) struct VoxtralTtsPhysicalStateSpec {
+    pub(crate) descriptor: CapabilityStateDescriptorV2,
+    pub(crate) retained: InferenceStateContract,
+    pub(crate) retained_max_tokens: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct VoxtralRealtimePhysicalStateSpec {
     pub(crate) descriptor: CapabilityStateDescriptorV2,
@@ -164,6 +176,103 @@ pub(crate) fn voxtral_retained_contract(
     }
     contract.validate()?;
     Ok(contract)
+}
+
+/// The Voxtral-TTS engine-route state for the sealed four-stage graph:
+/// `invocation` (the LM's paged K/V) becomes retained state fitted to
+/// `retained_max_tokens`, and stages keep only their scratch.
+pub(crate) fn voxtral_tts_physical_state_spec(
+    stage_graphs: &[&[StageDescriptor]],
+    invocation: InferenceStateContract,
+    retained_max_tokens: usize,
+) -> Result<VoxtralTtsPhysicalStateSpec> {
+    if stage_graphs.is_empty() || retained_max_tokens == 0 {
+        return Err(Error::ModelLoadError(
+            "Voxtral TTS retained state requires stages and a non-zero context".into(),
+        ));
+    }
+    let retained = voxtral_retained_contract(invocation)?;
+    let descriptor = voxtral_retained_scratch_descriptor(stage_graphs, &retained, "Voxtral TTS")?;
+    Ok(VoxtralTtsPhysicalStateSpec {
+        descriptor,
+        retained,
+        retained_max_tokens,
+    })
+}
+
+/// A descriptor with `retained` as managed state and one per-row scratch
+/// domain for every stage that declares a workspace.
+fn voxtral_retained_scratch_descriptor(
+    stage_graphs: &[&[StageDescriptor]],
+    retained: &InferenceStateContract,
+    label: &str,
+) -> Result<CapabilityStateDescriptorV2> {
+    let max_domain_id = retained
+        .domains
+        .iter()
+        .map(|domain| domain.id().get())
+        .max()
+        .ok_or_else(|| Error::ModelLoadError(format!("{label} retained contract is empty")))?;
+    let mut profiles = Vec::with_capacity(stage_graphs.len());
+    for stages in stage_graphs {
+        let mut ordered = stages.iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|stage| stage.id);
+        let mut invocation_stages = Vec::with_capacity(ordered.len());
+        for (index, stage) in ordered.into_iter().enumerate() {
+            // A stage that declares only its batch maximum leases an equal
+            // share per row.
+            let per_row_workspace = if stage.workspace_per_row_bytes == 0 {
+                stage.max_workspace_bytes / u64::try_from(stage.max_batch_size.max(1)).unwrap_or(1)
+            } else {
+                stage.workspace_per_row_bytes
+            };
+            let domains = if per_row_workspace == 0 {
+                Vec::new()
+            } else {
+                let scratch_id = max_domain_id
+                    .checked_add(u32::try_from(index + 1).map_err(|_| {
+                        Error::ModelLoadError(format!("{label} execution stage count exceeds u32"))
+                    })?)
+                    .ok_or_else(|| {
+                        Error::ModelLoadError(format!("{label} scratch domain overflow"))
+                    })?;
+                vec![InvocationWorkspaceDomain::Scratch {
+                    id: StateDomainId::new(scratch_id),
+                    placement: PlacementPolicy::BackendLocal,
+                    alignment_bytes: 64,
+                    zero_on_release: false,
+                    formula: WorkspaceFormula {
+                        fixed_bytes: per_row_workspace,
+                        dimensions: vec![],
+                        terms: vec![],
+                    },
+                }]
+            };
+            invocation_stages.push(InvocationStageWorkspace {
+                stage: stage.id,
+                lease_scope: InvocationLeaseScope::PerRow,
+                groups: Vec::new(),
+                domains,
+            });
+        }
+        profiles.push(InvocationWorkspaceProfile {
+            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
+            stages: invocation_stages,
+        });
+    }
+    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
+    profiles.dedup();
+    let descriptor = CapabilityStateDescriptorV2 {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        retained: RetainedStateCapability::Managed {
+            contract: retained.clone(),
+        },
+        invocation: InvocationWorkspaceSet::Bounded { profiles },
+    };
+    for stages in stage_graphs {
+        descriptor.validate_against_stages(stages)?;
+    }
+    Ok(descriptor)
 }
 
 pub(crate) fn voxtral_realtime_physical_state_spec(
@@ -260,71 +369,8 @@ pub(crate) fn voxtral_realtime_physical_state_spec(
             ));
         }
     }
-    let max_domain_id = retained
-        .domains
-        .iter()
-        .map(|domain| domain.id().get())
-        .max()
-        .ok_or_else(|| Error::ModelLoadError("Voxtral retained contract is empty".into()))?;
-    let mut profiles = Vec::with_capacity(stage_graphs.len());
-    for stages in stage_graphs {
-        let mut ordered = stages.iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|stage| stage.id);
-        let mut invocation_stages = Vec::with_capacity(ordered.len());
-        for (index, stage) in ordered.into_iter().enumerate() {
-            let per_row_workspace = if stage.workspace_per_row_bytes == 0 {
-                stage.max_workspace_bytes
-            } else {
-                stage.workspace_per_row_bytes
-            };
-            let domains = if per_row_workspace == 0 {
-                Vec::new()
-            } else {
-                let scratch_id = max_domain_id
-                    .checked_add(u32::try_from(index + 1).map_err(|_| {
-                        Error::ModelLoadError(
-                            "Voxtral realtime execution stage count exceeds u32".into(),
-                        )
-                    })?)
-                    .ok_or_else(|| {
-                        Error::ModelLoadError("Voxtral realtime scratch domain overflow".into())
-                    })?;
-                vec![InvocationWorkspaceDomain::Scratch {
-                    id: StateDomainId::new(scratch_id),
-                    placement: PlacementPolicy::BackendLocal,
-                    alignment_bytes: 64,
-                    zero_on_release: false,
-                    formula: WorkspaceFormula {
-                        fixed_bytes: per_row_workspace,
-                        dimensions: vec![],
-                        terms: vec![],
-                    },
-                }]
-            };
-            invocation_stages.push(InvocationStageWorkspace {
-                stage: stage.id,
-                lease_scope: InvocationLeaseScope::PerRow,
-                groups: Vec::new(),
-                domains,
-            });
-        }
-        profiles.push(InvocationWorkspaceProfile {
-            stage_graph_fingerprint: stage_graph_fingerprint(stages)?,
-            stages: invocation_stages,
-        });
-    }
-    profiles.sort_unstable_by_key(|profile| profile.stage_graph_fingerprint);
-    profiles.dedup();
-    let descriptor = CapabilityStateDescriptorV2 {
-        abi: CURRENT_INFERENCE_STATE_ABI,
-        retained: RetainedStateCapability::Managed {
-            contract: retained.clone(),
-        },
-        invocation: InvocationWorkspaceSet::Bounded { profiles },
-    };
-    for stages in stage_graphs {
-        descriptor.validate_against_stages(stages)?;
-    }
+    let descriptor =
+        voxtral_retained_scratch_descriptor(stage_graphs, &retained, "Voxtral realtime")?;
     Ok(VoxtralRealtimePhysicalStateSpec {
         descriptor,
         retained,

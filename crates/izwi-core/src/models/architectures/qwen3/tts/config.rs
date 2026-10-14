@@ -22,6 +22,10 @@ pub struct Qwen3TtsConfig {
 
     /// Talker (main LLM) configuration
     pub talker_config: TalkerConfig,
+
+    /// ECAPA x-vector encoder (Base checkpoints).
+    #[serde(default)]
+    pub speaker_encoder_config: Option<super::speaker_encoder::SpeakerEncoderConfig>,
 }
 
 /// Talker model configuration (the main Qwen3-based LLM)

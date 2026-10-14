@@ -289,6 +289,12 @@ fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
     scaled.broadcast_add(shift).map_err(Error::from)
 }
 
+/// The final layer's `RMSNorm(elementwise_affine=False)`. The reference
+/// normalizes `x.float()` and casts back (`_norm(x.float()).type_as(x)`),
+/// and so does this: the final layer's input reaches about 480 on the
+/// VibeVoice-1.5B checkpoint, so `x²` in F16 overflowed to infinity and
+/// zeroed the normalized row, which made every F16 (Metal) speech latent
+/// wrong.
 fn rms_norm_no_affine(x: &Tensor, eps: f64, unit_weight: &Tensor) -> Result<Tensor> {
     if x.device().is_cuda() {
         let unit_weight = unit_weight.to_device(x.device())?.to_dtype(x.dtype())?;
@@ -296,11 +302,12 @@ fn rms_norm_no_affine(x: &Tensor, eps: f64, unit_weight: &Tensor) -> Result<Tens
             return Ok(output);
         }
     }
-    let squared = x.sqr()?;
-    let mean = squared.mean_keepdim(D::Minus1)?;
-    let eps = Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?;
-    let denom = mean.broadcast_add(&eps)?.sqrt()?.recip()?;
-    x.broadcast_mul(&denom).map_err(Error::from)
+    let dtype = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let denom = (x.sqr()?.mean_keepdim(D::Minus1)? + eps)?.sqrt()?.recip()?;
+    x.broadcast_mul(&denom)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
 }
 
 fn classifier_free_guidance(
@@ -339,50 +346,92 @@ fn timestep_embedding(t: &Tensor, dim: usize, frequencies: &Tensor) -> Result<Te
     emb.to_dtype(dtype).map_err(Error::from)
 }
 
+/// DPM-Solver++(2M), the reference's noise scheduler:
+/// `DPMSolverMultistepScheduler(num_train_timesteps=1000,
+/// beta_schedule="cosine", prediction_type="v_prediction")` with the
+/// diffusers defaults (solver order 2, `dpmsolver++`, midpoint,
+/// `lower_order_final`, `final_sigmas_type="zero"`, linspace spacing) as
+/// vibevoice `schedule/dpm_solver.py` implements it.
+///
+/// Every step is affine in the current sample, the current data
+/// prediction and the previous one, so the per-step scalars are computed
+/// once on the host in f64 and each step is three fused multiply-adds in
+/// F32 (the reference upcasts the sample to F32 for the update).
 pub struct VibeVoiceDiffusionScheduler {
     alphas_cumprod: Vec<f32>,
     timesteps: Vec<usize>,
+    sigmas: Vec<f32>,
+    coefficients: Vec<DpmSolverCoefficients>,
+}
+
+/// One step: `x0 = data_sample * x + data_model * v` (the v-prediction
+/// data estimate), then `x' = sample * x + current * x0 + previous * x0_prev`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DpmSolverCoefficients {
+    data_sample: f64,
+    data_model: f64,
+    sample: f64,
+    current: f64,
+    previous: f64,
 }
 
 pub struct VibeVoiceDiffusionStepTensors {
     pub timestep: usize,
-    pub prev_timestep: Option<usize>,
     pub timestep_tensor: Tensor,
-    sqrt_alpha: Tensor,
-    sqrt_beta: Tensor,
-    sqrt_prev_alpha: Tensor,
-    sqrt_prev_beta: Tensor,
+    data_sample: Tensor,
+    data_model: Tensor,
+    sample: Tensor,
+    current: Tensor,
+    previous: Option<Tensor>,
+}
+
+/// The multistep history of one sampling trajectory: the previous step's
+/// data prediction (F32). Start each latent with a fresh state.
+#[derive(Default)]
+pub struct DpmSolverState {
+    previous_data: Option<Tensor>,
 }
 
 impl VibeVoiceDiffusionScheduler {
     pub fn new(num_train_timesteps: usize, num_inference_steps: usize) -> Self {
-        let betas = cosine_beta_schedule(num_train_timesteps.max(1));
-        let mut alphas_cumprod = Vec::with_capacity(betas.len());
-        let mut running = 1.0f32;
-        for beta in betas {
-            running *= 1.0 - beta;
-            alphas_cumprod.push(running.clamp(1e-8, 1.0));
+        let train = num_train_timesteps.max(1);
+        let alphas_cumprod = cosine_alphas_cumprod(train);
+        let steps = num_inference_steps.max(1);
+        // np.linspace(0, train - 1, steps + 1).round()[::-1][:-1]; numpy
+        // rounds halves to even.
+        let spacing = (train - 1) as f64 / steps as f64;
+        let mut timesteps = (0..=steps)
+            .map(|k| ((k as f64) * spacing).round_ties_even() as usize)
+            .collect::<Vec<_>>();
+        if let Some(last) = timesteps.last_mut() {
+            *last = train - 1;
         }
-        let inference_steps = num_inference_steps.max(1);
-        let last = num_train_timesteps.saturating_sub(1);
-        let timesteps = (0..inference_steps)
-            .map(|idx| {
-                let frac = if inference_steps == 1 {
-                    0.0
-                } else {
-                    idx as f32 / (inference_steps - 1) as f32
-                };
-                ((last as f32) * (1.0 - frac)).round() as usize
+        timesteps.reverse();
+        timesteps.pop();
+        // sigmas at the inference timesteps, then a final sigma of zero.
+        let mut sigmas = timesteps
+            .iter()
+            .map(|&t| {
+                let alpha = alphas_cumprod[t];
+                ((1.0 - alpha) / alpha).sqrt()
             })
-            .collect();
+            .collect::<Vec<f32>>();
+        sigmas.push(0.0);
+        let coefficients = dpm_solver_coefficients(&sigmas);
         Self {
             alphas_cumprod,
             timesteps,
+            sigmas,
+            coefficients,
         }
     }
 
     pub fn timesteps(&self) -> &[usize] {
         &self.timesteps
+    }
+
+    pub fn sigmas(&self) -> &[f32] {
+        &self.sigmas
     }
 
     pub fn alpha_cumprod(&self, timestep: usize) -> f32 {
@@ -392,136 +441,135 @@ impl VibeVoiceDiffusionScheduler {
             .unwrap_or(1.0)
     }
 
+    /// Per-step scalars and the timestep tensor (in `dtype`, for the
+    /// prediction head); the solver scalars are F32.
     pub fn step_tensors(
         &self,
         device: &Device,
         dtype: DType,
     ) -> Result<Vec<VibeVoiceDiffusionStepTensors>> {
+        let scalar = |value: f64| Tensor::new(value as f32, device).map_err(Error::from);
         self.timesteps
             .iter()
-            .enumerate()
-            .map(|(idx, &timestep)| {
-                let prev_timestep = self.timesteps.get(idx + 1).copied();
-                let coeffs = self.step_coefficients(timestep, prev_timestep);
+            .zip(&self.coefficients)
+            .map(|(&timestep, coefficients)| {
                 Ok(VibeVoiceDiffusionStepTensors {
                     timestep,
-                    prev_timestep,
                     timestep_tensor: Tensor::from_vec(vec![timestep as f32], (1,), device)?
                         .to_dtype(dtype)?,
-                    sqrt_alpha: Tensor::new(coeffs.sqrt_alpha, device)?.to_dtype(dtype)?,
-                    sqrt_beta: Tensor::new(coeffs.sqrt_beta, device)?.to_dtype(dtype)?,
-                    sqrt_prev_alpha: Tensor::new(coeffs.sqrt_prev_alpha, device)?
-                        .to_dtype(dtype)?,
-                    sqrt_prev_beta: Tensor::new(coeffs.sqrt_prev_beta, device)?.to_dtype(dtype)?,
+                    data_sample: scalar(coefficients.data_sample)?,
+                    data_model: scalar(coefficients.data_model)?,
+                    sample: scalar(coefficients.sample)?,
+                    current: scalar(coefficients.current)?,
+                    previous: (coefficients.previous != 0.0)
+                        .then(|| scalar(coefficients.previous))
+                        .transpose()?,
                 })
             })
             .collect()
     }
 
-    pub fn step_v_prediction(
-        &self,
-        model_output: &Tensor,
-        timestep: usize,
-        prev_timestep: Option<usize>,
-        sample: &Tensor,
-    ) -> Result<Tensor> {
-        let coeffs = self.step_coefficients(timestep, prev_timestep);
-        let sqrt_alpha =
-            Tensor::new(coeffs.sqrt_alpha, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_beta = Tensor::new(coeffs.sqrt_beta, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_prev_alpha =
-            Tensor::new(coeffs.sqrt_prev_alpha, sample.device())?.to_dtype(sample.dtype())?;
-        let sqrt_prev_beta =
-            Tensor::new(coeffs.sqrt_prev_beta, sample.device())?.to_dtype(sample.dtype())?;
-        step_v_prediction_with_tensors(
-            model_output,
-            sample,
-            &sqrt_alpha,
-            &sqrt_beta,
-            &sqrt_prev_alpha,
-            &sqrt_prev_beta,
-        )
-    }
-
-    pub fn step_v_prediction_with_tensors(
+    /// One DPM-Solver++ step from a v-prediction `model_output`, returning
+    /// the next sample in the sample's dtype.
+    pub fn step(
         &self,
         model_output: &Tensor,
         sample: &Tensor,
         step: &VibeVoiceDiffusionStepTensors,
+        state: &mut DpmSolverState,
     ) -> Result<Tensor> {
-        step_v_prediction_with_tensors(
-            model_output,
-            sample,
-            &step.sqrt_alpha,
-            &step.sqrt_beta,
-            &step.sqrt_prev_alpha,
-            &step.sqrt_prev_beta,
-        )
-    }
-
-    fn step_coefficients(
-        &self,
-        timestep: usize,
-        prev_timestep: Option<usize>,
-    ) -> DiffusionStepCoefficients {
-        let alpha = self.alpha_cumprod(timestep);
-        let prev_alpha = prev_timestep.map(|t| self.alpha_cumprod(t)).unwrap_or(1.0);
-        let beta = (1.0 - alpha).max(0.0);
-        let prev_beta = (1.0 - prev_alpha).max(0.0);
-        DiffusionStepCoefficients {
-            sqrt_alpha: alpha.sqrt(),
-            sqrt_beta: beta.sqrt(),
-            sqrt_prev_alpha: prev_alpha.sqrt(),
-            sqrt_prev_beta: prev_beta.sqrt(),
+        let dtype = sample.dtype();
+        let x = sample.to_dtype(DType::F32)?;
+        let v = model_output.to_dtype(DType::F32)?;
+        let data = x
+            .broadcast_mul(&step.data_sample)?
+            .broadcast_add(&v.broadcast_mul(&step.data_model)?)?;
+        let mut next = x
+            .broadcast_mul(&step.sample)?
+            .broadcast_add(&data.broadcast_mul(&step.current)?)?;
+        if let Some(previous) = &step.previous {
+            let previous_data = state.previous_data.as_ref().ok_or_else(|| {
+                Error::InferenceError(
+                    "VibeVoice DPM-Solver second-order step has no previous prediction".into(),
+                )
+            })?;
+            next = next.broadcast_add(&previous_data.broadcast_mul(previous)?)?;
         }
+        state.previous_data = Some(data);
+        next.to_dtype(dtype).map_err(Error::from)
     }
 }
 
-struct DiffusionStepCoefficients {
-    sqrt_alpha: f32,
-    sqrt_beta: f32,
-    sqrt_prev_alpha: f32,
-    sqrt_prev_beta: f32,
+/// The reference `step` per index: the first step and the final step (to
+/// sigma 0) are first order, every other step is the second-order
+/// midpoint update with the previous data prediction.
+fn dpm_solver_coefficients(sigmas: &[f32]) -> Vec<DpmSolverCoefficients> {
+    let alpha_sigma = |sigma: f64| {
+        let alpha = 1.0 / (sigma * sigma + 1.0).sqrt();
+        (alpha, sigma * alpha)
+    };
+    let lambda = |(alpha, sigma): (f64, f64)| alpha.ln() - sigma.ln();
+    let steps = sigmas.len() - 1;
+    (0..steps)
+        .map(|index| {
+            let (alpha_s0, sigma_s0) = alpha_sigma(f64::from(sigmas[index]));
+            let (alpha_t, sigma_t) = alpha_sigma(f64::from(sigmas[index + 1]));
+            let data_sample = alpha_s0;
+            let data_model = -sigma_s0;
+            if sigma_t == 0.0 {
+                // h = inf: x' = x0.
+                return DpmSolverCoefficients {
+                    data_sample,
+                    data_model,
+                    sample: 0.0,
+                    current: alpha_t,
+                    previous: 0.0,
+                };
+            }
+            let h = lambda((alpha_t, sigma_t)) - lambda((alpha_s0, sigma_s0));
+            let first = -alpha_t * ((-h).exp() - 1.0);
+            let sample = sigma_t / sigma_s0;
+            if index == 0 || index == steps - 1 {
+                return DpmSolverCoefficients {
+                    data_sample,
+                    data_model,
+                    sample,
+                    current: first,
+                    previous: 0.0,
+                };
+            }
+            // D0 = m0, D1 = (m0 - m1) / r0; x' = s*x + first*D0 + 0.5*first*D1.
+            let (alpha_s1, sigma_s1) = alpha_sigma(f64::from(sigmas[index - 1]));
+            let h0 = lambda((alpha_s0, sigma_s0)) - lambda((alpha_s1, sigma_s1));
+            let half = 0.5 * first * h / h0;
+            DpmSolverCoefficients {
+                data_sample,
+                data_model,
+                sample,
+                current: first + half,
+                previous: -half,
+            }
+        })
+        .collect()
 }
 
-fn step_v_prediction_with_tensors(
-    model_output: &Tensor,
-    sample: &Tensor,
-    sqrt_alpha: &Tensor,
-    sqrt_beta: &Tensor,
-    sqrt_prev_alpha: &Tensor,
-    sqrt_prev_beta: &Tensor,
-) -> Result<Tensor> {
-    let pred_original = sample
-        .broadcast_mul(sqrt_alpha)?
-        .broadcast_sub(&model_output.broadcast_mul(sqrt_beta)?)?;
-    let pred_epsilon = model_output
-        .broadcast_mul(sqrt_alpha)?
-        .broadcast_add(&sample.broadcast_mul(sqrt_beta)?)?;
-    pred_original
-        .broadcast_mul(sqrt_prev_alpha)?
-        .broadcast_add(&pred_epsilon.broadcast_mul(sqrt_prev_beta)?)
-        .map_err(Error::from)
-}
-
-fn cosine_beta_schedule(num_steps: usize) -> Vec<f32> {
-    let s = 0.008f32;
-    let mut alphas_cumprod = Vec::with_capacity(num_steps + 1);
-    for idx in 0..=num_steps {
-        let t = idx as f32 / num_steps as f32;
-        let value = (((t + s) / (1.0 + s)) * std::f32::consts::FRAC_PI_2)
+/// `alphas_cumprod` of the reference cosine schedule: betas from
+/// `betas_for_alpha_bar(alpha_transform_type="cosine")` (f64, clamped to
+/// 0.999, stored as F32), then the F32 running product.
+fn cosine_alphas_cumprod(num_steps: usize) -> Vec<f32> {
+    let alpha_bar = |t: f64| {
+        ((t + 0.008) / 1.008 * std::f64::consts::FRAC_PI_2)
             .cos()
-            .powi(2);
-        alphas_cumprod.push(value);
-    }
-    let first = alphas_cumprod[0];
-    for value in &mut alphas_cumprod {
-        *value /= first;
-    }
+            .powi(2)
+    };
+    let mut running = 1.0f32;
     (0..num_steps)
-        .map(|idx| {
-            let beta = 1.0 - (alphas_cumprod[idx + 1] / alphas_cumprod[idx]);
-            beta.clamp(1e-8, 0.999)
+        .map(|index| {
+            let t1 = index as f64 / num_steps as f64;
+            let t2 = (index + 1) as f64 / num_steps as f64;
+            let beta = (1.0 - alpha_bar(t2) / alpha_bar(t1)).min(0.999) as f32;
+            running *= 1.0 - beta;
+            running
         })
         .collect()
 }
@@ -533,42 +581,89 @@ mod tests {
 
     use candle_nn::VarBuilder;
 
+    /// VVT-4: timesteps, sigmas and a scripted v-prediction trajectory
+    /// match the reference `DPMSolverMultistepScheduler(1000, "cosine",
+    /// "v_prediction")` run in PyTorch (vibevoice `schedule/dpm_solver.py`)
+    /// for 3, 10 and 20 steps.
     #[test]
-    fn scheduler_builds_descending_inference_timesteps() {
-        let scheduler = VibeVoiceDiffusionScheduler::new(1000, 20);
-        assert_eq!(scheduler.timesteps().len(), 20);
-        assert_eq!(scheduler.timesteps()[0], 999);
-        assert_eq!(*scheduler.timesteps().last().unwrap(), 0);
-        assert!(scheduler.alpha_cumprod(999) > 0.0);
-    }
+    // Goldens are printed from the PyTorch reference at full precision.
+    #[allow(clippy::excessive_precision)]
+    fn dpm_solver_matches_the_reference_scheduler() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
 
-    #[test]
-    fn scheduler_step_tensors_match_scalar_step_path() {
+        let cases: [(usize, &[usize], [f32; 3], [f32; 8]); 3] = [
+            (
+                3,
+                &[999, 666, 333],
+                [20291.302734375, 1.750723123550415, 0.5897074341773987],
+                [
+                    1.189_619_3,
+                    0.705_316_1,
+                    -1.044_905_3,
+                    -0.856_171_7,
+                    -0.219_362_26,
+                    0.462_077_68,
+                    0.189_852_01,
+                    0.192_192_7,
+                ],
+            ),
+            (
+                10,
+                &[999, 899, 799, 699, 599, 500, 400, 300, 200, 100],
+                [20291.302734375, 6.3645920753479, 3.103729724884033],
+                [
+                    0.764_613_9,
+                    -0.105_061_57,
+                    -0.594_315_96,
+                    -0.679_934_56,
+                    -0.694_521_8,
+                    0.429_939_1,
+                    -0.014_546_813,
+                    0.399_899_36,
+                ],
+            ),
+            (
+                20,
+                &[
+                    999, 949, 899, 849, 799, 749, 699, 649, 599, 549, 500, 450, 400, 350, 300, 250,
+                    200, 150, 100, 50,
+                ],
+                [20291.302734375, 12.807271003723145, 6.3645920753479],
+                [
+                    0.770_184_3,
+                    -0.123_555_36,
+                    -0.425_158_95,
+                    -0.553_862_8,
+                    -0.918_555_4,
+                    0.221_215_87,
+                    -0.042_713_7,
+                    0.423_581_2,
+                ],
+            ),
+        ];
         let device = Device::Cpu;
-        let scheduler = VibeVoiceDiffusionScheduler::new(1000, 4);
-        let sample = Tensor::from_vec(vec![0.1f32, -0.2, 0.3, -0.4], (1, 4), &device).unwrap();
-        let model_output =
-            Tensor::from_vec(vec![0.05f32, 0.1, -0.15, -0.2], (1, 4), &device).unwrap();
-        let steps = scheduler
-            .step_tensors(&device, DType::F32)
-            .expect("step tensors");
-
-        let scalar = scheduler
-            .step_v_prediction(
-                &model_output,
-                steps[0].timestep,
-                steps[0].prev_timestep,
-                &sample,
-            )
-            .expect("scalar step");
-        let cached = scheduler
-            .step_v_prediction_with_tensors(&model_output, &sample, &steps[0])
-            .expect("cached step");
-        let scalar = scalar.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let cached = cached.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-
-        for (lhs, rhs) in scalar.iter().zip(cached.iter()) {
-            assert!((lhs - rhs).abs() < 1e-6);
+        for (steps, timesteps, first_sigmas, golden) in cases {
+            let scheduler = VibeVoiceDiffusionScheduler::new(1000, steps);
+            assert_eq!(scheduler.timesteps(), timesteps);
+            assert_eq!(scheduler.sigmas().len(), steps + 1);
+            assert_eq!(*scheduler.sigmas().last().unwrap(), 0.0);
+            let sigma_error = max_abs_diff(&scheduler.sigmas()[..3], &first_sigmas);
+            assert!(
+                sigma_error <= 1e-6 * 20291.3,
+                "sigmas {:?}",
+                &scheduler.sigmas()[..3]
+            );
+            let tensors = scheduler.step_tensors(&device, DType::F32).unwrap();
+            let mut state = DpmSolverState::default();
+            let mut x = Tensor::from_vec(xorshift_values(8, 1, 1.0), (2, 4), &device).unwrap();
+            for (index, step) in tensors.iter().enumerate() {
+                let v =
+                    Tensor::from_vec(xorshift_values(8, 100 + index as u64, 1.0), (2, 4), &device)
+                        .unwrap();
+                x = scheduler.step(&v, &x, step, &mut state).unwrap();
+            }
+            let error = max_abs_diff(&host_f32(&x).unwrap(), &golden);
+            assert!(error < 1e-5, "{steps} steps: max abs error {error}");
         }
     }
 
@@ -666,6 +761,27 @@ mod tests {
             &Tensor::from_vec(vec![0.84852815f32, 1.1313709], (1, 2), &device).unwrap(),
             1e-2,
         );
+    }
+
+    /// The final-layer norm keeps its statistics in F32: an F16 row whose
+    /// squares overflow F16 (|x| about 480, as the checkpoint's final-layer
+    /// input) normalizes like the F32 row instead of collapsing.
+    #[test]
+    fn rms_norm_no_affine_does_not_overflow_in_f16() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+        let device = Device::Cpu;
+        let x = xorshift_tensor(&[2, 64], 11, 480.0, &device).unwrap();
+        let f32_out =
+            rms_norm_no_affine(&x, 1e-5, &Tensor::ones(64, DType::F32, &device).unwrap()).unwrap();
+        let f16_out = rms_norm_no_affine(
+            &x.to_dtype(DType::F16).unwrap(),
+            1e-5,
+            &Tensor::ones(64, DType::F16, &device).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(f16_out.dtype(), DType::F16);
+        let relative = relative_l2(&host_f32(&f16_out).unwrap(), &host_f32(&f32_out).unwrap());
+        assert!(relative < 1e-3, "relative L2 {relative}");
     }
 
     fn tiny_diffusion_head(device: &Device) -> VibeVoiceDiffusionHead {

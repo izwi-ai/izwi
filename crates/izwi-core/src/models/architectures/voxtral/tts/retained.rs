@@ -99,6 +99,7 @@ struct VoxtralTtsHostCheckpoint {
     last_hidden: Option<Tensor>,
     frames: Vec<Vec<u32>>,
     phase: VoxtralTtsRetainedPhase,
+    codec_emitted_frames: usize,
 }
 
 pub(crate) struct VoxtralTtsQuantumCheckpoint {
@@ -118,6 +119,8 @@ pub(crate) struct VoxtralTtsRetainedState {
     pub(crate) last_hidden: Option<Tensor>,
     pub(crate) frames: Vec<Vec<u32>>,
     pub(crate) phase: VoxtralTtsRetainedPhase,
+    /// Frames whose codec chunks have been streamed (a chunk boundary).
+    pub(crate) codec_emitted_frames: usize,
 }
 
 impl VoxtralTtsRetainedState {
@@ -147,6 +150,7 @@ impl VoxtralTtsRetainedState {
             last_hidden: None,
             frames: Vec::new(),
             phase: VoxtralTtsRetainedPhase::Prefill,
+            codec_emitted_frames: 0,
         })
     }
 
@@ -223,6 +227,7 @@ impl VoxtralTtsRetainedState {
             last_hidden: self.last_hidden.clone(),
             frames: self.frames.clone(),
             phase: self.phase,
+            codec_emitted_frames: self.codec_emitted_frames,
         }
     }
 
@@ -232,6 +237,7 @@ impl VoxtralTtsRetainedState {
         self.last_hidden = checkpoint.last_hidden.clone();
         self.frames.clone_from(&checkpoint.frames);
         self.phase = checkpoint.phase;
+        self.codec_emitted_frames = checkpoint.codec_emitted_frames;
     }
 
     pub(crate) fn prompt_tokens(&self) -> usize {

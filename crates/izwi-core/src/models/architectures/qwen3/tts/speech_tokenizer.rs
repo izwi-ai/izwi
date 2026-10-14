@@ -9,14 +9,17 @@ use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, info};
 
 use crate::error::{Error, Result};
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention,
 };
-use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+use crate::models::shared::attention::gqa::{
+    banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask, BANDED_QUERY_BLOCK,
+};
 
 /// Speech Tokenizer Configuration
 #[derive(Debug, Clone, Deserialize)]
@@ -95,7 +98,29 @@ pub struct DecoderConfig {
     pub upsample_rates: Vec<usize>,
     pub upsampling_ratios: Vec<usize>,
     pub vector_quantization_hidden_dimension: usize,
+    /// Every pre-transformer layer is `sliding_attention` over this many keys
+    /// (the reference config's `layer_types` and `sliding_window`).
+    #[serde(default = "default_decoder_sliding_window")]
+    pub sliding_window: usize,
 }
+
+fn default_decoder_sliding_window() -> usize {
+    72
+}
+
+/// Codec frames per upsampler/vocoder window in [`SpeechTokenizerDecoder::decode`].
+/// The vocoder's activations run at up to 24 kHz (about 8 MiB of live F32
+/// tensors per frame at the last stage), so the window, not the utterance,
+/// sets the decode's working set: 32 frames (2.56 s) plus left context.
+const VOCODER_WINDOW_FRAMES: usize = 32;
+
+/// Kernel of the ConvNeXt depthwise conv after each upsampling stage.
+const CONVNEXT_KERNEL: usize = 7;
+/// Kernel of the first and last vocoder convs (`decoder.0`, `decoder.6`).
+const VOCODER_EDGE_KERNEL: usize = 7;
+/// Kernel and dilations of the three residual units in each decoder block.
+const RESIDUAL_KERNEL: usize = 7;
+const RESIDUAL_DILATIONS: [usize; 3] = [1, 3, 9];
 
 /// Causal Conv1d with left padding only.
 struct CausalConv1d {
@@ -781,7 +806,7 @@ impl ResidualUnit {
             conv1: CausalConv1d::load(
                 channels,
                 channels,
-                7,
+                RESIDUAL_KERNEL,
                 dilation,
                 1,
                 true,
@@ -827,9 +852,9 @@ impl DecoderBlock {
                 upsample_rate,
                 vb.pp("block.1.conv"),
             )?,
-            res1: ResidualUnit::load(out_channels, 1, vb.pp("block.2"))?,
-            res2: ResidualUnit::load(out_channels, 3, vb.pp("block.3"))?,
-            res3: ResidualUnit::load(out_channels, 9, vb.pp("block.4"))?,
+            res1: ResidualUnit::load(out_channels, RESIDUAL_DILATIONS[0], vb.pp("block.2"))?,
+            res2: ResidualUnit::load(out_channels, RESIDUAL_DILATIONS[1], vb.pp("block.3"))?,
+            res3: ResidualUnit::load(out_channels, RESIDUAL_DILATIONS[2], vb.pp("block.4"))?,
         })
     }
 
@@ -853,7 +878,15 @@ struct ConvNeXtBlock {
 
 impl ConvNeXtBlock {
     fn load(dim: usize, vb: VarBuilder) -> Result<Self> {
-        let dwconv = CausalConv1d::load(dim, dim, 7, 1, dim, true, vb.pp("dwconv.conv"))?;
+        let dwconv = CausalConv1d::load(
+            dim,
+            dim,
+            CONVNEXT_KERNEL,
+            1,
+            dim,
+            true,
+            vb.pp("dwconv.conv"),
+        )?;
         let norm = candle_nn::layer_norm(
             dim,
             LayerNormConfig {
@@ -918,10 +951,16 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rope_theta: f64,
+    sliding_window: usize,
 }
 
 impl Attention {
     fn load(cfg: &DecoderConfig, vb: VarBuilder) -> Result<Self> {
+        if cfg.sliding_window == 0 {
+            return Err(Error::ModelError(
+                "speech-tokenizer decoder sliding_window must be non-zero".into(),
+            ));
+        }
         Ok(Self {
             q_proj: candle_nn::linear_no_bias(
                 cfg.hidden_size,
@@ -947,16 +986,17 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             rope_theta: cfg.rope_theta,
+            sliding_window: cfg.sliding_window,
         })
     }
 
-    fn apply_rope(&self, x: Tensor) -> Result<Tensor> {
+    fn apply_rope(&self, x: Tensor, start_pos: usize) -> Result<Tensor> {
         let seq_len = x.dim(1)?;
         let half_dim = self.head_dim / 2;
         let (cos, sin) = build_rope_cache(
             seq_len,
             self.head_dim,
-            0,
+            start_pos,
             self.rope_theta,
             x.device(),
             x.dtype(),
@@ -978,6 +1018,11 @@ impl Attention {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_at(x, 0)
+    }
+
+    /// Attention over `x` whose first row is frame `start_pos`.
+    fn forward_at(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         let bsz = x.dim(0)?;
         let seq_len = x.dim(1)?;
 
@@ -994,15 +1039,16 @@ impl Attention {
                 .forward(x)?
                 .reshape((bsz, seq_len, self.num_kv_heads, self.head_dim))?;
 
-        q = self.apply_rope(q)?;
-        k = self.apply_rope(k)?;
+        q = self.apply_rope(q, start_pos)?;
+        k = self.apply_rope(k, start_pos)?;
 
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
         let v = v.transpose(1, 2)?;
 
-        let total_len = k.dim(2)?;
-        if flash_attention_requested() && total_len == seq_len {
+        // Plain causal attention equals the sliding window while every query
+        // sees at most `sliding_window` keys, so the fused path stays valid.
+        if flash_attention_requested() && seq_len <= self.sliding_window {
             if let Some(fused_out) =
                 try_fused_self_attention(&q, &k, &v, None, self.head_dim, true)?
             {
@@ -1015,12 +1061,13 @@ impl Attention {
             }
         }
 
-        let mask = causal_mask(seq_len, total_len, 0, q.device(), q.dtype())?;
-        let out = compact_gqa_sdpa_bhsd(
+        // Query blocks against only the keys their band reaches: no T x T
+        // score or mask tensor.
+        let out = banded_sdpa_bhsd(
             &q,
             &k,
             &v,
-            Some(CompactGqaMask::Additive(&mask)),
+            AttentionBand::causal_window(self.sliding_window),
             1.0 / (self.head_dim as f64).sqrt(),
         )?;
         let out = out
@@ -1101,8 +1148,13 @@ impl DecoderLayer {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward_at(x, 0)
+    }
+
+    /// The layer over `x` whose first row is frame `start_pos`.
+    fn forward_at(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&normed)?;
+        let attn_out = self.self_attn.forward_at(&normed, start_pos)?;
         let attn_out = attn_out.broadcast_mul(&self.self_attn_layer_scale)?;
         let x = x.broadcast_add(&attn_out)?;
 
@@ -1572,15 +1624,76 @@ pub struct SpeechTokenizerDecoder {
     encode_downsample_rate: usize,
     decode_upsample_rate: usize,
     config: DecoderConfig,
+    /// Left context per vocoder window: the vocoder's causal receptive field.
+    vocoder_context_frames: usize,
+    /// Upsampler/vocoder windows run since load (diagnostics).
+    vocoder_windows: AtomicU64,
+    /// Largest window, context included, the vocoder has run on (diagnostics).
+    vocoder_peak_window_frames: AtomicUsize,
+}
+
+/// Incremental decode state of [`SpeechTokenizerDecoder::decode_stream_step`]:
+/// the frames consumed and the bounded causal contexts. Tensors are
+/// immutable, so cloning the state is a cheap, exact checkpoint.
+#[derive(Debug, Clone)]
+pub struct SpeechTokenizerStream {
+    frames: usize,
+    pre_conv_tail: Option<Tensor>,
+    layer_tails: Vec<Option<Tensor>>,
+    latent_tail: Option<Tensor>,
+}
+
+impl SpeechTokenizerStream {
+    /// Codec frames decoded so far.
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+/// Windowed codec-decode counters for diagnostics.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SpeechTokenizerDecodeStats {
+    pub window_frames: usize,
+    pub context_frames: usize,
+    pub windows: u64,
+    pub peak_window_frames: usize,
 }
 
 impl SpeechTokenizerDecoder {
     /// Load decoder from speech_tokenizer directory.
-    pub fn load(model_dir: &std::path::Path, device: Device, dtype: DType) -> Result<Self> {
+    /// Load the decoder, and the reference encoder when `load_encoder`
+    /// (voice cloning is its only user).
+    pub fn load(
+        model_dir: &std::path::Path,
+        device: Device,
+        dtype: DType,
+        load_encoder: bool,
+    ) -> Result<Self> {
         info!("Loading speech tokenizer decoder from {:?}", model_dir);
 
         let config_str = std::fs::read_to_string(model_dir.join("config.json"))?;
-        let speech_cfg: SpeechTokenizerConfig = serde_json::from_str(&config_str)?;
+        let mut speech_cfg: SpeechTokenizerConfig = serde_json::from_str(&config_str)?;
+        if !load_encoder {
+            speech_cfg.encoder_config = None;
+        }
+        let weights_path = model_dir.join("model.safetensors");
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`).
+        let root_vb = unsafe {
+            crate::models::shared::weights::staged::metal_staged_safetensors(
+                &[weights_path],
+                dtype,
+                &device,
+            )?
+        };
+        Self::from_config(speech_cfg, root_vb, device)
+    }
+
+    fn from_config(
+        speech_cfg: SpeechTokenizerConfig,
+        root_vb: VarBuilder,
+        device: Device,
+    ) -> Result<Self> {
         let encoder_valid_num_quantizers = speech_cfg.encoder_valid_num_quantizers;
         let input_sample_rate = speech_cfg.input_sample_rate;
         let encode_downsample_rate = speech_cfg.encode_downsample_rate;
@@ -1590,10 +1703,14 @@ impl SpeechTokenizerDecoder {
             .encoder_config
             .map(serde_json::from_value)
             .transpose()?;
-
-        let weights_path = model_dir.join("model.safetensors");
-        let root_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device)? };
+        let vocoder_upsample = vocoder_upsample_factor(&decoder_config);
+        if vocoder_upsample != decode_upsample_rate {
+            return Err(Error::ModelError(format!(
+                "speech-tokenizer decode_upsample_rate {decode_upsample_rate} does not match \
+                 the decoder's upsampling product {vocoder_upsample}"
+            )));
+        }
+        let vocoder_context_frames = vocoder_receptive_field_frames(&decoder_config);
         let vb = root_vb.pp("decoder");
 
         // Official checkpoints store RVQ embeddings at 256 dims.
@@ -1658,7 +1775,7 @@ impl SpeechTokenizerDecoder {
         let decoder_init_conv = CausalConv1d::load(
             decoder_config.latent_dim,
             decoder_config.decoder_dim,
-            7,
+            VOCODER_EDGE_KERNEL,
             1,
             1,
             true,
@@ -1679,8 +1796,15 @@ impl SpeechTokenizerDecoder {
         }
 
         let final_snake = SnakeBeta::load(in_channels, vb.pp("decoder.5"))?;
-        let final_conv =
-            CausalConv1d::load(in_channels, 1, 7, 1, 1, true, vb.pp("decoder.6.conv"))?;
+        let final_conv = CausalConv1d::load(
+            in_channels,
+            1,
+            VOCODER_EDGE_KERNEL,
+            1,
+            1,
+            true,
+            vb.pp("decoder.6.conv"),
+        )?;
 
         let encoder = if let Some(cfg) = encoder_config {
             info!("Loading speech tokenizer encoder...");
@@ -1713,7 +1837,19 @@ impl SpeechTokenizerDecoder {
             encode_downsample_rate,
             decode_upsample_rate,
             config: decoder_config,
+            vocoder_context_frames,
+            vocoder_windows: AtomicU64::new(0),
+            vocoder_peak_window_frames: AtomicUsize::new(0),
         })
+    }
+
+    pub fn decode_stats(&self) -> SpeechTokenizerDecodeStats {
+        SpeechTokenizerDecodeStats {
+            window_frames: VOCODER_WINDOW_FRAMES,
+            context_frames: self.vocoder_context_frames,
+            windows: self.vocoder_windows.load(Ordering::Relaxed),
+            peak_window_frames: self.vocoder_peak_window_frames.load(Ordering::Relaxed),
+        }
     }
 
     /// Maximum codec frames produced from this exact input shape.
@@ -1749,135 +1885,29 @@ impl SpeechTokenizerDecoder {
         let encoder = self.encoder.as_ref().ok_or_else(|| {
             Error::ModelError("speech-tokenizer reference encoder is unavailable".into())
         })?;
-        let cfg = &encoder.config;
-        let samples = self
-            .input_sample_rate
-            .checked_mul(max_seconds)
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference sample overflow".into())
-            })?;
-        let frames = ceil_div(samples, self.encode_downsample_rate.max(1));
-        let u64_value = |value: usize, label: &str| {
-            u64::try_from(value).map_err(|_| {
-                Error::Overloaded(format!("speech-tokenizer reference {label} exceeds u64"))
-            })
-        };
-        let mul = |left: u64, right: u64| {
-            left.checked_mul(right).ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
-            })
-        };
-        let add = |left: u64, right: u64| {
-            left.checked_add(right).ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference workspace overflow".into())
-            })
-        };
-        let samples = u64_value(samples, "samples")?;
-        let frames = u64_value(frames, "frames")?;
-        let conv_width = [cfg.num_filters, cfg.hidden_size, cfg.intermediate_size]
-            .into_iter()
-            .max()
-            .unwrap_or(1);
-        let convolution = mul(mul(samples, u64_value(conv_width, "conv width")?)?, 8)?;
-        let attention = mul(
-            mul(u64_value(cfg.num_attention_heads, "head count")?, frames)?,
-            frames,
-        )?;
-        let transformer_width = cfg
-            .hidden_size
-            .checked_mul(8)
-            .and_then(|value| {
-                cfg.intermediate_size
-                    .checked_mul(3)
-                    .and_then(|ffn| value.checked_add(ffn))
-            })
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference transformer overflow".into())
-            })?;
-        let transformer = mul(frames, u64_value(transformer_width, "transformer width")?)?;
-        let quantizer_width = cfg
-            .codebook_size
-            .checked_add(
-                cfg.vector_quantization_hidden_dimension
-                    .checked_mul(4)
-                    .ok_or_else(|| {
-                        Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
-                    })?,
-            )
-            .ok_or_else(|| {
-                Error::Overloaded("speech-tokenizer reference quantizer overflow".into())
-            })?;
-        let quantizer = mul(frames, u64_value(quantizer_width, "quantizer width")?)?;
-        let elements = add(add(convolution, attention)?, add(transformer, quantizer)?)?;
-        mul(elements, u64_value(element_bytes, "dtype width")?)
+        reference_encode_workspace_upper_bound_bytes(
+            &encoder.config,
+            self.input_sample_rate,
+            self.encode_downsample_rate,
+            max_seconds,
+            element_bytes,
+        )
     }
 
-    /// Conservative backend-temporary peak for a terminal codec/vocoder pass.
-    /// It follows the actual decoder geometry: transformer attention runs at
-    /// codec-frame width, then each configured upsample stage increases time
-    /// while decoder blocks reduce channels.
+    /// Conservative backend-temporary peak for a terminal codec/vocoder pass
+    /// over `codec_frames` frames, following [`Self::decode`]: the frame-rate
+    /// stages scale with the frame count (sliding-window attention in bounded
+    /// query blocks), the upsampler and vocoder with one window.
     pub(crate) fn decode_temporary_upper_bound_bytes(
         &self,
         codec_frames: usize,
         element_bytes: usize,
     ) -> Result<u64> {
-        let frames = u64::try_from(codec_frames)
-            .map_err(|_| Error::Overloaded("speech-tokenizer frame bound exceeds u64".into()))?;
-        let checked_mul = |left: u64, right: u64| {
-            left.checked_mul(right)
-                .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))
-        };
-        let hidden = u64::try_from(self.config.hidden_size)
-            .map_err(|_| Error::Overloaded("speech-tokenizer hidden width exceeds u64".into()))?;
-        let heads = u64::try_from(self.config.num_attention_heads)
-            .map_err(|_| Error::Overloaded("speech-tokenizer head count exceeds u64".into()))?;
-        let attention = checked_mul(checked_mul(heads, frames)?, frames)?;
-        let transformer_linear = checked_mul(hidden, frames)?
-            .checked_mul(12)
-            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
-
-        let mut time = frames;
-        let latent = u64::try_from(self.config.latent_dim)
-            .map_err(|_| Error::Overloaded("speech-tokenizer latent width exceeds u64".into()))?;
-        let mut peak_activation = checked_mul(latent, time)?;
-        for ratio in &self.config.upsampling_ratios {
-            time = checked_mul(
-                time,
-                u64::try_from(*ratio).map_err(|_| {
-                    Error::Overloaded("speech-tokenizer upsample ratio exceeds u64".into())
-                })?,
-            )?;
-            peak_activation = peak_activation.max(checked_mul(latent, time)?);
-        }
-        let mut channels = u64::try_from(self.config.decoder_dim)
-            .map_err(|_| Error::Overloaded("speech-tokenizer decoder width exceeds u64".into()))?;
-        peak_activation = peak_activation.max(checked_mul(channels, time)?);
-        for rate in &self.config.upsample_rates {
-            time = checked_mul(
-                time,
-                u64::try_from(*rate).map_err(|_| {
-                    Error::Overloaded("speech-tokenizer decoder rate exceeds u64".into())
-                })?,
-            )?;
-            channels = (channels / 2).max(1);
-            peak_activation = peak_activation.max(checked_mul(channels, time)?);
-        }
-        // Convolution/residual blocks may retain inputs, outputs, and gated
-        // intermediates simultaneously; eight activation widths is a closed
-        // upper envelope for these inference-only stages.
-        let codec_elements = attention
-            .checked_add(transformer_linear)
-            .and_then(|value| {
-                peak_activation
-                    .checked_mul(8)
-                    .and_then(|peak| value.checked_add(peak))
-            })
-            .ok_or_else(|| Error::Overloaded("speech-tokenizer workspace overflow".into()))?;
-        checked_mul(
-            codec_elements,
-            u64::try_from(element_bytes).map_err(|_| {
-                Error::Overloaded("speech-tokenizer dtype width exceeds u64".into())
-            })?,
+        decode_workspace_upper_bound_bytes(
+            &self.config,
+            self.vocoder_context_frames,
+            codec_frames,
+            element_bytes,
         )
     }
 
@@ -1920,11 +1950,196 @@ impl SpeechTokenizerDecoder {
     }
 
     /// Decode codec tokens to audio waveform samples.
+    ///
+    /// The frame-rate stages (RVQ, pre-conv, the sliding-window transformer)
+    /// run once over every frame; their activations are a few KiB per frame.
+    /// The upsampler and vocoder, whose activations run at up to 24 kHz and
+    /// dominate memory, run in windows of [`VOCODER_WINDOW_FRAMES`] frames.
+    /// Each window carries enough left context to cover their causal
+    /// receptive field and drops it afterwards, so the output equals a
+    /// whole-utterance pass, and the device is synchronized after each window
+    /// so its pooled buffers are released before the next one.
     pub fn decode(&self, codec_tokens: &[Vec<u32>]) -> Result<Vec<f32>> {
+        self.decode_windowed(codec_tokens, VOCODER_WINDOW_FRAMES)
+    }
+
+    fn decode_windowed(&self, codec_tokens: &[Vec<u32>], window_frames: usize) -> Result<Vec<f32>> {
         if codec_tokens.is_empty() || codec_tokens[0].is_empty() {
             return Ok(Vec::new());
         }
+        let latents = self.decode_latents(codec_tokens)?;
+        let frames = latents.dim(2)?;
+        self.vocode_range(&latents, 0, frames, window_frames)
+    }
 
+    /// Samples for latent frames `from..to` of `latents`, vocoded in windows
+    /// of `window_frames` with the vocoder's causal left context from the
+    /// frames before each window (frames before `from` serve as context
+    /// only), clamped to [-1, 1].
+    fn vocode_range(
+        &self,
+        latents: &Tensor,
+        from: usize,
+        to: usize,
+        window_frames: usize,
+    ) -> Result<Vec<f32>> {
+        let window_frames = window_frames.max(1);
+        let upsample = self.decode_upsample_rate;
+        let mut audio = Vec::with_capacity(to.saturating_sub(from).saturating_mul(upsample));
+        let mut start = from;
+        while start < to {
+            let end = start.saturating_add(window_frames).min(to);
+            let context = self.vocoder_context_frames.min(start);
+            let span = end - start + context;
+            let samples = {
+                let window = latents.narrow(2, start - context, span)?;
+                let wav = self.vocode(&window)?;
+                let produced = wav.dim(2)?;
+                if produced != span * upsample {
+                    return Err(Error::InferenceError(format!(
+                        "speech-tokenizer vocoder produced {produced} samples for {span} \
+                         frames, expected {}",
+                        span * upsample
+                    )));
+                }
+                wav.narrow(2, context * upsample, (end - start) * upsample)?
+                    .clamp(-1.0f32, 1.0f32)?
+                    .flatten_all()?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?
+            };
+            audio.extend_from_slice(&samples);
+            self.vocoder_windows.fetch_add(1, Ordering::Relaxed);
+            self.vocoder_peak_window_frames
+                .fetch_max(span, Ordering::Relaxed);
+            // The window's tensors are dropped; synchronizing lets the
+            // backend release their pooled buffers before the next window.
+            self.device.synchronize()?;
+            start = end;
+        }
+        Ok(audio)
+    }
+
+    /// A fresh incremental decode (QTTS-5).
+    pub fn start_stream(&self) -> SpeechTokenizerStream {
+        SpeechTokenizerStream {
+            frames: 0,
+            pre_conv_tail: None,
+            layer_tails: vec![None; self.pre_transformer_layers.len()],
+            latent_tail: None,
+        }
+    }
+
+    /// Decode the next codec frames, `new_tokens[group][frame]` (the frames
+    /// after those `stream` has consumed), and return exactly the samples a
+    /// whole-utterance [`Self::decode`] produces for them (clamped,
+    /// unnormalized). The
+    /// decoder is causal, so earlier output never changes: the pre-conv keeps
+    /// its kernel's tail, each pre-transformer layer its last
+    /// `sliding_window - 1` input frames (and absolute RoPE positions), and
+    /// the vocoder its receptive-field latents. Each step costs its own
+    /// frames plus those bounded contexts, not the prefix.
+    pub fn decode_stream_step(
+        &self,
+        stream: &mut SpeechTokenizerStream,
+        new_tokens: &[Vec<u32>],
+    ) -> Result<Vec<f32>> {
+        let frames = new_tokens.first().map_or(0, Vec::len);
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+        let latents = self.stream_latents(stream, new_tokens)?;
+        let (latents, context) = match &stream.latent_tail {
+            Some(tail) => (Tensor::cat(&[tail, &latents], 2)?, tail.dim(2)?),
+            None => (latents, 0),
+        };
+        let samples =
+            self.vocode_range(&latents, context, context + frames, VOCODER_WINDOW_FRAMES)?;
+        let latent_len = latents.dim(2)?;
+        let kept = self.vocoder_context_frames.min(latent_len);
+        stream.latent_tail = (kept > 0)
+            .then(|| latents.narrow(2, latent_len - kept, kept))
+            .transpose()?;
+        Ok(samples)
+    }
+
+    /// Like [`Self::decode_stream_step`]: the next frames' latents
+    /// (`[1, latent_dim, frames]`), exactly as [`Self::decode_latents`]
+    /// computes them for the whole utterance.
+    fn stream_latents(
+        &self,
+        stream: &mut SpeechTokenizerStream,
+        new_tokens: &[Vec<u32>],
+    ) -> Result<Tensor> {
+        let frames = new_tokens.first().map_or(0, Vec::len);
+        let start = stream.frames;
+        let total = start + frames;
+        let slice = new_tokens;
+        if frames == 0 {
+            return Err(Error::InvalidInput(
+                "speech-tokenizer stream step has no frames".into(),
+            ));
+        }
+        let first_codes = normalized_codec_indices(
+            Some(slice[0].as_slice()),
+            frames,
+            self.rvq_first.codebook.codebook_size,
+        );
+        let first_tensor = Tensor::from_vec(first_codes, (1, frames), &self.device)?;
+        let quantized = self
+            .rvq_first
+            .decode(&first_tensor)?
+            .broadcast_add(&self.rvq_rest.decode(slice, frames, &self.device)?)?;
+
+        // Pre-conv: its causal zero padding is the initial tail.
+        let pad = self.pre_conv.causal_padding;
+        let tail = match &stream.pre_conv_tail {
+            Some(tail) => tail.clone(),
+            None => Tensor::zeros(
+                (quantized.dim(0)?, quantized.dim(1)?, pad),
+                quantized.dtype(),
+                &self.device,
+            )?,
+        };
+        let joined = Tensor::cat(&[&tail, &quantized], 2)?;
+        let hidden = self.pre_conv.conv.forward(&joined)?;
+        let joined_len = joined.dim(2)?;
+        stream.pre_conv_tail = Some(joined.narrow(2, joined_len - pad, pad)?);
+
+        let mut hidden = self
+            .pre_transformer_input_proj
+            .forward(&hidden.transpose(1, 2)?)?;
+        let keep = self.config.sliding_window.saturating_sub(1);
+        for (layer, tail) in self
+            .pre_transformer_layers
+            .iter()
+            .zip(stream.layer_tails.iter_mut())
+        {
+            let (full, cached) = match tail.as_ref() {
+                Some(tail) => (Tensor::cat(&[tail, &hidden], 1)?, tail.dim(1)?),
+                None => (hidden.clone(), 0),
+            };
+            let full_len = full.dim(1)?;
+            let kept = keep.min(full_len);
+            *tail = (kept > 0)
+                .then(|| full.narrow(1, full_len - kept, kept))
+                .transpose()?;
+            hidden = layer
+                .forward_at(&full, start - cached)?
+                .narrow(1, cached, frames)?;
+        }
+        let hidden = self.pre_transformer_norm.forward(&hidden)?;
+        let latents = self
+            .pre_transformer_output_proj
+            .forward(&hidden)?
+            .transpose(1, 2)?;
+        stream.frames = total;
+        Ok(latents)
+    }
+
+    /// RVQ, pre-conv and the pre-transformer over every frame:
+    /// `[1, latent_dim, frames]`.
+    fn decode_latents(&self, codec_tokens: &[Vec<u32>]) -> Result<Tensor> {
         let seq_len = codec_tokens[0].len();
         let first_codes = normalized_codec_indices(
             Some(codec_tokens[0].as_slice()),
@@ -1947,9 +2162,13 @@ impl SpeechTokenizerDecoder {
         }
         hidden = self.pre_transformer_norm.forward(&hidden)?;
         hidden = self.pre_transformer_output_proj.forward(&hidden)?;
+        hidden.transpose(1, 2).map_err(Error::from)
+    }
 
-        // Upsample stack + decoder blocks.
-        let mut hidden = hidden.transpose(1, 2)?;
+    /// Upsample stack + vocoder on `[1, latent_dim, frames]`: unclamped
+    /// `[1, 1, frames * decode_upsample_rate]` audio.
+    fn vocode(&self, latents: &Tensor) -> Result<Tensor> {
+        let mut hidden = latents.clone();
         for stage in &self.upsample_stages {
             hidden = stage.forward(&hidden)?;
         }
@@ -1958,17 +2177,98 @@ impl SpeechTokenizerDecoder {
             hidden = block.forward(&hidden)?;
         }
         hidden = self.final_snake.forward(&hidden)?;
-        let audio = self.final_conv.forward(&hidden)?;
-
-        // Clamp to audio range and flatten to mono sample vector.
-        let audio = audio.clamp(-1.0f32, 1.0f32)?;
-        audio
-            .squeeze(0)?
-            .squeeze(0)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()
-            .map_err(Error::from)
+        self.final_conv.forward(&hidden)
     }
+}
+
+/// Samples per codec frame produced by the upsampler and vocoder.
+fn vocoder_upsample_factor(cfg: &DecoderConfig) -> usize {
+    cfg.upsampling_ratios
+        .iter()
+        .chain(&cfg.upsample_rates)
+        .product::<usize>()
+        .max(1)
+}
+
+/// Left context, in codec frames, covering the causal receptive field of
+/// everything after the pre-transformer (upsampler, ConvNeXt blocks, vocoder),
+/// so a windowed pass reproduces a whole-utterance pass. Every stage is
+/// causal; each contributes the samples its kernel reaches back at its own
+/// rate, plus one sample for mapping a final-rate sample onto its grid.
+fn vocoder_receptive_field_frames(cfg: &DecoderConfig) -> usize {
+    let total = vocoder_upsample_factor(cfg);
+    let mut reach = 0usize;
+    let mut add = |taps: usize, rate: usize| reach += (taps + 1) * (total / rate.max(1));
+    let mut rate = 1usize;
+    for &ratio in &cfg.upsampling_ratios {
+        // Transposed conv with kernel == stride: no overlap between frames.
+        rate *= ratio;
+        add(CONVNEXT_KERNEL - 1, rate);
+    }
+    add(VOCODER_EDGE_KERNEL - 1, rate);
+    let residual_taps = (RESIDUAL_KERNEL - 1) * RESIDUAL_DILATIONS.iter().sum::<usize>();
+    for &upsample in &cfg.upsample_rates {
+        // Transposed conv with kernel 2r and stride r: one input sample back.
+        add(1, rate);
+        rate *= upsample;
+        add(residual_taps, rate);
+    }
+    add(VOCODER_EDGE_KERNEL - 1, rate);
+    reach.div_ceil(total)
+}
+
+/// Backend-temporary upper bound for [`SpeechTokenizerDecoder::decode`] over
+/// `codec_frames` frames with `context_frames` of vocoder left context.
+fn decode_workspace_upper_bound_bytes(
+    cfg: &DecoderConfig,
+    context_frames: usize,
+    codec_frames: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer workspace overflow".into());
+    let to_u64 = |value: usize| u64::try_from(value).map_err(|_| overflow());
+    let mul = |left: u64, right: u64| left.checked_mul(right).ok_or_else(overflow);
+    let add = |left: u64, right: u64| left.checked_add(right).ok_or_else(overflow);
+
+    // Frame-rate stages over every frame: one query block of sliding-window
+    // scores, the transformer's linear activations, and the pre-conv/latent
+    // tensors that stay live while the vocoder windows run.
+    let frames = to_u64(codec_frames)?;
+    let block = codec_frames.min(BANDED_QUERY_BLOCK);
+    let keys = codec_frames.min(block + cfg.sliding_window.max(1) - 1);
+    let attention = mul(
+        mul(to_u64(cfg.num_attention_heads)?, to_u64(block)?)?,
+        to_u64(keys)?,
+    )?;
+    let transformer_linear = mul(mul(to_u64(cfg.hidden_size)?, frames)?, 12)?;
+    let frame_rate_width = cfg.latent_dim.max(cfg.hidden_size.saturating_mul(3));
+    let frame_rate = mul(mul(to_u64(frame_rate_width)?, frames)?, 2)?;
+
+    // Upsampler and vocoder over one window, context included.
+    let window = codec_frames.min(VOCODER_WINDOW_FRAMES.saturating_add(context_frames));
+    let mut time = to_u64(window)?;
+    let latent = to_u64(cfg.latent_dim)?;
+    let mut peak_activation = mul(latent, time)?;
+    for ratio in &cfg.upsampling_ratios {
+        time = mul(time, to_u64(*ratio)?)?;
+        peak_activation = peak_activation.max(mul(latent, time)?);
+    }
+    let mut channels = to_u64(cfg.decoder_dim)?;
+    peak_activation = peak_activation.max(mul(channels, time)?);
+    for rate in &cfg.upsample_rates {
+        time = mul(time, to_u64(*rate)?)?;
+        channels = (channels / 2).max(1);
+        peak_activation = peak_activation.max(mul(channels, time)?);
+    }
+    // The widest stage's 7-tap convs hold an im2col copy (7 widths) next to
+    // the input, its padded copy, the output, the residual and two SnakeBeta
+    // temporaries: 13 activation widths.
+    let vocoder = mul(peak_activation, 13)?;
+    let elements = add(
+        add(attention, transformer_linear)?,
+        add(frame_rate, vocoder)?,
+    )?;
+    mul(elements, to_u64(element_bytes)?)
 }
 
 /// Build standard RoPE cos/sin cache.
@@ -2020,6 +2320,73 @@ fn causal_mask(
     Tensor::from_vec(data, (1, seq_len, total_len), device)?
         .to_dtype(dtype)
         .map_err(Error::from)
+}
+
+/// Backend temporaries of one reference encode of `max_seconds` of audio,
+/// following [`SpeechTokenizerEncoderNet`] and the encoder transformer: the
+/// conv stack's largest stage (its input, ELU, padded copy, the conv's
+/// im2col of `kernel x channels x length` and its output live together),
+/// the transformer at the conv stack's output rate, and the quantizer at
+/// the codec frame rate. Each downsampling stage doubles the channels and
+/// divides the length by its ratio (at least 2), so the full-rate stage
+/// with `num_filters` channels dominates. The previous bound charged every
+/// sample at the widest transformer width (`intermediate_size`) eight
+/// times: 47 GB for 30 s on Qwen3-TTS-0.6B-Base, which refused the load.
+pub(crate) fn reference_encode_workspace_upper_bound_bytes(
+    cfg: &EncoderConfig,
+    input_sample_rate: usize,
+    encode_downsample_rate: usize,
+    max_seconds: usize,
+    element_bytes: usize,
+) -> Result<u64> {
+    let overflow = || Error::Overloaded("speech-tokenizer reference workspace overflow".into());
+    let mul = |left: usize, right: usize| left.checked_mul(right).ok_or_else(overflow);
+    let samples = mul(input_sample_rate, max_seconds)?;
+    // First conv: input, padded input, im2col and output.
+    let mut peak = mul(
+        mul(cfg.audio_channels.max(1), samples)?,
+        cfg.kernel_size.saturating_add(2),
+    )?
+    .checked_add(mul(cfg.num_filters, samples)?)
+    .ok_or_else(overflow)?;
+    let mut channels = cfg.num_filters.max(1);
+    let mut length = samples;
+    for &ratio in cfg.upsampling_ratios.iter().rev() {
+        let activation = mul(channels, length)?;
+        // Residual units: input, ELU, padded copy, conv output and sum
+        // (five activations) beside the widest unit's im2col.
+        let residual = mul(activation, cfg.residual_kernel_size.saturating_add(5))?;
+        // Downsampling conv (kernel 2 x ratio, stride ratio): ELU, padded
+        // copy and input, an im2col of 2 activations, output of 2/ratio.
+        let downsample = mul(activation, 6)?;
+        peak = peak.max(residual).max(downsample);
+        channels = mul(channels, 2)?;
+        length = ceil_div(length, ratio.max(1));
+    }
+    let activation = mul(channels, length)?;
+    peak = peak.max(
+        mul(activation, cfg.last_kernel_size.saturating_add(3))?
+            .checked_add(mul(cfg.hidden_size, length)?)
+            .ok_or_else(overflow)?,
+    );
+    // Encoder transformer at the conv output rate: attention scores and
+    // their softmax, plus the layer activations.
+    let attention = mul(mul(mul(cfg.num_attention_heads, length)?, length)?, 2)?;
+    let transformer_width = mul(cfg.hidden_size, 8)?
+        .checked_add(mul(cfg.intermediate_size, 3)?)
+        .ok_or_else(overflow)?;
+    let transformer = mul(length, transformer_width)?;
+    let frames = ceil_div(samples, encode_downsample_rate.max(1));
+    let quantizer_width = cfg
+        .codebook_size
+        .checked_add(mul(cfg.vector_quantization_hidden_dimension, 4)?)
+        .ok_or_else(overflow)?;
+    let quantizer = mul(frames, quantizer_width)?;
+    let elements = [peak, attention, transformer, quantizer]
+        .into_iter()
+        .try_fold(0usize, |total, part| total.checked_add(part))
+        .ok_or_else(overflow)?;
+    u64::try_from(mul(elements, element_bytes)?).map_err(|_| overflow())
 }
 
 fn ceil_div(n: usize, d: usize) -> usize {
@@ -2094,9 +2461,42 @@ fn resample_audio_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<
     Ok(out)
 }
 
+/// The encoder of the Qwen3-TTS-12Hz speech tokenizer as shipped (0.6B and
+/// 1.7B Base share it): `speech_tokenizer/config.json` `encoder_config`.
+#[cfg(test)]
+pub(crate) const QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON: &str = r#"{"_frame_rate": 12.5,
+    "attention_bias": false, "audio_channels": 1, "codebook_dim": 256,
+    "codebook_size": 2048, "compress": 2, "dilation_growth_rate": 2, "head_dim": 64,
+    "hidden_size": 512, "intermediate_size": 2048, "kernel_size": 7, "last_kernel_size": 3,
+    "layer_scale_initial_scale": 0.01, "max_position_embeddings": 8000, "norm_eps": 1e-05,
+    "num_attention_heads": 8, "num_filters": 64, "num_hidden_layers": 8,
+    "num_key_value_heads": 8, "num_quantizers": 32, "num_residual_layers": 1,
+    "num_semantic_quantizers": 1, "pad_mode": "constant", "residual_kernel_size": 3,
+    "rope_theta": 10000.0, "sampling_rate": 24000, "sliding_window": 250,
+    "upsampling_ratios": [8, 6, 5, 4], "use_causal_conv": true, "use_conv_shortcut": false,
+    "vector_quantization_hidden_dimension": 256}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 30 s reference on the shipped encoder: the full-rate residual
+    /// unit (64 channels x 720,000 samples, five activations beside a
+    /// kernel-3 im2col) dominates, about 1.5 GB of F32 temporaries. The old
+    /// bound charged every sample at the 2,048-wide transformer width eight
+    /// times, 47 GB.
+    #[test]
+    fn reference_encode_bound_follows_the_shipped_encoder() {
+        let cfg: EncoderConfig = serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        let bytes =
+            reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 30, 4).unwrap();
+        let full_rate_activation = 64u64 * 720_000 * 4;
+        assert!(bytes >= full_rate_activation * 8, "{bytes}");
+        assert!(bytes < 2_000_000_000, "{bytes}");
+        // Shorter references cost proportionally less.
+        let ten = reference_encode_workspace_upper_bound_bytes(&cfg, 24_000, 1_920, 10, 4).unwrap();
+        assert!(ten * 2 < bytes);
+    }
 
     #[test]
     fn normalized_codec_indices_wrap_and_pad_tokens() {
@@ -2162,5 +2562,454 @@ mod tests {
 
         let (indices, _) = codebook.quantize(&frames).expect("quantize");
         assert_eq!(indices.to_vec1::<u32>().expect("indices"), vec![0]);
+    }
+
+    /// Deterministic xorshift weights keyed by tensor name: norm gains near
+    /// one, matrices and kernels scaled by 1/sqrt(fan-in), so stacked blocks
+    /// stay O(1).
+    struct XorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for XorshiftWeights {
+        fn get(
+            &self,
+            shape: candle_core::Shape,
+            name: &str,
+            _: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let seed = name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+            });
+            let gain = name.ends_with("norm.weight");
+            let fan_in = shape.dims().iter().skip(1).product::<usize>().max(1);
+            let scale = if gain {
+                0.1
+            } else {
+                (1.0 / (fan_in as f32).sqrt()).min(0.3)
+            };
+            let values = crate::kernels::numeric_check::xorshift_tensor(
+                shape.dims(),
+                seed,
+                scale,
+                &Device::Cpu,
+            )?;
+            let values = if gain { (values + 1.0)? } else { values };
+            values.to_dtype(dtype)?.to_device(device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    fn xorshift_vb(device: &Device) -> VarBuilder<'static> {
+        VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, device.clone())
+    }
+
+    /// The published 12 Hz decoder geometry shrunk to a few channels: two
+    /// pre-transformer layers with a 6-frame sliding window, the same
+    /// upsampling topology at x2 x2 then x3 x2 (24 samples per frame).
+    fn tiny_speech_tokenizer_config() -> SpeechTokenizerConfig {
+        serde_json::from_str(
+            r#"{"architectures": ["Qwen3TTSTokenizerV2Model"],
+            "model_type": "qwen3_tts_tokenizer_12hz", "encoder_valid_num_quantizers": 4,
+            "input_sample_rate": 24000, "output_sample_rate": 24000,
+            "decode_upsample_rate": 24, "encode_downsample_rate": 24,
+            "decoder_config": {"latent_dim": 16, "codebook_dim": 16, "codebook_size": 32,
+                "decoder_dim": 16, "hidden_size": 16, "intermediate_size": 32,
+                "hidden_act": "silu", "num_hidden_layers": 2, "num_attention_heads": 4,
+                "num_key_value_heads": 2, "head_dim": 8, "rms_norm_eps": 1e-5,
+                "rope_theta": 10000, "num_quantizers": 4, "num_semantic_quantizers": 1,
+                "semantic_codebook_size": 32, "sliding_window": 6,
+                "upsample_rates": [3, 2], "upsampling_ratios": [2, 2],
+                "vector_quantization_hidden_dimension": 16}}"#,
+        )
+        .unwrap()
+    }
+
+    /// QTTS-9: every pre-transformer layer attends to at most
+    /// `sliding_window` keys, so a change to frame 0 cannot reach frames at
+    /// or past the window through one layer (masked weights are exactly zero).
+    #[test]
+    fn decoder_attention_ignores_keys_outside_its_sliding_window() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let config = tiny_speech_tokenizer_config().decoder_config;
+        let window = config.sliding_window;
+        let attention = Attention::load(&config, xorshift_vb(&Device::Cpu)).unwrap();
+        let seq = 3 * window;
+        let x = xorshift_tensor(&[1, seq, config.hidden_size], 5, 1.0, &Device::Cpu).unwrap();
+        let bump = Tensor::ones((1, 1, config.hidden_size), DType::F32, &Device::Cpu).unwrap();
+        let perturbed = Tensor::cat(
+            &[
+                (x.narrow(1, 0, 1).unwrap() + bump).unwrap(),
+                x.narrow(1, 1, seq - 1).unwrap(),
+            ],
+            1,
+        )
+        .unwrap();
+        let base = host_f32(&attention.forward(&x).unwrap()).unwrap();
+        let moved = host_f32(&attention.forward(&perturbed).unwrap()).unwrap();
+        let width = config.hidden_size;
+        let frame_changed =
+            |t: usize| base[t * width..(t + 1) * width] != moved[t * width..(t + 1) * width];
+        assert!(
+            (0..window).all(frame_changed),
+            "frames inside the window must see frame 0"
+        );
+        assert!(
+            (window..seq).all(|t| !frame_changed(t)),
+            "frames past the window attended to frame 0"
+        );
+    }
+
+    fn tiny_decoder() -> SpeechTokenizerDecoder {
+        SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            xorshift_vb(&Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap()
+    }
+
+    /// Unstructured codes for every quantizer group.
+    fn xorshift_codes(groups: usize, frames: usize, codebook_size: usize) -> Vec<Vec<u32>> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..groups)
+            .map(|_| {
+                (0..frames)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % codebook_size as u64) as u32
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// QTTS-3: the windowed upsampler/vocoder reproduces a whole-utterance
+    /// pass across window boundaries, never runs on more than one window
+    /// plus its context, and is bit-identical when one window covers it all.
+    #[test]
+    fn windowed_codec_decode_matches_whole_utterance_decode() {
+        use crate::kernels::numeric_check::max_abs_diff;
+
+        let decoder = tiny_decoder();
+        let context = decoder.vocoder_context_frames;
+        assert!(context > 0);
+        let codes = xorshift_codes(4, 37, 32);
+        let window = 5;
+        let windowed = decoder.decode_windowed(&codes, window).unwrap();
+        let stats = decoder.decode_stats();
+        assert_eq!(stats.windows, 37usize.div_ceil(window) as u64);
+        assert_eq!(stats.peak_window_frames, window + context);
+
+        let whole = decoder.decode_windowed(&codes, usize::MAX).unwrap();
+        assert_eq!(whole.len(), 37 * 24);
+        assert!(
+            whole.iter().filter(|v| v.abs() < 0.99).count() > whole.len() / 2,
+            "decoder output is saturated; the comparison would be vacuous"
+        );
+        let error = max_abs_diff(&windowed, &whole);
+        assert!(error < 1e-5, "windowed decode diverges by {error}");
+
+        // The default window covers 20 frames in one pass: same op shapes.
+        let short = xorshift_codes(4, 20, 32);
+        assert_eq!(
+            decoder.decode(&short).unwrap(),
+            decoder.decode_windowed(&short, usize::MAX).unwrap()
+        );
+    }
+
+    /// QTTS-5: decoding a stream in uneven steps (single frames, steps
+    /// shorter and longer than the sliding window and the vocoder window)
+    /// reproduces the whole-utterance decode sample for sample, so a
+    /// stream never re-decodes its prefix and its chunks join seamlessly.
+    #[test]
+    fn stream_steps_reproduce_the_whole_decode() {
+        use crate::kernels::numeric_check::max_abs_diff;
+
+        let decoder = tiny_decoder();
+        let codes = xorshift_codes(4, 61, 32);
+        let whole = decoder.decode_windowed(&codes, usize::MAX).unwrap();
+        let mut stream = decoder.start_stream();
+        let mut streamed = Vec::new();
+        let mut frames = 0;
+        for step in [1usize, 5, 3, 9, 1, 19, 2, 21] {
+            let end = (frames + step).min(61);
+            let next = codes
+                .iter()
+                .map(|g| g[frames..end].to_vec())
+                .collect::<Vec<_>>();
+            let chunk = decoder.decode_stream_step(&mut stream, &next).unwrap();
+            assert_eq!(chunk.len(), (end - frames) * 24);
+            streamed.extend(chunk);
+            frames = end;
+        }
+        assert_eq!(stream.frames(), 61);
+        let none = vec![Vec::new(); 4];
+        assert!(decoder
+            .decode_stream_step(&mut stream, &none)
+            .unwrap()
+            .is_empty());
+        assert_eq!(streamed.len(), whole.len());
+        let error = max_abs_diff(&streamed, &whole);
+        assert!(error < 1e-5, "streamed decode diverges by {error}");
+    }
+
+    /// QTTS-5: the streamed pre-transformer latents equal the whole
+    /// utterance's where the attention context matters: each layer keeps
+    /// `sliding_window - 1` input frames (one frame less changes the latents
+    /// of every step's first frames about 20x past the tolerance).
+    #[test]
+    fn stream_latents_keep_each_layers_sliding_window_context() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff};
+
+        // Sharp attention (large q/k projections, unit layer scales), so a
+        // frame's latent depends visibly on its window's earlier frames.
+        struct SharpAttentionWeights;
+        impl candle_nn::var_builder::SimpleBackend for SharpAttentionWeights {
+            fn get(
+                &self,
+                shape: candle_core::Shape,
+                name: &str,
+                init: candle_nn::Init,
+                dtype: DType,
+                device: &Device,
+            ) -> candle_core::Result<Tensor> {
+                let base = XorshiftWeights.get(shape, name, init, dtype, device)?;
+                if name.contains("layer_scale") {
+                    base.ones_like()
+                } else if name.contains("q_proj") || name.contains("k_proj") {
+                    base * 8.0
+                } else if name.contains("v_proj")
+                    || name.contains("o_proj")
+                    || name.contains("output_proj")
+                {
+                    base * 4.0
+                } else {
+                    Ok(base)
+                }
+            }
+
+            fn get_unchecked(
+                &self,
+                name: &str,
+                _: DType,
+                _: &Device,
+            ) -> candle_core::Result<Tensor> {
+                candle_core::bail!("unexpected unchecked tensor request {name}")
+            }
+
+            fn contains_tensor(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let decoder = SpeechTokenizerDecoder::from_config(
+            tiny_speech_tokenizer_config(),
+            VarBuilder::from_backend(Box::new(SharpAttentionWeights), DType::F32, Device::Cpu),
+            Device::Cpu,
+        )
+        .unwrap();
+        let codes = xorshift_codes(4, 40, 32);
+        let whole = host_f32(&decoder.decode_latents(&codes).unwrap()).unwrap();
+        let mut stream = decoder.start_stream();
+        let mut parts = Vec::new();
+        let mut frames = 0;
+        for step in [3usize, 1, 7, 2, 11, 16] {
+            let end = frames + step;
+            let next = codes
+                .iter()
+                .map(|g| g[frames..end].to_vec())
+                .collect::<Vec<_>>();
+            parts.push(decoder.stream_latents(&mut stream, &next).unwrap());
+            frames = end;
+        }
+        let window = decoder.config.sliding_window;
+        assert!(stream
+            .layer_tails
+            .iter()
+            .all(|tail| tail.as_ref().unwrap().dim(1).unwrap() == window - 1));
+        let streamed = host_f32(&Tensor::cat(&parts, 2).unwrap()).unwrap();
+        let error = max_abs_diff(&streamed, &whole);
+        // Float reassociation gives about 1e-6; one frame of missing
+        // context gives about 2e-5.
+        assert!(error < 5e-6, "streamed latents diverge by {error}");
+    }
+
+    /// The computed vocoder context really covers its receptive field: a
+    /// change to latent frame 0 must not reach any sample at or past
+    /// `context` frames.
+    #[test]
+    fn vocoder_context_covers_the_measured_receptive_field() {
+        use crate::kernels::numeric_check::{host_f32, xorshift_tensor};
+
+        let decoder = tiny_decoder();
+        let config = &decoder.config;
+        let context = decoder.vocoder_context_frames;
+        let frames = context + 8;
+        let latents =
+            xorshift_tensor(&[1, config.latent_dim, frames], 9, 1.0, &Device::Cpu).unwrap();
+        let bump = Tensor::ones((1, config.latent_dim, 1), DType::F32, &Device::Cpu).unwrap();
+        let perturbed = Tensor::cat(
+            &[
+                (latents.narrow(2, 0, 1).unwrap() + bump).unwrap(),
+                latents.narrow(2, 1, frames - 1).unwrap(),
+            ],
+            2,
+        )
+        .unwrap();
+        let base = host_f32(&decoder.vocode(&latents).unwrap()).unwrap();
+        let moved = host_f32(&decoder.vocode(&perturbed).unwrap()).unwrap();
+        let last_changed = base
+            .iter()
+            .zip(&moved)
+            .rposition(|(a, b)| a != b)
+            .expect("frame 0 must reach its own samples");
+        assert!(
+            last_changed < context * decoder.decode_upsample_rate,
+            "frame 0 reached sample {last_changed}, past {context} frames of context"
+        );
+
+        // Published geometry: 11 frames (0.88 s) of left context.
+        let published: DecoderConfig = serde_json::from_str(PUBLISHED_DECODER_CONFIG).unwrap();
+        assert_eq!(vocoder_receptive_field_frames(&published), 11);
+    }
+
+    /// `decoder_config` of Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer
+    /// (identical across the published 12 Hz checkpoints).
+    const PUBLISHED_DECODER_CONFIG: &str = r#"{"attention_bias": false,
+        "attention_dropout": 0.0, "latent_dim": 1024, "codebook_dim": 512,
+        "codebook_size": 2048, "decoder_dim": 1536, "hidden_act": "silu",
+        "hidden_size": 512, "intermediate_size": 1024, "layer_scale_initial_scale": 0.01,
+        "max_position_embeddings": 8000, "head_dim": 64, "num_attention_heads": 16,
+        "num_hidden_layers": 8, "num_key_value_heads": 16, "num_quantizers": 16,
+        "num_semantic_quantizers": 1, "rms_norm_eps": 1e-05, "rope_theta": 10000,
+        "semantic_codebook_size": 4096, "sliding_window": 72, "upsample_rates": [8, 5, 4, 3],
+        "upsampling_ratios": [2, 2], "vector_quantization_hidden_dimension": 512}"#;
+
+    /// The decode price follows the windowed decode: the vocoder term is one
+    /// window whatever the utterance length, so 120 s of audio prices close
+    /// to 4 s instead of growing ~30x.
+    #[test]
+    fn codec_decode_price_is_one_vocoder_window() {
+        let published: DecoderConfig = serde_json::from_str(PUBLISHED_DECODER_CONFIG).unwrap();
+        let context = vocoder_receptive_field_frames(&published);
+        let price = |frames| decode_workspace_upper_bound_bytes(&published, context, frames, 4);
+        let window = price(VOCODER_WINDOW_FRAMES + context).unwrap();
+        let long = price(1_500).unwrap();
+        assert!(price(1).unwrap() < window);
+        assert!(long >= window);
+        // Only the frame-rate stages grow past one window: under 64 MiB more
+        // at 1,500 frames (120 s).
+        assert!(
+            long - window < 64 << 20,
+            "frame-rate growth {}",
+            long - window
+        );
+        // One F32 window of the published vocoder: 43 frames at 24 kHz with
+        // 96 channels and 13 activation widths, about 0.4 GiB.
+        assert!(
+            window > 300 << 20 && window < 512 << 20,
+            "window price {window}"
+        );
+    }
+
+    /// Real-weight check of the windowed decode against one whole-utterance
+    /// pass (CPU, F32, about 1.5 GB). Set IZWI_TEST_QWEN_TTS_SPEECH_TOKENIZER
+    /// to a `speech_tokenizer` directory, or keep the default izwi model path.
+    #[test]
+    #[ignore = "needs a local Qwen3-TTS speech_tokenizer checkpoint"]
+    fn published_windowed_decode_matches_whole_decode() {
+        use crate::kernels::numeric_check::{max_abs_diff, relative_l2};
+
+        let dir = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            std::env::var_os("IZWI_TEST_QWEN_TTS_SPEECH_TOKENIZER")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(
+                            "Library/Application Support/izwi/models/\
+                             Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer",
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let decoder = SpeechTokenizerDecoder::load(&dir, Device::Cpu, DType::F32, true).unwrap();
+        let frames = 72;
+        let codes = xorshift_codes(16, frames, 2048);
+        let started = std::time::Instant::now();
+        let windowed = decoder.decode(&codes).unwrap();
+        let windowed_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let whole = decoder.decode_windowed(&codes, usize::MAX).unwrap();
+        let whole_ms = started.elapsed().as_millis();
+        let stats = decoder.decode_stats();
+        eprintln!(
+            "windowed {windowed_ms} ms ({} windows, peak {} frames), whole {whole_ms} ms",
+            stats.windows, stats.peak_window_frames
+        );
+        assert_eq!(windowed.len(), frames * 1920);
+        let error = max_abs_diff(&windowed, &whole);
+        let rel = relative_l2(&windowed, &whole);
+        eprintln!("max abs diff {error:e}, relative L2 {rel:e}");
+        assert!(error < 1e-4 && rel < 1e-5, "max abs {error}, rel {rel}");
+    }
+
+    /// QTTS-10/11 parity gate for an F16 speech-tokenizer decoder on Metal:
+    /// the same codes (72 frames, xorshift, all 16 codebooks) decoded in F16
+    /// and in F32 on Metal. Opt-in (ignored, real weights, about 1.5 GB);
+    /// the decoder stays F32 by default unless this gate passes.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "needs a local Qwen3-TTS speech_tokenizer checkpoint and a Metal device"]
+    fn metal_f16_decoder_parity_gate() {
+        use crate::kernels::numeric_check::{max_abs_diff, relative_l2};
+
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let dir = {
+            let _env = crate::env_test_lock().lock().unwrap();
+            std::env::var_os("IZWI_TEST_QWEN_TTS_SPEECH_TOKENIZER")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| {
+                        std::path::PathBuf::from(home).join(
+                            "Library/Application Support/izwi/models/\
+                             Qwen3-TTS-12Hz-0.6B-CustomVoice/speech_tokenizer",
+                        )
+                    })
+                })
+                .unwrap()
+        };
+        let codes = xorshift_codes(16, 72, 2048);
+        let decode = |dtype| {
+            SpeechTokenizerDecoder::load(&dir, metal.clone(), dtype, false)
+                .unwrap()
+                .decode(&codes)
+                .unwrap()
+        };
+        let full = decode(DType::F32);
+        let half = decode(DType::F16);
+        let rel = relative_l2(&half, &full);
+        let error = max_abs_diff(&half, &full);
+        let snr_db = -20.0 * rel.log10();
+        eprintln!("F16 vs F32 decoder: relative L2 {rel:e}, SNR {snr_db:.1} dB, max abs {error:e}");
+        assert!(half.iter().all(|v| v.is_finite()));
+        assert!(
+            snr_db >= 30.0,
+            "F16 decoder SNR {snr_db:.1} dB is below the 30 dB gate"
+        );
     }
 }

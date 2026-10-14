@@ -325,6 +325,10 @@ pub struct SpeechHistoryRecordSummary {
     pub tokens_generated: Option<usize>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
+    /// Why generation ended (`stop`, `length`, `context_length`), when the
+    /// model reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -354,6 +358,10 @@ pub struct SpeechHistoryRecord {
     pub tokens_generated: Option<usize>,
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
+    /// Why generation ended (`stop`, `length`, `context_length`), when the
+    /// model reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +391,7 @@ pub struct NewSpeechHistoryRecord {
     pub audio_mime_type: String,
     pub audio_filename: Option<String>,
     pub audio_bytes: Vec<u8>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -404,6 +413,7 @@ pub struct CompleteSpeechHistoryRecord {
     pub audio_bytes: Vec<u8>,
     /// Attempt-owned output already persisted before the route projection is made ready.
     pub preexisting_audio_storage_path: Option<String>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,6 +731,7 @@ impl SpeechHistoryStore {
                 audio_storage_path: Set(audio_storage_path.clone().unwrap_or_default()),
                 audio_media_asset_id: Set(None),
                 audio_artifact_tenant: Set(None),
+                stop_reason: Set(record.stop_reason.clone()),
             })
             .exec(db)
             .await
@@ -1061,6 +1072,10 @@ impl SpeechHistoryStore {
                 Expr::value(tokens_generated),
             )
             .col_expr(
+                speech_history_records::Column::StopReason,
+                Expr::value(record.stop_reason.clone()),
+            )
+            .col_expr(
                 speech_history_records::Column::AudioMimeType,
                 Expr::value(audio_mime_type),
             )
@@ -1186,7 +1201,8 @@ const SPEECH_HISTORY_PAGE_SQL: &str = r#"
         rtf,
         tokens_generated,
         audio_mime_type,
-        audio_filename
+        audio_filename,
+        stop_reason
     FROM speech_history_records
     WHERE route_kind = ?1
     ORDER BY created_at DESC, id DESC
@@ -1211,7 +1227,8 @@ const SPEECH_HISTORY_PAGE_AFTER_CURSOR_SQL: &str = r#"
         rtf,
         tokens_generated,
         audio_mime_type,
-        audio_filename
+        audio_filename,
+        stop_reason
     FROM speech_history_records
     WHERE route_kind = ?1
         AND (created_at < ?2 OR (created_at = ?2 AND id < ?3))
@@ -1238,7 +1255,8 @@ const SPEECH_HISTORY_RECORD_COLUMNS: &str = r#"
     rtf,
     tokens_generated,
     audio_mime_type,
-    audio_filename
+    audio_filename,
+    stop_reason
 "#;
 
 async fn fetch_record_without_audio(
@@ -1368,6 +1386,7 @@ fn map_speech_history_summary(row: &QueryResult) -> anyhow::Result<SpeechHistory
             .and_then(i64_to_usize),
         audio_mime_type: row.try_get_by_index(15)?,
         audio_filename: row.try_get_by_index(16)?,
+        stop_reason: row.try_get_by_index(17)?,
     })
 }
 
@@ -1402,6 +1421,7 @@ fn map_speech_history_record(row: &QueryResult) -> anyhow::Result<SpeechHistoryR
             .and_then(i64_to_usize),
         audio_mime_type: row.try_get_by_index(17)?,
         audio_filename: row.try_get_by_index(18)?,
+        stop_reason: row.try_get_by_index(19)?,
     })
 }
 
@@ -1710,6 +1730,7 @@ mod tests {
 
     fn ready_record() -> NewSpeechHistoryRecord {
         NewSpeechHistoryRecord {
+            stop_reason: None,
             route_kind: SpeechRouteKind::TextToSpeech,
             processing_status: SpeechHistoryProcessingStatus::Ready,
             processing_error: None,
@@ -1733,6 +1754,7 @@ mod tests {
 
     fn completed_record(audio_bytes: Vec<u8>) -> CompleteSpeechHistoryRecord {
         CompleteSpeechHistoryRecord {
+            stop_reason: None,
             model_id: Some("model-b".to_string()),
             speaker: Some("Alex".to_string()),
             language: Some("en".to_string()),
@@ -1820,6 +1842,29 @@ mod tests {
             .sum()
     }
 
+    /// The stop reason a synchronous or durable record was generated with
+    /// is persisted and read back on every listing.
+    #[tokio::test]
+    async fn records_keep_their_stop_reason() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let created = store
+            .create_record(NewSpeechHistoryRecord {
+                stop_reason: Some("length".to_string()),
+                ..ready_record()
+            })
+            .await
+            .expect("record should create");
+        assert_eq!(created.stop_reason.as_deref(), Some("length"));
+        let (records, _) = store
+            .list_records_page(SpeechRouteKind::TextToSpeech, 10, None)
+            .await
+            .expect("records should list");
+        assert_eq!(records[0].stop_reason.as_deref(), Some("length"));
+        let serialized = serde_json::to_value(&created).unwrap();
+        assert_eq!(serialized["stop_reason"], "length");
+    }
+
     #[tokio::test]
     async fn creates_lists_reads_audio_updates_status_and_deletes_record() {
         let _guard = env_lock();
@@ -1903,6 +1948,7 @@ mod tests {
                 SpeechRouteKind::TextToSpeech,
                 pending.id.clone(),
                 CompleteSpeechHistoryRecord {
+                    stop_reason: None,
                     model_id: Some("model-b".to_string()),
                     speaker: Some("Alex".to_string()),
                     language: Some("en".to_string()),

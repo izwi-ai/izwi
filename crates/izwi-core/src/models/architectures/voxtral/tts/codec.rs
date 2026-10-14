@@ -1,18 +1,19 @@
 //! Voxtral neural codec decoder.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{
     ops, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Linear, Module,
     RmsNorm, VarBuilder,
 };
 
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::core::repeat_kv;
 use crate::models::shared::attention::flash::{
     flash_attention_requested, try_fused_self_attention_with_options, CudaFlashAttentionOptions,
 };
+use crate::models::shared::attention::gqa::{banded_sdpa_bhsd_with_bias, AttentionBand, BandBlock};
 
 use super::super::layers::linear_forward_last_dim;
 use super::acoustic::{strip_audio_token_offset, AudioCodeValue};
@@ -152,6 +153,9 @@ struct VoxtralCodecFeedForward {
 enum VoxtralPadMode {
     Constant,
     Replicate,
+    /// The reference `pad1d(mode="reflect")`, including its zero extension
+    /// of inputs no longer than the padding.
+    Reflect,
 }
 
 impl VoxtralCodecDecoder {
@@ -248,7 +252,9 @@ impl VoxtralCodecDecoder {
             1,
             args.conv_weight_norm,
             false,
-            VoxtralPadMode::Replicate,
+            // The reference `output_proj = CausalConv1d(...)` keeps the
+            // default `pad_mode="reflect"`; only `decoder_blocks.0` replicates.
+            VoxtralPadMode::Reflect,
             vb.pp("output_proj"),
         )?;
 
@@ -261,10 +267,30 @@ impl VoxtralCodecDecoder {
     }
 
     pub fn decode_timeline(&self, timeline: &VoxtralCodecTimeline) -> Result<Vec<f32>> {
+        self.decode_timeline_chunks(timeline, 0, true, VOXTRAL_CODEC_CHUNK_FRAMES)
+            .map(|(samples, _)| samples)
+    }
+
+    /// Per-chunk emission: the audio of the codec chunks starting at or after
+    /// frame `from` (a chunk boundary) that are complete. Chunks decode
+    /// independently (as the reference's chunked decode does), so a chunk's
+    /// audio never depends on later frames, and emitting the complete ones as
+    /// they fill reproduces [`Self::decode_timeline`] chunk for chunk. With
+    /// `finished`, the last, partial chunk is complete too. Returns the
+    /// samples and the frame after the last chunk decoded.
+    pub fn decode_timeline_chunks(
+        &self,
+        timeline: &VoxtralCodecTimeline,
+        from: usize,
+        finished: bool,
+        chunk_frames: usize,
+    ) -> Result<(Vec<f32>, usize)> {
         let trimmed = timeline.trim_at_end_audio();
         let frames = trimmed.generated_frame_count();
+        // Frames past end-of-audio are trimmed, so the audio is final.
+        let finished = finished || frames < timeline.generated_frame_count();
         if frames == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), from));
         }
         if trimmed.codebook_count() != self.quantizer.num_codebooks {
             return Err(Error::AudioError(format!(
@@ -275,10 +301,17 @@ impl VoxtralCodecDecoder {
         }
 
         let mut samples = Vec::new();
-        for range in self.config.chunk_ranges(frames) {
-            let chunk_frames = range.end - range.start;
+        let mut next = from;
+        for range in chunk_ranges(frames, chunk_frames) {
+            if range.start < from {
+                continue;
+            }
+            let chunk_len = range.end - range.start;
+            if !finished && chunk_len < chunk_frames.max(1) {
+                break;
+            }
             let codes = trimmed.to_unshifted_tensor_range(
-                range,
+                range.clone(),
                 self.quantizer.semantic_codebook.embeddings().device(),
             )?;
             let audio = self.decode_unshifted_codes(&codes)?;
@@ -286,10 +319,11 @@ impl VoxtralCodecDecoder {
                 .to_dtype(DType::F32)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
-            trim_samples_to_frames(&mut chunk, chunk_frames, &self.config)?;
+            trim_samples_to_frames(&mut chunk, chunk_len, &self.config)?;
             samples.extend(chunk);
+            next = range.end;
         }
-        Ok(samples)
+        Ok((samples, next))
     }
 
     pub fn decode_unshifted_codes(&self, codes: &Tensor) -> Result<Tensor> {
@@ -675,34 +709,8 @@ impl VoxtralCodecAttention {
                 }
             }
         }
-        let k = repeat_kv(&k, self.n_heads, self.n_kv_heads)?;
-        let v = repeat_kv(&v, self.n_heads, self.n_kv_heads)?;
-        let q = q_heads;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
-        let q = q.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-        let k = k.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-        let v = v.reshape((batch * self.n_heads, seq_len, self.head_dim))?;
-
-        let mut attn = q.matmul(&k.transpose(1, 2)?)?;
-        let scale =
-            Tensor::new((self.head_dim as f32).sqrt(), attn.device())?.to_dtype(attn.dtype())?;
-        attn = attn.broadcast_div(&scale)?;
-        let bias = alibi_attention_bias(
-            batch,
-            self.n_heads,
-            seq_len,
-            self.sliding_window,
-            self.causal,
-            &self.alibi_slopes,
-            attn.device(),
-            attn.dtype(),
-        )?;
-        attn = attn.broadcast_add(&bias)?;
-        let attn = ops::softmax(&attn, D::Minus1)?;
-        let out = attn.matmul(&v)?;
-        let out = out
-            .reshape((batch, self.n_heads, seq_len, self.head_dim))?
+        let out = self
+            .banded_attention(&q_heads, &k_kv_heads, &v_kv_heads)?
             .transpose(1, 2)?
             .reshape((batch, seq_len, q_dim))?;
         if out.dim(2)? != q_dim || kv_dim == 0 {
@@ -712,6 +720,39 @@ impl VoxtralCodecAttention {
         }
         linear_forward_last_dim(&self.wo, &out)
     }
+
+    /// Keys visible to each query: `i - window ..= i` (causal) or
+    /// `i - window ..= i + window`, as the reference's `outside_window` mask.
+    fn band(&self) -> AttentionBand {
+        AttentionBand {
+            left: self.sliding_window,
+            right: if self.causal { 0 } else { self.sliding_window },
+        }
+    }
+
+    /// ALiBi attention over the window, computed banded in query blocks: the
+    /// codec's windows are 2-16 keys, but its last stage runs at 8 x frames
+    /// positions, where dense scores and a host-built bias cost ~1-2 GiB per
+    /// layer for one 375-frame chunk.
+    fn banded_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        VOXTRAL_CODEC_BANDED_ATTENTION_CALLS.fetch_add(1, Ordering::Relaxed);
+        let band = self.band();
+        banded_sdpa_bhsd_with_bias(
+            q,
+            k,
+            v,
+            band,
+            1.0 / (self.head_dim as f64).sqrt(),
+            |block| alibi_block_bias(block, band, &self.alibi_slopes, q.device(), q.dtype()),
+        )
+    }
+}
+
+/// Codec attention layers computed banded since start (diagnostics).
+static VOXTRAL_CODEC_BANDED_ATTENTION_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn voxtral_codec_banded_attention_calls() -> u64 {
+    VOXTRAL_CODEC_BANDED_ATTENTION_CALLS.load(Ordering::Relaxed)
 }
 
 impl VoxtralCodecFeedForward {
@@ -986,7 +1027,30 @@ fn pad_1d(x: &Tensor, left: usize, right: usize, mode: VoxtralPadMode) -> Result
     match mode {
         VoxtralPadMode::Constant => x.pad_with_zeros(2, left, right).map_err(Error::from),
         VoxtralPadMode::Replicate => pad_replicate(x, left, right),
+        VoxtralPadMode::Reflect => pad_reflect(x, left, right),
     }
+}
+
+/// `pad1d(x, (left, right), mode="reflect")` from the reference tokenizer:
+/// an input no longer than the larger pad is first zero-extended on the
+/// right so the reflection exists, and that extension is cut off again.
+fn pad_reflect(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
+    let len = x.dim(2)?;
+    let max_pad = left.max(right);
+    let extra = if len <= max_pad { max_pad - len + 1 } else { 0 };
+    let extended = len + extra;
+    let mut indices = Vec::with_capacity(left + extended + right);
+    indices.extend((1..=left).rev().map(|offset| offset as u32));
+    indices.extend((0..extended).map(|index| index as u32));
+    indices.extend((0..right).map(|offset| (extended - 2 - offset) as u32));
+    indices.truncate(indices.len() - extra);
+    let source = if extra > 0 {
+        x.pad_with_zeros(2, 0, extra)?.contiguous()?
+    } else {
+        x.contiguous()?
+    };
+    let indices = Tensor::from_vec(indices, (left + len + right,), x.device())?;
+    source.index_select(&indices, 2).map_err(Error::from)
 }
 
 fn pad_replicate(x: &Tensor, left: usize, right: usize) -> Result<Tensor> {
@@ -1041,40 +1105,37 @@ fn voxtral_codec_cuda_flash_attention_options<'a>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn alibi_attention_bias(
-    batch: usize,
-    n_heads: usize,
-    seq_len: usize,
-    sliding_window: usize,
-    causal: bool,
+/// Additive `[1, heads, query_len, key_len]` bias for one band block: the
+/// reference's `slope_h * (key - query)` inside the band, -inf outside it.
+fn alibi_block_bias(
+    block: BandBlock,
+    band: AttentionBand,
     slopes: &[f32],
     device: &Device,
     dtype: DType,
 ) -> Result<Tensor> {
-    let mut values = Vec::with_capacity(batch * n_heads * seq_len * seq_len);
-    let window_left = sliding_window as isize;
-    let window_right = if causal { 0 } else { sliding_window as isize };
-    for _batch_idx in 0..batch {
-        for head in 0..n_heads {
-            let slope = slopes.get(head).copied().unwrap_or(1.0);
-            for query in 0..seq_len {
-                for key in 0..seq_len {
-                    let rel = key as isize - query as isize;
-                    let outside = rel < -window_left || rel > window_right;
-                    let future = causal && rel > 0;
-                    if outside || future {
-                        values.push(f32::NEG_INFINITY);
+    let mut values = Vec::with_capacity(slopes.len() * block.query_len * block.key_len);
+    for &slope in slopes {
+        for query in 0..block.query_len {
+            for key in 0..block.key_len {
+                let rel = block.relative(query, key);
+                values.push(
+                    if rel < -(band.left as isize) || rel > band.right as isize {
+                        f32::NEG_INFINITY
                     } else {
-                        values.push(slope * rel as f32);
-                    }
-                }
+                        slope * rel as f32
+                    },
+                );
             }
         }
     }
-    Tensor::from_vec(values, (batch * n_heads, seq_len, seq_len), device)?
-        .to_dtype(dtype)
-        .map_err(Error::from)
+    Tensor::from_vec(
+        values,
+        (1, slopes.len(), block.query_len, block.key_len),
+        device,
+    )?
+    .to_dtype(dtype)
+    .map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -1182,14 +1243,275 @@ mod tests {
         assert_eq!(samples.len(), 4);
     }
 
+    /// Per-chunk emission: emitting each complete codec chunk as frames
+    /// arrive (and the partial last chunk once finished) reproduces the
+    /// whole timeline decode, and end-of-audio finishes the stream early.
+    #[test]
+    fn chunked_emission_reproduces_the_timeline_decode() {
+        let device = Device::Cpu;
+        let config = tiny_codec_config();
+        let tensors = tiny_codec_tensors(&device);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device).pp("audio_tokenizer");
+        let decoder = VoxtralCodecDecoder::load(&config, vb).unwrap();
+        let code = |i: usize, k: usize| apply_audio_token_offset(((i * 7 + k * 3) % 3) as u32);
+        let timeline_of = |frames: usize| {
+            VoxtralCodecTimeline::new(
+                (0..3)
+                    .map(|k| (0..frames).map(|i| code(i, k)).collect())
+                    .collect(),
+            )
+            .unwrap()
+        };
+        let chunk = 2;
+        let whole = decoder
+            .decode_timeline_chunks(&timeline_of(7), 0, true, chunk)
+            .unwrap()
+            .0;
+        let mut streamed = Vec::new();
+        let mut emitted = 0;
+        for frames in 1..=7 {
+            let (samples, next) = decoder
+                .decode_timeline_chunks(&timeline_of(frames), emitted, false, chunk)
+                .unwrap();
+            assert_eq!(next, frames - frames % chunk);
+            streamed.extend(samples);
+            emitted = next;
+        }
+        let (tail, next) = decoder
+            .decode_timeline_chunks(&timeline_of(7), emitted, true, chunk)
+            .unwrap();
+        streamed.extend(tail);
+        assert_eq!(next, 7);
+        assert_eq!(streamed, whole);
+
+        // End-of-audio trims the timeline and completes its partial chunk.
+        let mut ended = timeline_of(5);
+        ended.shifted_codebooks[0][3] = AudioSpecialToken::End.id();
+        let (samples, next) = decoder
+            .decode_timeline_chunks(&ended, 2, false, chunk)
+            .unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(samples.len(), config_samples(&decoder, 1));
+    }
+
+    fn config_samples(decoder: &VoxtralCodecDecoder, frames: usize) -> usize {
+        decoder.config.samples_for_frames(frames).unwrap()
+    }
+
+    /// VXT-8: reflect padding matches the reference `pad1d` (NumPy
+    /// `np.pad(mode="reflect")` goldens), including the zero extension of
+    /// inputs no longer than the padding.
+    #[test]
+    fn reflect_padding_matches_reference_pad1d() {
+        let device = Device::Cpu;
+        let cases: [(&[f32], usize, usize, &[f32]); 4] = [
+            (&[1.0, 2.0, 3.0, 4.0], 2, 0, &[3.0, 2.0, 1.0, 2.0, 3.0, 4.0]),
+            (&[1.0, 2.0], 2, 0, &[0.0, 2.0, 1.0, 2.0]),
+            (&[5.0], 2, 1, &[0.0, 0.0, 5.0, 0.0]),
+            (&[1.0, 2.0, 3.0], 2, 1, &[3.0, 2.0, 1.0, 2.0, 3.0, 2.0]),
+        ];
+        for (input, left, right, expected) in cases {
+            // Two channels, the second negated, to check per-channel indexing.
+            let mut values = input.to_vec();
+            values.extend(input.iter().map(|v| -v));
+            let x = Tensor::from_vec(values, (1, 2, input.len()), &device).unwrap();
+            let padded = pad_1d(&x, left, right, VoxtralPadMode::Reflect).unwrap();
+            let rows = padded.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+            assert_eq!(rows[0], expected, "{input:?} ({left}, {right})");
+            let negated: Vec<f32> = expected.iter().map(|v| -v).collect();
+            assert_eq!(rows[1], negated);
+        }
+
+        // As in the reference: only `decoder_blocks.0` replicates;
+        // `output_proj` keeps CausalConv1d's default reflect padding.
+        let vb = VarBuilder::from_tensors(tiny_codec_tensors(&device), DType::F32, &device)
+            .pp("audio_tokenizer");
+        let decoder = VoxtralCodecDecoder::load(&tiny_codec_config(), vb).unwrap();
+        assert_eq!(decoder.output_proj.pad_mode, VoxtralPadMode::Reflect);
+        let VoxtralDecoderBlock::Conv(input_proj) = &decoder.decoder_blocks[0] else {
+            panic!("decoder_blocks.0 must be the input projection conv");
+        };
+        assert_eq!(input_proj.pad_mode, VoxtralPadMode::Replicate);
+    }
+
     #[test]
     fn alibi_bias_masks_future_and_outside_sliding_window() {
         let device = Device::Cpu;
-        let bias = alibi_attention_bias(1, 1, 4, 2, true, &[1.0], &device, DType::F32).unwrap();
-        let values = bias.to_vec3::<f32>().unwrap();
+        let block = BandBlock {
+            query_start: 0,
+            query_len: 4,
+            key_start: 0,
+            key_len: 4,
+        };
+        let band = AttentionBand { left: 2, right: 0 };
+        let bias = alibi_block_bias(block, band, &[1.0], &device, DType::F32).unwrap();
+        let values = bias.squeeze(0).unwrap().to_vec3::<f32>().unwrap();
         assert!(values[0][0][1].is_infinite());
         assert!(values[0][3][0].is_infinite());
         assert_eq!(values[0][3][1], -2.0);
+    }
+
+    /// Deterministic xorshift weights keyed by tensor name: norm gains near
+    /// one, matrices scaled by 1/sqrt(fan-in).
+    struct XorshiftWeights;
+
+    impl candle_nn::var_builder::SimpleBackend for XorshiftWeights {
+        fn get(
+            &self,
+            shape: Shape,
+            name: &str,
+            _: candle_nn::Init,
+            dtype: DType,
+            device: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let seed = name.bytes().fold(0xCBF2_9CE4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
+            });
+            let gain = name.ends_with("norm.weight");
+            let fan_in = shape.dims().iter().skip(1).product::<usize>().max(1);
+            let scale = if gain {
+                0.1
+            } else {
+                1.0 / (fan_in as f32).sqrt()
+            };
+            let values = crate::kernels::numeric_check::xorshift_tensor(
+                shape.dims(),
+                seed,
+                scale,
+                &Device::Cpu,
+            )?;
+            let values = if gain { (values + 1.0)? } else { values };
+            values.to_dtype(dtype)?.to_device(device)
+        }
+
+        fn get_unchecked(&self, name: &str, _: DType, _: &Device) -> candle_core::Result<Tensor> {
+            candle_core::bail!("unexpected unchecked tensor request {name}")
+        }
+
+        fn contains_tensor(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// Dense f64 reference for one head: softmax of `q.k / sqrt(d) +
+    /// slope * (j - i)` over keys `i - left ..= i + right`.
+    fn dense_alibi_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        (seq, dim): (usize, usize),
+        slope: f32,
+        band: AttentionBand,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (dim as f64).sqrt();
+        let mut out = vec![0f32; seq * dim];
+        for i in 0..seq {
+            let keys = i.saturating_sub(band.left)..=(i + band.right).min(seq - 1);
+            let scores: Vec<f64> = keys
+                .clone()
+                .map(|j| {
+                    let dot: f64 = (0..dim)
+                        .map(|d| f64::from(q[i * dim + d]) * f64::from(k[j * dim + d]))
+                        .sum();
+                    dot * scale + f64::from(slope) * (j as f64 - i as f64)
+                })
+                .collect();
+            let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            for d in 0..dim {
+                let value: f64 = keys
+                    .clone()
+                    .zip(&weights)
+                    .map(|(j, w)| w * f64::from(v[j * dim + d]))
+                    .sum();
+                out[i * dim + d] = (value / total) as f32;
+            }
+        }
+        out
+    }
+
+    /// VXT-7: codec attention runs banded over its ALiBi window (2, 4, 8 and
+    /// 16 keys, causal and two-sided) and matches a dense f64 reference over
+    /// 300 positions, across query blocks, with GQA 4:2.
+    #[test]
+    fn codec_attention_is_banded_and_matches_dense_alibi_reference() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let (seq, n_heads, n_kv_heads, head_dim) = (300, 4, 2, 4);
+        let mut args = tiny_codec_config().multimodal.audio_tokenizer_args;
+        args.dim = 16;
+        args.n_heads = n_heads;
+        args.n_kv_heads = n_kv_heads;
+        args.head_dim = head_dim;
+        let device = Device::Cpu;
+        let x = xorshift_tensor(&[1, seq, args.dim], 17, 1.0, &device).unwrap();
+        for causal in [true, false] {
+            args.causal = causal;
+            for window in [2usize, 4, 8, 16] {
+                let vb =
+                    VarBuilder::from_backend(Box::new(XorshiftWeights), DType::F32, device.clone());
+                let attention = VoxtralCodecAttention::load(&args, 0, window, vb).unwrap();
+                let before = voxtral_codec_banded_attention_calls();
+                let output = host_f32(&attention.forward(&x).unwrap()).unwrap();
+                assert!(voxtral_codec_banded_attention_calls() > before);
+
+                // Same projections, then dense attention per head on host.
+                let mut q = linear_forward_last_dim(&attention.wq, &x).unwrap();
+                let mut k = linear_forward_last_dim(&attention.wk, &x).unwrap();
+                let v = linear_forward_last_dim(&attention.wv, &x).unwrap();
+                if let Some(norm) = &attention.q_norm {
+                    q = norm.forward(&q).unwrap();
+                }
+                if let Some(norm) = &attention.k_norm {
+                    k = norm.forward(&k).unwrap();
+                }
+                let (q, k, v) = (
+                    host_f32(&q).unwrap(),
+                    host_f32(&k).unwrap(),
+                    host_f32(&v).unwrap(),
+                );
+                // The reference's `outside_window`: |j - i| > window, and
+                // j > i when causal.
+                let band = AttentionBand {
+                    left: window,
+                    right: if causal { 0 } else { window },
+                };
+                let mut heads = vec![0f32; seq * n_heads * head_dim];
+                for h in 0..n_heads {
+                    let kv = h / (n_heads / n_kv_heads);
+                    let column = |values: &[f32], heads: usize, head: usize| -> Vec<f32> {
+                        (0..seq)
+                            .flat_map(|t| {
+                                let row = t * heads * head_dim + head * head_dim;
+                                values[row..row + head_dim].to_vec()
+                            })
+                            .collect()
+                    };
+                    let out = dense_alibi_reference(
+                        &column(&q, n_heads, h),
+                        &column(&k, n_kv_heads, kv),
+                        &column(&v, n_kv_heads, kv),
+                        (seq, head_dim),
+                        attention.alibi_slopes[h],
+                        band,
+                    );
+                    for t in 0..seq {
+                        let row = t * n_heads * head_dim + h * head_dim;
+                        heads[row..row + head_dim]
+                            .copy_from_slice(&out[t * head_dim..(t + 1) * head_dim]);
+                    }
+                }
+                let heads = Tensor::from_vec(heads, (1, seq, n_heads * head_dim), &device).unwrap();
+                let reference =
+                    host_f32(&linear_forward_last_dim(&attention.wo, &heads).unwrap()).unwrap();
+                let error = max_abs_diff(&output, &reference);
+                assert!(
+                    error < 1e-5,
+                    "window {window}, causal {causal}: max abs error {error}"
+                );
+            }
+        }
     }
 
     #[test]

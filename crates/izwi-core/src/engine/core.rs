@@ -18,7 +18,7 @@ use super::cache::composite::{
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
 use super::cache::managed::{
-    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom, StateFitReserve,
 };
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
@@ -116,6 +116,23 @@ impl RequestPhaseTiming {
                 * 1000.0,
         )
     }
+}
+
+/// Steps on which one session's execution plan may fail to begin before the
+/// request fails. The run loop retries a failed step every 50 ms at most, so
+/// a plan that can never begin used to retry forever (TPIPE-15, LFA-10); a
+/// transient failure clears well within this bound.
+const MAX_PLAN_BEGIN_ATTEMPTS: u32 = 64;
+
+/// Count one more failed plan begin for `session`: whether its attempts are
+/// now exhausted.
+fn plan_begin_attempts_exhausted(
+    attempts: &mut HashMap<super::SessionKey, u32>,
+    session: &super::SessionKey,
+) -> bool {
+    let count = attempts.entry(session.clone()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count >= MAX_PLAN_BEGIN_ATTEMPTS
 }
 
 /// Why [`EngineCore::begin_execution_plan`] did not register a plan.
@@ -588,6 +605,9 @@ pub struct EngineCore {
     pending_terminal_outputs: VecDeque<CommittedExecutorOutput>,
     /// Consecutive retryable executor failures for each exact session.
     execution_retry_attempts: HashMap<super::SessionKey, u32>,
+    /// Consecutive steps on which a session's execution plan failed to
+    /// begin; bounded by [`MAX_PLAN_BEGIN_ATTEMPTS`] (TPIPE-15).
+    plan_begin_attempts: HashMap<super::SessionKey, u32>,
     workspace_progress_epoch: u64,
     workspace_retry_progress: HashMap<super::SessionKey, u64>,
     /// Each session's current run of refused batch workspaces.
@@ -3265,6 +3285,7 @@ impl EngineCore {
             incremental_stream_sessions: HashSet::new(),
             pending_terminal_outputs: VecDeque::new(),
             execution_retry_attempts: HashMap::new(),
+            plan_begin_attempts: HashMap::new(),
             workspace_progress_epoch: 0,
             workspace_retry_progress: HashMap::new(),
             workspace_waits: HashMap::new(),
@@ -3277,6 +3298,17 @@ impl EngineCore {
             initialized: false,
             next_batch_id: 1,
         })
+    }
+
+    /// An engine core whose managed state fits against `authority`.
+    #[cfg(test)]
+    pub(crate) fn new_with_managed_authority_for_test(
+        config: EngineCoreConfig,
+        authority: Arc<super::ResourceAuthority>,
+    ) -> Result<Self> {
+        let mut worker_config = WorkerConfig::from(&config);
+        worker_config.resource_authority = Some(authority);
+        Self::new_with_worker(config, worker_config)
     }
 
     #[cfg(test)]
@@ -3671,6 +3703,7 @@ impl EngineCore {
         self.active_stream_batches
             .retain(|_, batch| !batch.rows.values().any(|row| row == session));
         self.execution_retry_attempts.remove(session);
+        self.plan_begin_attempts.remove(session);
         self.workspace_waits.remove(session);
     }
 
@@ -4439,25 +4472,36 @@ impl EngineCore {
             .cloned()
             .collect::<Vec<_>>();
         let mut contract_failures = Vec::new();
+        let mut exhausted = Vec::new();
         for scheduled in &all_scheduled {
+            let session = scheduled.session_key();
             match self.begin_execution_plan(scheduled).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.plan_begin_attempts.remove(&session);
+                }
                 Err(PlanBeginError::AdapterContract(error)) => {
-                    contract_failures.push((scheduled.session_key(), error));
+                    contract_failures.push((session, error));
                 }
                 Err(PlanBeginError::Engine(error)) => {
+                    if plan_begin_attempts_exhausted(&mut self.plan_begin_attempts, &session) {
+                        exhausted.push((session, error));
+                        continue;
+                    }
                     self.rollback_unexecuted_schedule(&all_scheduled);
                     return Err(error);
                 }
             }
         }
-        if !contract_failures.is_empty() {
+        if !contract_failures.is_empty() || !exhausted.is_empty() {
             // Rescheduling would select the same unsupported work on every
             // step. Fail those requests now and commit their terminal outputs;
             // the rest of this schedule runs on the next step.
             self.rollback_unexecuted_schedule(&all_scheduled);
             for (session, error) in contract_failures {
                 self.fail_adapter_contract_mismatch(&session, error).await;
+            }
+            for (session, error) in exhausted {
+                self.fail_unstartable_plan(&session, error).await;
             }
             let capacity = self.config.resolved_physical_execution_capacity();
             return Ok(Some(PreparedEngineStep::with_execution_policy(
@@ -5152,6 +5196,34 @@ impl EngineCore {
     /// Fail a request whose bound adapter cannot run the work its executor
     /// schedules. Nothing was dispatched, so the session is released like any
     /// other terminal failure.
+    /// A session whose plan failed to begin on [`MAX_PLAN_BEGIN_ATTEMPTS`]
+    /// consecutive steps fails terminally instead of retrying forever.
+    async fn fail_unstartable_plan(&mut self, session: &super::SessionKey, error: Error) {
+        warn!(
+            request_id = %session.request_id,
+            session_epoch = session.epoch,
+            error = %error,
+            attempts = MAX_PLAN_BEGIN_ATTEMPTS,
+            "Execution plan could not begin; failing the request"
+        );
+        self.plan_begin_attempts.remove(session);
+        let message =
+            format!("execution could not begin after {MAX_PLAN_BEGIN_ATTEMPTS} attempts: {error}");
+        self.terminate_request_session(
+            session,
+            ExecutorOutput::error(session.request_id.clone(), message.clone()),
+            ExecutionDisposition::Failed(ExecutionFailure {
+                kind: FailureKind::Internal,
+                scope: FailureScope::Row,
+                retry: RetryDisposition::Never,
+                health: HealthImpact::None,
+                message,
+            }),
+            OutcomeProvenance::failure(FailureOrigin::AdapterPlanning, DispatchState::NotStarted),
+        )
+        .await;
+    }
+
     async fn fail_adapter_contract_mismatch(&mut self, session: &super::SessionKey, error: Error) {
         warn!(
             request_id = %session.request_id,
@@ -5518,26 +5590,16 @@ impl EngineCore {
         Ok(Some(runtime))
     }
 
+    /// Retained ASR or TTS state on the engine's own row limits, fitted
+    /// within live memory above `minimum_tokens` per sequence (see
+    /// [`Self::load_managed_model_state_with_portable_copies_and_rows`]).
     pub(crate) fn load_managed_model_state(
         &mut self,
         model_instance: super::ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
-    ) -> Result<Arc<super::ManagedKvModelRuntime>> {
-        self.load_managed_model_state_with_portable_copies(
-            model_instance,
-            retained_state,
-            logical_context_tokens,
-            1,
-        )
-    }
-
-    pub(crate) fn load_managed_model_state_with_portable_copies(
-        &mut self,
-        model_instance: super::ModelInstanceId,
-        retained_state: &crate::kv::v2::InferenceStateContract,
-        logical_context_tokens: Option<usize>,
-        portable_state_copies: u32,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         let rows = (
             self.config.max_retained_sequences,
@@ -5547,15 +5609,30 @@ impl EngineCore {
             model_instance,
             retained_state,
             logical_context_tokens,
-            portable_state_copies,
+            1,
             rows,
-            0,
+            minimum_tokens,
+            reserve,
         )
     }
 
-    /// ASR retained state with its own `(retained, staged)` row counts, at
-    /// most the engine's (ADM-6): the engine rows are sized for chat (on CUDA
-    /// one per 256 MiB of device memory), far wider than ASR concurrency.
+    /// Record a loaded model's tensor rows as reserved by the requests that
+    /// create them (see `ManagedKvCacheManager::price_tensor_rows_with_requests`).
+    pub(crate) fn price_tensor_rows_with_requests(
+        &mut self,
+        model_instance: super::ModelInstanceId,
+    ) -> Result<()> {
+        self.managed_kv_cache
+            .price_tensor_rows_with_requests(model_instance)
+    }
+
+    /// Retained ASR or TTS state with its own `(retained, staged)` row
+    /// counts, at most the engine's (ADM-6): the engine rows are sized for
+    /// chat (on CUDA one per 256 MiB of device memory), far wider than ASR
+    /// concurrency. `minimum_tokens` is the floor every sequence must reach
+    /// (one ASR chunk, one TTS prompt plus its output budget); a floor that
+    /// planning headroom cannot hold refuses the load with `Overloaded`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_managed_model_state_with_portable_copies_and_rows(
         &mut self,
         model_instance: super::ModelInstanceId,
@@ -5564,6 +5641,7 @@ impl EngineCore {
         portable_state_copies: u32,
         (retained_rows, staged_rows): (usize, usize),
         minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<super::ManagedKvModelRuntime>> {
         if retained_rows == 0
             || staged_rows == 0
@@ -5571,12 +5649,13 @@ impl EngineCore {
             || staged_rows > self.config.max_staged_transactions
         {
             return Err(Error::ModelLoadError(
-                "ASR state row limits exceed configured capacity".into(),
+                "retained state row limits exceed configured capacity".into(),
             ));
         }
         let backend = self.managed_kv_cache.worker_backend();
-        // Only ASR retained state loads through here; it fits within live
-        // memory so the requests it serves can run beside it.
+        // ASR and TTS retained state fit within live memory so the requests
+        // they serve can run beside them; the floor is admitted against
+        // planning headroom.
         let logical_token_reach = self.resolve_managed_token_reach_for_contract_with_rows(
             backend,
             model_instance,
@@ -5584,7 +5663,10 @@ impl EngineCore {
             logical_context_tokens,
             portable_state_copies,
             (retained_rows, staged_rows),
-            PortableFitHeadroom::Live { minimum_tokens },
+            PortableFitHeadroom::Live {
+                minimum_tokens,
+                reserve,
+            },
         )?;
         let runtime = self.managed_kv_cache.bind_model_state_with_capacity(
             model_instance,
@@ -5687,8 +5769,12 @@ impl EngineCore {
             &project_composite_paged_contract(full_contract, static_domain)?,
             logical_context_tokens,
             1,
-            // Whisper's decoder state: ASR, fitted within live memory.
-            PortableFitHeadroom::Live { minimum_tokens },
+            // Whisper's decoder state: ASR, fitted within live memory. Its
+            // load reconciles observed weight growth.
+            PortableFitHeadroom::Live {
+                minimum_tokens,
+                reserve: StateFitReserve::MeasuredUntracked,
+            },
         )?;
         let sequence_capacity = u32::try_from(self.config.max_retained_sequences)
             .map_err(|_| Error::InvalidInput("managed state sequence limit exceeds u32".into()))?;
@@ -5968,6 +6054,7 @@ impl EngineCore {
         self.incremental_stream_sessions.clear();
         self.pending_terminal_outputs.clear();
         self.execution_retry_attempts.clear();
+        self.plan_begin_attempts.clear();
         self.workspace_retry_progress.clear();
         self.workspace_waits.clear();
         self.workspace_row_limits.clear();
@@ -7100,6 +7187,23 @@ mod tests {
             core.pending_terminal_outputs.is_empty(),
             "a completed scheduler session must not receive a second terminal event"
         );
+    }
+
+    /// TPIPE-15: a plan that fails to begin is retried, but only for
+    /// [`MAX_PLAN_BEGIN_ATTEMPTS`] consecutive steps per session, and a
+    /// successful begin or another session does not share the count.
+    #[test]
+    fn plan_begin_retries_are_bounded_per_session() {
+        let mut attempts = HashMap::new();
+        let session = super::super::SessionKey::new("stuck".into(), 1);
+        let other = super::super::SessionKey::new("other".into(), 1);
+        for _ in 1..MAX_PLAN_BEGIN_ATTEMPTS {
+            assert!(!plan_begin_attempts_exhausted(&mut attempts, &session));
+        }
+        assert!(!plan_begin_attempts_exhausted(&mut attempts, &other));
+        assert!(plan_begin_attempts_exhausted(&mut attempts, &session));
+        attempts.remove(&session);
+        assert!(!plan_begin_attempts_exhausted(&mut attempts, &session));
     }
 
     #[tokio::test]

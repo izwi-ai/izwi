@@ -347,8 +347,10 @@ pub enum Commands {
         /// Text to synthesize (or "-" to read from stdin)
         text: String,
 
-        /// Model to use
-        #[arg(short, long, default_value = "qwen3-tts-0.6b-base")]
+        /// Model to use. The default speaks with a built-in voice; voice-clone
+        /// models (e.g. qwen3-tts-0.6b-base) need --reference-audio and
+        /// --reference-text or --saved-voice-id.
+        #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 
         /// Speaker voice or VibeVoice speaker label
@@ -383,15 +385,16 @@ pub enum Commands {
         #[arg(short, long, value_enum, default_value = "wav")]
         format: AudioFormat,
 
-        /// Speech speed multiplier
-        #[arg(short = 'r', long, default_value = "1.0")]
-        speed: f32,
+        /// Speech speed multiplier (models with speed control only)
+        #[arg(short = 'r', long)]
+        speed: Option<f32>,
 
-        /// Temperature for sampling
-        #[arg(short, long, default_value = "0.7")]
-        temperature: f32,
+        /// Temperature for sampling (unset keeps the model's own default)
+        #[arg(short, long)]
+        temperature: Option<f32>,
 
-        /// Stream output in real-time
+        /// Stream the audio as it is generated and write it to a WAV file
+        /// (reports the time to first audio)
         #[arg(long)]
         stream: bool,
 
@@ -653,8 +656,8 @@ pub enum BenchCommands {
 
     /// Benchmark TTS inference
     Tts {
-        /// Model to benchmark
-        #[arg(short, long, default_value = "qwen3-tts-0.6b-base")]
+        /// Model to benchmark (the default needs no reference audio)
+        #[arg(short, long, default_value = "Kokoro-82M")]
         model: String,
 
         /// Number of iterations
@@ -917,6 +920,33 @@ mod tests {
     use super::{Cli, Commands};
     use clap::Parser;
     use izwi_core::PhysicalExecutionMode;
+
+    /// TPIPE-25: the default TTS model speaks with a built-in voice (the old
+    /// default was clone-only and was sent no reference), and unset sampling
+    /// and speed are left to the model.
+    #[test]
+    fn tts_defaults_need_no_reference_and_leave_sampling_unset() {
+        let cli = Cli::try_parse_from(["izwi", "tts", "hello", "--stream"])
+            .expect("tts with defaults parses");
+        match cli.command {
+            Commands::Tts {
+                model,
+                speed,
+                temperature,
+                stream,
+                ..
+            } => {
+                assert_eq!(model, "Kokoro-82M");
+                let variant = izwi_core::parse_tts_model_variant(&model).unwrap();
+                assert!(variant
+                    .speech_capabilities()
+                    .is_some_and(|capabilities| capabilities.supports_builtin_voices));
+                assert_eq!((speed, temperature), (None, None));
+                assert!(stream);
+            }
+            _ => panic!("expected tts command"),
+        }
+    }
 
     #[test]
     fn chat_model_accepts_qwen38_catalog_id_as_free_form_input() {

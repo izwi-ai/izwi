@@ -2795,6 +2795,7 @@ impl BatchRuntimeStore {
         let stage_id = new_uuid();
         let text_sha256 = sha256_hex(input_text.as_bytes());
         let record = SpeechHistoryRecord {
+            stop_reason: None,
             id: record_id.clone(),
             created_at: now_u64,
             route_kind: SpeechRouteKind::TextToSpeech,
@@ -8299,6 +8300,7 @@ mod tests {
     ) -> NewDurableTextTtsAcceptance {
         NewDurableTextTtsAcceptance {
             projection: NewSpeechHistoryRecord {
+                stop_reason: None,
                 route_kind: SpeechRouteKind::TextToSpeech,
                 processing_status: SpeechHistoryProcessingStatus::Pending,
                 processing_error: None,

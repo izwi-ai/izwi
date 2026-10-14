@@ -848,7 +848,7 @@ mod tests {
             .reason
             .contains("QMatMul"));
         assert_eq!(
-            ModelVariant::Qwen3Tts12Hz06BBase4Bit
+            ModelVariant::Qwen3ForcedAligner06B4Bit
                 .cuda_quantization()
                 .level,
             CudaQuantizationSupportLevel::DenseDequantizedFallback
@@ -882,7 +882,7 @@ mod tests {
         assert!(dense.is_allowed_for_cuda());
         assert!(!dense.uses_dense_dequantized_fallback());
 
-        let dequant = ModelVariant::Qwen3Tts12Hz06BBase4Bit.cuda_quantization();
+        let dequant = ModelVariant::Qwen3ForcedAligner06B4Bit.cuda_quantization();
         assert!(dequant.is_allowed_for_cuda());
         assert!(dequant.uses_dense_dequantized_fallback());
 

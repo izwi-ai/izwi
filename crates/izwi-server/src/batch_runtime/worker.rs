@@ -503,6 +503,13 @@ impl Drop for ActiveExecutionGuard {
 #[error("speech_stage_yield: committed segment boundary")]
 pub struct SpeechStageYield;
 
+/// A stage failure that would recur on every attempt (an invalid request:
+/// a 4xx the client must fix). It fails the stage without a retry
+/// (TPIPE-27).
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DeterministicStageFailure(pub String);
+
 #[async_trait]
 pub trait StageExecutor: Send + Sync {
     fn stage_kind(&self) -> &'static str;
@@ -909,12 +916,20 @@ impl BatchWorkerRunner {
                 }
                 let message = err.to_string();
                 self.health.record_error(message.clone());
+                let deterministic = err.downcast_ref::<DeterministicStageFailure>().is_some();
                 let failed = self
                     .store
                     .fail_stage(
                         &lease,
-                        true,
-                        Some("executor_failed".to_string()),
+                        !deterministic,
+                        Some(
+                            if deterministic {
+                                "invalid_request"
+                            } else {
+                                "executor_failed"
+                            }
+                            .to_string(),
+                        ),
                         Some(message),
                     )
                     .await?;
@@ -1447,6 +1462,23 @@ mod tests {
     struct BlockingExecutor {
         started: Arc<Notify>,
         release: Arc<Notify>,
+    }
+
+    /// Fails every attempt with an invalid-request error.
+    struct DeterministicFailureExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StageExecutor for DeterministicFailureExecutor {
+        fn stage_kind(&self) -> &'static str {
+            "fake_stage"
+        }
+
+        async fn execute(&self, _claimed: ClaimedStage) -> anyhow::Result<StageExecutionOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(DeterministicStageFailure("`speed` must be between 0.5 and 2".into()).into())
+        }
     }
 
     struct ContextProgressExecutor;
@@ -2717,6 +2749,40 @@ mod tests {
             Some(1),
             "completed stage should report output artifact count"
         );
+    }
+
+    /// TPIPE-27: an invalid request fails on the first attempt; the
+    /// second attempt would fail the same way.
+    #[tokio::test]
+    async fn runner_does_not_retry_a_deterministic_failure() {
+        let store = build_store();
+        let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
+        let executor = Arc::new(DeterministicFailureExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![executor.clone()],
+            BatchWorkerConfig::local("worker-test"),
+            BatchWorkerHealth::new("worker-test"),
+        );
+
+        runner.run_until_idle(4).await.expect("run");
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        let stage = store
+            .get_stage(&stage_id)
+            .await
+            .expect("stage")
+            .expect("stage exists");
+        assert_eq!(stage.status, RuntimeStageStatus::Failed);
+        assert_eq!(stage.attempt_count, 1);
+        let job = store
+            .get_job(&job_id)
+            .await
+            .expect("job")
+            .expect("job exists");
+        assert_eq!(job.status, RuntimeJobStatus::Failed);
     }
 
     #[tokio::test]

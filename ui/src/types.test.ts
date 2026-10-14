@@ -158,3 +158,15 @@ describe("getSpeakerProfilesForVariant", () => {
     );
   });
 });
+
+describe("Kokoro speakers", () => {
+  it("lists only the 41 voices the server speaks", () => {
+    // Japanese (j*) and Mandarin (z*) voices have no G2P yet: the server
+    // hides them and refuses them with a 400.
+    const ids = getSpeakerProfilesForVariant("Kokoro-82M").map(
+      (speaker) => speaker.id,
+    );
+    expect(ids).toHaveLength(41);
+    expect(ids.filter((id) => /^[jz]/.test(id))).toEqual([]);
+  });
+});

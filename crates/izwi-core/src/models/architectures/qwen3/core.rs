@@ -3610,7 +3610,7 @@ pub fn repeat_kv(x: &Tensor, num_heads: usize, num_kv_heads: usize) -> Result<Te
     }
 }
 
-fn build_rope_inv_freqs(head_dim: usize, rope_theta: f64) -> Vec<f32> {
+pub(crate) fn build_rope_inv_freqs(head_dim: usize, rope_theta: f64) -> Vec<f32> {
     let half_dim = head_dim / 2;
     let mut inv_freq = Vec::with_capacity(half_dim);
     for i in 0..half_dim {

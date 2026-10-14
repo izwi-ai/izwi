@@ -946,6 +946,7 @@ pub async fn render_studio_project_segment(
         max_output_tokens: None,
         top_k: None,
         stream: Some(false),
+        sampling: Default::default(),
     };
 
     let record = synthesize_record(&state, &ctx, request, SpeechRouteKind::TextToSpeech).await?;

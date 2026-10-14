@@ -8,8 +8,12 @@ import {
   SPEAKER_ATTRIBUTED_ASR_PREFERRED_MODELS,
   TRANSCRIPTION_PREFERRED_MODELS,
   VOICE_CLONING_PREFERRED_MODELS,
+  REMOVED_MODEL_REPLACEMENTS,
+  TEXT_TO_SPEECH_PREFERRED_MODELS,
+  VOICE_DESIGN_PREFERRED_MODELS,
   diarizationSpeakerUpperBound,
   getChatRouteModelLabel,
+  normalizeStoredModelId,
   resolvePreferredRouteModel,
 } from "./routeModelCatalog";
 import { getModelProviderLabel, MODEL_DETAILS } from "./modelMetadata";
@@ -167,5 +171,34 @@ describe("route model catalog", () => {
     expect(getChatRouteModelLabel("Qwen3.8-27B-FP8")).toBe(
       "Qwen3.8 27B (FP8)",
     );
+  });
+
+  it("never prefers a removed or quantized Qwen3-TTS variant", () => {
+    const preferred = [
+      ...TEXT_TO_SPEECH_PREFERRED_MODELS,
+      ...VOICE_CLONING_PREFERRED_MODELS,
+      ...VOICE_DESIGN_PREFERRED_MODELS,
+    ];
+    for (const variant of preferred) {
+      expect(REMOVED_MODEL_REPLACEMENTS[variant]).toBeUndefined();
+      expect(variant).not.toMatch(/-(4bit|8bit|bf16)$/);
+      expect(MODEL_DETAILS[variant]).toBeDefined();
+    }
+    for (const removed of Object.keys(REMOVED_MODEL_REPLACEMENTS)) {
+      expect(MODEL_DETAILS[removed]).toBeUndefined();
+    }
+  });
+
+  it("normalizes a stored removed model id to its dense counterpart", () => {
+    expect(normalizeStoredModelId("Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit")).toBe(
+      "Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    );
+    expect(normalizeStoredModelId("Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit")).toBe(
+      "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    );
+    expect(normalizeStoredModelId("Kokoro-82M")).toBe("Kokoro-82M");
+    for (const replacement of Object.values(REMOVED_MODEL_REPLACEMENTS)) {
+      expect(MODEL_DETAILS[replacement]).toBeDefined();
+    }
   });
 });

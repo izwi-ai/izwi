@@ -14,9 +14,9 @@ Those endpoints only show variants that are enabled for download/use.
 
 | Family | Canonical IDs |
 |--------|---------------|
-| Qwen3 Base (reference-voice cloning) | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-0.6B-Base-4bit`, `Qwen3-TTS-12Hz-1.7B-Base`, `Qwen3-TTS-12Hz-1.7B-Base-4bit` |
-| Qwen3 CustomVoice (built-in speakers) | `Qwen3-TTS-12Hz-0.6B-CustomVoice`, `Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit`, `Qwen3-TTS-12Hz-1.7B-CustomVoice`, `Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` |
-| Qwen3 VoiceDesign | `Qwen3-TTS-12Hz-1.7B-VoiceDesign`, `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` |
+| Qwen3 Base (reference-voice cloning) | `Qwen3-TTS-12Hz-0.6B-Base`, `Qwen3-TTS-12Hz-1.7B-Base` |
+| Qwen3 CustomVoice (built-in speakers) | `Qwen3-TTS-12Hz-0.6B-CustomVoice`, `Qwen3-TTS-12Hz-1.7B-CustomVoice` |
+| Qwen3 VoiceDesign | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 | Voxtral TTS | `Voxtral-4B-TTS-2603` |
 | VibeVoice TTS | `VibeVoice-1.5B` |
 | Kokoro | `Kokoro-82M` |
@@ -80,8 +80,24 @@ These variants exist in the catalog but are not currently enabled for standard l
 - `Qwen3-14B-GGUF`
 - `Gemma-3-4b-it`
 - TTS 8-bit and BF16 metadata variants such as `Qwen3-TTS-12Hz-0.6B-Base-8bit`
-  and `Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`; selected 4-bit variants are the
-  standard low-memory downloads exposed by `izwi list`.
+  and `Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`.
+
+### Removed variants
+
+The five mlx 4-bit Qwen3-TTS conversions (`Qwen3-TTS-12Hz-0.6B-Base-4bit`,
+`Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit`, `Qwen3-TTS-12Hz-1.7B-Base-4bit`,
+`Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit`, `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit`)
+are no longer supported: they never reach the end of speech and produce
+unintelligible audio. Use the dense variant of the same name without `-4bit`.
+
+- Requests and `izwi pull` naming a removed ID return HTTP 400 naming its
+  replacement. The replacement needs more memory, so it is not substituted
+  automatically.
+- Studio projects, queued jobs and the remembered model selection that name a
+  removed ID use its replacement.
+- A removed variant already downloaded stays on disk until you delete it. The
+  admin model list reports it under `removed_models` with its size, and
+  `DELETE /v1/admin/models/<id>` removes it.
 
 ---
 
@@ -210,8 +226,7 @@ izwi status --detailed
 - `-GGUF` variants are quantized GGUF artifacts.
 - Smaller/quantized variants reduce memory and disk use at some quality/accuracy tradeoff.
 - `izwi list` shows enabled variants only. Some catalog metadata exists for
-  experimental 8-bit/BF16 TTS artifacts, but the standard downloadable
-  low-memory TTS variants are the explicit `-4bit` entries shown above.
+  experimental 8-bit/BF16 TTS artifacts; they are not downloadable.
 
 ---
 

@@ -229,6 +229,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_storage_path",
             "audio_media_asset_id",
             "audio_artifact_tenant",
+            "stop_reason",
         ],
     },
     RequiredSchemaTable {

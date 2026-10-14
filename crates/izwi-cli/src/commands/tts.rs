@@ -25,8 +25,8 @@ pub struct TtsArgs {
     pub instructions: Option<String>,
     pub output: Option<PathBuf>,
     pub format: AudioFormat,
-    pub speed: f32,
-    pub temperature: f32,
+    pub speed: Option<f32>,
+    pub temperature: Option<f32>,
     pub stream: bool,
     pub allow_format_fallback: bool,
     pub play: bool,
@@ -65,7 +65,7 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
     if text.trim().is_empty() {
         return Err(CliError::InvalidInput("Text cannot be empty".to_string()));
     }
-    reject_unsupported_cli_stream(&model, stream)?;
+    reject_unsupported_cli_stream(&format, stream)?;
 
     theme.step(1, 2, &format!("Generating speech with '{}'...", model));
 
@@ -118,22 +118,32 @@ pub async fn execute(args: TtsArgs, server: &str, theme: &Theme) -> Result<()> {
             });
         }
 
+        // Server-Sent Events: `audio.chunk` events carry base64 16-bit PCM,
+        // assembled here into one WAV file.
+        let mut assembler = SseSpeechAssembler::default();
+        let mut body = response.bytes_stream();
+        while let Some(bytes) = futures::StreamExt::next(&mut body).await {
+            let bytes = bytes.map_err(|e| CliError::Other(e.to_string()))?;
+            if assembler.push(&bytes)? && assembler.first_audio.is_none() {
+                assembler.first_audio = Some(start_time.elapsed());
+                pb.set_message("Receiving audio...");
+            }
+        }
+        let audio_data = assembler.finish()?;
         pb.finish_with_message("Generation complete");
-
-        let actual_format = response_header(response.headers(), "x-actual-response-format");
-        let format_fallback = response_header(response.headers(), "x-response-format-fallback");
-
-        let audio_data = response
-            .bytes()
-            .await
-            .map_err(|e| CliError::Other(e.to_string()))?;
+        if let Some(first_audio) = assembler.first_audio {
+            theme.info(&format!(
+                "First audio after {:.2}s",
+                first_audio.as_secs_f64()
+            ));
+        }
 
         handle_output(
             audio_data,
             output.clone(),
             &format,
-            actual_format.as_deref(),
-            format_fallback.as_deref(),
+            Some("wav"),
+            None,
             play,
             theme,
         )
@@ -274,8 +284,8 @@ struct BuildRequestArgs<'a> {
     reference_text_file: Option<PathBuf>,
     instructions: Option<String>,
     format: &'a AudioFormat,
-    speed: f32,
-    temperature: f32,
+    speed: Option<f32>,
+    temperature: Option<f32>,
     stream: bool,
     allow_format_fallback: bool,
 }
@@ -300,12 +310,18 @@ fn build_request_body(args: BuildRequestArgs<'_>) -> Result<Value> {
     let mut request_body = json!({
         "model": args.model,
         "input": args.text,
-        "speed": args.speed,
-        "temperature": args.temperature,
-        "response_format": requested_format_label(args.format),
+        // A stream carries raw 16-bit PCM chunks, assembled into a WAV.
+        "response_format": if args.stream { "pcm" } else { requested_format_label(args.format) },
         "stream": args.stream,
         "allow_format_fallback": args.allow_format_fallback,
     });
+    // Unset sampling and speed keep the model's own defaults.
+    if let Some(speed) = args.speed {
+        request_body["speed"] = json!(speed);
+    }
+    if let Some(temperature) = args.temperature {
+        request_body["temperature"] = json!(temperature);
+    }
 
     if let Some(speaker) = normalize_optional_text(args.speaker) {
         request_body["voice"] = Value::String(speaker);
@@ -348,14 +364,98 @@ fn normalize_optional_text(raw: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn reject_unsupported_cli_stream(_model: &str, stream: bool) -> Result<()> {
-    if !stream {
+/// `--stream` writes WAV: the stream carries raw PCM chunks.
+fn reject_unsupported_cli_stream(format: &AudioFormat, stream: bool) -> Result<()> {
+    if !stream || matches!(format, AudioFormat::Wav) {
         return Ok(());
     }
     Err(CliError::InvalidInput(
-        "`izwi tts --stream` receives Server-Sent Events that the CLI does not yet assemble into a playable audio file; omit --stream for CLI audio output."
-            .to_string(),
+        "`izwi tts --stream` writes WAV audio; use --format wav or omit --stream.".to_string(),
     ))
+}
+
+/// Assembles an OpenAI-route speech SSE stream (`audio.started`,
+/// `audio.chunk` with base64 16-bit PCM, `audio.done`, `audio.failed`) into
+/// a WAV file.
+#[derive(Debug, Default)]
+struct SseSpeechAssembler {
+    pending: String,
+    pcm: Vec<u8>,
+    sample_rate: Option<u32>,
+    done: bool,
+    first_audio: Option<Duration>,
+}
+
+impl SseSpeechAssembler {
+    /// Feed received bytes; returns whether they carried audio.
+    fn push(&mut self, bytes: &[u8]) -> Result<bool> {
+        self.pending.push_str(&String::from_utf8_lossy(bytes));
+        let mut audio = false;
+        while let Some(end) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=end).collect();
+            let Some(data) = line.trim_end().strip_prefix("data:") else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(data.trim())
+                .map_err(|e| CliError::Other(format!("Malformed speech stream event: {e}")))?;
+            match event["event"].as_str() {
+                Some("audio.started") => {
+                    self.sample_rate = event["sample_rate"].as_u64().map(|rate| rate as u32);
+                }
+                Some("audio.chunk") => {
+                    if let Some(rate) = event["sample_rate"].as_u64() {
+                        self.sample_rate.get_or_insert(rate as u32);
+                    }
+                    if let Some(encoded) = event["audio_base64"].as_str() {
+                        let bytes = STANDARD
+                            .decode(encoded)
+                            .map_err(|e| CliError::Other(format!("Malformed audio chunk: {e}")))?;
+                        audio |= !bytes.is_empty();
+                        self.pcm.extend_from_slice(&bytes);
+                    }
+                }
+                Some("audio.done") => self.done = true,
+                Some("audio.failed") => {
+                    return Err(CliError::Other(format!(
+                        "Speech generation failed: {}",
+                        event["error"].as_str().unwrap_or("unknown error")
+                    )))
+                }
+                _ => {}
+            }
+        }
+        Ok(audio)
+    }
+
+    /// The assembled audio as a 16-bit mono WAV.
+    fn finish(&self) -> Result<bytes::Bytes> {
+        if !self.done {
+            return Err(CliError::Other(
+                "Speech stream ended before audio.done".to_string(),
+            ));
+        }
+        let rate = self
+            .sample_rate
+            .filter(|rate| *rate > 0)
+            .ok_or_else(|| CliError::Other("Speech stream carried no audio".to_string()))?;
+        let data_len = u32::try_from(self.pcm.len())
+            .map_err(|_| CliError::Other("Speech stream is too long for WAV".to_string()))?;
+        let mut wav = Vec::with_capacity(44 + self.pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&self.pcm);
+        Ok(bytes::Bytes::from(wav))
+    }
 }
 
 fn output_extension(requested_format: &AudioFormat, actual_format: Option<&str>) -> &'static str {
@@ -396,12 +496,64 @@ mod tests {
     }
 
     #[test]
-    fn cli_streaming_is_rejected_before_request() {
-        let err = reject_unsupported_cli_stream("Kokoro-82M", true)
-            .expect_err("streaming should be rejected");
+    fn cli_streaming_writes_wav_only() {
+        reject_unsupported_cli_stream(&AudioFormat::Wav, true).expect("WAV streams");
+        reject_unsupported_cli_stream(&AudioFormat::Mp3, false).expect("non-stream MP3");
+        let err = reject_unsupported_cli_stream(&AudioFormat::Mp3, true)
+            .expect_err("a compressed stream is refused");
+        assert!(err.to_string().contains("--format wav"));
+    }
 
-        assert!(err.to_string().contains("omit --stream"));
-        reject_unsupported_cli_stream("Kokoro-82M", false).expect("non-streaming is supported");
+    /// TPIPE-25: `--stream` assembles the SSE PCM chunks into a WAV, even
+    /// when an event is split across network reads.
+    #[test]
+    fn sse_chunks_assemble_into_a_wav() {
+        let pcm = [1u8, 0, 2, 0, 3, 0];
+        let events = format!(
+            "data: {{\"event\":\"audio.started\",\"sample_rate\":24000}}\n\n\
+             data: {{\"event\":\"audio.chunk\",\"sequence\":0,\"audio_base64\":\"{}\"}}\n\n\
+             : keepalive\n\n\
+             data: {{\"event\":\"audio.done\"}}\n\n",
+            STANDARD.encode(pcm)
+        );
+        let mut assembler = SseSpeechAssembler::default();
+        let (head, tail) = events.as_bytes().split_at(70);
+        assembler.push(head).unwrap();
+        assembler.push(tail).unwrap();
+        let wav = assembler.finish().unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 24_000);
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 6);
+        assert_eq!(&wav[44..], &pcm);
+
+        let mut failed = SseSpeechAssembler::default();
+        let error = failed
+            .push(b"data: {\"event\":\"audio.failed\",\"error\":\"busy\"}\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"));
+        assert!(SseSpeechAssembler::default().finish().is_err());
+    }
+
+    #[test]
+    fn unset_sampling_and_speed_are_not_sent() {
+        let body = build_request_body(BuildRequestArgs {
+            model: "Kokoro-82M".to_string(),
+            text: "hello".to_string(),
+            speaker: None,
+            saved_voice_id: None,
+            reference_audio: None,
+            reference_text: None,
+            reference_text_file: None,
+            instructions: None,
+            format: &AudioFormat::Wav,
+            speed: None,
+            temperature: None,
+            stream: true,
+            allow_format_fallback: false,
+        })
+        .expect("request body");
+        assert!(body.get("speed").is_none() && body.get("temperature").is_none());
+        assert_eq!(body["response_format"], "pcm");
     }
 
     #[test]
@@ -416,8 +568,8 @@ mod tests {
             reference_text_file: None,
             instructions: None,
             format: &AudioFormat::Wav,
-            speed: 1.0,
-            temperature: 0.7,
+            speed: Some(1.0),
+            temperature: Some(0.7),
             stream: false,
             allow_format_fallback: false,
         })
@@ -443,8 +595,8 @@ mod tests {
             reference_text_file: None,
             instructions: None,
             format: &AudioFormat::Wav,
-            speed: 1.0,
-            temperature: 0.7,
+            speed: Some(1.0),
+            temperature: Some(0.7),
             stream: false,
             allow_format_fallback: false,
         })
@@ -467,8 +619,8 @@ mod tests {
             reference_text_file: None,
             instructions: None,
             format: &AudioFormat::Wav,
-            speed: 1.0,
-            temperature: 0.7,
+            speed: Some(1.0),
+            temperature: Some(0.7),
             stream: false,
             allow_format_fallback: false,
         })

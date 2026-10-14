@@ -380,6 +380,95 @@ impl AudioChunk {
     }
 }
 
+/// How a TTS model's streaming route delivers audio (TPIPE-3): progressive
+/// chunks as the model commits audio, or no streaming at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsStreamingMode {
+    Chunked,
+    Unsupported,
+}
+
+impl TtsStreamingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chunked => "chunked",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Why speech generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TtsStopReason {
+    /// The model ended speech itself.
+    #[serde(rename = "stop")]
+    EndOfSpeech,
+    /// The output-frame budget ended it: the audio may be cut short.
+    #[serde(rename = "length")]
+    OutputBudget,
+    /// The loaded context ended it before the budget: the audio may be cut
+    /// short.
+    #[serde(rename = "context_length")]
+    ContextLimit,
+}
+
+impl TtsStopReason {
+    /// The stop reason of a generation that committed `frames` audio frames
+    /// against a budget of `budget_frames` (`None` without a budget, `0`).
+    ///
+    /// `decode_steps`, when the family reports it, tells end of speech from
+    /// a context stop: a model that ends on its own runs one more decode step
+    /// (the end-of-speech step) than it commits frames, while a request cut
+    /// by the context the request was fitted to stops with every step
+    /// committed. Without it, an early stop is taken as end of speech.
+    pub fn classify(
+        budget_frames: usize,
+        frames: usize,
+        decode_steps: Option<usize>,
+    ) -> Option<Self> {
+        if budget_frames == 0 {
+            return None;
+        }
+        Some(if frames >= budget_frames {
+            Self::OutputBudget
+        } else {
+            match decode_steps {
+                Some(steps) if steps <= frames => Self::ContextLimit,
+                _ => Self::EndOfSpeech,
+            }
+        })
+    }
+
+    /// Whether the audio may be cut short.
+    pub fn truncated(self) -> bool {
+        !matches!(self, Self::EndOfSpeech)
+    }
+
+    /// The combined reason of several segments: a budget stop in any
+    /// segment cuts the whole, and an unknown segment makes it unknown.
+    pub fn combine(reasons: impl IntoIterator<Item = Option<Self>>) -> Option<Self> {
+        let mut combined = Some(Self::EndOfSpeech);
+        for reason in reasons {
+            match reason {
+                Some(Self::EndOfSpeech) => {}
+                Some(cut) => return Some(cut),
+                None => combined = None,
+            }
+        }
+        combined
+    }
+
+    /// The label: `stop`, `length` (budget) or `context_length`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EndOfSpeech => "stop",
+            Self::OutputBudget => "length",
+            Self::ContextLimit => "context_length",
+        }
+    }
+}
+
 /// Statistics for a generated chunk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkStats {
@@ -389,6 +478,9 @@ pub struct ChunkStats {
     pub tokens_generated: usize,
     /// Real-time factor (< 1.0 means faster than real-time)
     pub rtf: f32,
+    /// On a final chunk: why generation ended, when a frame budget applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<TtsStopReason>,
 }
 
 /// Complete generation result
@@ -400,11 +492,16 @@ pub struct GenerationResult {
     pub total_tokens: usize,
     pub total_time_ms: f32,
     pub diagnostics: Option<serde_json::Value>,
+    /// Why generation ended, when a frame budget applied.
+    pub stop_reason: Option<TtsStopReason>,
 }
 
 impl GenerationResult {
     /// Duration in seconds
     pub fn duration_secs(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
         self.samples.len() as f32 / self.sample_rate as f32
     }
 
@@ -422,6 +519,48 @@ impl GenerationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budget stop is `length` (the audio may be cut), an earlier end is
+    /// `stop`, and a combined long-form result is cut if any segment was.
+    #[test]
+    fn tts_stop_reason_reports_budget_stops_and_combines_segments() {
+        assert_eq!(TtsStopReason::classify(0, 400, None), None);
+        // Live, CPU Qwen: short 54 steps / 53 frames and long 983 / 982
+        // ended on EOS; medium 313 / 313 ran into its 313-frame budget.
+        assert_eq!(
+            TtsStopReason::classify(82, 53, Some(54)),
+            Some(TtsStopReason::EndOfSpeech)
+        );
+        assert_eq!(
+            TtsStopReason::classify(1_500, 982, Some(983)),
+            Some(TtsStopReason::EndOfSpeech)
+        );
+        assert_eq!(
+            TtsStopReason::classify(313, 313, Some(313)),
+            Some(TtsStopReason::OutputBudget)
+        );
+        // Stopped before the budget with every step committed: the context.
+        assert_eq!(
+            TtsStopReason::classify(313, 200, Some(200)),
+            Some(TtsStopReason::ContextLimit)
+        );
+        assert_eq!(
+            TtsStopReason::classify(400, 252, None),
+            Some(TtsStopReason::EndOfSpeech)
+        );
+        assert!(TtsStopReason::ContextLimit.truncated());
+        assert!(!TtsStopReason::EndOfSpeech.truncated());
+        let stop = Some(TtsStopReason::EndOfSpeech);
+        let cut = Some(TtsStopReason::OutputBudget);
+        assert_eq!(TtsStopReason::combine([stop, stop]), stop);
+        assert_eq!(TtsStopReason::combine([stop, cut, None]), cut);
+        assert_eq!(TtsStopReason::combine([stop, None]), None);
+        assert_eq!(TtsStopReason::OutputBudget.as_str(), "length");
+        assert_eq!(
+            serde_json::to_string(&TtsStopReason::EndOfSpeech).unwrap(),
+            "\"stop\""
+        );
+    }
 
     #[test]
     fn generation_request_keeps_explicit_model_variant() {

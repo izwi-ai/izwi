@@ -70,9 +70,10 @@ pub use engine::{
     OutputVisibility, PhysicalBatch, PhysicalBatchReport, PhysicalBatchRowReport, PlanId, Priority,
     ReadyQuantum, RequestProcessor, RequestStatus, ResourceAmount, ResourceEstimate,
     ResourceLedger, ResourceReservation, ResourceVector, RetryDisposition, Scheduler,
-    SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, StageDescriptor, StageId,
-    StageProgressKind, StageShapePolicy, StateDisposition, StreamingOutput, TerminalOutcome,
-    TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass, YieldReason,
+    SchedulerConfig, SchedulingPolicy, SessionEpoch, SessionKey, SpeechSamplingOptions,
+    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StateDisposition,
+    StreamingOutput, TerminalOutcome, TokenId, TtsEngineInput, WorkCost, WorkUnit, WorkloadClass,
+    YieldReason,
 };
 
 // Legacy re-exports for backward compatibility
@@ -120,7 +121,7 @@ pub use runtime::{
 pub use runtime::{
     validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,
     DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult,
+    DiarizationWord, GenerationRequest, GenerationResult, TtsStopReason, TtsStreamingMode,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
@@ -130,12 +131,13 @@ pub use artifacts::{
     ModelResidencyState, ModelWeights,
 };
 pub use catalog::{
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
-    resolve_asr_model_variant, resolve_diarization_model_variant,
-    resolve_diarization_model_variant_strict, ChatModelCapabilities, CudaEvidenceLevel,
-    CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind, CudaProviderClass,
-    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
-    ModelFamily, ModelInfo, ModelStatus, ModelVariant, SpeechModelCapabilities,
+    normalize_stored_model_id, parse_chat_model_variant, parse_model_variant,
+    parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
+    resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
+    ChatModelCapabilities, CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability,
+    CudaOperatorKind, CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel,
+    CudaSupportInfo, CudaSupportLevel, ModelFamily, ModelInfo, ModelStatus, ModelVariant,
+    RemovedModelVariant, SpeechModelCapabilities, REMOVED_MODEL_VARIANTS,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,

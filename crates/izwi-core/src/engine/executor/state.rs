@@ -104,6 +104,8 @@ pub(super) struct ActiveLfm25TtsDecode {
     pub(super) state: Lfm25AudioTtsRetainedState,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
+    /// Samples a streamed request has published so far.
+    pub(super) streamed_samples: usize,
 }
 
 pub(super) struct ActiveVibeVoiceTtsDecode {
@@ -112,6 +114,8 @@ pub(super) struct ActiveVibeVoiceTtsDecode {
     pub(super) state: VibeVoiceTtsRetainedState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
+    /// Samples a streamed request has published so far.
+    pub(super) streamed_samples: usize,
 }
 
 pub(super) struct ActiveFishS2TtsDecode {
@@ -135,6 +139,8 @@ pub(super) struct ActiveVoxtralTtsDecode {
     pub(super) state: VoxtralTtsRetainedState,
     pub(super) last_frames_generated: usize,
     pub(super) stream_sequence: usize,
+    /// Samples a streamed request has published so far.
+    pub(super) streamed_samples: usize,
 }
 
 pub(super) struct ActiveVoxtralRealtime {

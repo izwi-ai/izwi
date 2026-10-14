@@ -123,7 +123,7 @@ You can iterate quickly by changing only the prompt:
 
 ```bash
 izwi tts "Welcome back to the show." \
-  --model Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit \
+  --model Qwen3-TTS-12Hz-1.7B-VoiceDesign \
   --instructions "A bright podcast host voice with crisp diction" \
   --output podcast-host.wav
 ```
@@ -173,7 +173,6 @@ family and `/v1/audio/speech` streaming details.
 | Model | Size | Quality |
 |-------|------|---------|
 | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | ~4.2 GB | Better |
-| `Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit` | ~2.2 GB | Good + lower memory |
 
 Larger models better interpret complex descriptions.
 

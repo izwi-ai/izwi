@@ -1518,11 +1518,12 @@ impl InferenceCoordinator {
                             ));
                         }
                         Err(error) => {
-                            let message = error.to_string();
+                            // Every live row fails with the operation's own
+                            // error kind: an input error stays a 400 rather
+                            // than becoming an internal error.
                             for index in &live {
-                                outcomes[*index] = Some(PreparationPhysicalOutcome::Failed(
-                                    Error::InferenceError(message.clone()),
-                                ));
+                                outcomes[*index] =
+                                    Some(PreparationPhysicalOutcome::Failed(error.replicate()));
                             }
                             return Ok(outcomes
                                 .into_iter()
@@ -4699,6 +4700,49 @@ Pages free: 10.\n";
         assert_eq!(coordinator.snapshot().reserved_memory_bytes, 0);
     }
 
+    /// A preparation that fails as a whole reports its own error kind on
+    /// every live row: Kokoro's over-long input surfaced as a 500
+    /// "Inference error: Invalid input: ..." instead of a 400.
+    #[tokio::test]
+    async fn native_preparation_failure_keeps_the_error_kind_on_every_row() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 4, 4));
+        let first = coordinator.admit(job("native-prep-fail-a")).await.unwrap();
+        let second = coordinator.admit(job("native-prep-fail-b")).await.unwrap();
+        let contract = native_preparation_contract(&coordinator, 2, 64);
+        let row = |job| {
+            sealed_preparation_row(
+                &coordinator,
+                &contract,
+                job,
+                WorkCost::new(1, 4, 16),
+                4,
+                PreparationCancellation::default(),
+            )
+        };
+        let outcomes = coordinator
+            .run_loaded_native_preparation_batch::<usize, _>(
+                vec![row(first), row(second)],
+                contract,
+                WorkUnit::PreSequencePreparation {
+                    kind: "tts.prepare.kokoro".to_string(),
+                },
+                |_| Err(Error::InvalidInput("text too long".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    PreparationRowOutcome::Failed(Error::InvalidInput(message))
+                        if message == "text too long"
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn scalar_preparation_dispatch_uses_the_authenticated_bridge_path_at_width_one() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 2));
@@ -5620,29 +5664,36 @@ Pages free: 10.\n";
             provider_for_location(DeviceLocation::Metal { gpu_id: 99 }, PHYSICAL_CAPACITY);
         guarded_metal_provider.set_available(resources_for_location(
             DeviceLocation::Metal { gpu_id: 99 },
-            0,
+            EXPECTED_PENDING - 1,
         ));
         let guarded_metal = Arc::new(InferenceCoordinator::with_resource_authority(
             BackendKind::Metal,
             1,
             4,
-            Arc::new(ResourceAuthority::new(guarded_metal_provider)),
+            Arc::new(ResourceAuthority::new(guarded_metal_provider.clone())),
         ));
+        let guarded_spec = || JobSpec {
+            resources: resources_for_location(DeviceLocation::Metal { gpu_id: 99 }, AUTHORIZATION),
+            ..job("reported-arithmetic-control")
+        };
+        // The pending claim is the authorization less the observed input:
+        // one byte short of it is refused, exactly it is admitted.
         let guarded_error = guarded_metal
-            .admit_observed(
-                JobSpec {
-                    resources: resources_for_location(
-                        DeviceLocation::Metal { gpu_id: 99 },
-                        AUTHORIZATION,
-                    ),
-                    ..job("reported-arithmetic-control")
-                },
-                JobResourceObservation::host(INPUT_BYTES),
-            )
+            .admit_observed(guarded_spec(), JobResourceObservation::host(INPUT_BYTES))
             .await
             .unwrap_err()
             .to_string();
-        assert!(guarded_error.contains(&format!("unified_bytes: Known({EXPECTED_PENDING})")));
+        assert!(guarded_error.contains("insufficient live memory"));
+        guarded_metal_provider.set_available(resources_for_location(
+            DeviceLocation::Metal { gpu_id: 99 },
+            EXPECTED_PENDING,
+        ));
+        drop(
+            guarded_metal
+                .admit_observed(guarded_spec(), JobResourceObservation::host(INPUT_BYTES))
+                .await
+                .unwrap(),
+        );
 
         for (backend, location) in [
             (BackendKind::Cpu, DeviceLocation::Cpu),
@@ -5678,8 +5729,10 @@ Pages free: 10.\n";
                 }
                 BackendKind::Cuda => {
                     let error = result.unwrap_err().to_string();
+                    // The whole device authorization is pending (the
+                    // observed input is host memory).
                     assert!(
-                        error.contains(&format!("device_bytes: Known({AUTHORIZATION})")),
+                        error.contains("insufficient live GPU memory: needs 0.07 GB"),
                         "unexpected CUDA rejection: {error}"
                     );
                     assert_eq!(coordinator.snapshot().rejected_total, 1);

@@ -1,4 +1,4 @@
-import type { ModelInfo, ModelResidencySummary } from "@/api";
+import type { ModelInfo, ModelResidencySummary, RemovedModelInfo } from "@/api";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 
 export interface SharedPageProps {
@@ -31,6 +31,7 @@ export interface VoiceRouteProps {
 
 export interface ModelsRouteProps {
   models: ModelInfo[];
+  removedModels?: RemovedModelInfo[];
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;

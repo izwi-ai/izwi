@@ -167,6 +167,105 @@ pub fn depthwise_conv1d(
     acc.to_dtype(out_dtype)
 }
 
+static TRANSPOSED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of depthwise transposed convolutions served by
+/// [`depthwise_conv_transpose1d`].
+pub fn depthwise_conv_transpose1d_calls() -> u64 {
+    TRANSPOSED_CALLS.load(Ordering::Relaxed)
+}
+
+/// Whether `weight` is a depthwise transposed-conv kernel (`groups == C`,
+/// one output channel per group, dilation 1) that
+/// [`depthwise_conv_transpose1d`] can serve.
+pub fn is_depthwise_conv_transpose1d(
+    weight: &Tensor,
+    channels: usize,
+    groups: usize,
+    dilation: usize,
+) -> bool {
+    dilation == 1
+        && groups == channels
+        && channels > 0
+        && matches!(weight.dims(), [c, 1, k] if *c == channels && *k > 0)
+}
+
+/// Depthwise (`groups == channels`) transposed 1-D convolution on
+/// `(batch, channels, time)`, matching Candle's grouped `conv_transpose1d`
+/// (`weight` `(C, 1, K)`, dilation 1) up to summation order.
+///
+/// Candle splits a grouped transposed conv into one transposed conv per
+/// channel plus a concatenation. Here each output phase `r` (of `stride`) is
+/// a sum of shifted input slices, `phase_r[m] = Σ_q w[r + stride·q]·x[m − q]`;
+/// the phases are interleaved and the padding trimmed. That is about
+/// `K + stride + 3` element-wise ops whatever the channel count.
+pub fn depthwise_conv_transpose1d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+) -> Result<Tensor> {
+    let (batch, channels, len) = x.dims3()?;
+    let taps = match weight.dims() {
+        [c, 1, k] if *c == channels && *k > 0 => *k,
+        dims => candle_core::bail!(
+            "depthwise conv_transpose1d weight {dims:?} does not match {channels} channels"
+        ),
+    };
+    let stride = stride.max(1);
+    let full_len = (len.max(1) - 1) * stride + taps + output_padding;
+    if len == 0 || full_len < 2 * padding + 1 {
+        candle_core::bail!("depthwise conv_transpose1d input of length {len} is too short");
+    }
+    let out_len = full_len - 2 * padding;
+    let phase_len = (out_len + padding).div_ceil(stride);
+    let shifts = taps.div_ceil(stride);
+
+    let out_dtype = x.dtype();
+    let acc_dtype = match out_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        dtype => dtype,
+    };
+    // x[m − q] for q < shifts and m < phase_len: shift q starts at
+    // `shifts − 1 − q` in the left-padded input.
+    let right_pad = phase_len.saturating_sub(len);
+    let x = x
+        .to_dtype(acc_dtype)?
+        .pad_with_zeros(2, shifts - 1, right_pad)?;
+    let weight = weight.reshape((1, channels, taps))?.to_dtype(acc_dtype)?;
+    let mut phases = Vec::with_capacity(stride);
+    for r in 0..stride {
+        let mut phase: Option<Tensor> = None;
+        for q in 0..shifts {
+            let k = r + stride * q;
+            if k >= taps {
+                break;
+            }
+            let term = x
+                .narrow(2, shifts - 1 - q, phase_len)?
+                .broadcast_mul(&weight.narrow(2, k, 1)?)?;
+            phase = Some(match phase {
+                Some(acc) => (acc + term)?,
+                None => term,
+            });
+        }
+        phases.push(match phase {
+            Some(phase) => phase,
+            None => Tensor::zeros((batch, channels, phase_len), acc_dtype, x.device())?,
+        });
+    }
+    let mut out = Tensor::stack(&phases, 3)?
+        .reshape((batch, channels, phase_len * stride))?
+        .narrow(2, padding, out_len)?;
+    if let Some(bias) = bias {
+        out = out.broadcast_add(&bias.to_dtype(acc_dtype)?.reshape((1, channels, 1))?)?;
+    }
+    TRANSPOSED_CALLS.fetch_add(1, Ordering::Relaxed);
+    out.to_dtype(out_dtype)
+}
+
 /// Fold a per-channel affine `y' = y * scale + shift` applied after a
 /// depthwise convolution into its weight and bias.
 pub fn fold_channel_affine(
@@ -435,5 +534,117 @@ mod tests {
                 candle.as_secs_f64() / shared.as_secs_f64()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "timing only: cargo test --release ... -- --ignored --nocapture"]
+    fn bench_depthwise_transposed_vs_candle_grouped_conv_transpose1d() {
+        let mut rng = XorShift(0x0FED_CBA9_8765_4321);
+        for (channels, time) in [(512, 400), (1090, 400)] {
+            let x = rng.tensor(&[1, channels, time]);
+            let weight = rng.tensor(&[channels, 1, 3]);
+            let iters = 5;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                x.conv_transpose1d(&weight, 1, 1, 2, 1, channels).unwrap();
+            }
+            let candle = start.elapsed() / iters;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                depthwise_conv_transpose1d(&x, &weight, None, 2, 1, 1).unwrap();
+            }
+            let shared = start.elapsed() / iters;
+            eprintln!(
+                "C={channels} T={time} k3 s2: candle grouped {candle:?}, phase-decomposed {shared:?} ({:.1}x)",
+                candle.as_secs_f64() / shared.as_secs_f64()
+            );
+        }
+    }
+
+    /// The depthwise transposed conv matches Candle's grouped
+    /// `conv_transpose1d` (which runs one transposed conv per channel) across
+    /// Kokoro's k3/s2/p1/op1 upsampler and other strides, kernels and
+    /// paddings, with and without bias.
+    #[test]
+    fn depthwise_transposed_conv_matches_candle_grouped_conv_transpose1d() {
+        let mut rng = XorShift(0x5DEE_CE66_D1CE_4E5B);
+        // (batch, channels, time, taps, stride, padding, output_padding, bias)
+        let cases = [
+            (1, 512, 37, 3, 2, 1, 1, true), // Kokoro F0.1 / N.1 pool
+            (2, 64, 23, 3, 2, 1, 1, false), // batched
+            (1, 16, 11, 4, 2, 1, 0, true),
+            (1, 8, 9, 5, 3, 2, 1, true),
+            (1, 8, 6, 2, 2, 0, 0, false),
+            (1, 4, 5, 1, 2, 0, 1, true), // fewer taps than stride
+            (1, 4, 7, 3, 1, 1, 0, true), // stride 1
+        ];
+        for (batch, channels, time, taps, stride, padding, output_padding, with_bias) in cases {
+            let x = rng.tensor(&[batch, channels, time]);
+            let weight = rng.tensor(&[channels, 1, taps]);
+            let bias = with_bias.then(|| rng.tensor(&[channels]));
+            let mut expected = x
+                .conv_transpose1d(&weight, padding, output_padding, stride, 1, channels)
+                .unwrap();
+            if let Some(bias) = &bias {
+                expected = expected
+                    .broadcast_add(&bias.reshape((1, channels, 1)).unwrap())
+                    .unwrap();
+            }
+            let before = depthwise_conv_transpose1d_calls();
+            let actual = depthwise_conv_transpose1d(
+                &x,
+                &weight,
+                bias.as_ref(),
+                stride,
+                padding,
+                output_padding,
+            )
+            .unwrap();
+            assert!(depthwise_conv_transpose1d_calls() > before);
+            let diff = max_abs_diff(&expected, &actual);
+            assert!(
+                diff <= 1e-5,
+                "case {:?}: max |diff| {diff}",
+                (batch, channels, time, taps, stride, padding, output_padding)
+            );
+        }
+        assert!(is_depthwise_conv_transpose1d(
+            &rng.tensor(&[512, 1, 3]),
+            512,
+            512,
+            1
+        ));
+        assert!(!is_depthwise_conv_transpose1d(
+            &rng.tensor(&[8, 2, 3]),
+            8,
+            8,
+            1
+        ));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_depthwise_transposed_conv_matches_cpu() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let mut rng = XorShift(0x1234_5678_9ABC_DEF1);
+        let x = rng.tensor(&[1, 512, 37]);
+        let weight = rng.tensor(&[512, 1, 3]);
+        let bias = rng.tensor(&[512]);
+        let cpu = depthwise_conv_transpose1d(&x, &weight, Some(&bias), 2, 1, 1).unwrap();
+        let metal = depthwise_conv_transpose1d(
+            &x.to_device(&device).unwrap(),
+            &weight.to_device(&device).unwrap(),
+            Some(&bias.to_device(&device).unwrap()),
+            2,
+            1,
+            1,
+        )
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap();
+        assert!(max_abs_diff(&cpu, &metal) <= 1e-5);
     }
 }

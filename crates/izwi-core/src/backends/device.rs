@@ -492,12 +492,16 @@ impl DeviceProfile {
 
     /// The per-family Metal default, before `IZWI_METAL_DTYPE`.
     fn metal_family_dtype_selection(&self, request: DTypeSelectionRequest<'_>) -> DTypeSelection {
-        if request.model_family == Some(ModelFamily::Voxtral)
-            && request.checkpoint_dtype != Some(DType::F32)
+        if matches!(
+            request.model_family,
+            Some(ModelFamily::Voxtral | ModelFamily::VoxtralTts)
+        ) && request.checkpoint_dtype != Some(DType::F32)
         {
-            // Voxtral's BF16 checkpoint: BF16 on Apple9+ (once Metal paged
+            // Voxtral's BF16 checkpoints: BF16 on Apple9+ (once Metal paged
             // attention takes BF16), F16 on Apple7/8, which also keeps
             // realtime decoding within Apple GPU memory and latency limits.
+            // Voxtral TTS applies the tier to its LM and acoustic
+            // transformer behind a load-time self-check; its codec stays F32.
             return self.metal_bf16_checkpoint_lm_tier();
         }
         DTypeSelection {
@@ -512,8 +516,6 @@ impl DeviceProfile {
                 "VibeVoice TTS Metal policy uses F16 to bound dense model residency".into()
             } else if request.model_family == Some(ModelFamily::WhisperAsr) {
                 "Whisper Metal policy runs its F16 checkpoint in F16 on every Apple family, with F32 softmax, LayerNorm statistics and logits (whisper.cpp, mlx-whisper, OpenAI Whisper)".into()
-            } else if request.model_family == Some(ModelFamily::VoxtralTts) {
-                "Voxtral TTS Metal policy keeps F32 across LM, acoustic transformer, and codec until lower-precision kernels are proven".into()
             } else {
                 "Metal default dtype remains F32".into()
             },
@@ -1779,10 +1781,13 @@ mod tests {
             metal_profile.select_model_dtype(ModelFamily::Qwen3Tts, None),
             DType::F32
         );
-        assert_eq!(
-            metal_profile.select_model_dtype(ModelFamily::VoxtralTts, None),
-            DType::F32
+        // Voxtral TTS's LM and acoustic stages take the same tier (behind
+        // the model's load-time self-check).
+        let tts = metal_profile.resolve_dtype(
+            DTypeSelectionRequest::new(None).with_model_family(ModelFamily::VoxtralTts),
         );
+        assert_eq!(tts.dtype, DType::F16);
+        assert!(tts.reason.contains("LM tier"), "{}", tts.reason);
     }
 
     #[test]

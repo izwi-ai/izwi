@@ -7,7 +7,8 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api::admin::models::{
     AdminModelActionResponse, AdminModelBatchCapabilities, AdminModelDownloadProgressEvent,
-    AdminModelInfo, AdminModelRouteCapabilities, AdminModelsResponse, AdminSpeechModelCapabilities,
+    AdminModelInfo, AdminModelRouteCapabilities, AdminModelsResponse, AdminRemovedModelInfo,
+    AdminSpeechModelCapabilities,
 };
 use crate::api::openai::audio::align::{
     AlignmentJsonRequest, AlignmentMultipartRequest, AlignmentResponse, AlignmentWord,
@@ -48,6 +49,7 @@ use crate::api::openai::audio::align::{
         AdminModelInfo,
         AdminModelRouteCapabilities,
         AdminModelsResponse,
+        AdminRemovedModelInfo,
         AdminSpeechModelCapabilities,
         AlignmentJsonRequest,
         AlignmentMultipartRequest,

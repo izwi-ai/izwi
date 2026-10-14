@@ -91,15 +91,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Voice Cloning"],
     size: "2.3 GB",
   },
-  "Qwen3-TTS-12Hz-0.6B-Base-4bit": {
-    shortName: "0.6B Base 4-bit",
-    fullName: "Qwen3-TTS 12Hz 0.6B Base (MLX 4-bit)",
-    description:
-      "Quantized base model for lower VRAM without losing cloning support",
-    category: "tts",
-    capabilities: ["Voice Cloning", "4-bit"],
-    size: "1.6 GB",
-  },
   "Qwen3-TTS-12Hz-0.6B-Base-8bit": {
     shortName: "0.6B Base 8-bit",
     fullName: "Qwen3-TTS 12Hz 0.6B Base (MLX 8-bit)",
@@ -125,14 +116,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "tts",
     capabilities: ["Text to Speech"],
     size: "2.3 GB",
-  },
-  "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit": {
-    shortName: "0.6B Custom 4-bit",
-    fullName: "Qwen3-TTS 12Hz 0.6B CustomVoice (MLX 4-bit)",
-    description: "Quantized CustomVoice for laptops with tight memory",
-    category: "tts",
-    capabilities: ["Text to Speech", "4-bit"],
-    size: "1.6 GB",
   },
   "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit": {
     shortName: "0.6B Custom 8-bit",
@@ -160,14 +143,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Voice Cloning"],
     size: "4.2 GB",
   },
-  "Qwen3-TTS-12Hz-1.7B-Base-4bit": {
-    shortName: "1.7B Base 4-bit",
-    fullName: "Qwen3-TTS 12Hz 1.7B Base (MLX 4-bit)",
-    description: "Quantized base model for lower-memory voice cloning",
-    category: "tts",
-    capabilities: ["Voice Cloning", "4-bit"],
-    size: "2.2 GB",
-  },
   // TTS 1.7B CustomVoice
   "Qwen3-TTS-12Hz-1.7B-CustomVoice": {
     shortName: "1.7B CustomVoice",
@@ -177,14 +152,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     capabilities: ["Text to Speech"],
     size: "4.2 GB",
   },
-  "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit": {
-    shortName: "1.7B Custom 4-bit",
-    fullName: "Qwen3-TTS 12Hz 1.7B CustomVoice (MLX 4-bit)",
-    description: "Quantized CustomVoice model with lower VRAM requirements",
-    category: "tts",
-    capabilities: ["Text to Speech", "4-bit"],
-    size: "2.2 GB",
-  },
   // TTS 1.7B VoiceDesign models
   "Qwen3-TTS-12Hz-1.7B-VoiceDesign": {
     shortName: "1.7B VoiceDesign",
@@ -193,14 +160,6 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     category: "tts",
     capabilities: ["Voice Design"],
     size: "4.2 GB",
-  },
-  "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit": {
-    shortName: "1.7B Design 4-bit",
-    fullName: "Qwen3-TTS 12Hz 1.7B VoiceDesign (MLX 4-bit)",
-    description: "Quantized VoiceDesign for creative voices on 16GB devices",
-    category: "tts",
-    capabilities: ["Voice Design", "4-bit"],
-    size: "2.2 GB",
   },
   "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit": {
     shortName: "1.7B Design 8-bit",
@@ -222,9 +181,9 @@ export const MODEL_DETAILS: Record<string, ModelDetail> = {
     shortName: "Kokoro 82M",
     fullName: "Kokoro-82M by hexgrad",
     description:
-      "Lightweight multilingual TTS model with 54 built-in voices (Rust runtime integration pending)",
+      "Lightweight multilingual TTS model with 41 built-in voices in English, Spanish, French, Hindi, Italian and Portuguese",
     category: "tts",
-    capabilities: ["Text to Speech", "54 Voices", "24 kHz"],
+    capabilities: ["Text to Speech", "41 Voices", "24 kHz"],
     size: "346 MB",
   },
   "VibeVoice-1.5B": {

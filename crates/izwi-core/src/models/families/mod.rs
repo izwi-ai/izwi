@@ -24,19 +24,14 @@ impl FamilyRegistration {
 
 const QWEN3_TTS_VARIANTS: &[ModelVariant] = &[
     ModelVariant::Qwen3Tts12Hz06BBase,
-    ModelVariant::Qwen3Tts12Hz06BBase4Bit,
     ModelVariant::Qwen3Tts12Hz06BBase8Bit,
     ModelVariant::Qwen3Tts12Hz06BBaseBf16,
     ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-    ModelVariant::Qwen3Tts12Hz06BCustomVoice4Bit,
     ModelVariant::Qwen3Tts12Hz06BCustomVoice8Bit,
     ModelVariant::Qwen3Tts12Hz06BCustomVoiceBf16,
     ModelVariant::Qwen3Tts12Hz17BBase,
-    ModelVariant::Qwen3Tts12Hz17BBase4Bit,
     ModelVariant::Qwen3Tts12Hz17BCustomVoice,
-    ModelVariant::Qwen3Tts12Hz17BCustomVoice4Bit,
     ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
-    ModelVariant::Qwen3Tts12Hz17BVoiceDesign4Bit,
     ModelVariant::Qwen3Tts12Hz17BVoiceDesign8Bit,
     ModelVariant::Qwen3Tts12Hz17BVoiceDesignBf16,
 ];
@@ -315,6 +310,7 @@ mod tests {
         if variant
             .speech_capabilities()
             .is_some_and(|capabilities| capabilities.supports_streaming)
+            && !variant.streams_on_its_tts_route()
         {
             expected.insert(ConformanceCapability::StreamingTts);
         }

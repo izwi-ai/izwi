@@ -6,7 +6,7 @@
 //! are grouped into the row dimension of a batched matrix multiplication so a
 //! single compact K/V head serves every query head in its group.
 
-use candle_core::{Tensor, D};
+use candle_core::{DType, Device, Tensor, D};
 
 use crate::error::{Error, Result};
 
@@ -199,9 +199,139 @@ fn normalize_mask(
     Ok(normalized)
 }
 
+/// Query rows per block in [`banded_sdpa_bhsd`]. One block's score tensor is
+/// `[batch, heads, block, block + left + right]`, so banded attention memory
+/// is bounded by the band, not the sequence.
+pub(crate) const BANDED_QUERY_BLOCK: usize = 128;
+
+/// Keys visible to query `i`: `i - left ..= i + right`, clipped to the
+/// sequence. Hugging Face's causal `sliding_window = w` is `left = w - 1`,
+/// `right = 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttentionBand {
+    pub left: usize,
+    pub right: usize,
+}
+
+impl AttentionBand {
+    /// A causal sliding window over `window` keys, the current one included.
+    pub(crate) fn causal_window(window: usize) -> Self {
+        Self {
+            left: window.max(1) - 1,
+            right: 0,
+        }
+    }
+}
+
+/// One query block of [`banded_sdpa_bhsd_with_bias`] and the key span its
+/// band reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BandBlock {
+    pub query_start: usize,
+    pub query_len: usize,
+    pub key_start: usize,
+    pub key_len: usize,
+}
+
+impl BandBlock {
+    /// Signed distance `key - query` between block-local indices.
+    pub(crate) fn relative(&self, query: usize, key: usize) -> isize {
+        (self.key_start + key) as isize - (self.query_start + query) as isize
+    }
+}
+
+/// Additive `[1, query_len, key_len]` mask for one block: zero inside the
+/// band, negative infinity outside.
+pub(crate) fn band_block_mask(
+    block: BandBlock,
+    band: AttentionBand,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut data = vec![0f32; block.query_len * block.key_len];
+    for (query, row) in data.chunks_exact_mut(block.key_len).enumerate() {
+        for (key, value) in row.iter_mut().enumerate() {
+            let rel = block.relative(query, key);
+            if rel < -(band.left as isize) || rel > band.right as isize {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Tensor::from_vec(data, (1, block.query_len, block.key_len), device)?
+        .to_dtype(dtype)
+        .map_err(Error::from)
+}
+
+/// [`compact_gqa_sdpa_bhsd`] restricted to `band`, computed in query blocks
+/// of [`BANDED_QUERY_BLOCK`] rows against only the keys each block's band can
+/// reach. No `seq x seq` score, mask or bias tensor is built.
+pub(crate) fn banded_sdpa_bhsd(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    band: AttentionBand,
+    softmax_scale: f64,
+) -> Result<Tensor> {
+    banded_sdpa_bhsd_with_bias(query, key, value, band, softmax_scale, |block| {
+        band_block_mask(block, band, query.device(), query.dtype())
+    })
+}
+
+/// [`banded_sdpa_bhsd`] with a caller-built additive bias per block (any
+/// [`compact_gqa_sdpa_bhsd`] mask shape over `[query_len, key_len]`). The
+/// bias must itself mask keys outside `band`; `band` only bounds the key
+/// span each block reads.
+pub(crate) fn banded_sdpa_bhsd_with_bias<F>(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    band: AttentionBand,
+    softmax_scale: f64,
+    mut block_bias: F,
+) -> Result<Tensor>
+where
+    F: FnMut(BandBlock) -> Result<Tensor>,
+{
+    let seq_len = query.dim(2)?;
+    let key_seq = key.dim(2)?;
+    if key_seq != seq_len {
+        return Err(Error::InvalidInput(format!(
+            "banded attention needs self-attention lengths, got q={seq_len}, k={key_seq}"
+        )));
+    }
+    let mut blocks = Vec::with_capacity(seq_len.div_ceil(BANDED_QUERY_BLOCK));
+    let mut query_start = 0;
+    while query_start < seq_len {
+        let query_len = BANDED_QUERY_BLOCK.min(seq_len - query_start);
+        let key_start = query_start.saturating_sub(band.left);
+        let key_end = (query_start + query_len)
+            .saturating_add(band.right)
+            .min(seq_len);
+        let block = BandBlock {
+            query_start,
+            query_len,
+            key_start,
+            key_len: key_end - key_start,
+        };
+        let bias = block_bias(block)?;
+        blocks.push(compact_gqa_sdpa_bhsd(
+            &query.narrow(2, query_start, query_len)?,
+            &key.narrow(2, key_start, block.key_len)?,
+            &value.narrow(2, key_start, block.key_len)?,
+            Some(CompactGqaMask::Additive(&bias)),
+            softmax_scale,
+        )?);
+        query_start += query_len;
+    }
+    if blocks.len() == 1 {
+        return Ok(blocks.remove(0));
+    }
+    Tensor::cat(&blocks, 2).map_err(Error::from)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compact_gqa_sdpa_bhsd, CompactGqaMask};
+    use super::{banded_sdpa_bhsd, compact_gqa_sdpa_bhsd, AttentionBand, CompactGqaMask};
     use candle_core::{Device, Tensor, D};
 
     fn repeat_heads(tensor: &Tensor, query_heads: usize) -> candle_core::Result<Tensor> {
@@ -353,5 +483,81 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid compact GQA head geometry"));
+    }
+
+    /// Dense f64 reference: softmax over keys `i - left ..= i + right`, with
+    /// K/V head `h / (q_heads / kv_heads)` serving query head `h`.
+    fn dense_band_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        (q_heads, kv_heads, seq, dim): (usize, usize, usize, usize),
+        band: AttentionBand,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (dim as f64).sqrt();
+        let mut out = vec![0f32; q_heads * seq * dim];
+        for h in 0..q_heads {
+            let kv = h / (q_heads / kv_heads);
+            for i in 0..seq {
+                let keys = i.saturating_sub(band.left)..=(i + band.right).min(seq - 1);
+                let scores: Vec<f64> = keys
+                    .clone()
+                    .map(|j| {
+                        (0..dim)
+                            .map(|d| {
+                                f64::from(q[(h * seq + i) * dim + d])
+                                    * f64::from(k[(kv * seq + j) * dim + d])
+                            })
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for d in 0..dim {
+                    let value: f64 = keys
+                        .clone()
+                        .zip(&weights)
+                        .map(|(j, w)| w * f64::from(v[(kv * seq + j) * dim + d]))
+                        .sum();
+                    out[(h * seq + i) * dim + d] = (value / total) as f32;
+                }
+            }
+        }
+        out
+    }
+
+    /// Blocked banded attention equals a dense banded reference across block
+    /// boundaries, for a causal sliding window and a two-sided band, with GQA.
+    #[test]
+    fn banded_attention_matches_dense_band_reference() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+
+        let (q_heads, kv_heads, seq, dim) = (4, 2, 300, 8);
+        let device = &Device::Cpu;
+        let q = xorshift_tensor(&[1, q_heads, seq, dim], 1, 1.0, device).unwrap();
+        let k = xorshift_tensor(&[1, kv_heads, seq, dim], 2, 1.0, device).unwrap();
+        let v = xorshift_tensor(&[1, kv_heads, seq, dim], 3, 1.0, device).unwrap();
+        for band in [
+            AttentionBand::causal_window(72),
+            AttentionBand::causal_window(1),
+            AttentionBand {
+                left: 16,
+                right: 16,
+            },
+        ] {
+            let out = banded_sdpa_bhsd(&q, &k, &v, band, 1.0 / (dim as f64).sqrt()).unwrap();
+            assert_eq!(out.dims(), &[1, q_heads, seq, dim]);
+            let reference = dense_band_reference(
+                &host_f32(&q).unwrap(),
+                &host_f32(&k).unwrap(),
+                &host_f32(&v).unwrap(),
+                (q_heads, kv_heads, seq, dim),
+                band,
+            );
+            let error = max_abs_diff(&host_f32(&out).unwrap(), &reference);
+            assert!(error < 1e-5, "{band:?}: max abs error {error}");
+        }
     }
 }

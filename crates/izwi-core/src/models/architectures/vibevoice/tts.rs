@@ -26,7 +26,8 @@ use crate::models::architectures::vibevoice::config::{
 };
 use crate::models::architectures::vibevoice::connector::SpeechConnector;
 use crate::models::architectures::vibevoice::diffusion::{
-    VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler, VibeVoiceDiffusionStepTensors,
+    DpmSolverState, VibeVoiceDiffusionHead, VibeVoiceDiffusionScheduler,
+    VibeVoiceDiffusionStepTensors,
 };
 use crate::models::architectures::vibevoice::prompt::{
     VibeVoicePromptTokenizer, VibeVoiceSpecialTokens,
@@ -47,17 +48,28 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::telemetry::{
     snapshot as kernel_telemetry_snapshot, KernelPathTelemetrySnapshot,
 };
-use crate::models::shared::weights::gguf::load_model_weights;
+use crate::models::shared::weights::gguf::safetensors_weight_files;
+use crate::models::shared::weights::staged::metal_staged_safetensors;
 
 const TARGET_SAMPLE_RATE: u32 = 24_000;
 const SPEECH_TOKEN_COMPRESS_RATIO: usize = 3_200;
 const MIN_FRAMES_BEFORE_STOP: usize = 4;
 const AUTO_MIN_OUTPUT_FRAMES: usize = 8;
 const AUTO_MAX_OUTPUT_FRAMES: usize = 384;
-const WORDS_PER_SECOND: f32 = 2.6;
+/// Frames per chunk of the final acoustic decode. One F32 chunk peaks near
+/// 2 x 128 x 3200 x 32 x 4 B = 105 MB in the decoder FFN, inside the 512 MiB
+/// decode workspace a row is priced at, whatever the utterance length.
+const VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES: usize = 32;
+const WORDS_PER_SECOND: f32 = 2.0;
+const CJK_CHARS_PER_SECOND: f32 = 3.0;
 const AUTO_PADDING_SECONDS: f32 = 0.8;
 pub const VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF: f64 = 300.0;
-const DEFAULT_CFG_SCALE: f32 = 1.5;
+/// Classifier-free guidance of the reference demos (`--cfg_scale` 1.3 in
+/// `inference_from_file.py`, 1.3 in the Gradio demo).
+pub const VIBEVOICE_TTS_DEFAULT_CFG_SCALE: f32 = 1.3;
+/// Diffusion steps of the reference demo (`set_ddpm_inference_steps(10)`);
+/// with the second-order solver 10 steps track the 20-step trajectory.
+pub const VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS: usize = 10;
 const VIBEVOICE_CFG_BATCHING_ENV: &str = "IZWI_VIBEVOICE_CFG_BATCHING";
 const VIBEVOICE_CUDA_DDPM_STEPS_ENV: &str = "IZWI_VIBEVOICE_CUDA_DDPM_STEPS";
 static NEXT_VIBEVOICE_TTS_STATE_ID: AtomicU64 = AtomicU64::new(1);
@@ -93,7 +105,7 @@ impl VibeVoiceTtsGenerationParams {
                 .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
         };
         Self {
-            cfg_scale: DEFAULT_CFG_SCALE,
+            cfg_scale: VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
             diffusion_steps: default_diffusion_steps.max(1),
             max_frames,
             auto_frame_budget,
@@ -123,6 +135,11 @@ pub struct VibeVoiceTtsProfile {
     pub positive_decode_ms: f32,
     pub negative_decode_ms: f32,
     pub final_decode_ms: f32,
+    /// Chunks of the final decode ([`VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES`]).
+    pub final_decode_chunks: usize,
+    /// Frames whose waveform came from the generation-time streaming decode
+    /// instead of a final decode.
+    pub final_audio_from_frames: usize,
     pub host_audio_ms: f32,
     pub frames_generated: usize,
     pub diffusion_steps: usize,
@@ -162,6 +179,9 @@ struct EncodedReference {
 
 struct GeneratedSpeechFeedback {
     embed: Tensor,
+    /// This frame's waveform from the streaming acoustic decode
+    /// (`[1, 1, 3200]`), the same samples a final decode would produce.
+    audio: Tensor,
     acoustic_decode_ms: f32,
     semantic_encode_ms: f32,
     connector_ms: f32,
@@ -254,6 +274,12 @@ pub(crate) struct VibeVoiceTtsRetainedState {
     acoustic_clock: u64,
     semantic_clock: u64,
     scaled_latents: Vec<Tensor>,
+    /// Per-frame waveforms decoded during generation, parallel to
+    /// `scaled_latents` and checkpointed with it.
+    frame_audio: Vec<Tensor>,
+    /// Frames whose waveform [`VibeVoiceTtsModel::stream_retained_audio`]
+    /// has handed out.
+    streamed_frames: usize,
     frame_noises: Vec<Tensor>,
     finished: bool,
     active_quantum: Option<u64>,
@@ -278,6 +304,8 @@ struct VibeVoiceTtsRetainedCheckpointPayload {
     acoustic_clock: u64,
     semantic_clock: u64,
     scaled_latents: Vec<Tensor>,
+    frame_audio: Vec<Tensor>,
+    streamed_frames: usize,
     finished: bool,
     staged_step: Option<VibeVoiceTtsRetainedDecodeStep>,
     managed_completions_drained: bool,
@@ -298,6 +326,21 @@ pub struct VibeVoiceTtsModel {
     language_model: Qwen3Model,
     prediction_head: VibeVoiceDiffusionHead,
     model_identity: [u8; 32],
+}
+
+/// The dtype [`VibeVoiceTtsModel::load`] reads every weight at on `device`
+/// (`IZWI_VIBEVOICE_TTS_DTYPE`, or the family default).
+pub(crate) fn vibevoice_tts_weight_dtype(device: &DeviceProfile) -> Result<DType> {
+    Ok(std::env::var("IZWI_VIBEVOICE_TTS_DTYPE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            device.select_model_dtype_checked(ModelFamily::VibeVoiceTts, Some(raw), "VibeVoice TTS")
+        })
+        .transpose()?
+        .unwrap_or_else(|| device.select_model_dtype(ModelFamily::VibeVoiceTts, None)))
 }
 
 impl VibeVoiceTtsModel {
@@ -324,21 +367,15 @@ impl VibeVoiceTtsModel {
         let diffusion_config = config.diffusion_head_config.clone().ok_or_else(|| {
             Error::ModelLoadError("VibeVoice TTS config missing diffusion head".to_string())
         })?;
-        let dtype = std::env::var("IZWI_VIBEVOICE_TTS_DTYPE")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(|raw| {
-                device.select_model_dtype_checked(
-                    ModelFamily::VibeVoiceTts,
-                    Some(raw),
-                    "VibeVoice TTS",
-                )
-            })
-            .transpose()?
-            .unwrap_or_else(|| device.select_model_dtype(ModelFamily::VibeVoiceTts, None));
-        let vb = load_model_weights(model_dir, dtype, &device.device)?;
+        let dtype = vibevoice_tts_weight_dtype(&device)?;
+        // Host-cast, exact-size uploads with periodic synchronization on
+        // Metal (`staged`); Candle's mapped backend elsewhere.
+        let vb = unsafe {
+            metal_staged_safetensors(&safetensors_weight_files(model_dir)?, dtype, &device.device)
+        }
+        .map_err(|error| {
+            Error::ModelLoadError(format!("Failed to load VibeVoice TTS weights: {error}"))
+        })?;
         let tokenizer =
             VibeVoicePromptTokenizer::load(model_dir, config.decoder_config.vocab_size)?;
         let acoustic_tokenizer = VibeVoiceAcousticTokenizer::load(
@@ -443,11 +480,11 @@ impl VibeVoiceTtsModel {
         vibevoice_physical_state_spec(stage_graphs, contract, max_context_tokens)
     }
 
+    /// The reference demo's 10 steps. The config's `ddpm_num_inference_steps`
+    /// (20) is what bare `generate()` uses; the published inference scripts
+    /// override it to 10.
     pub fn default_diffusion_steps(&self) -> usize {
-        self.prediction_head
-            .config()
-            .ddpm_num_inference_steps
-            .max(1)
+        VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS
     }
 
     pub fn available_speakers(&self) -> Vec<String> {
@@ -600,6 +637,8 @@ impl VibeVoiceTtsModel {
             acoustic_clock: 0,
             semantic_clock: 0,
             scaled_latents: Vec::with_capacity(max_frames),
+            frame_audio: Vec::with_capacity(max_frames),
+            streamed_frames: 0,
             frame_noises,
             finished: false,
             active_quantum: None,
@@ -633,6 +672,8 @@ impl VibeVoiceTtsModel {
                 acoustic_clock: 0,
                 semantic_clock: 0,
                 scaled_latents: Vec::new(),
+                frame_audio: Vec::new(),
+                streamed_frames: 0,
                 finished: false,
                 staged_step: None,
                 managed_completions_drained: true,
@@ -785,19 +826,9 @@ impl VibeVoiceTtsModel {
             "VibeVoice retained TTS negative decode",
         )?);
         state.scaled_latents.push(latent_frame);
+        state.frame_audio.push(feedback.audio);
         state.managed_completions_drained = false;
-        state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
-        if !state.finished && state.scaled_latents.len() >= MIN_FRAMES_BEFORE_STOP {
-            let predicted = next_tts_control_token_from_hidden(
-                &self.language_model,
-                state.last_hidden.as_ref().ok_or_else(|| {
-                    Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
-                })?,
-                self.tokenizer.specials(),
-            )?;
-            state.finished = predicted == self.tokenizer.specials().speech_end
-                || predicted == self.tokenizer.specials().endoftext;
-        }
+        state.finished = self.retained_frame_ends_row(state)?;
         let step = VibeVoiceTtsRetainedDecodeStep {
             frames_generated: state.scaled_latents.len(),
             finished: state.finished,
@@ -898,8 +929,13 @@ impl VibeVoiceTtsModel {
                 "VibeVoice retained TTS batched negative decode",
             )?);
             state.scaled_latents.push(latent_frame);
+            state.frame_audio.push(feedback.audio);
             state.managed_completions_drained = false;
-            state.finished = state.scaled_latents.len() >= state.params.max_frames.max(1);
+            // Same stop rule as the scalar step: a row whose next control
+            // token is speech_end / endoftext finishes now, instead of
+            // falling back to the scalar step next quantum and sampling one
+            // more latent from its end-of-speech state (VVT-6).
+            state.finished = self.retained_frame_ends_row(state)?;
             let step = VibeVoiceTtsRetainedDecodeStep {
                 frames_generated: state.scaled_latents.len(),
                 finished: state.finished,
@@ -908,6 +944,32 @@ impl VibeVoiceTtsModel {
             steps.push(step);
         }
         Ok(steps)
+    }
+
+    /// Whether a row is done after committing a frame: the frame cap, or,
+    /// from [`MIN_FRAMES_BEFORE_STOP`] frames on, the LM predicting a
+    /// non-diffusion control token next. The reference stops there and
+    /// never samples a latent for `speech_end` / `endoftext`.
+    fn retained_frame_ends_row(&self, state: &VibeVoiceTtsRetainedState) -> Result<bool> {
+        let frames = state.scaled_latents.len();
+        if frames >= state.params.max_frames.max(1) {
+            return Ok(true);
+        }
+        if frames < MIN_FRAMES_BEFORE_STOP {
+            return Ok(false);
+        }
+        let predicted = next_tts_control_token_from_hidden(
+            &self.language_model,
+            state.last_hidden.as_ref().ok_or_else(|| {
+                Error::InferenceError("VibeVoice retained TTS has no positive hidden".into())
+            })?,
+            self.tokenizer.specials(),
+        )?;
+        Ok(control_token_ends_speech(
+            frames,
+            predicted,
+            self.tokenizer.specials(),
+        ))
     }
 
     pub(crate) fn retained_decode_batch_eligible(
@@ -952,27 +1014,47 @@ impl VibeVoiceTtsModel {
         profile.frames_generated = state.scaled_latents.len();
         profile.diffusion_steps =
             vibevoice_effective_diffusion_steps(self.device.kind, state.params.diffusion_steps);
-        let scaled_latents = Tensor::cat(&state.scaled_latents, 1)?;
-        let unscaled = unscale_latents(
-            &scaled_latents,
-            &state.artifact.normalization.bias,
-            &state.artifact.normalization.scale,
+        let samples = self.final_audio(
+            &state.scaled_latents,
+            &state.frame_audio,
+            &state.artifact.normalization,
+            &mut profile,
         )?;
-        let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode(&unscaled)?;
-        profile.final_decode_ms = elapsed_ms(started);
-        let started = Instant::now();
-        let samples = audio
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        profile.host_audio_ms = elapsed_ms(started);
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
             frames_generated: state.scaled_latents.len(),
             profile,
         })
+    }
+
+    /// The rate of the audio [`Self::stream_retained_audio`] returns.
+    pub(crate) fn output_sample_rate(&self) -> u32 {
+        self.preprocessor.target_sample_rate()
+    }
+
+    /// Progressive audio (VVT-10): the waveforms of the frames committed
+    /// since the last call, read back in one copy. They are the samples
+    /// [`Self::finalize_retained_state`] concatenates (the streaming decode
+    /// is causal with carried caches), so concatenating every call's output
+    /// gives the final waveform. Call between quanta; a request streamed this
+    /// way finishes with this call instead of the final concatenation.
+    pub(crate) fn stream_retained_audio(
+        &self,
+        state: &mut VibeVoiceTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        self.validate_retained_state(state)?;
+        if state.active_quantum.is_some() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained TTS streams audio only between quanta".into(),
+            ));
+        }
+        if state.frame_audio.len() != state.scaled_latents.len() {
+            return Err(Error::InferenceError(
+                "VibeVoice retained TTS is missing a frame waveform to stream".into(),
+            ));
+        }
+        take_streamed_frame_audio(&state.frame_audio, &mut state.streamed_frames)
     }
 
     fn validate_retained_state(&self, state: &VibeVoiceTtsRetainedState) -> Result<()> {
@@ -1120,6 +1202,7 @@ impl VibeVoiceTtsModel {
         )?;
         profile.diffusion_steps = diffusion_plan.steps.len();
         let mut scaled_latents = Vec::with_capacity(max_frames);
+        let mut frame_audio = Vec::with_capacity(max_frames);
         for ((pos, negative_pos), frame_idx) in
             (prompt.input_ids.len()..).zip(1usize..).zip(0..max_frames)
         {
@@ -1170,6 +1253,7 @@ impl VibeVoiceTtsModel {
             profile.feedback_semantic_encode_ms += feedback.semantic_encode_ms;
             profile.feedback_connector_ms += feedback.connector_ms;
             scaled_latents.push(latent_frame);
+            frame_audio.push(feedback.audio);
 
             let (hidden, negative_hidden) = {
                 let (positive, negative) = leases.lease_pair_mut(
@@ -1211,45 +1295,29 @@ impl VibeVoiceTtsModel {
         }
 
         profile.frames_generated = scaled_latents.len();
-        let scaled_latents = Tensor::cat(&scaled_latents, 1)?;
-        let unscaled = unscale_latents(
+        let samples = self.final_audio(
             &scaled_latents,
-            &reference.normalization.bias,
-            &reference.normalization.scale,
+            &frame_audio,
+            &reference.normalization,
+            &mut profile,
         )?;
-        let started = Instant::now();
-        let audio = self.acoustic_tokenizer.decode(&unscaled)?;
-        profile.final_decode_ms = elapsed_ms(started);
-        let started = Instant::now();
-        let samples = audio
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        profile.host_audio_ms = elapsed_ms(started);
         let kernel_telemetry_end = kernel_telemetry_snapshot();
         apply_kernel_telemetry_delta(&mut profile, &kernel_telemetry_start, &kernel_telemetry_end);
         info!(?profile, "VibeVoice TTS generation profile");
         Ok(VibeVoiceTtsOutput {
             samples,
             sample_rate: self.preprocessor.target_sample_rate(),
-            frames_generated: scaled_latents.dim(1)?,
+            frames_generated: scaled_latents.len(),
             profile,
         })
     }
 
     fn encode_reference(&self, reference: &VibeVoiceSpeakerReference) -> Result<EncodedReference> {
-        let cleaned = preprocess_reference_audio(
-            reference.audio_samples.clone(),
+        let resampled = reference_audio_for_encoder(
+            &reference.audio_samples,
             reference.sample_rate,
             &self.preprocessor,
-        );
-        if cleaned.is_empty() {
-            return Err(Error::InvalidInput(
-                "VibeVoice TTS reference_audio contains no usable speech".to_string(),
-            ));
-        }
-        let target_sample_rate = self.preprocessor.target_sample_rate();
-        let resampled = resample_linear(&cleaned, reference.sample_rate, target_sample_rate)?;
+        )?;
         let speech = Tensor::from_vec(
             resampled.clone(),
             (1, 1, resampled.len()),
@@ -1268,6 +1336,39 @@ impl VibeVoiceTtsModel {
             scaled_latents,
             normalization,
         })
+    }
+
+    /// The utterance waveform. The streaming decode that feeds the semantic
+    /// encoder has already produced every frame's samples, and with causal
+    /// convs and carried caches they equal a whole-sequence decode, so they
+    /// are concatenated and read back once instead of decoding again (VVT-10).
+    /// A missing frame falls back to the chunked final decode.
+    fn final_audio(
+        &self,
+        scaled_latents: &[Tensor],
+        frame_audio: &[Tensor],
+        normalization: &LatentNormalization,
+        profile: &mut VibeVoiceTtsProfile,
+    ) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        if frame_audio.len() == scaled_latents.len() {
+            let samples = VibeVoiceAcousticTokenizer::concat_frame_audio(frame_audio)?;
+            profile.host_audio_ms = elapsed_ms(started);
+            profile.final_audio_from_frames = frame_audio.len();
+            return Ok(samples);
+        }
+        let unscaled = unscale_latents(
+            &Tensor::cat(scaled_latents, 1)?,
+            &normalization.bias,
+            &normalization.scale,
+        )?;
+        // Read back per chunk inside the decode, so host_audio_ms stays 0.
+        let (samples, chunks) = self
+            .acoustic_tokenizer
+            .decode_frames_chunked(&unscaled, VIBEVOICE_FINAL_DECODE_CHUNK_FRAMES)?;
+        profile.final_decode_ms = elapsed_ms(started);
+        profile.final_decode_chunks = chunks;
+        Ok(samples)
     }
 
     fn latent_normalization(&self, latents: &Tensor) -> Result<LatentNormalization> {
@@ -1324,6 +1425,7 @@ impl VibeVoiceTtsModel {
         )?;
         Ok(GeneratedSpeechFeedback {
             embed,
+            audio: audio_chunk,
             acoustic_decode_ms,
             semantic_encode_ms,
             connector_ms: connector_acoustic_ms + elapsed_ms(started),
@@ -1383,6 +1485,7 @@ impl VibeVoiceTtsModel {
         )?;
         Ok(GeneratedSpeechFeedback {
             embed,
+            audio: audio_chunk,
             acoustic_decode_ms,
             semantic_encode_ms,
             connector_ms: connector_acoustic_ms + elapsed_ms(started),
@@ -1418,6 +1521,7 @@ impl VibeVoiceTtsModel {
             &self.device.device,
         )?
         .to_dtype(self.dtype)?;
+        let mut solver = DpmSolverState::default();
         for step in &plan.steps {
             let model_output = if let (Some(negative_condition), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
@@ -1462,11 +1566,9 @@ impl VibeVoiceTtsModel {
                     &condition,
                 )?
             };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
+            speech = plan
+                .scheduler
+                .step(&model_output, &speech, &step.tensors, &mut solver)?;
         }
         Ok(speech)
     }
@@ -1478,50 +1580,13 @@ impl VibeVoiceTtsModel {
         plan: &VibeVoiceDiffusionPlan,
         noise: &Tensor,
     ) -> Result<Tensor> {
-        let condition = self.prediction_head.condition_projection(condition)?;
-        let negative_condition = if plan.cfg_tensor.is_some() {
-            negative_condition
-                .map(|condition| self.prediction_head.condition_projection(condition))
-                .transpose()?
-        } else {
-            None
-        };
-        let mut speech = noise.clone();
-        for step in &plan.steps {
-            let model_output = if let (Some(negative), Some(cfg)) =
-                (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
-            {
-                let conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
-                let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
-                let timestep = Tensor::cat(
-                    &[
-                        step.timestep_embedding.clone(),
-                        step.timestep_embedding.clone(),
-                    ],
-                    0,
-                )?;
-                let outputs = self.prediction_head.forward_with_precomputed(
-                    &latents,
-                    &timestep,
-                    &conditions,
-                )?;
-                let positive = outputs.narrow(0, 0, 1)?;
-                let negative = outputs.narrow(0, 1, 1)?;
-                negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
-            } else {
-                self.prediction_head.forward_with_precomputed(
-                    &speech,
-                    &step.timestep_embedding,
-                    &condition,
-                )?
-            };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
-        }
-        Ok(speech)
+        sample_latent_from_noise(
+            &self.prediction_head,
+            condition,
+            negative_condition,
+            plan,
+            noise,
+        )
     }
 
     fn sample_speech_latent_cross_request_batch(
@@ -1554,6 +1619,7 @@ impl VibeVoiceTtsModel {
             .map(|state| &state.frame_noises[state.scaled_latents.len()])
             .collect::<Vec<_>>();
         let mut speech = Tensor::cat(&noises, 0)?;
+        let mut solver = DpmSolverState::default();
         for step in &plan.steps {
             let model_output = if let (Some(negative), Some(cfg)) =
                 (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
@@ -1578,11 +1644,9 @@ impl VibeVoiceTtsModel {
                 self.prediction_head
                     .forward_with_precomputed(&speech, &timestep, &condition)?
             };
-            speech = plan.scheduler.step_v_prediction_with_tensors(
-                &model_output,
-                &speech,
-                &step.tensors,
-            )?;
+            speech = plan
+                .scheduler
+                .step(&model_output, &speech, &step.tensors, &mut solver)?;
         }
         (0..batch)
             .map(|row| speech.narrow(0, row, 1).map_err(Error::from))
@@ -1656,6 +1720,8 @@ impl VibeVoiceTtsRetainedState {
                 acoustic_clock: self.acoustic_clock,
                 semantic_clock: self.semantic_clock,
                 scaled_latents: self.scaled_latents.clone(),
+                frame_audio: self.frame_audio.clone(),
+                streamed_frames: self.streamed_frames,
                 finished: self.finished,
                 staged_step: self.staged_step.clone(),
                 managed_completions_drained: self.managed_completions_drained,
@@ -1703,6 +1769,8 @@ impl VibeVoiceTtsRetainedState {
         self.acoustic_clock = payload.acoustic_clock;
         self.semantic_clock = payload.semantic_clock;
         self.scaled_latents = payload.scaled_latents;
+        self.frame_audio = payload.frame_audio;
+        self.streamed_frames = payload.streamed_frames;
         self.finished = payload.finished;
         self.staged_step = payload.staged_step;
         self.managed_completions_drained = payload.managed_completions_drained;
@@ -1753,22 +1821,89 @@ impl VibeVoiceTtsRetainedState {
 }
 
 pub fn vibevoice_tts_auto_max_frames_for_text(text: &str) -> usize {
-    let word_count = text
-        .split_whitespace()
-        .filter(|word| !word.is_empty())
-        .count();
-    let char_count = text.chars().filter(|ch| !ch.is_whitespace()).count();
-    let effective_words = if word_count > 0 {
-        word_count as f32
-    } else if char_count > 0 {
-        (char_count as f32 / 4.0).ceil()
-    } else {
-        1.0
-    };
-    let estimated_secs = AUTO_PADDING_SECONDS + effective_words / WORDS_PER_SECOND;
+    // A slow pace per language, so slow voices reach end of speech inside
+    // the budget; unspaced CJK text is budgeted by characters (VVT-9).
+    let estimated_secs = AUTO_PADDING_SECONDS
+        + crate::models::shared::speech_duration::estimated_speech_secs(
+            text,
+            WORDS_PER_SECOND,
+            CJK_CHARS_PER_SECOND,
+        );
     let estimated_frames =
         (estimated_secs * ModelVariant::VIBEVOICE_TTS_FRAME_RATE_HZ).ceil() as usize;
     estimated_frames.clamp(AUTO_MIN_OUTPUT_FRAMES, AUTO_MAX_OUTPUT_FRAMES)
+}
+
+/// The largest automatic output-frame budget; longer text is split by long
+/// form.
+pub fn vibevoice_tts_auto_max_output_frames() -> usize {
+    AUTO_MAX_OUTPUT_FRAMES
+}
+
+/// Decoder positions one VibeVoice TTS prompt may take before its first
+/// frame: the system prompt, a voice section whose reference is cropped to
+/// 12 s (90 latent frames at 7.5 Hz), the target text that fills the largest
+/// automatic budget (about 130 words) and the speech-output header.
+const STATE_PROMPT_TOKENS: usize = 512;
+
+/// The retained context every VibeVoice TTS request needs in each CFG
+/// domain (positive and negative): one prompt plus the largest automatic
+/// output budget, one position per frame. Load admission guarantees it or
+/// refuses the load; live memory caps only growth above it.
+pub(crate) fn vibevoice_tts_state_floor_tokens() -> usize {
+    STATE_PROMPT_TOKENS + AUTO_MAX_OUTPUT_FRAMES
+}
+
+/// One speech latent from `noise`, conditioned on the LM's last hidden
+/// state (and the negative one under CFG), through `plan`'s DPM-Solver++
+/// steps.
+fn sample_latent_from_noise(
+    prediction_head: &VibeVoiceDiffusionHead,
+    condition: &Tensor,
+    negative_condition: Option<&Tensor>,
+    plan: &VibeVoiceDiffusionPlan,
+    noise: &Tensor,
+) -> Result<Tensor> {
+    let condition = prediction_head.condition_projection(condition)?;
+    let negative_condition = if plan.cfg_tensor.is_some() {
+        negative_condition
+            .map(|condition| prediction_head.condition_projection(condition))
+            .transpose()?
+    } else {
+        None
+    };
+    let mut speech = noise.clone();
+    let mut solver = DpmSolverState::default();
+    for step in &plan.steps {
+        let model_output = if let (Some(negative), Some(cfg)) =
+            (negative_condition.as_ref(), plan.cfg_tensor.as_ref())
+        {
+            let conditions = Tensor::cat(&[condition.clone(), negative.clone()], 0)?;
+            let latents = Tensor::cat(&[speech.clone(), speech.clone()], 0)?;
+            let timestep = Tensor::cat(
+                &[
+                    step.timestep_embedding.clone(),
+                    step.timestep_embedding.clone(),
+                ],
+                0,
+            )?;
+            let outputs =
+                prediction_head.forward_with_precomputed(&latents, &timestep, &conditions)?;
+            let positive = outputs.narrow(0, 0, 1)?;
+            let negative = outputs.narrow(0, 1, 1)?;
+            negative.broadcast_add(&positive.broadcast_sub(&negative)?.broadcast_mul(cfg)?)?
+        } else {
+            prediction_head.forward_with_precomputed(
+                &speech,
+                &step.timestep_embedding,
+                &condition,
+            )?
+        };
+        speech = plan
+            .scheduler
+            .step(&model_output, &speech, &step.tensors, &mut solver)?;
+    }
+    Ok(speech)
 }
 
 fn vibevoice_diffusion_plan(
@@ -2027,6 +2162,18 @@ fn next_tts_control_token_from_hidden(
     select_next_tts_control_token(&scores)
 }
 
+/// The stop rule shared by the scalar and batched decode steps: after
+/// `frames` committed frames, a predicted `speech_end` or `endoftext` ends the
+/// row once the minimum length is reached; `speech_pad` continues it.
+fn control_token_ends_speech(
+    frames: usize,
+    predicted: u32,
+    specials: &VibeVoiceSpecialTokens,
+) -> bool {
+    frames >= MIN_FRAMES_BEFORE_STOP
+        && (predicted == specials.speech_end || predicted == specials.endoftext)
+}
+
 fn tts_control_tokens(specials: &VibeVoiceSpecialTokens) -> [u32; 3] {
     [specials.speech_pad, specials.speech_end, specials.endoftext]
 }
@@ -2211,136 +2358,146 @@ fn elapsed_ms(started: Instant) -> f32 {
     started.elapsed().as_secs_f32() * 1000.0
 }
 
-fn preprocess_reference_audio(
-    mut samples: Vec<f32>,
+/// Longest voice prompt encoded, in seconds. The reference processor has no
+/// limit, but the preparation stage is priced at a flat 512 MiB, and the
+/// acoustic encoder's first stage holds about 1 KB of F32 activations per
+/// input sample (12 s = 0.3 GB); a longer prompt needs that price raised.
+const MAX_REFERENCE_SECONDS: usize = 12;
+/// A cut is placed at the quietest window of this length ...
+const REFERENCE_CUT_WINDOW_SECONDS: f32 = 0.05;
+/// ... within this much audio before the limit.
+const REFERENCE_CUT_SEARCH_SECONDS: usize = 4;
+
+/// The voice-prompt audio the reference encodes: resampled to the
+/// tokenizer rate with a band-limited resampler (`librosa.load(sr=24000)`),
+/// then the whole sample brought to the target dBFS and scaled down only if
+/// it would clip (`AudioNormalizer`). No DC removal, silence trimming or
+/// energy-window cropping: the reference does none of them. Past
+/// [`MAX_REFERENCE_SECONDS`] the audio is cut at the quietest point of the
+/// last few seconds before the limit, so the cut does not land mid-word.
+fn reference_audio_for_encoder(
+    samples: &[f32],
     sample_rate: u32,
     config: &VibeVoicePreprocessorConfig,
-) -> Vec<f32> {
-    if samples.is_empty() || sample_rate == 0 {
-        return Vec::new();
+) -> Result<Vec<f32>> {
+    if sample_rate == 0 {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_audio sample rate must be positive".into(),
+        ));
     }
-
-    for sample in &mut samples {
-        if !sample.is_finite() {
-            *sample = 0.0;
-        }
+    let finite = samples
+        .iter()
+        .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
+        .collect::<Vec<_>>();
+    let target_rate = config.target_sample_rate();
+    let mut audio = crate::audio::resample_mono_high_quality(&finite, sample_rate, target_rate)?;
+    let limit = target_rate as usize * MAX_REFERENCE_SECONDS;
+    if audio.len() > limit {
+        let end = quietest_cut_before(
+            &audio,
+            limit,
+            target_rate as usize * REFERENCE_CUT_SEARCH_SECONDS,
+            ((target_rate as f32) * REFERENCE_CUT_WINDOW_SECONDS) as usize,
+        );
+        audio.truncate(end);
     }
-
-    let mean = samples.iter().copied().sum::<f32>() / samples.len() as f32;
-    for sample in &mut samples {
-        *sample -= mean;
+    let peak = audio.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+    if audio.is_empty() || peak <= config.eps.max(1e-8) {
+        return Err(Error::InvalidInput(
+            "VibeVoice TTS reference_audio contains no usable speech".to_string(),
+        ));
     }
-
-    let initial_peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
-    if initial_peak <= config.eps.max(1e-8) {
-        return Vec::new();
-    }
-
-    let silence_threshold = (initial_peak * 0.04).max(0.0025);
-    let first_idx = samples.iter().position(|s| s.abs() >= silence_threshold);
-    let last_idx = samples.iter().rposition(|s| s.abs() >= silence_threshold);
-    if let (Some(first), Some(last)) = (first_idx, last_idx) {
-        let margin = ((sample_rate as f32) * 0.12) as usize;
-        let start = first.saturating_sub(margin);
-        let end = (last + margin + 1).min(samples.len());
-        samples = samples[start..end].to_vec();
-    }
-
-    let max_len = sample_rate as usize * 12;
-    if max_len > 0 && samples.len() > max_len {
-        let start = highest_energy_window_start(&samples, max_len);
-        samples = samples[start..start + max_len].to_vec();
-    }
-
     if config.normalize_audio {
-        normalize_reference_loudness(&mut samples, config.target_db_fs, config.eps);
+        normalize_reference_loudness(&mut audio, config.target_db_fs, config.eps);
     }
-
-    samples
+    Ok(audio)
 }
 
+/// The reference `AudioNormalizer`: scale to `target_db_fs` by
+/// `10^(dB/20) / (rms + eps)`, then, if any sample exceeds 1, divide by
+/// `max + eps`.
 fn normalize_reference_loudness(samples: &mut [f32], target_db_fs: f32, eps: f32) {
     if samples.is_empty() {
         return;
     }
     let rms = (samples
         .iter()
-        .map(|&sample| (sample as f64) * (sample as f64))
+        .map(|&sample| f64::from(sample) * f64::from(sample))
         .sum::<f64>()
         / samples.len() as f64)
-        .sqrt() as f32;
-    if rms <= eps.max(1e-8) {
-        return;
-    }
-    let target_rms = 10f32.powf(target_db_fs / 20.0);
-    let gain = target_rms / rms;
+        .sqrt();
+    let gain = 10f64.powf(f64::from(target_db_fs) / 20.0) / (rms + f64::from(eps));
     for sample in samples.iter_mut() {
-        *sample *= gain;
+        *sample = (f64::from(*sample) * gain) as f32;
     }
-
     let peak = samples.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
-    if peak > 0.99 {
-        let limit = 0.99 / peak;
+    if peak > 1.0 {
+        let divisor = peak + eps;
         for sample in samples.iter_mut() {
-            *sample *= limit;
+            *sample /= divisor;
         }
     }
 }
 
-fn highest_energy_window_start(samples: &[f32], window: usize) -> usize {
-    if samples.is_empty() || window == 0 || samples.len() <= window {
-        return 0;
+/// End of the quietest `window`-sample stretch (lowest energy) that ends
+/// within `search` samples before `limit`; `limit` itself when the audio is
+/// not longer than that.
+fn quietest_cut_before(samples: &[f32], limit: usize, search: usize, window: usize) -> usize {
+    let limit = limit.min(samples.len());
+    let window = window.max(1);
+    let first_end = limit.saturating_sub(search).max(window);
+    if first_end >= limit {
+        return limit;
     }
-
-    let mut prefix = Vec::with_capacity(samples.len() + 1);
+    let mut prefix = Vec::with_capacity(limit + 1);
     prefix.push(0.0f64);
-    for &sample in samples {
-        let energy = (sample as f64) * (sample as f64);
-        let next = prefix.last().copied().unwrap_or(0.0) + energy;
+    for &sample in &samples[..limit] {
+        let next = prefix.last().copied().unwrap_or(0.0) + f64::from(sample) * f64::from(sample);
         prefix.push(next);
     }
-
-    let mut best_start = 0usize;
-    let mut best_energy = f64::NEG_INFINITY;
-    for start in 0..=(samples.len() - window) {
-        let energy = prefix[start + window] - prefix[start];
-        if energy > best_energy {
-            best_energy = energy;
-            best_start = start;
-        }
-    }
-    best_start
+    (first_end..=limit)
+        .min_by(|&a, &b| {
+            let energy = |end: usize| prefix[end] - prefix[end - window];
+            energy(a).total_cmp(&energy(b))
+        })
+        .unwrap_or(limit)
 }
 
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if src_rate == 0 || dst_rate == 0 {
-        return Err(Error::InvalidInput(
-            "Sample rates must be positive for VibeVoice TTS resampling".to_string(),
-        ));
-    }
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for idx in 0..out_len {
-        let src_pos = idx as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let right = (left + 1).min(audio.len() - 1);
-        let frac = (src_pos - left as f64) as f32;
-        out.push(audio[left] * (1.0 - frac) + audio[right] * frac);
-    }
-    Ok(out)
+/// The frames of `frame_audio` after `*streamed`, concatenated and read back
+/// once; `*streamed` advances past them.
+fn take_streamed_frame_audio(frame_audio: &[Tensor], streamed: &mut usize) -> Result<Vec<f32>> {
+    let from = (*streamed).min(frame_audio.len());
+    let samples = VibeVoiceAcousticTokenizer::concat_frame_audio(&frame_audio[from..])?;
+    *streamed = frame_audio.len();
+    Ok(samples)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// VVT-10: streaming hands out each committed frame's waveform once, in
+    /// order, so the stream concatenates to the final waveform.
+    #[test]
+    fn streamed_frame_audio_concatenates_to_the_final_waveform() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let device = candle_core::Device::Cpu;
+        let frames = (0..7)
+            .map(|frame| xorshift_tensor(&[1, 1, 3200], 0xF00 + frame, 0.5, &device).unwrap())
+            .collect::<Vec<_>>();
+        let whole = VibeVoiceAcousticTokenizer::concat_frame_audio(&frames).unwrap();
+        let mut streamed_frames = 0;
+        let mut streamed = Vec::new();
+        for committed in [1usize, 1, 4, 4, 7, 7] {
+            let chunk =
+                take_streamed_frame_audio(&frames[..committed], &mut streamed_frames).unwrap();
+            assert_eq!(streamed_frames, committed);
+            streamed.extend(chunk);
+        }
+        assert_eq!(streamed, whole);
+    }
 
     use candle_nn::VarBuilder;
 
@@ -2406,7 +2563,9 @@ mod tests {
 
         assert!(params.auto_frame_budget);
         assert_eq!(params.diffusion_steps, 20);
-        assert_eq!(params.cfg_scale, DEFAULT_CFG_SCALE);
+        // VVT-5: the reference demos' guidance scale.
+        assert_eq!(params.cfg_scale, 1.3);
+        assert_eq!(VIBEVOICE_TTS_DEFAULT_DIFFUSION_STEPS, 10);
     }
 
     #[test]
@@ -2554,6 +2713,35 @@ mod tests {
         );
     }
 
+    /// VVT-6: the scalar and batched steps share one stop rule; a row that
+    /// predicts speech_end or endoftext after the minimum length is finished
+    /// at that frame, so no latent is ever sampled from the end state.
+    #[test]
+    fn control_token_stop_rule_matches_the_reference_loop() {
+        let specials = VibeVoiceSpecialTokens::default();
+        let min = MIN_FRAMES_BEFORE_STOP;
+        assert!(!control_token_ends_speech(
+            min - 1,
+            specials.speech_end,
+            &specials
+        ));
+        assert!(control_token_ends_speech(
+            min,
+            specials.speech_end,
+            &specials
+        ));
+        assert!(control_token_ends_speech(
+            min + 7,
+            specials.endoftext,
+            &specials
+        ));
+        assert!(!control_token_ends_speech(
+            min + 7,
+            specials.speech_pad,
+            &specials
+        ));
+    }
+
     #[test]
     fn latent_scaling_round_trips() {
         let device = candle_core::Device::Cpu;
@@ -2635,33 +2823,97 @@ mod tests {
         assert!(validate_latent_scale_factor("speech_scaling_factor", &negative, 64).is_err());
     }
 
+    /// VVT-13: loudness follows the reference `AudioNormalizer`: RMS to the
+    /// target dBFS over the whole sample, then a divide by `max + eps` only
+    /// if a sample exceeds 1.
     #[test]
-    fn reference_preprocessing_normalizes_to_configured_loudness() {
+    fn reference_preprocessing_matches_the_reference_normalizer() {
         let config = VibeVoicePreprocessorConfig {
             target_db_fs: -20.0,
             ..VibeVoicePreprocessorConfig::default()
         };
-        let processed = preprocess_reference_audio(
-            (0..24_000)
-                .map(|idx| if idx % 2 == 0 { 0.2 } else { -0.2 })
-                .collect(),
-            24_000,
-            &config,
-        );
-        let rms = (processed
-            .iter()
-            .map(|&sample| (sample as f64) * (sample as f64))
-            .sum::<f64>()
-            / processed.len() as f64)
-            .sqrt() as f32;
-
-        assert!((rms - 0.1).abs() < 1e-4);
+        let input = crate::kernels::numeric_check::xorshift_values(24_000, 3, 0.2);
+        let processed = reference_audio_for_encoder(&input, 24_000, &config).unwrap();
+        let rms = |values: &[f32]| {
+            (values.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / values.len() as f64).sqrt()
+        };
+        let gain = 10f64.powf(-1.0) / (rms(&input) + f64::from(config.eps));
+        assert_eq!(processed.len(), input.len());
+        for (actual, source) in processed.iter().zip(&input) {
+            assert!((f64::from(*actual) - f64::from(*source) * gain).abs() < 1e-6);
+        }
+        // A loud target would clip: scaled down by max + eps, not to 0.99.
+        let loud = VibeVoicePreprocessorConfig {
+            target_db_fs: 6.0,
+            ..config
+        };
+        let processed = reference_audio_for_encoder(&input, 24_000, &loud).unwrap();
+        let peak = processed.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak <= 1.0 && peak > 0.999_99, "peak {peak}");
     }
 
+    /// VVT-13: a 48 kHz reference is band-limited before decimation: a
+    /// 15 kHz tone (above the 12 kHz output Nyquist) must not alias to 9 kHz
+    /// next to a 1 kHz tone. Linear interpolation folded it back.
     #[test]
-    fn resample_linear_preserves_identity_rate() {
-        let audio = vec![0.0, 0.5, -0.25];
-        assert_eq!(resample_linear(&audio, 24_000, 24_000).unwrap(), audio);
+    fn reference_resampling_does_not_alias() {
+        let config = VibeVoicePreprocessorConfig {
+            normalize_audio: false,
+            ..VibeVoicePreprocessorConfig::default()
+        };
+        let input = (0..48_000)
+            .map(|n| {
+                let t = n as f32 / 48_000.0;
+                0.3 * (std::f32::consts::TAU * 1_000.0 * t).sin()
+                    + 0.3 * (std::f32::consts::TAU * 15_000.0 * t).sin()
+            })
+            .collect::<Vec<_>>();
+        let output = reference_audio_for_encoder(&input, 48_000, &config).unwrap();
+        let tone = |hz: f64| {
+            let (mut re, mut im) = (0f64, 0f64);
+            for (n, &v) in output.iter().enumerate().skip(2_400).take(19_200) {
+                let phase = std::f64::consts::TAU * hz * n as f64 / 24_000.0;
+                re += f64::from(v) * phase.cos();
+                im += f64::from(v) * phase.sin();
+            }
+            (re * re + im * im).sqrt()
+        };
+        let (wanted, alias) = (tone(1_000.0), tone(9_000.0));
+        assert!(
+            alias < wanted * 1e-2,
+            "9 kHz alias {alias} vs 1 kHz {wanted}"
+        );
+    }
+
+    /// VVT-13: references up to the limit are kept whole (no energy-window
+    /// crop, no silence trim); longer ones are cut at the quietest point
+    /// before the limit, here a silent gap 2 s before it.
+    #[test]
+    fn long_references_are_cut_in_silence_before_the_limit() {
+        let config = VibeVoicePreprocessorConfig {
+            normalize_audio: false,
+            ..VibeVoicePreprocessorConfig::default()
+        };
+        let rate = 24_000usize;
+        let speech =
+            |len: usize, seed: u64| crate::kernels::numeric_check::xorshift_values(len, seed, 0.3);
+        let mut short = vec![0.0f32; rate];
+        short.extend(speech(rate * 9, 5));
+        short.extend(vec![0.0f32; rate]);
+        let kept = reference_audio_for_encoder(&short, 24_000, &config).unwrap();
+        assert_eq!(kept.len(), short.len());
+
+        let gap_end = rate * (MAX_REFERENCE_SECONDS - 2);
+        let mut long = speech(gap_end - rate / 10, 7);
+        long.extend(vec![0.0f32; rate / 10]);
+        long.extend(speech(rate * 10, 9));
+        let cut = reference_audio_for_encoder(&long, 24_000, &config).unwrap();
+        assert!(cut.len() <= rate * MAX_REFERENCE_SECONDS);
+        assert!(
+            cut.len() > gap_end - rate / 10 && cut.len() <= gap_end,
+            "cut at {} outside the silent gap ending at {gap_end}",
+            cut.len()
+        );
     }
 
     #[test]
@@ -2791,5 +3043,61 @@ mod tests {
             name.to_string(),
             Tensor::from_vec(values, (rows, cols), device).unwrap(),
         );
+    }
+
+    /// Speech latents on Metal, where the TTS runs in F16, match an F32 CPU
+    /// reference on the checkpoint: one 10-step CFG 1.3 DPM-Solver++
+    /// trajectory from the same noise and conditions. The final layer's F16
+    /// norm overflowed (its input reaches about 480), which left every Metal
+    /// latent about 95% off (relative L2) and the speech unrelated to the
+    /// text.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires VibeVoice-1.5B weights (IZWI_VIBEVOICE_MODEL_DIR) and Metal"]
+    fn metal_f16_latent_sampling_matches_f32_on_the_checkpoint() {
+        use crate::kernels::numeric_check::{host_f32, relative_l2, xorshift_tensor};
+
+        let dir = PathBuf::from(std::env::var("IZWI_VIBEVOICE_MODEL_DIR").unwrap());
+        let config = VibeVoiceConfig::load(&dir).unwrap();
+        let head_config = config.diffusion_head_config.clone().unwrap();
+        let files = safetensors_weight_files(&dir).unwrap();
+        let sample = |device: &Device, kind: DeviceKind, dtype: DType| {
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device) }.unwrap();
+            let head =
+                VibeVoiceDiffusionHead::load(head_config.clone(), vb.pp("model.prediction_head"))
+                    .unwrap();
+            let plan = vibevoice_diffusion_plan(
+                &head,
+                VibeVoiceDiffusionScheduler::new(head_config.ddpm_num_steps, 10),
+                device,
+                dtype,
+                VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
+                kind,
+            )
+            .unwrap();
+            let input = |seed, width, scale| {
+                xorshift_tensor(&[1, width], seed, scale, &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap()
+                    .to_device(device)
+                    .unwrap()
+            };
+            let condition = input(7, head_config.hidden_size, 3.0);
+            let negative = input(9, head_config.hidden_size, 3.0);
+            let noise = input(8, head_config.latent_size, 1.7);
+            let latent =
+                sample_latent_from_noise(&head, &condition, Some(&negative), &plan, &noise)
+                    .unwrap();
+            host_f32(&latent).unwrap()
+        };
+        let Some(metal_device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; VibeVoice F16 latent leg not run");
+            return;
+        };
+        let reference = sample(&Device::Cpu, DeviceKind::Cpu, DType::F32);
+        let metal = sample(&metal_device, DeviceKind::Metal, DType::F16);
+        let relative = relative_l2(&metal, &reference);
+        assert!(relative < 1e-2, "Metal F16 latent relative L2 {relative}");
     }
 }

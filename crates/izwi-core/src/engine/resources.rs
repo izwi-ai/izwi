@@ -976,9 +976,14 @@ impl ResourceAuthority {
                 let existing_pending = state.pending_resources()?;
                 let live_claim = existing_pending.checked_add(pending)?;
                 if !live_claim.fits_within(physical.available) {
-                    return Err(Error::Overloaded(format!(
+                    tracing::warn!(
                         "insufficient live physical capacity for {:?}: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, live_by_class={:?}",
                         owner.class, physical.available, physical.capacity, state.pending_by_class(None)?
+                    );
+                    return Err(Error::Overloaded(live_capacity_reason(
+                        pending,
+                        existing_pending,
+                        physical.available,
                     )));
                 }
                 state.ledger.reserve(resources)?
@@ -1014,9 +1019,14 @@ impl ResourceAuthority {
                         if exceeds(live_claim.host_bytes, live.host_bytes)
                             || exceeds(live_claim.unified_bytes, live.unified_bytes)
                         {
-                            return Err(Error::Overloaded(format!(
+                            tracing::warn!(
                                 "insufficient live memory for a request: new_pending={pending:?}, existing_pending={existing_pending:?}, live_claim={live_claim:?}, physical_available={live:?}, live_by_class={:?}",
                                 state.pending_by_class(None)?
+                            );
+                            return Err(Error::Overloaded(live_capacity_reason(
+                                pending,
+                                existing_pending,
+                                live,
                             )));
                         }
                     }
@@ -1078,9 +1088,14 @@ impl ResourceAuthority {
             let physical = self.normalized_physical_snapshot();
             state.ledger.update_capacity(physical.capacity);
             if !live_claim.fits_within(physical.available) {
-                return Err(Error::Overloaded(format!(
+                tracing::warn!(
                     "insufficient live physical capacity for resource lease growth: next_pending={next_pending:?}, other_pending={other_pending:?}, live_claim={live_claim:?}, physical_available={:?}, physical_capacity={:?}, other_live_by_class={:?}",
                     physical.available, physical.capacity, state.pending_by_class(Some(id))?
+                );
+                return Err(Error::Overloaded(live_capacity_reason(
+                    next_pending,
+                    other_pending,
+                    physical.available,
                 )));
             }
             state.ledger.resize(id, resources)?
@@ -1131,7 +1146,8 @@ impl ResourceAuthority {
             ));
         }
         if !current.fits_within(resources) {
-            return Err(Error::InvalidInput(
+            // An owner's accounting bug, never the client's input.
+            return Err(Error::InferenceError(
                 "materialized resource usage cannot decrease through post-allocation observation; the owning runtime must restore its pending claim before freeing physical memory"
                     .to_string(),
             ));
@@ -1206,6 +1222,65 @@ fn known_bytes(amount: ResourceAmount) -> u64 {
         ResourceAmount::Known(bytes) => bytes,
         ResourceAmount::Unknown => 0,
     }
+}
+
+/// The short reason a client sees when `subject` needs more memory than is
+/// available: "{subject}: needs X GB, Y GB available". Callers log the
+/// detail (headroom, reserve, geometry) beside it.
+pub(crate) fn capacity_shortfall_reason(
+    subject: impl std::fmt::Display,
+    need_bytes: u64,
+    available_bytes: u64,
+) -> String {
+    format!(
+        "{subject}: needs {:.2} GB, {:.2} GB available",
+        need_bytes as f64 / 1e9,
+        available_bytes as f64 / 1e9
+    )
+}
+
+/// The short reason a client sees when live memory refuses a claim: the
+/// first domain where `need` plus what is already held for admitted work
+/// exceeds `available`, in GB. The full vectors are logged by the caller.
+fn live_capacity_reason(
+    need: ResourceVector,
+    held: ResourceVector,
+    available: ResourceVector,
+) -> String {
+    let domains: [(&str, fn(ResourceVector) -> ResourceAmount); 6] = [
+        ("memory", |vector| vector.host_bytes),
+        ("memory", |vector| vector.unified_bytes),
+        ("GPU memory", |vector| vector.device_bytes),
+        ("KV memory", |vector| vector.kv_bytes),
+        ("workspace memory", |vector| vector.temporary_bytes),
+        ("compute slots", |vector| vector.compute_slots),
+    ];
+    for (label, amount) in domains {
+        let (ResourceAmount::Known(need), ResourceAmount::Known(held)) =
+            (amount(need), amount(held))
+        else {
+            continue;
+        };
+        let claim = need.saturating_add(held);
+        if ResourceAmount::Known(claim).fits(amount(available)) {
+            continue;
+        }
+        let ResourceAmount::Known(available) = amount(available) else {
+            return format!("insufficient live {label}: its capacity is unknown");
+        };
+        let free = available.saturating_sub(held);
+        if label == "compute slots" {
+            return format!("insufficient {label}: needs {need}, {free} available");
+        }
+        let gb = |bytes: u64| bytes as f64 / 1e9;
+        return format!(
+            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB held for admitted work)",
+            gb(need),
+            gb(free),
+            gb(held)
+        );
+    }
+    "insufficient live memory".to_string()
 }
 
 fn advisory_ledger_capacity(
@@ -1640,6 +1715,24 @@ mod tests {
         assert_eq!(authority.snapshot().reservations, 0);
     }
 
+    /// The live Kokoro refusal sent the client every resource vector and the
+    /// per-class pending table; it now reads like this.
+    #[test]
+    fn live_capacity_reason_is_short_and_in_gb() {
+        let unified = |bytes| ResourceVector {
+            unified_bytes: ResourceAmount::Known(bytes),
+            ..ResourceVector::zero()
+        };
+        assert_eq!(
+            live_capacity_reason(
+                unified(3_337_390_021),
+                unified(104_000_000),
+                unified(2_304_168_748)
+            ),
+            "insufficient live memory: needs 3.34 GB, 2.20 GB available (0.10 GB held for admitted work)"
+        );
+    }
+
     #[test]
     fn live_capacity_failure_is_transactional() {
         let provider = Arc::new(TestProvider {
@@ -1656,11 +1749,11 @@ mod tests {
                 slots(1),
             )
             .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("new_pending="));
-        assert!(message.contains("existing_pending="));
-        assert!(message.contains("physical_available="));
-        assert!(message.contains("physical_capacity="));
+        // The client gets a short reason; the vectors go to the log.
+        assert_eq!(
+            error.to_string(),
+            "Inference capacity unavailable: insufficient compute slots: needs 1, 0 available"
+        );
         assert_eq!(authority.snapshot().reserved, slots(0));
     }
 
@@ -1723,17 +1816,18 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(message.contains("live_by_class="));
-        assert!(message.contains("BatchWorkspace"));
+        // The per-class table is logged; the client gets one short line.
+        assert!(!message.contains("live_by_class="));
         assert!(!message.contains("private-"));
-        assert!(message.len() < 4500);
+        assert!(message.len() < 160);
         assert_eq!(authority.snapshot(), before);
         let growth_message = authority
             .resize(cache.id.unwrap(), slots(600))
             .unwrap_err()
             .to_string();
-        assert!(growth_message.contains("other_live_by_class="));
+        assert!(!growth_message.contains("other_live_by_class="));
         assert!(!growth_message.contains("private-"));
+        assert!(growth_message.len() < 160);
         assert_eq!(authority.snapshot(), before);
         drop((cache, requests));
     }
@@ -2560,9 +2654,10 @@ mod tests {
         lease.record_materialized_usage(slots(100)).unwrap();
         provider.set_available(50);
 
+        // The owner's accounting bug, not the client's input.
         assert!(matches!(
             lease.record_materialized_usage(slots(50)),
-            Err(Error::InvalidInput(_))
+            Err(Error::InferenceError(_))
         ));
         assert_eq!(authority.snapshot().reserved, slots(100));
     }

@@ -22,11 +22,11 @@ use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::{
     parse_tts_model_variant, AudioChunk, GenerationConfig, GenerationRequest, ModelVariant,
-    WorkloadClass,
+    TtsStopReason, WorkloadClass,
 };
 
 const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
-const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
+const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-RTF-Basis, X-Wall-Time-Ms, X-Wall-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
 
 /// OpenAI-compatible speech synthesis request.
 #[derive(Debug, Deserialize)]
@@ -81,6 +81,10 @@ pub struct SpeechRequest {
     /// Optional saved voice identifier resolved server-side.
     #[serde(default)]
     pub saved_voice_id: Option<String>,
+    /// izwi extensions: speech sampling (`top_p`, `seed`, `subtalker_*`,
+    /// `cfg_scale`, `diffusion_steps`, `repetition_penalty`).
+    #[serde(flatten)]
+    pub sampling: crate::api::tts_policy::SpeechSamplingRequest,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +116,37 @@ struct SpeechStreamEvent {
     rtf: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// On `audio.done`: `stop` when the model ended speech, `length` when
+    /// the output budget cut it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<&'static str>,
+}
+
+/// One SSE event as JSON, carrying OpenAI's speech-stream shape beside
+/// izwi's (TPIPE-11): an `audio.chunk` is also a `speech.audio.delta` with
+/// the base64 PCM in `audio`, and `audio.done` is also a `speech.audio.done`
+/// with `usage`. Existing clients keep reading `event` and `audio_base64`.
+fn openai_stream_payload(event: &SpeechStreamEvent) -> String {
+    let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        match event.event {
+            "audio.chunk" => {
+                object.insert("type".into(), "speech.audio.delta".into());
+                if let Some(audio) = &event.audio_base64 {
+                    object.insert("audio".into(), audio.clone().into());
+                }
+            }
+            "audio.done" => {
+                object.insert("type".into(), "speech.audio.done".into());
+                object.insert(
+                    "usage".into(),
+                    serde_json::json!({ "output_tokens": event.tokens_generated }),
+                );
+            }
+            _ => {}
+        }
+    }
+    value.to_string()
 }
 
 fn stream_event_queue_capacity() -> usize {
@@ -122,12 +157,24 @@ fn stream_event_queue_capacity() -> usize {
         .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
 }
 
+/// Send one SSE event, failing a reader that has stalled past the stall
+/// deadline (`IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS`, 30 s) as the
+/// first-party stream does, so a connected but stuck client cannot pin the
+/// generation and its permit forever (TPIPE-13).
 async fn send_stream_event(
     event_tx: &mpsc::Sender<String>,
     event: SpeechStreamEvent,
 ) -> Result<(), ()> {
-    let payload = serde_json::to_string(&event).unwrap_or_default();
-    event_tx.send(payload).await.map_err(|_| ())
+    let payload = openai_stream_payload(&event);
+    let stall_secs = std::env::var("IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30);
+    tokio::time::timeout(Duration::from_secs(stall_secs), event_tx.send(payload))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
 }
 
 pub async fn speech(
@@ -135,12 +182,14 @@ pub async fn speech(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
+    crate::api::tts_policy::check_tts_input_length(&req.input)?;
     let req = resolve_saved_voice_request(&state, normalize_speech_request(req)).await?;
-    info!("OpenAI speech request: {} chars", req.input.len());
+    info!("OpenAI speech request: {} bytes", req.input.len());
 
     let variant = parse_tts_model_variant(&req.model)
         .map_err(|err| ApiError::bad_request(format!("Unsupported TTS model: {}", err)))?;
     validate_speech_voice_contract(&req, variant)?;
+    crate::api::tts_policy::validate_speech_speed(variant, req.speed)?;
     let streaming = resolve_streaming_mode(&req)?;
     let resolved_format = parse_response_format(
         req.response_format.as_deref().unwrap_or("wav"),
@@ -167,26 +216,31 @@ pub async fn speech(
     let permit = state
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
+    let request_started = std::time::Instant::now();
     state.runtime.load_model(variant).await?;
 
-    let timeout = Duration::from_secs(resolve_speech_timeout_secs(
-        state.request_timeout_secs,
-        variant,
-        &req,
-    ));
     let format = resolved_format.format;
     let actual_format = resolved_format.label;
     let format_fallback = resolved_format.fallback;
 
-    let result = tokio::time::timeout(timeout, async {
+    // No wall clock wraps active generation (TPIPE-6): it ends on its own,
+    // on an error, or when the client disconnects and drops this future,
+    // which cancels the engine work.
+    let result = {
         let mut runtime_context = permit.runtime_context();
         runtime_context.tenant_key = tenant_key;
-        let gen_request = build_generation_request(&req, ctx.correlation_id, false, variant)
+        let mut gen_request = build_generation_request(&req, ctx.correlation_id, false, variant)
             .with_runtime_context(runtime_context);
-        state.runtime.generate(gen_request).await
-    })
-    .await
-    .map_err(|_| ApiError::internal("Request timeout"))??;
+        // Text one automatic request cannot finish is split by long form,
+        // as on the first-party route, instead of being cut at the cap.
+        crate::api::tts_long_form::defer_automatic_budget_to_long_form(
+            &mut gen_request,
+            variant,
+            req.max_output_tokens.or(req.max_tokens),
+        );
+        crate::api::tts_long_form::generate_long_form_tts(&state.runtime, variant, gen_request)
+            .await?
+    };
 
     let sample_rate = result.sample_rate;
     let samples = result.samples.clone();
@@ -200,12 +254,24 @@ pub async fn speech(
     let generation_time_ms = result.total_time_ms;
     let rtf = result.rtf();
     let tokens_generated = result.total_tokens;
+    // Two RTF bases, both reported (TPIPE-9): X-RTF over engine execution
+    // (summed across long-form segments) and X-Wall-RTF over the request's
+    // wall time from admission, as the streams report it.
+    let wall_ms = request_started.elapsed().as_secs_f64() * 1000.0;
+    let wall_rtf = if duration_secs > 0.0 {
+        wall_ms / 1000.0 / f64::from(duration_secs)
+    } else {
+        0.0
+    };
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header("X-Generation-Time-Ms", format!("{:.1}", generation_time_ms))
         .header("X-Audio-Duration-Secs", format!("{:.2}", duration_secs))
         .header("X-RTF", format!("{:.3}", rtf))
+        .header("X-RTF-Basis", "engine_execution")
+        .header("X-Wall-Time-Ms", format!("{wall_ms:.1}"))
+        .header("X-Wall-RTF", format!("{wall_rtf:.3}"))
         .header("X-Tokens-Generated", tokens_generated.to_string())
         .header("X-Audio-Sample-Rate", sample_rate.to_string())
         .header(
@@ -229,6 +295,11 @@ pub async fn speech(
                     "299 Izwi \"Requested response_format returned {actual_format}; fallback was explicitly enabled\""
                 ),
             );
+    }
+    if let Some(stop_reason) = result.stop_reason {
+        builder = builder
+            .header("X-Stop-Reason", stop_reason.as_str())
+            .header("X-Output-Truncated", stop_reason.truncated().to_string());
     }
     if let Some(diagnostics) = result.diagnostics.as_ref() {
         builder = builder.header("X-Izwi-Tts-Diagnostics", diagnostics.to_string());
@@ -367,15 +438,10 @@ async fn fish_file_speech(
         .await
         .map_err(ApiError::from)
     };
-    let timeout = Duration::from_secs(state.request_timeout_secs.max(1));
-    let (_, (body, length, rate, samples, statistics)) =
-        tokio::time::timeout(timeout, async { tokio::try_join!(generation, collect) })
-            .await
-            .map_err(|_| {
-                ApiError::internal(
-            "Synchronous speech deadline exceeded; use durable speech history for long jobs",
-        )
-            })??;
+    // The plan runs until it completes, fails, stalls (per-segment progress
+    // deadline) or the client disconnects; a fixed wall clock failed long
+    // narrations with a 500 after minutes of work (TPIPE-6).
+    let (_, (body, length, rate, samples, statistics)) = tokio::try_join!(generation, collect)?;
     let duration = samples as f64 / f64::from(rate);
     let elapsed = started.elapsed().as_secs_f64();
     let mut builder = Response::builder()
@@ -396,6 +462,11 @@ async fn fish_file_speech(
         .header("X-Actual-Response-Format", resolved_format.label);
     if let Some(stats) = statistics {
         builder = builder.header("X-Tokens-Generated", stats.tokens_generated);
+        if let Some(stop_reason) = stats.stop_reason {
+            builder = builder
+                .header("X-Stop-Reason", stop_reason.as_str())
+                .header("X-Output-Truncated", stop_reason.truncated().to_string());
+        }
     }
     if let Some(fallback) = resolved_format.fallback {
         builder = builder.header("X-Response-Format-Fallback", fallback);
@@ -403,58 +474,6 @@ async fn fish_file_speech(
     builder
         .body(body)
         .map_err(|e| ApiError::internal(e.to_string()))
-}
-
-fn resolve_speech_timeout_secs(
-    default_timeout_secs: u64,
-    variant: ModelVariant,
-    req: &SpeechRequest,
-) -> u64 {
-    // Keep global timeout behavior for non-Qwen TTS families.
-    let Some(model_max_frames) = variant.tts_max_output_frames_hint() else {
-        return default_timeout_secs.max(1);
-    };
-    let Some(frame_rate_hz) = variant.tts_output_frame_rate_hz_hint() else {
-        return default_timeout_secs.max(1);
-    };
-
-    // `0`/omitted means the same model-aware automatic frame budget used by
-    // the first-party product route.
-    let requested_frames = req.max_output_tokens.or(req.max_tokens);
-    let effective_frames = resolve_tts_output_frames(variant, &req.input, requested_frames)
-        .unwrap_or(model_max_frames);
-
-    // Estimate output duration from codec frame budget and requested speed.
-    let speed = req.speed.unwrap_or(1.0).clamp(0.25, 4.0) as f64;
-    let estimated_audio_secs = ((effective_frames as f64) / (frame_rate_hz as f64)) / speed;
-
-    // Conservative real-time-factor multiplier for non-stream long-form synthesis.
-    let timeout_rtf = std::env::var("IZWI_TTS_TIMEOUT_RTF")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .unwrap_or_else(|| {
-            if variant == ModelVariant::VibeVoice15BTts {
-                izwi_core::runtime_models::architectures::vibevoice::tts::VIBEVOICE_TTS_DEFAULT_TIMEOUT_RTF
-            } else {
-                8.0
-            }
-        });
-    let timeout_padding_secs = std::env::var("IZWI_TTS_TIMEOUT_PADDING_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(30);
-    let timeout_max_secs = std::env::var("IZWI_TTS_TIMEOUT_MAX_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60);
-
-    let adaptive_secs = (estimated_audio_secs * timeout_rtf).ceil() as u64;
-    let suggested_secs = adaptive_secs
-        .saturating_add(timeout_padding_secs)
-        .min(timeout_max_secs.max(1));
-
-    default_timeout_secs.max(suggested_secs).max(1)
 }
 
 fn normalize_speech_request(mut req: SpeechRequest) -> SpeechRequest {
@@ -504,66 +523,22 @@ fn validate_speech_voice_contract(
     req: &SpeechRequest,
     variant: ModelVariant,
 ) -> Result<(), ApiError> {
-    let has_direct_reference_audio = req
-        .reference_audio
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    let has_direct_reference_text = req
-        .reference_text
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    if has_direct_reference_audio != has_direct_reference_text {
-        return Err(ApiError::bad_request(
-            "Provide both `reference_audio` and `reference_text` together.",
-        ));
-    }
-
-    if has_direct_reference_audio {
-        let supports_reference_voice = variant
+    let present = |value: Option<&str>| value.map(has_non_empty_text).unwrap_or(false);
+    // OpenAI requires `voice`, so a client sends one even to a model that
+    // speaks only with a reference; it is ignored there, not refused.
+    let speaker = present(req.voice.as_deref())
+        && variant
             .speech_capabilities()
-            .map(|capabilities| capabilities.supports_reference_voice)
-            .unwrap_or(false);
-        if !supports_reference_voice {
-            return Err(ApiError::bad_request(format!(
-                "{variant} does not support reference or saved voices.",
-            )));
-        }
-    }
-
-    let has_voice_description = req
-        .instructions
-        .as_deref()
-        .map(has_non_empty_text)
-        .unwrap_or(false);
-    if has_voice_description {
-        let supports_voice_description = variant
-            .speech_capabilities()
-            .map(|capabilities| capabilities.supports_voice_description)
-            .unwrap_or(false);
-        if !supports_voice_description {
-            return Err(ApiError::bad_request(format!(
-                "{variant} does not support voice direction prompts.",
-            )));
-        }
-    }
-
-    match variant {
-        ModelVariant::VibeVoice15BTts if !has_direct_reference_audio => {
-            return Err(ApiError::bad_request(
-                "VibeVoice-1.5B requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-            ));
-        }
-        ModelVariant::FishAudioS2Pro if !has_direct_reference_audio => {
-            return Err(ApiError::bad_request(
-                "FishAudio-S2-Pro requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
-            ));
-        }
-        _ => {}
-    }
-
-    Ok(())
+            .is_some_and(|capabilities| capabilities.supports_builtin_voices);
+    crate::api::tts_policy::validate_speech_voice(
+        variant,
+        crate::api::tts_policy::SpeechVoiceRequest {
+            speaker,
+            reference_audio: present(req.reference_audio.as_deref()),
+            reference_text: present(req.reference_text.as_deref()),
+            voice_description: present(req.instructions.as_deref()),
+        },
+    )
 }
 
 async fn stream_speech(
@@ -575,6 +550,7 @@ async fn stream_speech(
     resolved_format: ResolvedSpeechFormat,
 ) -> Result<Response<Body>, ApiError> {
     let stream_entry_started = Instant::now();
+    let streaming_mode = state.runtime.tts_streaming_mode(variant);
     let format = resolved_format.format;
     let format_fallback = resolved_format.fallback;
     let mut gen_request = build_generation_request(&req, correlation_id, true, variant);
@@ -616,6 +592,7 @@ async fn stream_speech(
                     audio_duration_secs: None,
                     rtf: None,
                     error: Some("Server is shutting down".to_string()),
+                    stop_reason: None,
                 };
                 let _ = send_stream_event(&event_tx, error_event).await;
                 return;
@@ -646,6 +623,7 @@ async fn stream_speech(
                     audio_duration_secs: None,
                     rtf: None,
                     error: Some(err.to_string()),
+                    stop_reason: None,
                 },
             )
             .await;
@@ -736,6 +714,7 @@ async fn stream_speech(
                         audio_duration_secs: None,
                         rtf: None,
                         error: Some(format!("Failed to encode audio chunk: {}", err)),
+                        stop_reason: None,
                     };
                     let _ = send_stream_event(&event_tx, error_event).await;
                     stream_failed = true;
@@ -758,6 +737,7 @@ async fn stream_speech(
                 audio_duration_secs: None,
                 rtf: None,
                 error: None,
+                stop_reason: None,
             };
             if send_stream_event(&event_tx, chunk_event).await.is_err() {
                 client_closed = true;
@@ -790,6 +770,7 @@ async fn stream_speech(
                 audio_duration_secs: None,
                 rtf: None,
                 error: None,
+                stop_reason: None,
             };
             let _ = send_stream_event(&event_tx, done_event).await;
             return;
@@ -839,6 +820,10 @@ async fn stream_speech(
                     audio_duration_secs: Some(audio_duration_secs),
                     rtf: Some(rtf),
                     error: None,
+                    stop_reason: terminal_statistics
+                        .as_ref()
+                        .and_then(|stats| stats.stop_reason)
+                        .map(TtsStopReason::as_str),
                 };
                 let _ = send_stream_event(&event_tx, final_event).await;
             }
@@ -858,6 +843,7 @@ async fn stream_speech(
                     audio_duration_secs: None,
                     rtf: None,
                     error: Some(err.to_string()),
+                    stop_reason: None,
                 };
                 let _ = send_stream_event(&event_tx, error_event).await;
             }
@@ -877,6 +863,7 @@ async fn stream_speech(
                     audio_duration_secs: None,
                     rtf: None,
                     error: Some(format!("Streaming task failed: {}", err)),
+                    stop_reason: None,
                 };
                 let _ = send_stream_event(&event_tx, error_event).await;
             }
@@ -900,6 +887,9 @@ async fn stream_speech(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache, no-transform")
         .header("X-Accel-Buffering", "no")
+        // Whether this stream is progressive or one final chunk (TPIPE-3).
+        .header("X-Izwi-Streaming-Mode", streaming_mode.as_str())
+        .header("Access-Control-Expose-Headers", "X-Izwi-Streaming-Mode")
         .body(Body::from_stream(stream))
         .unwrap())
 }
@@ -947,6 +937,7 @@ fn build_generation_request(
     if let Some(top_k) = req.top_k {
         gen_config.options.top_k = top_k;
     }
+    gen_config.options.speech = req.sampling.options(req.temperature, req.top_k);
     gen_config.options.speaker = req.voice.clone();
 
     GenerationRequest {
@@ -1063,6 +1054,7 @@ fn speech_started_event(
         audio_duration_secs: None,
         rtf: None,
         error: format_fallback.map(|fallback| format!("Requested format fallback: {fallback}")),
+        stop_reason: None,
     })
 }
 
@@ -1118,84 +1110,58 @@ mod tests {
         .is_none());
     }
 
+    /// TPIPE-24: unset sampling stays unset for the engine (so family
+    /// defaults apply), and the izwi extension fields reach it.
     #[test]
-    fn qwen_auto_timeout_expands_for_long_form() {
-        let req = SpeechRequest {
-            model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
-            input: "hello ".repeat(100),
-            voice: Some("Aiden".to_string()),
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: None,
-            language: None,
-            temperature: None,
-            max_tokens: Some(0),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
+    fn speech_sampling_fields_reach_the_engine_and_unset_stays_unset() {
+        let unset: SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "Qwen3-TTS-12Hz-0.6B-CustomVoice", "input": "hello", "voice": "ryan"
+        }))
+        .unwrap();
+        let generation = build_generation_request(
+            &unset,
+            "c".into(),
+            false,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        );
+        assert_eq!(
+            generation.config.options.speech,
+            izwi_core::SpeechSamplingOptions::default()
+        );
 
-        let timeout =
-            resolve_speech_timeout_secs(300, ModelVariant::Qwen3Tts12Hz06BCustomVoice, &req);
-        assert!(timeout > 300, "expected adaptive timeout > default");
-    }
-
-    #[test]
-    fn explicit_small_frame_budget_keeps_timeout_near_default() {
-        let req = SpeechRequest {
-            model: "Qwen3-TTS-12Hz-0.6B-CustomVoice".to_string(),
-            input: "hello".to_string(),
-            voice: Some("Aiden".to_string()),
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: Some(1.0),
-            language: None,
-            temperature: None,
-            max_tokens: Some(256),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
-
-        let timeout =
-            resolve_speech_timeout_secs(300, ModelVariant::Qwen3Tts12Hz06BCustomVoice, &req);
-        assert_eq!(timeout, 300);
-    }
-
-    #[test]
-    fn non_qwen_tts_uses_default_timeout() {
-        let req = SpeechRequest {
-            model: "Kokoro-82M".to_string(),
-            input: "hello".to_string(),
-            voice: None,
-            response_format: Some("wav".to_string()),
-            allow_format_fallback: None,
-            speed: None,
-            language: None,
-            temperature: None,
-            max_tokens: Some(0),
-            max_output_tokens: None,
-            top_k: None,
-            stream: Some(false),
-            stream_format: None,
-            instructions: None,
-            reference_audio: None,
-            reference_text: None,
-            saved_voice_id: None,
-        };
-
-        let timeout = resolve_speech_timeout_secs(300, ModelVariant::Kokoro82M, &req);
-        assert_eq!(timeout, 300);
+        let set: SpeechRequest = serde_json::from_value(serde_json::json!({
+            "model": "VibeVoice-1.5B", "input": "hello", "temperature": 0.5, "top_k": 12,
+            "top_p": 0.9, "seed": 7, "subtalker_temperature": 0.6, "subtalker_top_k": 20,
+            "subtalker_top_p": 0.95, "subtalker_do_sample": false, "cfg_scale": 1.5,
+            "diffusion_steps": 20, "repetition_penalty": 1.2
+        }))
+        .unwrap();
+        let speech =
+            build_generation_request(&set, "c".into(), false, ModelVariant::VibeVoice15BTts)
+                .config
+                .options
+                .speech;
+        assert_eq!(
+            (speech.temperature, speech.top_k, speech.top_p, speech.seed),
+            (Some(0.5), Some(12), Some(0.9), Some(7))
+        );
+        assert_eq!(
+            (
+                speech.subtalker_temperature,
+                speech.subtalker_top_k,
+                speech.subtalker_top_p,
+                speech.subtalker_do_sample
+            ),
+            (Some(0.6), Some(20), Some(0.95), Some(false))
+        );
+        assert_eq!(
+            (
+                speech.cfg_scale,
+                speech.diffusion_steps,
+                speech.repetition_penalty
+            ),
+            (Some(1.5), Some(20), Some(1.2))
+        );
     }
 
     #[test]
@@ -1218,10 +1184,8 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
-
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::Voxtral4BTts2603, &req);
-        assert_eq!(timeout, 72);
 
         let generation = build_generation_request(
             &req,
@@ -1256,10 +1220,8 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
-
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::VibeVoice15BTts, &req);
-        assert_eq!(timeout, 1_110);
 
         let generation = build_generation_request(
             &req,
@@ -1294,11 +1256,8 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("hello".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
-
-        let timeout = resolve_speech_timeout_secs(1, ModelVariant::FishAudioS2Pro, &req);
-        // The conservative Fish segment estimate includes room for pauses and EOS.
-        assert_eq!(timeout, 98);
 
         let generation = build_generation_request(
             &req,
@@ -1332,6 +1291,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let generation = build_generation_request(
@@ -1367,6 +1327,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1394,11 +1355,97 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::FishAudioS2Pro)
             .expect_err("missing reference should fail");
-        assert!(err.message.contains("FishAudio-S2-Pro requires"));
+        assert!(err.message.contains("requires `saved_voice_id`"));
+    }
+
+    /// TPIPE-12: the OpenAI route applies the same capability-driven voice
+    /// contract as the first-party routes: a Qwen Base model needs a
+    /// reference and a VoiceDesign model needs `instructions`, while the
+    /// required OpenAI `voice` is ignored by a reference-only model.
+    #[test]
+    fn openai_speech_applies_the_shared_voice_contract() {
+        let request = |voice: Option<&str>, instructions: Option<&str>| SpeechRequest {
+            model: "m".to_string(),
+            input: "hello".to_string(),
+            voice: voice.map(str::to_string),
+            response_format: None,
+            allow_format_fallback: None,
+            speed: None,
+            language: None,
+            temperature: None,
+            max_tokens: None,
+            max_output_tokens: None,
+            top_k: None,
+            stream: None,
+            stream_format: None,
+            instructions: instructions.map(str::to_string),
+            reference_audio: None,
+            reference_text: None,
+            saved_voice_id: None,
+            sampling: Default::default(),
+        };
+        assert!(validate_speech_voice_contract(
+            &request(Some("alloy"), None),
+            ModelVariant::Qwen3Tts12Hz06BBase
+        )
+        .unwrap_err()
+        .message
+        .contains("requires `saved_voice_id`"));
+        assert!(validate_speech_voice_contract(
+            &request(None, None),
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign
+        )
+        .unwrap_err()
+        .message
+        .contains("requires a voice description"));
+        assert!(validate_speech_voice_contract(
+            &request(None, Some("A calm narrator")),
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign
+        )
+        .is_ok());
+        assert!(validate_speech_voice_contract(
+            &request(Some("af_heart"), None),
+            ModelVariant::Kokoro82M
+        )
+        .is_ok());
+    }
+
+    /// TPIPE-11: the SSE events also carry OpenAI's `speech.audio.delta` and
+    /// `speech.audio.done` shape.
+    #[test]
+    fn sse_events_carry_the_openai_speech_stream_shape() {
+        let event = |name: &'static str| SpeechStreamEvent {
+            event: name,
+            timing: None,
+            request_id: None,
+            sequence: Some(0),
+            audio_base64: Some("AAEC".into()),
+            sample_count: None,
+            is_final: None,
+            sample_rate: None,
+            audio_format: None,
+            tokens_generated: Some(12),
+            generation_time_ms: None,
+            audio_duration_secs: None,
+            rtf: None,
+            error: None,
+            stop_reason: None,
+        };
+        let delta: serde_json::Value =
+            serde_json::from_str(&openai_stream_payload(&event("audio.chunk"))).unwrap();
+        assert_eq!(delta["type"], "speech.audio.delta");
+        assert_eq!(delta["audio"], "AAEC");
+        assert_eq!(delta["event"], "audio.chunk");
+        assert_eq!(delta["audio_base64"], "AAEC");
+        let done: serde_json::Value =
+            serde_json::from_str(&openai_stream_payload(&event("audio.done"))).unwrap();
+        assert_eq!(done["type"], "speech.audio.done");
+        assert_eq!(done["usage"]["output_tokens"], 12);
     }
 
     #[test]
@@ -1421,6 +1468,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         let err = validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1448,6 +1496,7 @@ mod tests {
             reference_audio: Some("UklGRg==".to_string()),
             reference_text: Some("reference words".to_string()),
             saved_voice_id: None,
+            sampling: Default::default(),
         };
 
         validate_speech_voice_contract(&req, ModelVariant::VibeVoice15BTts)
@@ -1508,6 +1557,7 @@ mod tests {
             reference_audio: None,
             reference_text: None,
             saved_voice_id: None,
+            sampling: Default::default(),
         };
         assert!(resolve_streaming_mode(&req).expect("streaming mode"));
     }
@@ -1546,6 +1596,7 @@ mod tests {
             generation_time_ms: 10.0,
             tokens_generated: 1,
             rtf: 0.2,
+            stop_reason: None,
         });
         accumulate_stream_statistics(&mut statistics, &first);
         let mut terminal = AudioChunk::final_chunk("fish".into(), 1, Vec::new());
@@ -1553,6 +1604,7 @@ mod tests {
             generation_time_ms: 25.0,
             tokens_generated: 2,
             rtf: 0.3,
+            stop_reason: None,
         });
         accumulate_stream_statistics(&mut statistics, &terminal);
         let statistics = statistics.unwrap();
@@ -1605,6 +1657,7 @@ mod tests {
             audio_duration_secs: None,
             rtf: None,
             error: None,
+            stop_reason: None,
         };
 
         let value = serde_json::to_value(event).expect("serialize event");

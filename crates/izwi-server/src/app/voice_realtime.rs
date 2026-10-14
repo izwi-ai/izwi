@@ -1664,8 +1664,9 @@ async fn handle_text_message(
                         ));
                     }
                     let _ = resolve_chat_model_id(Some(text_model_id.as_str()))?;
-                    parse_tts_model_variant(tts_model_id.as_str())
+                    let tts_variant = parse_tts_model_variant(tts_model_id.as_str())
                         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
+                    validate_realtime_tts_model(tts_variant)?;
 
                     VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
                         asr_model_id,
@@ -2390,104 +2391,196 @@ async fn stream_tts_to_socket(
         .await
         .map_err(|err| format!("Failed to load TTS model: {err}"))?;
 
-    let sample_rate = state.runtime.sample_rate().await;
-    let encoder = AudioEncoder::new(sample_rate, 1);
+    // The audio is announced at the model's own rate, read from its first
+    // chunk, not the codec default (TPIPE-22: a 44.1 kHz model played at
+    // 0.54x when labelled 24 kHz).
+    let fallback_sample_rate = state.runtime.sample_rate().await;
+    let mut announced_rate: Option<u32> = None;
+    let announce = |sample_rate: u32| {
+        send_turn_json(
+            out_tx,
+            output_generation,
+            json!({
+                "type": "assistant_audio_start",
+                "utterance_id": utterance_id,
+                "utterance_seq": utterance_seq,
+                "sample_rate": sample_rate,
+                "audio_format": "pcm_i16",
+            }),
+        );
+    };
 
+    // The reply is spoken a segment at a time, its first sentence first, so
+    // the first audio follows the first sentence's synthesis, not the whole
+    // reply's (TPIPE-21).
+    let segments = realtime_speech_segments(text);
+    let segment_count = segments.len();
+    let mut chunk_seq = 0u32;
+    for (segment_index, segment) in segments.into_iter().enumerate() {
+        let last_segment = segment_index + 1 == segment_count;
+        let gen_config = GenerationConfig {
+            streaming: true,
+            options: GenerationParams {
+                max_tokens: 0,
+                speaker: speaker.clone(),
+                voice: speaker.clone(),
+                ..Default::default()
+            },
+        };
+
+        let gen_request = GenerationRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            model_variant: Some(tts_variant),
+            correlation_id: Some(correlation_id.to_string()),
+            runtime_context,
+            text: segment,
+            config: gen_config,
+            language: None,
+            reference_audio: None,
+            reference_text: None,
+            voice_description: None,
+        };
+
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<izwi_core::AudioChunk>(32);
+        let runtime = state.runtime.clone();
+        let generation_task = AbortOnDropTask::new(tokio::spawn(async move {
+            runtime.generate_streaming(gen_request, chunk_tx).await
+        }));
+
+        loop {
+            let chunk = tokio::select! {
+                _ = control.cancelled() => return Err("Turn cancelled".to_string()),
+                chunk = chunk_rx.recv() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if chunk.samples.is_empty() && !(chunk.is_final && last_segment) {
+                continue;
+            }
+            let (sample_rate, first) = realtime_chunk_rate(
+                &mut announced_rate,
+                chunk.sample_rate_or(fallback_sample_rate),
+            )?;
+            if first {
+                announce(sample_rate);
+            }
+            let encoder = AudioEncoder::new(sample_rate, 1);
+
+            let encoded = encoder
+                .encode(&chunk.samples, AudioFormat::RawI16)
+                .map_err(|err| format!("Failed to encode streamed TTS chunk: {err}"))?;
+
+            let frame = encode_assistant_audio_binary_frame(
+                utterance_seq,
+                chunk_seq,
+                sample_rate,
+                chunk.is_final && last_segment,
+                &encoded,
+            );
+            chunk_seq = chunk_seq.saturating_add(1);
+            let sample_count = encoded.len() / std::mem::size_of::<i16>();
+            let duration_ms = (sample_count as u64)
+                .saturating_mul(1_000)
+                .checked_div(sample_rate.max(1) as u64)
+                .unwrap_or(0);
+            out_tx
+                .send_audio(
+                    output_generation,
+                    Message::Binary(frame.into()),
+                    encoded.len(),
+                    duration_ms,
+                )
+                .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
+        }
+
+        match generation_task.join().await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(format!("TTS failed: {err}")),
+            Err(err) => return Err(format!("TTS streaming task failed: {err}")),
+        }
+    }
+
+    if announced_rate.is_none() {
+        announce(fallback_sample_rate);
+    }
     send_turn_json(
         out_tx,
         output_generation,
         json!({
-            "type": "assistant_audio_start",
+            "type": "assistant_audio_done",
             "utterance_id": utterance_id,
             "utterance_seq": utterance_seq,
-            "sample_rate": sample_rate,
-            "audio_format": "pcm_i16",
         }),
     );
+    Ok(())
+}
 
-    let gen_config = GenerationConfig {
-        streaming: true,
-        options: GenerationParams {
-            max_tokens: 0,
-            speaker: speaker.clone(),
-            voice: speaker,
-            ..Default::default()
-        },
+/// Characters one realtime TTS segment carries after the first sentence.
+const REALTIME_SEGMENT_CHARS: usize = 240;
+
+/// The reply as realtime TTS segments: its first sentence alone (the first
+/// audio waits only for it), then whole sentences packed up to
+/// [`REALTIME_SEGMENT_CHARS`].
+fn realtime_speech_segments(text: &str) -> Vec<String> {
+    let spans = crate::api::sentence_split::sentence_spans(text);
+    let Some(first) = spans.first() else {
+        return vec![text.trim().to_string()];
     };
-
-    let gen_request = GenerationRequest {
-        id: uuid::Uuid::new_v4().to_string(),
-        model_variant: Some(tts_variant),
-        correlation_id: Some(correlation_id.to_string()),
-        runtime_context,
-        text: text.to_string(),
-        config: gen_config,
-        language: None,
-        reference_audio: None,
-        reference_text: None,
-        voice_description: None,
-    };
-
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<izwi_core::AudioChunk>(32);
-    let runtime = state.runtime.clone();
-    let generation_task = AbortOnDropTask::new(tokio::spawn(async move {
-        runtime.generate_streaming(gen_request, chunk_tx).await
-    }));
-
-    loop {
-        let chunk = tokio::select! {
-            _ = control.cancelled() => return Err("Turn cancelled".to_string()),
-            chunk = chunk_rx.recv() => chunk,
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        if chunk.samples.is_empty() && !chunk.is_final {
-            continue;
-        }
-
-        let encoded = encoder
-            .encode(&chunk.samples, AudioFormat::RawI16)
-            .map_err(|err| format!("Failed to encode streamed TTS chunk: {err}"))?;
-
-        let chunk_seq = u32::try_from(chunk.sequence).unwrap_or(u32::MAX);
-        let frame = encode_assistant_audio_binary_frame(
-            utterance_seq,
-            chunk_seq,
-            sample_rate,
-            chunk.is_final,
-            &encoded,
-        );
-        let sample_count = encoded.len() / std::mem::size_of::<i16>();
-        let duration_ms = (sample_count as u64)
-            .saturating_mul(1_000)
-            .checked_div(sample_rate.max(1) as u64)
-            .unwrap_or(0);
-        out_tx
-            .send_audio(
-                output_generation,
-                Message::Binary(frame.into()),
-                encoded.len(),
-                duration_ms,
-            )
-            .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
+    let mut segments = crate::api::sentence_split::pack_sentences(
+        &text[first.clone()],
+        REALTIME_SEGMENT_CHARS,
+        &|_| true,
+    );
+    let rest = text[first.end..].trim();
+    if !rest.is_empty() {
+        segments.extend(crate::api::sentence_split::pack_sentences(
+            rest,
+            REALTIME_SEGMENT_CHARS,
+            &|_| true,
+        ));
     }
+    segments
+}
 
-    match generation_task.join().await {
-        Ok(Ok(())) => {
-            send_turn_json(
-                out_tx,
-                output_generation,
-                json!({
-                    "type": "assistant_audio_done",
-                    "utterance_id": utterance_id,
-                    "utterance_seq": utterance_seq,
-                }),
-            );
-            Ok(())
+/// Realtime voice speaks with a built-in voice and streams its audio: a
+/// reference-only model (Qwen Base, VibeVoice, Fish) has no voice to speak
+/// with here, and one that does not stream would delay the first audio to
+/// the end (TPIPE-21).
+fn validate_realtime_tts_model(variant: izwi_core::ModelVariant) -> Result<(), String> {
+    let capabilities = variant
+        .speech_capabilities()
+        .ok_or_else(|| format!("Model `{variant}` is not a text-to-speech model."))?;
+    if !capabilities.supports_builtin_voices {
+        return Err(format!(
+            "Model `{variant}` speaks only with a reference voice; realtime voice needs a model with built-in voices."
+        ));
+    }
+    if !capabilities.supports_streaming {
+        return Err(format!(
+            "Model `{variant}` does not stream audio; realtime voice needs a streaming model."
+        ));
+    }
+    Ok(())
+}
+
+/// The rate a realtime utterance's audio is labelled with: its first chunk's
+/// (`true` when this chunk announces it). A later chunk at another rate is
+/// refused rather than mislabelled.
+fn realtime_chunk_rate(
+    announced: &mut Option<u32>,
+    chunk_rate: u32,
+) -> Result<(u32, bool), String> {
+    let chunk_rate = chunk_rate.max(1);
+    match *announced {
+        None => {
+            *announced = Some(chunk_rate);
+            Ok((chunk_rate, true))
         }
-        Ok(Err(err)) => Err(format!("TTS failed: {err}")),
-        Err(err) => Err(format!("TTS streaming task failed: {err}")),
+        Some(rate) if rate == chunk_rate => Ok((rate, false)),
+        Some(rate) => Err(format!(
+            "TTS audio changed sample rate mid-utterance ({rate} Hz to {chunk_rate} Hz)"
+        )),
     }
 }
 
@@ -3423,6 +3516,55 @@ mod tests {
             pre_roll_ms: 100,
             input_sample_rate_hint: Some(16_000),
         })
+    }
+
+    /// TPIPE-21: the reply's first sentence is spoken alone, the rest in
+    /// packed sentence segments; decimals and titles do not split.
+    #[test]
+    fn realtime_replies_are_spoken_first_sentence_first() {
+        let reply = "Sure, Dr. Lee. The total is 3.14 units. It ships today, and arrives \
+            tomorrow. Anything else?";
+        let segments = realtime_speech_segments(reply);
+        assert_eq!(segments[0], "Sure, Dr. Lee.");
+        assert_eq!(
+            segments[1..].join(" "),
+            "The total is 3.14 units. It ships today, and arrives tomorrow. Anything else?"
+        );
+        assert_eq!(realtime_speech_segments("Hello"), vec!["Hello"]);
+    }
+
+    /// Realtime voice refuses a reference-only TTS model at session
+    /// configuration and takes every built-in-voice model, all of which
+    /// stream.
+    #[test]
+    fn realtime_tts_needs_a_built_in_streaming_voice() {
+        use izwi_core::ModelVariant;
+        assert!(validate_realtime_tts_model(ModelVariant::Kokoro82M).is_ok());
+        assert!(validate_realtime_tts_model(ModelVariant::Qwen3Tts12Hz06BCustomVoice).is_ok());
+        assert!(
+            validate_realtime_tts_model(ModelVariant::Qwen3Tts12Hz06BBase)
+                .unwrap_err()
+                .contains("reference voice")
+        );
+        // Voxtral and LFM2.5 Audio stream committed audio now.
+        assert!(validate_realtime_tts_model(ModelVariant::Voxtral4BTts2603).is_ok());
+        assert!(validate_realtime_tts_model(ModelVariant::Lfm25Audio15BGguf).is_ok());
+    }
+
+    /// TPIPE-22: an utterance is labelled with its first chunk's rate (44.1
+    /// kHz for Fish), and a chunk at another rate is refused.
+    #[test]
+    fn realtime_audio_is_labelled_with_the_models_rate() {
+        let mut announced = None;
+        assert_eq!(
+            realtime_chunk_rate(&mut announced, 44_100),
+            Ok((44_100, true))
+        );
+        assert_eq!(
+            realtime_chunk_rate(&mut announced, 44_100),
+            Ok((44_100, false))
+        );
+        assert!(realtime_chunk_rate(&mut announced, 24_000).is_err());
     }
 
     #[test]

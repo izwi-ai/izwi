@@ -28,9 +28,6 @@ pub enum ModelVariant {
     /// 0.6B parameter base model
     #[serde(rename = "Qwen3-TTS-12Hz-0.6B-Base")]
     Qwen3Tts12Hz06BBase,
-    /// 0.6B parameter base model (MLX 4-bit)
-    #[serde(rename = "Qwen3-TTS-12Hz-0.6B-Base-4bit")]
-    Qwen3Tts12Hz06BBase4Bit,
     /// 0.6B parameter base model (MLX 8-bit)
     #[serde(rename = "Qwen3-TTS-12Hz-0.6B-Base-8bit")]
     Qwen3Tts12Hz06BBase8Bit,
@@ -40,9 +37,6 @@ pub enum ModelVariant {
     /// 0.6B parameter custom voice model
     #[serde(rename = "Qwen3-TTS-12Hz-0.6B-CustomVoice")]
     Qwen3Tts12Hz06BCustomVoice,
-    /// 0.6B parameter custom voice model (MLX 4-bit)
-    #[serde(rename = "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit")]
-    Qwen3Tts12Hz06BCustomVoice4Bit,
     /// 0.6B parameter custom voice model (MLX 8-bit)
     #[serde(rename = "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit")]
     Qwen3Tts12Hz06BCustomVoice8Bit,
@@ -52,21 +46,12 @@ pub enum ModelVariant {
     /// 1.7B parameter base model
     #[serde(rename = "Qwen3-TTS-12Hz-1.7B-Base")]
     Qwen3Tts12Hz17BBase,
-    /// 1.7B parameter base model (MLX 4-bit)
-    #[serde(rename = "Qwen3-TTS-12Hz-1.7B-Base-4bit")]
-    Qwen3Tts12Hz17BBase4Bit,
     /// 1.7B parameter custom voice model  
     #[serde(rename = "Qwen3-TTS-12Hz-1.7B-CustomVoice")]
     Qwen3Tts12Hz17BCustomVoice,
-    /// 1.7B parameter custom voice model (MLX 4-bit)
-    #[serde(rename = "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit")]
-    Qwen3Tts12Hz17BCustomVoice4Bit,
     /// 1.7B parameter voice design model
     #[serde(rename = "Qwen3-TTS-12Hz-1.7B-VoiceDesign")]
     Qwen3Tts12Hz17BVoiceDesign,
-    /// 1.7B parameter voice design model (MLX 4-bit)
-    #[serde(rename = "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit")]
-    Qwen3Tts12Hz17BVoiceDesign4Bit,
     /// 1.7B parameter voice design model (MLX 8-bit)
     #[serde(rename = "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit")]
     Qwen3Tts12Hz17BVoiceDesign8Bit,
@@ -299,10 +284,15 @@ impl ModelVariant {
     /// Official Qwen3-TTS generation limit from upstream generation configs
     /// (`max_new_tokens` in Hugging Face `generation_config.json`).
     pub const QWEN3_TTS_MAX_OUTPUT_FRAMES: usize = 8192;
-    /// Qwen3-TTS codec frame rate encoded in model variant naming ("12Hz").
-    pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 12.0;
+    /// Qwen3-TTS codec frame rate: the speech tokenizer's 24 kHz output over
+    /// its 1,920-sample decode upsampling (`speech_tokenizer/config.json`).
+    /// The "12Hz" in the variant name is rounded; budgets at 12 Hz cut 4% of
+    /// the audio they meant to allow (QTTS-21).
+    pub const QWEN3_TTS_FRAME_RATE_HZ: f32 = 24_000.0 / 1_920.0;
     pub const QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT: usize = 9;
-    pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 54;
+    /// Kokoro's 54 voices less the 13 Japanese and Mandarin ones, which
+    /// have no G2P yet and are hidden and refused.
+    pub const KOKORO_BUILT_IN_VOICE_COUNT: usize = 41;
     pub const LFM25_AUDIO_BUILT_IN_VOICE_COUNT: usize = 4;
     pub const VOXTRAL_TTS_BUILT_IN_VOICE_COUNT: usize = 20;
     pub const VOXTRAL_TTS_MAX_OUTPUT_FRAMES: usize = 1500;
@@ -349,13 +339,9 @@ impl ModelVariant {
     pub fn repo_id(&self) -> &'static str {
         match self {
             Self::Qwen3Tts12Hz06BBase => "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-            Self::Qwen3Tts12Hz06BBase4Bit => "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit",
             Self::Qwen3Tts12Hz06BBase8Bit => "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
             Self::Qwen3Tts12Hz06BBaseBf16 => "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
             Self::Qwen3Tts12Hz06BCustomVoice => "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Qwen3Tts12Hz06BCustomVoice4Bit => {
-                "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"
-            }
             Self::Qwen3Tts12Hz06BCustomVoice8Bit => {
                 "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
             }
@@ -363,15 +349,8 @@ impl ModelVariant {
                 "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
             }
             Self::Qwen3Tts12Hz17BBase => "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            Self::Qwen3Tts12Hz17BBase4Bit => "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit",
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-            Self::Qwen3Tts12Hz17BCustomVoice4Bit => {
-                "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit"
-            }
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-            Self::Qwen3Tts12Hz17BVoiceDesign4Bit => {
-                "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit"
-            }
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => {
                 "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
             }
@@ -418,19 +397,14 @@ impl ModelVariant {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Qwen3Tts12Hz06BBase => "Qwen3-TTS 0.6B Base",
-            Self::Qwen3Tts12Hz06BBase4Bit => "Qwen3-TTS 0.6B Base 4-bit",
             Self::Qwen3Tts12Hz06BBase8Bit => "Qwen3-TTS 0.6B Base 8-bit",
             Self::Qwen3Tts12Hz06BBaseBf16 => "Qwen3-TTS 0.6B Base bf16",
             Self::Qwen3Tts12Hz06BCustomVoice => "Qwen3-TTS 0.6B CustomVoice",
-            Self::Qwen3Tts12Hz06BCustomVoice4Bit => "Qwen3-TTS 0.6B CustomVoice 4-bit",
             Self::Qwen3Tts12Hz06BCustomVoice8Bit => "Qwen3-TTS 0.6B CustomVoice 8-bit",
             Self::Qwen3Tts12Hz06BCustomVoiceBf16 => "Qwen3-TTS 0.6B CustomVoice bf16",
             Self::Qwen3Tts12Hz17BBase => "Qwen3-TTS 1.7B Base",
-            Self::Qwen3Tts12Hz17BBase4Bit => "Qwen3-TTS 1.7B Base 4-bit",
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen3-TTS 1.7B CustomVoice",
-            Self::Qwen3Tts12Hz17BCustomVoice4Bit => "Qwen3-TTS 1.7B CustomVoice 4-bit",
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS 1.7B VoiceDesign",
-            Self::Qwen3Tts12Hz17BVoiceDesign4Bit => "Qwen3-TTS 1.7B VoiceDesign 4-bit",
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS 1.7B VoiceDesign 8-bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS 1.7B VoiceDesign bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS Tokenizer 12Hz",
@@ -474,19 +448,14 @@ impl ModelVariant {
     pub fn dir_name(&self) -> &'static str {
         match self {
             Self::Qwen3Tts12Hz06BBase => "Qwen3-TTS-12Hz-0.6B-Base",
-            Self::Qwen3Tts12Hz06BBase4Bit => "Qwen3-TTS-12Hz-0.6B-Base-4bit",
             Self::Qwen3Tts12Hz06BBase8Bit => "Qwen3-TTS-12Hz-0.6B-Base-8bit",
             Self::Qwen3Tts12Hz06BBaseBf16 => "Qwen3-TTS-12Hz-0.6B-Base-bf16",
             Self::Qwen3Tts12Hz06BCustomVoice => "Qwen3-TTS-12Hz-0.6B-CustomVoice",
-            Self::Qwen3Tts12Hz06BCustomVoice4Bit => "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit",
             Self::Qwen3Tts12Hz06BCustomVoice8Bit => "Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
             Self::Qwen3Tts12Hz06BCustomVoiceBf16 => "Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16",
             Self::Qwen3Tts12Hz17BBase => "Qwen3-TTS-12Hz-1.7B-Base",
-            Self::Qwen3Tts12Hz17BBase4Bit => "Qwen3-TTS-12Hz-1.7B-Base-4bit",
             Self::Qwen3Tts12Hz17BCustomVoice => "Qwen3-TTS-12Hz-1.7B-CustomVoice",
-            Self::Qwen3Tts12Hz17BCustomVoice4Bit => "Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit",
             Self::Qwen3Tts12Hz17BVoiceDesign => "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-            Self::Qwen3Tts12Hz17BVoiceDesign4Bit => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit",
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => "Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
             Self::Qwen3TtsTokenizer12Hz => "Qwen3-TTS-Tokenizer-12Hz",
@@ -530,19 +499,14 @@ impl ModelVariant {
     pub fn estimated_size(&self) -> u64 {
         match self {
             Self::Qwen3Tts12Hz06BBase => 2_516_106_051, // ~2.34 GB
-            Self::Qwen3Tts12Hz06BBase4Bit => 1_711_328_624, // ~1.59 GB
             Self::Qwen3Tts12Hz06BBase8Bit => 1_991_299_138, // ~1.85 GB
             Self::Qwen3Tts12Hz06BBaseBf16 => 2_516_143_009, // ~2.34 GB
             Self::Qwen3Tts12Hz06BCustomVoice => 2_498_388_392, // ~2.33 GB
-            Self::Qwen3Tts12Hz06BCustomVoice4Bit => 1_693_604_738, // ~1.58 GB
             Self::Qwen3Tts12Hz06BCustomVoice8Bit => 1_973_575_388, // ~1.84 GB
             Self::Qwen3Tts12Hz06BCustomVoiceBf16 => 2_498_419_405, // ~2.33 GB
             Self::Qwen3Tts12Hz17BBase => 4_544_229_700, // ~4.23 GB
-            Self::Qwen3Tts12Hz17BBase4Bit => 2_335_000_000, // ~2.17 GB (est)
             Self::Qwen3Tts12Hz17BCustomVoice => 4_520_218_951, // ~4.21 GB
-            Self::Qwen3Tts12Hz17BCustomVoice4Bit => 2_330_000_000, // ~2.17 GB (est)
             Self::Qwen3Tts12Hz17BVoiceDesign => 4_520_163_832, // ~4.21 GB
-            Self::Qwen3Tts12Hz17BVoiceDesign4Bit => 2_312_058_795, // ~2.15 GB
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit => 3_080_140_867, // ~2.87 GB
             Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 4_520_194_992, // ~4.21 GB
             Self::Qwen3TtsTokenizer12Hz => 682_300_739, // ~0.64 GB
@@ -586,19 +550,14 @@ impl ModelVariant {
     pub fn memory_required_gb(&self) -> f32 {
         match self {
             Self::Qwen3Tts12Hz06BBase
-            | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BBase8Bit
             | Self::Qwen3Tts12Hz06BBaseBf16
             | Self::Qwen3Tts12Hz06BCustomVoice
-            | Self::Qwen3Tts12Hz06BCustomVoice4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice8Bit
             | Self::Qwen3Tts12Hz06BCustomVoiceBf16 => 2.5,
             Self::Qwen3Tts12Hz17BBase
-            | Self::Qwen3Tts12Hz17BBase4Bit
             | Self::Qwen3Tts12Hz17BCustomVoice
-            | Self::Qwen3Tts12Hz17BCustomVoice4Bit
             | Self::Qwen3Tts12Hz17BVoiceDesign
-            | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => 6.0,
             Self::Qwen3TtsTokenizer12Hz => 1.0,
@@ -740,24 +699,34 @@ impl ModelVariant {
         }
     }
 
+    /// Whether a streamed request runs on the TTS capability's own
+    /// native-streaming graph instead of a separately loaded streaming
+    /// capability. The engine binds every TTS request to its TTS adapter, so
+    /// these families stream without a second copy of their retained state.
+    pub fn streams_on_its_tts_route(&self) -> bool {
+        matches!(
+            self.family(),
+            crate::catalog::ModelFamily::Lfm25Audio
+                | crate::catalog::ModelFamily::VibeVoiceTts
+                | crate::catalog::ModelFamily::VoxtralTts
+        )
+    }
+
     pub fn speech_capabilities(&self) -> Option<SpeechModelCapabilities> {
         let capabilities = match self {
             Self::Qwen3Tts12Hz06BBase
-            | Self::Qwen3Tts12Hz06BBase4Bit
             | Self::Qwen3Tts12Hz06BBase8Bit
             | Self::Qwen3Tts12Hz06BBaseBf16
-            | Self::Qwen3Tts12Hz17BBase
-            | Self::Qwen3Tts12Hz17BBase4Bit => SpeechModelCapabilities {
+            | Self::Qwen3Tts12Hz17BBase => SpeechModelCapabilities {
                 supports_builtin_voices: false,
                 built_in_voice_count: None,
                 supports_reference_voice: true,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Qwen3Tts12Hz06BCustomVoice
-            | Self::Qwen3Tts12Hz06BCustomVoice4Bit
             | Self::Qwen3Tts12Hz06BCustomVoice8Bit
             | Self::Qwen3Tts12Hz06BCustomVoiceBf16 => SpeechModelCapabilities {
                 supports_builtin_voices: true,
@@ -765,22 +734,19 @@ impl ModelVariant {
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
-            Self::Qwen3Tts12Hz17BCustomVoice | Self::Qwen3Tts12Hz17BCustomVoice4Bit => {
-                SpeechModelCapabilities {
-                    supports_builtin_voices: true,
-                    built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
-                    supports_reference_voice: false,
-                    supports_voice_description: true,
-                    supports_streaming: true,
-                    supports_speed_control: true,
-                    supports_auto_long_form: true,
-                }
-            }
+            Self::Qwen3Tts12Hz17BCustomVoice => SpeechModelCapabilities {
+                supports_builtin_voices: true,
+                built_in_voice_count: Some(Self::QWEN_CUSTOMVOICE_BUILT_IN_VOICE_COUNT),
+                supports_reference_voice: false,
+                supports_voice_description: true,
+                supports_streaming: true,
+                supports_speed_control: false,
+                supports_auto_long_form: true,
+            },
             Self::Qwen3Tts12Hz17BVoiceDesign
-            | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
             | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
             | Self::Qwen3Tts12Hz17BVoiceDesignBf16 => SpeechModelCapabilities {
                 supports_builtin_voices: false,
@@ -788,7 +754,7 @@ impl ModelVariant {
                 supports_reference_voice: false,
                 supports_voice_description: true,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             },
             Self::Kokoro82M => SpeechModelCapabilities {
@@ -805,7 +771,7 @@ impl ModelVariant {
                 built_in_voice_count: Some(Self::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
@@ -814,7 +780,7 @@ impl ModelVariant {
                 built_in_voice_count: Some(Self::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             },
@@ -823,7 +789,7 @@ impl ModelVariant {
                 built_in_voice_count: None,
                 supports_reference_voice: true,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             },
@@ -898,6 +864,20 @@ impl ModelVariant {
         }
     }
 
+    /// The sample rate this TTS variant's audio comes out at, for surfaces
+    /// that announce it before the first chunk (realtime sessions).
+    pub fn tts_output_sample_rate_hint(&self) -> Option<u32> {
+        match self.family() {
+            crate::catalog::ModelFamily::FishS2Tts => Some(44_100),
+            crate::catalog::ModelFamily::Qwen3Tts
+            | crate::catalog::ModelFamily::KokoroTts
+            | crate::catalog::ModelFamily::VoxtralTts
+            | crate::catalog::ModelFamily::VibeVoiceTts
+            | crate::catalog::ModelFamily::Lfm25Audio => Some(24_000),
+            _ => None,
+        }
+    }
+
     /// Max output duration hint in seconds for this TTS variant, if known.
     pub fn tts_max_output_seconds_hint(&self) -> Option<f32> {
         let frames = self.tts_max_output_frames_hint()?;
@@ -933,15 +913,10 @@ impl ModelVariant {
     pub fn is_quantized(&self) -> bool {
         matches!(
             self,
-            Self::Qwen3Tts12Hz06BBase4Bit
-                | Self::Qwen3Tts12Hz06BBase8Bit
+            Self::Qwen3Tts12Hz06BBase8Bit
                 | Self::Qwen3Tts12Hz06BBaseBf16
-                | Self::Qwen3Tts12Hz06BCustomVoice4Bit
                 | Self::Qwen3Tts12Hz06BCustomVoice8Bit
                 | Self::Qwen3Tts12Hz06BCustomVoiceBf16
-                | Self::Qwen3Tts12Hz17BBase4Bit
-                | Self::Qwen3Tts12Hz17BCustomVoice4Bit
-                | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
                 | Self::Qwen3Tts12Hz17BVoiceDesign8Bit
                 | Self::Qwen3Tts12Hz17BVoiceDesignBf16
                 | Self::Lfm2512BInstructGguf
@@ -1055,11 +1030,6 @@ impl ModelVariant {
             // checkpoint remains an exact-SHA hardware handoff gate.
             | Self::Qwen36Moe35BA3BFp8
             | Self::Qwen3827BFp8
-            | Self::Qwen3Tts12Hz06BBase4Bit
-            | Self::Qwen3Tts12Hz06BCustomVoice4Bit
-            | Self::Qwen3Tts12Hz17BBase4Bit
-            | Self::Qwen3Tts12Hz17BCustomVoice4Bit
-            | Self::Qwen3Tts12Hz17BVoiceDesign4Bit
             | Self::Qwen3ForcedAligner06B4Bit
             | Self::Lfm2512BInstructGguf
             | Self::Lfm2512BThinkingGguf
@@ -1086,19 +1056,14 @@ impl ModelVariant {
     pub fn all() -> &'static [ModelVariant] {
         &[
             Self::Qwen3Tts12Hz06BBase,
-            Self::Qwen3Tts12Hz06BBase4Bit,
             Self::Qwen3Tts12Hz06BBase8Bit,
             Self::Qwen3Tts12Hz06BBaseBf16,
             Self::Qwen3Tts12Hz06BCustomVoice,
-            Self::Qwen3Tts12Hz06BCustomVoice4Bit,
             Self::Qwen3Tts12Hz06BCustomVoice8Bit,
             Self::Qwen3Tts12Hz06BCustomVoiceBf16,
             Self::Qwen3Tts12Hz17BBase,
-            Self::Qwen3Tts12Hz17BBase4Bit,
             Self::Qwen3Tts12Hz17BCustomVoice,
-            Self::Qwen3Tts12Hz17BCustomVoice4Bit,
             Self::Qwen3Tts12Hz17BVoiceDesign,
-            Self::Qwen3Tts12Hz17BVoiceDesign4Bit,
             Self::Qwen3Tts12Hz17BVoiceDesign8Bit,
             Self::Qwen3Tts12Hz17BVoiceDesignBf16,
             Self::Qwen3TtsTokenizer12Hz,
@@ -1175,6 +1140,25 @@ pub struct SpeechModelCapabilities {
     pub supports_auto_long_form: bool,
 }
 
+impl SpeechModelCapabilities {
+    /// The `speed` a model with speed control honours, inclusive. A request
+    /// outside it (or any speed but 1.0 for a model without speed control)
+    /// is refused rather than silently clamped or dropped (TPIPE-10).
+    pub const SPEED_RANGE: (f32, f32) = (0.5, 2.0);
+
+    /// The longest reference audio a voice-clone request or saved voice
+    /// carries, in seconds; longer audio is refused with 400 at upload and at
+    /// synthesis alike (TPIPE-23).
+    pub const MAX_REFERENCE_AUDIO_SECS: u64 = 30;
+
+    /// Whether this model honours `speed`.
+    pub fn honours_speed(&self, speed: f32) -> bool {
+        speed == 1.0
+            || (self.supports_speed_control
+                && (Self::SPEED_RANGE.0..=Self::SPEED_RANGE.1).contains(&speed))
+    }
+}
+
 /// Machine-readable controls exposed by chat-capable model runtimes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatModelCapabilities {
@@ -1233,6 +1217,28 @@ mod tests {
     use crate::catalog::ModelTask;
 
     use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
+
+    /// TPIPE-22: the announced realtime rate is each family's real output
+    /// rate (Fish's codec runs at 44.1 kHz).
+    #[test]
+    fn tts_output_sample_rate_hints_match_the_model_codecs() {
+        assert_eq!(
+            ModelVariant::FishAudioS2Pro.tts_output_sample_rate_hint(),
+            Some(crate::models::architectures::fish_s2::FishS2DacConfig::current().sample_rate)
+        );
+        assert_eq!(
+            ModelVariant::Lfm25Audio15BGguf.tts_output_sample_rate_hint(),
+            Some(24_000)
+        );
+        assert_eq!(
+            ModelVariant::Kokoro82M.tts_output_sample_rate_hint(),
+            Some(24_000)
+        );
+        assert_eq!(
+            ModelVariant::WhisperLargeV3Turbo.tts_output_sample_rate_hint(),
+            None
+        );
+    }
 
     #[test]
     fn chat_capabilities_expose_reasoning_effort_only_for_qwen38() {
@@ -1508,7 +1514,7 @@ mod tests {
                 built_in_voice_count: Some(ModelVariant::VOXTRAL_TTS_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             })
@@ -1547,7 +1553,7 @@ mod tests {
                 built_in_voice_count: None,
                 supports_reference_voice: true,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: true,
             })
@@ -1647,7 +1653,7 @@ mod tests {
                 supports_reference_voice: true,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );
@@ -1663,7 +1669,7 @@ mod tests {
                 supports_reference_voice: false,
                 supports_voice_description: false,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );
@@ -1675,7 +1681,7 @@ mod tests {
                 supports_reference_voice: false,
                 supports_voice_description: true,
                 supports_streaming: true,
-                supports_speed_control: true,
+                supports_speed_control: false,
                 supports_auto_long_form: true,
             })
         );
@@ -1706,7 +1712,7 @@ mod tests {
                 built_in_voice_count: Some(ModelVariant::LFM25_AUDIO_BUILT_IN_VOICE_COUNT),
                 supports_reference_voice: false,
                 supports_voice_description: false,
-                supports_streaming: false,
+                supports_streaming: true,
                 supports_speed_control: false,
                 supports_auto_long_form: false,
             })

@@ -3,24 +3,38 @@
 //! This module provides native Rust implementation for Qwen3-TTS models,
 //! supporting both CustomVoice (preset speakers) and voice cloning modes.
 
+mod budget;
 mod config;
 mod predictor;
+mod reference_cache;
 mod rope;
-mod speech_tokenizer;
+mod speaker_encoder;
+pub(crate) mod speech_tokenizer;
+
+use speaker_encoder::SpeakerEncoder;
 mod talker;
 mod tokenizer;
 
+pub use budget::{
+    qwen3_tts_auto_max_frames_for_text, qwen3_tts_auto_max_output_frames,
+    QWEN3_TTS_AUTO_MAX_AUDIO_SECS,
+};
+pub(crate) use budget::{qwen3_tts_retained_memory_tokens, qwen3_tts_state_floor_tokens};
 pub use config::Qwen3TtsConfig;
 pub use predictor::{
     code_predictor_physical_context_tokens, CodePredictor, CodePredictorPhysicalCache,
-    CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
+    CodeSelection, SubtalkerSampling, CODE_PREDICTOR_PHYSICAL_PREFILL_TOKENS,
 };
-pub use speech_tokenizer::SpeechTokenizerDecoder;
+pub use speech_tokenizer::{
+    SpeechTokenizerDecodeStats, SpeechTokenizerDecoder, SpeechTokenizerStream,
+};
+#[cfg(test)]
+pub(crate) use talker::read_f16_embedding as read_qwen3_tts_f16_text_embedding;
+pub(crate) use talker::text_embedding_reads_in_place as qwen3_tts_text_embedding_reads_in_place;
 pub use talker::{TalkerModel, TalkerPhysicalCache};
 pub use tokenizer::{SpeakerReference, TtsSpecialTokens, TtsTokenizer};
 
-use candle_core::{DType, IndexOp, Tensor, D};
-use candle_nn::VarBuilder;
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -32,10 +46,16 @@ use tracing::{debug, info};
 use crate::backends::state::{
     PhysicalStateSequenceId, PhysicalStateTransactionId, StateComponentValue, TensorStateArena,
 };
-use crate::backends::DeviceProfile;
+use crate::backends::{DTypeSelection, DeviceProfile};
 use crate::catalog::ModelFamily;
 use crate::engine::{StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
+use crate::kernels::f16_weight_linear::{
+    load_weight_only_f16, WeightOnlyF16Load, F16_PROJECTION_MAX_RELATIVE_L2,
+};
+use crate::kernels::numeric_check::{
+    run_numeric_self_check, xorshift_values, NumericSelfCheckReport, F16_SAFE_MAX_ABS,
+};
 use crate::kv::v2::{
     minimum_physical_bytes_for_capacity, stage_graph_fingerprint, BoundedShape,
     CapabilityStateDescriptorV2, CheckpointPolicy, InferenceStateContract, InvocationLeaseScope,
@@ -54,11 +74,45 @@ use crate::models::shared::sampling::{
     bounded_device_sampling_candidates, device_candidates_cover_top_p, sample_device_candidates,
 };
 use crate::models::shared::state::exact_stage_scratch_domain;
+use crate::models::shared::weights::staged::metal_staged_safetensors;
+use candle_nn::VarBuilder;
+
+/// Device-to-host readbacks on the Qwen3-TTS decode path (each one blocks on
+/// the device). Every readback in the talker, predictor and semantic sampler
+/// goes through [`record_qwen3_tts_host_readback`].
+static QWEN3_TTS_HOST_READBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static QWEN3_TTS_HOST_READBACKS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn record_qwen3_tts_host_readback() {
+    QWEN3_TTS_HOST_READBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    QWEN3_TTS_HOST_READBACKS_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+/// Process-wide count of Qwen3-TTS device-to-host readbacks.
+pub fn qwen3_tts_host_readbacks() -> u64 {
+    QWEN3_TTS_HOST_READBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This thread's readbacks, for tests that count one frame.
+#[cfg(test)]
+pub(crate) fn thread_qwen3_tts_host_readbacks() -> u64 {
+    QWEN3_TTS_HOST_READBACKS_THREAD.with(std::cell::Cell::get)
+}
 
 const NEWLINE_TOKEN_ID: u32 = 198;
-const ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM: &str = "IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM";
 const MIN_QWEN_TTS_TOKENS_BEFORE_EOS: usize = 8;
 const MAX_VOICE_CLONE_REFERENCE_FRAMES: usize = 320;
+/// The longest reference audio a request may carry (saved voices and
+/// inline references share the limit), which prices its encode.
+const MAX_REFERENCE_AUDIO_SECS: usize =
+    crate::catalog::SpeechModelCapabilities::MAX_REFERENCE_AUDIO_SECS as usize;
 const QWEN3_TTS_MODEL_STATE_DOMAIN: StateDomainId = StateDomainId::new(2);
 
 fn validate_qwen3_tts_tensor_state_shapes(
@@ -171,17 +225,74 @@ pub struct TtsGenerationParams {
     pub repetition_penalty: f32,
     /// Maximum generated codec frames. `0` means auto (model maximum).
     pub max_frames: usize,
+    /// Residual-codebook sampling (the reference's `subtalker_*` settings).
+    pub subtalker: SubtalkerSampling,
+    /// Sampling seed; 0 seeds from the clock.
+    pub seed: u64,
 }
 
 impl Default for TtsGenerationParams {
     fn default() -> Self {
-        // Mirrors the official generation_config defaults.
+        // Every published Qwen3-TTS checkpoint ships the same
+        // generation_config.json: sampling at temperature 0.9, top-k 50,
+        // top-p 1.0, repetition penalty 1.05, and the same for the sub-talker.
         Self {
             temperature: 0.9,
             top_p: 1.0,
             top_k: 50,
             repetition_penalty: 1.05,
             max_frames: crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES,
+            subtalker: SubtalkerSampling::default(),
+            seed: 0,
+        }
+    }
+}
+
+impl TtsGenerationParams {
+    /// The request's sampling over the generation_config defaults: a field
+    /// the request left unset keeps the published default (TPIPE-24). A
+    /// greedy request (temperature 0) keeps every codebook greedy unless it
+    /// sets sub-talker sampling itself.
+    pub fn for_request(speech: &crate::engine::SpeechSamplingOptions, max_frames: usize) -> Self {
+        let defaults = Self::default();
+        let temperature = speech.temperature.unwrap_or(defaults.temperature).max(0.0);
+        let mut subtalker = Self::subtalker_for_request_temperature(temperature);
+        if let Some(do_sample) = speech.subtalker_do_sample {
+            subtalker.do_sample = do_sample;
+        }
+        if let Some(value) = speech.subtalker_temperature {
+            subtalker.temperature = value.max(0.0);
+        }
+        if let Some(value) = speech.subtalker_top_k {
+            subtalker.top_k = value;
+        }
+        if let Some(value) = speech.subtalker_top_p {
+            subtalker.top_p = value.clamp(0.0, 1.0);
+        }
+        Self {
+            temperature,
+            top_p: speech.top_p.unwrap_or(defaults.top_p).clamp(0.0, 1.0),
+            top_k: speech.top_k.unwrap_or(defaults.top_k),
+            repetition_penalty: speech
+                .repetition_penalty
+                .unwrap_or(defaults.repetition_penalty)
+                .max(1.0),
+            max_frames,
+            subtalker,
+            seed: speech.seed.unwrap_or(0),
+        }
+    }
+}
+
+impl TtsGenerationParams {
+    /// Sub-talker settings for a request whose semantic temperature is
+    /// `temperature`: the reference defaults, except that a greedy request
+    /// (temperature 0) stays greedy for every codebook, so it is deterministic.
+    pub fn subtalker_for_request_temperature(temperature: f32) -> SubtalkerSampling {
+        if temperature <= 1e-5 {
+            SubtalkerSampling::greedy()
+        } else {
+            SubtalkerSampling::default()
         }
     }
 }
@@ -452,6 +563,8 @@ pub struct PhysicalTtsDecodeState {
     emitted_frames: usize,
     emitted_samples: usize,
     decode_raw_token_scratch: Vec<Vec<u32>>,
+    /// The incremental codec decode once streaming has emitted audio.
+    codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
 }
 
@@ -474,6 +587,8 @@ struct PhysicalTtsDecodeBatchCheckpoint {
     emitted_frames: usize,
     emitted_samples: usize,
     decode_raw_token_scratch: Vec<Vec<u32>>,
+    /// The incremental codec decode once streaming has emitted audio.
+    codec_stream: Option<SpeechTokenizerStream>,
     finished: bool,
 }
 
@@ -510,6 +625,7 @@ impl PhysicalTtsDecodeState {
             emitted_frames: self.emitted_frames,
             emitted_samples: self.emitted_samples,
             decode_raw_token_scratch: self.decode_raw_token_scratch.clone(),
+            codec_stream: self.codec_stream.clone(),
             finished: self.finished,
         }
     }
@@ -535,6 +651,7 @@ impl PhysicalTtsDecodeState {
         self.emitted_frames = checkpoint.emitted_frames;
         self.emitted_samples = checkpoint.emitted_samples;
         self.decode_raw_token_scratch = checkpoint.decode_raw_token_scratch;
+        self.codec_stream = checkpoint.codec_stream;
         self.finished = checkpoint.finished;
     }
 
@@ -854,6 +971,7 @@ pub struct PreparedTtsPredictorStage {
     expected_tensor_sequence: Option<PhysicalStateSequenceId>,
     next_rng: SimpleRng,
     next_semantic_history: Vec<u32>,
+    subtalker: SubtalkerSampling,
     sampling_ms: f64,
 }
 
@@ -937,18 +1055,13 @@ impl TtsGenerationParams {
     /// Convert external generation config to TTS sampling params.
     pub fn from_generation_config(cfg: &crate::runtime::GenerationConfig) -> Self {
         let opts = &cfg.options;
-        Self {
-            temperature: opts.temperature.max(0.0),
-            top_p: opts.top_p.clamp(0.0, 1.0),
-            top_k: if opts.top_k == 0 { 50 } else { opts.top_k },
-            repetition_penalty: opts.repetition_penalty.max(1.0),
-            max_frames: if opts.max_tokens == 0 {
-                crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES
-            } else {
-                opts.max_tokens
-                    .clamp(16, crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
-            },
-        }
+        let max_frames = if opts.max_tokens == 0 {
+            crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES
+        } else {
+            opts.max_tokens
+                .clamp(16, crate::model::ModelVariant::QWEN3_TTS_MAX_OUTPUT_FRAMES)
+        };
+        Self::for_request(&opts.speech, max_frames)
     }
 }
 
@@ -976,12 +1089,19 @@ pub struct Qwen3TtsModel {
     code_predictor: CodePredictor,
     /// Speech tokenizer decoder for codec to audio conversion
     speech_tokenizer: SpeechTokenizerDecoder,
+    /// ECAPA x-vector encoder for voice cloning (Base checkpoints).
+    speaker_encoder: Option<SpeakerEncoder>,
     /// Model configuration
     config: Qwen3TtsConfig,
     /// Decode-time KV page size.
     kv_page_size: usize,
     /// KV cache quantization mode.
     kv_quantization: KvCacheQuantization,
+    /// Whether the talker and predictor projections loaded as weight-only
+    /// F16, why, and the self-check that decided.
+    weight_precision: WeightOnlyF16Load,
+    /// Prepared voice-clone references, by reference audio.
+    reference_cache: reference_cache::ReferenceCache,
 }
 
 impl Qwen3TtsModel {
@@ -1010,19 +1130,7 @@ impl Qwen3TtsModel {
             ));
         }
         let full = self.managed_inference_state_contract()?;
-        let mut retained_base = InferenceStateContract {
-            abi: full.abi,
-            domains: vec![full.domains[0].clone()],
-            groups: vec![full.groups[0].clone()],
-        };
-        let StateDomainSpec::PagedAttention(talker) = &mut retained_base.domains[0] else {
-            unreachable!("Qwen3 TTS talker is paged attention")
-        };
-        talker.header.prefix = PrefixPolicy::Disabled;
-        talker.header.checkpoint = CheckpointPolicy::Transactional;
-        retained_base.groups[0].prefix_shareable = false;
-        retained_base.validate()?;
-        let retained = qwen3_tts_retained_state_contract(retained_base, &self.config, self.dtype)?;
+        let retained = qwen3_tts_retained_talker_contract(&full, &self.config, self.dtype)?;
 
         let mut predictor_contract = InferenceStateContract {
             abi: full.abi,
@@ -1127,6 +1235,30 @@ impl Qwen3TtsModel {
     }
 }
 
+/// The retained talker state a loaded model publishes: the talker's pages
+/// from `full` (the two-domain managed contract) and every decode tensor.
+pub(crate) fn qwen3_tts_retained_talker_contract(
+    full: &InferenceStateContract,
+    config: &Qwen3TtsConfig,
+    dtype: DType,
+) -> Result<InferenceStateContract> {
+    let mut retained_base = InferenceStateContract {
+        abi: full.abi,
+        domains: vec![full.domains[0].clone()],
+        groups: vec![full.groups[0].clone()],
+    };
+    let StateDomainSpec::PagedAttention(talker) = &mut retained_base.domains[0] else {
+        return Err(Error::ModelLoadError(
+            "Qwen3 TTS talker state must be paged attention".into(),
+        ));
+    };
+    talker.header.prefix = PrefixPolicy::Disabled;
+    talker.header.checkpoint = CheckpointPolicy::Transactional;
+    retained_base.groups[0].prefix_shareable = false;
+    retained_base.validate()?;
+    qwen3_tts_retained_state_contract(retained_base, config, dtype)
+}
+
 fn qwen3_tts_state_dtype(dtype: DType) -> Result<StateDType> {
     match dtype {
         DType::F32 => Ok(StateDType::F32),
@@ -1145,7 +1277,8 @@ fn qwen3_tts_retained_state_contract(
 ) -> Result<InferenceStateContract> {
     let state_dtype = qwen3_tts_state_dtype(dtype)?;
     let hidden = config.talker_config.hidden_size;
-    let max_sequence = config.talker_config.max_position_embeddings;
+    let max_sequence =
+        qwen3_tts_retained_memory_tokens(config.talker_config.max_position_embeddings);
     let vocab = config.talker_config.vocab_size;
     retained
         .domains
@@ -1227,7 +1360,7 @@ fn qwen3_tts_state_component(
     })
 }
 
-fn qwen3_tts_inference_state_contract(
+pub(crate) fn qwen3_tts_inference_state_contract(
     config: &Qwen3TtsConfig,
     talker_dtype: DType,
     predictor_dtype: DType,
@@ -1301,17 +1434,245 @@ pub struct Qwen3TtsDiagnostics {
     pub vocab_size: usize,
     pub text_vocab_size: usize,
     pub num_code_groups: usize,
+    /// Talker/predictor projection storage (weight-only F16 tier).
+    pub weight_precision: serde_json::Value,
     /// Whether bounded candidate selection can execute on the selected device.
     pub device_sampling: bool,
     /// Backward-compatible CUDA-specific capability flag.
     pub cuda_sampling: bool,
+    /// Windowed codec decode: window geometry and windows run since load.
+    pub codec_decode: SpeechTokenizerDecodeStats,
+    /// Device-to-host readbacks on the decode path since start.
+    pub host_readbacks_total: u64,
+    /// Voice-clone references prepared from the cache vs encoded.
+    pub reference_cache: reference_cache::ReferenceCacheStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Qwen3TtsDTypePlan {
-    talker: DType,
-    code_predictor: DType,
-    speech_tokenizer: DType,
+pub(crate) struct Qwen3TtsDTypePlan {
+    pub(crate) talker: DType,
+    pub(crate) code_predictor: DType,
+    pub(crate) speech_tokenizer: DType,
+}
+
+/// What [`Qwen3TtsModel::load`] reads from a checkpoint, resolved from its
+/// `config.json` and the device the way the loader resolves it, so load
+/// admission prices the same representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen3TtsLoadLayout {
+    pub(crate) dtypes: Qwen3TtsDTypePlan,
+    /// The ECAPA x-vector encoder (`speaker_encoder.*`, F32): Base
+    /// (voice-clone) checkpoints that ship one.
+    pub(crate) speaker_encoder: bool,
+    /// The speech-tokenizer encoder (`encoder.*`): only voice cloning encodes
+    /// reference audio, so the other variants never load it.
+    pub(crate) tokenizer_encoder: bool,
+    /// The talker and predictor projections and the text embedding are
+    /// requested as weight-only F16 (F16 storage, F32 compute; Metal only).
+    /// The load-time self-check can still fall back to dense F32.
+    pub(crate) weight_only_f16: bool,
+}
+
+impl Qwen3TtsLoadLayout {
+    pub(crate) fn resolve(config: &Qwen3TtsConfig, device: &DeviceProfile) -> Result<Self> {
+        let (is_custom_voice_model, is_voice_clone_model) = qwen3_tts_model_kind(config);
+        let dtypes = select_qwen3_tts_dtypes(
+            device,
+            qwen3_tts_dtype_override().as_deref(),
+            is_custom_voice_model,
+            is_voice_clone_model,
+        )?;
+        Ok(Self {
+            dtypes,
+            speaker_encoder: is_voice_clone_model && config.speaker_encoder_config.is_some(),
+            tokenizer_encoder: is_voice_clone_model,
+            weight_only_f16: qwen3_tts_weight_only_f16(device, dtypes).dtype == DType::F16,
+        })
+    }
+}
+
+/// The load layout of the Qwen3-TTS checkpoint in `model_dir` on `device`.
+pub(crate) fn qwen3_tts_load_layout(
+    model_dir: &Path,
+    device: &DeviceProfile,
+) -> Result<Qwen3TtsLoadLayout> {
+    let config: Qwen3TtsConfig =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    Qwen3TtsLoadLayout::resolve(&config, device)
+}
+
+/// `(custom_voice, voice_clone)`: which kind of checkpoint `config` is.
+fn qwen3_tts_model_kind(config: &Qwen3TtsConfig) -> (bool, bool) {
+    let model_type = config
+        .tts_model_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_'], "");
+    let custom_voice = model_type == "customvoice";
+    let voice_clone = model_type == "base"
+        || model_type == "voiceclone"
+        || model_type == "voicecloning"
+        || config.talker_config.spk_id.is_empty();
+    (custom_voice, voice_clone)
+}
+
+/// The operator's Qwen3-TTS precision override. Only
+/// `IZWI_QWEN_TTS_DTYPE` applies: `IZWI_QWEN_DTYPE` lowers Qwen ASR and chat
+/// precision, and must not silently switch TTS to a precision that corrupts
+/// its speech (NR-3).
+fn qwen3_tts_dtype_override() -> Option<String> {
+    std::env::var(QWEN3_TTS_DTYPE_ENV).ok()
+}
+
+const QWEN3_TTS_DTYPE_ENV: &str = "IZWI_QWEN_TTS_DTYPE";
+
+static QWEN3_TTS_CODEC_STREAM_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process-wide count of codec frames decoded incrementally for streaming
+/// (QTTS-5). Each frame is decoded once; the prefix re-decode decoded about
+/// N^2 / (2 * interval) frames for an N-frame stream.
+pub fn qwen3_tts_codec_stream_frames() -> u64 {
+    QWEN3_TTS_CODEC_STREAM_FRAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_qwen3_tts_codec_stream_frames(frames: usize) {
+    QWEN3_TTS_CODEC_STREAM_FRAMES.fetch_add(frames as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The talker and code predictor, their projections and the text embedding
+/// stored in F16 on `f16` when given (weight-only F16), else dense.
+/// `checkpoint` is the safetensors file the builders read.
+fn load_qwen3_tts_transformers(
+    talker_config: &config::TalkerConfig,
+    code_predictor_config: &config::CodePredictorConfig,
+    talker_vb: &VarBuilder,
+    code_predictor_vb: &VarBuilder,
+    f16: Option<&Device>,
+    checkpoint: &Path,
+) -> Result<(TalkerModel, CodePredictor)> {
+    let talker = TalkerModel::load(
+        talker_config.clone(),
+        talker_vb.pp("talker"),
+        f16,
+        checkpoint,
+    )?;
+    let code_predictor = CodePredictor::load(
+        code_predictor_config.clone(),
+        code_predictor_vb.pp("talker.code_predictor"),
+        talker_config.num_code_groups,
+        f16,
+    )?;
+    Ok((talker, code_predictor))
+}
+
+/// Talker positions the weight-only F16 self-check runs.
+const QWEN3_TTS_PROBE_TOKENS: usize = 16;
+
+/// The weight-only F16 load-time self-check (report 13): the conversions are
+/// checked against the original F32 weights (relative L2 at most
+/// [`F16_PROJECTION_MAX_RELATIVE_L2`]), then xorshift text tokens run
+/// through the text projection, every talker layer, the norm and the codec
+/// head on a scratch cache, and one greedy predictor frame from the last
+/// hidden state. Every probed tensor must be finite and inside the F16-safe
+/// range.
+fn qwen3_tts_weight_only_self_check(
+    talker: &TalkerModel,
+    code_predictor: &CodePredictor,
+    talker_vb: &VarBuilder,
+    code_predictor_vb: &VarBuilder,
+    talker_state_dtype: DType,
+    predictor_state_dtype: DType,
+) -> NumericSelfCheckReport {
+    run_numeric_self_check("Qwen3-TTS weight-only F16", F16_SAFE_MAX_ABS, || {
+        let relative = talker.check_f16_conversion(&talker_vb.pp("talker"))?.max(
+            code_predictor.check_f16_conversion(&code_predictor_vb.pp("talker.code_predictor"))?,
+        );
+        if !relative.is_finite() || relative > F16_PROJECTION_MAX_RELATIVE_L2 {
+            return Err(Error::ModelLoadError(format!(
+                "Qwen3-TTS F16 weights differ from their F32 originals by relative L2 {relative:.3e}"
+            )));
+        }
+        qwen3_tts_numeric_probe(
+            talker,
+            code_predictor,
+            talker_state_dtype,
+            predictor_state_dtype,
+        )
+    })
+}
+
+/// The probe of [`qwen3_tts_weight_only_self_check`]: talker hidden states and
+/// logits, and the predictor frame's acoustic embedding sum.
+fn qwen3_tts_numeric_probe(
+    talker: &TalkerModel,
+    code_predictor: &CodePredictor,
+    talker_state_dtype: DType,
+    predictor_state_dtype: DType,
+) -> Result<Vec<(String, Tensor)>> {
+    let device = talker.device().clone();
+    let cfg = talker.config();
+    let draws = xorshift_values(QWEN3_TTS_PROBE_TOKENS + 1, 0x7151, 1.0);
+    let pick = |draw: f32, limit: usize| ((draw.abs() * limit as f32) as u32).min(limit as u32 - 1);
+    let ids = draws[..QWEN3_TTS_PROBE_TOKENS]
+        .iter()
+        .map(|draw| pick(*draw, cfg.text_vocab_size))
+        .collect::<Vec<_>>();
+    let embeds = talker.get_projected_text_embeddings(&ids)?;
+    let mut talker_cache = TalkerPhysicalCache::scratch_for_probe(
+        &device,
+        talker_state_dtype,
+        cfg.num_hidden_layers,
+        cfg.num_key_value_heads,
+        cfg.head_dim(),
+        QWEN3_TTS_PROBE_TOKENS,
+    )?;
+    let (hidden, logits) = talker.prefill_physical_with_embeds(&embeds, &mut talker_cache, None)?;
+    let predictor_cfg = code_predictor.config();
+    let mut predictor_cache = CodePredictorPhysicalCache::scratch_for_probe(
+        &device,
+        predictor_state_dtype,
+        predictor_cfg.num_hidden_layers,
+        predictor_cfg.num_key_value_heads,
+        predictor_cfg.head_dim(),
+        code_predictor.physical_context_tokens_per_frame(),
+    )?;
+    let semantic = talker.get_codec_embedding(pick(
+        draws[QWEN3_TTS_PROBE_TOKENS],
+        2048.min(cfg.vocab_size),
+    ))?;
+    let codes = code_predictor.generate_acoustic_codes_physical(
+        &hidden,
+        &semantic,
+        &mut predictor_cache,
+        &mut CodeSelection::Greedy,
+    )?;
+    let acoustic = code_predictor.get_acoustic_embeddings_sum(&codes)?;
+    Ok(vec![
+        ("talker_hidden".to_string(), hidden),
+        ("talker_logits".to_string(), logits),
+        ("predictor_embedding_sum".to_string(), acoustic),
+    ])
+}
+
+/// Weight-only F16 for the talker and code predictor (QTTS-10/11): on Metal,
+/// when both compute in F32, their projections and the text embedding are
+/// stored in F16 while activations, norms, softmax, RoPE and logits stay
+/// F32, behind a load-time self-check with F32 fallback.
+/// `IZWI_QWEN_TTS_DTYPE=f32` (or `IZWI_METAL_DTYPE=f32`) keeps every weight
+/// F32; an explicit lower-precision compute dtype keeps its dense plan.
+pub(crate) fn qwen3_tts_weight_only_f16(
+    device: &DeviceProfile,
+    plan: Qwen3TtsDTypePlan,
+) -> DTypeSelection {
+    if !device.kind.is_metal() || plan.talker != DType::F32 || plan.code_predictor != DType::F32 {
+        return DTypeSelection {
+            dtype: DType::F32,
+            reason: "weight-only F16 applies to F32 talker/predictor compute on Metal".into(),
+        };
+    }
+    let raw = qwen3_tts_dtype_override();
+    device.resolve_metal_weight_only_f16(raw.as_deref().map(|raw| (QWEN3_TTS_DTYPE_ENV, raw)))
 }
 
 fn select_qwen3_tts_dtypes(
@@ -1323,6 +1684,17 @@ fn select_qwen3_tts_dtypes(
     if let Some(raw) = dtype_override.map(str::trim).filter(|raw| !raw.is_empty()) {
         let dtype =
             device.select_model_dtype_checked(ModelFamily::Qwen3Tts, Some(raw), "Qwen3 TTS")?;
+        // No lower-precision tier is validated for these checkpoints yet:
+        // all-F16 (and BF16) Metal CustomVoice/Base produce structurally
+        // valid but corrupted speech (QTTS-10/11).
+        if device.kind.is_metal()
+            && (is_custom_voice_model || is_voice_clone_model)
+            && dtype != DType::F32
+        {
+            return Err(Error::ModelLoadError(format!(
+                "{QWEN3_TTS_DTYPE_ENV}={raw} is not supported for Qwen3-TTS CustomVoice or Base models on Metal: {dtype:?} produces corrupted speech; unset it or use f32"
+            )));
+        }
         return Ok(Qwen3TtsDTypePlan {
             talker: dtype,
             code_predictor: dtype,
@@ -1336,8 +1708,9 @@ fn select_qwen3_tts_dtypes(
         // component produces structurally valid but corrupted speech.
         DType::F32
     } else if device.kind.is_metal() {
-        // VoiceDesign remains safe at F16 and benefits from lower residency.
-        DType::F16
+        // VoiceDesign computes in F32 too; its residency comes from the
+        // weight-only F16 tier (QTTS-10), not from all-F16 compute.
+        DType::F32
     } else {
         device.select_model_dtype(ModelFamily::Qwen3Tts, None)
     };
@@ -1388,6 +1761,19 @@ fn qwen_tts_uses_device_sampling(device: &DeviceProfile) -> bool {
     device.kind.is_cuda() || device.kind.is_metal()
 }
 
+/// The repetition-penalty history after generating `token`. The reference
+/// (Hugging Face's `RepetitionPenaltyLogitsProcessor` over the talker's
+/// generated ids) penalizes every semantic code generated so far, each once,
+/// so the history keeps each distinct code and never forgets one. It is
+/// bounded by the semantic vocabulary.
+fn record_semantic_history(history: &[u32], token: u32) -> Vec<u32> {
+    let mut next = history.to_vec();
+    if !next.contains(&token) {
+        next.push(token);
+    }
+    next
+}
+
 fn qwen_tts_allows_eos(frames_generated: usize) -> bool {
     frames_generated >= MIN_QWEN_TTS_TOKENS_BEFORE_EOS
 }
@@ -1406,6 +1792,39 @@ impl TtsSessionCacheLayout {
 
 fn cache_layout_overflow() -> Error {
     Error::Overloaded("Qwen3-TTS session cache layout overflow".to_string())
+}
+
+/// The speaker slot of the codec prefix: a preset speaker's codec token, or a
+/// voice-clone x-vector already shaped `[1, 1, hidden]`.
+#[derive(Clone, Copy)]
+enum SpeakerPrefix<'a> {
+    Id(u32),
+    Embedding(&'a Tensor),
+}
+
+/// Loads the ECAPA x-vector encoder when the checkpoint ships one. It runs in
+/// F32 (about 45 MB) whatever the talker dtype.
+fn load_speaker_encoder(
+    config: &Qwen3TtsConfig,
+    weights_path: &Path,
+    device: &Device,
+) -> Result<Option<SpeakerEncoder>> {
+    let Some(encoder_config) = config.speaker_encoder_config.clone() else {
+        return Ok(None);
+    };
+    let vb = unsafe {
+        metal_staged_safetensors(std::slice::from_ref(&weights_path), DType::F32, device)?
+    };
+    if !vb.contains_tensor("speaker_encoder.fc.weight") {
+        return Ok(None);
+    }
+    if encoder_config.enc_dim != config.talker_config.hidden_size {
+        return Err(Error::ModelLoadError(format!(
+            "Qwen3-TTS speaker encoder width {} does not match the talker hidden size {}",
+            encoder_config.enc_dim, config.talker_config.hidden_size
+        )));
+    }
+    SpeakerEncoder::load(encoder_config, vb.pp("speaker_encoder")).map(Some)
 }
 
 fn conditioned_prefill_tokens(
@@ -1471,12 +1890,23 @@ fn standard_session_cache_layout(
     )
 }
 
+/// Prefill length of the streaming-mode voice-clone ICL block, as the
+/// reference's `generate_icl_prompt` builds it: text is added position-wise
+/// onto the codec-BOS plus reference-codec embeddings, so the block is always
+/// `codec_tokens` long. Text past the codec length is not prefilled; it feeds
+/// one token per generated frame (the trailing text), and shorter text is
+/// padded with `tts_pad`.
+fn voice_clone_icl_prefill_tokens(_text_tokens: usize, codec_tokens: usize) -> usize {
+    codec_tokens
+}
+
 fn voice_clone_session_cache_layout(
     max_position_embeddings: usize,
     prompt_tokens: usize,
     reference_prompt_tokens: usize,
     reference_frames: usize,
     has_language: bool,
+    has_speaker_embedding: bool,
     requested_max_frames: usize,
 ) -> Result<TtsSessionCacheLayout> {
     let target_text_tokens = prompt_tokens.checked_sub(8).filter(|count| *count > 0);
@@ -1507,10 +1937,10 @@ fn voice_clone_session_cache_layout(
         .min(MAX_VOICE_CLONE_REFERENCE_FRAMES)
         .checked_add(1)
         .ok_or_else(cache_layout_overflow)?;
-    let base_prefill_tokens =
-        conditioned_prefill_tokens(0, has_language, false, 0).ok_or_else(cache_layout_overflow)?;
+    let base_prefill_tokens = conditioned_prefill_tokens(0, has_language, has_speaker_embedding, 0)
+        .ok_or_else(cache_layout_overflow)?;
     let prefill_tokens = base_prefill_tokens
-        .checked_add(text_tokens.max(codec_tokens))
+        .checked_add(voice_clone_icl_prefill_tokens(text_tokens, codec_tokens))
         .ok_or_else(cache_layout_overflow)?;
 
     resolve_session_cache_layout(
@@ -1538,25 +1968,8 @@ impl Qwen3TtsModel {
         info!("Model type: {}", config.tts_model_type);
         info!("Model size: {}", config.tts_model_size);
 
-        let model_type_normalized = config
-            .tts_model_type
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['-', '_'], "");
-        let is_custom_voice_model = model_type_normalized == "customvoice";
-        let is_voice_clone_model = model_type_normalized == "base"
-            || model_type_normalized == "voiceclone"
-            || model_type_normalized == "voicecloning"
-            || config.talker_config.spk_id.is_empty();
-        let dtype_override = std::env::var("IZWI_QWEN_TTS_DTYPE")
-            .ok()
-            .or_else(|| std::env::var("IZWI_QWEN_DTYPE").ok());
-        let dtype_plan = select_qwen3_tts_dtypes(
-            &device,
-            dtype_override.as_deref(),
-            is_custom_voice_model,
-            is_voice_clone_model,
-        )?;
+        let layout = Qwen3TtsLoadLayout::resolve(&config, &device)?;
+        let dtype_plan = layout.dtypes;
         let (talker_state_dtype, predictor_state_dtype) =
             select_qwen3_tts_state_dtypes(&device, dtype_plan, kv_cache_dtype)?;
 
@@ -1566,8 +1979,12 @@ impl Qwen3TtsModel {
 
         // Load model weights
         let weights_path = model_dir.join("model.safetensors");
+        // On Metal each tensor is cast on the host and uploaded at its exact
+        // size, with a device synchronization every 256 MiB of uploads, so
+        // the F32 talker neither rounds up to powers of two nor keeps every
+        // BF16 upload alive until the load fence.
         let talker_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
+            metal_staged_safetensors(
                 std::slice::from_ref(&weights_path),
                 dtype_plan.talker,
                 &device.device,
@@ -1577,7 +1994,7 @@ impl Qwen3TtsModel {
             talker_vb.clone()
         } else {
             unsafe {
-                VarBuilder::from_mmaped_safetensors(
+                metal_staged_safetensors(
                     std::slice::from_ref(&weights_path),
                     dtype_plan.code_predictor,
                     &device.device,
@@ -1585,13 +2002,7 @@ impl Qwen3TtsModel {
             }
         };
 
-        // Load talker model
-        info!("Loading talker model...");
-        let talker = TalkerModel::load(config.talker_config.clone(), talker_vb.pp("talker"))?;
-
-        // Load code predictor
-        info!("Loading code predictor...");
-        let num_code_groups = config.talker_config.num_code_groups;
+        info!("Loading talker and code predictor...");
         // For 1.7B model, codec embeddings use talker.text_hidden_size (2048)
         // For 0.6B model, codec embeddings use code_predictor.hidden_size (1024)
         // Detect 1.7B by checking if talker.hidden_size differs from code_predictor.hidden_size
@@ -1600,11 +2011,41 @@ impl Qwen3TtsModel {
             // 1.7B case: codec embeddings use text_hidden_size dimension
             code_predictor_config.text_hidden_size = Some(config.talker_config.text_hidden_size);
         }
-        let code_predictor = CodePredictor::load(
-            code_predictor_config,
-            code_predictor_vb.pp("talker.code_predictor"),
-            num_code_groups,
+        let weight_only = qwen3_tts_weight_only_f16(&device, dtype_plan);
+        let ((talker, code_predictor), weight_precision) = load_weight_only_f16(
+            "Qwen3-TTS",
+            &weight_only,
+            &device.device,
+            |f16| {
+                load_qwen3_tts_transformers(
+                    &config.talker_config,
+                    &code_predictor_config,
+                    &talker_vb,
+                    &code_predictor_vb,
+                    f16,
+                    &weights_path,
+                )
+            },
+            |(talker, code_predictor)| {
+                qwen3_tts_weight_only_self_check(
+                    talker,
+                    code_predictor,
+                    &talker_vb,
+                    &code_predictor_vb,
+                    talker_state_dtype,
+                    predictor_state_dtype,
+                )
+            },
         )?;
+        info!(
+            "Qwen3-TTS projection weights: {} ({})",
+            if weight_precision.projections_f16 {
+                "F16"
+            } else {
+                "dense"
+            },
+            weight_precision.reason
+        );
 
         // Load speech tokenizer decoder
         info!("Loading speech tokenizer decoder...");
@@ -1613,6 +2054,7 @@ impl Qwen3TtsModel {
             &speech_tokenizer_path,
             device.device.clone(),
             dtype_plan.speech_tokenizer,
+            layout.tokenizer_encoder,
         )?;
 
         info!(
@@ -1625,6 +2067,11 @@ impl Qwen3TtsModel {
             predictor_state_dtype,
         );
         let kv_quantization = KvCacheQuantization::from_dtype_hint(kv_cache_dtype);
+        let speaker_encoder = if layout.speaker_encoder {
+            load_speaker_encoder(&config, &weights_path, &device.device)?
+        } else {
+            None
+        };
 
         Ok(Self {
             device,
@@ -1638,9 +2085,12 @@ impl Qwen3TtsModel {
             talker,
             code_predictor,
             speech_tokenizer,
+            speaker_encoder,
             config,
+            weight_precision,
             kv_page_size: kv_page_size.max(1),
             kv_quantization,
+            reference_cache: reference_cache::ReferenceCache::default(),
         })
     }
 
@@ -1675,6 +2125,7 @@ impl Qwen3TtsModel {
                 reference_prompt_ids.len(),
                 reference_frames,
                 has_language,
+                self.speaker_encoder.is_some(),
                 request.max_frames,
             )
         } else {
@@ -1786,7 +2237,7 @@ impl Qwen3TtsModel {
                 .checked_add(
                     self.speech_tokenizer
                         .reference_encode_temporary_upper_bound_bytes(
-                            30,
+                            MAX_REFERENCE_AUDIO_SECS,
                             self.speech_tokenizer_dtype.size_in_bytes(),
                         )?,
                 )
@@ -1795,6 +2246,51 @@ impl Qwen3TtsModel {
                 })?;
         }
         Ok((host.max(1), accelerator.max(1)))
+    }
+
+    /// What one request holds while it runs at the largest automatic budget
+    /// (one full prompt, the automatic frame cap), as (host, accelerator)
+    /// bytes: the larger of its prefill and its per-row decode workspace
+    /// (separate stages; decode includes one codec window), plus the output
+    /// buffer the runtime reserves. Load holds it out of the state fits
+    /// (P2.3).
+    pub(crate) fn request_envelope_bytes(&self) -> Result<(u64, u64)> {
+        let prompt = budget::QWEN3_TTS_STATE_PROMPT_TOKENS;
+        let frames = qwen3_tts_auto_max_output_frames();
+        let voice_clone = qwen3_tts_model_kind(&self.config).1;
+        let (prefill_host, prefill_accelerator) =
+            self.resumable_prefill_workspace_bytes(prompt, frames, voice_clone)?;
+        let (decode_host, decode_accelerator) =
+            self.continuous_decode_bounded_workspace_per_row_bytes(prompt, frames)?;
+        let output = u64::try_from(self.speech_tokenizer.decoded_sample_upper_bound(frames)?)
+            .ok()
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS request envelope overflow".into()))?;
+        let host = prefill_host
+            .max(decode_host)
+            .checked_add(output)
+            .ok_or_else(|| Error::Overloaded("Qwen3-TTS request envelope overflow".into()))?;
+        let reference_accelerator = if voice_clone {
+            self.speech_tokenizer
+                .reference_encode_temporary_upper_bound_bytes(
+                    MAX_REFERENCE_AUDIO_SECS,
+                    self.speech_tokenizer_dtype.size_in_bytes(),
+                )?
+        } else {
+            0
+        };
+        tracing::info!(
+            prompt_tokens = prompt,
+            frames,
+            prefill_host,
+            prefill_accelerator,
+            reference_accelerator,
+            decode_host,
+            decode_accelerator,
+            output_host = output,
+            "Qwen3-TTS request envelope terms (prefill includes the reference encode)"
+        );
+        Ok((host, prefill_accelerator.max(decode_accelerator)))
     }
 
     /// Frame-bounded scheduler accounting for one continuously decoded row.
@@ -1822,7 +2318,7 @@ impl Qwen3TtsModel {
             .ok_or_else(|| Error::Overloaded("Qwen3-TTS codec history overflow".into()))?;
         let codec_host = checked_bytes(codec_elements, std::mem::size_of::<u32>(), "codec host")?;
         let semantic_host = checked_bytes(
-            frames.min(256),
+            frames.min(self.config.talker_config.vocab_size),
             std::mem::size_of::<u32>(),
             "semantic history",
         )?;
@@ -1892,8 +2388,12 @@ impl Qwen3TtsModel {
             vocab_size: self.config.talker_config.vocab_size,
             text_vocab_size: self.config.talker_config.text_vocab_size,
             num_code_groups: self.config.talker_config.num_code_groups,
+            weight_precision: self.weight_precision.diagnostics(),
             device_sampling: qwen_tts_uses_device_sampling(&self.device),
             cuda_sampling: self.device.kind.is_cuda(),
+            codec_decode: self.speech_tokenizer.decode_stats(),
+            host_readbacks_total: qwen3_tts_host_readbacks(),
+            reference_cache: self.reference_cache.stats(),
         }
     }
 
@@ -2019,10 +2519,11 @@ impl Qwen3TtsModel {
         let retained_tokens = prefill_tokens
             .checked_add(trailing_tokens)
             .ok_or_else(|| Error::InferenceError("Qwen3-TTS retained sequence overflow".into()))?;
-        if retained_tokens > self.config.talker_config.max_position_embeddings {
-            return Err(Error::InferenceError(format!(
-                "Qwen3-TTS prepared and trailing memory require {retained_tokens} tokens, exceeding context {}",
-                self.config.talker_config.max_position_embeddings
+        let retained_limit =
+            qwen3_tts_retained_memory_tokens(self.config.talker_config.max_position_embeddings);
+        if retained_tokens > retained_limit {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3-TTS prompt and text need {retained_tokens} tokens, above the {retained_limit} one request may hold; split the text"
             )));
         }
         let retained_sequence_memory = Tensor::cat(&[&prefill_embeds, &trailing_text_hidden], 1)?;
@@ -2045,7 +2546,18 @@ impl Qwen3TtsModel {
         language: Option<&str>,
         params: &TtsGenerationParams,
     ) -> Result<PreparedTtsDecodePrefill> {
-        let ref_codec_tokens = self.encode_reference_audio(reference)?;
+        // The same reference (a saved voice, each long-form segment) is
+        // encoded once and then served from the cache (TPIPE-23).
+        let prepared = self.reference_cache.get_or_prepare(
+            reference_cache::ReferenceCache::key(&reference.audio_samples, reference.sample_rate),
+            || {
+                Ok(reference_cache::PreparedReference {
+                    codes: self.encode_reference_audio(reference)?,
+                    speaker_embedding: self.reference_speaker_embedding(reference)?,
+                })
+            },
+        )?;
+        let ref_codec_tokens = prepared.codes;
         if ref_codec_tokens.is_empty() || ref_codec_tokens[0].is_empty() {
             return Err(Error::ModelError(
                 "Voice cloning reference encoder produced no conditioning tokens".to_string(),
@@ -2071,8 +2583,13 @@ impl Qwen3TtsModel {
         }
 
         let language_id = self.resolve_language_id(language);
-        let base_prefill =
-            self.build_conditioned_prefill_embeddings(&[], None, language_id, None)?;
+        let speaker_embedding = prepared.speaker_embedding;
+        let base_prefill = self.build_conditioned_prefill_embeddings(
+            &[],
+            speaker_embedding.as_ref().map(SpeakerPrefix::Embedding),
+            language_id,
+            None,
+        )?;
         let tts_pad_embed = self
             .talker
             .get_projected_special_embed(self.specials.tts_pad_token_id)?;
@@ -2139,7 +2656,7 @@ impl Qwen3TtsModel {
         let instruct_ids = self.encode_instruction_ids(instruct)?;
         let prefill_embeds = self.build_conditioned_prefill_embeddings(
             &prompt_ids,
-            Some(speaker_id),
+            Some(SpeakerPrefix::Id(speaker_id)),
             language_id,
             instruct_ids.as_deref(),
         )?;
@@ -2283,12 +2800,8 @@ impl Qwen3TtsModel {
                 sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
             }));
         }
-        let mut next_semantic_history = state.semantic_history.clone();
-        next_semantic_history.push(semantic_token);
-        if next_semantic_history.len() > 256 {
-            let drain = next_semantic_history.len() - 256;
-            next_semantic_history.drain(0..drain);
-        }
+        let next_semantic_history =
+            record_semantic_history(&state.semantic_history, semantic_token);
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let talker_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
@@ -2320,6 +2833,7 @@ impl Qwen3TtsModel {
                 expected_tensor_sequence: state.tensor_sequence,
                 next_rng,
                 next_semantic_history,
+                subtalker: state.params.subtalker,
                 sampling_ms: sampling_started.elapsed().as_secs_f64() * 1000.0,
             },
         ))
@@ -2332,7 +2846,7 @@ impl Qwen3TtsModel {
     /// acoustic embedding or step-input construction fails.
     pub fn tts_predictor_stage_batch_physical(
         &self,
-        rows: Vec<PreparedTtsPredictorStage>,
+        mut rows: Vec<PreparedTtsPredictorStage>,
         caches: &mut [&mut CodePredictorPhysicalCache],
     ) -> Result<Vec<PreparedTtsTalkerStage>> {
         if rows.is_empty() || rows.len() != caches.len() {
@@ -2360,11 +2874,32 @@ impl Qwen3TtsModel {
             .map(|cache| cache.context_len())
             .collect::<Vec<_>>();
         let predictor_started = Instant::now();
-        let acoustic = self.code_predictor.generate_acoustic_codes_physical_batch(
-            &talker_hidden,
-            &semantic_embeds,
-            caches,
-        )?;
+        // Each row keeps drawing from its own post-semantic RNG; the advanced
+        // state commits with the talker step, like the semantic draw.
+        let mut rngs = rows.iter().map(|row| row.next_rng).collect::<Vec<_>>();
+        let acoustic = {
+            let mut draws = rngs
+                .iter_mut()
+                .map(|rng| move || rng.next_f32())
+                .collect::<Vec<_>>();
+            let mut selections = rows
+                .iter()
+                .zip(draws.iter_mut())
+                .map(|(row, draw)| CodeSelection::Sample {
+                    params: row.subtalker,
+                    draw,
+                })
+                .collect::<Vec<_>>();
+            self.code_predictor.generate_acoustic_codes_physical_batch(
+                &talker_hidden,
+                &semantic_embeds,
+                caches,
+                &mut selections,
+            )?
+        };
+        for (row, rng) in rows.iter_mut().zip(rngs) {
+            row.next_rng = rng;
+        }
         let predictor_ms = predictor_started.elapsed().as_secs_f64() * 1000.0;
         let result = rows
             .into_iter()
@@ -2807,23 +3342,26 @@ impl Qwen3TtsModel {
             });
         }
 
-        let mut next_semantic_history = state.semantic_history.clone();
-        next_semantic_history.push(semantic_token);
-        if next_semantic_history.len() > 256 {
-            let drain = next_semantic_history.len() - 256;
-            next_semantic_history.drain(0..drain);
-        }
+        let next_semantic_history =
+            record_semantic_history(&state.semantic_history, semantic_token);
 
         let predictor_start = Instant::now();
         let semantic_embed = self.talker.get_codec_embedding(semantic_token)?;
         let last_hidden = state.last_hidden.as_ref().ok_or_else(|| {
             Error::InferenceError("Qwen3-TTS last hidden state is not hydrated".into())
         })?;
-        let acoustic_codes = self.code_predictor.generate_acoustic_codes_physical(
-            last_hidden,
-            &semantic_embed,
-            predictor_cache,
-        )?;
+        let acoustic_codes = {
+            let mut draw = || next_rng.next_f32();
+            self.code_predictor.generate_acoustic_codes_physical(
+                last_hidden,
+                &semantic_embed,
+                predictor_cache,
+                &mut CodeSelection::Sample {
+                    params: state.params.subtalker,
+                    draw: &mut draw,
+                },
+            )?
+        };
         let acoustic_embed_sum = self
             .code_predictor
             .get_acoustic_embeddings_sum(&acoustic_codes)?;
@@ -2974,6 +3512,10 @@ impl Qwen3TtsModel {
             return Ok((icl_input, tts_pad_embed.clone()));
         }
 
+        debug_assert_eq!(
+            voice_clone_icl_prefill_tokens(text_lens, codec_lens),
+            codec_lens
+        );
         if text_lens > codec_lens {
             let text_prefix = text_embed.i((.., ..codec_lens, ..))?;
             let trailing = text_embed.i((.., codec_lens.., ..))?;
@@ -3215,12 +3757,13 @@ impl Qwen3TtsModel {
             last_hidden,
             last_logits,
             tensor_sequence: None,
-            rng: SimpleRng::new(),
+            rng: SimpleRng::seeded(prepared.params.seed),
             params: prepared.params,
             stream_config,
             emitted_frames: 0,
             emitted_samples: 0,
             decode_raw_token_scratch: Vec::new(),
+            codec_stream: None,
             finished: false,
         })
     }
@@ -3236,6 +3779,7 @@ impl Qwen3TtsModel {
             &mut state.emitted_frames,
             &mut state.emitted_samples,
             &mut state.decode_raw_token_scratch,
+            &mut state.codec_stream,
             force,
         )
     }
@@ -3247,6 +3791,7 @@ impl Qwen3TtsModel {
         emitted_frames: &mut usize,
         emitted_samples: &mut usize,
         decode_raw_token_scratch: &mut Vec<Vec<u32>>,
+        codec_stream: &mut Option<SpeechTokenizerStream>,
         force: bool,
     ) -> Result<Vec<f32>> {
         let total_frames = codec_groups.first().map(Vec::len).unwrap_or(0);
@@ -3264,54 +3809,75 @@ impl Qwen3TtsModel {
             }
         }
 
-        let lookahead = if force {
-            0
-        } else {
-            stream_config.decode_lookahead_frames
-        };
-        let target_frames = total_frames.saturating_sub(lookahead);
-        if target_frames <= *emitted_frames {
-            return Ok(Vec::new());
-        }
-
         for group in codec_groups {
-            if group.len() < target_frames {
+            if group.len() < total_frames {
                 return Ok(Vec::new());
             }
         }
-
-        if self.device.kind.is_cuda() && !force && qwen_tts_cuda_chunked_codec_stream_enabled() {
-            let (samples, next_emitted_frames, next_emitted_samples) = self
-                .decode_cuda_stream_chunk(
-                    codec_groups,
-                    *emitted_frames,
-                    *emitted_samples,
-                    target_frames,
-                    stream_config,
-                    decode_raw_token_scratch,
-                )?;
-            *emitted_frames = next_emitted_frames;
-            *emitted_samples = next_emitted_samples;
-            return Ok(samples);
+        if force && *emitted_frames == 0 {
+            // Nothing streamed: one whole-utterance decode, finished exactly
+            // as streamed audio is.
+            self.fill_raw_codec_scratch(codec_groups, total_frames, decode_raw_token_scratch)?;
+            let decoded = self.decode_raw_codec_tokens(decode_raw_token_scratch)?;
+            *emitted_frames = total_frames;
+            *emitted_samples = decoded.len();
+            return Ok(decoded);
         }
-
-        self.fill_raw_codec_scratch(codec_groups, target_frames, decode_raw_token_scratch)?;
-        let decoded = self.decode_raw_codec_tokens(decode_raw_token_scratch)?;
-        if decoded.len() <= *emitted_samples {
-            *emitted_frames = target_frames;
+        if total_frames <= *emitted_frames {
             return Ok(Vec::new());
         }
+        // Streaming (QTTS-5): the decoder is causal, so each emission decodes
+        // only its new frames against bounded contexts and returns exactly
+        // the whole decode's samples for them: no prefix re-decode, no
+        // lookahead, and no loudness normalization on either path (the
+        // reference streams the raw clamped waveform).
+        if codec_stream.is_none() && *emitted_frames != 0 {
+            return Err(Error::InferenceError(
+                "Qwen3-TTS codec stream state is missing after emitted audio".into(),
+            ));
+        }
+        let stream = codec_stream.get_or_insert_with(|| self.speech_tokenizer.start_stream());
+        self.fill_raw_codec_scratch_range(
+            codec_groups,
+            *emitted_frames,
+            total_frames,
+            decode_raw_token_scratch,
+        )?;
+        let mut samples = self
+            .speech_tokenizer
+            .decode_stream_step(stream, decode_raw_token_scratch)?;
+        finish_decoded_audio(&mut samples);
+        record_qwen3_tts_codec_stream_frames(total_frames - *emitted_frames);
+        *emitted_frames = total_frames;
+        *emitted_samples += samples.len();
+        Ok(samples)
+    }
 
-        let new_samples = decoded[*emitted_samples..].to_vec();
-        *emitted_samples = decoded.len();
-        *emitted_frames = target_frames;
-        Ok(new_samples)
+    /// The voice-clone x-vector as the reference computes it: the ECAPA
+    /// encoder over the reference audio resampled to 24 kHz, shaped
+    /// `[1, 1, hidden]` in the codec-embedding dtype. `None` for checkpoints
+    /// without a speaker encoder.
+    fn reference_speaker_embedding(&self, reference: &SpeakerReference) -> Result<Option<Tensor>> {
+        let Some(encoder) = &self.speaker_encoder else {
+            return Ok(None);
+        };
+        let samples = crate::audio::resample_mono_high_quality(
+            &reference.audio_samples,
+            reference.sample_rate,
+            encoder.config().sample_rate,
+        )?;
+        let embedding = encoder.embed_samples(&samples, &self.device.device)?;
+        Ok(Some(
+            embedding
+                .reshape((1, 1, encoder.config().enc_dim))?
+                .to_dtype(self.dtype)?,
+        ))
     }
 
     fn build_conditioned_prefill_embeddings(
         &self,
         prompt_ids: &[u32],
-        speaker_id: Option<u32>,
+        speaker: Option<SpeakerPrefix<'_>>,
         language_id: Option<u32>,
         instruct_ids: Option<&[u32]>,
     ) -> Result<Tensor> {
@@ -3336,20 +3902,32 @@ impl Qwen3TtsModel {
                 self.specials.codec_think_eos_id,
             ]);
         }
-        if let Some(speaker_id) = speaker_id {
+        let tags = codec_prefix_ids.len();
+        if let Some(SpeakerPrefix::Id(speaker_id)) = speaker {
             codec_prefix_ids.push(speaker_id);
         }
         codec_prefix_ids.push(self.specials.codec_pad_id);
         codec_prefix_ids.push(self.specials.codec_bos_id);
 
-        let prefix_len = codec_prefix_ids.len();
+        let mut codec_prefix = self.talker.get_codec_embedding_batch(&codec_prefix_ids)?;
+        if let Some(SpeakerPrefix::Embedding(embedding)) = speaker {
+            // The reference splices the x-vector between the tags and pad/BOS.
+            codec_prefix = Tensor::cat(
+                &[
+                    &codec_prefix.i((.., ..tags, ..))?,
+                    embedding,
+                    &codec_prefix.i((.., tags.., ..))?,
+                ],
+                1,
+            )?;
+        }
+        let prefix_len = codec_prefix.dim(1)?;
         if prefix_len < 2 {
             return Err(Error::InferenceError(
                 "Invalid codec prefix while building conditioned prefill".to_string(),
             ));
         }
 
-        let codec_prefix = self.talker.get_codec_embedding_batch(&codec_prefix_ids)?;
         let codec_without_last = codec_prefix.i((.., ..prefix_len - 1, ..))?;
 
         let mut tts_overlay_ids = vec![self.specials.tts_pad_token_id; prefix_len - 2];
@@ -3445,38 +4023,6 @@ impl Qwen3TtsModel {
         self.decode_raw_codec_tokens(&raw_codec_tokens)
     }
 
-    fn decode_cuda_stream_chunk(
-        &self,
-        codec_tokens: &[Vec<u32>],
-        emitted_frames: usize,
-        emitted_samples: usize,
-        target_frames: usize,
-        stream_config: TtsStreamingConfig,
-        scratch: &mut Vec<Vec<u32>>,
-    ) -> Result<(Vec<f32>, usize, usize)> {
-        let context_frames = emitted_frames.min(
-            stream_config
-                .decode_lookahead_frames
-                .max(stream_config.decode_interval_frames)
-                .max(4),
-        );
-        let start_frame = emitted_frames.saturating_sub(context_frames);
-        let chunk_frames = target_frames.saturating_sub(start_frame);
-        if chunk_frames == 0 {
-            return Ok((Vec::new(), emitted_frames, emitted_samples));
-        }
-
-        self.fill_raw_codec_scratch_range(codec_tokens, start_frame, target_frames, scratch)?;
-        let decoded = self.decode_raw_codec_tokens(scratch)?;
-        let skip_samples = decoded
-            .len()
-            .saturating_mul(emitted_frames.saturating_sub(start_frame))
-            / chunk_frames;
-        let new_samples = decoded.get(skip_samples..).unwrap_or(&[]).to_vec();
-        let emitted_samples = emitted_samples.saturating_add(new_samples.len());
-        Ok((new_samples, target_frames, emitted_samples))
-    }
-
     fn fill_raw_codec_scratch(
         &self,
         codec_tokens: &[Vec<u32>],
@@ -3533,7 +4079,7 @@ impl Qwen3TtsModel {
             return Ok(Vec::new());
         }
         let mut audio = self.speech_tokenizer.decode(raw_codec_tokens)?;
-        normalize_audio(&mut audio);
+        finish_decoded_audio(&mut audio);
         Ok(audio)
     }
 
@@ -3580,21 +4126,6 @@ fn raw_codec_token(
     }
 }
 
-pub(crate) fn qwen_tts_cuda_chunked_codec_stream_enabled() -> bool {
-    qwen_tts_cuda_chunked_codec_stream_enabled_from(
-        std::env::var(ENV_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM)
-            .ok()
-            .as_deref(),
-    )
-}
-
-fn qwen_tts_cuda_chunked_codec_stream_enabled_from(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
 /// Argmax sampling for greedy decoding
 fn argmax(logits: &Tensor) -> Result<u32> {
     let logits = match logits.rank() {
@@ -3622,12 +4153,14 @@ fn argmax(logits: &Tensor) -> Result<u32> {
     } else {
         idx.squeeze(0)?
     };
+    record_qwen3_tts_host_readback();
     idx.to_dtype(DType::U32)?
         .to_scalar::<u32>()
         .map_err(Error::from)
 }
 
 fn logit_scalar_f32(logits: &Tensor, idx: u32) -> Result<f32> {
+    record_qwen3_tts_host_readback();
     logits
         .i(idx as usize)?
         .to_dtype(DType::F32)?
@@ -3660,63 +4193,34 @@ fn argmax_semantic(
         }
     };
 
+    // One device argmax over the allowed codes (semantic codes, plus EOS when
+    // allowed), one readback. Ties keep the lower index, so a semantic code
+    // tied with EOS wins as before.
     let vocab_len = logits.dim(0)?;
     let semantic_len = (semantic_vocab_size as usize).min(vocab_len);
-    let mut best_idx = if semantic_len > 0 {
-        let semantic_logits = logits.narrow(0, 0, semantic_len)?;
-        Some(argmax(&semantic_logits)?)
-    } else {
-        None
-    };
-    let best_val = if let Some(idx) = best_idx {
-        logit_scalar_f32(&logits, idx)?
-    } else {
-        f32::NEG_INFINITY
-    };
-
-    let eos_idx = eos_token_id as usize;
-    if allow_eos && eos_idx < vocab_len && eos_idx >= semantic_len {
-        let eos_val = logit_scalar_f32(&logits, eos_token_id)?;
-        if eos_val > best_val {
-            best_idx = Some(eos_token_id);
-        }
+    let (sampling_vocab, allowed) =
+        semantic_sampling_vocab_and_mask(vocab_len, semantic_len, eos_token_id, allow_eos);
+    if sampling_vocab == 0 {
+        return Ok(if allow_eos { eos_token_id } else { 0 });
     }
-
-    if let Some(idx) = best_idx {
-        Ok(idx)
-    } else if allow_eos {
-        Ok(eos_token_id)
-    } else {
-        Ok(0)
+    let mut row = logits.narrow(0, 0, sampling_vocab)?.to_dtype(DType::F32)?;
+    if allowed.iter().any(|allowed| !allowed) {
+        let mask = allowed.iter().map(|&a| u8::from(a)).collect::<Vec<_>>();
+        let mask = Tensor::from_vec(mask, sampling_vocab, row.device())?;
+        let blocked = Tensor::full(f32::NEG_INFINITY, sampling_vocab, row.device())?;
+        row = mask.where_cond(&row, &blocked)?;
     }
+    argmax(&row)
 }
 
-fn argmax_semantic_reference(
-    logits: &Tensor,
+/// Host argmax over the allowed semantic codes (and EOS when allowed) of
+/// already read-back logits; the first index wins ties.
+fn argmax_semantic_values(
+    values: &[f32],
     semantic_vocab_size: u32,
     eos_token_id: u32,
     allow_eos: bool,
-) -> Result<u32> {
-    let logits = logits.to_dtype(DType::F32)?;
-    let logits = match logits.rank() {
-        1 => logits,
-        2 => {
-            let (rows, _cols) = logits.dims2()?;
-            if rows != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected Qwen3-TTS semantic logits shape: {:?}",
-                    logits.shape().dims()
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected Qwen3-TTS semantic logits rank: {rank}"
-            )))
-        }
-    };
-    let values = logits.to_vec1::<f32>()?;
+) -> u32 {
     let mut max_idx: Option<usize> = None;
     let mut max_val = f32::NEG_INFINITY;
 
@@ -3733,11 +4237,11 @@ fn argmax_semantic_reference(
     }
 
     if let Some(idx) = max_idx {
-        Ok(idx as u32)
+        idx as u32
     } else if allow_eos {
-        Ok(eos_token_id)
+        eos_token_id
     } else {
-        Ok(0)
+        0
     }
 }
 
@@ -3801,6 +4305,7 @@ fn sample_semantic(
         0.0,
         Some(&allowed_mask),
     )? {
+        record_qwen3_tts_host_readback();
         if device_candidates_cover_top_p(&candidates, params.top_p) {
             if let Some(token) = sample_device_candidates(&candidates, params.top_p, rng.next_f32())
             {
@@ -3957,7 +4462,18 @@ fn sample_semantic_reference(
             )))
         }
     };
+    record_qwen3_tts_host_readback();
     let mut values = logits.to_vec1::<f32>()?;
+    // Greedy decodes the raw logits (no penalty), from this one readback.
+    if params.temperature <= 1e-5 {
+        return Ok(argmax_semantic_values(
+            &values,
+            semantic_vocab_size,
+            eos_token_id,
+            allow_eos,
+        ));
+    }
+    let raw_values = values.clone();
 
     // Token suppression: keep semantic range and optional EOS only.
     for (idx, v) in values.iter_mut().enumerate() {
@@ -3993,11 +4509,6 @@ fn sample_semantic_reference(
         }
     }
 
-    // Greedy fallback when sampling is effectively disabled.
-    if params.temperature <= 1e-5 {
-        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
-    }
-
     let temperature = params.temperature.max(1e-5);
     for v in values.iter_mut() {
         if v.is_finite() {
@@ -4031,7 +4542,12 @@ fn sample_semantic_reference(
 
     let mut sum: f32 = probs.iter().map(|(_, p)| *p).sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return argmax_semantic_reference(&logits, semantic_vocab_size, eos_token_id, allow_eos);
+        return Ok(argmax_semantic_values(
+            &raw_values,
+            semantic_vocab_size,
+            eos_token_id,
+            allow_eos,
+        ));
     }
     for (_, p) in probs.iter_mut() {
         *p /= sum;
@@ -4101,6 +4617,8 @@ fn collect_semantic_sampling_values(
         };
         let prefetch = params.top_k.saturating_add(penalty_extra).min(semantic_len);
         let (sorted_values, sorted_indices) = semantic_logits.sort_last_dim(false)?;
+        record_qwen3_tts_host_readback();
+        record_qwen3_tts_host_readback();
         let values = sorted_values.narrow(0, 0, prefetch)?.to_vec1::<f32>()?;
         let indices = sorted_indices
             .narrow(0, 0, prefetch)?
@@ -4109,6 +4627,7 @@ fn collect_semantic_sampling_values(
         return Ok(indices.into_iter().zip(values).collect());
     }
 
+    record_qwen3_tts_host_readback();
     Ok(semantic_logits
         .to_vec1::<f32>()?
         .into_iter()
@@ -4123,6 +4642,17 @@ struct SimpleRng {
 }
 
 impl SimpleRng {
+    /// A seeded generator, or a clock-seeded one for seed 0.
+    fn seeded(seed: u64) -> Self {
+        if seed == 0 {
+            Self::new()
+        } else {
+            Self {
+                state: seed ^ 0xA076_1D64_78BD_642F,
+            }
+        }
+    }
+
     fn new() -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4148,76 +4678,16 @@ impl SimpleRng {
     }
 }
 
-fn normalize_audio(samples: &mut [f32]) {
-    if samples.is_empty() {
-        return;
-    }
-
-    // Drop non-finite values and remove DC offset.
-    let mut sum = 0.0f64;
-    let mut count = 0usize;
-    for s in samples.iter_mut() {
-        if !s.is_finite() {
-            *s = 0.0;
-            continue;
-        }
-        sum += *s as f64;
-        count += 1;
-    }
-    if count > 0 {
-        let mean = (sum / count as f64) as f32;
-        for s in samples.iter_mut() {
-            *s -= mean;
-        }
-    }
-
-    // Peak normalize to avoid hard clipping in WAV encoder.
-    let mut peak = 0.0f32;
-    for &s in samples.iter() {
-        let a = s.abs();
-        if a > peak {
-            peak = a;
-        }
-    }
-    if peak > 0.95 {
-        let scale = 0.95 / peak;
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-    }
-
-    // Keep output loudness within a practical band for WAV playback.
-    let mut power = 0.0f64;
-    for &s in samples.iter() {
-        power += (s as f64) * (s as f64);
-    }
-    let rms = (power / samples.len() as f64).sqrt() as f32;
-    let max_rms = 0.12f32;
-    let min_rms = 0.04f32;
-    if rms > max_rms && rms > 1e-6 {
-        let scale = max_rms / rms;
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-    } else if rms < min_rms && rms > 1e-6 {
-        let scale = (min_rms / rms).min(8.0);
-        for s in samples.iter_mut() {
-            *s *= scale;
-        }
-
-        // Re-apply peak guard after boosting.
-        let mut peak = 0.0f32;
-        for &s in samples.iter() {
-            let a = s.abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-        if peak > 0.95 {
-            let scale = 0.95 / peak;
-            for s in samples.iter_mut() {
-                *s *= scale;
-            }
+/// The treatment every decoded sample gets, streamed or not: the codec has
+/// already clamped it to [-1, 1], and a non-finite sample is silenced. No
+/// whole-utterance gain is applied to either path (a stream cannot know the
+/// utterance's peak or loudness before it ends, and the reference returns
+/// the raw clamped waveform), so a stream concatenates to exactly the
+/// non-stream output.
+fn finish_decoded_audio(samples: &mut [f32]) {
+    for sample in samples.iter_mut() {
+        if !sample.is_finite() {
+            *sample = 0.0;
         }
     }
 }
@@ -4230,7 +4700,7 @@ pub fn load_model(model_path: &Path, device: DeviceProfile) -> Result<Qwen3TtsMo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::backends::state::{negotiate_state_plan, StateBackendPlanRequest};
     use crate::backends::{BackendKind, DeviceCapabilities, DeviceKind};
     use crate::engine::{
@@ -4257,7 +4727,8 @@ mod tests {
         }
     }
 
-    fn cache_test_config() -> Qwen3TtsConfig {
+    /// Real Qwen3-TTS-12Hz-0.6B talker and predictor geometry.
+    pub(crate) fn cache_test_config() -> Qwen3TtsConfig {
         Qwen3TtsConfig {
             architectures: vec!["Qwen3TTSForConditionalGeneration".to_string()],
             model_type: "qwen3_tts".to_string(),
@@ -4270,6 +4741,7 @@ mod tests {
             tts_bos_token_id: 151672,
             tts_eos_token_id: 151673,
             tts_pad_token_id: 151671,
+            speaker_encoder_config: None,
             talker_config: TalkerConfig {
                 model_type: "qwen3_tts_talker".to_string(),
                 hidden_size: 1024,
@@ -4523,14 +4995,17 @@ mod tests {
 
         assert_eq!(tensor.sequence_capacity(), 16);
         assert_eq!(tensor.transaction_capacity(), 16);
-        assert_eq!(tensor.per_sequence_bytes(), 67_119_104);
-        assert_eq!(tensor.authorized_bytes(), 2_147_811_328);
+        // The encoder memory row holds the 2,524-token state floor (one
+        // prompt plus 120 s of frames), not the 32,768 position embeddings
+        // (67,119,104 B a row).
+        assert_eq!(tensor.per_sequence_bytes(), 2_524 * 1_024 * 2 + 10_240);
+        assert_eq!(tensor.authorized_bytes(), 32 * (2_524 * 1_024 * 2 + 10_240));
 
         // Before the shared page/row fix, the 512 pages needed by one 32K
         // context were treated as 512 retained sequences and added to the 16
         // transaction rows. That 35.4 GB state claim alone can reject a model
         // load on a 48 GB L40S after weights are resident.
-        let legacy_authorization = tensor.per_sequence_bytes() * (512 + 16);
+        let legacy_authorization = 67_119_104_u64 * (512 + 16);
         assert_eq!(legacy_authorization, 35_438_886_912);
         assert_eq!(
             allocation
@@ -4720,6 +5195,7 @@ mod tests {
             emitted_frames: 0,
             emitted_samples: 0,
             decode_raw_token_scratch: Vec::new(),
+            codec_stream: None,
             finished: false,
         }
     }
@@ -4780,6 +5256,7 @@ mod tests {
                     state: state.rng.state.wrapping_add(1),
                 },
                 next_semantic_history: next_history,
+                subtalker: SubtalkerSampling::default(),
                 sampling_ms: 1.0,
             },
             acoustic_codes: vec![1, 2, 3],
@@ -5036,22 +5513,64 @@ mod tests {
         assert_eq!(capped.talker_cache_tokens(), Some(127));
 
         let small_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, 8, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, 8, false, false, 64).unwrap();
         let large_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, 200, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, 200, false, false, 64).unwrap();
         let capped_reference =
-            voice_clone_session_cache_layout(2_048, 20, 15, usize::MAX, false, 64).unwrap();
+            voice_clone_session_cache_layout(2_048, 20, 15, usize::MAX, false, false, 64).unwrap();
         let explicit_cap = voice_clone_session_cache_layout(
             2_048,
             20,
             15,
             MAX_VOICE_CLONE_REFERENCE_FRAMES,
             false,
+            false,
             64,
         )
         .unwrap();
         assert!(large_reference.prefill_tokens > small_reference.prefill_tokens);
         assert_eq!(capped_reference, explicit_cap);
+    }
+
+    /// QTTS-8: the voice-clone layout prices exactly the prefill the ICL
+    /// block builds, base + reference frames + codec BOS, whether the
+    /// reference + target text is shorter or longer than the reference
+    /// codes. A 3 s reference (38 frames) with a long target used to be
+    /// authorized for more tokens than were prepared, failing the request.
+    #[test]
+    fn voice_clone_layout_prefill_matches_the_icl_block_for_any_text_length() {
+        let base = conditioned_prefill_tokens(0, false, false, 0).unwrap();
+        // prompt = 8 framing + target tokens; reference = 5 framing + text.
+        for (target, reference, frames) in [(4, 3, 38), (40, 30, 38), (300, 40, 38), (5, 5, 400)] {
+            let layout = voice_clone_session_cache_layout(
+                4_096,
+                target + 8,
+                reference + 5,
+                frames,
+                false,
+                false,
+                64,
+            )
+            .unwrap();
+            let codec_tokens = frames.min(MAX_VOICE_CLONE_REFERENCE_FRAMES) + 1;
+            // QTTS-7: the x-vector takes one codec-prefix slot.
+            let with_xvector = voice_clone_session_cache_layout(
+                4_096,
+                target + 8,
+                reference + 5,
+                frames,
+                false,
+                true,
+                64,
+            )
+            .unwrap();
+            assert_eq!(with_xvector.prefill_tokens, layout.prefill_tokens + 1);
+            assert_eq!(
+                layout.prefill_tokens,
+                base + codec_tokens,
+                "target {target}, reference {reference}, frames {frames}"
+            );
+        }
     }
 
     #[test]
@@ -5109,15 +5628,10 @@ mod tests {
         let metal_base = select_qwen3_tts_dtypes(&metal, None, false, true).unwrap();
         assert_eq!(metal_base, metal_custom);
 
+        // VoiceDesign computes in F32 like the others; its residency comes
+        // from the weight-only F16 tier (QTTS-10).
         let metal_voice_design = select_qwen3_tts_dtypes(&metal, None, false, false).unwrap();
-        assert_eq!(
-            metal_voice_design,
-            Qwen3TtsDTypePlan {
-                talker: DType::F16,
-                code_predictor: DType::F16,
-                speech_tokenizer: DType::F16,
-            }
-        );
+        assert_eq!(metal_voice_design, metal_custom);
     }
 
     #[test]
@@ -5140,6 +5654,329 @@ mod tests {
             select_qwen3_tts_state_dtypes(&cpu, cpu_compute, "float16").unwrap(),
             (DType::F32, DType::F32)
         );
+    }
+
+    /// NR-3: the shared `IZWI_QWEN_DTYPE` (Qwen ASR and chat) must not
+    /// change Qwen3-TTS precision, and a lower-precision TTS override on
+    /// Metal CustomVoice/Base is refused instead of corrupting speech.
+    #[test]
+    fn qwen_tts_precision_ignores_shared_qwen_dtype_and_refuses_low_precision_on_metal() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = (
+            std::env::var("IZWI_QWEN_DTYPE").ok(),
+            std::env::var(QWEN3_TTS_DTYPE_ENV).ok(),
+        );
+        std::env::set_var("IZWI_QWEN_DTYPE", "f16");
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        assert_eq!(qwen3_tts_dtype_override(), None);
+        std::env::set_var(QWEN3_TTS_DTYPE_ENV, "bf16");
+        assert_eq!(qwen3_tts_dtype_override().as_deref(), Some("bf16"));
+        for (name, value) in [
+            ("IZWI_QWEN_DTYPE", previous.0),
+            (QWEN3_TTS_DTYPE_ENV, previous.1),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        for (custom_voice, clone) in [(true, false), (false, true)] {
+            for raw in ["f16", "bf16"] {
+                let error = select_qwen3_tts_dtypes(&metal, Some(raw), custom_voice, clone)
+                    .expect_err("low-precision CustomVoice/Base must be refused on Metal");
+                assert!(error.to_string().contains(QWEN3_TTS_DTYPE_ENV), "{error}");
+            }
+            assert_eq!(
+                select_qwen3_tts_dtypes(&metal, Some("f32"), custom_voice, clone)
+                    .unwrap()
+                    .talker,
+                DType::F32
+            );
+        }
+        // VoiceDesign already runs at F16 on Metal by default.
+        assert_eq!(
+            select_qwen3_tts_dtypes(&metal, Some("f16"), false, false)
+                .unwrap()
+                .talker,
+            DType::F16
+        );
+    }
+
+    /// QTTS-10/11: on Metal every Qwen3-TTS variant takes weight-only F16
+    /// for its talker and predictor (F32 compute), `IZWI_QWEN_TTS_DTYPE=f32`
+    /// keeps every weight F32, an explicit lower compute dtype keeps its dense
+    /// plan, and CPU/CUDA never take the tier. The load layout reports it.
+    #[test]
+    fn metal_qwen_tts_takes_weight_only_f16_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = (
+            std::env::var(QWEN3_TTS_DTYPE_ENV).ok(),
+            std::env::var("IZWI_METAL_DTYPE").ok(),
+        );
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+
+        let metal = dtype_test_profile(DeviceKind::Metal, true, true);
+        for (custom_voice, clone) in [(true, false), (false, true), (false, false)] {
+            let plan = select_qwen3_tts_dtypes(&metal, None, custom_voice, clone).unwrap();
+            assert_eq!(plan.talker, DType::F32);
+            let tier = qwen3_tts_weight_only_f16(&metal, plan);
+            assert_eq!(tier.dtype, DType::F16, "{}", tier.reason);
+        }
+        std::env::set_var(QWEN3_TTS_DTYPE_ENV, "f32");
+        let plan = select_qwen3_tts_dtypes(&metal, Some("f32"), true, false).unwrap();
+        assert_eq!(qwen3_tts_weight_only_f16(&metal, plan).dtype, DType::F32);
+        std::env::remove_var(QWEN3_TTS_DTYPE_ENV);
+        let voice_design_f16 = select_qwen3_tts_dtypes(&metal, Some("f16"), false, false).unwrap();
+        assert_eq!(voice_design_f16.talker, DType::F16);
+        assert_eq!(
+            qwen3_tts_weight_only_f16(&metal, voice_design_f16).dtype,
+            DType::F32
+        );
+        for kind in [DeviceKind::Cpu, DeviceKind::Cuda] {
+            let profile = dtype_test_profile(kind, true, true);
+            let plan = select_qwen3_tts_dtypes(&profile, None, true, false).unwrap();
+            assert_eq!(qwen3_tts_weight_only_f16(&profile, plan).dtype, DType::F32);
+        }
+
+        for (name, value) in [
+            (QWEN3_TTS_DTYPE_ENV, previous.0),
+            ("IZWI_METAL_DTYPE", previous.1),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    /// The tiny talker + predictor checkpoint for weight-only F16 tests:
+    /// xorshift weights (the MLP gate projections scaled by `gate_scale`)
+    /// under the names `load_qwen3_tts_transformers` reads.
+    fn tiny_transformer_tensors(
+        talker_cfg: &config::TalkerConfig,
+        gate_scale: f32,
+    ) -> std::collections::HashMap<String, Tensor> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        let device = candle_core::Device::Cpu;
+        let h = talker_cfg.hidden_size;
+        let p = &talker_cfg.code_predictor_config;
+        let mut shapes: Vec<(String, Vec<usize>)> = vec![
+            (
+                "talker.model.text_embedding.weight".into(),
+                vec![talker_cfg.text_vocab_size, talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc1.weight".into(),
+                vec![talker_cfg.text_hidden_size, talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc1.bias".into(),
+                vec![talker_cfg.text_hidden_size],
+            ),
+            (
+                "talker.text_projection.linear_fc2.weight".into(),
+                vec![h, talker_cfg.text_hidden_size],
+            ),
+            ("talker.text_projection.linear_fc2.bias".into(), vec![h]),
+            (
+                "talker.model.codec_embedding.weight".into(),
+                vec![talker_cfg.vocab_size, h],
+            ),
+            (
+                "talker.codec_head.weight".into(),
+                vec![talker_cfg.vocab_size, h],
+            ),
+        ];
+        let layer =
+            |prefix: &str, hidden: usize, inter: usize, heads: usize, kv: usize, hd: usize| {
+                vec![
+                    (
+                        format!("{prefix}.self_attn.q_proj.weight"),
+                        vec![heads * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.k_proj.weight"),
+                        vec![kv * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.v_proj.weight"),
+                        vec![kv * hd, hidden],
+                    ),
+                    (
+                        format!("{prefix}.self_attn.o_proj.weight"),
+                        vec![hidden, heads * hd],
+                    ),
+                    (
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        vec![inter, hidden],
+                    ),
+                    (format!("{prefix}.mlp.up_proj.weight"), vec![inter, hidden]),
+                    (
+                        format!("{prefix}.mlp.down_proj.weight"),
+                        vec![hidden, inter],
+                    ),
+                ]
+            };
+        shapes.extend(layer(
+            "talker.model.layers.0",
+            h,
+            talker_cfg.intermediate_size,
+            talker_cfg.num_attention_heads,
+            talker_cfg.num_key_value_heads,
+            talker_cfg.head_dim(),
+        ));
+        shapes.extend(layer(
+            "talker.code_predictor.model.layers.0",
+            p.hidden_size,
+            p.intermediate_size,
+            p.num_attention_heads,
+            p.num_key_value_heads,
+            p.head_dim(),
+        ));
+        for group in 0..talker_cfg.num_code_groups.min(15) {
+            shapes.push((
+                format!("talker.code_predictor.model.codec_embedding.{group}.weight"),
+                vec![p.vocab_size, p.hidden_size],
+            ));
+            shapes.push((
+                format!("talker.code_predictor.lm_head.{group}.weight"),
+                vec![p.vocab_size, p.hidden_size],
+            ));
+        }
+        let mut tensors = shapes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, shape))| {
+                let scale = if name.ends_with("mlp.gate_proj.weight") {
+                    gate_scale
+                } else {
+                    0.4
+                };
+                let tensor =
+                    xorshift_tensor(&shape, 0x9E37 + index as u64, scale, &device).unwrap();
+                (name, tensor)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for (prefix, hidden, hd) in [
+            ("talker.model", h, talker_cfg.head_dim()),
+            ("talker.code_predictor.model", p.hidden_size, p.head_dim()),
+        ] {
+            let ones = |n: usize| Tensor::ones(n, DType::F32, &device).unwrap();
+            tensors.insert(format!("{prefix}.norm.weight"), ones(hidden));
+            for name in ["input_layernorm", "post_attention_layernorm"] {
+                tensors.insert(format!("{prefix}.layers.0.{name}.weight"), ones(hidden));
+            }
+            for name in ["q_norm", "k_norm"] {
+                tensors.insert(
+                    format!("{prefix}.layers.0.self_attn.{name}.weight"),
+                    ones(hd),
+                );
+            }
+        }
+        tensors
+    }
+
+    /// QTTS-10/11: on the tiny checkpoint, weight-only F16 transformers
+    /// (the CPU's dense-F16 path) pass the self-check and track the dense
+    /// F32 probe; F16 weights that overflow fail it, and the load falls
+    /// back to dense F32 with the reason recorded.
+    #[test]
+    fn weight_only_f16_transformers_pass_the_self_check_or_fall_back() {
+        let device = candle_core::Device::Cpu;
+        let talker_cfg = talker::tests::tiny_talker(&device).config().clone();
+        let predictor_cfg = talker_cfg.code_predictor_config.clone();
+        // The checkpoint is a file: the F16 text embedding is read from it
+        // in place.
+        let dir = std::env::temp_dir().join(format!("izwi-qwen3-tts-f16-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vb_for = |gate_scale: f32| {
+            let path = dir.join(format!("model-{gate_scale}.safetensors"));
+            candle_core::safetensors::save(
+                &tiny_transformer_tensors(&talker_cfg, gate_scale),
+                &path,
+            )
+            .unwrap();
+            let vb = unsafe {
+                candle_nn::VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &device)
+            }
+            .unwrap();
+            (vb, path)
+        };
+        let load = |vb: &candle_nn::VarBuilder, f16, path: &Path| {
+            load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, vb, vb, f16, path).unwrap()
+        };
+        let (vb, path) = vb_for(0.4);
+        let (dense_talker, dense_predictor) = load(&vb, None, &path);
+        let (half_talker, half_predictor) = load(&vb, Some(&device), &path);
+        let dense =
+            qwen3_tts_numeric_probe(&dense_talker, &dense_predictor, DType::F32, DType::F32)
+                .unwrap();
+        let report = qwen3_tts_weight_only_self_check(
+            &half_talker,
+            &half_predictor,
+            &vb,
+            &vb,
+            DType::F32,
+            DType::F32,
+        );
+        assert!(report.passed, "{}", report.reason);
+        // The F16 weights are really F16 (rounded), the dense ones untouched.
+        assert!(half_talker.projections_f16() && half_predictor.projections_f16());
+        assert!(!dense_talker.projections_f16() && !dense_predictor.projections_f16());
+        let rounding = half_talker.check_f16_conversion(&vb.pp("talker")).unwrap();
+        assert!(rounding > 0.0 && rounding < 1e-2, "{rounding}");
+        assert_eq!(
+            dense_talker.check_f16_conversion(&vb.pp("talker")).unwrap(),
+            0.0
+        );
+        let half =
+            qwen3_tts_numeric_probe(&half_talker, &half_predictor, DType::F32, DType::F32).unwrap();
+        for ((name, d), (_, h)) in dense.iter().zip(&half).take(2) {
+            let d = crate::kernels::numeric_check::host_f32(d).unwrap();
+            let h = crate::kernels::numeric_check::host_f32(h).unwrap();
+            let relative = crate::kernels::numeric_check::relative_l2(&h, &d);
+            assert!(relative < 1e-2, "{name}: relative L2 {relative}");
+        }
+
+        let selection = DTypeSelection {
+            dtype: DType::F16,
+            reason: "test tier".into(),
+        };
+        for (gate_scale, expect_f16) in [(0.4f32, true), (1e6, false)] {
+            let (vb, path) = vb_for(gate_scale);
+            let (_, precision) = load_weight_only_f16(
+                "tiny Qwen3-TTS",
+                &selection,
+                &device,
+                |f16| {
+                    load_qwen3_tts_transformers(&talker_cfg, &predictor_cfg, &vb, &vb, f16, &path)
+                },
+                |(talker, predictor)| {
+                    qwen3_tts_weight_only_self_check(
+                        talker,
+                        predictor,
+                        &vb,
+                        &vb,
+                        DType::F32,
+                        DType::F32,
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                precision.projections_f16, expect_f16,
+                "{}",
+                precision.reason
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -5291,6 +6128,104 @@ mod tests {
         assert_eq!(mask, vec![true; 4]);
     }
 
+    /// QTTS-6: residual codebooks sample with the reference sub-talker
+    /// defaults unless the request is greedy.
+    #[test]
+    fn subtalker_sampling_defaults_follow_the_reference_and_greedy_requests() {
+        assert_eq!(
+            TtsGenerationParams::default().subtalker,
+            SubtalkerSampling {
+                do_sample: true,
+                temperature: 0.9,
+                top_k: 50,
+                top_p: 1.0,
+            }
+        );
+        let mut config = crate::runtime::GenerationConfig::default();
+        config.options.speech.temperature = Some(0.7);
+        let sampled = TtsGenerationParams::from_generation_config(&config).subtalker;
+        assert_eq!(sampled, SubtalkerSampling::default());
+        config.options.speech.temperature = Some(0.0);
+        let greedy = TtsGenerationParams::from_generation_config(&config).subtalker;
+        assert!(greedy.is_greedy());
+    }
+
+    /// QTTS-4: the semantic draw reads back once per frame on each sampler
+    /// path (greedy device, host reference), so with the talker (0) and the
+    /// predictor (1) a frame costs two readbacks.
+    #[test]
+    fn semantic_sampling_reads_back_once_per_frame() {
+        let logits = Tensor::new(
+            vec![0.5f32, 2.0, -1.0, 0.25, 3.0, 1.0],
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let mut rng = SimpleRng {
+            state: 0x1234_5678_9abc_def0,
+        };
+        for (temperature, prefer_device) in [(0.0, true), (0.0, false), (0.9, false)] {
+            let params = TtsGenerationParams {
+                temperature,
+                ..Default::default()
+            };
+            let before = thread_qwen3_tts_host_readbacks();
+            sample_semantic(&logits, 4, 5, true, &params, &[], &mut rng, prefer_device).unwrap();
+            assert_eq!(
+                thread_qwen3_tts_host_readbacks() - before,
+                1,
+                "temperature {temperature}, device {prefer_device}"
+            );
+        }
+    }
+
+    /// The semantic repetition penalty covers every code generated so far,
+    /// as the reference's does, not just the last 256 frames: a code seen
+    /// once at frame 0 is still penalized 300 frames later, on both the host
+    /// and the candidate sampler.
+    #[test]
+    fn semantic_repetition_penalty_remembers_every_generated_code() {
+        let mut history = record_semantic_history(&[], 5);
+        for frame in 0..300u32 {
+            history = record_semantic_history(&history, 10 + frame % 280);
+        }
+        assert!(history.contains(&5));
+        assert_eq!(history.len(), 281, "each code is kept once");
+
+        // Unpenalized, code 5 narrowly beats code 6; penalized (1.0 / 1.05)
+        // it loses, and the near-zero temperature makes the draw decisive.
+        let mut values = vec![-30.0f32; 300];
+        values[5] = 1.0;
+        values[6] = 0.99;
+        let logits = Tensor::new(values, &candle_core::Device::Cpu).unwrap();
+        let params = TtsGenerationParams {
+            temperature: 1e-3,
+            top_p: 1.0,
+            top_k: 2,
+            repetition_penalty: 1.05,
+            ..Default::default()
+        };
+        for prefer_device in [false, true] {
+            let mut rng = SimpleRng {
+                state: 0x2545_f491_4f6c_dd1d,
+            };
+            assert_eq!(
+                sample_semantic(
+                    &logits,
+                    300,
+                    299,
+                    false,
+                    &params,
+                    &history,
+                    &mut rng,
+                    prefer_device
+                )
+                .unwrap(),
+                6,
+                "prefer_device={prefer_device}"
+            );
+        }
+    }
+
     #[test]
     fn top_k_semantic_sampling_keeps_penalty_replacement_candidates() {
         let logits = Tensor::new(vec![10.0f32, 9.0, 0.0, -5.0], &candle_core::Device::Cpu).unwrap();
@@ -5311,6 +6246,35 @@ mod tests {
         );
     }
 
+    /// Streamed and non-stream audio get the same per-sample treatment, so
+    /// a stream concatenates to the non-stream output: a quiet utterance is
+    /// neither boosted nor DC-shifted as a whole, and only non-finite
+    /// samples change.
+    #[test]
+    fn decoded_audio_is_finished_the_same_streamed_or_whole() {
+        let utterance = (0..960)
+            .map(|index| 0.01 + 0.02 * (index as f32 * 0.05).sin())
+            .collect::<Vec<_>>();
+        let mut decoded = utterance.clone();
+        decoded[7] = f32::NAN;
+        decoded[500] = f32::INFINITY;
+
+        let mut whole = decoded.clone();
+        finish_decoded_audio(&mut whole);
+        let mut streamed = Vec::new();
+        for chunk in decoded.chunks(320) {
+            let mut chunk = chunk.to_vec();
+            finish_decoded_audio(&mut chunk);
+            streamed.extend(chunk);
+        }
+        assert_eq!(streamed, whole);
+
+        let mut expected = utterance;
+        expected[7] = 0.0;
+        expected[500] = 0.0;
+        assert_eq!(whole, expected);
+    }
+
     #[test]
     fn raw_codec_token_mapping_preserves_unoffset_tokens() {
         assert_eq!(raw_codec_token(151_936 + 7, 0, 151_936, 2048), 7);
@@ -5320,16 +6284,5 @@ mod tests {
             19
         );
         assert_eq!(raw_codec_token(19, 3, 151_936, 2048), 19);
-    }
-
-    #[test]
-    fn cuda_chunked_codec_streaming_is_explicit_opt_in() {
-        assert!(!qwen_tts_cuda_chunked_codec_stream_enabled_from(None));
-        for raw in ["", "0", "false", "off", "no"] {
-            assert!(!qwen_tts_cuda_chunked_codec_stream_enabled_from(Some(raw)));
-        }
-        for raw in ["1", "true", "YES", " on "] {
-            assert!(qwen_tts_cuda_chunked_codec_stream_enabled_from(Some(raw)));
-        }
     }
 }

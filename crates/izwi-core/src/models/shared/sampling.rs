@@ -16,7 +16,7 @@ use crate::{Error, Result};
 
 use super::chat::ChatGenerationConfig;
 
-const DEVICE_SORT_CHUNK: usize = 1024;
+pub(crate) const DEVICE_SORT_CHUNK: usize = 1024;
 const MAX_EXACT_F32_INTEGER: usize = 1 << 24;
 const DEVICE_SAMPLING_TENSOR_CACHE_ENTRIES: usize = 8;
 pub const DEVICE_SAMPLING_CANDIDATE_LIMIT: usize = 256;
@@ -1193,6 +1193,89 @@ fn apply_history_penalties(
         .map_err(Error::from)
 }
 
+/// Draw one token on CUDA or Metal and keep it on device: temperature and
+/// top-k run on the accelerator, then the Gumbel-max trick picks among the
+/// k candidates using `draw` (host uniforms in [0, 1), k values uploaded).
+/// Nothing is read back, so a caller can feed the token straight into the
+/// next embedding gather and read a whole frame once. Exact sampling from
+/// softmax(top-k(logits / temperature)). `None` asks for the host path: other
+/// devices, greedy temperature, or top-k 0 / above the device sort bound.
+pub fn device_resident_top_k_sample(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    draw: &mut dyn FnMut() -> f32,
+) -> Result<Option<Tensor>> {
+    if !(logits.device().is_cuda() || logits.device().is_metal()) {
+        return Ok(None);
+    }
+    resident_top_k_sample(logits, vocab_limit, top_k, temperature, draw)
+}
+
+/// [`device_resident_top_k_sample`] on any device, CPU included: the token
+/// stays a `[1]` U32 tensor where the logits live. `None` for greedy
+/// temperature or a top-k of 0 / above the device sort bound.
+pub fn resident_top_k_sample(
+    logits: &Tensor,
+    vocab_limit: usize,
+    top_k: usize,
+    temperature: f32,
+    draw: &mut dyn FnMut() -> f32,
+) -> Result<Option<Tensor>> {
+    if temperature <= 1e-5 || top_k == 0 || top_k > DEVICE_SORT_CHUNK {
+        return Ok(None);
+    }
+    let row = logits_row(logits)?;
+    let vocab = row.dim(0)?.min(vocab_limit);
+    if vocab == 0 {
+        return Ok(None);
+    }
+    let adjusted = sanitize_finite(&row.narrow(0, 0, vocab)?.to_dtype(DType::F32)?)?;
+    let adjusted = (adjusted / temperature as f64)?;
+    let k = top_k.min(vocab);
+    let gumbel = gumbel_noise(k, draw);
+    gumbel_top_k_token(&adjusted, k, &gumbel).map(Some)
+}
+
+/// `-ln(-ln(u))` for `count` uniforms, the Gumbel(0, 1) noise of the
+/// Gumbel-max trick.
+pub(crate) fn gumbel_noise(count: usize, draw: &mut dyn FnMut() -> f32) -> Vec<f32> {
+    (0..count)
+        .map(|_| {
+            let uniform = f64::from(draw()).clamp(1e-12, 1.0 - 1e-12);
+            (-(-uniform.ln()).ln()) as f32
+        })
+        .collect()
+}
+
+/// The top-k candidate of `scores` (already scaled by temperature) whose
+/// score plus `gumbel` is largest, as a `[1]` U32 token on the scores' device.
+fn gumbel_top_k_token(scores: &Tensor, k: usize, gumbel: &[f32]) -> Result<Tensor> {
+    let (values, indices) = bounded_topk(scores, k)?;
+    let keep = values.dim(0)?;
+    let noise = Tensor::from_vec(gumbel[..keep].to_vec(), keep, scores.device())?;
+    let pick = values
+        .broadcast_add(&noise)?
+        .argmax(D::Minus1)?
+        .to_dtype(DType::U32)?
+        .reshape(1)?;
+    indices
+        .to_dtype(DType::U32)?
+        .index_select(&pick, 0)
+        .map_err(Error::from)
+}
+
+/// The `k` largest values of a rank-1 `values`, sorted descending, and their
+/// U32 indices, computed on the values' device. `None` when `k` is 0 or above
+/// the device sort bound.
+pub(crate) fn device_top_k(values: &Tensor, k: usize) -> Result<Option<(Tensor, Tensor)>> {
+    if k == 0 || k > DEVICE_SORT_CHUNK {
+        return Ok(None);
+    }
+    bounded_topk(values, k).map(Some)
+}
+
 fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
     let length = values.dim(0)?;
     if length == 0 || length > u32::MAX as usize || k == 0 || k > DEVICE_SORT_CHUNK {
@@ -1250,6 +1333,73 @@ fn bounded_topk(values: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gumbel-max over the device top-k: the token is the top-k candidate
+    /// with the largest score + noise, and only top-k candidates can win.
+    #[test]
+    fn gumbel_top_k_token_picks_the_noisy_argmax_within_top_k() {
+        let device = Device::Cpu;
+        let scores = Tensor::from_vec(vec![0.5f32, 3.0, 1.0, 2.5, -4.0], 5, &device).unwrap();
+        // Top-3 in score order: indices 1 (3.0), 3 (2.5), 2 (1.0).
+        let pick = |noise: [f32; 3]| {
+            gumbel_top_k_token(&scores, 3, &noise)
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()[0]
+        };
+        assert_eq!(pick([0.0, 0.0, 0.0]), 1);
+        assert_eq!(pick([0.0, 0.6, 0.0]), 3);
+        assert_eq!(pick([0.0, 0.0, 2.1]), 2);
+        // Index 0 (0.5) is outside the top 3, whatever the noise.
+        assert_ne!(pick([-9.0, -9.0, -9.0]), 0);
+        let noise = gumbel_noise(4, &mut || 0.5);
+        assert!((noise[0] - 0.366_512_9).abs() < 1e-6, "{noise:?}");
+    }
+
+    /// The device-resident sampler runs on Metal and agrees with the CPU
+    /// Gumbel-max for the same draws.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_device_resident_top_k_sample_matches_cpu_gumbel_max() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let values = crate::kernels::numeric_check::xorshift_values(2049, 31, 4.0);
+        let logits = Tensor::from_vec(values, 2049, &device).unwrap();
+        for seed in 0..8u64 {
+            let mut state = seed;
+            let mut draws = Vec::new();
+            let mut draw = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = (state >> 40) as f32 / (1u64 << 24) as f32;
+                draws.push(value);
+                value
+            };
+            let token = device_resident_top_k_sample(&logits, 2048, 64, 0.8, &mut draw)
+                .unwrap()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()[0];
+            let mut replay = draws.into_iter();
+            let noise = gumbel_noise(64, &mut || replay.next().unwrap());
+            let cpu_scores = (logits
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .narrow(0, 0, 2048)
+                .unwrap()
+                / 0.8f64)
+                .unwrap();
+            let expected = gumbel_top_k_token(&cpu_scores, 64, &noise)
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()[0];
+            assert_eq!(token, expected, "seed {seed}");
+            assert!(token < 2048);
+        }
+    }
 
     fn parity_logits(width: usize) -> Vec<f32> {
         (0..width)

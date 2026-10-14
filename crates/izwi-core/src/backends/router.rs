@@ -476,7 +476,7 @@ mod tests {
             "Selected cuda backend",
         );
         let router = BackendRouter::from_context(context);
-        let plan = router.select(ModelVariant::Qwen3Tts12Hz06BBase4Bit);
+        let plan = router.select(ModelVariant::Qwen3ForcedAligner06B4Bit);
 
         assert_eq!(
             plan.cuda_quantization.level,

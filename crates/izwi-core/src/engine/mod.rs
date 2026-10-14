@@ -63,6 +63,7 @@ pub(crate) use cache::composite::{
 #[cfg(test)]
 pub(crate) use cache::managed::ManagedKvCacheManager;
 pub(crate) use cache::managed::ManagedKvModelRuntime;
+pub(crate) use cache::managed::StateFitReserve;
 pub use cache::managed::{
     ManagedKvArenaRuntimeSnapshot, ManagedKvCoordinatorSnapshot, ManagedKvModelRuntimeSnapshot,
     ManagedKvOperationSnapshot, ManagedKvRuntimeSnapshot, ManagedKvRuntimeTotalsSnapshot,
@@ -172,6 +173,7 @@ pub use metrics::{
     ENGINE_STREAM_CHECKPOINT_REJECTIONS_TOTAL, ENGINE_STREAM_DELIVERY_FAILURES_TOTAL,
 };
 pub use output::{AsrProgress, AsrProgressPhase, OutputProcessor, StreamingOutput};
+pub(crate) use request::KokoroPreparedText;
 pub use request::{
     AsrEngineInput, AudioChatEngineInput, ChatEngineInput, EngineAudioInput, EngineCoreRequest,
     EngineStreamPolicy, EngineTask, RealtimeAsrOperationAck, RealtimeAsrOperationKind,
@@ -187,7 +189,7 @@ pub use scheduler::{ScheduleResult, Scheduler, SchedulerConfig, SchedulingPolicy
 pub use types::FinishReason as OutputFinishReason;
 pub use types::{
     AudioOutput, EngineMetrics, EngineOutput, GenerationParams, LatencyBreakdown, Priority,
-    RequestId, SequenceId, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
+    RequestId, SequenceId, SpeechSamplingOptions, TaskType, TokenId, TokenLogprob, TopTokenLogprob,
 };
 
 use crate::error::{Error, Result};
@@ -3068,13 +3070,28 @@ impl Engine {
         model_instance: ModelInstanceId,
         retained_state: &crate::kv::v2::InferenceStateContract,
         logical_context_tokens: Option<usize>,
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
         let _step = self.step_gate.lock().await;
         self.core.write().await.load_managed_model_state(
             model_instance,
             retained_state,
             logical_context_tokens,
+            minimum_tokens,
+            reserve,
         )
+    }
+
+    pub(crate) async fn price_tensor_rows_with_requests(
+        &self,
+        model_instance: ModelInstanceId,
+    ) -> Result<()> {
+        let _step = self.step_gate.lock().await;
+        self.core
+            .write()
+            .await
+            .price_tensor_rows_with_requests(model_instance)
     }
 
     pub(crate) async fn load_managed_model_state_with_row_limits(
@@ -3118,6 +3135,8 @@ impl Engine {
                 portable_state_copies,
                 rows,
                 minimum_tokens,
+                // ASR loads reconcile their observed weight growth.
+                StateFitReserve::MeasuredUntracked,
             )
     }
 

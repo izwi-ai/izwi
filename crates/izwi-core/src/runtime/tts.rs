@@ -9,31 +9,24 @@ use crate::backends::BackendKind;
 use crate::catalog::ModelFamily;
 use crate::engine::{
     tts_explicit_output_limit, GenerationParams as CoreGenParams, ResourceAmount, ResourceVector,
-    WorkUnit,
 };
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
-use crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt;
-use crate::models::architectures::qwen3::tts::qwen_tts_cuda_chunked_codec_stream_enabled;
-use crate::models::architectures::vibevoice::tts::{
-    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
-};
-use crate::models::architectures::voxtral::tts::{
-    voxtral_tts_auto_max_frames_for_text, VoxtralTtsGenerationParams,
-};
-use crate::models::shared::chat::{ChatMessage, ChatRole};
+use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+use crate::models::architectures::kokoro::kokoro_output_budget;
+use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+use crate::models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
-use crate::runtime::audio_io::decode_reference_audio_base64;
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
 use crate::runtime::request::TtsRuntimeRequest;
-use crate::runtime::service::{CapabilityLoadOptions, RuntimeService};
+use crate::runtime::service::RuntimeService;
 use crate::runtime::telemetry::{
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming,
 };
 use crate::runtime::types::{
-    AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult,
+    AudioChunk, ChunkStats, GenerationConfig, GenerationRequest, GenerationResult, TtsStopReason,
+    TtsStreamingMode,
 };
 use crate::runtime::CoordinatorLane;
 
@@ -50,7 +43,8 @@ struct DirectTtsGenerationShape {
     units: u64,
     max_output_samples: u64,
     has_reference_decode: bool,
-    kokoro_max_chunk_expanded_frames: Option<u64>,
+    /// Planned frames of one Kokoro stream chunk.
+    kokoro_chunk_frames: Option<usize>,
 }
 
 fn direct_tts_generation_shape(
@@ -61,22 +55,21 @@ fn direct_tts_generation_shape(
 ) -> Result<DirectTtsGenerationShape> {
     let explicit = request.config.options.max_tokens;
     if matches!(variant.family(), ModelFamily::KokoroTts) {
+        // The direct route streams: it synthesizes one planned chunk (at
+        // most `KOKORO_STREAM_TARGET_CHARS`) at a time and hands its audio
+        // on, so it holds one chunk's workspace and output (KOK-8).
         let budget = kokoro_output_budget(&request.text, request.config.options.speed)?;
+        let frames = crate::runtime::kokoro::kokoro_stream_chunk_frames(
+            &request.text,
+            request.config.options.speed,
+        );
         return Ok(DirectTtsGenerationShape {
             units: u64::try_from(budget.max_model_tokens).map_err(|_| {
                 Error::InvalidInput("Kokoro model-token budget exceeds u64".to_string())
             })?,
-            max_output_samples: u64::try_from(budget.max_samples).map_err(|_| {
-                Error::InvalidInput("Kokoro output-sample budget exceeds u64".to_string())
-            })?,
+            max_output_samples: kokoro_chunk_price(frames, backend)?.output_samples,
             has_reference_decode: false,
-            kokoro_max_chunk_expanded_frames: Some(
-                u64::try_from(budget.max_chunk_expanded_frames).map_err(|_| {
-                    Error::InvalidInput(
-                        "Kokoro expanded-frame workspace budget exceeds u64".to_string(),
-                    )
-                })?,
-            ),
+            kokoro_chunk_frames: Some(frames),
         });
     }
     let (units, output_samples_per_unit, has_reference_decode) = match variant.family() {
@@ -145,7 +138,7 @@ fn direct_tts_generation_shape(
             .checked_mul(output_samples_per_unit)
             .ok_or_else(|| Error::Overloaded("TTS output shape overflowed".to_string()))?,
         has_reference_decode,
-        kokoro_max_chunk_expanded_frames: None,
+        kokoro_chunk_frames: None,
     })
 }
 
@@ -214,23 +207,22 @@ fn direct_tts_additional_resources(
         .max_output_samples
         .checked_mul(std::mem::size_of::<f32>() as u64)
         .ok_or_else(|| Error::Overloaded("TTS output reservation overflowed".to_string()))?;
-    let (state_host_bytes, cpu_tensor_bytes, accelerator_tensor_bytes) =
-        if let Some(max_chunk_expanded_frames) = shape.kokoro_max_chunk_expanded_frames {
-            let workspace = kokoro_peak_workspace(max_chunk_expanded_frames)?;
-            (
-                workspace.host_bytes,
-                workspace.cpu_tensor_bytes,
-                workspace.accelerator_tensor_bytes,
-            )
-        } else {
-            let state_bytes = shape
-                .units
-                .checked_mul(DIRECT_TTS_STATE_BYTES_PER_UNIT)
-                .ok_or_else(|| {
-                    Error::Overloaded("TTS session reservation overflowed".to_string())
-                })?;
-            (0, state_bytes, state_bytes)
-        };
+    let (state_host_bytes, cpu_tensor_bytes, accelerator_tensor_bytes) = if let Some(frames) =
+        shape.kokoro_chunk_frames
+    {
+        let price = kokoro_chunk_price(frames, backend)?;
+        (
+            price.host_bytes,
+            price.cpu_tensor_bytes,
+            price.accelerator_tensor_bytes,
+        )
+    } else {
+        let state_bytes = shape
+            .units
+            .checked_mul(DIRECT_TTS_STATE_BYTES_PER_UNIT)
+            .ok_or_else(|| Error::Overloaded("TTS session reservation overflowed".to_string()))?;
+        (0, state_bytes, state_bytes)
+    };
     let (reference_host_bytes, reference_accelerator_bytes) =
         if shape.has_reference_decode && request.reference_audio.is_some() {
             (
@@ -283,12 +275,21 @@ impl DirectTtsObservationContext {
     }
 }
 
-fn uses_direct_tts_runtime(variant: ModelVariant) -> bool {
-    matches!(variant.family(), ModelFamily::VoxtralTts)
+/// Kokoro streams its planned chunks natively on the direct route; every
+/// other TTS request, streaming or not, runs on the engine.
+fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
+    matches!(variant.family(), ModelFamily::KokoroTts)
 }
 
-fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
-    uses_direct_tts_runtime(variant) || matches!(variant.family(), ModelFamily::KokoroTts)
+/// The execution target the public TTS route actually uses for `variant`.
+/// The adapter registry must advertise the same target, or no loaded
+/// contract can serve the request (VXT-1).
+pub(crate) fn tts_route_target(variant: ModelVariant, streaming: bool) -> ExecutionTargetKind {
+    if streaming && uses_direct_streaming_tts_runtime(variant) {
+        ExecutionTargetKind::DirectModel
+    } else {
+        ExecutionTargetKind::TokenEngine
+    }
 }
 
 pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Result<usize> {
@@ -342,51 +343,27 @@ pub(super) fn direct_tts_retained_input_bytes(request: &GenerationRequest) -> Re
     Ok(total)
 }
 
-fn vibevoice_reference_from_request(
-    request: &GenerationRequest,
-) -> Result<VibeVoiceSpeakerReference> {
-    let ref_audio = request.reference_audio.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    let ref_text = request.reference_text.as_deref().ok_or_else(|| {
-        Error::InvalidInput(
-            "VibeVoice TTS requires `reference_audio` and `reference_text`".to_string(),
-        )
-    })?;
-    if ref_text.trim().is_empty() {
-        return Err(Error::InvalidInput(
-            "VibeVoice TTS reference_text cannot be empty".to_string(),
-        ));
+/// The streaming mode `variant` delivers (TPIPE-3). Every streaming family
+/// publishes audio as it commits it: Qwen3-TTS per codec frame, LFM2.5
+/// Audio per detokenized code run (LFT-5), VibeVoice per frame (VVT-10),
+/// Voxtral per codec chunk, Fish per decoded frame batch and Kokoro per
+/// sentence chunk.
+fn tts_streaming_mode(variant: ModelVariant) -> TtsStreamingMode {
+    if variant
+        .speech_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_streaming)
+    {
+        TtsStreamingMode::Chunked
+    } else {
+        TtsStreamingMode::Unsupported
     }
-    let (audio_samples, sample_rate) = decode_reference_audio_base64(ref_audio)?;
-    Ok(VibeVoiceSpeakerReference {
-        audio_samples,
-        sample_rate,
-        text: ref_text.to_string(),
-    })
 }
 
-fn qwen_tts_streaming_uses_final_only(
-    is_cuda: bool,
-    variant: ModelVariant,
-    chunked_codec_stream_enabled: bool,
-) -> bool {
-    matches!(variant.family(), ModelFamily::Qwen3Tts) && !(is_cuda && chunked_codec_stream_enabled)
-}
-
-fn lfm25_audio_prompt_messages(text: &str, speaker: Option<&str>) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage {
-            role: ChatRole::System,
-            content: lfm25_audio_tts_system_prompt(speaker).to_string(),
-        },
-        ChatMessage {
-            role: ChatRole::User,
-            content: text.trim().to_string(),
-        },
-    ]
+impl RuntimeService {
+    /// How a streaming request for `variant` delivers audio here (TPIPE-3).
+    pub fn tts_streaming_mode(&self, variant: ModelVariant) -> TtsStreamingMode {
+        tts_streaming_mode(variant)
+    }
 }
 
 async fn send_direct_tts_chunk(
@@ -501,430 +478,60 @@ impl RuntimeService {
                     .map(|_| variant)
             })
     }
+}
 
-    async fn lfm25_audio_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_audio_chat(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No LFM2.5 Audio model loaded".to_string()))?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .unwrap_or_else(|| self.config.portable_context_ceiling());
-        let max_new_tokens = if request.config.options.max_tokens == 0 {
-            LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS.min(context_limit.max(1))
-        } else {
-            request
-                .config
-                .options
-                .max_tokens
-                .min(tts_explicit_output_limit(
-                    self.backend_router.context().backend_kind,
-                    variant,
-                    context_limit,
-                ))
-        };
-        let requested_speaker = request
-            .config
-            .options
-            .speaker
-            .clone()
-            .or_else(|| request.config.options.voice.clone());
-        let request_id = request.id;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let started = Instant::now();
-                    let output = model
-                        .generate_sequential_with_callback_from_invocation_workspace(
-                            &lfm25_audio_prompt_messages(&text, requested_speaker.as_deref()),
-                            max_new_tokens,
-                            leases,
-                            &mut |_delta| {},
-                        )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id,
-                        samples: output.samples,
-                        sample_rate: output.sample_rate,
-                        total_tokens: output.tokens_generated,
-                        total_time_ms,
-                        diagnostics: output.diagnostics,
-                    })
-                },
-            )
-            .await
+/// A finished request must carry audio at a real sample rate: an empty
+/// result is an error, not a 200 with an empty WAV (TPIPE-18).
+fn ensure_speech_audio(
+    variant: ModelVariant,
+    request_id: &str,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<()> {
+    if samples.is_empty() || sample_rate == 0 {
+        return Err(Error::InferenceError(format!(
+            "{variant} produced no audio for request {request_id}"
+        )));
     }
+    Ok(())
+}
 
-    async fn lfm25_audio_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .lfm25_audio_tts_generate(job, request, variant, true)
-            .await?;
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.is_final = true;
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
+/// Speak numbers, currency, dates, times and units as words when the
+/// request asks for it, or leaves it unset for a family that normalizes by
+/// default (`batch.tts.normalize_text`, TPIPE-26). English text only.
+fn normalize_speech_text(
+    mut request: GenerationRequest,
+    variant: ModelVariant,
+) -> GenerationRequest {
+    use crate::models::shared::text_normalize::{
+        family_normalizes_by_default, is_english, normalize_english,
+    };
+    let enabled = request
+        .config
+        .options
+        .speech
+        .normalize_text
+        .unwrap_or_else(|| family_normalizes_by_default(variant.family()));
+    if enabled
+        && is_english(
+            request.language.as_deref(),
+            request.config.options.speaker.as_deref(),
+        )
+    {
+        request.text = normalize_english(&request.text);
     }
-
-    async fn voxtral_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_voxtral_tts(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No Voxtral TTS model loaded".to_string()))?;
-        let context_limit = self
-            .model_registry
-            .effective_context(variant)
-            .unwrap_or_else(|| self.config.portable_context_ceiling());
-        let explicit_max_frames = tts_explicit_output_limit(
-            self.backend_router.context().backend_kind,
-            variant,
-            context_limit,
-        );
-        let request_id = request.id;
-        let config = request.config;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_paged(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let voice = config
-                        .options
-                        .speaker
-                        .clone()
-                        .or_else(|| config.options.voice.clone())
-                        .or_else(|| model.available_speakers().into_iter().next())
-                        .ok_or_else(|| {
-                            Error::InferenceError(
-                                "Voxtral TTS model exposes no preset voices".to_string(),
-                            )
-                        })?;
-                    let params =
-                        VoxtralTtsGenerationParams::from_generation_config_for_text_with_limit(
-                            &config,
-                            &text,
-                            explicit_max_frames,
-                        );
-                    let started = Instant::now();
-                    let domains = leases.domains().collect::<Vec<_>>();
-                    let [domain] = domains.as_slice() else {
-                        return Err(Error::InferenceError(format!(
-                            "Voxtral TTS requires one invocation KV domain, found {}",
-                            domains.len()
-                        )));
-                    };
-                    let output = model.generate_with_voice_physical(
-                        &text,
-                        &voice,
-                        params,
-                        leases.cache_mut(*domain)?,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-                    let sample_rate = u32::try_from(output.sample_rate).map_err(|_| {
-                        Error::InferenceError(format!(
-                            "Voxtral TTS sample rate {} exceeds u32",
-                            output.sample_rate
-                        ))
-                    })?;
-
-                    Ok(GenerationResult {
-                        request_id,
-                        samples: output.samples,
-                        sample_rate,
-                        total_tokens: output.frames_generated,
-                        total_time_ms,
-                        diagnostics: None,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn voxtral_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .voxtral_tts_generate(job, request, variant, true)
-            .await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
-
-    async fn vibevoice_tts_generate(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        streaming_required: bool,
-    ) -> Result<GenerationResult> {
-        self.observe_broker_capability_request(
-            CapabilityKind::Tts,
-            Some(variant),
-            streaming_required,
-        )?;
-        let (residency_lease, execution_contract, state_binding) = self
-            .load_capability_with_state_for_job(
-                job,
-                variant,
-                CapabilityKind::Tts,
-                streaming_required,
-                ExecutionTargetKind::DirectModel,
-                CapabilityLoadOptions::default(),
-            )
-            .await?;
-
-        let text = request.text.trim().to_string();
-        if text.is_empty() {
-            return Err(Error::InvalidInput("TTS request missing text".to_string()));
-        }
-
-        let model = self
-            .model_registry
-            .get_vibevoice_tts(variant)
-            .await
-            .ok_or_else(|| Error::InferenceError("No VibeVoice TTS model loaded".to_string()))?;
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::AtomicJob {
-                    kind: CapabilityKind::Tts.as_str().to_string(),
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let reference = vibevoice_reference_from_request(&request)?;
-                    let requested_speaker = request.config.options.speaker.as_deref().or(request
-                        .config
-                        .options
-                        .voice
-                        .as_deref());
-                    let params = VibeVoiceTtsGenerationParams::from_generation_config_for_text(
-                        &request.config,
-                        &text,
-                        model.default_diffusion_steps(),
-                    );
-                    let started = Instant::now();
-                    let output = model.generate_with_reference_physical(
-                        &text,
-                        &reference,
-                        requested_speaker,
-                        params,
-                        leases,
-                    )?;
-                    let total_time_ms = started.elapsed().as_secs_f32() * 1000.0;
-
-                    Ok(GenerationResult {
-                        request_id: request.id,
-                        samples: output.samples,
-                        sample_rate: output.sample_rate,
-                        total_tokens: output.frames_generated,
-                        total_time_ms,
-                        diagnostics: None,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn vibevoice_tts_generate_streaming(
-        &self,
-        job: &JobLease,
-        request: GenerationRequest,
-        variant: ModelVariant,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let result = self
-            .vibevoice_tts_generate(job, request, variant, true)
-            .await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        send_direct_tts_chunk(job, &chunk_tx, chunk).await
-    }
-
-    async fn qwen_tts_final_only_streaming(
-        &self,
-        mut request: GenerationRequest,
-        chunk_tx: mpsc::Sender<AudioChunk>,
-    ) -> Result<()> {
-        let deadline = request.runtime_context.deadline;
-        let request_id = request.id.clone();
-        request.config.streaming = false;
-        let result = self.generate(request).await?;
-        let generation_time_ms = result.total_time_ms;
-        let tokens_generated = result.total_tokens;
-        let rtf = result.rtf();
-        let mut chunk = AudioChunk::final_chunk(result.request_id.clone(), 0, result.samples)
-            .with_sample_rate(result.sample_rate);
-        chunk.stats = Some(ChunkStats {
-            generation_time_ms,
-            tokens_generated,
-            rtf,
-        });
-        let send = chunk_tx.send(chunk);
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline.into(), send)
-                .await
-                .map_err(|_| Error::Timeout(request_id))?
-                .map_err(|_| {
-                    Error::InferenceError("Streaming output channel closed".to_string())
-                })?,
-            None => send.await.map_err(|_| {
-                Error::InferenceError("Streaming output channel closed".to_string())
-            })?,
-        }
-
-        info!(
-            "Qwen3-TTS streaming emitted final-only audio in {:.1}ms (RTF {:.3}); enable IZWI_QWEN_TTS_CUDA_CHUNKED_CODEC_STREAM=1 for experimental progressive CUDA codec streaming",
-            generation_time_ms, rtf
-        );
-        Ok(())
-    }
+    request
 }
 
 impl RuntimeService {
     /// Generate audio from text using the unified core engine.
     pub async fn generate(&self, request: GenerationRequest) -> Result<GenerationResult> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
-        if uses_direct_tts_runtime(resolved_variant) {
-            let observation = DirectTtsObservationContext::new(&request, resolved_variant, false);
-            let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
-            let observed_input_bytes = u64::try_from(retained_input_bytes).map_err(|_| {
-                Error::InvalidInput("TTS retained input size exceeds u64".to_string())
-            })?;
-            let mut spec = self.coordinator_job_for_input(
-                request.id.clone(),
-                CoordinatorLane::Atomic,
-                request.runtime_context,
-                retained_input_bytes,
-            );
-            spec.resources = spec.resources.checked_add(direct_tts_additional_resources(
-                self.backend_router.context().backend_kind,
-                &request,
-                resolved_variant,
-                self.config.portable_context_ceiling(),
-            )?)?;
-            let job = self
-                .coordinator
-                .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-                .await?;
-            let result = match resolved_variant.family() {
-                ModelFamily::KokoroTts => self.kokoro_tts_generate(&job, request).await,
-                ModelFamily::Lfm25Audio => {
-                    self.lfm25_audio_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                ModelFamily::VoxtralTts => {
-                    self.voxtral_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                ModelFamily::VibeVoiceTts => {
-                    self.vibevoice_tts_generate(&job, request, resolved_variant, false)
-                        .await
-                }
-                _ => unreachable!("direct TTS family checked above"),
-            };
-            self.record_direct_tts_observation(observation, result.as_ref().map(Some));
-            return result;
-        }
+        let request = normalize_speech_text(request, resolved_variant);
         let core_params = core_params_from_generation(&request.config);
         let core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
             .into_engine_request(core_params);
+        let budget_frames = core_request.params.max_tokens;
 
         let output = self.run_request(core_request).await?;
         let diagnostics = Some(serde_json::json!({
@@ -939,6 +546,7 @@ impl RuntimeService {
         }));
         let samples = output.audio.samples;
         let sample_rate = output.audio.sample_rate;
+        ensure_speech_audio(resolved_variant, &output.request_id, &samples, sample_rate)?;
         let total_tokens = output.num_tokens;
         let total_time_ms = output.generation_time.as_secs_f32() * 1000.0;
 
@@ -955,6 +563,12 @@ impl RuntimeService {
             total_tokens,
             total_time_ms,
             diagnostics,
+            stop_reason: tts_stop_reason(
+                resolved_variant,
+                budget_frames,
+                &output.latency_breakdown,
+                total_tokens,
+            ),
         })
     }
 
@@ -968,6 +582,7 @@ impl RuntimeService {
         chunk_tx: mpsc::Sender<AudioChunk>,
     ) -> Result<()> {
         let resolved_variant = self.resolve_tts_variant_for_request(&request).await?;
+        let request = normalize_speech_text(request, resolved_variant);
         if uses_direct_streaming_tts_runtime(resolved_variant) {
             let observation = DirectTtsObservationContext::new(&request, resolved_variant, true);
             let retained_input_bytes = direct_tts_retained_input_bytes(&request)?;
@@ -995,34 +610,10 @@ impl RuntimeService {
                     self.kokoro_tts_generate_streaming(&job, request, chunk_tx)
                         .await
                 }
-                ModelFamily::Lfm25Audio => {
-                    self.lfm25_audio_tts_generate_streaming(
-                        &job,
-                        request,
-                        resolved_variant,
-                        chunk_tx,
-                    )
-                    .await
-                }
-                ModelFamily::VoxtralTts => {
-                    self.voxtral_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
-                        .await
-                }
-                ModelFamily::VibeVoiceTts => {
-                    self.vibevoice_tts_generate_streaming(&job, request, resolved_variant, chunk_tx)
-                        .await
-                }
                 _ => unreachable!("direct TTS family checked above"),
             };
             self.record_direct_tts_observation(observation, result.as_ref().map(|_| None));
             return result;
-        }
-        if qwen_tts_streaming_uses_final_only(
-            self.device.kind.is_cuda(),
-            resolved_variant,
-            qwen_tts_cuda_chunked_codec_stream_enabled(),
-        ) {
-            return self.qwen_tts_final_only_streaming(request, chunk_tx).await;
         }
         let core_params = core_params_from_generation(&request.config);
         let mut core_request = TtsRuntimeRequest::from_generation(request, resolved_variant)?
@@ -1033,6 +624,7 @@ impl RuntimeService {
         }
 
         let terminal_deadline = core_request.deadline;
+        let budget_frames = core_request.params.max_tokens;
         let mut next_sequence = 0usize;
         let output = self
             .run_streaming_request(core_request, |stream_chunk| {
@@ -1068,11 +660,42 @@ impl RuntimeService {
             generation_time_ms: output.generation_time.as_secs_f32() * 1000.0,
             tokens_generated: output.num_tokens,
             rtf: output.rtf(),
+            stop_reason: tts_stop_reason(
+                resolved_variant,
+                budget_frames,
+                &output.latency_breakdown,
+                output.num_tokens,
+            ),
         });
         send_terminal_tts_chunk(&chunk_tx, terminal, terminal_deadline).await?;
         info!("Streaming generation complete via core engine");
         Ok(())
     }
+}
+
+/// Why an engine TTS request ended. The engine's decode accounting counts
+/// committed audio frames (`decode_tokens`) and decode steps separately;
+/// `num_tokens` (scheduler tokens) is not a frame count for every family,
+/// so it is only the fallback. Only Qwen3-TTS is known to end on a decode
+/// step that commits no frame, so only its step count separates end of
+/// speech from a context stop.
+fn tts_stop_reason(
+    variant: ModelVariant,
+    budget_frames: usize,
+    breakdown: &Option<crate::engine::LatencyBreakdown>,
+    num_tokens: usize,
+) -> Option<TtsStopReason> {
+    let frames = breakdown
+        .as_ref()
+        .and_then(|breakdown| breakdown.decode_tokens)
+        .unwrap_or(num_tokens);
+    let steps = breakdown
+        .as_ref()
+        .filter(|breakdown| {
+            breakdown.decode_tokens.is_some() && variant.family() == ModelFamily::Qwen3Tts
+        })
+        .map(|breakdown| breakdown.decode_steps as usize);
+    TtsStopReason::classify(budget_frames, frames, steps)
 }
 
 fn core_params_from_generation(config: &GenerationConfig) -> CoreGenParams {
@@ -1089,7 +712,10 @@ mod tests {
 
     #[test]
     fn fish_s2_public_tts_routes_always_use_retained_execution() {
-        assert!(!uses_direct_tts_runtime(ModelVariant::FishAudioS2Pro));
+        assert_eq!(
+            tts_route_target(ModelVariant::FishAudioS2Pro, false),
+            ExecutionTargetKind::TokenEngine
+        );
         assert!(!uses_direct_streaming_tts_runtime(
             ModelVariant::FishAudioS2Pro
         ));
@@ -1097,7 +723,10 @@ mod tests {
 
     #[test]
     fn kokoro_uses_engine_for_atomic_generation_and_direct_native_streaming() {
-        assert!(!uses_direct_tts_runtime(ModelVariant::Kokoro82M));
+        assert_eq!(
+            tts_route_target(ModelVariant::Kokoro82M, false),
+            ExecutionTargetKind::TokenEngine
+        );
         assert!(uses_direct_streaming_tts_runtime(ModelVariant::Kokoro82M));
     }
     use crate::backends::BackendKind;
@@ -1106,40 +735,257 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    /// TPIPE-3: the advertised streaming mode of every enabled TTS variant
+    /// is what its streaming route does. Every streaming family publishes
+    /// audio as it commits it, so none is final-only: Qwen3-TTS on every
+    /// backend (its per-frame stream replaced the CUDA-only chunked codec),
+    /// and LFM2.5 Audio, VibeVoice and Voxtral, which used to run the
+    /// non-stream route and send one final chunk.
     #[test]
-    fn qwen_tts_cuda_streaming_defaults_to_final_only_without_chunked_codec() {
-        assert!(qwen_tts_streaming_uses_final_only(
-            true,
+    fn advertised_streaming_mode_is_what_the_route_does() {
+        use crate::runtime::adapters::{RuntimeAdapterRegistry, StreamingMode};
+        let registry = RuntimeAdapterRegistry::built_in();
+        for variant in ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.is_enabled() && variant.speech_capabilities().is_some())
+        {
+            // A stream runs on a streaming capability, or on the TTS
+            // capability's own native-streaming graph, which the loader
+            // seals only for a TTS adapter that streams in chunks.
+            let streams = registry
+                .require(CapabilityKind::StreamingTts, variant)
+                .is_ok()
+                || (variant.streams_on_its_tts_route()
+                    && registry
+                        .require(CapabilityKind::Tts, variant)
+                        .is_ok_and(|tts| tts.streaming_mode == StreamingMode::Chunked));
+            let expected = if streams {
+                TtsStreamingMode::Chunked
+            } else {
+                TtsStreamingMode::Unsupported
+            };
+            assert_eq!(tts_streaming_mode(variant), expected, "{variant}");
+        }
+        for variant in [
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            false,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_cuda_streaming_respects_chunked_codec_opt_in() {
-        assert!(!qwen_tts_streaming_uses_final_only(
-            true,
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            true,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_non_cuda_streaming_defaults_to_final_only() {
-        assert!(qwen_tts_streaming_uses_final_only(
-            false,
-            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
-            false,
-        ));
-    }
-
-    #[test]
-    fn qwen_tts_final_only_streaming_policy_does_not_affect_non_qwen() {
-        assert!(!qwen_tts_streaming_uses_final_only(
-            true,
+            ModelVariant::Qwen3Tts12Hz17BVoiceDesign,
             ModelVariant::Kokoro82M,
-            false,
-        ));
+            ModelVariant::FishAudioS2Pro,
+            ModelVariant::Lfm25Audio15BGguf,
+            ModelVariant::VibeVoice15BTts,
+            ModelVariant::Voxtral4BTts2603,
+        ] {
+            assert_eq!(
+                tts_streaming_mode(variant),
+                TtsStreamingMode::Chunked,
+                "{variant}"
+            );
+            assert_eq!(
+                tts_route_target(variant, true),
+                if variant.is_kokoro() {
+                    ExecutionTargetKind::DirectModel
+                } else {
+                    ExecutionTargetKind::TokenEngine
+                },
+                "{variant}"
+            );
+        }
+    }
+
+    /// The live CPU Qwen runs: short (54 steps / 53 frames) and long
+    /// (983 / 982) ended on EOS but were reported as budget stops, because
+    /// the scheduler token count is not a frame count; medium (313 / 313)
+    /// really hit its budget. A family without the end-of-speech step
+    /// signal never reads as a context stop.
+    #[test]
+    fn empty_speech_output_is_an_error_and_never_a_nan_duration() {
+        let variant = ModelVariant::Kokoro82M;
+        assert!(ensure_speech_audio(variant, "empty", &[], 24_000).is_err());
+        assert!(ensure_speech_audio(variant, "rateless", &[0.1], 0).is_err());
+        assert!(ensure_speech_audio(variant, "ok", &[0.1], 24_000).is_ok());
+        let result = GenerationResult {
+            request_id: "rateless".into(),
+            samples: vec![0.1; 10],
+            sample_rate: 0,
+            total_tokens: 1,
+            total_time_ms: 5.0,
+            diagnostics: None,
+            stop_reason: None,
+        };
+        assert_eq!(result.duration_secs(), 0.0);
+        assert_eq!(result.rtf(), 0.0);
+    }
+
+    /// Kokoro speaks "$1,250.75" and "March 3rd" as words by default; a
+    /// family that reads them itself is left alone unless the request asks,
+    /// and a request can turn Kokoro's off.
+    #[test]
+    fn speech_text_normalization_follows_the_family_default_and_the_request() {
+        let text = "It costs $1,250.75 on March 3rd.";
+        let spoken = "It costs one thousand two hundred fifty dollars and seventy-five cents on March third.";
+        let request = |normalize_text: Option<bool>| {
+            let mut request = GenerationRequest::new(text);
+            request.config.options.speech.normalize_text = normalize_text;
+            request
+        };
+        assert_eq!(
+            normalize_speech_text(request(None), ModelVariant::Kokoro82M).text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(None), ModelVariant::Qwen3Tts12Hz06BCustomVoice).text,
+            text
+        );
+        assert_eq!(
+            normalize_speech_text(
+                request(Some(true)),
+                ModelVariant::Qwen3Tts12Hz06BCustomVoice
+            )
+            .text,
+            spoken
+        );
+        assert_eq!(
+            normalize_speech_text(request(Some(false)), ModelVariant::Kokoro82M).text,
+            text
+        );
+        // Non-English text is never rewritten.
+        let mut japanese = request(None);
+        japanese.config.options.speaker = Some("jf_alpha".into());
+        assert_eq!(
+            normalize_speech_text(japanese, ModelVariant::Kokoro82M).text,
+            text
+        );
+    }
+
+    #[test]
+    fn engine_tts_stop_reason_reads_frames_and_the_end_of_speech_step() {
+        let breakdown = |steps: u32, frames: usize| {
+            Some(crate::engine::LatencyBreakdown {
+                queue_wait_ms: 0.0,
+                media_decode_ms: None,
+                normalization_ms: None,
+                prefill_ms: 0.0,
+                decode_ms: 0.0,
+                decode_wall_ms: None,
+                decode_tokens: Some(frames),
+                post_first_token_ms: None,
+                sampling_ms: None,
+                codec_ms: None,
+                postprocess_ms: None,
+                ttft_ms: None,
+                total_ms: 0.0,
+                prefill_steps: 1,
+                decode_steps: steps,
+            })
+        };
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let reason = |variant, budget, b: Option<_>, tokens| {
+            tts_stop_reason(variant, budget, &b, tokens).unwrap()
+        };
+        assert_eq!(
+            reason(qwen, 82, breakdown(54, 53), 864),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(qwen, 1_500, breakdown(983, 982), 15_712),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(qwen, 313, breakdown(313, 313), 5_008),
+            TtsStopReason::OutputBudget
+        );
+        assert_eq!(
+            reason(qwen, 313, breakdown(200, 200), 3_200),
+            TtsStopReason::ContextLimit
+        );
+        let vibevoice = ModelVariant::VibeVoice15BTts;
+        assert_eq!(
+            reason(vibevoice, 384, breakdown(200, 200), 200),
+            TtsStopReason::EndOfSpeech
+        );
+        assert_eq!(
+            reason(vibevoice, 384, None, 384),
+            TtsStopReason::OutputBudget
+        );
+        assert_eq!(tts_stop_reason(qwen, 0, &breakdown(5, 5), 5), None);
+    }
+
+    /// Phase 0 capability contract for every enabled TTS variant: the route
+    /// the runtime takes for non-stream and stream requests is the one the
+    /// registry advertises (VXT-1); streaming is advertised exactly when a
+    /// streaming capability is published; a streamed request that runs on
+    /// the engine belongs to a family whose executor publishes audio and a
+    /// final marker (TPIPE-3/4); and the automatic
+    /// frame budget grows with text and stays inside the model's maximum
+    /// (TPIPE-2).
+    #[test]
+    fn every_tts_family_route_matches_its_advertised_capability_and_budget() {
+        use crate::models::architectures::qwen3::tts::qwen3_tts_auto_max_frames_for_text;
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        use crate::runtime::adapters::RuntimeAdapterRegistry;
+        // Families whose engine executors stream committed audio and publish
+        // the final marker.
+        const ENGINE_STREAM_EMITTERS: [ModelFamily; 5] = [
+            ModelFamily::Qwen3Tts,
+            ModelFamily::FishS2Tts,
+            ModelFamily::VoxtralTts,
+            ModelFamily::Lfm25Audio,
+            ModelFamily::VibeVoiceTts,
+        ];
+        let registry = RuntimeAdapterRegistry::built_in();
+        let short = "Hello there.";
+        let paragraph = "The committee reviewed every proposal in detail. ".repeat(6);
+        let flood = "word ".repeat(20_000);
+        let mut checked = 0;
+        for variant in ModelVariant::all().iter().copied() {
+            if !variant.is_enabled() || !variant.is_tts() {
+                continue;
+            }
+            checked += 1;
+            let capabilities = variant.speech_capabilities().expect("speech capabilities");
+            let tts = registry
+                .require(CapabilityKind::Tts, variant)
+                .unwrap_or_else(|error| panic!("{variant}: {error}"));
+            assert_eq!(
+                tts.execution_target,
+                tts_route_target(variant, false),
+                "{variant}: non-stream route"
+            );
+            match registry.require(CapabilityKind::StreamingTts, variant) {
+                Ok(streaming) => {
+                    assert!(capabilities.supports_streaming, "{variant}");
+                    assert_eq!(
+                        streaming.execution_target,
+                        tts_route_target(variant, true),
+                        "{variant}: stream route"
+                    );
+                }
+                Err(_) => assert!(
+                    !capabilities.supports_streaming || variant.streams_on_its_tts_route(),
+                    "{variant}"
+                ),
+            }
+            let engine_stream = capabilities.supports_streaming
+                && tts_route_target(variant, true) == ExecutionTargetKind::TokenEngine;
+            assert!(
+                !engine_stream || ENGINE_STREAM_EMITTERS.contains(&variant.family()),
+                "{variant}: an engine stream would end without audio"
+            );
+            let budget: Option<fn(&str) -> usize> = match variant.family() {
+                ModelFamily::Qwen3Tts => Some(qwen3_tts_auto_max_frames_for_text),
+                ModelFamily::VibeVoiceTts => Some(vibevoice_tts_auto_max_frames_for_text),
+                ModelFamily::VoxtralTts => Some(voxtral_tts_auto_max_frames_for_text),
+                _ => None,
+            };
+            if let Some(budget) = budget {
+                let maximum = variant.tts_max_output_frames_hint().expect("frame hint");
+                assert!(budget(short) > 0, "{variant}");
+                assert!(budget(&paragraph) > budget(short), "{variant}");
+                assert!(budget(&flood) <= maximum, "{variant}");
+            }
+        }
+        assert!(checked >= 8, "only {checked} TTS variants were checked");
     }
 
     #[test]
@@ -1270,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn kokoro_max_text_at_minimum_speed_uses_the_hard_model_output_contract() {
+    fn kokoro_max_text_keeps_the_hard_unit_contract_and_reserves_one_chunk_of_output() {
         let max_sequence_length = 4096usize;
         let max_text_chars = max_sequence_length * 8;
         let mut request = GenerationRequest::new("x".repeat(max_text_chars));
@@ -1284,86 +1130,56 @@ mod tests {
         )
         .unwrap();
 
-        let expected_frames = budget
-            .max_model_tokens
-            .checked_mul(100)
-            .unwrap()
-            .min(max_text_chars * 4_096);
-        let expected_samples = expected_frames
-            .checked_mul(600)
-            .and_then(|samples| samples.checked_add((max_text_chars - 1) * 960))
-            .unwrap();
-        assert_eq!(budget.max_samples, expected_samples);
-        assert_eq!(budget.max_chunk_expanded_frames, 4_096);
         assert_eq!(shape.units, budget.max_model_tokens as u64);
-        assert_eq!(shape.max_output_samples, expected_samples as u64);
+        // One 180-character chunk at 4 frames per character, halved speed.
+        assert_eq!(shape.kokoro_chunk_frames, Some(1_440));
+        assert_eq!(shape.max_output_samples, 1_440 * 600);
     }
 
+    /// KOK-8/9: a 45-word stream reserved 3.34 GB on Metal (4,096 frames of
+    /// workspace plus the whole text's output at 50 bins per token) and was
+    /// refused against 2.30 GB of live memory, although one chunk of real
+    /// speech needs far less. The stream now reserves its largest planned
+    /// chunk at the planning pace, with the final-stage im2col counted
+    /// (rounded to a power of two on Metal), and one chunk of output.
     #[test]
-    fn kokoro_worst_case_chunk_reserves_architecture_peak_on_each_backend() {
-        // 29 input characters authorize at least 512 worst-case model tokens,
-        // so the per-chunk frame ceiling, rather than total request tokens,
-        // determines the live activation peak.
-        let mut request = GenerationRequest::new("x".repeat(29));
-        request.config.options.speed = 0.5;
-        let budget = kokoro_output_budget(&request.text, request.config.options.speed).unwrap();
-        assert_eq!(budget.max_chunk_expanded_frames, 4_096);
-
-        let expanded_frames = 4_096u64;
-        let generator_time_scale = 2 * 10 * 6;
-        let final_stage_elements_per_frame = generator_time_scale * 128;
-        let retained_elements_per_frame = generator_time_scale * 22 + 512 + 2 * 2;
-        let cpu_tensor_bytes = expanded_frames
-            * (final_stage_elements_per_frame * 10 + retained_elements_per_frame)
-            * std::mem::size_of::<f32>() as u64;
-        let accelerator_tensor_bytes = expanded_frames
-            * (final_stage_elements_per_frame * 9 + retained_elements_per_frame)
-            * std::mem::size_of::<f32>() as u64;
-        let host_workspace_bytes =
-            expanded_frames * generator_time_scale * 5 * 40 * std::mem::size_of::<f32>() as u64;
-        let output_bytes = budget.max_samples as u64 * std::mem::size_of::<f32>() as u64;
-
-        let cpu = direct_tts_additional_resources(
-            BackendKind::Cpu,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-        let metal = direct_tts_additional_resources(
-            BackendKind::Metal,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-        let cuda = direct_tts_additional_resources(
-            BackendKind::Cuda,
-            &request,
-            ModelVariant::Kokoro82M,
-            4_096,
-        )
-        .unwrap();
-
+    fn kokoro_stream_reserves_one_planned_chunk_on_each_backend() {
+        use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+        let paragraph = "Good morning. Today we are testing a speech synthesis system on a \
+            laptop. The goal is to measure how fast it runs, how much memory it uses, and \
+            whether every word in this paragraph comes out clearly, without skipping, \
+            repeating, or adding anything at the end.";
+        let request = GenerationRequest::new(paragraph);
+        let resources = |backend| {
+            direct_tts_additional_resources(backend, &request, ModelVariant::Kokoro82M, 4_096)
+                .unwrap()
+        };
+        let frames = 180 * 4;
+        let price = |backend| kokoro_chunk_price(frames, backend).unwrap();
+        let output_bytes = frames as u64 * 600 * 4;
+        let metal = price(BackendKind::Metal);
         assert_eq!(
-            cpu.host_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes + cpu_tensor_bytes)
+            resources(BackendKind::Metal).unified_bytes,
+            ResourceAmount::Known(output_bytes + metal.host_bytes + metal.accelerator_tensor_bytes)
         );
+        let cpu = price(BackendKind::Cpu);
         assert_eq!(
-            metal.unified_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes + accelerator_tensor_bytes)
+            resources(BackendKind::Cpu).host_bytes,
+            ResourceAmount::Known(output_bytes + cpu.host_bytes + cpu.cpu_tensor_bytes)
         );
+        let cuda = price(BackendKind::Cuda);
         assert_eq!(
-            cuda.host_bytes,
-            ResourceAmount::Known(output_bytes + host_workspace_bytes)
+            resources(BackendKind::Cuda).device_bytes,
+            ResourceAmount::Known(cuda.accelerator_tensor_bytes)
         );
-        assert_eq!(
-            cuda.device_bytes,
-            ResourceAmount::Known(accelerator_tensor_bytes)
-        );
+        let ResourceAmount::Known(metal_total) = resources(BackendKind::Metal).unified_bytes else {
+            panic!("known Metal reservation");
+        };
+        // The tiled decoder (16 MiB per conv) holds one tile's im2col, not
+        // the 512 MiB stage im2col: about 0.55 GB, from about 1.0 GB.
         assert!(
-            output_bytes + host_workspace_bytes + cpu_tensor_bytes < 4 * 1024 * 1024 * 1024,
-            "the enforced frame ceiling must keep a worst-case chunk admissible on practical hosts"
+            metal_total < 600 * 1024 * 1024,
+            "45-word stream reserves {metal_total} bytes on Metal"
         );
     }
 

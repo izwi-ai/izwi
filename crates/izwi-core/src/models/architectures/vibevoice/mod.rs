@@ -29,6 +29,8 @@ pub mod diffusion;
 pub mod prompt;
 pub mod tokenizer;
 pub mod tts;
+#[cfg(test)]
+mod tts_smoke;
 
 pub(crate) const VIBEVOICE_ASR_DECODER_DOMAIN: StateDomainId = StateDomainId::new(1);
 pub(crate) const VIBEVOICE_ASR_ACOUSTIC_DOMAIN: StateDomainId = StateDomainId::new(2);
@@ -893,6 +895,73 @@ fn vibevoice_tensor_invocation_bytes(state: &StateDomainSpec) -> Result<u64> {
                 Error::ModelLoadError("VibeVoice tokenizer domain bytes overflow".into())
             })
     })
+}
+
+/// The retained TTS contract a loaded VibeVoice-1.5B publishes, from its
+/// real decoder geometry (Qwen2.5-1.5B: 28 layers, 12 query and 2 KV heads
+/// of 128) in `dtype`, with a small tokenizer streaming state. Lets load
+/// admission be tested without weights.
+#[cfg(test)]
+pub(crate) fn vibevoice_tts_retained_test_contract(dtype: DType) -> InferenceStateContract {
+    use crate::models::architectures::qwen3::core::{
+        qwen3_decoder_cache_domain, Qwen3DecoderCacheGeometry,
+    };
+    let decoder = [
+        (VIBEVOICE_TTS_POSITIVE_DOMAIN, VIBEVOICE_TTS_POSITIVE_GROUP),
+        (VIBEVOICE_TTS_NEGATIVE_DOMAIN, VIBEVOICE_TTS_NEGATIVE_GROUP),
+    ];
+    let domains = decoder
+        .iter()
+        .map(|(domain, _)| {
+            qwen3_decoder_cache_domain(Qwen3DecoderCacheGeometry {
+                domain: *domain,
+                clock: StateClock::DecoderTokens,
+                num_layers: 28,
+                num_query_heads: 12,
+                num_kv_heads: 2,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                sliding_window: None,
+                storage_dtype: dtype,
+                preferred_page_tokens:
+                    crate::models::shared::attention::paged::default_kv_page_size(),
+                prefix: PrefixPolicy::Disabled,
+            })
+            .map(StateDomainSpec::PagedAttention)
+        })
+        .collect::<Result<Vec<_>>>()
+        .expect("VibeVoice decoder domains");
+    let state = InferenceStateContract {
+        abi: CURRENT_INFERENCE_STATE_ABI,
+        domains,
+        groups: decoder
+            .iter()
+            .map(|(domain, group)| StateGroupSpec {
+                id: *group,
+                domains: vec![*domain],
+                prefix_shareable: false,
+            })
+            .collect(),
+    };
+    let tokenizer = [
+        (VIBEVOICE_TTS_ACOUSTIC_DOMAIN, StateClock::CodecFrames),
+        (VIBEVOICE_TTS_SEMANTIC_DOMAIN, StateClock::CodecFrames),
+    ]
+    .map(|(domain, clock)| {
+        VibeVoiceTokenizerStateDomain::new(
+            domain,
+            VIBEVOICE_TTS_TOKENIZER_GROUP,
+            clock,
+            vec![VibeVoiceTokenizerStateComponentGeometry {
+                channels: 64,
+                frames: 6,
+            }],
+        )
+        .expect("VibeVoice tokenizer domain")
+    });
+    let invocation = vibevoice_invocation_contract_from_state(state, dtype, &tokenizer)
+        .expect("VibeVoice TTS invocation contract");
+    vibevoice_tts_retained_contract(&invocation).expect("VibeVoice TTS retained contract")
 }
 
 #[cfg(test)]

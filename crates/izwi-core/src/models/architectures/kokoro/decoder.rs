@@ -28,6 +28,7 @@ use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
 use crate::error::{Error, Result};
+use crate::kernels::conv_tiling::conv1d_bounded;
 #[cfg(feature = "metal")]
 use crate::kernels::metal_encoder::IzwiMetalCommandEncoderExt;
 
@@ -35,6 +36,11 @@ use super::config::{KokoroConfig, KokoroIstftNetConfig};
 use super::prosody::{
     load_plain_conv1d, load_weight_norm_conv1d, load_weight_norm_conv1d_no_bias,
     load_weight_norm_conv_transpose1d, AdaIN1d, AdainResBlk1d,
+};
+use super::{
+    KOKORO_ACTIVATION_DTYPE_BYTES, KOKORO_DECODER_TIME_EXPANSION,
+    KOKORO_GENERATOR_RESBLOCK_KERNELS, KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS,
+    KOKORO_GENERATOR_UPSAMPLE_RATES,
 };
 
 #[cfg(feature = "metal")]
@@ -135,6 +141,61 @@ fn kokoro_metal_harmonic_overlap_enabled() -> bool {
         ),
         Err(_) => true,
     }
+}
+
+/// The im2col bound of every generator conv1d (KOK-9): a conv whose
+/// Candle im2col would exceed it runs in output-time tiles
+/// (`kernels::conv_tiling`). 16 MiB is about 25 duration frames of the final
+/// stage's k=11 convs, so a chunk tiles into tens of launches per conv.
+pub(crate) const KOKORO_IM2COL_TILE_BYTES: u64 = 16 << 20;
+
+/// The decoder's peak im2col working set for one chunk of `frames`
+/// duration frames, with tiling: `(cpu, accelerator)` bytes. The final
+/// generator stage dominates (128 channels, 120 steps per frame; earlier
+/// stages and `conv_post` need less per conv). A conv over the tile bound
+/// holds one tile's im2col plus its tile outputs until they are
+/// concatenated (one stage buffer); a conv within it holds its whole
+/// im2col. The CPU runs the three resblock branches concurrently (all
+/// kernels live), accelerators one at a time (the largest). Admission
+/// should price this per chunk in place of the untiled im2col
+/// (`admission::kokoro_im2col_bytes`), keeping its Metal power-of-two
+/// rounding.
+pub(crate) fn kokoro_decoder_im2col_bytes(frames: u64) -> Result<(u64, u64)> {
+    let overflow = || Error::Overloaded("Kokoro decoder im2col price overflowed".to_string());
+    let steps = KOKORO_GENERATOR_UPSAMPLE_RATES
+        .iter()
+        .try_fold(KOKORO_DECODER_TIME_EXPANSION as u64, |scale, rate| {
+            scale.checked_mul(*rate as u64)
+        })
+        .and_then(|per_frame| per_frame.checked_mul(frames))
+        .ok_or_else(overflow)?;
+    let channels = (KOKORO_GENERATOR_UPSAMPLE_INITIAL_CHANNELS
+        >> KOKORO_GENERATOR_UPSAMPLE_RATES.len()) as u64;
+    let elem = KOKORO_ACTIVATION_DTYPE_BYTES;
+    let mut cpu = 0u64;
+    let mut accelerator = 0u64;
+    for kernel in KOKORO_GENERATOR_RESBLOCK_KERNELS {
+        let kernel = kernel as u64;
+        let full = channels
+            .checked_mul(kernel)
+            .and_then(|n| n.checked_mul(steps))
+            .and_then(|n| n.checked_mul(elem))
+            .ok_or_else(overflow)?;
+        let held = if full <= KOKORO_IM2COL_TILE_BYTES {
+            full
+        } else {
+            let tile = channels * kernel * elem;
+            let tile_bytes = (KOKORO_IM2COL_TILE_BYTES / tile).max(1) * tile;
+            let outputs = channels
+                .checked_mul(steps)
+                .and_then(|n| n.checked_mul(elem))
+                .ok_or_else(overflow)?;
+            tile_bytes.checked_add(outputs).ok_or_else(overflow)?
+        };
+        cpu = cpu.checked_add(held).ok_or_else(overflow)?;
+        accelerator = accelerator.max(held);
+    }
+    Ok((cpu, accelerator))
 }
 
 #[derive(Debug)]
@@ -586,7 +647,7 @@ impl KokoroIstftGenerator {
 
         let t2 = Instant::now();
         x = ops::leaky_relu(&x, 0.01).map_err(Error::from)?;
-        x = self.conv_post.forward(&x).map_err(Error::from)?;
+        x = conv1d_bounded(&x, &self.conv_post, KOKORO_IM2COL_TILE_BYTES).map_err(Error::from)?;
         if profile {
             sync_kokoro_profile_tensor(&x);
         }
@@ -1217,7 +1278,8 @@ impl AdaInResBlock1 {
                 log_kokoro_profile(&format!("{prefix}.iter.{j}.adain1_snake"), t.elapsed());
             }
             let t_conv1 = if profile { Some(Instant::now()) } else { None };
-            xt = self.convs1[j].forward(&xt).map_err(Error::from)?;
+            xt = conv1d_bounded(&xt, &self.convs1[j], KOKORO_IM2COL_TILE_BYTES)
+                .map_err(Error::from)?;
             if let (Some(prefix), Some(t)) = (profile_prefix, t_conv1) {
                 sync_kokoro_profile_tensor(&xt);
                 log_kokoro_profile(&format!("{prefix}.iter.{j}.conv1"), t.elapsed());
@@ -1229,7 +1291,8 @@ impl AdaInResBlock1 {
                 log_kokoro_profile(&format!("{prefix}.iter.{j}.adain2_snake"), t.elapsed());
             }
             let t_conv2 = if profile { Some(Instant::now()) } else { None };
-            xt = self.convs2[j].forward(&xt).map_err(Error::from)?;
+            xt = conv1d_bounded(&xt, &self.convs2[j], KOKORO_IM2COL_TILE_BYTES)
+                .map_err(Error::from)?;
             if let (Some(prefix), Some(t)) = (profile_prefix, t_conv2) {
                 sync_kokoro_profile_tensor(&xt);
                 log_kokoro_profile(&format!("{prefix}.iter.{j}.conv2"), t.elapsed());
@@ -1643,13 +1706,15 @@ fn sinegen_f02sine(
 
     let down_t = (t / upsample_scale.max(1)).max(1);
     let rad_down = linear_resample_time_time_major(&rad_values, t, down_t, dim);
+    // `torch.cumsum(rad_values, dim=1) * 2 * torch.pi`: Torch's CPU cumsum
+    // accumulates F32 in f64 and stores each prefix as F32.
     let mut phase_down = vec![0.0f32; rad_down.len()];
     for h in 0..dim {
-        let mut acc = 0.0f32;
+        let mut acc = 0.0f64;
         for ti in 0..down_t {
             let idx = ti * dim + h;
-            acc += rad_down[idx];
-            phase_down[idx] = acc * (2.0 * PI);
+            acc += f64::from(rad_down[idx]);
+            phase_down[idx] = (acc as f32) * (2.0 * PI);
         }
     }
     let scale = upsample_scale.max(1) as f32;
@@ -1732,6 +1797,28 @@ fn hann_window_periodic(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KOK-9: with tiling, a 45-word stream chunk (180 characters at the
+    /// planning pace, 720 frames) holds a bounded im2col: one 16 MiB tile
+    /// plus one stage buffer per live conv, against 487 MB untiled on an
+    /// accelerator. Small chunks (under the bound) are priced untiled.
+    #[test]
+    fn decoder_im2col_price_is_bounded_by_tiling() {
+        let frames = 720u64;
+        let (cpu, accelerator) = kokoro_decoder_im2col_bytes(frames).unwrap();
+        let untiled_widest = 128 * 11 * 120 * frames * 4;
+        let stage_buffer = 128 * 120 * frames * 4;
+        assert_eq!(untiled_widest, 486_604_800);
+        assert!(accelerator <= KOKORO_IM2COL_TILE_BYTES + stage_buffer);
+        assert!(accelerator < 64 << 20, "{accelerator}");
+        assert!(
+            cpu <= 3 * (KOKORO_IM2COL_TILE_BYTES + stage_buffer),
+            "{cpu}"
+        );
+        let (small_cpu, small_accelerator) = kokoro_decoder_im2col_bytes(2).unwrap();
+        assert_eq!(small_accelerator, 128 * 11 * 120 * 2 * 4);
+        assert_eq!(small_cpu, 128 * (3 + 7 + 11) * 120 * 2 * 4);
+    }
 
     #[test]
     fn kokoro_hann_window_periodic_smoke() {
@@ -1822,6 +1909,26 @@ mod tests {
             .expect("fused values");
 
         assert_eq!(fused, reference);
+    }
+
+    /// KOK-17: the sine phase is a cumulative sum accumulated in f64 and
+    /// stored as F32 (Torch's CPU cumsum), so it does not drift over a long
+    /// chunk; an F32 accumulator drifts by far more than the tolerance here.
+    #[test]
+    fn sine_phase_accumulates_in_f64_like_torch_cumsum() {
+        let t = 200_000;
+        let f0 = vec![2_962.963f32; t];
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let sines = sinegen_f02sine(&f0, t, 1, 24_000.0, 1, &mut rng);
+        let rad = (2_962.963f32 * (1.0f32 / 24_000.0)).rem_euclid(1.0);
+        let mut acc = 0.0f64;
+        let mut worst = 0.0f32;
+        for (index, sine) in sines.iter().enumerate() {
+            acc += f64::from(rad);
+            let expected = ((acc as f32) * (2.0 * PI)).sin();
+            worst = worst.max((sine - expected).abs());
+            assert!(worst.is_finite() && worst < 1e-3, "sample {index}: {worst}");
+        }
     }
 
     #[test]

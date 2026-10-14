@@ -27,6 +27,7 @@ pub use config::{
     VoxtralTtsAudioTokenizerArgs, VoxtralTtsConfig, VoxtralTtsMultimodalConfig, DEFAULT_CFG_ALPHA,
     DEFAULT_N_DECODING_STEPS, VOXTRAL_TTS_MODEL_TYPE,
 };
+pub(crate) use model::VOXTRAL_TTS_STATE_CONTEXT_TOKENS;
 pub use model::{
     select_voxtral_tts_dtypes, VoxtralTtsAssets, VoxtralTtsDTypePlan, VoxtralTtsModel,
     VoxtralTtsOutput,

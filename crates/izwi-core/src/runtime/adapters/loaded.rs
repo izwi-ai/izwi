@@ -3084,6 +3084,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
                     max_codebooks: 8,
                     max_materialized_tensor_elements: 4_096 * 2_048,
                     max_retained_resident_bytes: 4_096 * 2_048 * 4,
+                    max_preparation_workspace_bytes: 4_096 * 2_048 * 4,
                     max_workspace_bytes: 64 * 1024 * 1024,
                 },
             )
@@ -3127,7 +3128,7 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
         preparation.shape_policy = StageShapePolicy::Exact;
         preparation.max_work_units = u64::try_from(ceiling.max_prompt_tokens)
             .map_err(|_| Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into()))?;
-        preparation.max_workspace_bytes = ceiling.max_workspace_bytes;
+        preparation.max_workspace_bytes = ceiling.max_preparation_workspace_bytes;
         preparation.output_visibility = OutputVisibility::AfterQuantumCommit;
         let mut prefill = StageDescriptor::from_execution_profile(
             StageId::new(1),
@@ -7803,6 +7804,97 @@ mod tests {
         assert_eq!(contract.stages[1].shape_policy, StageShapePolicy::Exact);
         assert_eq!(contract.stages[1].concurrency, ConcurrencyClass::Exclusive);
         assert_eq!(contract.stages[1].max_batch_size, 1);
+    }
+
+    /// VXT-1: the registry advertised DirectModel while the loaded adapter
+    /// publishes only engine sequence stages, so the direct route's
+    /// `AtomicJob` matched no stage and every request failed. The contract
+    /// target must be the route `RuntimeService` takes, every unit of work
+    /// that route schedules must find its stage, and the retained context
+    /// is bounded by one request, not the LM's 128,000 positions (VXT-2).
+    #[test]
+    fn voxtral_tts_contract_target_is_the_route_taken_and_serves_its_scheduled_work() {
+        use crate::engine::{InputRange, SequencePhase, WorkUnit};
+        use crate::kv::v2::{
+            test_contract, CheckpointPolicy, InvocationWorkspaceDomain, InvocationWorkspaceSet,
+            RetainedStateCapability, StateDomainSpec, StateScope,
+        };
+        use crate::models::architectures::voxtral::tts::model::voxtral_tts_retained_max_tokens;
+        use crate::models::architectures::voxtral::tts::VOXTRAL_TTS_STATE_CONTEXT_TOKENS;
+        let variant = ModelVariant::Voxtral4BTts2603;
+        let registry = RuntimeAdapterRegistry::built_in();
+        let metadata = *registry.require(CapabilityKind::Tts, variant).unwrap();
+        assert_eq!(
+            metadata.execution_target,
+            crate::runtime::tts::tts_route_target(variant, false)
+        );
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let contract = VoxtralTtsExecutionAdapter::new(
+                ExecutionGroupId::new(91),
+                ModelInstanceId::new(92),
+                metadata,
+                backend,
+                2,
+            )
+            .contract(StreamingRequirements::NONE)
+            .unwrap();
+            assert_eq!(
+                contract.metadata.execution_target,
+                metadata.execution_target
+            );
+            let binding = contract.adapter_binding().unwrap();
+            let sequence = |phase| WorkUnit::SequenceStep {
+                phase,
+                input: InputRange::new(0, 8).unwrap(),
+                max_output_steps: 1,
+                auxiliary_state: None,
+            };
+            for work in [
+                WorkUnit::PreSequencePreparation {
+                    kind: "tts.prepare.voxtral".into(),
+                },
+                sequence(SequencePhase::Prefill),
+                sequence(SequencePhase::Decode),
+                WorkUnit::SequenceFinalize {
+                    max_output_steps: 1,
+                },
+            ] {
+                binding
+                    .stage_for_work(&work)
+                    .unwrap_or_else(|error| panic!("{backend:?} {work:?}: {error}"));
+            }
+            assert!(binding
+                .stage_for_work(&WorkUnit::AtomicJob { kind: "tts".into() })
+                .is_err());
+
+            let mut invocation = test_contract();
+            for domain in &mut invocation.domains {
+                let StateDomainSpec::PagedAttention(domain) = domain else {
+                    panic!("test contract is paged");
+                };
+                domain.header.scope = StateScope::Invocation;
+                domain.header.checkpoint = CheckpointPolicy::None;
+            }
+            let spec = crate::models::architectures::voxtral::voxtral_tts_physical_state_spec(
+                &[contract.stages.as_ref()],
+                invocation,
+                voxtral_tts_retained_max_tokens(128_000),
+            )
+            .unwrap();
+            assert_eq!(spec.retained_max_tokens, VOXTRAL_TTS_STATE_CONTEXT_TOKENS);
+            assert!(matches!(
+                spec.descriptor.retained,
+                RetainedStateCapability::Managed { .. }
+            ));
+            let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+                panic!("bounded scratch profiles");
+            };
+            assert!(profiles
+                .iter()
+                .flat_map(|profile| profile.stages.iter())
+                .flat_map(|stage| stage.domains.iter())
+                .all(|domain| matches!(domain, InvocationWorkspaceDomain::Scratch { .. })));
+        }
     }
 
     #[test]

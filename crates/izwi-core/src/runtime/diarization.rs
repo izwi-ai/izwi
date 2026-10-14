@@ -378,8 +378,21 @@ impl RuntimeService {
         if workspace.host_bytes > authorized_workspace.host_bytes
             || workspace.accelerator_bytes > authorized_workspace.accelerator_bytes
         {
-            return Err(Error::Overloaded(format!(
+            tracing::warn!(
                 "Sortformer workspace {workspace:?} exceeds production authorization {authorized_workspace:?}"
+            );
+            let (need, limit) = if workspace.host_bytes > authorized_workspace.host_bytes {
+                (workspace.host_bytes, authorized_workspace.host_bytes)
+            } else {
+                (
+                    workspace.accelerator_bytes,
+                    authorized_workspace.accelerator_bytes,
+                )
+            };
+            return Err(Error::Overloaded(format!(
+                "diarization workspace needs {:.2} GB, above the {:.2} GB one request may use",
+                need as f64 / 1e9,
+                limit as f64 / 1e9
             )));
         }
         let expected_workspace = workspace;

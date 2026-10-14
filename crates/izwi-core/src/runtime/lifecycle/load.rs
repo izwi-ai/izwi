@@ -10,9 +10,10 @@ use tracing::{info, warn};
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::BackendKind;
 use crate::config::ContextLengthPreference;
+use crate::engine::resources::capacity_shortfall_reason;
 use crate::engine::{
     AdapterInstanceId, CacheMode, ModelInstanceId, ReservationClass, ReservationOwner,
-    ResourceAmount, ResourceLease, ResourceVector, StageDescriptor,
+    ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{
@@ -43,6 +44,8 @@ mod asr_memory;
 mod qwen36moe_memory;
 #[path = "qwen38_memory.rs"]
 mod qwen38_memory;
+#[path = "tts_memory.rs"]
+mod tts_memory;
 
 pub(super) fn now_unix_millis() -> u64 {
     SystemTime::now()
@@ -188,6 +191,25 @@ fn state_fit_budgets(
 /// variants, and for ASR families without an LLM decoder context).
 fn asr_minimum_tokens(variant: ModelVariant) -> u64 {
     super::asr_envelope::minimum_sequence_tokens(variant).unwrap_or(0)
+}
+
+/// The retained-state floor of a TTS variant, in tokens per sequence: one
+/// prompt plus the family's largest automatic output budget (per CFG domain
+/// for VibeVoice). `0` (the page minimum) for every other variant.
+fn tts_state_minimum_tokens(variant: ModelVariant) -> u64 {
+    let tokens = match variant.family() {
+        crate::catalog::ModelFamily::Qwen3Tts => {
+            crate::models::architectures::qwen3::tts::qwen3_tts_state_floor_tokens()
+        }
+        crate::catalog::ModelFamily::VibeVoiceTts => {
+            crate::models::architectures::vibevoice::tts::vibevoice_tts_state_floor_tokens()
+        }
+        crate::catalog::ModelFamily::VoxtralTts => {
+            crate::models::architectures::voxtral::tts::VOXTRAL_TTS_STATE_CONTEXT_TOKENS
+        }
+        _ => 0,
+    };
+    tokens as u64
 }
 
 fn automatic_state_group_budget(available_bytes: u64, remaining_groups: u64) -> u64 {
@@ -510,6 +532,55 @@ fn admit_asr_request_floor(
     Ok(authorization)
 }
 
+/// Whether a load of `variant` is reconciled against the device observer:
+/// the families whose admission is a residency plan (ASR and TTS), so an
+/// observed excess means the plan under-prices the loader.
+fn reconciles_device_usage(variant: ModelVariant) -> bool {
+    asr_memory::is_asr_variant(variant) || tts_memory::has_plan(variant)
+}
+
+/// A request envelope in `backend`'s ledger domains: host and accelerator
+/// share one memory on CPU and Metal; CUDA splits them.
+fn request_envelope_resources(
+    backend: BackendKind,
+    envelope: super::asr_envelope::AsrRequestEnvelope,
+) -> Result<ResourceVector> {
+    let mut resources = ResourceVector::zero();
+    match backend {
+        BackendKind::Cpu => {
+            resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+        }
+        BackendKind::Metal => {
+            resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
+        }
+        BackendKind::Cuda => {
+            resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
+            resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
+        }
+    }
+    Ok(resources)
+}
+
+/// The short refusal of a load whose per-slot request envelope does not
+/// fit beside its weights: what the envelope needs in the load's domain and
+/// what planning has left (a 503; the terms are logged by the caller).
+fn request_envelope_shortfall(
+    variant: ModelVariant,
+    backend: BackendKind,
+    envelope: super::asr_envelope::AsrRequestEnvelope,
+    available_bytes: u64,
+) -> Result<Error> {
+    let need = match backend {
+        BackendKind::Cuda => envelope.accelerator_bytes,
+        BackendKind::Cpu | BackendKind::Metal => envelope.total_bytes()?,
+    };
+    Ok(Error::Overloaded(capacity_shortfall_reason(
+        format_args!("not enough memory to run {variant} requests"),
+        need,
+        available_bytes,
+    )))
+}
+
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
 /// reading and the ledger's reserved bytes, both in the load domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,21 +633,44 @@ fn reconcile_observed_growth(
     Ok(observed_growth)
 }
 
+/// The residency plan first admission prices for a checkpoint-planned
+/// family (Fish, ASR, TTS), or `None` for one without a plan. The Metal OOM
+/// retry judges futility by the same plan.
+fn checkpoint_resource_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &crate::backends::DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    if variant == ModelVariant::FishAudioS2Pro {
+        let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
+            model_path, device,
+        )?;
+        return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
+    }
+    // ASR and TTS families price what their loader allocates on every
+    // backend; the catalog figure stays a display value for them.
+    if let Some(plan) = asr_memory::resource_plan(variant, model_path, device)? {
+        return Ok(Some(plan));
+    }
+    tts_memory::resource_plan(variant, model_path, device)
+}
+
 /// Static load peak that decides whether a Metal OOM retry can fit. The
 /// catalog's `memory_required_gb` is one coarse figure for every backend (80
 /// GiB for Qwen3.8, 140 GiB for Qwen3.6, sized for the CPU F32 expansion);
 /// these checkpoints use the per-backend representation estimate that load
-/// admission prices instead. An ASR checkpoint (`asr_checkpoint`: its path and
-/// the load device) is judged by the residency plan first admission priced.
+/// admission prices instead. A planned checkpoint (`checkpoint`: its path and
+/// the load device; Fish, ASR and TTS) is judged by the plan first admission
+/// priced ([`checkpoint_resource_plan`]).
 fn retry_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,
-    asr_checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
+    checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
-    if let Some((model_path, device)) = asr_checkpoint {
-        if let Ok(Some(plan)) = asr_memory::resource_plan(variant, model_path, device) {
+    if let Some((model_path, device)) = checkpoint {
+        if let Ok(Some(plan)) = checkpoint_resource_plan(variant, model_path, device) {
             if let ResourceAmount::Known(bytes) =
                 load_domain_bytes(plan.load_authorization, backend)
             {
@@ -1415,8 +1509,13 @@ impl ModelLifecycleController {
         let Some((minimum, maximum)) = axis_bounds else {
             let bytes = required(None)?;
             if bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "portable fixed invocation state does not fit: state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!("not enough memory for {variant}'s working state"),
+                    bytes,
+                    budget,
                 )));
             }
             return Ok(());
@@ -1431,8 +1530,13 @@ impl ModelLifecycleController {
         let selected = if let PortableInvocationContextIntent::Explicit { selected } = intent {
             let bytes = required(Some(selected))?;
             if bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "explicit portable context does not fit: context={selected}, state_bytes={bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!("not enough memory for {variant} at a {selected}-token context"),
+                    bytes,
+                    budget,
                 )));
             }
             selected
@@ -1454,8 +1558,15 @@ impl ModelLifecycleController {
             }
             let minimum_bytes = required(Some(minimum))?;
             if minimum_bytes > budget {
-                return Err(does_not_fit(format!(
+                tracing::warn!(
                     "portable invocation context minimum does not fit: context={minimum}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+                );
+                return Err(does_not_fit(capacity_shortfall_reason(
+                    format_args!(
+                        "not enough memory for {variant}'s minimum {minimum}-token context"
+                    ),
+                    minimum_bytes,
+                    budget,
                 )));
             }
             let (mut low, mut high) = (minimum, ceiling);
@@ -1686,17 +1797,8 @@ impl ModelLifecycleController {
             }
             return qwen36moe_memory::resource_plan(backend, &self.config.performance);
         }
-        if variant == ModelVariant::FishAudioS2Pro {
-            let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
-                model_path,
-                &self.backend_router.context().device,
-            )?;
-            return fish_s2_resource_plan(backend, memory);
-        }
-        // ASR families price what their loader allocates on every backend;
-        // the catalog figure stays a display value for them.
         if let Some(plan) =
-            asr_memory::resource_plan(variant, model_path, &self.backend_router.context().device)?
+            checkpoint_resource_plan(variant, model_path, &self.backend_router.context().device)?
         {
             return Ok(plan);
         }
@@ -1837,8 +1939,16 @@ impl ModelLifecycleController {
                         .refresh_physical_capacity_after_release();
                     continue;
                 }
+                tracing::warn!(
+                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}"
+                );
                 return Err(Error::ModelLoadError(format!(
-                    "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}; no idle resident model is available for eviction; unload a model to make room"
+                    "{}; no idle resident model is available for eviction; unload a model to make room",
+                    capacity_shortfall_reason(
+                        format_args!("Cannot load {requested_variant}"),
+                        required_bytes,
+                        headroom,
+                    )
                 )));
             };
             info!(
@@ -1852,10 +1962,11 @@ impl ModelLifecycleController {
         }
     }
 
-    /// One reconciliation checkpoint for an ASR load, or `None` for other
-    /// families and backends without a device observer (CPU).
+    /// One reconciliation checkpoint for a load priced by a residency plan
+    /// (ASR and TTS), or `None` for other families and backends without a
+    /// device observer (CPU).
     fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
-        if !asr_memory::is_asr_variant(variant) {
+        if !reconciles_device_usage(variant) {
             return None;
         }
         let authority = self.coordinator.resource_authority();
@@ -1876,47 +1987,80 @@ impl ModelLifecycleController {
         )
     }
 
-    /// Reserve one ASR request envelope per execution slot for the state
-    /// fits to leave free, or `None` for a variant without one.
-    fn hold_asr_request_envelope(
+    /// Reserve one request envelope per execution slot for the state fits
+    /// to leave free (ASR: one full chunk; TTS: one request at the largest
+    /// automatic budget), or `None` for a variant without one.
+    async fn hold_request_envelope(
         &self,
         variant: ModelVariant,
         backend: BackendKind,
     ) -> Result<Option<ResourceLease>> {
         let slots = self.coordinator.physical_execution_admission().capacity();
-        let Some(envelope) =
-            super::asr_envelope::deferred_request_envelope(variant, backend, slots)?
-        else {
-            return Ok(None);
-        };
-        let mut resources = ResourceVector::zero();
-        match backend {
-            BackendKind::Cpu => {
-                resources.host_bytes = ResourceAmount::Known(envelope.total_bytes()?);
-            }
-            BackendKind::Metal => {
-                resources.unified_bytes = ResourceAmount::Known(envelope.total_bytes()?);
-            }
-            BackendKind::Cuda => {
-                resources.host_bytes = ResourceAmount::Known(envelope.host_bytes);
-                resources.device_bytes = ResourceAmount::Known(envelope.accelerator_bytes);
-            }
-        }
-        let lease = self.coordinator.resource_authority().reserve(
+        let (envelope, label) =
+            match super::asr_envelope::deferred_request_envelope(variant, backend, slots)? {
+                Some(envelope) => (envelope, "asr"),
+                None => match self.tts_request_envelope(variant).await? {
+                    Some(envelope) => (envelope.scaled(slots)?, "tts"),
+                    None => return Ok(None),
+                },
+            };
+        let resources = request_envelope_resources(backend, envelope)?;
+        let authority = self.coordinator.resource_authority();
+        let lease = match authority.reserve(
             ReservationOwner::new(
                 ReservationClass::Model,
-                format!("{variant}:asr-request-envelope"),
+                format!("{variant}:{label}-request-envelope"),
             ),
             resources,
-        )?;
+        ) {
+            Ok(lease) => lease,
+            Err(Error::Overloaded(detail)) => {
+                let available = match authority.planning_headroom_bytes(backend)? {
+                    ResourceAmount::Known(bytes) => bytes,
+                    ResourceAmount::Unknown => 0,
+                };
+                tracing::warn!(
+                    model = %variant,
+                    request_slots = slots,
+                    host_bytes = envelope.host_bytes,
+                    accelerator_bytes = envelope.accelerator_bytes,
+                    planning_headroom = available,
+                    %detail,
+                    "The {label} request envelope does not fit beside the loaded weights"
+                );
+                return Err(request_envelope_shortfall(
+                    variant, backend, envelope, available,
+                )?);
+            }
+            Err(error) => return Err(error),
+        };
         info!(
             model = %variant,
             request_slots = slots,
             host_bytes = envelope.host_bytes,
             accelerator_bytes = envelope.accelerator_bytes,
-            "Holding the ASR request envelope out of the state fits"
+            "Holding the {label} request envelope out of the state fits"
         );
         Ok(Some(lease))
+    }
+
+    /// One TTS request's envelope, priced by the loaded model (P2.3), for
+    /// the families whose load fits state beside it: Qwen3-TTS.
+    async fn tts_request_envelope(
+        &self,
+        variant: ModelVariant,
+    ) -> Result<Option<super::asr_envelope::AsrRequestEnvelope>> {
+        if variant.family() != crate::catalog::ModelFamily::Qwen3Tts {
+            return Ok(None);
+        }
+        let Some(model) = self.model_registry.get_qwen_tts(variant).await else {
+            return Ok(None);
+        };
+        let (host_bytes, accelerator_bytes) = model.request_envelope_bytes()?;
+        Ok(Some(super::asr_envelope::AsrRequestEnvelope {
+            host_bytes,
+            accelerator_bytes,
+        }))
     }
 
     async fn reserve_model_resources(
@@ -2324,12 +2468,24 @@ impl ModelLifecycleController {
                             authorized_bytes = own_bytes,
                             "Observed device growth of the weight load"
                         );
+                        self.model_registry.publish_weight_residency(
+                            variant,
+                            crate::models::registry::WeightResidency {
+                                priced_bytes: own_bytes,
+                                observed_bytes: observed,
+                            },
+                        );
                         Some((backend, observed))
                     }
                     None => None,
                 },
                 None => None,
             };
+            // A load without an observation leaves its weight under-pricing
+            // untracked; its live state fits keep only the configured reserve
+            // so those bytes, already charged by the live sample, are not
+            // reserved a second time (R-1).
+            let state_fit_reserve = StateFitReserve::for_observed_load(observed_weights.is_some());
             // Model tensors are now visible in the backend provider's used
             // memory. Reconcile the lease before reserving any retained or
             // invocation state so live headroom does not charge the model once
@@ -2344,14 +2500,14 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
-            if asr_memory::is_asr_variant(variant) {
+            if reconciles_device_usage(variant) {
                 // The cached live sample can predate the fence that released
                 // the load's staging; the state fits read a fresh one.
                 self.coordinator
                     .resource_authority()
                     .refresh_physical_capacity_after_release();
             }
-            let request_envelope_hold = self.hold_asr_request_envelope(variant, backend)?;
+            let request_envelope_hold = self.hold_request_envelope(variant, backend).await?;
             let usage_before_state = self.sample_device_usage(variant);
             // Resolve physical state from the exact loaded chat implementation
             // without wrapping or replacing the already-selected adapter.
@@ -2929,12 +3085,16 @@ impl ModelLifecycleController {
                             ))
                         })?;
                     let physical_spec = model.realtime_physical_state_spec(&stage_graphs)?;
+                    // One planned ASR chunk per sequence, as every other
+                    // ASR retained-state fit guarantees.
                     let retained = self
                         .core_engine
                         .load_managed_model_state(
                             model_instance_id,
                             &physical_spec.retained,
                             Some(physical_spec.retained_max_tokens),
+                            asr_minimum_tokens(variant),
+                            state_fit_reserve,
                         )
                         .await?;
                     let retained_uses = contracts
@@ -3128,12 +3288,17 @@ impl ModelLifecycleController {
                             .map_or(physical_spec.retained_max_tokens, |tokens| {
                                 physical_spec.retained_max_tokens.min(tokens)
                             });
+                        // The ASR fit above already sized this model's
+                        // retained runtime (bound to the same contract), so
+                        // this fit asks for no floor of its own.
                         let retained = self
                             .core_engine
                             .load_managed_model_state(
                                 model_instance_id,
                                 &physical_spec.retained,
                                 Some(retained_max_tokens),
+                                0,
+                                state_fit_reserve,
                             )
                             .await?;
                         self.model_registry.publish_effective_context(
@@ -3233,7 +3398,14 @@ impl ModelLifecycleController {
                             model_instance_id,
                             &physical_spec.retained,
                             Some(retained_max_tokens),
+                            tts_state_minimum_tokens(variant),
+                            state_fit_reserve,
                         )
+                        .await?;
+                    // Each request reserves the encoder memory it creates
+                    // (prefill workspace), so the rows are not also pending.
+                    self.core_engine
+                        .price_tensor_rows_with_requests(model_instance_id)
                         .await?;
                     self.model_registry.publish_effective_context(
                         variant,
@@ -3327,6 +3499,8 @@ impl ModelLifecycleController {
                         model_instance_id,
                         retained_contract,
                         retained_max_tokens,
+                        tts_state_minimum_tokens(variant),
+                        state_fit_reserve,
                     )
                     .await?;
                 self.model_registry.publish_effective_context(
@@ -3395,6 +3569,7 @@ impl ModelLifecycleController {
                 };
                 let capacity = crate::runtime::fish_capacity::ResolvedFishServingCapacity::resolve(
                     model.config(), &fish_limits, headroom, native_batching,
+                    model.state_element_bytes(),
                 )?;
                 tracing::info!(?capacity, ?backend, "Sealing Fish serving capacity; device throughput qualification is separate");
                 bundle_draft.seal_fish_capacity(capacity.clone())?;
@@ -3426,16 +3601,43 @@ impl ModelLifecycleController {
                     .map(|contract| contract.stages.as_ref())
                     .collect::<Vec<_>>();
                 let physical_spec = model.physical_state_spec(&stage_graphs)?;
-                let publication = self
-                    .load_invocation_workspace_publication(
+                // The engine route runs the LM on retained paged K/V (one
+                // context per request, shared by prefill and decode).
+                let retained = self
+                    .core_engine
+                    .load_managed_model_state(
                         model_instance_id,
-                        &contracts,
-                        physical_spec.descriptor,
-                        &physical_spec.invocation,
-                        None,
-                        HashMap::new(),
+                        &physical_spec.retained,
+                        Some(physical_spec.retained_max_tokens),
+                        tts_state_minimum_tokens(variant),
+                        state_fit_reserve,
                     )
                     .await?;
+                self.model_registry.publish_effective_context(
+                    variant,
+                    retained.logical_token_reach(),
+                )?;
+                crate::runtime::rollout::validate_managed_state_plan_eligibility(
+                    variant,
+                    CapabilityKind::Tts,
+                    retained.state_plan_v2(),
+                )?;
+                let retained_uses = contracts
+                    .iter()
+                    .map(|contract| {
+                        Ok((
+                            stage_graph_fingerprint(&contract.stages)?,
+                            RetainedStateUseV2::ExternalPaged,
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                // Stages keep only scratch; no stage owns K/V of its own.
+                let publication = self.load_scratch_only_workspace_publication(
+                    &contracts,
+                    physical_spec.descriptor,
+                    Some(retained.into()),
+                    retained_uses,
+                )?;
                 state_publications.insert(CapabilityKind::Tts, publication);
             }
             if variant.family() == crate::catalog::ModelFamily::KokoroTts {
@@ -6388,5 +6590,293 @@ mod tests {
         assert!(!runtime.model_manager.is_ready(variant).await);
         assert_eq!(authority.snapshot().reservations, 0);
         std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// A unified-memory machine whose provider samples live memory and
+    /// observes device usage (Metal's `currentAllocatedSize`).
+    #[derive(Debug)]
+    struct ObservedUnifiedProvider {
+        capacity: u64,
+        available: u64,
+        observed: u64,
+    }
+
+    impl PhysicalCapacityProvider for ObservedUnifiedProvider {
+        fn snapshot(&self) -> PhysicalCapacitySnapshot {
+            let unified = |bytes| ResourceVector {
+                unified_bytes: ResourceAmount::Known(bytes),
+                ..ResourceVector::zero()
+            };
+            PhysicalCapacitySnapshot {
+                capacity: unified(self.capacity),
+                available: unified(self.available),
+                source: CapacitySource::Test,
+            }
+        }
+
+        fn observed_device_usage_bytes(&self) -> Option<u64> {
+            Some(self.observed)
+        }
+    }
+
+    /// The final Metal run's Qwen3-TTS-0.6B-Base load (about 11.4 GB of
+    /// planning capacity, 10 GB live, 2.67 GB of weights) reserves its one
+    /// request slot's envelope: CustomVoice's live envelope plus a 30 s
+    /// reference encode on the shipped encoder. The reference term was
+    /// 47 GB and refused the load with the generic capacity error; a
+    /// refusal now names what the envelope needs and what is available.
+    #[test]
+    fn qwen_base_request_envelope_fits_beside_its_weights() {
+        use crate::models::architectures::qwen3::tts::speech_tokenizer::{
+            reference_encode_workspace_upper_bound_bytes, EncoderConfig,
+            QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON,
+        };
+        let encoder: EncoderConfig =
+            serde_json::from_str(QWEN3_TTS_12HZ_ENCODER_CONFIG_JSON).unwrap();
+        let reference =
+            reference_encode_workspace_upper_bound_bytes(&encoder, 24_000, 1_920, 30, 4).unwrap();
+        // CustomVoice's envelope from the same run (no reference encode).
+        let envelope = super::super::asr_envelope::AsrRequestEnvelope {
+            host_bytes: 46_377_456,
+            accelerator_bytes: 471_076_352 + reference,
+        };
+        /// Metal as the server builds it: a configured planning budget
+        /// beside a live sample.
+        #[derive(Debug)]
+        struct BudgetedUnifiedProvider;
+        impl PhysicalCapacityProvider for BudgetedUnifiedProvider {
+            fn snapshot(&self) -> PhysicalCapacitySnapshot {
+                let unified = |bytes| ResourceVector {
+                    unified_bytes: ResourceAmount::Known(bytes),
+                    ..ResourceVector::zero()
+                };
+                PhysicalCapacitySnapshot {
+                    capacity: unified(16_000_000_000),
+                    available: unified(10_000_000_000),
+                    source: CapacitySource::MetalWorkingSet,
+                }
+            }
+            fn configured_budget(&self) -> Option<ResourceVector> {
+                Some(ResourceVector {
+                    host_bytes: ResourceAmount::Known(11_400_000_000),
+                    unified_bytes: ResourceAmount::Known(11_400_000_000),
+                    ..ResourceVector::zero()
+                })
+            }
+            fn observed_device_usage_bytes(&self) -> Option<u64> {
+                Some(2_668_085_248)
+            }
+        }
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(BudgetedUnifiedProvider),
+        ));
+        let weights = ResourceVector {
+            unified_bytes: ResourceAmount::Known(2_667_798_788),
+            ..ResourceVector::zero()
+        };
+        let _weights = authority
+            .reserve_with_initial_materialized(
+                ReservationOwner::new(ReservationClass::Model, "weights"),
+                weights,
+                weights,
+            )
+            .unwrap();
+        authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "envelope"),
+                super::request_envelope_resources(BackendKind::Metal, envelope).unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("reference {reference} bytes: {error}"));
+
+        let refusal = super::request_envelope_shortfall(
+            ModelVariant::Qwen3Tts12Hz06BBase,
+            BackendKind::Metal,
+            envelope,
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(matches!(refusal, crate::error::Error::Overloaded(_)));
+        let message = refusal.to_string();
+        assert!(message.contains("needs "), "{message}");
+        assert!(message.contains("1.00 GB available"), "{message}");
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// What load admission charged Qwen3-TTS 0.6B's weights at 0adabf16.
+    const TTS_CHARGED_WEIGHT_BYTES: u64 = 2_493_807_108;
+
+    /// Load TTS retained state through the engine's real load path the way
+    /// `load_model` does for an unobserved (non-ASR) load, beside weights the
+    /// ledger charged at [`TTS_CHARGED_WEIGHT_BYTES`] while the device
+    /// observer reports `observed` bytes in use.
+    fn load_tts_retained_state(
+        variant: ModelVariant,
+        contract: &crate::kv::v2::InferenceStateContract,
+        maximum_tokens: usize,
+        capacity: u64,
+        available: u64,
+        observed: u64,
+    ) -> crate::error::Result<u64> {
+        let authority = Arc::new(ResourceAuthority::new_advisory_shared_host_unified(
+            Arc::new(ObservedUnifiedProvider {
+                capacity,
+                available,
+                observed,
+            }),
+        ));
+        let weights = ResourceVector {
+            unified_bytes: ResourceAmount::Known(TTS_CHARGED_WEIGHT_BYTES),
+            ..ResourceVector::zero()
+        };
+        let _weights = authority.reserve_with_initial_materialized(
+            ReservationOwner::new(ReservationClass::Model, variant.to_string()),
+            weights,
+            weights,
+        )?;
+        assert!(
+            authority.untracked_device_bytes(BackendKind::Cpu).unwrap() > 0,
+            "observed usage must exceed what the ledger materialized"
+        );
+        let mut config = crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            max_retained_sequences: 1,
+            max_staged_transactions: 1,
+            ..Default::default()
+        };
+        config.portable_context_auto = true;
+        let mut core =
+            crate::engine::EngineCore::new_with_managed_authority_for_test(config, authority)?;
+        let runtime = core.load_managed_model_state(
+            ModelInstanceId::new(4_101),
+            contract,
+            Some(maximum_tokens),
+            super::tts_state_minimum_tokens(variant),
+            crate::engine::StateFitReserve::for_observed_load(false),
+        )?;
+        Ok(runtime.logical_token_reach())
+    }
+
+    /// R-1: Qwen3-TTS retained state collapsed to one 64-token page on
+    /// Metal, cutting every CustomVoice request at 54 frames and refusing
+    /// every clone. The fit must reach every request's prompt plus its
+    /// automatic budget whatever live memory reads, spend live growth above
+    /// it without reserving the unobserved weight under-pricing a second
+    /// time, and refuse with a 503 naming the shortfall when planning
+    /// headroom cannot hold the floor.
+    #[test]
+    fn qwen3_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_headroom() {
+        use crate::models::architectures::qwen3::tts::{
+            qwen3_tts_auto_max_frames_for_text, qwen3_tts_auto_max_output_frames,
+            qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+            tests::cache_test_config,
+        };
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let config = cache_test_config();
+        let full = qwen3_tts_inference_state_contract(
+            &config,
+            candle_core::DType::F32,
+            candle_core::DType::F32,
+            crate::models::shared::attention::paged::default_kv_page_size(),
+        )
+        .unwrap();
+        let contract =
+            qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32).unwrap();
+        // A clone prompt with the longest reference: role and codec-prefix
+        // tokens plus 320 reference codes.
+        let max_clone_prefill = 9 + 320 + 1;
+        let paragraph = "Good morning. Today we are testing a speech system that reads \
+            longer passages aloud, and we want to hear whether every sentence comes out \
+            clearly without the voice drifting, rushing, or stopping before the final word.";
+        assert!(qwen3_tts_auto_max_frames_for_text(paragraph) < qwen3_tts_auto_max_output_frames());
+        let required = (max_clone_prefill + qwen3_tts_auto_max_output_frames()) as u64;
+        let maximum = 3_072;
+        let budget = 11 * GIB + 440 * 1024 * 1024;
+        let observed = 6_000_000_000;
+
+        // Live memory is far below planning and the observed usage leaves
+        // nothing above the measured untracked bytes: the floor holds.
+        let reach = load_tts_retained_state(variant, &contract, maximum, budget, GIB / 2, observed)
+            .unwrap();
+        assert!(reach >= required, "effective context {reach} < {required}");
+        assert!(reach < maximum as u64, "live memory must still cap growth");
+
+        // With 3 GiB live, the configured reserve leaves growth for the full
+        // context; the unobserved weight under-pricing is not reserved again.
+        let reach = load_tts_retained_state(variant, &contract, maximum, budget, 3 * GIB, observed)
+            .unwrap();
+        assert_eq!(reach, maximum as u64);
+
+        // A floor planning headroom cannot hold refuses the load (503).
+        let tight = TTS_CHARGED_WEIGHT_BYTES + GIB + 64 * 1024 * 1024;
+        match load_tts_retained_state(variant, &contract, maximum, tight, tight, observed) {
+            Err(Error::Overloaded(message)) => {
+                assert!(
+                    message.starts_with("not enough memory for this model's minimum")
+                        && message.contains(" GB, ")
+                        && !message.contains("planning_headroom="),
+                    "{message}"
+                )
+            }
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        }
+    }
+
+    /// Phase 0 state-ceiling contract: every TTS family whose load fits
+    /// retained state guarantees one full request (its longest prompt plus
+    /// its largest automatic output budget), and families sized elsewhere
+    /// ask for no floor.
+    #[test]
+    fn tts_state_floor_covers_one_full_request_per_family() {
+        use crate::catalog::ModelFamily;
+        use crate::models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        let flood = "word ".repeat(20_000);
+        let floor = |variant| super::tts_state_minimum_tokens(variant) as usize;
+        for variant in ModelVariant::all().iter().copied() {
+            if !variant.is_enabled() || !variant.is_tts() {
+                continue;
+            }
+            let required = match variant.family() {
+                // 320 reference codes plus role and codec-prefix tokens.
+                ModelFamily::Qwen3Tts => 330 + qwen3_tts_auto_max_output_frames(),
+                // A 12 s voice reference (90 latents) plus its markers.
+                ModelFamily::VibeVoiceTts => 96 + vibevoice_tts_auto_max_frames_for_text(&flood),
+                // A preset voice prompt plus CUDA's frame maximum.
+                ModelFamily::VoxtralTts => 256 + ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES,
+                _ => {
+                    assert_eq!(floor(variant), 0, "{variant}");
+                    continue;
+                }
+            };
+            assert!(
+                floor(variant) >= required,
+                "{variant}: floor {} < {required}",
+                floor(variant)
+            );
+        }
+    }
+
+    /// R-1 for VibeVoice: every request returned 400 against a 64-token
+    /// context. Both CFG domains must reach a prompt plus the largest
+    /// automatic budget.
+    #[test]
+    fn vibevoice_tts_effective_context_covers_prompt_and_frame_budget_under_low_live_headroom() {
+        use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+        let variant = ModelVariant::VibeVoice15BTts;
+        let contract =
+            crate::models::architectures::vibevoice::vibevoice_tts_retained_test_contract(
+                candle_core::DType::F32,
+            );
+        // System prompt, a 12 s voice reference (90 latents plus markers)
+        // and the target text that fills the largest automatic budget.
+        let longest = "word ".repeat(1_000);
+        let required = (30 + 96 + 200 + vibevoice_tts_auto_max_frames_for_text(&longest)) as u64;
+        let maximum = 1_536;
+        let budget = 11 * GIB + 440 * 1024 * 1024;
+        let reach =
+            load_tts_retained_state(variant, &contract, maximum, budget, GIB / 2, 6_000_000_000)
+                .unwrap();
+        assert!(reach >= required, "effective context {reach} < {required}");
+        assert!(reach < maximum as u64, "live memory must still cap growth");
     }
 }

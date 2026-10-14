@@ -189,6 +189,9 @@ pub(crate) struct Lfm25AudioTtsStageCeiling {
     pub(crate) max_codebooks: usize,
     pub(crate) max_materialized_tensor_elements: u64,
     pub(crate) max_retained_resident_bytes: u64,
+    /// Seal maximum of the preparation stage, which only gathers prompt
+    /// embeddings.
+    pub(crate) max_preparation_workspace_bytes: u64,
     pub(crate) max_workspace_bytes: u64,
 }
 
@@ -584,6 +587,28 @@ impl Lfm25AudioModel {
     ) -> Result<Vec<f32>> {
         self.detokenizer
             .decode(state.audio_codes(), &self.device.device)
+    }
+
+    /// Streamed audio for a retained TTS state (LFT-5): the samples of the
+    /// codes generated since the last call, exactly as the final
+    /// [`Self::detokenize_retained_tts_state`] would produce them, plus the
+    /// ISTFT tail once the state has finished. Call it after a committed
+    /// quantum (the stream rides in the state's checkpoint, so a rolled-back
+    /// quantum rolls it back too). A request streamed this way must not also
+    /// take the whole-utterance detokenize.
+    pub(crate) fn stream_retained_tts_audio(
+        &self,
+        state: &mut Lfm25AudioTtsRetainedState,
+    ) -> Result<Vec<f32>> {
+        let finished = state.finished();
+        let (pending, stream) = state.audio_stream_parts();
+        let mut samples =
+            self.detokenizer
+                .decode_stream_step(stream, &pending, &self.device.device)?;
+        if finished {
+            samples.extend(self.detokenizer.finish_stream(stream));
+        }
+        Ok(samples)
     }
 
     pub(crate) fn retained_asr_prefill_step(
@@ -1162,6 +1187,9 @@ impl Lfm25AudioModel {
         let retained_resident_bytes = materialized.checked_mul(4).ok_or_else(|| {
             Error::InvalidInput("LFM2.5 Audio TTS retained bytes overflowed".into())
         })?;
+        // A stage-seal maximum only: every request is priced from its own
+        // prompt and output budget (`tts_preparation_envelope`, the prefill
+        // and decode envelopes at bind).
         let max_workspace_bytes = self
             .tts_decode_resource_envelope(self.main_config.context_length - 1, true)?
             .workspace_bytes
@@ -1175,8 +1203,23 @@ impl Lfm25AudioModel {
             max_codebooks: self.decoder_config.codebooks,
             max_materialized_tensor_elements: materialized,
             max_retained_resident_bytes: retained_resident_bytes,
+            // Preparation only gathers prompt embeddings (`embed_token_ids`).
+            max_preparation_workspace_bytes: retained_resident_bytes,
             max_workspace_bytes,
         })
+    }
+
+    /// The preparation envelope of one TTS request, from `messages` before
+    /// they are tokenized (LFT-1).
+    pub(crate) fn tts_preparation_envelope(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Lfm25AudioTtsPreparationEnvelope> {
+        tts_preparation_envelope(
+            tts_prompt_token_bound(messages),
+            &self.main_config,
+            BackendKind::from(self.device.kind),
+        )
     }
 
     pub(crate) fn tts_prefill_resource_envelope(
@@ -1185,15 +1228,7 @@ impl Lfm25AudioModel {
         tokens: usize,
         prompt_tokens: usize,
     ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
-        let end = start
-            .checked_add(tokens)
-            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS prefill overflowed".into()))?;
-        if tokens == 0 || end > prompt_tokens || prompt_tokens >= self.main_config.context_length {
-            return Err(Error::InvalidInput(
-                "LFM2.5 Audio TTS prefill is outside its prompt".into(),
-            ));
-        }
-        self.tts_step_resource_envelope(tokens, end, end == prompt_tokens, false)
+        tts_prefill_resource_envelope(&self.tts_envelope_geometry(), start, tokens, prompt_tokens)
     }
 
     pub(crate) fn tts_decode_resource_envelope(
@@ -1201,74 +1236,16 @@ impl Lfm25AudioModel {
         position: usize,
         include_depthformer: bool,
     ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
-        let visible = position
-            .checked_add(1)
-            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS position overflowed".into()))?;
-        if visible > self.main_config.context_length {
-            return Err(Error::InvalidInput(
-                "LFM2.5 Audio TTS decode exceeds model context".into(),
-            ));
-        }
-        self.tts_step_resource_envelope(1, visible, !include_depthformer, include_depthformer)
+        tts_decode_resource_envelope(&self.tts_envelope_geometry(), position, include_depthformer)
     }
 
-    fn tts_step_resource_envelope(
-        &self,
-        query_tokens: usize,
-        visible_tokens: usize,
-        include_logits: bool,
-        include_depthformer: bool,
-    ) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
-        let main = checked_asr_main_step_workspace(
-            query_tokens,
-            visible_tokens,
-            self.tokenizer.vocab_size(),
-            if include_logits { query_tokens } else { 0 },
-            &self.main_config,
-        )?;
-        let depth = if include_depthformer {
-            checked_depthformer_frame_workspace(&self.decoder_config)?
-        } else {
-            0
-        };
-        let workspace_bytes = main
-            .checked_add(depth)
-            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS workspace overflowed".into()))?;
-        let backend = BackendKind::from(self.device.kind);
-        let (host_workspace_bytes, device_workspace_bytes, unified_workspace_bytes) =
-            map_asr_workspace_domains(backend, 0, workspace_bytes)?;
-        let depthformer_steps = if include_depthformer {
-            self.decoder_config.codebooks
-        } else {
-            0
-        };
-        let work_units = u64::try_from(query_tokens)
-            .ok()
-            .and_then(|main| main.checked_add(u64::try_from(depthformer_steps).ok()?))
-            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS work exceeds u64".into()))?;
-        let materialized_tensor_elements = u64::try_from(query_tokens)
-            .ok()
-            .and_then(|tokens| {
-                tokens.checked_mul(u64::try_from(self.main_config.embedding_length).ok()?)
-            })
-            .and_then(|main| {
-                main.checked_add(
-                    u64::try_from(depthformer_steps)
-                        .ok()?
-                        .checked_mul(u64::try_from(self.decoder_config.depthformer_dim).ok()?)?,
-                )
-            })
-            .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS elements overflowed".into()))?;
-        Ok(Lfm25AudioTtsStepResourceEnvelope {
-            backend,
-            work_units,
-            materialized_tensor_elements,
-            host_workspace_bytes,
-            device_workspace_bytes,
-            unified_workspace_bytes,
-            workspace_bytes,
-            depthformer_steps,
-        })
+    fn tts_envelope_geometry(&self) -> TtsEnvelopeGeometry<'_> {
+        TtsEnvelopeGeometry {
+            main: &self.main_config,
+            decoder: &self.decoder_config,
+            vocab_size: self.tokenizer.vocab_size(),
+            backend: BackendKind::from(self.device.kind),
+        }
     }
 
     pub(crate) fn transcribe_prepared_asr_with_callback_physical(
@@ -1900,6 +1877,14 @@ impl Lfm25AudioModel {
                     "audio_frames": audio_frames_generated,
                     "sample_rate": self.decoder_config.output_sample_rate,
                     "samples": samples_len
+                },
+                "detokenizer": {
+                    "banded_attention_calls_total":
+                        crate::models::architectures::lfm2::backbone::lfm2_banded_stateless_attention_calls()
+                },
+                "audio_head": {
+                    "device_sampled_codes_total":
+                        super::audio_output::lfm25_device_sampled_audio_codes()
                 }
             })),
         })
@@ -2818,6 +2803,256 @@ fn map_asr_workspace_domains(
     })
 }
 
+/// The geometry the TTS step envelopes are priced from.
+struct TtsEnvelopeGeometry<'a> {
+    main: &'a Lfm2BackboneConfig,
+    decoder: &'a Lfm25AudioDecoderConfig,
+    vocab_size: usize,
+    backend: BackendKind,
+}
+
+/// Chat-template tokens `build_chat_prompt` adds around each message (the
+/// `<|im_start|>` and `<|im_end|>` specials) beyond its encoded text.
+const TTS_PROMPT_SPECIALS_PER_MESSAGE: usize = 2;
+/// Tokens a tokenizer may add per encoded string beyond one per byte (a
+/// normalizer's dummy prefix).
+const TTS_PROMPT_SLACK_PER_ENCODE: usize = 1;
+
+/// An upper bound on the prompt `build_chat_prompt` produces for
+/// `messages`, without tokenizing: byte-level BPE never yields more tokens
+/// than UTF-8 bytes, plus the template's special tokens, the default system
+/// message and the assistant header.
+pub(crate) fn tts_prompt_token_bound(messages: &[ChatMessage]) -> usize {
+    let encoded = |text: &str| text.len() + TTS_PROMPT_SLACK_PER_ENCODE;
+    let message = |role: &str, content: &str| {
+        TTS_PROMPT_SPECIALS_PER_MESSAGE
+            + encoded(&format!("{role}\n"))
+            + encoded(content.trim())
+            + encoded("\n")
+    };
+    let mut tokens = 1 + 1 + encoded("assistant\n");
+    if !matches!(
+        messages.first().map(|message| &message.role),
+        Some(ChatRole::System)
+    ) {
+        tokens += message(
+            ChatRole::System.as_prompt_role(),
+            "You are a helpful assistant.",
+        );
+    }
+    for entry in messages {
+        tokens += message(entry.role.as_prompt_role(), &entry.content);
+    }
+    tokens
+}
+
+/// What one TTS preparation reserves: its prompt embeddings, the artifact
+/// it retains, priced from the prompt bound and never above one position
+/// short of the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lfm25AudioTtsPreparationEnvelope {
+    pub(crate) backend: BackendKind,
+    pub(crate) max_prompt_tokens: usize,
+    pub(crate) max_materialized_tensor_elements: u64,
+    pub(crate) max_retained_resident_bytes: u64,
+    pub(crate) workspace_bytes: u64,
+}
+
+fn tts_preparation_envelope(
+    prompt_token_bound: usize,
+    main: &Lfm2BackboneConfig,
+    backend: BackendKind,
+) -> Result<Lfm25AudioTtsPreparationEnvelope> {
+    let max_prompt_tokens = prompt_token_bound
+        .min(main.context_length.saturating_sub(1))
+        .max(1);
+    let elements = u64::try_from(max_prompt_tokens)
+        .ok()
+        .and_then(|tokens| tokens.checked_mul(u64::try_from(main.embedding_length).ok()?))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS preparation overflowed".into()))?;
+    // Embeddings are gathered from the dense table at most in F32.
+    let bytes = elements.checked_mul(4).ok_or_else(|| {
+        Error::InvalidInput("LFM2.5 Audio TTS preparation bytes overflowed".into())
+    })?;
+    Ok(Lfm25AudioTtsPreparationEnvelope {
+        backend,
+        max_prompt_tokens,
+        max_materialized_tensor_elements: elements,
+        max_retained_resident_bytes: bytes,
+        workspace_bytes: bytes,
+    })
+}
+
+fn tts_prefill_resource_envelope(
+    geometry: &TtsEnvelopeGeometry<'_>,
+    start: usize,
+    tokens: usize,
+    prompt_tokens: usize,
+) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+    let end = start
+        .checked_add(tokens)
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS prefill overflowed".into()))?;
+    if tokens == 0 || end > prompt_tokens || prompt_tokens >= geometry.main.context_length {
+        return Err(Error::InvalidInput(
+            "LFM2.5 Audio TTS prefill is outside its prompt".into(),
+        ));
+    }
+    tts_step_resource_envelope(geometry, tokens, end, end == prompt_tokens, false)
+}
+
+fn tts_decode_resource_envelope(
+    geometry: &TtsEnvelopeGeometry<'_>,
+    position: usize,
+    include_depthformer: bool,
+) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+    let visible = position
+        .checked_add(1)
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS position overflowed".into()))?;
+    if visible > geometry.main.context_length {
+        return Err(Error::InvalidInput(
+            "LFM2.5 Audio TTS decode exceeds model context".into(),
+        ));
+    }
+    tts_step_resource_envelope(
+        geometry,
+        1,
+        visible,
+        !include_depthformer,
+        include_depthformer,
+    )
+}
+
+fn tts_step_resource_envelope(
+    geometry: &TtsEnvelopeGeometry<'_>,
+    query_tokens: usize,
+    visible_tokens: usize,
+    include_logits: bool,
+    include_depthformer: bool,
+) -> Result<Lfm25AudioTtsStepResourceEnvelope> {
+    // TTS projects only the last position to logits (`project_last_hidden`).
+    let main = checked_tts_main_step_workspace(
+        query_tokens,
+        visible_tokens,
+        geometry.vocab_size,
+        usize::from(include_logits),
+        geometry.main,
+    )?;
+    let depth = if include_depthformer {
+        checked_depthformer_frame_workspace(geometry.decoder)?
+    } else {
+        0
+    };
+    let workspace_bytes = main
+        .checked_add(depth)
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS workspace overflowed".into()))?;
+    let backend = geometry.backend;
+    let (host_workspace_bytes, device_workspace_bytes, unified_workspace_bytes) =
+        map_asr_workspace_domains(backend, 0, workspace_bytes)?;
+    let depthformer_steps = if include_depthformer {
+        geometry.decoder.codebooks
+    } else {
+        0
+    };
+    let work_units = u64::try_from(query_tokens)
+        .ok()
+        .and_then(|main| main.checked_add(u64::try_from(depthformer_steps).ok()?))
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS work exceeds u64".into()))?;
+    let materialized_tensor_elements = u64::try_from(query_tokens)
+        .ok()
+        .and_then(|tokens| tokens.checked_mul(u64::try_from(geometry.main.embedding_length).ok()?))
+        .and_then(|main| {
+            main.checked_add(
+                u64::try_from(depthformer_steps)
+                    .ok()?
+                    .checked_mul(u64::try_from(geometry.decoder.depthformer_dim).ok()?)?,
+            )
+        })
+        .ok_or_else(|| Error::InvalidInput("LFM2.5 Audio TTS elements overflowed".into()))?;
+    Ok(Lfm25AudioTtsStepResourceEnvelope {
+        backend,
+        work_units,
+        materialized_tensor_elements,
+        host_workspace_bytes,
+        device_workspace_bytes,
+        unified_workspace_bytes,
+        workspace_bytes,
+        depthformer_steps,
+    })
+}
+
+/// One TTS main-backbone step's peak workspace (LFT-8). The backbone runs
+/// its blocks one after another and each block's intermediates drop when it
+/// returns, so the peak is the residual stream plus the largest block's
+/// working set; two blocks are priced live to cover the pool handing the
+/// next block its buffers while the previous block's are still in flight.
+/// Attention blocks add scores over the visible prefix, ShortConv blocks
+/// clone their ring, and logits cover `logits_rows` positions.
+fn checked_tts_main_step_workspace(
+    query_tokens: usize,
+    visible_tokens: usize,
+    vocab_size: usize,
+    logits_rows: usize,
+    config: &Lfm2BackboneConfig,
+) -> Result<u64> {
+    let overflow = || Error::InvalidInput("LFM2.5 Audio TTS step workspace overflowed".into());
+    let u = |value: usize| {
+        u64::try_from(value)
+            .map_err(|_| Error::InvalidInput("LFM2.5 Audio step geometry exceeds u64".into()))
+    };
+    let q = u(query_tokens)?;
+    let visible = u(visible_tokens)?;
+    let hidden = u(config.embedding_length)?;
+    let ffn = u(config
+        .feed_forward_length
+        .unwrap_or(config.embedding_length))?;
+    let heads = u(config.attention_head_count)?;
+    let has_attention = config
+        .attention_head_count_kv
+        .iter()
+        .take(config.block_count)
+        .any(|kv_heads| *kv_heads > 0);
+    let has_shortconv = config
+        .attention_head_count_kv
+        .iter()
+        .take(config.block_count)
+        .any(|kv_heads| *kv_heads == 0)
+        || config.attention_head_count_kv.len() < config.block_count;
+    let block_planes = q
+        .checked_mul(hidden)
+        .and_then(|planes| planes.checked_mul(12))
+        .and_then(|planes| planes.checked_add(q.checked_mul(ffn)?.checked_mul(4)?))
+        .ok_or_else(overflow)?;
+    let attention = if has_attention {
+        heads
+            .checked_mul(q)
+            .and_then(|scores| scores.checked_mul(visible))
+            .and_then(|scores| scores.checked_mul(4))
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    let ring = if has_shortconv {
+        u(config.shortconv_l_cache)?
+            .checked_mul(hidden)
+            .ok_or_else(overflow)?
+    } else {
+        0
+    };
+    let largest_block = block_planes
+        .checked_add(attention.max(ring))
+        .ok_or_else(overflow)?;
+    let residual = q
+        .checked_mul(hidden)
+        .and_then(|planes| planes.checked_mul(2));
+    let logits = u(logits_rows)?.checked_mul(u(vocab_size)?);
+    largest_block
+        .checked_mul(2)
+        .and_then(|elements| elements.checked_add(residual?))
+        .and_then(|elements| elements.checked_add(logits?))
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(overflow)
+}
+
 fn checked_asr_main_step_workspace(
     query_tokens: usize,
     visible_tokens: usize,
@@ -2971,6 +3206,105 @@ mod tests {
     use super::*;
     use crate::backends::DeviceProfile;
     use crate::model::ModelVariant;
+
+    /// LFM2.5-Audio-1.5B's published geometry (GGUF header): the LFM2-1.2B
+    /// backbone with its context clamped to 32,768, and the 6-layer,
+    /// 1,024-wide Depthformer over 8 codebooks.
+    fn published_tts_geometry() -> (Lfm2BackboneConfig, Lfm25AudioDecoderConfig) {
+        (
+            Lfm2BackboneConfig {
+                architecture: "lfm2".into(),
+                block_count: 16,
+                context_length: ModelVariant::LFM25_AUDIO_NATIVE_CONTEXT_TOKENS,
+                embedding_length: 2_048,
+                embedding_length_out: None,
+                feed_forward_length: Some(8_192),
+                attention_head_count: 32,
+                attention_head_count_kv: vec![0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0],
+                attention_layer_norm_rms_epsilon: 1e-5,
+                attention_sliding_window: None,
+                rope_freq_base: 1_000_000.0,
+                shortconv_l_cache: 3,
+            },
+            Lfm25AudioDecoderConfig {
+                codebooks: 8,
+                audio_vocab_size: 2_049,
+                audio_end_token_id: 2_048,
+                depthformer_layers: 6,
+                depthformer_dim: 1_024,
+                output_sample_rate: 24_000,
+                output_n_fft: 1_280,
+                output_hop_length: 320,
+                detokenizer_upsample_factor: 6,
+                interleaved_n_text: 6,
+                interleaved_n_audio: 12,
+            },
+        )
+    }
+
+    /// LFT-1/R-2: TTS preparation was priced from the model ceiling (a
+    /// full-context prefill, 3.12 TiB), so every request was refused on
+    /// every backend. A short request's preparation, prefill and decode
+    /// envelopes together stay under 100 MiB, and none is sized from the
+    /// context.
+    #[test]
+    fn tts_request_envelopes_are_priced_from_the_request_not_the_context() {
+        let (main, decoder) = published_tts_geometry();
+        let geometry = TtsEnvelopeGeometry {
+            main: &main,
+            decoder: &decoder,
+            vocab_size: 65_536,
+            backend: BackendKind::Metal,
+        };
+        let messages = [
+            ChatMessage {
+                role: ChatRole::System,
+                content: crate::models::architectures::lfm25_audio::lfm25_audio_tts_system_prompt(
+                    None,
+                )
+                .into(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "The quick brown fox jumps over the lazy dog.".into(),
+            },
+        ];
+        let bound = tts_prompt_token_bound(&messages);
+        // The bound covers every byte of the template it mirrors.
+        let template_bytes = messages
+            .iter()
+            .map(|message| message.content.len() + message.role.as_prompt_role().len())
+            .sum::<usize>()
+            + "assistant".len();
+        assert!(
+            bound >= template_bytes && bound < 160,
+            "prompt bound {bound}"
+        );
+        let preparation = tts_preparation_envelope(bound, &main, BackendKind::Metal).unwrap();
+        assert_eq!(preparation.max_prompt_tokens, bound);
+
+        let prompt_tokens = 60;
+        let max_new_tokens = 1_024;
+        let prefill =
+            tts_prefill_resource_envelope(&geometry, 0, prompt_tokens, prompt_tokens).unwrap();
+        let decode =
+            tts_decode_resource_envelope(&geometry, prompt_tokens + max_new_tokens - 1, true)
+                .unwrap();
+        let reserved = preparation.workspace_bytes
+            + preparation.max_retained_resident_bytes
+            + prefill.workspace_bytes
+            + decode.workspace_bytes;
+        assert!(
+            reserved < 100 * 1024 * 1024,
+            "a 60-token request reserves {reserved} bytes: preparation {preparation:?}, prefill {}, decode {}",
+            prefill.workspace_bytes,
+            decode.workspace_bytes
+        );
+        // The preparation bound never reaches the context, even for a text
+        // longer than it.
+        let flood = tts_preparation_envelope(usize::MAX, &main, BackendKind::Metal).unwrap();
+        assert_eq!(flood.max_prompt_tokens, main.context_length - 1);
+    }
 
     #[test]
     fn lfm25_partial_audio_decode_requires_streaming_and_ready_frames() {

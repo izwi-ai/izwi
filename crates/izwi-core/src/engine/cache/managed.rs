@@ -417,6 +417,11 @@ struct ManagedKvModelState {
     /// Tensor-arena committed backing recorded on the lease beside
     /// `materialized_resources`; the rest of the tensor envelope is pending.
     tensor_materialized_bytes: u64,
+    /// The requests that create this model's tensor rows already reserve
+    /// them, so the whole envelope is recorded on the lease at load and is
+    /// never a pending claim (see
+    /// [`ManagedKvCacheManager::price_tensor_rows_with_requests`]).
+    tensor_rows_request_priced: bool,
     allocation_ledger: StateAllocationLedger,
 }
 
@@ -518,14 +523,47 @@ impl Default for ManagedKvCacheManager {
 /// What a portable managed-state fit may spend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PortableFitHeadroom {
-    /// Stable planning headroom (chat and TTS state).
+    /// Stable planning headroom (chat and Fish state).
     Planning,
     /// Planning headroom clamped to live memory
-    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR state, which
-    /// must leave room for the requests it serves. `minimum_tokens` is the
-    /// one-chunk floor each sequence must reach (`0`: the page minimum); it
+    /// ([`ResourceAuthority::state_fit_headroom_bytes`]): ASR and TTS
+    /// retained state, which must leave room for the requests it serves.
+    /// `minimum_tokens` is the floor each sequence must reach (one ASR chunk,
+    /// or one TTS prompt plus its output budget; `0`: the page minimum); it
     /// is admitted against planning headroom or the load is refused.
-    Live { minimum_tokens: u64 },
+    Live {
+        minimum_tokens: u64,
+        reserve: StateFitReserve,
+    },
+}
+
+/// The safety reserve a live state fit leaves free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateFitReserve {
+    /// The configured floor or the measured untracked device memory,
+    /// whichever is larger (ADM-11). Right for a load whose weight growth
+    /// was observed and reconciled: what remains untracked is pool slack and
+    /// other growth that recurs beside the state.
+    MeasuredUntracked,
+    /// The configured floor alone, for a load without a device observation.
+    /// Its weights are priced from the checkpoint, not observed, so on Metal
+    /// the whole under-pricing (Qwen3-TTS 0.6B: about 5.2 GB held against
+    /// 2.5 GB charged) reads as untracked memory. The live sample already
+    /// charges those bytes, so reserving them again left no growth budget
+    /// and collapsed TTS state to one page (R-1).
+    Configured,
+}
+
+impl StateFitReserve {
+    /// The reserve for a load that did (`true`) or did not observe its
+    /// weight growth.
+    pub(crate) const fn for_observed_load(observed: bool) -> Self {
+        if observed {
+            Self::MeasuredUntracked
+        } else {
+            Self::Configured
+        }
+    }
 }
 
 impl ManagedKvCacheManager {
@@ -613,11 +651,16 @@ impl ManagedKvCacheManager {
         let planning = authority.planning_headroom_bytes(self.worker_backend)?;
         let (growth_headroom, safety_reserve_bytes) = match headroom {
             PortableFitHeadroom::Planning => (planning, safety_reserve_bytes),
-            // ASR state keeps the one reserve its invocation fit keeps too:
-            // the configured floor or the measured untracked growth (ADM-11).
-            PortableFitHeadroom::Live { .. } => (
+            // Retained state keeps the one reserve its invocation fit keeps
+            // too: the configured floor or, for an observed load, the
+            // measured untracked growth (ADM-11).
+            PortableFitHeadroom::Live { reserve, .. } => (
                 authority.state_fit_headroom_bytes(self.worker_backend)?,
-                authority.state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+                match reserve {
+                    StateFitReserve::MeasuredUntracked => authority
+                        .state_safety_reserve_bytes(self.worker_backend, safety_reserve_bytes),
+                    StateFitReserve::Configured => safety_reserve_bytes,
+                },
             ),
         };
         let ResourceAmount::Known(headroom_bytes) = planning else {
@@ -676,7 +719,7 @@ impl ManagedKvCacheManager {
         };
 
         let floor_tokens = match headroom {
-            PortableFitHeadroom::Live { minimum_tokens } => minimum_tokens,
+            PortableFitHeadroom::Live { minimum_tokens, .. } => minimum_tokens,
             PortableFitHeadroom::Planning => 0,
         };
         let minimum_tokens = u64::from(page_tokens_hint)
@@ -684,11 +727,19 @@ impl ManagedKvCacheManager {
             .min(maximum_tokens);
         let minimum_bytes = required_bytes(minimum_tokens)?;
         if minimum_bytes > floor_budget_bytes {
-            let message = format!(
-                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}"
+            tracing::warn!(
+                "portable context cannot fit the model-authored minimum: minimum_tokens={minimum_tokens}, state_bytes={minimum_bytes}, planning_headroom={headroom_bytes}, safety_reserve={safety_reserve_bytes}, shortfall_bytes={}",
+                minimum_bytes - floor_budget_bytes
             );
-            // An ASR floor that planning headroom cannot hold is a capacity
-            // refusal (503), not a load defect.
+            let message = crate::engine::resources::capacity_shortfall_reason(
+                format_args!(
+                    "not enough memory for this model's minimum {minimum_tokens}-token state"
+                ),
+                minimum_bytes,
+                floor_budget_bytes,
+            );
+            // An ASR or TTS floor that planning headroom cannot hold is a
+            // capacity refusal (503), not a load defect.
             return Err(match headroom {
                 PortableFitHeadroom::Live { .. } => Error::Overloaded(message),
                 PortableFitHeadroom::Planning => Error::ModelLoadError(message),
@@ -1492,6 +1543,7 @@ impl ManagedKvCacheManager {
                 resource_lease,
                 materialized_resources,
                 tensor_materialized_bytes: 0,
+                tensor_rows_request_priced: false,
                 allocation_ledger,
             },
         );
@@ -1501,6 +1553,39 @@ impl ManagedKvCacheManager {
             })?)
             .ok_or_else(|| Error::InvalidInput("managed KV arena generation overflow".into()))?;
         Ok(runtime)
+    }
+
+    /// Stop charging a model's lazy tensor rows as pending live claims, for
+    /// a model whose requests reserve the rows they create (Qwen3-TTS prices
+    /// its encoder memory in the prefill workspace, then commits it). The
+    /// envelope stays authorized (planning still holds it); recording it as
+    /// materialized means a row is counted once, by its request, and the
+    /// rows no request has created never refuse a request whose own need
+    /// fits live memory. Idempotent.
+    pub(crate) fn price_tensor_rows_with_requests(
+        &mut self,
+        model_instance: ModelInstanceId,
+    ) -> Result<()> {
+        let state = self.models.get_mut(&model_instance).ok_or_else(|| {
+            Error::InvalidInput("managed tensor rows target an unbound model".into())
+        })?;
+        if state.tensor_rows_request_priced {
+            return Ok(());
+        }
+        let Some(arena) = state.runtime.tensor_state() else {
+            return Err(Error::InvalidInput(
+                "request-priced tensor rows need a model with tensor state".into(),
+            ));
+        };
+        let envelope = arena.capacity().authorized_bytes();
+        if let Some(lease) = state.resource_lease.as_ref() {
+            lease.record_materialized_usage(state.materialized_resources.checked_add(
+                tensor_state_resources(state.runtime.plan.backend, envelope)?,
+            )?)?;
+        }
+        state.tensor_materialized_bytes = envelope;
+        state.tensor_rows_request_priced = true;
+        Ok(())
     }
 
     /// Resolve an arena runtime that was allocated by model loading. Request
@@ -3802,9 +3887,17 @@ fn fit_resident_rows_and_reach(
         None => {
             let explicit = geometry(rows.retained_sequence_rows)?;
             if explicit.minimum_bytes > budget_bytes {
-                return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum: {}; {CUDA_EXPLICIT_ROWS_GUIDANCE}",
+                tracing::warn!(
+                    "CUDA managed context cannot fit the model-authored minimum: {}",
                     explicit.describe(headroom_bytes, safety_reserve_bytes)
+                );
+                return Err(Error::ModelLoadError(format!(
+                    "{}; {CUDA_EXPLICIT_ROWS_GUIDANCE}",
+                    crate::engine::resources::capacity_shortfall_reason(
+                        "CUDA managed context cannot fit the model-authored minimum",
+                        explicit.minimum_bytes,
+                        budget_bytes,
+                    )
                 )));
             }
             explicit
@@ -3815,9 +3908,17 @@ fn fit_resident_rows_and_reach(
                     .min(rows.retained_sequence_rows),
             )?;
             if floor.minimum_bytes > budget_bytes {
-                return Err(Error::ModelLoadError(format!(
-                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}; {CUDA_AUTOMATIC_ROWS_GUIDANCE}",
+                tracing::warn!(
+                    "CUDA managed context cannot fit the model-authored minimum at the decode width: {}",
                     floor.describe(headroom_bytes, safety_reserve_bytes)
+                );
+                return Err(Error::ModelLoadError(format!(
+                    "{}; {CUDA_AUTOMATIC_ROWS_GUIDANCE}",
+                    crate::engine::resources::capacity_shortfall_reason(
+                        "CUDA managed context cannot fit the model-authored minimum at the decode width",
+                        floor.minimum_bytes,
+                        budget_bytes,
+                    )
                 )));
             }
             let state_cap = (budget_bytes as f64 * fraction) as u64;
@@ -4167,6 +4268,9 @@ fn tensor_state_resources(backend: BackendKind, bytes: u64) -> Result<ResourceVe
 /// Every caller has already applied its arena transition, so a failure here
 /// is logged rather than returned: a stale record keeps the previous claim.
 fn reconcile_tensor_materialization(state: &mut ManagedKvModelState) {
+    if state.tensor_rows_request_priced {
+        return;
+    }
     let Some(arena) = state.runtime.tensor_state() else {
         return;
     };
@@ -5976,7 +6080,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(fit(PortableFitHeadroom::Planning), 4_096);
-        let live = fit(PortableFitHeadroom::Live { minimum_tokens: 0 });
+        let live = fit(PortableFitHeadroom::Live {
+            minimum_tokens: 0,
+            reserve: StateFitReserve::MeasuredUntracked,
+        });
         assert!((1_024..1_024 + 64).contains(&live), "live fit {live}");
 
         // Right after a large load live memory can read below the reserve
@@ -6008,6 +6115,7 @@ mod tests {
                 1,
                 PortableFitHeadroom::Live {
                     minimum_tokens: floor,
+                    reserve: StateFitReserve::MeasuredUntracked,
                 },
             )
         };
@@ -6654,8 +6762,10 @@ mod tests {
                         message.contains("IZWI_MAX_STAGED_TRANSACTIONS"),
                         "{message}"
                     );
+                    // The client sees the short shortfall; the geometry
+                    // (per-sequence bytes, rows) is logged.
                     assert!(
-                        message.contains(&format!("per_sequence_state_bytes={per_sequence}")),
+                        message.contains(" GB, ") && !message.contains("per_sequence_state_bytes="),
                         "{message}"
                     );
                     continue;
@@ -10229,6 +10339,117 @@ mod tests {
         drop(request);
         assert_eq!(authority.snapshot().reservations, 0);
         assert_eq!(authority.snapshot().reserved, ResourceVector::zero());
+        Ok(())
+    }
+
+    /// Live Qwen3-TTS 0.6B: every request was refused because ten lazy
+    /// encoder-memory rows sized at 32,768 positions (1,342,382,080 B) sat
+    /// in `existing_pending`. Rows are now sized from the TTS state ceiling
+    /// (2,524 positions), and because each request reserves the row it
+    /// creates in its prefill workspace, the unused rows are no pending
+    /// claim: a request whose own need fits live memory is admitted.
+    #[test]
+    fn qwen_tts_tensor_rows_follow_the_tts_ceiling_and_never_block_a_fitting_request() -> Result<()>
+    {
+        use crate::models::architectures::qwen3::tts::{
+            qwen3_tts_inference_state_contract, qwen3_tts_retained_talker_contract,
+            tests::cache_test_config,
+        };
+        const AVAILABLE: u64 = 2_304_168_748;
+        let provider = Arc::new(DriverFreeProvider {
+            capacity: 16 * 1024 * 1024 * 1024,
+            available: std::sync::atomic::AtomicU64::new(AVAILABLE),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let config = cache_test_config();
+        let full = qwen3_tts_inference_state_contract(
+            &config,
+            candle_core::DType::F32,
+            candle_core::DType::F32,
+            16,
+        )?;
+        let retained = qwen3_tts_retained_talker_contract(&full, &config, candle_core::DType::F32)?;
+        let model = ModelInstanceId::new(606);
+        let mut manager = ManagedKvCacheManager::new(Some(authority.clone()));
+        let runtime = manager.bind_model_state_with_capacity(
+            model,
+            BackendKind::Cpu,
+            ManagedStateCapacityRequest {
+                total_paged_pages: 8 * 160,
+                logical_token_reach: Some(2_560),
+                retained_sequence_rows: 8,
+                staged_transaction_rows: 2,
+            },
+            16,
+            &retained,
+        )?;
+        let arena = runtime.tensor_state().expect("tensor arena").clone();
+        // 2,524 x 1,024 F32 encoder memory plus the embedding, hidden and
+        // logits rows; ten rows are about 0.1 GB.
+        assert_eq!(arena.capacity().per_sequence_bytes(), 10_358_784);
+        let envelope = arena.capacity().authorized_bytes();
+        assert_eq!(envelope, 103_587_840);
+        // Bound alone, the unused rows are pending and refuse a request
+        // that fits by itself.
+        assert!(!workspace_fits(&authority, AVAILABLE)?);
+        assert!(workspace_fits(&authority, AVAILABLE - envelope)?);
+
+        let reserved = authority.snapshot().reserved;
+        manager.price_tensor_rows_with_requests(model)?;
+        manager.price_tensor_rows_with_requests(model)?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        assert!(!workspace_fits(&authority, AVAILABLE + 1)?);
+        // Planning still holds the whole envelope.
+        assert_eq!(authority.snapshot().reserved, reserved);
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            envelope
+        );
+
+        // A request's committed row and its release leave the envelope
+        // recorded: the request paid for the row, the lease never re-pends it.
+        let session = SessionKey::new("qwen-tts-request".into(), 1);
+        let prefill = manager
+            .prepare(&runtime, 1, &session, &sequence_work(0, 12), None)?
+            .expect("prefill reservation");
+        let row = |shape: (usize, usize, usize)| {
+            Some(Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap())
+        };
+        arena.stage_replace(
+            PhysicalStateTransactionId::new(prefill.txn_id)?,
+            StateDomainId::new(2),
+            0,
+            12,
+            [
+                (1, 1, 40, 1_024),
+                (2, 1, 1, 1_024),
+                (3, 1, 1, 1_024),
+                (4, 1, 1, 3_072),
+            ]
+            .into_iter()
+            .map(|(id, batch, sequence, width)| StateComponentValue {
+                component: StateComponentId::new(id),
+                tensor: row((batch, sequence, width)),
+            })
+            .collect(),
+        )?;
+        manager.finalize(
+            &prefill,
+            Some(&prefill.completed_write_receipt_for_test()),
+            true,
+        )?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        manager.release_session(&session)?;
+        assert!(workspace_fits(&authority, AVAILABLE)?);
+        assert_eq!(
+            manager.runtime_snapshot().models[0].materialized_tensor_bytes,
+            envelope
+        );
+
+        drop(arena);
+        drop(runtime);
+        assert!(manager.unload_model(model)?);
+        assert_eq!(authority.snapshot().reservations, 0);
         Ok(())
     }
 

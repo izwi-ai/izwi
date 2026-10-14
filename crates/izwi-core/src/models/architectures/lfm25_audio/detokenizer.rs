@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::{Lfm25AudioDecoderConfig, Lfm2BackboneConfig, LFM25_AUDIO_AUDIO_VOCAB_SIZE};
-use crate::models::architectures::lfm2::backbone::QuantizedLfm2Backbone;
+use crate::models::architectures::lfm2::backbone::{Lfm2StatelessStream, QuantizedLfm2Backbone};
 
 pub struct Lfm25AudioDetokenizer {
     fused_embedding: Embedding,
@@ -24,6 +24,33 @@ pub struct Lfm25AudioDetokenizer {
     codebooks: usize,
     codebook_offsets: Vec<u32>,
     codebook_offsets_tensor: Tensor,
+}
+
+/// Incremental detokenizer state ([`Lfm25AudioDetokenizer::decode_stream_step`]):
+/// the code frames consumed, the backbone's per-layer contexts and the
+/// ISTFT's unfinished overlap. A clone is an exact checkpoint.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lfm25DetokenizerStream {
+    frames: usize,
+    backbone: Lfm2StatelessStream,
+    istft: IstftStream,
+}
+
+impl Lfm25DetokenizerStream {
+    /// Code frames detokenized so far.
+    pub(crate) fn frames(&self) -> usize {
+        self.frames
+    }
+}
+
+/// The streaming ISTFT's overlap-add buffers from absolute sample `base`.
+#[derive(Debug, Clone, Default)]
+struct IstftStream {
+    spectral_frames: usize,
+    base: usize,
+    emitted: usize,
+    output: Vec<f32>,
+    envelope: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -202,6 +229,129 @@ impl Lfm25AudioDetokenizer {
         Ok((samples, profile))
     }
 
+    /// Detokenize the next code frames, `new_codes[codebook][frame]` (the
+    /// frames after those `stream` has consumed), and return the samples of
+    /// the whole-utterance [`Self::decode`] that no later frame can change
+    /// (LFT-5). The detokenizer is causal (ShortConv plus a 30-position
+    /// window), so the backbone runs only the new positions against bounded
+    /// per-layer contexts, and the ISTFT emits each sample once every frame
+    /// overlapping it has been added. [`Self::finish_stream`] emits the rest.
+    pub(crate) fn decode_stream_step(
+        &self,
+        stream: &mut Lfm25DetokenizerStream,
+        new_codes: &[Vec<u32>],
+        device: &Device,
+    ) -> Result<Vec<f32>> {
+        if new_codes.len() != self.codebooks {
+            return Err(Error::InvalidInput(format!(
+                "Expected {} audio codebooks, received {}",
+                self.codebooks,
+                new_codes.len()
+            )));
+        }
+        let frames = new_codes.first().map(Vec::len).unwrap_or(0);
+        if frames == 0 {
+            return Ok(Vec::new());
+        }
+        if new_codes.iter().any(|codes| codes.len() != frames)
+            || new_codes.iter().flatten().any(|code| *code >= 2048)
+        {
+            return Err(Error::InvalidInput(
+                "Detokenizer stream codes must share a frame length and lie in [0, 2047]".into(),
+            ));
+        }
+        let embeds = self.fused_embeddings(new_codes, device)?;
+        let upsampled = self.upsample_nearest(&embeds)?;
+        let projected = {
+            let guard = self.backbone.lock().map_err(|_| {
+                Error::InferenceError("LFM2.5 Audio detokenizer mutex poisoned".to_string())
+            })?;
+            let hidden = guard.forward_embeds_stream(&mut stream.backbone, &upsampled)?;
+            guard.project_hidden(&hidden)?
+        };
+        let freq_bins = self.n_fft / 2 + 1;
+        let projected = projected.i(0)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        for frame in &projected {
+            if frame.len() != freq_bins * 2 {
+                return Err(Error::InferenceError(format!(
+                    "Detokenizer output width mismatch: expected {}, found {}",
+                    freq_bins * 2,
+                    frame.len()
+                )));
+            }
+            self.istft_add_frame(&mut stream.istft, frame, freq_bins);
+        }
+        stream.frames += frames;
+        let ready = stream.istft.spectral_frames * self.hop_length;
+        Ok(self.istft_emit(&mut stream.istft, ready))
+    }
+
+    /// The samples after the last [`Self::decode_stream_step`]: the tail the
+    /// whole-utterance ISTFT ends with.
+    pub(crate) fn finish_stream(&self, stream: &mut Lfm25DetokenizerStream) -> Vec<f32> {
+        let frames = stream.istft.spectral_frames;
+        if frames == 0 {
+            return Vec::new();
+        }
+        let pad = (self.n_fft - self.hop_length) / 2;
+        let end = (frames - 1) * self.hop_length + self.n_fft - pad;
+        self.istft_emit(&mut stream.istft, end)
+    }
+
+    /// Overlap-add one spectral frame, as [`Self::istft_same`] does.
+    fn istft_add_frame(&self, istft: &mut IstftStream, frame: &[f32], freq_bins: usize) {
+        let mut full = vec![Complex::<f32>::new(0.0, 0.0); self.n_fft];
+        for freq_idx in 0..freq_bins {
+            full[freq_idx] =
+                Complex::from_polar(frame[freq_idx].exp(), frame[freq_bins + freq_idx]);
+        }
+        for freq_idx in 1..(freq_bins - 1) {
+            full[self.n_fft - freq_idx] = full[freq_idx].conj();
+        }
+        self.ifft.process(&mut full);
+        let first = istft.spectral_frames * self.hop_length;
+        let needed = first + self.n_fft - istft.base;
+        if istft.output.len() < needed {
+            istft.output.resize(needed, 0.0);
+            istft.envelope.resize(needed, 0.0);
+        }
+        for sample_idx in 0..self.n_fft {
+            let sample = full[sample_idx].re / self.n_fft as f32 * self.istft_window[sample_idx];
+            let index = first + sample_idx - istft.base;
+            istft.output[index] += sample;
+            istft.envelope[index] += self.istft_window_sq[sample_idx];
+        }
+        istft.spectral_frames += 1;
+    }
+
+    /// Normalized samples from the last emitted one up to absolute index
+    /// `end` (exclusive), cropped by the "same" padding like
+    /// [`Self::istft_same`]; the emitted prefix leaves the buffers.
+    fn istft_emit(&self, istft: &mut IstftStream, end: usize) -> Vec<f32> {
+        let pad = (self.n_fft - self.hop_length) / 2;
+        let start = istft.emitted.max(pad);
+        if end <= start {
+            return Vec::new();
+        }
+        let samples = (start..end)
+            .map(|index| {
+                let local = index - istft.base;
+                let env = istft.envelope.get(local).copied().unwrap_or(0.0);
+                if env > 1e-11 {
+                    istft.output[local] / env
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        istft.emitted = end;
+        let drop = end - istft.base;
+        istft.output.drain(..drop.min(istft.output.len()));
+        istft.envelope.drain(..drop.min(istft.envelope.len()));
+        istft.base = end;
+        samples
+    }
+
     fn fused_embeddings(&self, audio_codes: &[Vec<u32>], device: &Device) -> Result<Tensor> {
         let frames = audio_codes[0].len();
         let mut flat = Vec::with_capacity(frames * self.codebooks);
@@ -362,4 +512,94 @@ fn load_tensor_any(
         "Missing GGUF tensor; tried {}",
         names.join(" | ")
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels::numeric_check::{max_abs_diff, xorshift_tensor};
+
+    /// A tiny detokenizer: two codebooks, the tiny windowed LFM2 backbone
+    /// (window 30) with a 6-wide head, and a 4-point ISTFT with hop 2.
+    fn tiny_detokenizer() -> Lfm25AudioDetokenizer {
+        let device = Device::Cpu;
+        let codebooks = 2;
+        let rows = codebooks * (LFM25_AUDIO_AUDIO_VOCAB_SIZE - 1) + 1;
+        let table = xorshift_tensor(&[rows, 8], 0xDE70, 1.0, &device).unwrap();
+        let n_fft = 4;
+        let window = vec![0.1f32, 0.6, 1.0, 0.6];
+        let codebook_offsets = (0..codebooks)
+            .map(|idx| (idx * (LFM25_AUDIO_AUDIO_VOCAB_SIZE - 1)) as u32)
+            .collect::<Vec<_>>();
+        Lfm25AudioDetokenizer {
+            fused_embedding: Embedding::new(table, 8),
+            backbone: Mutex::new(
+                crate::models::architectures::lfm2::backbone::tests::tiny_windowed_backbone_with_head(
+                    Some(30),
+                    6,
+                ),
+            ),
+            istft_window_sq: window.iter().map(|v| v * v).collect(),
+            istft_window: window,
+            ifft: FftPlanner::<f32>::new().plan_fft_inverse(n_fft),
+            upsample_factor: 6,
+            n_fft,
+            hop_length: 2,
+            codebooks,
+            codebook_offsets_tensor: Tensor::from_vec(
+                codebook_offsets.clone(),
+                codebooks,
+                &device,
+            )
+            .unwrap(),
+            codebook_offsets,
+        }
+    }
+
+    /// LFT-5: streaming the detokenizer in uneven steps, then finishing,
+    /// reproduces the whole-utterance decode sample for sample: backbone
+    /// contexts and the ISTFT overlap carry across steps.
+    #[test]
+    fn streamed_detokenizer_matches_the_whole_decode() {
+        let detokenizer = tiny_detokenizer();
+        let mut state = 0x1234_5678u64;
+        let codes = (0..2)
+            .map(|_| {
+                (0..40)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % 2048) as u32
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let whole = detokenizer.decode(&codes, &Device::Cpu).unwrap();
+        let mut stream = Lfm25DetokenizerStream::default();
+        let mut streamed = Vec::new();
+        let mut start = 0;
+        for step in [1usize, 5, 3, 9, 22] {
+            let next = codes
+                .iter()
+                .map(|c| c[start..start + step].to_vec())
+                .collect::<Vec<_>>();
+            let chunk = detokenizer
+                .decode_stream_step(&mut stream, &next, &Device::Cpu)
+                .unwrap();
+            assert!(!chunk.is_empty());
+            streamed.extend(chunk);
+            start += step;
+        }
+        assert_eq!(stream.frames(), 40);
+        streamed.extend(detokenizer.finish_stream(&mut stream));
+        assert_eq!(streamed.len(), whole.len());
+        let scale = whole.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(scale > 1e-3, "degenerate output");
+        let error = max_abs_diff(&streamed, &whole);
+        assert!(
+            error <= 1e-5 * scale.max(1.0),
+            "streamed vs whole max abs {error}"
+        );
+    }
 }

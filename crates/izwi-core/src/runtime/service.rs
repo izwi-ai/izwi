@@ -65,7 +65,7 @@ use crate::models::architectures::granite_speech::asr::{
     GraniteSpeechPreparationBatchRow, GraniteSpeechPreparedGeometry,
     GraniteSpeechPreparedPromptArtifact,
 };
-use crate::models::architectures::kokoro::{kokoro_output_budget, kokoro_peak_workspace};
+use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::qwen3::asr::{
     Qwen3AsrAudioBatchRow, Qwen3AsrAudioPreparationGeometry, Qwen3AsrPreparedAudio,
 };
@@ -73,7 +73,8 @@ use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrPreparationDecision, VibeVoiceAsrPreparedArtifact, VibeVoiceAsrPreparedGeometry,
 };
 use crate::models::architectures::vibevoice::tts::{
-    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference, VibeVoiceTtsGenerationParams,
+    vibevoice_tts_auto_max_frames_for_text, VibeVoiceSpeakerReference,
+    VibeVoiceTtsGenerationParams, VIBEVOICE_TTS_DEFAULT_CFG_SCALE,
 };
 use crate::models::architectures::voxtral::tts::VoxtralTtsGenerationParams;
 use crate::models::architectures::whisper::asr::{
@@ -760,6 +761,86 @@ fn host_input_observation(input_bytes: usize) -> Result<JobResourceObservation> 
     ))
 }
 
+/// VibeVoice sampling for a request: unset fields keep the reference demo's
+/// CFG 1.3 and `default_diffusion_steps` (10) (TPIPE-24, VVT-5).
+fn vibevoice_tts_request_params(
+    params: &GenerationParams,
+    text: &str,
+    default_diffusion_steps: usize,
+) -> VibeVoiceTtsGenerationParams {
+    let auto_frame_budget = params.max_tokens == 0;
+    VibeVoiceTtsGenerationParams {
+        cfg_scale: params
+            .speech
+            .cfg_scale
+            .unwrap_or(VIBEVOICE_TTS_DEFAULT_CFG_SCALE),
+        diffusion_steps: params
+            .speech
+            .diffusion_steps
+            .unwrap_or(default_diffusion_steps)
+            .max(1),
+        max_frames: if auto_frame_budget {
+            vibevoice_tts_auto_max_frames_for_text(text)
+        } else {
+            params
+                .max_tokens
+                .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
+        },
+        auto_frame_budget,
+    }
+}
+
+/// Fish S2 sampling for a request: unset fields keep fish-speech's serving
+/// defaults, and the seed defaults to one derived from the request id.
+fn fish_s2_request_params(params: &GenerationParams, request_id: &str) -> FishS2GenerationParams {
+    let defaults = FishS2GenerationParams::default();
+    FishS2GenerationParams {
+        max_frames: if params.max_tokens == 0 {
+            defaults.max_frames
+        } else {
+            params
+                .max_tokens
+                .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
+        },
+        temperature: params.speech.temperature.unwrap_or(defaults.temperature),
+        top_p: params.speech.top_p.unwrap_or(defaults.top_p),
+        top_k: params
+            .audio_top_k
+            .or(params.speech.top_k)
+            .unwrap_or(defaults.top_k),
+        seed: params
+            .speech
+            .seed
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id)),
+        ..defaults
+    }
+}
+
+/// Voxtral sampling for a request: unset fields keep Voxtral's defaults
+/// (greedy semantic codes), and the flow-matching seed defaults to one
+/// derived from the request id, so a retried frame redraws the same noise.
+fn voxtral_tts_request_params(
+    params: &GenerationParams,
+    request_id: &str,
+    context_limit: usize,
+) -> VoxtralTtsGenerationParams {
+    let speech = &params.speech;
+    let defaults = VoxtralTtsGenerationParams::default();
+    VoxtralTtsGenerationParams {
+        max_frames: params
+            .max_tokens
+            .max(1)
+            .min(context_limit.saturating_sub(1).max(1)),
+        temperature: speech.temperature.unwrap_or(defaults.temperature).max(0.0),
+        top_p: speech.top_p.unwrap_or(defaults.top_p).clamp(0.0, 1.0),
+        top_k: speech.top_k.unwrap_or(defaults.top_k),
+        seed: speech
+            .seed
+            .unwrap_or_else(|| EngineCoreRequest::chat_request_seed(request_id).max(1)),
+        ..defaults
+    }
+}
+
 fn retained_lfm25_audio_tts_artifact_host_bytes(messages: &[ChatMessage]) -> Result<u64> {
     let mut bytes = 0usize;
     add_chat_messages_allocations(&mut bytes, messages, messages.len())?;
@@ -860,30 +941,54 @@ pub(super) fn add_fish_s2_artifact_to_admission(
     Ok(())
 }
 
+/// What one engine Kokoro request reserves, from its prepared chunks
+/// (KOK-8/9): the widest chunk's decoder workspace (chunks run one after
+/// another) and the joined output of every chunk, each at the planning pace
+/// for its own text rather than the model's 50-bins-per-token ceiling.
 fn kokoro_synthesis_resources(
     backend: BackendKind,
-    text: &str,
-    speed: f32,
+    prepared: &crate::engine::KokoroPreparedText,
 ) -> Result<ResourceVector> {
-    let budget = kokoro_output_budget(text, speed)?;
-    let workspace = kokoro_peak_workspace(
-        u64::try_from(budget.max_chunk_expanded_frames)
-            .map_err(|_| Error::Overloaded("Kokoro frame budget exceeds u64".into()))?,
-    )?;
-    let output_bytes = u64::try_from(budget.max_samples)
-        .ok()
-        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
-        .ok_or_else(|| Error::Overloaded("Kokoro output reservation overflowed".into()))?;
-    let host_bytes = output_bytes
-        .checked_add(workspace.host_bytes)
-        .ok_or_else(|| Error::Overloaded("Kokoro host reservation overflowed".into()))?;
+    use crate::models::architectures::kokoro::admission::{
+        kokoro_chunk_frame_bound, kokoro_chunk_price,
+    };
+    let overflow = || Error::Overloaded("Kokoro reservation overflowed".into());
+    let mut widest: Option<crate::models::architectures::kokoro::admission::KokoroChunkPrice> =
+        None;
+    let mut output_samples = 0u64;
+    for (index, chunk) in prepared.chunks.iter().enumerate() {
+        let frames = kokoro_chunk_frame_bound(chunk.source_text.chars().count(), chunk.speed);
+        let price = kokoro_chunk_price(frames, backend)?;
+        let pause = if index == 0 {
+            0
+        } else {
+            KOKORO_JOIN_PAUSE_SAMPLES
+        };
+        output_samples = output_samples
+            .checked_add(price.output_samples)
+            .and_then(|samples| samples.checked_add(pause))
+            .ok_or_else(overflow)?;
+        if widest.is_none_or(|current| price.frames > current.frames) {
+            widest = Some(price);
+        }
+    }
+    let widest =
+        widest.ok_or_else(|| Error::InvalidInput("Kokoro request has no chunks".into()))?;
+    let host_bytes = output_samples
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .and_then(|bytes| bytes.checked_add(widest.host_bytes))
+        .ok_or_else(overflow)?;
     super::tts::direct_tts_physical_resources(
         backend,
         host_bytes,
-        workspace.cpu_tensor_bytes,
-        workspace.accelerator_tensor_bytes,
+        widest.cpu_tensor_bytes,
+        widest.accelerator_tensor_bytes,
     )
 }
+
+/// Silence the executor inserts between joined Kokoro chunks (40 ms at
+/// 24 kHz).
+const KOKORO_JOIN_PAUSE_SAMPLES: u64 = 960;
 
 fn ensure_preparation_copy_deadline(job: &JobLease) -> Result<()> {
     if job
@@ -6055,7 +6160,8 @@ impl RuntimeService {
                         "Kokoro preparation must remain scalar".into(),
                     ));
                 }
-                let artifact = Arc::new(model_for_preparation.prepare_request(
+                let artifact = Arc::new(crate::runtime::kokoro::prepare_kokoro_text(
+                    &*model_for_preparation,
                     &text,
                     speaker.as_deref(),
                     language.as_deref(),
@@ -6095,12 +6201,11 @@ impl RuntimeService {
         )?;
         let (mut execution, _) = self.coordinator_job_for_request(&prepared)?;
         let prepared_text = prepared
-            .tts_text_for_execution()
+            .prepared_kokoro_tts_artifact_for_executor()?
             .ok_or_else(|| Error::InferenceError("prepared Kokoro request lost its text".into()))?;
         execution.resources = execution.resources.checked_add(kokoro_synthesis_resources(
             self.backend_router.context().backend_kind,
-            prepared_text,
-            prepared.params.speed,
+            &prepared_text,
         )?)?;
         match self
             .coordinator
@@ -6186,20 +6291,8 @@ impl RuntimeService {
             text: reference_text.to_string(),
         };
         let requested_speaker = request.tts_speaker_for_execution().map(str::to_string);
-        let auto_frame_budget = request.params.max_tokens == 0;
-        let params = VibeVoiceTtsGenerationParams {
-            cfg_scale: 1.5,
-            diffusion_steps: model.default_diffusion_steps().max(1),
-            max_frames: if auto_frame_budget {
-                vibevoice_tts_auto_max_frames_for_text(&text)
-            } else {
-                request
-                    .params
-                    .max_tokens
-                    .clamp(1, ModelVariant::VIBEVOICE_TTS_MAX_OUTPUT_FRAMES)
-            },
-            auto_frame_budget,
-        };
+        let params =
+            vibevoice_tts_request_params(&request.params, &text, model.default_diffusion_steps());
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("VibeVoice TTS retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
@@ -6384,25 +6477,7 @@ impl RuntimeService {
             sample_rate,
             text: reference_text.to_string(),
         };
-        let params = FishS2GenerationParams {
-            max_frames: if request.params.max_tokens == 0 {
-                FishS2GenerationParams::default().max_frames
-            } else {
-                request
-                    .params
-                    .max_tokens
-                    .clamp(1, ModelVariant::FISH_S2_PRO_MAX_OUTPUT_FRAMES)
-            },
-            temperature: request.params.temperature,
-            top_p: request.params.top_p,
-            top_k: request
-                .params
-                .audio_top_k
-                .or_else(|| (request.params.top_k > 0).then_some(request.params.top_k))
-                .unwrap_or(FishS2GenerationParams::default().top_k),
-            seed: EngineCoreRequest::chat_request_seed(&request.id),
-            ..FishS2GenerationParams::default()
-        };
+        let params = fish_s2_request_params(&request.params, &request.id);
         params.validate()?;
         let memory = model.preparation_memory(&text, &reference, context_limit)?;
         // The text clone and decoded reference were constructed under the initial
@@ -6605,14 +6680,7 @@ impl RuntimeService {
             .map(str::to_string)
             .or_else(|| model.available_speakers().into_iter().next())
             .ok_or_else(|| Error::InvalidInput("Voxtral TTS has no available voice".into()))?;
-        let params = VoxtralTtsGenerationParams {
-            max_frames: request
-                .params
-                .max_tokens
-                .max(1)
-                .min(context_limit.saturating_sub(1).max(1)),
-            ..Default::default()
-        };
+        let params = voxtral_tts_request_params(&request.params, &request.id, context_limit);
         let retained_request_bytes = u64::try_from(retained_engine_request_input_bytes(&request)?)
             .map_err(|_| Error::Overloaded("Voxtral TTS retained request exceeds u64".into()))?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_bytes))?;
@@ -6769,10 +6837,19 @@ impl RuntimeService {
             })?;
         job.record_materialized_usage(JobResourceObservation::host(retained_request_host_bytes))?;
         let bridge = self.coordinator.bridge_preparation_admission(job)?;
+        // Priced from this request's prompt bound, never the model ceiling
+        // (LFT-1): the ceiling's full-context prefill refused every request.
+        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
+        let envelope = model.lfm25_audio_tts_preparation_envelope(&messages)?;
+        if envelope.backend != backend || envelope.max_prompt_tokens > ceiling.max_prompt_tokens {
+            return Err(Error::InferenceError(
+                "LFM2.5 Audio TTS preparation envelope exceeds its loaded ceiling".into(),
+            ));
+        }
         let preparation_resources = asr_encoder_retained_resources(
             backend,
             retained_request_host_bytes,
-            ceiling.max_retained_resident_bytes,
+            envelope.max_retained_resident_bytes,
         )?;
         let preparation_spec = JobSpec {
             request_id: request.id.clone(),
@@ -6799,16 +6876,15 @@ impl RuntimeService {
                 return Err(error);
             }
         };
-        let messages = request.lfm25_audio_tts_messages_for_preparation()?;
         let work = WorkUnit::PreSequencePreparation {
             kind: "tts.prepare.lfm25_audio".into(),
         };
-        let workspace = lfm25_audio_tts_preparation_workspace(backend, ceiling.max_workspace_bytes);
+        let workspace = lfm25_audio_tts_preparation_workspace(backend, envelope.workspace_bytes);
         let cost = crate::engine::WorkCost::with_workspace(
-            u64::try_from(ceiling.max_prompt_tokens).map_err(|_| {
-                Error::Overloaded("LFM2.5 Audio TTS prompt ceiling exceeds u64".into())
+            u64::try_from(envelope.max_prompt_tokens).map_err(|_| {
+                Error::Overloaded("LFM2.5 Audio TTS prompt bound exceeds u64".into())
             })?,
-            ceiling.max_materialized_tensor_elements,
+            envelope.max_materialized_tensor_elements,
             workspace,
         );
         let cancellation = PreparationCancellation::default();
@@ -6817,7 +6893,7 @@ impl RuntimeService {
             &preparation_contract,
             &work,
             cost,
-            ceiling.max_materialized_tensor_elements,
+            envelope.max_materialized_tensor_elements,
             cancellation.clone(),
         )?;
         let model_for_preparation = model.clone();
@@ -6870,9 +6946,9 @@ impl RuntimeService {
             PreparationRowOutcome::Failed(error) => return Err(error),
         };
         if artifact.prompt_tokens == 0
-            || artifact.prompt_tokens > ceiling.max_prompt_tokens
-            || artifact.materialized_tensor_elements > ceiling.max_materialized_tensor_elements
-            || artifact.retained_resident_bytes > ceiling.max_retained_resident_bytes
+            || artifact.prompt_tokens > envelope.max_prompt_tokens
+            || artifact.materialized_tensor_elements > envelope.max_materialized_tensor_elements
+            || artifact.retained_resident_bytes > envelope.max_retained_resident_bytes
         {
             drop(artifact);
             drop(request);
@@ -6923,10 +6999,11 @@ impl RuntimeService {
     /// before binding or engine admission. Keep the family pipeline in one place.
     async fn prepare_request_for_binding(
         &self,
-        request: EngineCoreRequest,
+        mut request: EngineCoreRequest,
         job: JobLease,
         residency_lease: Option<&ModelResidencyLease>,
     ) -> Result<(EngineCoreRequest, JobLease)> {
+        request.normalize_tts_params_before_preparation()?;
         let (request, job) = self
             .prepare_asr_shape_for_binding(request, job, residency_lease)
             .await?;
@@ -10832,6 +10909,90 @@ mod tests {
         assert_eq!(
             Some(spec.resources),
             asr_transient_resources(backend, variant, after, Some(257.0 / 16_000.0)).unwrap()
+        );
+    }
+
+    /// KOK-8: an engine Kokoro request reserves its widest prepared chunk's
+    /// workspace and the joined output of its chunks at the planning pace,
+    /// not 4,096 frames and the 50-bins-per-token output of its whole text.
+    #[test]
+    fn kokoro_engine_reservation_follows_the_prepared_chunks() {
+        use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
+        use crate::models::architectures::kokoro::KokoroPreparedRequest;
+        let chunk = |text: &str| KokoroPreparedRequest {
+            source_text: text.into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            phonemes: "p".into(),
+            token_ids: vec![1; 8],
+            ref_style: candle_core::Tensor::zeros(
+                (1, 4),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            speed: 1.0,
+        };
+        let prepared = crate::engine::KokoroPreparedText {
+            source_text: "ab".into(),
+            requested_speaker: None,
+            requested_language: None,
+            requested_speed: 1.0,
+            chunks: vec![chunk(&"a".repeat(100)), chunk(&"b".repeat(40))],
+        };
+        let wide = kokoro_chunk_price(400, BackendKind::Metal).unwrap();
+        let narrow = kokoro_chunk_price(160, BackendKind::Metal).unwrap();
+        let output = (wide.output_samples + narrow.output_samples + 960) * 4;
+        assert_eq!(
+            kokoro_synthesis_resources(BackendKind::Metal, &prepared)
+                .unwrap()
+                .unified_bytes,
+            ResourceAmount::Known(output + wide.host_bytes + wide.accelerator_tensor_bytes)
+        );
+    }
+
+    /// TPIPE-24: unset speech sampling keeps each family's reference
+    /// default instead of the shared chat defaults, and request fields
+    /// override it.
+    #[test]
+    fn speech_family_params_keep_reference_defaults_until_the_request_sets_them() {
+        let unset = GenerationParams::default();
+        let vibevoice = vibevoice_tts_request_params(&unset, "Hello there.", 10);
+        assert_eq!((vibevoice.cfg_scale, vibevoice.diffusion_steps), (1.3, 10));
+        let fish = fish_s2_request_params(&unset, "request-a");
+        assert_eq!((fish.temperature, fish.top_p, fish.top_k), (0.7, 0.7, 30));
+        assert_eq!(fish.seed, EngineCoreRequest::chat_request_seed("request-a"));
+        let voxtral = voxtral_tts_request_params(&unset, "request-a", 4096);
+        assert_eq!(
+            (voxtral.temperature, voxtral.top_p, voxtral.top_k),
+            (0.0, 1.0, 0)
+        );
+        assert_ne!(voxtral.seed, 0, "retried frames redraw the same noise");
+
+        let mut set = GenerationParams::default();
+        set.speech.cfg_scale = Some(2.0);
+        set.speech.diffusion_steps = Some(20);
+        set.speech.temperature = Some(0.5);
+        set.speech.top_p = Some(0.9);
+        set.speech.top_k = Some(12);
+        set.speech.seed = Some(99);
+        let vibevoice = vibevoice_tts_request_params(&set, "Hello there.", 10);
+        assert_eq!((vibevoice.cfg_scale, vibevoice.diffusion_steps), (2.0, 20));
+        let fish = fish_s2_request_params(&set, "request-a");
+        assert_eq!(
+            (fish.temperature, fish.top_p, fish.top_k, fish.seed),
+            (0.5, 0.9, 12, 99)
+        );
+        let voxtral = voxtral_tts_request_params(&set, "request-a", 4096);
+        assert_eq!(
+            (
+                voxtral.temperature,
+                voxtral.top_p,
+                voxtral.top_k,
+                voxtral.seed
+            ),
+            (0.5, 0.9, 12, 99)
         );
     }
 

@@ -19,6 +19,10 @@ pub struct VoxtralTtsGenerationParams {
     pub n_decoding_steps: usize,
     pub max_frames: usize,
     pub auto_frame_budget: bool,
+    /// Flow-matching noise seed. Nonzero draws each frame's initial noise
+    /// from a stream keyed by (seed, frame), so a request (and any retry of
+    /// a frame) reproduces; 0 keeps unseeded device noise.
+    pub seed: u64,
 }
 
 impl Default for VoxtralTtsGenerationParams {
@@ -31,6 +35,7 @@ impl Default for VoxtralTtsGenerationParams {
             n_decoding_steps: DEFAULT_N_DECODING_STEPS,
             max_frames: ModelVariant::VOXTRAL_TTS_MAX_OUTPUT_FRAMES,
             auto_frame_budget: false,
+            seed: 0,
         }
     }
 }
@@ -87,6 +92,7 @@ impl VoxtralTtsGenerationParams {
             n_decoding_steps: DEFAULT_N_DECODING_STEPS,
             max_frames,
             auto_frame_budget,
+            seed: 0,
         }
     }
 }

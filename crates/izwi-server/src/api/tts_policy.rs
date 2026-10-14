@@ -1,7 +1,211 @@
 use izwi_core::catalog::ModelFamily;
-use izwi_core::runtime_models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
+pub(crate) use izwi_core::runtime_models::architectures::qwen3::tts::{
+    qwen3_tts_auto_max_frames_for_text as qwen_tts_auto_max_frames_for_text,
+};
+use izwi_core::runtime_models::architectures::qwen3::tts::qwen3_tts_auto_max_output_frames;
+use izwi_core::runtime_models::architectures::vibevoice::tts::{
+    vibevoice_tts_auto_max_frames_for_text, vibevoice_tts_auto_max_output_frames,
+};
 use izwi_core::runtime_models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
 use izwi_core::ModelVariant;
+
+/// The longest speech input one request may carry, in UTF-8 bytes
+/// (`IZWI_TTS_MAX_TEXT_BYTES`, default 1 MiB). Long form splits text into
+/// model-sized calls, so this bounds only the request itself (TPIPE-14).
+pub(crate) fn tts_max_text_bytes() -> usize {
+    std::env::var("IZWI_TTS_MAX_TEXT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1024 * 1024)
+}
+
+/// The voice a speech request asks for, as the routes read it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SpeechVoiceRequest {
+    /// A built-in speaker was named.
+    pub(crate) speaker: bool,
+    pub(crate) reference_audio: bool,
+    pub(crate) reference_text: bool,
+    /// A voice description (VoiceDesign `instructions`).
+    pub(crate) voice_description: bool,
+}
+
+/// The one capability-driven voice contract every speech route applies
+/// (TPIPE-12): a reference comes as audio and transcript together; a model
+/// is given only the voice inputs it supports; and a model whose only voice
+/// mode is a reference (Qwen Base, VibeVoice, Fish) or a description (Qwen
+/// VoiceDesign) must be given one.
+pub(crate) fn validate_speech_voice(
+    variant: ModelVariant,
+    voice: SpeechVoiceRequest,
+) -> Result<(), crate::error::ApiError> {
+    use crate::error::ApiError;
+    let capabilities = variant.speech_capabilities().ok_or_else(|| {
+        ApiError::bad_request(format!("{variant} is not a text-to-speech model."))
+    })?;
+    if voice.reference_audio != voice.reference_text {
+        return Err(ApiError::bad_request(
+            "Provide both `reference_audio` and `reference_text` together.",
+        ));
+    }
+    let reference = voice.reference_audio && voice.reference_text;
+    if voice.speaker && !capabilities.supports_builtin_voices {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support built-in speaker selection.",
+        )));
+    }
+    if reference && !capabilities.supports_reference_voice {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support reference or saved voices.",
+        )));
+    }
+    if voice.voice_description && !capabilities.supports_voice_description {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not support voice direction prompts.",
+        )));
+    }
+    if !capabilities.supports_builtin_voices
+        && !capabilities.supports_reference_voice
+        && !capabilities.supports_voice_description
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} does not expose a supported text-to-speech voice mode.",
+        )));
+    }
+    if capabilities.supports_reference_voice
+        && !capabilities.supports_builtin_voices
+        && !capabilities.supports_voice_description
+        && !reference
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} requires `saved_voice_id` or both `reference_audio` and `reference_text`.",
+        )));
+    }
+    if capabilities.supports_voice_description
+        && !capabilities.supports_builtin_voices
+        && !capabilities.supports_reference_voice
+        && !voice.voice_description
+    {
+        return Err(ApiError::bad_request(format!(
+            "{variant} requires a voice description (`instructions` or `voice_description`).",
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a `speed` the model cannot honour with 400 (TPIPE-10): any speed
+/// but 1.0 on a model without speed control, or one outside the supported
+/// range, instead of clamping or dropping it silently.
+pub(crate) fn validate_speech_speed(
+    variant: ModelVariant,
+    speed: Option<f32>,
+) -> Result<(), crate::error::ApiError> {
+    let Some(speed) = speed else {
+        return Ok(());
+    };
+    let capabilities = variant.speech_capabilities();
+    if capabilities
+        .as_ref()
+        .is_some_and(|capabilities| capabilities.honours_speed(speed))
+        || (capabilities.is_none() && speed == 1.0)
+    {
+        return Ok(());
+    }
+    let (low, high) = izwi_core::catalog::SpeechModelCapabilities::SPEED_RANGE;
+    Err(crate::error::ApiError::bad_request(
+        if capabilities.is_some_and(|capabilities| capabilities.supports_speed_control) {
+            format!("`speed` must be between {low} and {high} for {variant}; got {speed}")
+        } else {
+            format!("{variant} does not support speed control; omit `speed` or set it to 1.0")
+        },
+    ))
+}
+
+/// Refuse an over-limit speech input with 413 before any model loads.
+pub(crate) fn check_tts_input_length(text: &str) -> Result<(), crate::error::ApiError> {
+    let limit = tts_max_text_bytes();
+    if text.len() > limit {
+        return Err(crate::error::ApiError::payload_too_large(format!(
+            "Speech input is {} bytes, above the {limit}-byte limit; send it as several requests",
+            text.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Optional speech-sampling fields a request may set beside `temperature`
+/// and `top_k`. Anything left unset keeps the model family's reference
+/// default (TPIPE-24): Qwen3-TTS generation_config, LFM 0.8 / top-k 64,
+/// VibeVoice CFG 1.3 with 10 steps, fish-speech 0.7 / 0.7, Voxtral greedy.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct SpeechSamplingRequest {
+    /// Nucleus sampling threshold, in (0, 1].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Sampling seed (Qwen3-TTS, LFM2.5-Audio, Fish S2, Voxtral noise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Repetition penalty (Qwen3-TTS), >= 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    /// Qwen3-TTS residual-codebook sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_do_sample: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_top_k: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtalker_top_p: Option<f32>,
+    /// VibeVoice classifier-free guidance scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_scale: Option<f32>,
+    /// VibeVoice diffusion steps per frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffusion_steps: Option<usize>,
+    /// Speak numbers, currency, dates, times and units as words (English).
+    /// Unset keeps the model's default: on for Kokoro, off for models that
+    /// read them themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalize_text: Option<bool>,
+}
+
+impl SpeechSamplingRequest {
+    /// The engine's speech sampling for a request that also set `temperature`
+    /// and `top_k` (each `None` when the client left it unset).
+    pub(crate) fn options(
+        &self,
+        temperature: Option<f32>,
+        top_k: Option<usize>,
+    ) -> izwi_core::SpeechSamplingOptions {
+        izwi_core::SpeechSamplingOptions {
+            temperature,
+            top_p: self.top_p,
+            top_k,
+            repetition_penalty: self.repetition_penalty,
+            seed: self.seed,
+            subtalker_do_sample: self.subtalker_do_sample,
+            subtalker_temperature: self.subtalker_temperature,
+            subtalker_top_k: self.subtalker_top_k,
+            subtalker_top_p: self.subtalker_top_p,
+            cfg_scale: self.cfg_scale,
+            diffusion_steps: self.diffusion_steps,
+            normalize_text: self.normalize_text,
+        }
+    }
+}
+
+/// The largest explicit output-frame budget any backend honours for
+/// `variant`.
+fn explicit_frame_ceiling(variant: ModelVariant) -> usize {
+    let hint = variant.tts_max_output_frames_hint().unwrap_or(1);
+    if variant == ModelVariant::Voxtral4BTts2603 {
+        hint.max(ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES)
+    } else {
+        hint
+    }
+}
 
 pub(crate) fn resolve_tts_output_frames(
     variant: ModelVariant,
@@ -10,7 +214,10 @@ pub(crate) fn resolve_tts_output_frames(
 ) -> Option<usize> {
     let model_max_frames = variant.tts_max_output_frames_hint()?;
     match requested_frames {
-        Some(value) if value > 0 => Some(value.clamp(1, model_max_frames)),
+        // An explicit budget is clamped to the largest any backend honours;
+        // the runtime clamps it again to the loaded backend's limit (Voxtral
+        // allows 2,048 frames on CUDA, not the 1,500-frame hint; TPIPE-19).
+        Some(value) if value > 0 => Some(value.clamp(1, explicit_frame_ceiling(variant))),
         Some(0) | None if variant == ModelVariant::Voxtral4BTts2603 => {
             Some(voxtral_tts_auto_max_frames_for_text(text).min(model_max_frames))
         }
@@ -28,27 +235,23 @@ pub(crate) fn resolve_tts_output_frames(
     }
 }
 
-pub(crate) fn qwen_tts_auto_max_frames_for_text(text: &str) -> usize {
-    const MIN_AUDIO_SECS: f32 = 4.0;
-    const MAX_AUDIO_SECS_PER_REQUEST: f32 = 120.0;
-    const WORDS_PER_SECOND: f32 = 2.5;
-    const CHARS_PER_WORD: usize = 5;
-    const END_PADDING_SECS: f32 = 2.0;
-
-    let word_count = text.split_whitespace().count();
-    let char_word_equivalent = text
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .count()
-        .div_ceil(CHARS_PER_WORD);
-    let estimated_words = word_count.max(char_word_equivalent).max(1);
-    let estimated_secs = ((estimated_words as f32) / WORDS_PER_SECOND + END_PADDING_SECS)
-        .clamp(MIN_AUDIO_SECS, MAX_AUDIO_SECS_PER_REQUEST);
-    let frames = (estimated_secs * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ).ceil() as usize;
-    frames.clamp(
-        (MIN_AUDIO_SECS * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-        (MAX_AUDIO_SECS_PER_REQUEST * ModelVariant::QWEN3_TTS_FRAME_RATE_HZ) as usize,
-    )
+/// Whether `text` is too long for one automatic request of `variant`: its
+/// automatic budget reaches the per-request cap, so one request would cut
+/// it. Only families that advertise automatic long form split; Fish plans
+/// its own segments.
+pub(crate) fn tts_text_exceeds_one_request(variant: ModelVariant, text: &str) -> bool {
+    if !variant
+        .speech_capabilities()
+        .is_some_and(|capabilities| capabilities.supports_auto_long_form)
+    {
+        return false;
+    }
+    let cap = match variant.family() {
+        ModelFamily::Qwen3Tts => qwen3_tts_auto_max_output_frames(),
+        ModelFamily::VibeVoiceTts => vibevoice_tts_auto_max_output_frames(),
+        _ => return false,
+    };
+    resolve_tts_output_frames(variant, text, None).is_some_and(|frames| frames >= cap)
 }
 
 fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
@@ -79,6 +282,51 @@ fn fish_s2_tts_auto_max_frames_for_text(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TPIPE-19: an explicit Voxtral budget up to CUDA's 2,048 frames
+    /// reaches the runtime (which clamps it to the loaded backend's limit),
+    /// rather than being cut to the 1,500-frame hint here.
+    #[test]
+    fn explicit_budgets_reach_the_runtime_up_to_the_largest_backend_limit() {
+        let voxtral = ModelVariant::Voxtral4BTts2603;
+        assert_eq!(
+            resolve_tts_output_frames(voxtral, "hi", Some(2_000)),
+            Some(2_000)
+        );
+        assert_eq!(
+            resolve_tts_output_frames(voxtral, "hi", Some(9_999)),
+            Some(ModelVariant::VOXTRAL_TTS_CUDA_MAX_OUTPUT_FRAMES)
+        );
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let qwen_cap = qwen.tts_max_output_frames_hint().unwrap();
+        assert_eq!(
+            resolve_tts_output_frames(qwen, "hi", Some(usize::MAX)),
+            Some(qwen_cap)
+        );
+    }
+
+    /// TPIPE-10: Qwen3-TTS reads no `speed`, so it no longer advertises
+    /// speed control and refuses any speed but 1.0; Kokoro honours 0.5-2.0
+    /// and refuses a speed it would have clamped.
+    #[test]
+    fn speed_is_honoured_or_refused_never_clamped_or_dropped() {
+        let qwen = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let kokoro = ModelVariant::Kokoro82M;
+        assert!(validate_speech_speed(qwen, None).is_ok());
+        assert!(validate_speech_speed(qwen, Some(1.0)).is_ok());
+        let error = validate_speech_speed(qwen, Some(1.5)).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("does not support speed control"));
+        assert!(validate_speech_speed(kokoro, Some(0.5)).is_ok());
+        assert!(validate_speech_speed(kokoro, Some(2.0)).is_ok());
+        let error = validate_speech_speed(kokoro, Some(0.25)).unwrap_err();
+        assert!(
+            error.message.contains("between 0.5 and 2"),
+            "{}",
+            error.message
+        );
+        assert!(validate_speech_speed(ModelVariant::FishAudioS2Pro, Some(0.9)).is_err());
+    }
 
     #[test]
     fn qwen_auto_budget_is_text_sized_and_bounded() {

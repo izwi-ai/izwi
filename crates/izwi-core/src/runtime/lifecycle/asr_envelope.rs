@@ -65,7 +65,12 @@ impl AsrRequestEnvelope {
             .ok_or_else(overflow)
     }
 
-    fn scaled(self, factor: u64) -> Result<Self> {
+    /// `slots` concurrent requests.
+    pub(crate) fn scaled(self, slots: usize) -> Result<Self> {
+        self.scaled_by(u64::try_from(slots.max(1)).map_err(|_| overflow())?)
+    }
+
+    fn scaled_by(self, factor: u64) -> Result<Self> {
         Ok(Self {
             host_bytes: self.host_bytes.checked_mul(factor).ok_or_else(overflow)?,
             accelerator_bytes: self
@@ -386,7 +391,7 @@ pub(crate) fn deferred_request_envelope(
         return Ok(None);
     };
     let slots = u64::try_from(request_slots.max(1)).map_err(|_| overflow())?;
-    envelope.scaled(slots).map(Some)
+    envelope.scaled_by(slots).map(Some)
 }
 
 #[cfg(test)]

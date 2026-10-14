@@ -391,7 +391,96 @@ pub(super) struct IncrementalModelExecutionReady {
     fish_s2_tts_params: Option<FishS2GenerationParams>,
     voxtral_tts: Option<Arc<VoxtralTtsPreparedArtifact>>,
     voxtral_tts_params: Option<VoxtralTtsGenerationParams>,
-    kokoro_tts: Option<Arc<KokoroPreparedRequest>>,
+    kokoro_tts: Option<Arc<KokoroPreparedText>>,
+}
+
+/// Speech-rate range every TTS request is clamped to. Clients may send
+/// OpenAI's 0.25–4.0; the engine supports 0.5–2.0 (as `izwi tts --speed`
+/// documents).
+pub(crate) const TTS_SPEED_RANGE: (f32, f32) = crate::catalog::SpeechModelCapabilities::SPEED_RANGE;
+
+pub(crate) fn clamp_tts_speed(speed: f32) -> f32 {
+    speed.clamp(TTS_SPEED_RANGE.0, TTS_SPEED_RANGE.1)
+}
+
+/// A Kokoro request prepared for synthesis. The voice pack conditions at
+/// most 510 phonemes, so longer text is split by the chunk planner into
+/// pieces that each fit (one piece for most requests); the pieces are
+/// synthesized in order and joined with a short pause.
+#[derive(Debug, Clone)]
+pub(crate) struct KokoroPreparedText {
+    pub(crate) source_text: String,
+    pub(crate) requested_speaker: Option<String>,
+    pub(crate) requested_language: Option<String>,
+    pub(crate) requested_speed: f32,
+    pub(crate) chunks: Vec<KokoroPreparedRequest>,
+}
+
+impl KokoroPreparedText {
+    /// Model input tokens across every chunk (each chunk's phoneme tokens
+    /// plus its two boundary tokens).
+    pub(crate) fn input_tokens(&self) -> Result<usize> {
+        self.chunks
+            .iter()
+            .try_fold(0usize, |total, chunk| {
+                total.checked_add(chunk.token_ids.len().checked_add(2)?)
+            })
+            .ok_or_else(|| Error::InvalidInput("Kokoro prepared token count overflowed".into()))
+    }
+
+    fn longest_chunk_tokens(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.token_ids.len().saturating_add(2))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_well_formed(&self) -> bool {
+        !self.chunks.is_empty()
+            && self.chunks.iter().all(|chunk| {
+                !chunk.token_ids.is_empty()
+                    && !chunk.phonemes.is_empty()
+                    && chunk.speed.is_finite()
+                    && chunk.requested_speed.to_bits() == self.requested_speed.to_bits()
+            })
+    }
+
+    fn matches_request(
+        &self,
+        text: &str,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        speed: f32,
+    ) -> bool {
+        self.source_text == text
+            && self.requested_speaker.as_deref() == speaker
+            && self.requested_language.as_deref() == language
+            && self.requested_speed.to_bits() == speed.to_bits()
+    }
+
+    pub(crate) fn retained_tensor_bytes(&self) -> Result<u64> {
+        self.chunks.iter().try_fold(0u64, |total, chunk| {
+            total
+                .checked_add(chunk.retained_tensor_bytes()?)
+                .ok_or_else(|| Error::Overloaded("Kokoro prepared bytes overflowed".into()))
+        })
+    }
+
+    pub(crate) fn retained_host_bytes(&self) -> Result<u64> {
+        let own = [
+            self.source_text.capacity(),
+            self.requested_speaker.as_ref().map_or(0, String::capacity),
+            self.requested_language.as_ref().map_or(0, String::capacity),
+        ]
+        .into_iter()
+        .sum::<usize>();
+        self.chunks.iter().try_fold(own as u64, |total, chunk| {
+            total
+                .checked_add(chunk.retained_host_bytes()?)
+                .ok_or_else(|| Error::Overloaded("Kokoro prepared bytes overflowed".into()))
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2816,7 +2905,7 @@ impl EngineCoreRequest {
 
     fn kokoro_tts_stage_cost(
         binding: Option<&super::ExecutionAdapterBinding>,
-        prepared: &KokoroPreparedRequest,
+        prepared: &KokoroPreparedText,
     ) -> Result<Option<(StageId, WorkCost)>> {
         let Some(stage) = binding.and_then(|binding| {
             binding.stages.iter().find(|stage| {
@@ -2827,9 +2916,13 @@ impl EngineCoreRequest {
             return Ok(None);
         };
         let tensor_elements = prepared
-            .token_ids
-            .len()
-            .checked_add(prepared.ref_style.elem_count())
+            .chunks
+            .iter()
+            .try_fold(0usize, |total, chunk| {
+                total
+                    .checked_add(chunk.token_ids.len())?
+                    .checked_add(chunk.ref_style.elem_count())
+            })
             .and_then(|elements| u64::try_from(elements).ok())
             .ok_or_else(|| Error::Overloaded("Kokoro prepared tensor size overflowed".into()))?;
         Ok(Some((stage.id, WorkCost::new(1, tensor_elements, 0))))
@@ -3633,6 +3726,19 @@ impl EngineCoreRequest {
         self.prepared_asr_execution_shape == Some(PreparedAsrExecutionShape::LongFormAtomic)
     }
 
+    /// Clamp TTS generation parameters once, before any preparation reads
+    /// them. Preparation records the speed it prepared for and execution
+    /// checks it against the request, so a later clamp (engine admission)
+    /// failed every request outside the range with "changed after
+    /// preparation" (KOK-20).
+    pub(crate) fn normalize_tts_params_before_preparation(&mut self) -> Result<()> {
+        if self.task_type == TaskType::TTS {
+            self.params.speed = clamp_tts_speed(self.params.speed);
+            self.params.speech.validate()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn lfm25_audio_tts_messages_for_preparation(&self) -> Result<Vec<ChatMessage>> {
         let text = self
             .text
@@ -3730,7 +3836,16 @@ impl EngineCoreRequest {
     }
 
     pub(crate) fn lfm25_audio_tts_generation_config(&self) -> Lfm25AudioGenerationConfig {
-        Lfm25AudioGenerationConfig::default()
+        // Unset fields keep the reference 0.8 / top-k 64; the seed defaults
+        // to one derived from the request id, as audio chat does.
+        let speech = &self.params.speech;
+        Lfm25AudioGenerationConfig::tts(
+            self.params.audio_temperature.or(speech.temperature),
+            self.params.audio_top_k.or(speech.top_k),
+            speech
+                .seed
+                .unwrap_or_else(|| Self::chat_request_seed(&self.id)),
+        )
     }
 
     pub(crate) fn install_vibevoice_tts_execution_model(
@@ -3861,7 +3976,7 @@ impl EngineCoreRequest {
         &mut self,
         model_variant: ModelVariant,
         model: KokoroTtsModelLease,
-        artifact: Arc<KokoroPreparedRequest>,
+        artifact: Arc<KokoroPreparedText>,
         max_sequence_tokens: usize,
     ) -> Result<()> {
         let text = self
@@ -3874,21 +3989,13 @@ impl EngineCoreRequest {
             .speaker
             .as_deref()
             .or(self.params.voice.as_deref());
-        let input_tokens =
-            artifact.token_ids.len().checked_add(2).ok_or_else(|| {
-                Error::InvalidInput("Kokoro prepared token count overflowed".into())
-            })?;
+        let input_tokens = artifact.input_tokens()?;
         if self.task_type != TaskType::TTS
             || self.model_variant != Some(model_variant)
             || model_variant.family() != ModelFamily::KokoroTts
-            || artifact.source_text != text
-            || artifact.requested_speaker.as_deref() != speaker
-            || artifact.requested_language.as_deref() != self.language.as_deref()
-            || artifact.requested_speed.to_bits() != self.params.speed.to_bits()
-            || artifact.token_ids.is_empty()
-            || artifact.phonemes.is_empty()
-            || !artifact.speed.is_finite()
-            || input_tokens > max_sequence_tokens
+            || !artifact.matches_request(text, speaker, self.language.as_deref(), self.params.speed)
+            || !artifact.is_well_formed()
+            || artifact.longest_chunk_tokens() > max_sequence_tokens
         {
             return Err(Error::InvalidInput(format!(
                 "Kokoro TTS request {} preparation does not match its routed input/model/context",
@@ -4036,23 +4143,14 @@ impl EngineCoreRequest {
             .as_ref()
             .and_then(|ready| ready.qwen_tts.as_ref())
             .map(|prepared| prepared.max_frames);
-        TtsGenerationParams {
-            temperature: self.params.temperature.max(0.0),
-            top_p: self.params.top_p.clamp(0.0, 1.0),
-            top_k: if self.params.top_k == 0 {
-                50
-            } else {
-                self.params.top_k
-            },
-            repetition_penalty: self.params.repetition_penalty.max(1.0),
-            max_frames: if let Some(max_frames) = prepared_max_frames {
-                max_frames
-            } else if self.params.max_tokens == 0 {
-                model_max_frames
-            } else {
-                self.params.max_tokens.clamp(16, model_max_frames.max(16))
-            },
-        }
+        let max_frames = if let Some(max_frames) = prepared_max_frames {
+            max_frames
+        } else if self.params.max_tokens == 0 {
+            model_max_frames
+        } else {
+            self.params.max_tokens.clamp(16, model_max_frames.max(16))
+        };
+        TtsGenerationParams::for_request(&self.params.speech, max_frames)
     }
 
     fn validate_incremental_model_execution_preparation(&self) -> Result<()> {
@@ -4256,17 +4354,15 @@ impl EngineCoreRequest {
                 .speaker
                 .as_deref()
                 .or(self.params.voice.as_deref());
-            let input_tokens = prepared.token_ids.len().checked_add(2).ok_or_else(|| {
-                Error::InvalidInput("Kokoro prepared token count overflowed".into())
-            })?;
+            let input_tokens = prepared.input_tokens()?;
             if ready.model_variant.family() != ModelFamily::KokoroTts
-                || prepared.source_text != text
-                || prepared.requested_speaker.as_deref() != speaker
-                || prepared.requested_language.as_deref() != self.language.as_deref()
-                || prepared.requested_speed.to_bits() != self.params.speed.to_bits()
-                || prepared.token_ids.is_empty()
-                || prepared.phonemes.is_empty()
-                || !prepared.speed.is_finite()
+                || !prepared.matches_request(
+                    text,
+                    speaker,
+                    self.language.as_deref(),
+                    self.params.speed,
+                )
+                || !prepared.is_well_formed()
                 || self.prepared_sequence_input_tokens != Some(input_tokens)
             {
                 return Err(Error::InvalidInput(format!(
@@ -4520,7 +4616,7 @@ impl EngineCoreRequest {
 
     pub(crate) fn prepared_kokoro_tts_artifact_for_executor(
         &self,
-    ) -> Result<Option<Arc<KokoroPreparedRequest>>> {
+    ) -> Result<Option<Arc<KokoroPreparedText>>> {
         self.validate_incremental_model_execution_preparation()?;
         Ok(self
             .incremental_model_execution_ready
@@ -5768,8 +5864,10 @@ impl RequestProcessor {
             };
         }
 
-        // Clamp speed
-        params.speed = params.speed.clamp(0.5, 2.0);
+        // Clamp speed (already applied before TTS preparation, so the
+        // prepared artifact and execution see the same value).
+        params.speed = clamp_tts_speed(params.speed);
+        params.speech.validate()?;
 
         // Validate repetition penalty
         if params.repetition_penalty < 1.0 {
@@ -5987,6 +6085,24 @@ impl RequestBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// KOK-20: a speed outside the engine range is clamped before
+    /// preparation, so engine admission leaves it unchanged and the prepared
+    /// artifact still matches the request.
+    #[test]
+    fn tts_speed_is_clamped_before_preparation_and_unchanged_by_admission() {
+        for (requested, expected) in [(0.25, 0.5), (4.0, 2.0), (1.25, 1.25)] {
+            let mut request = super::EngineCoreRequest::tts("Speed probe.");
+            request.params.speed = requested;
+            request.normalize_tts_params_before_preparation().unwrap();
+            assert_eq!(request.params.speed, expected);
+            let prepared_speed = request.params.speed;
+            let admitted = super::RequestProcessor::new(super::EngineCoreConfig::default())
+                .process(request)
+                .expect("TTS request admits");
+            assert_eq!(admitted.params.speed.to_bits(), prepared_speed.to_bits());
+        }
+    }
+
     #[test]
     fn audio_output_credits_survive_commit_transfer_and_abort_returns_capacity() {
         let request = super::EngineCoreRequest::tts("credit test");
@@ -7433,5 +7549,95 @@ mod tests {
                 RealtimeAsrOperationPayload::Finish,
             )
             .is_err());
+    }
+
+    /// LFT-2: an LFM TTS request samples audio codes at the reference
+    /// 0.8 / top-k 64 with a request-derived seed, and honours overrides.
+    #[test]
+    fn lfm25_tts_generation_config_uses_reference_audio_sampling() {
+        let mut request = EngineCoreRequest::tts("hello");
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.8, 64));
+        assert_eq!(config.text.temperature, 0.0);
+        assert_eq!(
+            config.seed,
+            EngineCoreRequest::chat_request_seed(&request.id)
+        );
+        request.params.audio_temperature = Some(0.5);
+        request.params.audio_top_k = Some(10);
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.5, 10));
+        // The speech request fields reach LFM too; a seed overrides the
+        // request-derived one.
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.3);
+        request.params.speech.top_k = Some(8);
+        request.params.speech.seed = Some(42);
+        let config = request.lfm25_audio_tts_generation_config();
+        assert_eq!((config.audio.temperature, config.audio.top_k), (0.3, 8));
+        assert_eq!(config.seed, 42);
+    }
+
+    /// TPIPE-24: the shared chat defaults (temperature 0.7, top-p 0.9,
+    /// repetition penalty 1.1) used to reach Qwen3-TTS sampling. Unset
+    /// fields now keep the published generation_config, and request fields
+    /// override it, sub-talker included.
+    #[test]
+    fn qwen_tts_unset_sampling_keeps_generation_config_defaults() {
+        let request = EngineCoreRequest::tts("hello");
+        assert_eq!(request.params.temperature, 0.7, "chat default is present");
+        let params = request.qwen_tts_generation_params();
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (0.9, 1.0, 50)
+        );
+        assert_eq!(params.repetition_penalty, 1.05);
+        assert!(params.subtalker.do_sample);
+        assert_eq!(
+            (
+                params.subtalker.temperature,
+                params.subtalker.top_k,
+                params.subtalker.top_p
+            ),
+            (0.9, 50, 1.0)
+        );
+        assert_eq!(params.seed, 0);
+
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.6);
+        request.params.speech.top_p = Some(0.8);
+        request.params.speech.subtalker_top_k = Some(20);
+        request.params.speech.subtalker_do_sample = Some(false);
+        request.params.speech.seed = Some(7);
+        let params = request.qwen_tts_generation_params();
+        assert_eq!((params.temperature, params.top_p), (0.6, 0.8));
+        assert_eq!(params.subtalker.top_k, 20);
+        assert!(!params.subtalker.do_sample);
+        assert_eq!(params.seed, 7);
+
+        // A greedy request stays greedy for every codebook.
+        let mut request = EngineCoreRequest::tts("hello");
+        request.params.speech.temperature = Some(0.0);
+        assert!(!request.qwen_tts_generation_params().subtalker.do_sample);
+    }
+
+    /// Out-of-range speech sampling is an input error before preparation.
+    #[test]
+    fn invalid_speech_sampling_is_rejected_before_preparation() {
+        for mutate in [
+            (|s: &mut super::super::SpeechSamplingOptions| s.top_p = Some(0.0))
+                as fn(&mut super::super::SpeechSamplingOptions),
+            |s| s.temperature = Some(f32::NAN),
+            |s| s.cfg_scale = Some(-1.0),
+            |s| s.diffusion_steps = Some(0),
+            |s| s.repetition_penalty = Some(0.5),
+        ] {
+            let mut request = EngineCoreRequest::tts("hello");
+            mutate(&mut request.params.speech);
+            assert!(matches!(
+                request.normalize_tts_params_before_preparation(),
+                Err(Error::InvalidInput(_))
+            ));
+        }
     }
 }

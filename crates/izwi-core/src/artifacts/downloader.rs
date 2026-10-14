@@ -2311,8 +2311,6 @@ impl ModelDownloader {
                 match variant {
                     ModelVariant::Qwen3Tts12Hz06BBase
                     | ModelVariant::Qwen3Tts12Hz06BCustomVoice => 1_800_000_000,
-                    ModelVariant::Qwen3Tts12Hz17BBase4Bit
-                    | ModelVariant::Qwen3Tts12Hz17BCustomVoice4Bit => 2_330_000_000,
                     ModelVariant::Qwen3Tts12Hz17BBase
                     | ModelVariant::Qwen3Tts12Hz17BCustomVoice
                     | ModelVariant::Qwen3Tts12Hz17BVoiceDesign => 3_850_000_000,
@@ -2477,7 +2475,7 @@ impl ModelDownloader {
     }
 
     /// Calculate directory size recursively
-    fn dir_size(path: &Path) -> Result<u64> {
+    pub(crate) fn dir_size(path: &Path) -> Result<u64> {
         let mut size = 0;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
@@ -2539,6 +2537,23 @@ mod tests {
             }
             assert!(downloader.is_downloaded(variant), "{variant}");
         }
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    /// The advertised Kokoro voice count is the voices it speaks: every
+    /// downloaded voice except the Japanese and Mandarin ones, which have
+    /// no G2P yet and are hidden and refused.
+    #[test]
+    fn kokoro_advertises_only_the_voices_it_speaks() {
+        use crate::models::architectures::kokoro::phonemizer::kokoro_speaker_supported;
+        let (downloader, temp_dir) = test_downloader();
+        let spoken = downloader
+            .get_model_files(ModelVariant::Kokoro82M)
+            .iter()
+            .filter_map(|file| file.strip_prefix("voices/")?.strip_suffix(".pt"))
+            .filter(|voice| kokoro_speaker_supported(voice))
+            .count();
+        assert_eq!(spoken, ModelVariant::KOKORO_BUILT_IN_VOICE_COUNT);
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

@@ -108,7 +108,7 @@ fn overflow() -> Error {
     Error::ModelLoadError("ASR residency plan overflow".into())
 }
 
-fn sum(values: &[u64]) -> Result<u64> {
+pub(super) fn sum(values: &[u64]) -> Result<u64> {
     values
         .iter()
         .try_fold(0u64, |total, value| total.checked_add(*value))
@@ -208,7 +208,16 @@ pub(super) struct AsrResidencyPlan {
 }
 
 impl AsrResidencyPlan {
-    fn from_ledger(ledger: Ledger, memo_bytes: u64) -> Result<Self> {
+    /// This plan, with a load peak that also covers `fallback`: a loader
+    /// that checks a lower-precision form at load and reloads densely when
+    /// the check fails passes through both.
+    pub(super) fn with_fallback_peak(mut self, fallback: &Self) -> Self {
+        self.load_peak_bytes = self.load_peak_bytes.max(fallback.load_peak_bytes);
+        self.host_staging_bytes = self.host_staging_bytes.max(fallback.host_staging_bytes);
+        self
+    }
+
+    pub(super) fn from_ledger(ledger: Ledger, memo_bytes: u64) -> Result<Self> {
         let ledger = ledger.finish()?;
         Ok(Self {
             backend: ledger.backend,
@@ -239,7 +248,7 @@ impl AsrResidencyPlan {
 
 /// How a loader reads a tensor's payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
+pub(super) enum Source {
     /// From a memory-mapped safetensors file.
     Mapped,
     /// Through a host buffer (a PyTorch zip entry).
@@ -273,7 +282,7 @@ struct Step {
 /// may run last, beside every resident byte and whatever earlier steps left
 /// for Candle to release at the next synchronization.
 #[derive(Debug)]
-struct Ledger {
+pub(super) struct Ledger {
     backend: BackendKind,
     logical: u64,
     resident: u64,
@@ -316,7 +325,7 @@ struct Ledger {
 }
 
 impl Ledger {
-    fn new(backend: BackendKind) -> Self {
+    pub(super) fn new(backend: BackendKind) -> Self {
         Self {
             backend,
             logical: 0,
@@ -343,7 +352,7 @@ impl Ledger {
     /// A ledger for a loader that reads through
     /// `staged::metal_staged_safetensors`, which is Candle's own backend
     /// except on Metal.
-    fn staged(backend: BackendKind) -> Self {
+    pub(super) fn staged(backend: BackendKind) -> Self {
         let mut ledger = Self::new(backend);
         if ledger.metal() {
             ledger.sync_interval = Some(METAL_LOAD_SYNC_INTERVAL_BYTES);
@@ -427,7 +436,12 @@ impl Ledger {
     /// Metal loader casts on the host and uploads the result) and rewritten by
     /// device ops into each later dtype of `chain`, the last of which stays
     /// resident. Every form stays alive until the step ends.
-    fn var(&mut self, tensor: &CensusTensor, source: Source, chain: &[DType]) -> Result<()> {
+    pub(super) fn var(
+        &mut self,
+        tensor: &CensusTensor,
+        source: Source,
+        chain: &[DType],
+    ) -> Result<()> {
         let (&first, rest) = chain.split_first().ok_or_else(overflow)?;
         let stored = tensor.stored_bytes;
         let elements = tensor.elements();
@@ -771,9 +785,48 @@ impl Ledger {
     /// A weight read on the host at its stored dtype, converted there to
     /// `dtype` and uploaded once at its exact size (`F16WeightLinear`): the
     /// host read and its converted copy are alive beside the upload.
-    fn host_converted(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+    pub(super) fn host_converted(&mut self, tensor: &CensusTensor, dtype: DType) -> Result<()> {
+        self.host_converted_through(tensor, None, dtype)
+    }
+
+    /// [`Self::host_converted`] for a weight the loader reads at an
+    /// `intermediate` host dtype first (an MLX-quantized Qwen3-TTS text
+    /// embedding is dequantized at F32, then converted). The read converts
+    /// the stored copy and drops it, so the intermediate is alive with the
+    /// stored copy while it is read and with the converted form after: the
+    /// larger pair, not all three.
+    pub(super) fn host_converted_through(
+        &mut self,
+        tensor: &CensusTensor,
+        intermediate: Option<DType>,
+        dtype: DType,
+    ) -> Result<()> {
         let bytes = dense_bytes(tensor.elements(), dtype)?;
-        let host = sum(&[tensor.stored_bytes, bytes])?;
+        let host = match intermediate {
+            Some(form) => {
+                let intermediate = dense_bytes(tensor.elements(), form)?;
+                sum(&[tensor.stored_bytes, intermediate])?.max(sum(&[intermediate, bytes])?)
+            }
+            None => sum(&[tensor.stored_bytes, bytes])?,
+        };
+        self.host_staged(bytes, host)
+    }
+
+    /// [`Self::host_converted`] for a weight converted straight from its
+    /// memory map (Qwen3-TTS's float text embedding): the converted copy is
+    /// the only host allocation, the mapped checkpoint pages being file
+    /// backed.
+    pub(super) fn host_converted_in_place(
+        &mut self,
+        tensor: &CensusTensor,
+        dtype: DType,
+    ) -> Result<()> {
+        let bytes = dense_bytes(tensor.elements(), dtype)?;
+        self.host_staged(bytes, bytes)
+    }
+
+    /// A weight of `bytes` uploaded once from `host` bytes of host buffers.
+    fn host_staged(&mut self, bytes: u64, host: u64) -> Result<()> {
         self.apply(match self.backend {
             BackendKind::Cpu | BackendKind::Metal => Step {
                 logical: bytes,
@@ -863,7 +916,7 @@ fn cuda_qtensor_padding(tensor: &CensusTensor) -> Result<u64> {
 
 /// The census of `paths`, or `None` when one is missing (the loader reports
 /// that). A file that is not a readable checkpoint is an error.
-fn census_of(paths: &[PathBuf]) -> Result<Option<Vec<CensusFile>>> {
+pub(super) fn census_of(paths: &[PathBuf]) -> Result<Option<Vec<CensusFile>>> {
     if paths.iter().any(|path| !path.is_file()) {
         return Ok(None);
     }
@@ -878,7 +931,7 @@ fn census_of(paths: &[PathBuf]) -> Result<Option<Vec<CensusFile>>> {
         .map(Some)
 }
 
-fn by_name(files: &[CensusFile]) -> BTreeMap<&str, &CensusTensor> {
+pub(super) fn by_name(files: &[CensusFile]) -> BTreeMap<&str, &CensusTensor> {
     files
         .iter()
         .flat_map(|file| file.tensors.iter())
@@ -1477,6 +1530,8 @@ fn vibevoice_plan(
         f16_tokenizer_projections: resolve_vibevoice_tokenizer_projection_precision(device).dtype
             == DType::F16,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
+        tts: false,
+        staged: false,
     };
     price_vibevoice(&files, backend, &load).map(Some)
 }
@@ -1484,9 +1539,10 @@ fn vibevoice_plan(
 /// The TTS-only acoustic decoder, which VibeVoice-ASR does not load.
 const VIBEVOICE_ASR_UNLOADED_DECODER: &str = "model.acoustic_tokenizer.decoder.";
 
-/// How `VibeVoiceAsrModel::load` represents the checkpoint.
+/// How `VibeVoiceAsrModel::load` (or, with `tts`, `VibeVoiceTtsModel::load`)
+/// represents the checkpoint.
 #[derive(Debug, Clone, Copy)]
-struct VibeVoiceLoad {
+pub(super) struct VibeVoiceLoad {
     /// The decoder LM's dtype.
     lm_dtype: DType,
     /// The tokenizers' and connectors' dtype.
@@ -1495,6 +1551,25 @@ struct VibeVoiceLoad {
     f16_tokenizer_projections: bool,
     /// Dense projection fusion (`qwen3/core.rs`).
     fused_projections: bool,
+    /// The TTS model, which loads the acoustic decoder and the prediction
+    /// head the ASR model skips.
+    tts: bool,
+    /// The loader reads through `staged::metal_staged_safetensors`.
+    staged: bool,
+}
+
+impl VibeVoiceLoad {
+    /// `VibeVoiceTtsModel::load`: every tensor at `dtype`.
+    pub(super) fn tts(dtype: DType, fused_projections: bool) -> Self {
+        Self {
+            lm_dtype: dtype,
+            audio_dtype: dtype,
+            f16_tokenizer_projections: false,
+            fused_projections,
+            tts: true,
+            staged: true,
+        }
+    }
 }
 
 /// VibeVoice-ASR (`vibevoice/asr.rs`): every tensor through a `VarBuilder`,
@@ -1505,7 +1580,7 @@ struct VibeVoiceLoad {
 /// prediction head and speech scaling factors are skipped. With dense
 /// projection fusion (`qwen3/core.rs`), each LM layer's
 /// Q/K/V weights and biases and its gate/up weights are concatenated.
-fn price_vibevoice(
+pub(super) fn price_vibevoice(
     files: &[CensusFile],
     backend: BackendKind,
     load: &VibeVoiceLoad,
@@ -1513,7 +1588,11 @@ fn price_vibevoice(
     let dtype = load.lm_dtype;
     let fused_projections = load.fused_projections;
     let tensors = by_name(files);
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = if load.staged {
+        Ledger::staged(backend)
+    } else {
+        Ledger::new(backend)
+    };
     let mut grouped = BTreeSet::new();
     if fused_projections {
         for name in tensors.keys() {
@@ -1548,12 +1627,13 @@ fn price_vibevoice(
         }
     }
     for (name, tensor) in &tensors {
-        let tts_only = name.starts_with("model.prediction_head.")
-            || name.starts_with(VIBEVOICE_ASR_UNLOADED_DECODER)
-            || matches!(
-                *name,
-                "model.speech_scaling_factor" | "model.speech_bias_factor"
-            );
+        let tts_only = !load.tts
+            && (name.starts_with("model.prediction_head.")
+                || name.starts_with(VIBEVOICE_ASR_UNLOADED_DECODER)
+                || matches!(
+                    *name,
+                    "model.speech_scaling_factor" | "model.speech_bias_factor"
+                ));
         if tts_only || grouped.contains(name) {
             continue;
         }
@@ -1720,7 +1800,7 @@ fn price_lfm25_audio(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::backends::{DeviceCapabilities, DeviceKind};
     use crate::models::architectures::qwen3::core::{
@@ -1733,7 +1813,7 @@ mod tests {
     /// A committed header census: `[name, dtype, shape]`, or
     /// `[pattern, dtype, shape, first, count]` for a run of tensors whose names
     /// differ in one index (`{i}`), with each file's exact payload total.
-    fn fixture(json: &str) -> Vec<CensusFile> {
+    pub(in super::super) fn fixture(json: &str) -> Vec<CensusFile> {
         let doc: serde_json::Value = serde_json::from_str(json).unwrap();
         let files = doc["files"].as_array().unwrap();
         files
@@ -1825,7 +1905,7 @@ mod tests {
 
     /// A device profile standing in for `backend`'s (dtype resolvers read only
     /// the kind and capabilities): CUDA reports BF16 and F16, Metal F16.
-    fn profile(backend: BackendKind) -> DeviceProfile {
+    pub(in super::super) fn profile(backend: BackendKind) -> DeviceProfile {
         let kind = match backend {
             BackendKind::Cpu => DeviceKind::Cpu,
             BackendKind::Metal => DeviceKind::Metal,
@@ -1844,7 +1924,7 @@ mod tests {
         }
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(in super::super) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1975,6 +2055,8 @@ mod tests {
                 backend == BackendKind::Metal,
                 None,
             ),
+            tts: false,
+            staged: false,
         }
     }
 
@@ -2006,11 +2088,14 @@ mod tests {
         price_lfm25_audio(&census, backend, LFM_ROPE_TABLES).unwrap()
     }
 
-    fn gib(bytes: u64) -> f64 {
+    pub(in super::super) fn gib(bytes: u64) -> f64 {
         bytes as f64 / GIB
     }
 
-    fn stored(files: &[CensusFile], keep: impl Fn(&CensusTensor) -> bool) -> u64 {
+    pub(in super::super) fn stored(
+        files: &[CensusFile],
+        keep: impl Fn(&CensusTensor) -> bool,
+    ) -> u64 {
         files
             .iter()
             .flat_map(|file| file.tensors.iter())
@@ -2028,7 +2113,7 @@ mod tests {
             .unwrap()
     }
 
-    fn assert_gib(label: &str, bytes: u64, expected: f64) {
+    pub(in super::super) fn assert_gib(label: &str, bytes: u64, expected: f64) {
         let actual = gib(bytes);
         assert!(
             (actual - expected).abs() <= 0.015,
@@ -2577,7 +2662,7 @@ mod tests {
         );
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
+    pub(in super::super) fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "izwi-asr-residency-{label}-{}",
             uuid::Uuid::new_v4()
@@ -2587,7 +2672,7 @@ mod tests {
     }
 
     /// Writes a small BF16 VibeVoice-shaped `model.safetensors`.
-    fn write_vibevoice_checkpoint(dir: &Path) -> u64 {
+    pub(in super::super) fn write_vibevoice_checkpoint(dir: &Path) -> u64 {
         let device = candle_core::Device::Cpu;
         let tensors = std::collections::HashMap::from([
             (

@@ -1,5 +1,6 @@
 //! Rollback-safe retained LFM2.5 Audio TTS continuation.
 
+use super::detokenizer::Lfm25DetokenizerStream;
 use std::sync::Arc;
 
 use candle_core::{IndexOp, Tensor};
@@ -69,6 +70,7 @@ struct Lfm25AudioTtsHostCheckpoint {
     tokens_generated: usize,
     in_audio: bool,
     finished: bool,
+    audio_stream: Lfm25DetokenizerStream,
 }
 
 pub(crate) struct Lfm25AudioTtsQuantumCheckpoint {
@@ -94,6 +96,8 @@ pub(crate) struct Lfm25AudioTtsRetainedState {
     tokens_generated: usize,
     in_audio: bool,
     finished: bool,
+    /// The incremental detokenizer for streamed audio (LFT-5).
+    audio_stream: Lfm25DetokenizerStream,
 }
 
 impl Lfm25AudioTtsRetainedState {
@@ -239,6 +243,7 @@ impl Lfm25AudioTtsRetainedState {
             tokens_generated: 0,
             in_audio: false,
             finished: false,
+            audio_stream: Lfm25DetokenizerStream::default(),
         })
     }
 
@@ -801,6 +806,7 @@ impl Lfm25AudioTtsRetainedState {
             tokens_generated: self.tokens_generated,
             in_audio: self.in_audio,
             finished: self.finished,
+            audio_stream: self.audio_stream.clone(),
         }
     }
 
@@ -815,6 +821,7 @@ impl Lfm25AudioTtsRetainedState {
         self.tokens_generated = host.tokens_generated;
         self.in_audio = host.in_audio;
         self.finished = host.finished;
+        self.audio_stream = host.audio_stream.clone();
     }
 
     pub(crate) fn prompt_tokens(&self) -> usize {
@@ -840,6 +847,17 @@ impl Lfm25AudioTtsRetainedState {
     }
     pub(crate) fn audio_codes(&self) -> &[Vec<u32>] {
         &self.audio_codes
+    }
+
+    /// The codes not yet streamed and the stream to feed them to.
+    pub(crate) fn audio_stream_parts(&mut self) -> (Vec<Vec<u32>>, &mut Lfm25DetokenizerStream) {
+        let streamed = self.audio_stream.frames();
+        let pending = self
+            .audio_codes
+            .iter()
+            .map(|codes| codes.get(streamed..).unwrap_or(&[]).to_vec())
+            .collect();
+        (pending, &mut self.audio_stream)
     }
 }
 

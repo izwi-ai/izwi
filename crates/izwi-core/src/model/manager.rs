@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::info;
 
 use crate::artifacts::ModelWeights;
-use crate::catalog::{ModelInfo, ModelStatus, ModelVariant};
+use crate::catalog::{ModelInfo, ModelStatus, ModelVariant, RemovedModelVariant};
 use crate::config::EngineConfig;
 use crate::error::{Error, Result};
 use crate::model::download::{DownloadProgress, DownloadState, ModelDownloader};
@@ -27,6 +27,15 @@ pub struct ModelManager {
 struct ModelState {
     info: ModelInfo,
     weights: Option<Arc<ModelWeights>>,
+}
+
+/// A download of a variant whose support was removed, still on disk. It is
+/// reported, never deleted automatically, so the user can reclaim the space.
+#[derive(Debug, Clone)]
+pub struct RemovedModelDownload {
+    pub removed: &'static RemovedModelVariant,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
 }
 
 impl ModelManager {
@@ -476,6 +485,29 @@ impl ModelManager {
         Ok(())
     }
 
+    /// Leftover downloads of removed variants in the models directory.
+    pub async fn removed_model_downloads(&self) -> Vec<RemovedModelDownload> {
+        let models_dir = self.downloader.models_dir.clone();
+        tokio::task::spawn_blocking(move || removed_model_downloads_in(&models_dir))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Delete a removed variant's leftover download. Returns whether a
+    /// directory existed.
+    pub async fn delete_removed_model(&self, removed: &RemovedModelVariant) -> Result<bool> {
+        let path = self.downloader.models_dir.join(removed.id);
+        tokio::task::spawn_blocking(move || {
+            if !path.is_dir() {
+                return Ok(false);
+            }
+            std::fs::remove_dir_all(&path)?;
+            Ok(true)
+        })
+        .await
+        .map_err(|error| Error::InferenceError(format!("removed-model delete failed: {error}")))?
+    }
+
     /// Start a non-blocking background download
     pub async fn spawn_download(
         &self,
@@ -550,12 +582,73 @@ impl Clone for ModelDownloader {
     }
 }
 
+fn removed_model_downloads_in(models_dir: &std::path::Path) -> Vec<RemovedModelDownload> {
+    crate::catalog::REMOVED_MODEL_VARIANTS
+        .iter()
+        .filter_map(|removed| {
+            let local_path = models_dir.join(removed.id);
+            if !local_path.is_dir() {
+                return None;
+            }
+            let size_bytes = ModelDownloader::dir_size(&local_path).unwrap_or(0);
+            Some(RemovedModelDownload {
+                removed,
+                local_path,
+                size_bytes,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    /// A removed variant's leftover download is listed with its size and is
+    /// deleted only on request; supported downloads are not listed as removed.
+    #[tokio::test]
+    async fn removed_variant_downloads_are_reported_and_deleted_on_request() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("izwi-removed-model-test-{}", Uuid::new_v4()));
+        let leftover = temp_dir.join("Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit");
+        std::fs::create_dir_all(leftover.join("speech_tokenizer")).unwrap();
+        std::fs::write(leftover.join("model.safetensors"), vec![0u8; 1_000]).unwrap();
+        std::fs::write(
+            leftover.join("speech_tokenizer/model.safetensors"),
+            [0u8; 24],
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp_dir.join("Kokoro-82M")).unwrap();
+        let manager = ModelManager::new(EngineConfig {
+            models_dir: temp_dir.clone(),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+
+        let removed = manager.removed_model_downloads().await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            removed[0].removed.id,
+            "Qwen3-TTS-12Hz-0.6B-CustomVoice-4bit"
+        );
+        assert_eq!(removed[0].size_bytes, 1_024);
+        assert!(leftover.is_dir(), "listing must never delete");
+
+        assert!(manager
+            .delete_removed_model(removed[0].removed)
+            .await
+            .unwrap());
+        assert!(!leftover.exists());
+        assert!(manager.removed_model_downloads().await.is_empty());
+        assert!(!manager
+            .delete_removed_model(removed[0].removed)
+            .await
+            .unwrap());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn list_models_uses_static_estimate_without_any_network_resolution() {

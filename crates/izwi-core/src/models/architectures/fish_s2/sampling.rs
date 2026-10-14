@@ -2,12 +2,14 @@
 //! upstream filters cumulative probabilities before temperature, and excludes
 //! the token that crosses top-p (except that rank zero always survives).
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, IndexOp, Tensor};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::error::{Error, Result};
-use crate::models::shared::sampling::bounded_device_sampling_candidates;
+use crate::models::shared::sampling::{
+    bounded_device_sampling_candidates, device_top_k, gumbel_noise, DEVICE_SORT_CHUNK,
+};
 use crate::models::shared::telemetry;
 
 #[derive(Debug, Clone)]
@@ -62,6 +64,127 @@ impl FishS2Sampler {
         // Only floating-point summation residue can reach this branch.
         Ok(probabilities.last().unwrap().0)
     }
+}
+
+/// Per-frame inputs for device-resident sampling of `tokens` codes from one
+/// sampler: Gumbel noise rows drawn from the sampler's RNG (none when
+/// greedy) and the upper-triangular ones matrix the top-p cumulative sum
+/// multiplies by. Both are uploaded once per frame.
+pub(crate) struct FishS2ResidentDraws {
+    noise: Option<Tensor>,
+    upper: Tensor,
+    top_k: usize,
+}
+
+impl FishS2Sampler {
+    /// `None` when this policy needs the host path: top-k 0 (whole-row
+    /// top-p support) or above the device sort bound.
+    pub(crate) fn resident_draws(
+        &mut self,
+        tokens: usize,
+        device: &candle_core::Device,
+    ) -> Result<Option<FishS2ResidentDraws>> {
+        validate_policy(self.temperature, self.top_p)?;
+        if self.top_k == 0 || self.top_k > DEVICE_SORT_CHUNK {
+            return Ok(None);
+        }
+        let noise = if self.temperature > 0.0 {
+            let rng = &mut self.rng;
+            let mut draw = || rng.r#gen::<f32>();
+            let values = gumbel_noise(tokens * self.top_k, &mut draw);
+            Some(Tensor::from_vec(values, (tokens, self.top_k), device)?)
+        } else {
+            None
+        };
+        Ok(Some(FishS2ResidentDraws {
+            noise,
+            upper: Tensor::triu2(self.top_k, DType::F32, device)?,
+            top_k: self.top_k,
+        }))
+    }
+}
+
+/// Fish's policy on the logits' device (upstream `logits_to_probs`): top-p
+/// over the raw softmax of the whole row, dropping candidates whose
+/// cumulative probability exceeds `top_p` except rank 0, then top-k, then
+/// temperature. Returns the tempered logits of the `top_k` highest
+/// candidates, with removed ones pushed to -1e30, and their token ids.
+pub(crate) fn resident_filtered_candidates(
+    row: &Tensor,
+    temperature: f32,
+    top_p: f32,
+    upper: &Tensor,
+    top_k: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let row = row.to_dtype(DType::F32)?;
+    let Some((values, indices)) = device_top_k(&row, top_k)? else {
+        return Ok(None);
+    };
+    let k = values.dim(0)?;
+    let max = values.narrow(0, 0, 1)?;
+    let log_sum_exp = row
+        .broadcast_sub(&max)?
+        .exp()?
+        .sum_keepdim(0)?
+        .log()?
+        .broadcast_add(&max)?;
+    let raw = values.broadcast_sub(&log_sum_exp)?.exp()?;
+    let cumulative = raw
+        .unsqueeze(0)?
+        .matmul(&upper.narrow(0, 0, k)?.narrow(1, 0, k)?)?
+        .squeeze(0)?;
+    // Rank 0 has nothing before it; every later rank has a positive prefix.
+    let keep = cumulative
+        .le(top_p as f64)?
+        .maximum(&(&cumulative - &raw)?.le(0.0)?)?
+        .to_dtype(DType::F32)?;
+    let tempered = (values.broadcast_sub(&max)? / f64::from(temperature.max(1e-5)))?;
+    let masked = (tempered + keep.affine(1e30, -1e30)?)?;
+    Ok(Some((masked, indices)))
+}
+
+/// One device-resident Fish draw for `row`: the token as a `[1]` U32 tensor
+/// and the row's count of non-finite logits as a `[1]` U32 tensor, both left
+/// on the device for the caller to read back once per frame. `noise_row` is
+/// this token's Gumbel noise (`None` when greedy).
+pub(crate) fn sample_resident(
+    row: &Tensor,
+    temperature: f32,
+    top_p: f32,
+    draws: &FishS2ResidentDraws,
+    token: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let vocab = row.dims1()?;
+    if vocab == 0 {
+        return Err(Error::InferenceError(
+            "Fish S2 fast sampler received empty logits".into(),
+        ));
+    }
+    let row_f32 = row.to_dtype(DType::F32)?;
+    let non_finite = row_f32
+        .ne(&row_f32)?
+        .maximum(&row_f32.abs()?.gt(f32::MAX as f64)?)?
+        .to_dtype(DType::U32)?
+        .sum_keepdim(0)?;
+    let Some((masked, indices)) =
+        resident_filtered_candidates(&row_f32, temperature, top_p, &draws.upper, draws.top_k)?
+    else {
+        return Ok(None);
+    };
+    let indices = indices.to_dtype(DType::U32)?;
+    let token = match &draws.noise {
+        // Greedy: the highest logit, rank 0 of the sorted candidates.
+        None => indices.narrow(0, 0, 1)?,
+        Some(noise) => {
+            let k = masked.dim(0)?;
+            let pick = masked
+                .broadcast_add(&noise.i(token)?.narrow(0, 0, k)?)?
+                .argmax_keepdim(0)?
+                .to_dtype(DType::U32)?;
+            indices.index_select(&pick, 0)?
+        }
+    };
+    Ok(Some((token, non_finite)))
 }
 
 pub(crate) fn validate_policy(temperature: f32, top_p: f32) -> Result<()> {
@@ -274,6 +397,144 @@ fn non_finite_error(values: &[f32], row: &Tensor, label: &str) -> Error {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    /// FSH-4: the device filter keeps exactly the host policy's support
+    /// (top-p over the whole row's raw softmax, rank 0 always, then top-k)
+    /// with the same tempered probabilities.
+    #[test]
+    fn resident_filter_matches_the_host_policy() {
+        use crate::kernels::numeric_check::xorshift_values;
+
+        let device = Device::Cpu;
+        let values = xorshift_values(64, 0xF15F, 3.0);
+        let row = Tensor::from_vec(values.clone(), 64, &device).unwrap();
+        for (temperature, top_p, top_k) in [
+            (0.7f32, 0.9f32, 30usize),
+            (1.3, 0.5, 8),
+            (0.8, 1.0, 12),
+            (0.5, 0.01, 30),
+        ] {
+            let host = FishS2SamplingDistribution::from_values(&values, None)
+                .unwrap()
+                .probabilities(temperature, top_p, top_k)
+                .unwrap();
+            let upper = Tensor::triu2(top_k, DType::F32, &device).unwrap();
+            let (masked, indices) =
+                resident_filtered_candidates(&row, temperature, top_p, &upper, top_k)
+                    .unwrap()
+                    .unwrap();
+            let probabilities = candle_nn::ops::softmax_last_dim(&masked)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let indices = indices.to_vec1::<u32>().unwrap();
+            let device_support = indices
+                .iter()
+                .zip(&probabilities)
+                .filter(|(_, p)| **p > 0.0)
+                .map(|(token, p)| (*token, *p))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                device_support.len(),
+                host.len(),
+                "policy {temperature}/{top_p}/{top_k}"
+            );
+            for ((token, p), (host_token, host_p)) in device_support.iter().zip(&host) {
+                assert_eq!(token, host_token);
+                assert!((p - host_p).abs() <= 1e-5, "{token}: {p} vs {host_p}");
+            }
+        }
+    }
+
+    /// FSH-4: the production device path (Metal) keeps the CPU filter's
+    /// support and probabilities, and greedy draws agree.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_resident_filter_matches_cpu() {
+        use crate::kernels::numeric_check::xorshift_values;
+
+        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let values = xorshift_values(4096, 0x5EED, 4.0);
+        let run = |device: &Device| {
+            let row = Tensor::from_vec(values.clone(), 4096, device).unwrap();
+            let upper = Tensor::triu2(30, DType::F32, device).unwrap();
+            let (masked, indices) = resident_filtered_candidates(&row, 0.7, 0.9, &upper, 30)
+                .unwrap()
+                .unwrap();
+            let probabilities = candle_nn::ops::softmax_last_dim(&masked)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut greedy = FishS2Sampler::with_top_k(0.0, 0.9, 30, 1);
+            let draws = greedy.resident_draws(1, device).unwrap().unwrap();
+            let (code, non_finite) = sample_resident(&row, 0.0, 0.9, &draws, 0).unwrap().unwrap();
+            (
+                indices.to_vec1::<u32>().unwrap(),
+                probabilities,
+                code.to_vec1::<u32>().unwrap(),
+                non_finite.to_vec1::<u32>().unwrap(),
+            )
+        };
+        let (cpu_indices, cpu_p, cpu_code, _) = run(&Device::Cpu);
+        let (metal_indices, metal_p, metal_code, metal_bad) = run(&metal);
+        assert_eq!(metal_indices, cpu_indices);
+        assert_eq!(metal_code, cpu_code);
+        assert_eq!(metal_bad, vec![0]);
+        for (m, c) in metal_p.iter().zip(&cpu_p) {
+            assert!((m - c).abs() <= 1e-5, "{m} vs {c}");
+        }
+    }
+
+    /// FSH-4: Gumbel-max over the filtered candidates draws tokens at the
+    /// host policy's probabilities, and greedy picks the top logit.
+    #[test]
+    fn resident_draws_follow_the_host_distribution() {
+        let device = Device::Cpu;
+        let values = vec![2.0f32, 1.5, 1.0, 0.2, -1.0, -3.0];
+        let row = Tensor::from_vec(values.clone(), 6, &device).unwrap();
+        let host = FishS2SamplingDistribution::from_values(&values, None)
+            .unwrap()
+            .probabilities(0.8, 0.95, 4)
+            .unwrap();
+        let mut sampler = FishS2Sampler::with_top_k(0.8, 0.95, 4, 99);
+        let draws_per_batch = 500;
+        let mut counts = [0usize; 6];
+        for _ in 0..8 {
+            let draws = sampler
+                .resident_draws(draws_per_batch, &device)
+                .unwrap()
+                .unwrap();
+            for token in 0..draws_per_batch {
+                let (code, non_finite) = sample_resident(&row, 0.8, 0.95, &draws, token)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(non_finite.to_vec1::<u32>().unwrap(), vec![0]);
+                counts[code.to_vec1::<u32>().unwrap()[0] as usize] += 1;
+            }
+        }
+        let total = (8 * draws_per_batch) as f32;
+        for (token, p) in &host {
+            let observed = counts[*token as usize] as f32 / total;
+            assert!((observed - p).abs() < 0.03, "{token}: {observed} vs {p}");
+        }
+        let outside = (0..6u32)
+            .filter(|token| host.iter().all(|(kept, _)| kept != token))
+            .map(|token| counts[token as usize])
+            .sum::<usize>();
+        assert_eq!(outside, 0, "only the host support can be drawn");
+
+        let mut greedy = FishS2Sampler::with_top_k(0.0, 0.9, 4, 1);
+        let draws = greedy.resident_draws(1, &device).unwrap().unwrap();
+        let (code, _) = sample_resident(&row, 0.0, 0.9, &draws, 0).unwrap().unwrap();
+        assert_eq!(code.to_vec1::<u32>().unwrap(), vec![0]);
+        assert!(FishS2Sampler::with_top_k(0.7, 0.9, 0, 1)
+            .resident_draws(1, &device)
+            .unwrap()
+            .is_none());
+    }
 
     fn distribution(probabilities: &[f32]) -> FishS2SamplingDistribution {
         let logits = probabilities

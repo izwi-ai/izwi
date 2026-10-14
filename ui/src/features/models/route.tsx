@@ -11,7 +11,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import clsx from "clsx";
-import type { ModelInfo } from "@/api";
+import type { ModelInfo, RemovedModelInfo } from "@/api";
 import { PageHeader, PageShell } from "@/components/PageShell";
 import type { ModelDownloadProgressMap } from "@/features/models/downloadProgress";
 import {
@@ -24,6 +24,8 @@ import { withQwen3Prefix } from "@/utils/modelDisplay";
 
 interface MyModelsPageProps {
   models: ModelInfo[];
+  /** Downloads of removed variants still on disk; only deletion applies. */
+  removedModels?: RemovedModelInfo[];
   loading: boolean;
   downloadProgress: ModelDownloadProgressMap;
   onDownload: (variant: string) => void;
@@ -138,6 +140,7 @@ function compareProviders(left: string, right: string): number {
 
 export function MyModelsPage({
   models,
+  removedModels = [],
   loading,
   downloadProgress,
   onDownload,
@@ -254,7 +257,8 @@ export function MyModelsPage({
   const deleteTargetName =
     deleteTargetDetails && deleteModalVariant
       ? withQwen3Prefix(deleteTargetDetails.shortName, deleteModalVariant)
-      : deleteModalVariant;
+      : (removedModels.find((model) => model.variant === deleteModalVariant)
+          ?.display_name ?? deleteModalVariant);
 
   if (loading) {
     return (
@@ -584,6 +588,52 @@ export function MyModelsPage({
             </section>
           ))}
         </div>
+      )}
+
+      {removedModels.length > 0 && (
+        <section
+          aria-label="Removed models"
+          className="space-y-2 rounded-xl border border-[var(--status-warning-border)] bg-[var(--bg-surface-1)] p-3 sm:p-4"
+        >
+          <div>
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              Removed models still on disk
+            </h3>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              Izwi no longer runs these downloads and never deletes them for
+              you. Delete them to reclaim the space.
+            </p>
+          </div>
+          <ul className="divide-y divide-[var(--border-muted)]">
+            {removedModels.map((model) => (
+              <li
+                key={model.variant}
+                className="flex flex-col gap-2 py-2 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-[var(--text-primary)]">
+                    {model.display_name}
+                  </p>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    {formatBytes(model.size_bytes)} · use {model.replacement}{" "}
+                    instead
+                  </p>
+                  <p className="text-xs text-[var(--text-subtle)]">
+                    {model.reason}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setDeleteModalVariant(model.variant)}
+                  className="inline-flex shrink-0 items-center gap-1.5 self-start rounded-md border border-[var(--danger-border)] bg-[var(--danger-bg)] px-3 py-1.5 text-xs font-medium text-[var(--danger-text)] transition-colors hover:bg-[var(--danger-bg-hover)] sm:self-auto"
+                  aria-label={`Delete ${model.display_name}`}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {deleteModalVariant && (

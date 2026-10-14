@@ -4,22 +4,26 @@
 //! voice-pack handling, and future Candle inference implementation from the
 //! generic runtime orchestration layer.
 
+pub(crate) mod admission;
 mod albert;
 mod config;
 mod decoder;
-mod phonemizer;
+pub(crate) mod phonemizer;
+pub mod planning;
 mod prosody;
 mod text_encoder;
 mod voice;
 
 pub use config::KokoroConfig;
+pub use prosody::kokoro_fused_lstm_steps;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use candle_core::pickle::read_pth_tensor_info;
+use candle_core::pickle::PthTensors;
 use candle_core::{DType, IndexOp, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use tracing::info;
@@ -37,7 +41,7 @@ use self::text_encoder::KokoroTextEncoder;
 use self::voice::VoiceLibrary;
 pub(crate) use self::voice::KOKORO_MODEL_MEMO_MAX_BYTES;
 
-const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
+pub(crate) const CHECKPOINT_FILE: &str = "kokoro-v1_0.pth";
 const CONFIG_FILE: &str = "config.json";
 const VOICES_DIR: &str = "voices";
 const KOKORO_MAX_PHONEMES_PER_INPUT_CHAR: usize = 16;
@@ -84,7 +88,7 @@ const KOKORO_ACCELERATOR_LIVE_STAGE_BUFFERS: u64 = 9;
 // voicing mask, phase/radian intermediates, and a collected sine buffer. Forty
 // f32 values per final-rate sample is a conservative bound over those vectors.
 const KOKORO_HARMONIC_HOST_F32_PER_SAMPLE: u64 = 40;
-const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
+pub(crate) const CHECKPOINT_SUBMODULE_KEYS: &[&str] = &[
     "bert",
     "bert_encoder",
     "predictor",
@@ -105,6 +109,67 @@ pub(crate) struct KokoroPeakWorkspace {
     pub host_bytes: u64,
     pub cpu_tensor_bytes: u64,
     pub accelerator_tensor_bytes: u64,
+}
+
+/// Whether `error` is the per-chunk expanded-frame cap, which splitting the
+/// chunk's phonemes recovers from.
+fn is_kokoro_frame_cap_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::InferenceError(message)
+            if message.contains("hard frame contract") || message.contains("hard per-chunk contract")
+    )
+}
+
+/// Synthesizes `phonemes` with `synth`; on the frame-cap error, splits at the
+/// space nearest the middle (or the middle character) and synthesizes each
+/// half the same way, concatenating the audio. Any other error is returned.
+fn synthesize_splitting_on_frame_cap(
+    phonemes: &str,
+    synth: &mut dyn FnMut(&str) -> Result<Vec<f32>>,
+) -> Result<Vec<f32>> {
+    const MAX_DEPTH: usize = 12;
+    fn go(
+        phonemes: &str,
+        synth: &mut dyn FnMut(&str) -> Result<Vec<f32>>,
+        depth: usize,
+    ) -> Result<Vec<f32>> {
+        match synth(phonemes) {
+            Err(error) if is_kokoro_frame_cap_error(&error) && depth < MAX_DEPTH => {
+                let Some((left, right)) = split_phonemes_near_middle(phonemes) else {
+                    return Err(error);
+                };
+                let mut samples = go(&left, synth, depth + 1)?;
+                samples.extend(go(&right, synth, depth + 1)?);
+                Ok(samples)
+            }
+            other => other,
+        }
+    }
+    go(phonemes, synth, 0)
+}
+
+/// Two non-empty halves split at the space closest to the middle, or at the
+/// middle character when the chunk has no inner space.
+fn split_phonemes_near_middle(phonemes: &str) -> Option<(String, String)> {
+    let chars = phonemes.trim().chars().collect::<Vec<_>>();
+    if chars.len() < 2 {
+        return None;
+    }
+    let middle = chars.len() / 2;
+    let split = chars
+        .iter()
+        .enumerate()
+        .filter(|(index, ch)| ch.is_whitespace() && *index > 0 && *index + 1 < chars.len())
+        .map(|(index, _)| index)
+        .min_by_key(|index| index.abs_diff(middle));
+    let (left, right) = match split {
+        Some(index) => (&chars[..index], &chars[index + 1..]),
+        None => (&chars[..middle], &chars[middle..]),
+    };
+    let left = left.iter().collect::<String>().trim().to_string();
+    let right = right.iter().collect::<String>().trim().to_string();
+    (!left.is_empty() && !right.is_empty()).then_some((left, right))
 }
 
 pub(crate) fn kokoro_peak_workspace(max_chunk_expanded_frames: u64) -> Result<KokoroPeakWorkspace> {
@@ -543,91 +608,24 @@ impl KokoroTtsModel {
         validate_kokoro_output_contract(&config)?;
 
         let dtype = DType::F32;
-        let checkpoint_tensor_counts =
-            inspect_and_validate_checkpoint(&checkpoint_path, &device.device, dtype)?;
+        let checkpoint = KokoroCheckpoint::open(&checkpoint_path, &device.device, dtype)?;
 
         let phonemizer = EspeakPhonemizer::auto()?;
         let voices = VoiceLibrary::new(voices_dir, device.device.clone(), dtype)?;
-        let bert = {
-            let vb =
-                VarBuilder::from_pth_with_state(&checkpoint_path, dtype, "bert", &device.device)
-                    .map_err(|e| {
-                        Error::ModelLoadError(format!(
-                            "Failed to create Kokoro BERT VarBuilder for {}: {}",
-                            checkpoint_path.display(),
-                            e
-                        ))
-                    })?;
-            albert::CustomAlbert::load(
-                &albert::AlbertModelConfig::from_kokoro(&config),
-                vb.pp("module"),
-            )?
-        };
-        let bert_encoder = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "bert_encoder",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro bert_encoder VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            candle_nn::linear(
-                config.plbert.hidden_size,
-                config.hidden_dim,
-                vb.pp("module"),
-            )
-            .map_err(Error::from)?
-        };
-        let prosody = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "predictor",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro predictor VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            KokoroProsodyPredictor::load(&config, vb)?
-        };
-        let text_encoder = {
-            let vb = VarBuilder::from_pth_with_state(
-                &checkpoint_path,
-                dtype,
-                "text_encoder",
-                &device.device,
-            )
-            .map_err(|e| {
-                Error::ModelLoadError(format!(
-                    "Failed to create Kokoro text_encoder VarBuilder for {}: {}",
-                    checkpoint_path.display(),
-                    e
-                ))
-            })?;
-            KokoroTextEncoder::load(&config, vb)?
-        };
-        let decoder = {
-            let vb =
-                VarBuilder::from_pth_with_state(&checkpoint_path, dtype, "decoder", &device.device)
-                    .map_err(|e| {
-                        Error::ModelLoadError(format!(
-                            "Failed to create Kokoro decoder VarBuilder for {}: {}",
-                            checkpoint_path.display(),
-                            e
-                        ))
-                    })?;
-            decoder::KokoroDecoder::load(&config, vb)?
-        };
+        let bert = albert::CustomAlbert::load(
+            &albert::AlbertModelConfig::from_kokoro(&config),
+            checkpoint.submodule("bert")?.pp("module"),
+        )?;
+        let bert_encoder = candle_nn::linear(
+            config.plbert.hidden_size,
+            config.hidden_dim,
+            checkpoint.submodule("bert_encoder")?.pp("module"),
+        )
+        .map_err(Error::from)?;
+        let prosody = KokoroProsodyPredictor::load(&config, checkpoint.submodule("predictor")?)?;
+        let text_encoder = KokoroTextEncoder::load(&config, checkpoint.submodule("text_encoder")?)?;
+        let decoder = decoder::KokoroDecoder::load(&config, checkpoint.submodule("decoder")?)?;
+        let checkpoint_tensor_counts = checkpoint.tensor_counts;
 
         info!(
             "Loaded Kokoro scaffolding from {:?} (phonemizer={}, submodules={:?})",
@@ -653,8 +651,58 @@ impl KokoroTtsModel {
         })
     }
 
+    /// The voices Kokoro can speak. Japanese (`j*`) and Mandarin (`z*`)
+    /// voice packs ship with the checkpoint but are hidden: their G2P is not
+    /// ported, and requests for them are rejected as invalid input.
     pub fn available_speakers(&self) -> Result<Vec<String>> {
-        self.voices.list_speakers()
+        Ok(self
+            .voices
+            .list_speakers()?
+            .into_iter()
+            .filter(|speaker| phonemizer::kokoro_speaker_supported(speaker))
+            .collect())
+    }
+
+    /// Plan `text` into chunks within the voice pack's phoneme limit and
+    /// `policy`'s character budgets, phonemizing the whole text once
+    /// (KOK-11). Each chunk carries the phonemes [`Self::prepare_planned`]
+    /// feeds the model, so nothing is phonemized again.
+    pub fn plan_chunks(
+        &self,
+        text: &str,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        policy: planning::KokoroChunkPolicy,
+    ) -> Result<Vec<planning::KokoroPlannedChunk>> {
+        let speaker = self.resolve_speaker(speaker)?;
+        let units = self
+            .phonemizer
+            .phonemize_units(text, language, Some(&speaker))?;
+        Ok(planning::plan_chunks(
+            units,
+            policy,
+            KOKORO_MAX_PHONEMES_PER_CHUNK,
+        ))
+    }
+
+    /// The model inputs for a planned chunk, from its phonemes (no G2P).
+    pub fn prepare_planned(
+        &self,
+        chunk: &planning::KokoroPlannedChunk,
+        speaker: Option<&str>,
+        language: Option<&str>,
+        speed: f32,
+    ) -> Result<KokoroPreparedRequest> {
+        let requested_speaker = speaker.map(str::to_owned);
+        let resolved = self.resolve_speaker(speaker)?;
+        self.prepared_from_phonemes(
+            &chunk.text,
+            requested_speaker,
+            language.map(str::to_owned),
+            speed,
+            &resolved,
+            chunk.phonemes.clone(),
+        )
     }
 
     pub fn prepare_request(
@@ -684,6 +732,33 @@ impl KokoroTtsModel {
                 "Kokoro phoneme expansion {phoneme_len} exceeds the {KOKORO_MAX_PHONEMES_PER_INPUT_CHAR}-per-input-character contract ({max_phonemes})"
             )));
         }
+        self.prepared_from_phonemes(
+            text,
+            requested_speaker,
+            requested_language,
+            requested_speed,
+            &speaker,
+            phonemes,
+        )
+    }
+
+    /// The model inputs for an already phonemized chunk: token ids, the voice
+    /// style row for its length, and the normalized speed.
+    fn prepared_from_phonemes(
+        &self,
+        text: &str,
+        requested_speaker: Option<String>,
+        requested_language: Option<String>,
+        requested_speed: f32,
+        speaker: &str,
+        phonemes: String,
+    ) -> Result<KokoroPreparedRequest> {
+        let phoneme_len = phonemes.chars().count();
+        if phoneme_len == 0 {
+            return Err(Error::InvalidInput(
+                "Kokoro phonemizer produced no phonemes".to_string(),
+            ));
+        }
         if phoneme_len > KOKORO_MAX_PHONEMES_PER_CHUNK {
             return Err(Error::InvalidInput(format!(
                 "Kokoro phoneme sequence length {phoneme_len} exceeds supported voice-pack limit ({KOKORO_MAX_PHONEMES_PER_CHUNK}). Chunking is not implemented yet in the native runtime."
@@ -699,8 +774,8 @@ impl KokoroTtsModel {
             )));
         }
 
-        let ref_style = self.voices.style_for_phoneme_len(&speaker, phoneme_len)?;
-        let speed = normalize_kokoro_speed(speed)?;
+        let ref_style = self.voices.style_for_phoneme_len(speaker, phoneme_len)?;
+        let speed = normalize_kokoro_speed(requested_speed)?;
 
         Ok(KokoroPreparedRequest {
             source_text: text.to_string(),
@@ -734,6 +809,62 @@ impl KokoroTtsModel {
     /// exact expanded-duration decoder buckets. Every multi-row bucket reaches
     /// ALBERT/text/prosody or the decoder as one native `B > 1` tensor call.
     pub fn generate_prepared_batch(
+        &self,
+        prepared: &[KokoroPreparedRequest],
+    ) -> Result<Vec<KokoroSynthesisResult>> {
+        match self.generate_prepared_batch_once(prepared) {
+            Err(error) if is_kokoro_frame_cap_error(&error) => {
+                // A row whose predicted durations overflow the per-chunk
+                // frame cap (slow speech, long pauses) would fail the whole
+                // cohort. Rerun each row alone, splitting only rows that
+                // overflow (KOK-13).
+                prepared
+                    .iter()
+                    .map(|row| self.generate_row_splitting_on_frame_cap(row))
+                    .collect()
+            }
+            other => other,
+        }
+    }
+
+    /// One row, split at a word boundary near the middle of its phonemes
+    /// (recursively) while its predicted durations overflow the frame cap;
+    /// the halves' audio is concatenated in order.
+    fn generate_row_splitting_on_frame_cap(
+        &self,
+        prepared: &KokoroPreparedRequest,
+    ) -> Result<KokoroSynthesisResult> {
+        let speaker = self.resolve_speaker(prepared.requested_speaker.as_deref())?;
+        let mut tokens_generated = 0usize;
+        let samples = synthesize_splitting_on_frame_cap(&prepared.phonemes, &mut |phonemes| {
+            let chunk = if phonemes == prepared.phonemes {
+                prepared.clone()
+            } else {
+                self.prepared_from_phonemes(
+                    &prepared.source_text,
+                    prepared.requested_speaker.clone(),
+                    prepared.requested_language.clone(),
+                    prepared.requested_speed,
+                    &speaker,
+                    phonemes.to_string(),
+                )?
+            };
+            let mut results = self.generate_prepared_batch_once(std::slice::from_ref(&chunk))?;
+            let result = results.pop().ok_or_else(|| {
+                Error::InferenceError("Kokoro returned an empty scalar synthesis batch".into())
+            })?;
+            tokens_generated += result.tokens_generated;
+            Ok(result.samples)
+        })?;
+        Ok(KokoroSynthesisResult {
+            samples,
+            sample_rate: KokoroConfig::TARGET_SAMPLE_RATE,
+            tokens_generated,
+            phonemes: prepared.phonemes.clone(),
+        })
+    }
+
+    fn generate_prepared_batch_once(
         &self,
         prepared: &[KokoroPreparedRequest],
     ) -> Result<Vec<KokoroSynthesisResult>> {
@@ -1118,6 +1249,10 @@ impl KokoroTtsModel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("af_heart");
+        if !phonemizer::kokoro_speaker_supported(requested) {
+            // Japanese and Mandarin voices: the typed unsupported-language error.
+            phonemizer::kokoro_voice_for(None, Some(requested))?;
+        }
         if let Some(exact) = speakers.iter().find(|s| s.as_str() == requested) {
             return Ok(exact.clone());
         }
@@ -1169,37 +1304,76 @@ impl KokoroTtsModel {
     }
 }
 
-fn inspect_and_validate_checkpoint(
-    checkpoint_path: &Path,
-    device: &candle_core::Device,
-    dtype: DType,
-) -> Result<HashMap<String, usize>> {
-    let mut counts = HashMap::new();
-    for key in CHECKPOINT_SUBMODULE_KEYS {
-        let infos = read_pth_tensor_info(checkpoint_path, false, Some(key)).map_err(|e| {
-            Error::ModelLoadError(format!(
-                "Failed to inspect Kokoro checkpoint submodule '{key}' in {}: {}",
-                checkpoint_path.display(),
-                e
-            ))
-        })?;
-        if infos.is_empty() {
-            return Err(Error::ModelLoadError(format!(
-                "Kokoro checkpoint submodule '{key}' in {} has no tensors",
-                checkpoint_path.display()
-            )));
-        }
-        let _vb =
-            VarBuilder::from_pth_with_state(checkpoint_path, dtype, key, device).map_err(|e| {
+static KOKORO_CHECKPOINT_PARSES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_CHECKPOINT_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Process-wide count of Kokoro checkpoint state-dict parses (one pickle
+/// read of `kokoro-v1_0.pth` per submodule).
+pub fn kokoro_checkpoint_parses() -> u64 {
+    KOKORO_CHECKPOINT_PARSES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn thread_checkpoint_parses() -> u64 {
+    THREAD_CHECKPOINT_PARSES.with(|parses| parses.get())
+}
+
+fn record_checkpoint_parse() {
+    KOKORO_CHECKPOINT_PARSES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_CHECKPOINT_PARSES.with(|parses| parses.set(parses.get() + 1));
+}
+
+/// The checkpoint's submodule state dicts, each parsed once and shared by
+/// validation (the tensor counts) and weight loading (the VarBuilders).
+struct KokoroCheckpoint {
+    submodules: HashMap<&'static str, VarBuilder<'static>>,
+    tensor_counts: HashMap<String, usize>,
+}
+
+impl KokoroCheckpoint {
+    fn open(checkpoint_path: &Path, device: &candle_core::Device, dtype: DType) -> Result<Self> {
+        let mut submodules = HashMap::new();
+        let mut tensor_counts = HashMap::new();
+        for key in CHECKPOINT_SUBMODULE_KEYS {
+            let tensors = PthTensors::new(checkpoint_path, Some(key)).map_err(|e| {
                 Error::ModelLoadError(format!(
-                    "Failed to create Candle VarBuilder for Kokoro submodule '{key}' in {}: {}",
+                    "Failed to inspect Kokoro checkpoint submodule '{key}' in {}: {}",
                     checkpoint_path.display(),
                     e
                 ))
             })?;
-        counts.insert((*key).to_string(), infos.len());
+            record_checkpoint_parse();
+            let count = tensors.tensor_infos().len();
+            if count == 0 {
+                return Err(Error::ModelLoadError(format!(
+                    "Kokoro checkpoint submodule '{key}' in {} has no tensors",
+                    checkpoint_path.display()
+                )));
+            }
+            submodules.insert(
+                *key,
+                VarBuilder::from_backend(Box::new(tensors), dtype, device.clone()),
+            );
+            tensor_counts.insert((*key).to_string(), count);
+        }
+        Ok(Self {
+            submodules,
+            tensor_counts,
+        })
     }
-    Ok(counts)
+
+    fn submodule(&self, key: &str) -> Result<VarBuilder<'static>> {
+        self.submodules.get(key).cloned().ok_or_else(|| {
+            Error::ModelLoadError(format!(
+                "Kokoro checkpoint submodule '{key}' was not opened"
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1209,6 +1383,60 @@ mod tests {
     use rustfft::num_complex::Complex32;
     use rustfft::FftPlanner;
     use std::path::Path;
+
+    /// KOK-13: the real frame-cap error is recognized as recoverable.
+    #[test]
+    fn duration_frame_cap_error_is_recognized_for_splitting() {
+        let error = prosody::bounded_duration_frames(vec![100.0; 64], 4_096).unwrap_err();
+        assert!(is_kokoro_frame_cap_error(&error), "{error}");
+        assert!(!is_kokoro_frame_cap_error(&Error::InferenceError(
+            "Kokoro duration predictor produced a non-finite value".into()
+        )));
+    }
+
+    /// KOK-13: a chunk whose durations overflow the frame cap is split at the
+    /// space nearest its middle, recursively, and the halves' audio is
+    /// concatenated in order; other errors are not retried.
+    #[test]
+    fn frame_cap_overflow_splits_the_chunk_and_keeps_order() {
+        assert_eq!(
+            split_phonemes_near_middle("ab cd ef"),
+            Some(("ab cd".to_string(), "ef".to_string()))
+        );
+        assert_eq!(
+            split_phonemes_near_middle("abcdef"),
+            Some(("abc".to_string(), "def".to_string()))
+        );
+        assert_eq!(split_phonemes_near_middle("a"), None);
+
+        let cap_error = || Error::InferenceError("exceeded its hard frame contract".into());
+        let mut calls = Vec::new();
+        let audio = synthesize_splitting_on_frame_cap(
+            "hˈɛ wˈɜː lˈd ɪz bɪɡ ænd ɹˈaʊnd",
+            &mut |chunk| {
+                calls.push(chunk.to_string());
+                if chunk.chars().count() > 8 {
+                    return Err(cap_error());
+                }
+                Ok(chunk
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .map(|ch| ch as u32 as f32)
+                    .collect())
+            },
+        )
+        .unwrap();
+        let expected = "hˈɛwˈɜːlˈdɪzbɪɡændɹˈaʊnd"
+            .chars()
+            .map(|ch| ch as u32 as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(audio, expected);
+        assert!(calls.len() > 3);
+
+        let mut other =
+            |_: &str| -> Result<Vec<f32>> { Err(Error::InferenceError("unrelated".into())) };
+        assert!(synthesize_splitting_on_frame_cap("a b c d", &mut other).is_err());
+    }
 
     fn prepared_with_width(width: usize) -> KokoroPreparedRequest {
         KokoroPreparedRequest {
@@ -1399,6 +1627,32 @@ mod tests {
         ));
     }
 
+    /// KOK-19: loading parses each checkpoint submodule's pickle once (five
+    /// parses), sharing it between validation and the weight VarBuilders;
+    /// it used to be parsed three times per submodule (fifteen).
+    #[test]
+    #[ignore = "requires the local Kokoro artifact (IZWI_KOKORO_MODEL_DIR)"]
+    fn kokoro_load_parses_each_checkpoint_submodule_once() {
+        let model_dir = {
+            let _guard = crate::env_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::var_os("IZWI_KOKORO_MODEL_DIR")
+                .expect("set IZWI_KOKORO_MODEL_DIR to the local Kokoro-82M directory")
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu")).expect("cpu device");
+        let before = thread_checkpoint_parses();
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        assert_eq!(
+            thread_checkpoint_parses() - before,
+            CHECKPOINT_SUBMODULE_KEYS.len() as u64
+        );
+        let counts = model.checkpoint_tensor_counts();
+        assert_eq!(counts.len(), CHECKPOINT_SUBMODULE_KEYS.len());
+        assert!(counts.values().all(|count| *count > 0), "{counts:?}");
+    }
+
     #[test]
     fn kokoro_local_prepare_smoke_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
@@ -1534,6 +1788,34 @@ mod tests {
         assert!(result.samples.iter().all(|v| v.is_finite()));
     }
 
+    /// KOK-3 live: punctuation reaches the model as tokens, so pauses and
+    /// sentence ends change the (deterministic) durations.
+    #[test]
+    fn kokoro_local_punctuation_changes_the_audio_if_env_set() {
+        let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
+            return;
+        };
+        let device = DeviceSelector::detect_with_preference(Some("cpu"))
+            .expect("detect cpu device for Kokoro punctuation check");
+        let model =
+            KokoroTtsModel::load(Path::new(&model_dir), device).expect("load local Kokoro model");
+        let prepared = model
+            .prepare_request("Wait, really? Yes. No!", Some("af_heart"), None, 1.0)
+            .expect("prepare punctuated request");
+        assert!(prepared.phonemes.ends_with("nˈO!"), "{}", prepared.phonemes);
+        let samples = |text: &str| {
+            model
+                .generate_with_seed_for_test(text, Some("af_heart"), None, 1.0, 7)
+                .expect("generate")
+                .samples
+                .len()
+        };
+        assert_ne!(
+            samples("Wait, really? Yes. No!"),
+            samples("Wait really Yes No")
+        );
+    }
+
     #[test]
     fn kokoro_local_audio_regression_cpu_if_env_set() {
         let Some(model_dir) = std::env::var_os("IZWI_KOKORO_MODEL_DIR") else {
@@ -1571,8 +1853,11 @@ mod tests {
         );
 
         assert_eq!(result.sample_rate, KokoroConfig::TARGET_SAMPLE_RATE);
-        assert_eq!(result.samples.len(), 52_800, "unexpected sample length");
-        assert!((duration_s - 2.2).abs() < 0.02, "duration_s={duration_s}");
+        // misaki-convention phonemes (KOK-3/KOK-4): "həlˈO mI nˈAm ɪz bˈɛlə"
+        // has single-token diphthongs, so it is shorter than raw espeak's
+        // 52,800 samples.
+        assert_eq!(result.samples.len(), 49_800, "unexpected sample length");
+        assert!((duration_s - 2.075).abs() < 0.02, "duration_s={duration_s}");
         assert!((rms - 0.047_011).abs() < 0.015, "rms={rms}");
         assert!((peak - 0.373_43).abs() < 0.15, "peak={peak}");
         assert!((zcr - 0.222_845).abs() < 0.08, "zcr={zcr}");

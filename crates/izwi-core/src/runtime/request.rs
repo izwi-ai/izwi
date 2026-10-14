@@ -173,6 +173,11 @@ pub(crate) struct TtsRuntimeRequest {
     voice_description: Option<String>,
 }
 
+/// How long a TTS stream may wait for its reader before failing: the same
+/// 30 s stall deadline the HTTP streams apply. A slow reader is waited for
+/// rather than failed when the engine's small queue fills (TPIPE-13).
+const TTS_STREAM_SEND_DEADLINE_MS: u64 = 30_000;
+
 impl TtsRuntimeRequest {
     pub(crate) fn from_generation(
         request: GenerationRequest,
@@ -186,7 +191,10 @@ impl TtsRuntimeRequest {
             envelope: RequestEnvelope::new(CapabilityKind::Tts, model_variant)
                 .with_request_id(request.id)
                 .with_correlation_id(request.correlation_id)
-                .with_runtime_context(request.runtime_context),
+                .with_runtime_context(request.runtime_context)
+                .with_stream_policy(RuntimeStreamPolicy::BlockWithDeadline {
+                    timeout_ms: TTS_STREAM_SEND_DEADLINE_MS,
+                }),
             text: request.text,
             language: request.language,
             reference_audio: request.reference_audio,
@@ -547,6 +555,22 @@ mod tests {
     use crate::engine::{EngineTask, GenerationParams};
     use crate::models::shared::chat::{ChatMessage, ChatRole};
     use crate::runtime::types::GenerationRequest;
+
+    /// TPIPE-13: a TTS stream waits up to the stall deadline for a slow
+    /// reader instead of failing when the engine queue is full.
+    #[test]
+    fn tts_streams_wait_for_a_slow_reader_up_to_the_stall_deadline() {
+        let request = TtsRuntimeRequest::from_generation(
+            GenerationRequest::new("hello"),
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        )
+        .unwrap()
+        .into_engine_request(CoreGenerationParams::default());
+        assert_eq!(
+            request.stream_policy,
+            EngineStreamPolicy::BlockWithDeadline { timeout_ms: 30_000 }
+        );
+    }
 
     #[test]
     fn tts_runtime_request_builds_core_request_with_model_identity() {

@@ -83,6 +83,97 @@ pub struct GenerationParams {
     /// (`response_format: json_object`).
     #[serde(default)]
     pub constrain_json_object: bool,
+
+    /// Speech sampling the request set explicitly (TTS only).
+    #[serde(default)]
+    pub speech: SpeechSamplingOptions,
+}
+
+/// Sampling choices a speech request set explicitly. `None` is unset, so the
+/// model family's reference default applies. The shared `temperature`,
+/// `top_p` and `top_k` above always carry the chat defaults (0.7 / 0.9 / off)
+/// and cannot say "unset", so speech families that read them sampled with
+/// chat settings instead of their own (TPIPE-24).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpeechSamplingOptions {
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    /// Sampling seed; a family without a seedable sampler ignores it.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Qwen3-TTS residual-codebook (sub-talker) sampling.
+    #[serde(default)]
+    pub subtalker_do_sample: Option<bool>,
+    #[serde(default)]
+    pub subtalker_temperature: Option<f32>,
+    #[serde(default)]
+    pub subtalker_top_k: Option<usize>,
+    #[serde(default)]
+    pub subtalker_top_p: Option<f32>,
+    /// VibeVoice classifier-free guidance scale.
+    #[serde(default)]
+    pub cfg_scale: Option<f32>,
+    /// VibeVoice diffusion steps per frame.
+    #[serde(default)]
+    pub diffusion_steps: Option<usize>,
+    /// English text normalization (numbers, currency, dates, times, units)
+    /// before synthesis; unset keeps the family's default (on for Kokoro).
+    #[serde(default)]
+    pub normalize_text: Option<bool>,
+}
+
+impl SpeechSamplingOptions {
+    /// Largest accepted `diffusion_steps`.
+    pub const MAX_DIFFUSION_STEPS: usize = 100;
+
+    /// Reject values no sampler accepts, as an input error (400).
+    pub fn validate(&self) -> crate::error::Result<()> {
+        let invalid = |message: String| Err(crate::error::Error::InvalidInput(message));
+        for (name, value) in [
+            ("temperature", self.temperature),
+            ("subtalker_temperature", self.subtalker_temperature),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return invalid(format!("{name} must be a finite number >= 0"));
+            }
+        }
+        for (name, value) in [
+            ("top_p", self.top_p),
+            ("subtalker_top_p", self.subtalker_top_p),
+        ] {
+            if value.is_some_and(|value| !(value > 0.0 && value <= 1.0)) {
+                return invalid(format!("{name} must be in (0, 1]"));
+            }
+        }
+        if self
+            .repetition_penalty
+            .is_some_and(|value| !value.is_finite() || value < 1.0)
+        {
+            return invalid("repetition_penalty must be a finite number >= 1".into());
+        }
+        if self
+            .cfg_scale
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return invalid("cfg_scale must be a finite number > 0".into());
+        }
+        if self
+            .diffusion_steps
+            .is_some_and(|steps| steps == 0 || steps > Self::MAX_DIFFUSION_STEPS)
+        {
+            return invalid(format!(
+                "diffusion_steps must be between 1 and {}",
+                Self::MAX_DIFFUSION_STEPS
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_temperature() -> f32 {
@@ -120,6 +211,7 @@ impl Default for GenerationParams {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            speech: SpeechSamplingOptions::default(),
         }
     }
 }

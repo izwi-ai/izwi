@@ -31,6 +31,32 @@ pub struct Lfm25AudioGenerationConfig {
     pub seed: u64,
 }
 
+/// Audio-code sampling the references use for TTS: liquid-audio's README
+/// (`audio_temperature=0.8, audio_top_k=64`) and llama.cpp's sequential
+/// mode (audio-decoder.cpp).
+pub const LFM25_TTS_AUDIO_TEMPERATURE: f32 = 0.8;
+pub const LFM25_TTS_AUDIO_TOP_K: usize = 64;
+
+impl Lfm25AudioGenerationConfig {
+    /// TTS sampling: greedy text (as both references decode it) and audio
+    /// codes at the reference temperature and top-k unless the request sets
+    /// `audio_temperature` / `audio_top_k`. A temperature of 0 is greedy;
+    /// a top-k of 0 disables the cutoff. `seed` 0 draws a time seed.
+    pub fn tts(audio_temperature: Option<f32>, audio_top_k: Option<usize>, seed: u64) -> Self {
+        Self {
+            text: Lfm25SamplingConfig::default(),
+            audio: Lfm25SamplingConfig {
+                temperature: audio_temperature
+                    .unwrap_or(LFM25_TTS_AUDIO_TEMPERATURE)
+                    .max(0.0),
+                top_k: audio_top_k.unwrap_or(LFM25_TTS_AUDIO_TOP_K),
+                top_p: 1.0,
+            },
+            seed,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SimpleRng {
     state: u64,
@@ -273,6 +299,20 @@ fn argmax_values(values: &[f32]) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// LFT-2: TTS samples audio codes at the reference 0.8 / top-k 64 by
+    /// default, keeps text greedy, and honours request overrides and seed.
+    #[test]
+    fn tts_config_uses_reference_audio_sampling_by_default() {
+        let config = super::Lfm25AudioGenerationConfig::tts(None, None, 42);
+        assert_eq!(config.audio.temperature, 0.8);
+        assert_eq!(config.audio.top_k, 64);
+        assert_eq!(config.audio.top_p, 1.0);
+        assert_eq!(config.text.temperature, 0.0);
+        assert_eq!(config.seed, 42);
+        let greedy = super::Lfm25AudioGenerationConfig::tts(Some(0.0), Some(1), 7);
+        assert_eq!((greedy.audio.temperature, greedy.audio.top_k), (0.0, 1));
+    }
+
     use super::*;
 
     #[test]
