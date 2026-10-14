@@ -1582,6 +1582,98 @@ impl CandleAcceleratorKvArena {
         )?)
     }
 
+    /// Metal prefill as per-query decode rows on the simdgroup GQA kernel.
+    ///
+    /// A causal query at prefix position `p` attends exactly the decode row
+    /// whose context ends at `p` (clipped to the window), so expanding every
+    /// query into such a row reproduces paged prefill exactly. The rows share
+    /// K/V reads within a GQA group and use `simd_sum` reductions, where the
+    /// scalar prefill kernel serialized every key behind threadgroup barriers.
+    /// Returns `None` for geometries the GQA kernel does not cover.
+    #[cfg(feature = "metal")]
+    fn metal_gqa_prefill_as_decode_rows(
+        &self,
+        layer: &AcceleratorLayerStorage,
+        args: &PagedKvPrefillArgs<'_>,
+    ) -> Result<Option<Tensor>> {
+        let num_heads = args.queries.dims()[1];
+        if !crate::kernels::metal_paged_gqa::gqa_decode_enabled()
+            || crate::kernels::metal_paged_gqa::GqaDecodeVariant::select(
+                layer.key_head_dim,
+                layer.value_head_dim,
+                num_heads,
+                layer.num_kv_heads,
+            )
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let page_tokens = self.config.page_tokens;
+        let total_queries = args.queries.dims()[0];
+        let mut contexts = Vec::with_capacity(total_queries);
+        let mut offsets = Vec::with_capacity(total_queries);
+        let mut tables = Vec::<Vec<u32>>::with_capacity(total_queries);
+        for row in args.rows {
+            let pages = row
+                .blocks
+                .iter()
+                .map(|block| self.validate_block(*block).map(|page| page as u32))
+                .collect::<Result<Vec<_>>>()?;
+            let prefix = row.context_len - row.query_len;
+            for local in 0..row.query_len {
+                let causal = prefix + local + 1;
+                let context = args
+                    .window_tokens
+                    .map_or(causal, |window| causal.min(window));
+                let physical_start = row.first_page_offset + (causal - context);
+                let first_page = (physical_start / page_tokens) as usize;
+                let first_page_offset = physical_start % page_tokens;
+                let needed = (first_page_offset + context).div_ceil(page_tokens) as usize;
+                let table = pages
+                    .get(first_page..first_page + needed)
+                    .ok_or_else(|| {
+                        Error::InferenceError(
+                            "Metal paged prefill row has an incomplete block table".into(),
+                        )
+                    })?
+                    .to_vec();
+                contexts.push(context);
+                offsets.push(first_page_offset);
+                tables.push(table);
+            }
+        }
+        if contexts.len() != total_queries {
+            return Err(Error::InferenceError(
+                "Metal paged prefill rows do not cover every query exactly once".into(),
+            ));
+        }
+        let max_blocks = tables.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let mut metadata = Vec::with_capacity(total_queries * (2 + max_blocks));
+        metadata.extend_from_slice(&contexts);
+        metadata.extend_from_slice(&offsets);
+        for table in &tables {
+            metadata.extend_from_slice(table);
+            metadata.extend(std::iter::repeat_n(0, max_blocks - table.len()));
+        }
+        let device_metadata = Tensor::from_vec(metadata.clone(), metadata.len(), &self.device)?;
+        Ok(Some(crate::kernels::metal::paged_decode_attention(
+            args.queries,
+            &layer.keys,
+            &layer.values,
+            metadata,
+            &device_metadata,
+            total_queries,
+            num_heads,
+            layer.num_kv_heads,
+            page_tokens as usize,
+            max_blocks,
+            layer.key_head_dim,
+            layer.value_head_dim,
+            args.softmax_scale,
+            args.softcap,
+        )?))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_paged_prefill(
         &self,
@@ -1589,6 +1681,9 @@ impl CandleAcceleratorKvArena {
         args: &PagedKvPrefillArgs<'_>,
         lowered: &LoweredPrefillMetadata,
     ) -> Result<Tensor> {
+        if let Some(output) = self.metal_gqa_prefill_as_decode_rows(layer, args)? {
+            return Ok(output);
+        }
         Ok(crate::kernels::metal::paged_prefill_attention(
             args.queries,
             &layer.keys,
@@ -4214,6 +4309,177 @@ mod tests {
                             (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
                             "hd {head_dim} heads {num_heads}/{num_kv_heads} {dtype:?} \
                              softcap {softcap:?} element {index}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Metal prefill runs as per-query rows on the GQA decode kernel; it must
+    /// equal the CPU reference for fresh prompts, chunks continuing a prefix,
+    /// sliding windows crossing pages, softcap and both dtypes.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_gqa_paged_prefill_matches_cpu_for_chunks_and_windows() -> Result<()> {
+        let Some(device) = private_metal_device()? else {
+            return Ok(());
+        };
+        let _env = EagerFenceEnv::set(None);
+        let page_tokens = 16_usize;
+        let capacity_pages = 96_usize;
+        // (context_len, query_len, first_page_offset): a fresh prompt and a
+        // 70-token chunk continuing a 1000-token prefix.
+        let rows = [(40_usize, 40_usize, 3_usize), (1070, 70, 0)];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        for (head_dim, num_kv_heads, num_heads) in
+            [(64_usize, 2_usize, 8_usize), (128, 4, 16), (256, 2, 16)]
+        {
+            for dtype in [DType::F32, DType::F16] {
+                for (softcap, window) in
+                    [(None, None), (Some(30.0_f32), None), (None, Some(37_u32))]
+                {
+                    let binding = KvLayerBinding {
+                        model_layer: 0,
+                        physical_layer: 0,
+                    };
+                    let metal_id = KvArenaId {
+                        model_instance: ModelInstanceId::new(42),
+                        backend: BackendKind::Metal,
+                        device_ordinal: Some(0),
+                        generation: 1,
+                    };
+                    let cpu_id = KvArenaId {
+                        backend: BackendKind::Cpu,
+                        device_ordinal: None,
+                        ..metal_id
+                    };
+                    let group = KvGroupId::new(0);
+                    let config = KvArenaConfig {
+                        id: metal_id,
+                        group,
+                        page_tokens: page_tokens as u32,
+                        capacity_pages: capacity_pages as u32,
+                        growth: None,
+                        dtype,
+                        layers: vec![super::super::KvLayerConfig {
+                            binding,
+                            num_kv_heads: num_kv_heads as u32,
+                            key_head_dim: head_dim as u32,
+                            value_head_dim: head_dim as u32,
+                        }],
+                    };
+                    let metal_arena = CandleAcceleratorKvArena::new_mutation_only(
+                        config.clone(),
+                        device.clone(),
+                    )?;
+                    let cpu_arena = super::super::CpuKvArena::new(KvArenaConfig {
+                        id: cpu_id,
+                        ..config
+                    })?;
+                    let block = |arena, index| CacheBlockRef {
+                        arena,
+                        group,
+                        index,
+                        slot_generation: 1,
+                    };
+                    let elements = capacity_pages * page_tokens * num_kv_heads * head_dim;
+                    let keys = (0..elements).map(|_| next()).collect::<Vec<_>>();
+                    let values = (0..elements).map(|_| next()).collect::<Vec<_>>();
+                    let shape = (capacity_pages * page_tokens, num_kv_heads, head_dim);
+                    let targets: [(&dyn KvArena, KvArenaId, &Device); 2] = [
+                        (&metal_arena, metal_id, &device),
+                        (&cpu_arena, cpu_id, &Device::Cpu),
+                    ];
+                    for (arena, on, target) in targets {
+                        let slots = (0..capacity_pages as u32)
+                            .flat_map(|page| {
+                                (0..page_tokens as u32).map(move |offset| KvSlotRef {
+                                    block: block(on, page),
+                                    offset,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let lowered = arena.lower_slots(&slots)?;
+                        arena.write_slots(
+                            binding,
+                            KvWriteArgs {
+                                keys: &Tensor::from_vec(keys.clone(), shape, target)?
+                                    .to_dtype(dtype)?,
+                                values: &Tensor::from_vec(values.clone(), shape, target)?
+                                    .to_dtype(dtype)?,
+                                slots: lowered.as_ref(),
+                            },
+                        )?;
+                    }
+                    let prefill_rows = |arena| {
+                        let mut cursor = 0_u32;
+                        let mut query_start = 0_u32;
+                        rows.iter()
+                            .map(|&(context_len, query_len, first_page_offset)| {
+                                let pages = (context_len + first_page_offset).div_ceil(page_tokens);
+                                let blocks = (0..pages)
+                                    .map(|_| {
+                                        let index = (cursor * 29) % capacity_pages as u32;
+                                        cursor += 1;
+                                        block(arena, index)
+                                    })
+                                    .collect::<Vec<_>>();
+                                let row = PagedKvPrefillRow {
+                                    blocks,
+                                    first_page_offset: first_page_offset as u32,
+                                    query_start,
+                                    query_len: query_len as u32,
+                                    context_len: context_len as u32,
+                                };
+                                query_start += query_len as u32;
+                                row
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let total_queries = rows.iter().map(|row| row.1).sum::<usize>();
+                    let queries = (0..total_queries * num_heads * head_dim)
+                        .map(|_| next())
+                        .collect::<Vec<_>>();
+                    let prefill = |arena: &dyn KvArena, on, target: &Device| -> Result<Vec<f32>> {
+                        arena
+                            .paged_prefill(
+                                binding,
+                                PagedKvPrefillArgs {
+                                    queries: &Tensor::from_vec(
+                                        queries.clone(),
+                                        (total_queries, num_heads, head_dim),
+                                        target,
+                                    )?
+                                    .to_dtype(dtype)?,
+                                    rows: &prefill_rows(on),
+                                    softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+                                    softcap,
+                                    window_tokens: window,
+                                },
+                            )?
+                            .to_device(&Device::Cpu)?
+                            .to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()
+                            .map_err(Into::into)
+                    };
+                    let metal = prefill(&metal_arena, metal_id, &device)?;
+                    let cpu = prefill(&cpu_arena, cpu_id, &Device::Cpu)?;
+                    assert_eq!(metal.len(), cpu.len());
+                    let tolerance = if dtype == DType::F32 { 2e-4 } else { 4e-3 };
+                    for (index, (actual, expected)) in metal.iter().zip(&cpu).enumerate() {
+                        assert!(
+                            (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+                            "hd {head_dim} {dtype:?} softcap {softcap:?} window {window:?} \
+                             element {index}: {actual} != {expected}"
                         );
                     }
                 }
