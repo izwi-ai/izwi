@@ -9,6 +9,9 @@
 //! liveness, and old-generation drain are all asserted on real files and
 //! real processes.
 
+// The fake workers are executable scripts launched through unix permissions.
+#![cfg(unix)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

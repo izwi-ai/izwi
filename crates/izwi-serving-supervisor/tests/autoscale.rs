@@ -10,6 +10,9 @@
 //! append the standby's line only after its readiness, and scale-down must
 //! remove it, drain the worker, and never touch the core set.
 
+// The fake workers are executable scripts launched through unix permissions.
+#![cfg(unix)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};

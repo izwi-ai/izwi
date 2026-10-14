@@ -227,6 +227,9 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     spawn_diagnostic_signal_listener(diagnostic_tx);
     // DS6: SIGUSR2 requests an in-process rollout abort while the rollout is
     // still reversible (launch or window phases).
+    // Off unix nothing sends, but the sender must outlive the run so the
+    // receiver never observes a closed channel.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let (abort_tx, mut abort_rx) = watch::channel(false);
     #[cfg(unix)]
     tokio::spawn(async move {

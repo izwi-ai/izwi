@@ -27,7 +27,6 @@ use izwi_serving_protocol::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -672,13 +671,14 @@ fn write_view(path: &Path, text: &str) -> Result<(), AutoscaleError> {
     ));
     let result = (|| {
         {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)
-                .map_err(AutoscaleError::Io)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path).map_err(AutoscaleError::Io)?;
             file.write_all(text.as_bytes())
                 .map_err(AutoscaleError::Io)?;
             file.sync_all().map_err(AutoscaleError::Io)?;
@@ -1199,6 +1199,20 @@ mod tests {
 
         reconcile_min_set(&path, &node, &[core]).unwrap();
         assert_eq!(view(&path), first, "reconciliation is idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_views_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let node = autoscaled_node(directory.path());
+        let path = directory.path().join("shared-approvals");
+        let core = node.worker(&id("cpu-1")).unwrap();
+
+        reconcile_min_set(&path, &node, &[core]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "approvals views are owner-only");
     }
 
     #[test]

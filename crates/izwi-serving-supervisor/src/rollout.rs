@@ -23,7 +23,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -677,12 +676,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RolloutError> {
     ));
     let result = (|| {
         {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&temp_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path)?;
             file.write_all(bytes)?;
             file.sync_all()?;
         }
@@ -1112,6 +1113,17 @@ mod tests {
         write_atomic(&approvals, window.as_bytes()).unwrap();
         assert_eq!(parse_len(&approvals), 2);
         clear_approvals_backup(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let approvals = dir.path().join("approvals.txt");
+        write_atomic(&approvals, b"# empty view\n").unwrap();
+        let mode = std::fs::metadata(&approvals).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "approvals views are owner-only");
     }
 
     fn parse_len(path: &Path) -> usize {
