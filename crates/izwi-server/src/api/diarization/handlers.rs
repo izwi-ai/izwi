@@ -26,9 +26,10 @@ use crate::error::ApiError;
 use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, resolve_diarization_model_variant_strict,
-    ChatMessage, ChatRequestConfig, ChatRole, DiarizationConfig, GenerationParams, ModelVariant,
-    RuntimeRequestContext, RuntimeService, WorkloadClass,
+    parse_chat_model_variant, parse_model_variant, resolve_diarization_asr_model_variant,
+    resolve_diarization_model_variant_strict, ChatMessage, ChatRequestConfig, ChatRole,
+    DiarizationConfig, GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
+    WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -328,6 +329,7 @@ async fn create_pending_record(
 ) -> Result<DiarizationRecord, ApiError> {
     reject_granite_diarization_model(parsed.model_id.as_deref())?;
     validate_diarization_model_id(parsed.model_id.as_deref())?;
+    resolve_pipeline_model_ids(parsed)?;
     validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
 
     state
@@ -400,6 +402,28 @@ fn validate_diarization_model_id(model_id: Option<&str>) -> Result<(), ApiError>
     resolve_diarization_model_variant_strict(raw_model_id)
         .map_err(ApiError::bad_request)
         .map(|_| ())
+}
+
+/// Explicit pipeline ASR and aligner ids are the source of truth as well:
+/// reject ids the pipeline cannot run before the job starts (instead of
+/// failing it after diarization or silently using the default), and persist
+/// the resolved catalog ids. Missing ids keep the server-side defaults.
+fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Result<(), ApiError> {
+    if let Some(raw) = parsed.asr_model_id.as_deref() {
+        let variant =
+            resolve_diarization_asr_model_variant(Some(raw)).map_err(ApiError::bad_request)?;
+        parsed.asr_model_id = Some(variant.dir_name().to_string());
+    }
+    if let Some(raw) = parsed.aligner_model_id.as_deref() {
+        let variant = parse_model_variant(raw)
+            .ok()
+            .filter(ModelVariant::is_forced_aligner)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("Model '{raw}' is not a forced aligner model."))
+            })?;
+        parsed.aligner_model_id = Some(variant.dir_name().to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

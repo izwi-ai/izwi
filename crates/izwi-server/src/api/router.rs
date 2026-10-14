@@ -1026,6 +1026,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn diarization_create_rejects_pipeline_models_it_cannot_run() {
+        let (app, temp_dir) = test_api_app(
+            "diarization_create_rejects_pipeline_models_it_cannot_run",
+            true,
+        );
+        for (field, expected) in [
+            (r#""asr_model":"bogus""#, "Unknown diarization ASR model id"),
+            (
+                r#""asr_model":"LFM2.5-Audio-1.5B-GGUF""#,
+                "cannot transcribe in the diarization pipeline",
+            ),
+            (
+                r#""aligner_model":"bogus""#,
+                "is not a forced aligner model",
+            ),
+            (
+                r#""aligner_model":"Parakeet-TDT-0.6B-v3""#,
+                "is not a forced aligner model",
+            ),
+        ] {
+            let body = tiny_audio_json_body_with_fields(field);
+            let response = send_request(
+                app.clone(),
+                build_request(Method::POST, "/v1/diarizations", Some(body.as_str())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let payload = read_json(response).await;
+            let message = payload["error"]["message"]
+                .as_str()
+                .expect("error message should exist");
+            assert!(message.contains(expected), "{field}: {message}");
+        }
+
+        let accepted = send_request(
+            app,
+            build_request(
+                Method::POST,
+                "/v1/diarizations",
+                Some(
+                    tiny_audio_json_body_with_fields(
+                        r#""asr_model":"parakeet-tdt-0.6b-v3","aligner_model":"Qwen3-ForcedAligner-0.6B""#,
+                    )
+                    .as_str(),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let record = read_json(accepted).await;
+        assert_eq!(record["asr_model_id"], "Parakeet-TDT-0.6B-v3");
+        assert_eq!(record["aligner_model_id"], "Qwen3-ForcedAligner-0.6B");
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
     async fn granite_speech_is_rejected_for_diarization_jobs() {
         let (app, temp_dir) = test_api_app("granite_speech_is_rejected_for_diarization_jobs", true);
         let body = tiny_audio_json_body_with_fields(r#""model_id":"Granite-Speech-4.1-2B-Plus""#);

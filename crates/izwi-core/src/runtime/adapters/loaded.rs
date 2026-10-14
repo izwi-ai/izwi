@@ -139,6 +139,17 @@ const fn scalar_row_policy_without_concurrency_evidence() -> (usize, PhysicalLau
     (1, launch_policy_without_concurrency_evidence())
 }
 
+/// Whether a contract can run one whole job as a blocking stage: the
+/// long-form ASR graph that the diarization pipeline requires.
+pub(crate) fn contract_supports_atomic_blocking(contract: &LoadedExecutionContract) -> bool {
+    contract.stages.iter().any(|stage| {
+        matches!(
+            stage.selector,
+            StageWorkSelector::Atomic | StageWorkSelector::Any
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedExecutionContract {
     pub(crate) execution_group_id: ExecutionGroupId,
@@ -4717,6 +4728,26 @@ impl RuntimeAdapterRegistry {
             .collect()
     }
 
+    /// Weight-free check that a model's long-form graph can run as one
+    /// blocking stage: builds the adapter a load would build and reads its
+    /// long-form contract, so a pipeline can refuse the model before any work.
+    pub(crate) fn supports_atomic_long_form(
+        &self,
+        capability: CapabilityKind,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+    ) -> Result<bool> {
+        let metadata = *self.require(capability, model_variant)?;
+        let adapter = self.create_loaded_adapter(
+            ExecutionGroupId::new(0),
+            ModelInstanceId::new(0),
+            metadata,
+            backend_kind,
+        )?;
+        let contract = adapter.contract(StreamingRequirements::NONE.with_asr_long_form(true))?;
+        Ok(contract_supports_atomic_blocking(&contract))
+    }
+
     fn create_loaded_adapter(
         &self,
         execution_group_id: ExecutionGroupId,
@@ -6458,6 +6489,73 @@ mod tests {
                 .unwrap()][..]
             )
         );
+    }
+
+    #[test]
+    fn every_pipeline_selectable_asr_publishes_an_atomic_long_form_graph() {
+        // The diarization pipeline loads its ASR long-form on every backend
+        // and refuses a contract without an atomic stage, so every variant the
+        // pipeline resolver accepts must publish one: in the sealed bundle and
+        // in the weight-free probe the pipeline runs before diarizing.
+        let registry = RuntimeAdapterRegistry::built_in();
+        let mut selectable = Vec::new();
+        for &variant in ModelVariant::all() {
+            if crate::catalog::resolve_diarization_asr_model_variant(Some(variant.dir_name()))
+                != Ok(variant)
+            {
+                continue;
+            }
+            selectable.push(variant);
+            for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+                assert!(
+                    registry
+                        .supports_atomic_long_form(CapabilityKind::Asr, variant, backend)
+                        .unwrap_or_else(|error| panic!("{variant}/{backend:?}: {error}")),
+                    "{variant}/{backend:?} probe has no atomic long-form graph"
+                );
+                let draft = LoadedModelBundleDraft::build(
+                    &registry,
+                    ExecutionGroupId::new(7),
+                    ModelInstanceId::new(1),
+                    variant,
+                    backend,
+                )
+                .unwrap();
+                install_test_preparation_seals(&draft, backend, 1);
+                let contract = draft
+                    .capabilities
+                    .get(&CapabilityKind::Asr)
+                    .unwrap()
+                    .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+                    .unwrap();
+                assert!(
+                    contract_supports_atomic_blocking(&contract),
+                    "{variant}/{backend:?} long-form contract has no atomic stage"
+                );
+                assert!(
+                    contract
+                        .adapter_binding()
+                        .unwrap()
+                        .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe".into(),
+                        })
+                        .is_ok(),
+                    "{variant}/{backend:?} cannot place a diarization transcription"
+                );
+            }
+        }
+        // Every native ASR family and Voxtral is selectable by its catalog id
+        // (no variant escapes the check through an unparseable name), and no
+        // audio-chat model is: the pipeline cannot hold one as its ASR.
+        let expected = ModelVariant::all()
+            .iter()
+            .copied()
+            .filter(|variant| variant.is_asr() || variant.is_voxtral())
+            .collect::<Vec<_>>();
+        assert_eq!(selectable, expected);
+        assert!(selectable.contains(&ModelVariant::ParakeetTdt06BV3));
+        assert!(selectable.contains(&ModelVariant::VoxtralMini4BRealtime2602));
+        assert!(!selectable.contains(&ModelVariant::Lfm25Audio15BGguf));
     }
 
     #[test]

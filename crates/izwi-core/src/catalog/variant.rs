@@ -458,6 +458,24 @@ pub fn resolve_asr_model_variant(input: Option<&str>) -> ModelVariant {
     }
 }
 
+/// Resolve the ASR model of the diarization transcript pipeline. The pipeline
+/// transcribes through the native ASR registry (or its Voxtral route) with an
+/// atomic long-form graph, so audio-chat models are not accepted. An explicit
+/// id that is unknown or not such a model is an error, never a silent
+/// fallback to the default.
+pub fn resolve_diarization_asr_model_variant(input: Option<&str>) -> Result<ModelVariant, String> {
+    let Some(raw) = input else {
+        return Ok(ModelVariant::ParakeetTdt06BV3);
+    };
+    match parse_model_variant(raw) {
+        Ok(variant) if variant.is_asr() || variant.is_voxtral() => Ok(variant),
+        Ok(variant) => Err(format!(
+            "Model '{raw}' cannot transcribe in the diarization pipeline (resolved to {variant:?}); choose an ASR model."
+        )),
+        Err(_) => Err(format!("Unknown diarization ASR model id '{raw}'.")),
+    }
+}
+
 pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     use ModelVariant::*;
 
@@ -869,6 +887,37 @@ fn normalize_identifier(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diarization_asr_resolution_rejects_unknown_and_non_native_ids() {
+        assert_eq!(
+            resolve_diarization_asr_model_variant(None),
+            Ok(ModelVariant::ParakeetTdt06BV3)
+        );
+        assert_eq!(
+            resolve_diarization_asr_model_variant(Some("parakeet-tdt-0.6b-v3")),
+            Ok(ModelVariant::ParakeetTdt06BV3)
+        );
+        assert_eq!(
+            resolve_diarization_asr_model_variant(Some("Whisper-Large-v3-Turbo")),
+            Ok(ModelVariant::WhisperLargeV3Turbo)
+        );
+        assert_eq!(
+            resolve_diarization_asr_model_variant(Some("Voxtral-Mini-4B-Realtime-2602")),
+            Ok(ModelVariant::VoxtralMini4BRealtime2602)
+        );
+        for rejected in [
+            "bogus",
+            "LFM2.5-Audio-1.5B-GGUF",
+            "Qwen3-ForcedAligner-0.6B",
+            "Qwen3.5-4B",
+        ] {
+            assert!(
+                resolve_diarization_asr_model_variant(Some(rejected)).is_err(),
+                "{rejected} must not silently become the default pipeline ASR"
+            );
+        }
+    }
 
     #[test]
     fn parse_by_repo_tail() {

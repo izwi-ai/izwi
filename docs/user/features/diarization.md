@@ -88,8 +88,8 @@ POST /v1/speech-to-text/jobs?job_kind=diarization
 |-------|------|-------------|
 | `file` | File | Audio file to analyze |
 | `model` | String | Diarization model (`diar_streaming_sortformer_4spk-v2.1` or `Nemotron-3-Diarization`). The selected checkpoint bounds `max_speakers`: 4 for Sortformer v2.1, 8 for Nemotron-3 |
-| `asr_model` | String | Optional ASR model override |
-| `aligner_model` | String | Optional forced aligner model override |
+| `asr_model` | String | Optional ASR model override (an ASR or Voxtral model; other ids return 400) |
+| `aligner_model` | String | Optional forced aligner model override (non-aligner ids return 400) |
 | `llm_model` | String | Optional transcript refinement model |
 | `min_speakers` | Integer | Optional minimum expected speakers |
 | `max_speakers` | Integer | Optional maximum expected speakers |

@@ -1,7 +1,8 @@
 //! Diarization runtime methods.
 
 use crate::catalog::{
-    resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
+    resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
+    resolve_diarization_model_variant,
 };
 use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
@@ -606,6 +607,22 @@ impl RuntimeService {
         }
         audio_input.validate_retained_size()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
+        // Refuse an ASR or aligner the pipeline cannot run before diarizing:
+        // the ASR's long-form graph must run as one blocking stage (the
+        // predicate the post-load guard applies).
+        let asr_variant =
+            resolve_diarization_asr_model_variant(asr_model_id).map_err(Error::InvalidInput)?;
+        if !self.adapter_registry.supports_atomic_long_form(
+            CapabilityKind::Asr,
+            asr_variant,
+            self.backend_context().backend_kind,
+        )? {
+            return Err(Error::InvalidInput(format!(
+                "{asr_variant} cannot transcribe in the diarization pipeline: it has no atomic long-form graph"
+            )));
+        }
+        let aligner_variant =
+            crate::runtime::asr::resolve_forced_aligner_variant(aligner_model_id)?;
         self.observe_broker_capability_request(
             CapabilityKind::Diarization,
             Some(diarization_variant),
@@ -689,7 +706,6 @@ impl RuntimeService {
             )
             .await?;
 
-        let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
         self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
         let asr_target = self
             .adapter_registry
@@ -722,9 +738,6 @@ impl RuntimeService {
             ),
         };
 
-        let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
-            runtime_request.aligner_model_id.as_deref(),
-        )?;
         let aligner_binding = match self
             .load_capability_for_job(
                 &pipeline_job,
@@ -2500,6 +2513,37 @@ mod tests {
         assert_eq!(metal.host_bytes, ResourceAmount::Known(0));
         assert_eq!(metal.device_bytes, ResourceAmount::Known(0));
         assert_eq!(cuda.unified_bytes, ResourceAmount::Known(0));
+    }
+
+    #[tokio::test]
+    async fn pipeline_rejects_an_unrunnable_asr_or_aligner_before_diarizing() {
+        // No checkpoints exist here: an id that reached Sortformer would fail
+        // with a load or decode error instead of naming the rejected model.
+        let runtime = RuntimeService::new(crate::config::EngineConfig {
+            models_dir: std::env::temp_dir().join("izwi-diarization-pipeline-validation"),
+            ..crate::config::EngineConfig::default()
+        })
+        .expect("runtime");
+        let audio = vec![7_u8; 64];
+        let config = DiarizationConfig::default();
+        for (asr, aligner, rejected) in [
+            (Some("bogus"), None, "bogus"),
+            (
+                Some("LFM2.5-Audio-1.5B-GGUF"),
+                None,
+                "LFM2.5-Audio-1.5B-GGUF",
+            ),
+            (None, Some("Parakeet-TDT-0.6B-v3"), "not a forced aligner"),
+        ] {
+            let error = runtime
+                .diarize_with_transcript_bytes(&audio, None, asr, aligner, None, &config, false)
+                .await
+                .expect_err("an unrunnable pipeline model must be rejected");
+            assert!(
+                matches!(&error, Error::InvalidInput(message) if message.contains(rejected)),
+                "{asr:?}/{aligner:?}: {error}"
+            );
+        }
     }
 
     #[allow(clippy::await_holding_lock)]

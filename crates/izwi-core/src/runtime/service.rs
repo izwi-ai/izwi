@@ -30,10 +30,9 @@ use crate::engine::metrics::{
 };
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
-    StageWorkSelector, Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason,
-    ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig,
-    WorkloadClass,
+    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
+    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
@@ -88,8 +87,9 @@ use crate::models::architectures::whisper::asr::{
 use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
-    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
+    contract_supports_atomic_blocking, CapabilityKind, ExecutionTargetKind,
+    LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry,
+    StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
@@ -2612,14 +2612,7 @@ fn loaded_contract_for_residency(
             expected_target.expect("checked as some")
         )));
     }
-    if asr_long_form
-        && !contract.stages.iter().any(|stage| {
-            matches!(
-                stage.selector,
-                StageWorkSelector::Atomic | StageWorkSelector::Any
-            )
-        })
-    {
+    if asr_long_form && !contract_supports_atomic_blocking(&contract) {
         return Err(Error::InvalidInput(format!(
             "loaded capability {:?} for {} does not support atomic blocking execution",
             capability,
