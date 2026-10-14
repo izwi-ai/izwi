@@ -816,109 +816,116 @@ impl RuntimeService {
             InferenceStateRequirement::Invocation
                 | InferenceStateRequirement::RetainedAndInvocation
         );
-        let _asr_lease = asr_lease;
-
-        let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
-            let audio_for_task = audio.clone();
-            let transcription = if invocation_asr {
-                self.coordinator
-                    .run_loaded_blocking_stage_with_invocation_workspace(
-                        &pipeline_job,
-                        asr_contract,
-                        asr_state,
-                        WorkUnit::AtomicJob {
-                            kind: "diarization.transcribe".to_string(),
-                        },
-                        move |leases| {
-                            asr_model.transcribe_from_invocation_workspace(
-                                &audio_for_task.samples,
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                                None,
-                                NativeAsrGenerationOptions::default(),
-                                leases,
-                            )
-                        },
-                    )
-                    .await?
+        // Every ASR handle (residency lease, model, contract and state) moves
+        // into this block and drops at its end, so the ASR is evictable before
+        // the aligner runs and the refinement LLM loads (ADM-8). Dropping only
+        // the lease would let eviction count weights the model still pins.
+        let (asr_text, chunk_texts, detected_language) = {
+            let _asr_lease = asr_lease;
+            let (asr_model, asr_contract, asr_state) = (asr_model, asr_contract, asr_state);
+            if use_single_pass_asr {
+                let audio_for_task = audio.clone();
+                let transcription = if invocation_asr {
+                    self.coordinator
+                        .run_loaded_blocking_stage_with_invocation_workspace(
+                            &pipeline_job,
+                            asr_contract,
+                            asr_state,
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.transcribe".to_string(),
+                            },
+                            move |leases| {
+                                asr_model.transcribe_from_invocation_workspace(
+                                    &audio_for_task.samples,
+                                    PIPELINE_SAMPLE_RATE,
+                                    None,
+                                    None,
+                                    NativeAsrGenerationOptions::default(),
+                                    leases,
+                                )
+                            },
+                        )
+                        .await?
+                } else {
+                    self.coordinator
+                        .run_loaded_blocking_stage(
+                            &pipeline_job,
+                            asr_contract,
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.transcribe".to_string(),
+                            },
+                            move || {
+                                asr_model.transcribe_with_details(
+                                    &audio_for_task.samples,
+                                    PIPELINE_SAMPLE_RATE,
+                                    None,
+                                )
+                            },
+                        )
+                        .await?
+                };
+                (transcription.text, Vec::new(), transcription.language)
+            } else if invocation_asr {
+                let (cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
+                let mut assembler = TranscriptAssembler::new(cfg);
+                let mut transcribed = Vec::with_capacity(chunks.len());
+                for chunk in chunks {
+                    if chunk.end_sample <= chunk.start_sample
+                        || chunk.end_sample > audio.samples.len()
+                    {
+                        continue;
+                    }
+                    let model = asr_model.clone();
+                    let chunk_audio = audio.clone();
+                    let chunk_start = chunk.start_sample;
+                    let chunk_end = chunk.end_sample;
+                    let transcription = self
+                        .coordinator
+                        .run_loaded_blocking_stage_with_invocation_workspace(
+                            &pipeline_job,
+                            asr_contract.clone(),
+                            asr_state.clone(),
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.transcribe_chunks".to_string(),
+                            },
+                            move |leases| {
+                                model.transcribe_from_invocation_workspace(
+                                    &chunk_audio.samples[chunk_start..chunk_end],
+                                    PIPELINE_SAMPLE_RATE,
+                                    None,
+                                    None,
+                                    NativeAsrGenerationOptions::default(),
+                                    leases,
+                                )
+                            },
+                        )
+                        .await?;
+                    assembler.push_chunk_text(&transcription.text);
+                    transcribed.push(TranscribedChunk {
+                        range: chunk,
+                        text: transcription.text,
+                        language: transcription.language,
+                    });
+                }
+                (assembler.finish().trim().to_string(), transcribed, None)
             } else {
-                self.coordinator
+                let audio_for_task = audio.clone();
+                let (text, chunks) = self
+                    .coordinator
                     .run_loaded_blocking_stage(
                         &pipeline_job,
                         asr_contract,
                         WorkUnit::AtomicJob {
-                            kind: "diarization.transcribe".to_string(),
-                        },
-                        move || {
-                            asr_model.transcribe_with_details(
-                                &audio_for_task.samples,
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                            )
-                        },
-                    )
-                    .await?
-            };
-            (transcription.text, Vec::new(), transcription.language)
-        } else if invocation_asr {
-            let (cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
-            let mut assembler = TranscriptAssembler::new(cfg);
-            let mut transcribed = Vec::with_capacity(chunks.len());
-            for chunk in chunks {
-                if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len()
-                {
-                    continue;
-                }
-                let model = asr_model.clone();
-                let chunk_audio = audio.clone();
-                let chunk_start = chunk.start_sample;
-                let chunk_end = chunk.end_sample;
-                let transcription = self
-                    .coordinator
-                    .run_loaded_blocking_stage_with_invocation_workspace(
-                        &pipeline_job,
-                        asr_contract.clone(),
-                        asr_state.clone(),
-                        WorkUnit::AtomicJob {
                             kind: "diarization.transcribe_chunks".to_string(),
                         },
-                        move |leases| {
-                            model.transcribe_from_invocation_workspace(
-                                &chunk_audio.samples[chunk_start..chunk_end],
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                                None,
-                                NativeAsrGenerationOptions::default(),
-                                leases,
-                            )
+                        move || {
+                            transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit)
                         },
                     )
                     .await?;
-                assembler.push_chunk_text(&transcription.text);
-                transcribed.push(TranscribedChunk {
-                    range: chunk,
-                    text: transcription.text,
-                    language: transcription.language,
-                });
+                (text, chunks, None)
             }
-            (assembler.finish().trim().to_string(), transcribed, None)
-    } else {
-        let audio_for_task = audio.clone();
-        let (text, chunks) = self
-            .coordinator
-            .run_loaded_blocking_stage(
-                &pipeline_job,
-                asr_contract,
-                WorkUnit::AtomicJob {
-                    kind: "diarization.transcribe_chunks".to_string(),
-                },
-                move || {
-                    transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit)
-                },
-            )
-            .await?;
-        (text, chunks, None)
-    };
+        };
         let asr_words = extract_words(&asr_text);
 
         let mut model_aligned_words = 0usize;
