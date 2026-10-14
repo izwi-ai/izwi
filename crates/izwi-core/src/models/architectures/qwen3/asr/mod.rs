@@ -1335,6 +1335,12 @@ const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
 const QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS: usize = 1_200;
 const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
+/// Alignable words (or CJK characters) one aligner window accepts per second
+/// of audio. Fast speech runs about 5 per second; the bound keeps the prompt
+/// (about 3.5 tokens per word) proportional to the encoded window.
+const QWEN3_ALIGNER_MAX_WORDS_PER_SECOND: f64 = 10.0;
+/// Word allowance for very short windows (a single short utterance).
+const QWEN3_ALIGNER_MIN_WORD_ALLOWANCE: usize = 32;
 const QWEN3_ASR_SAMPLE_RATE: u32 = 16_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1499,6 +1505,24 @@ fn qwen3_asr_effective_max_frames(
         .unwrap_or(0)
 }
 
+/// Longest aligner input (16 kHz samples) whose centre-padded mel, which
+/// keeps the final frame, has at most `maximum_frames` frames.
+fn qwen3_aligner_max_window_samples(maximum_frames: usize, hop_length: usize) -> usize {
+    maximum_frames
+        .saturating_sub(1)
+        .saturating_mul(hop_length.max(1))
+}
+
+/// Most alignable words one aligner window of `audio_seconds` accepts.
+fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
+    let proportional = if audio_seconds.is_finite() && audio_seconds > 0.0 {
+        (audio_seconds * QWEN3_ALIGNER_MAX_WORDS_PER_SECOND).ceil() as usize
+    } else {
+        0
+    };
+    proportional.max(QWEN3_ALIGNER_MIN_WORD_ALLOWANCE)
+}
+
 fn qwen3_asr_admit_frames(
     frames: usize,
     cuda_device_observed: bool,
@@ -1517,14 +1541,19 @@ fn qwen3_asr_admit_frames(
     if maximum == 0 || frames <= maximum {
         return Ok(frames);
     }
-    if cuda_device_observed {
-        let route = if forced_aligner {
-            "forced alignment"
-        } else {
-            "transcription"
-        };
+    // The aligner times the whole reference text against the audio it
+    // encodes, so a truncated mel would squeeze every later word into the
+    // window. Over-limit alignment is rejected on every backend; callers
+    // window the audio by `max_audio_seconds_hint`.
+    if forced_aligner {
         return Err(Error::InvalidInput(format!(
-            "Qwen3 ASR CUDA {route} input has {frames} mel frames, exceeding the explicit {maximum}-frame limit"
+            "Qwen3 forced alignment input has {frames} mel frames, exceeding the {maximum}-frame ({:.1} s) window; split the audio into windows of at most that length",
+            maximum as f64 * hop_length.max(1) as f64 / sample_rate.max(1) as f64
+        )));
+    }
+    if cuda_device_observed {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 ASR CUDA transcription input has {frames} mel frames, exceeding the explicit {maximum}-frame limit"
         )));
     }
     Ok(maximum)
@@ -1862,8 +1891,14 @@ impl Qwen3AsrModel {
             self.mel.config().hop_length,
         );
         if maximum_frames > 0 {
-            let hop = self.mel.config().hop_length.max(1) as f32;
-            return Some(maximum_frames as f32 * hop / sample_rate);
+            let hop = self.mel.config().hop_length.max(1);
+            if self.is_forced_aligner {
+                // The aligner keeps every centre-padded frame, so the window is
+                // the longest audio whose frame count still fits.
+                let samples = qwen3_aligner_max_window_samples(maximum_frames, hop);
+                return Some(samples as f32 / sample_rate);
+            }
+            return Some(maximum_frames as f32 * hop as f32 / sample_rate);
         }
         if self.preprocessor.n_samples > 0 {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
@@ -2756,8 +2791,23 @@ impl Qwen3AsrModel {
             audio.to_vec()
         };
 
-        let mut mel_spec = self.mel.compute(&audio)?;
-        let admitted_frames = qwen3_asr_admit_frames(
+        let words = extract_alignment_words(reference_text);
+        if words.is_empty() {
+            return Err(Error::InvalidInput(
+                "Reference text produced no alignable words".to_string(),
+            ));
+        }
+        let audio_seconds = audio.len() as f64 / f64::from(QWEN3_ASR_SAMPLE_RATE);
+        let max_words = qwen3_aligner_max_words(audio_seconds);
+        if words.len() > max_words {
+            return Err(Error::InvalidInput(format!(
+                "Forced alignment text has {} words for {audio_seconds:.1} s of audio; one window aligns at most {max_words}",
+                words.len()
+            )));
+        }
+
+        let mel_spec = self.mel.compute(&audio)?;
+        qwen3_asr_admit_frames(
             mel_spec.len(),
             self.device.device.is_cuda(),
             true,
@@ -2765,7 +2815,6 @@ impl Qwen3AsrModel {
             self.mel.config().sample_rate,
             self.mel.config().hop_length,
         )?;
-        mel_spec.truncate(admitted_frames);
 
         let n_mels = self.mel.config().n_mels;
         if mel_spec.is_empty() {
@@ -2790,13 +2839,6 @@ impl Qwen3AsrModel {
             audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
         }
         let audio_len = audio_embeds.dim(1)?;
-
-        let words = extract_alignment_words(reference_text);
-        if words.is_empty() {
-            return Err(Error::InvalidInput(
-                "Reference text produced no alignable words".to_string(),
-            ));
-        }
 
         let prompt = self.build_forced_aligner_prompt(audio_len, &words)?;
         let timestamp_positions: Vec<usize> = prompt
@@ -2850,7 +2892,12 @@ impl Qwen3AsrModel {
             alignments.push((word.clone(), start, end));
         }
 
-        let audio_duration_ms = ((audio.len() as f32 / 16_000.0) * 1000.0).round() as u32;
+        // Bound timings by the audio the mel frames encode.
+        let encoded_samples = frames
+            .saturating_mul(self.mel.config().hop_length.max(1))
+            .min(audio.len());
+        let audio_duration_ms =
+            ((encoded_samples as f64 * 1000.0) / f64::from(QWEN3_ASR_SAMPLE_RATE)).round() as u32;
         normalize_alignment_bounds(&mut alignments, audio_duration_ms);
         if alignment_distribution_is_degenerate(&alignments, audio_duration_ms) {
             warn!(
@@ -5036,7 +5083,71 @@ mod tests {
         assert!(error.to_string().contains("Qwen/Qwen3-ASR-0.6B"));
     }
     #[test]
-    fn cuda_audio_limits_expand_without_changing_portable_truncation() {
+    fn forced_aligner_rejects_over_limit_audio_on_every_backend() {
+        let configured = 3_000;
+        assert_eq!(
+            qwen3_asr_admit_frames(3_000, false, true, configured, 16_000, 160).unwrap(),
+            3_000
+        );
+        let error = qwen3_asr_admit_frames(3_001, false, true, configured, 16_000, 160)
+            .expect_err("CPU/Metal aligner must reject, not truncate, over-limit audio");
+        assert!(matches!(error, Error::InvalidInput(_)), "{error}");
+        assert!(error.to_string().contains("30.0 s"), "{error}");
+        assert!(qwen3_asr_admit_frames(4_000, false, true, configured, 16_000, 160).is_err());
+        assert_eq!(
+            qwen3_asr_admit_frames(18_000, true, true, configured, 16_000, 160).unwrap(),
+            18_000
+        );
+        assert!(qwen3_asr_admit_frames(18_001, true, true, configured, 16_000, 160).is_err());
+    }
+
+    #[test]
+    fn forced_aligner_window_hint_fits_the_frame_limit() {
+        let (n_fft, hop) = (400, 160);
+        for maximum in [3_000usize, 18_000] {
+            let samples = qwen3_aligner_max_window_samples(maximum, hop);
+            assert_eq!(
+                qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
+                maximum
+            );
+            assert_eq!(
+                qwen3_asr_mel_frame_count(samples + hop, n_fft, hop).unwrap(),
+                maximum + 1
+            );
+            assert!(qwen3_asr_admit_frames(
+                qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
+                maximum == 18_000,
+                true,
+                3_000,
+                16_000,
+                hop
+            )
+            .is_ok());
+        }
+        // A 30.0 s window encodes 3001 frames, so the CPU/Metal hint is 29.99 s.
+        assert_eq!(qwen3_aligner_max_window_samples(3_000, hop), 479_840);
+    }
+
+    #[test]
+    fn forced_aligner_word_bound_is_proportional_to_the_window() {
+        assert_eq!(
+            qwen3_aligner_max_words(0.0),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+        assert_eq!(
+            qwen3_aligner_max_words(1.0),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+        assert_eq!(qwen3_aligner_max_words(30.0), 300);
+        assert_eq!(qwen3_aligner_max_words(180.0), 1_800);
+        assert_eq!(
+            qwen3_aligner_max_words(f64::NAN),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+    }
+
+    #[test]
+    fn cuda_audio_limits_expand_portable_transcription_truncation() {
         let configured = 3_000;
         assert_eq!(
             qwen3_asr_admit_frames(3_001, false, false, configured, 16_000, 160).unwrap(),
