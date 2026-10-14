@@ -249,7 +249,15 @@ impl RetainedStaticAttentionRuntimeV2 {
                 components: Vec::new(),
             },
         };
-        if let Err(error) = self.lock_arena(slot)?.begin_install(&intent) {
+        // A slot whose earlier reset failed came back dirty; retry the reset
+        // here so a transient fault heals and a persistent one is reported.
+        let began = self.lock_arena(slot).and_then(|mut arena| {
+            if arena.is_dirty() {
+                arena.reset_for_reuse()?;
+            }
+            arena.begin_install(&intent)
+        });
+        if let Err(error) = began {
             state.free_slots.push(slot);
             return Err(error);
         }
@@ -310,7 +318,11 @@ impl RetainedStaticAttentionRuntimeV2 {
     ) -> Result<()> {
         let mut state = self.lock_state()?;
         let slot = self.transaction_slot_in_state(&state, transaction)?;
-        self.lock_arena(slot)?.reset_for_reuse()?;
+        // The slot returns to the pool even if its reset fails: it stays
+        // dirty, and the next install resets it before reuse.
+        let reset = self
+            .lock_arena(slot)
+            .and_then(|mut arena| arena.reset_for_reuse());
         let transaction_state = state
             .transactions
             .remove(&transaction.nonce)
@@ -321,7 +333,7 @@ impl RetainedStaticAttentionRuntimeV2 {
             .expect("transaction sequence exists under the state lock")
             .transaction_nonce = None;
         state.free_slots.push(slot);
-        Ok(())
+        reset
     }
 
     pub(crate) fn install(
@@ -368,10 +380,15 @@ impl RetainedStaticAttentionRuntimeV2 {
         rows: &[StaticAttentionRaggedRow],
         softmax_scale: f32,
     ) -> Result<Tensor> {
-        let state = self.lock_state()?;
-        let slot = self.committed_slot(&state, sequence)?;
-        self.lock_arena(slot)?
-            .attend(model_layer, queries, rows, softmax_scale)
+        // Take the slot lock before dropping the identity map (the order
+        // release uses), so the slot cannot be reset or reassigned mid-kernel
+        // while other sequences still attend concurrently.
+        let arena = {
+            let state = self.lock_state()?;
+            let slot = self.committed_slot(&state, sequence)?;
+            self.lock_arena(slot)?
+        };
+        arena.attend(model_layer, queries, rows, softmax_scale)
     }
 
     /// One authenticated physical envelope for rows backed by distinct static
@@ -449,12 +466,20 @@ impl RetainedStaticAttentionRuntimeV2 {
                 "retained static-attention sequence has an active transaction",
             ));
         }
-        if let Some(slot) = sequence_state.committed_slot {
-            self.lock_arena(slot)?.reset_for_reuse()?;
-            state.free_slots.push(slot);
-        }
+        // Owners release from Drop and cannot retry, so a failed reset must
+        // not strand the slot: it returns dirty and the next install resets it.
+        let reset = match sequence_state.committed_slot {
+            Some(slot) => {
+                let reset = self
+                    .lock_arena(slot)
+                    .and_then(|mut arena| arena.reset_for_reuse());
+                state.free_slots.push(slot);
+                reset
+            }
+            None => Ok(()),
+        };
         state.sequences.remove(&sequence.nonce);
-        Ok(())
+        reset
     }
 
     pub(crate) fn close_and_validate_drained(&self) -> Result<()> {
@@ -754,6 +779,36 @@ mod tests {
             .unwrap();
         assert!(runtime.stage_layer(transaction, layer(1, 0.0)).is_err());
         foreign.abort_install(transaction).unwrap();
+    }
+
+    #[test]
+    fn a_failed_reset_returns_the_slot_and_the_next_install_heals_it() {
+        let runtime = build_runtime(5, 1);
+        let first = runtime.register_sequence().unwrap();
+        runtime
+            .install(first, [1; 32], vec![layer(1, 0.0)])
+            .unwrap();
+        crate::backends::state::FAIL_NEXT_STATIC_ATTENTION_RESET.with(|fail| fail.set(true));
+        assert!(runtime.release_sequence(first).is_err());
+        assert!(runtime.read(first).is_err(), "the sequence is gone");
+
+        // The only slot came back dirty rather than leaking; the next install
+        // resets it and installs normally.
+        let second = runtime.register_sequence().unwrap();
+        runtime
+            .install(second, [2; 32], vec![layer(1, 5.0)])
+            .unwrap();
+        assert!(runtime.read(second).unwrap().is_some());
+
+        // A failed abort also hands its staging slot back.
+        runtime.release_sequence(second).unwrap();
+        let third = runtime.register_sequence().unwrap();
+        let transaction = runtime.begin_install(third, [3; 32], 1).unwrap();
+        crate::backends::state::FAIL_NEXT_STATIC_ATTENTION_RESET.with(|fail| fail.set(true));
+        assert!(runtime.abort_install(transaction).is_err());
+        runtime
+            .install(third, [3; 32], vec![layer(1, 3.0)])
+            .unwrap();
     }
 
     #[test]

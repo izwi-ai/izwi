@@ -19,6 +19,8 @@ pub(crate) use invocation::{
     InvocationTensorComponentSlice, InvocationTensorComponentValue, InvocationTensorDomainKind,
     InvocationTensorSnapshot, InvocationTensorStepValues, InvocationTensorUpdateV2,
 };
+#[cfg(test)]
+pub(crate) use static_attention::FAIL_NEXT_RESET as FAIL_NEXT_STATIC_ATTENTION_RESET;
 #[allow(unused_imports)]
 pub(crate) use static_attention::{
     InvocationStaticAttentionArena, StaticAttentionLayerValue, StaticAttentionMetadata,
