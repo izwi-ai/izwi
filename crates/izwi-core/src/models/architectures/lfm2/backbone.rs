@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module};
+use candle_nn::{Conv1d, Conv1dConfig, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
 use crate::backends::kv::{
@@ -494,7 +494,7 @@ struct ProjectionHead {
 pub struct QuantizedLfm2Backbone {
     cfg: Lfm2BackboneConfig,
     /// `None` for a backbone that only runs on supplied embeddings.
-    token_embeddings: Option<Embedding>,
+    token_embeddings: Option<Arc<candle_core::quantized::QTensor>>,
     output_head: ProjectionHead,
     layers: Vec<LayerWeights>,
     norm: LfmRmsNorm,
@@ -1170,24 +1170,36 @@ impl ShortConvLayer {
 }
 
 impl ProjectionHead {
-    fn load(loader: &GgufLoader, device: &Device) -> Result<Self> {
-        let weight = load_qmatmul_any(
-            loader,
-            device,
-            &[
-                "output.weight".to_string(),
-                "lm_head.weight".to_string(),
-                "model.output.weight".to_string(),
-                "model.lm_head.weight".to_string(),
-                "lfm.output.weight".to_string(),
-                "lfm.lm_head.weight".to_string(),
-                "dense_2_out.weight".to_string(),
-                "dense_2.weight".to_string(),
-                "lin.weight".to_string(),
-                "token_embd.weight".to_string(),
-                "tok_embeddings.weight".to_string(),
-            ],
-        )?;
+    /// The output projection, or for a checkpoint without one the tied token
+    /// table: `token_embeddings` when the backbone already holds it, else a
+    /// fresh read.
+    fn load(
+        loader: &GgufLoader,
+        device: &Device,
+        token_embeddings: Option<&Arc<candle_core::quantized::QTensor>>,
+    ) -> Result<Self> {
+        let untied = [
+            "output.weight",
+            "lm_head.weight",
+            "model.output.weight",
+            "model.lm_head.weight",
+            "lfm.output.weight",
+            "lfm.lm_head.weight",
+            "dense_2_out.weight",
+            "dense_2.weight",
+            "lin.weight",
+        ]
+        .map(String::from);
+        let weight = match token_embeddings {
+            Some(tied) if !untied.iter().any(|name| loader.has_tensor(name)) => {
+                QMatMul::from_weights(tied.clone()).map_err(Error::from)?
+            }
+            _ => {
+                let mut names = untied.to_vec();
+                names.extend(["token_embd.weight", "tok_embeddings.weight"].map(String::from));
+                load_qmatmul_any(loader, device, &names)?
+            }
+        };
         let bias = load_optional_bias_any(
             loader,
             device,
@@ -1231,8 +1243,8 @@ impl QuantizedLfm2Backbone {
     }
 
     /// A backbone that only ever runs on supplied embeddings, such as the
-    /// LFM2.5-Audio detokenizer: its token-embedding table (dequantized to
-    /// F32 by [`Self::load`]) is never read, so it is not loaded.
+    /// LFM2.5-Audio detokenizer: its token-embedding table is never read, so
+    /// it is not loaded.
     pub fn load_for_embeds(
         loader: &GgufLoader,
         cfg: Lfm2BackboneConfig,
@@ -1261,15 +1273,14 @@ impl QuantizedLfm2Backbone {
             "emb.emb.weight".to_string(),
             "emb.weight".to_string(),
         ];
+        // Token rows are gathered straight from the quantized table
+        // (`QTensor::embedding`, all backends), which a tied LM head shares:
+        // no dequantized copy (512 MiB F32 for LFM2.5's 65,536 x 2,048
+        // vocabulary) and no second quantized read for the head.
         let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
-            let token_embedding_q = load_qtensor_any(loader, device, &embedding_names)?;
-            let weight = token_embedding_q.dequantize(device).map_err(Error::from)?;
-            let (vocab_size, hidden_size) = weight.dims2()?;
-            (
-                Some(Embedding::new(weight, hidden_size)),
-                vocab_size,
-                hidden_size,
-            )
+            let token_embedding_q = Arc::new(load_qtensor_any(loader, device, &embedding_names)?);
+            let (vocab_size, hidden_size) = token_embedding_q.shape().dims2()?;
+            (Some(token_embedding_q), vocab_size, hidden_size)
         } else {
             let shape = embedding_names
                 .iter()
@@ -1305,7 +1316,7 @@ impl QuantizedLfm2Backbone {
             )?,
             cfg.attention_layer_norm_rms_epsilon,
         )?;
-        let output_head = ProjectionHead::load(loader, device)?;
+        let output_head = ProjectionHead::load(loader, device, token_embeddings.as_ref())?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
@@ -1512,7 +1523,7 @@ impl QuantizedLfm2Backbone {
             .ok_or_else(|| {
                 Error::InferenceError("LFM2 backbone was loaded without token embeddings".into())
             })?
-            .forward(token_ids)
+            .embedding(token_ids)
             .map_err(Error::from)
     }
 

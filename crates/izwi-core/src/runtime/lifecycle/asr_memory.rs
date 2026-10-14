@@ -1767,10 +1767,10 @@ fn gguf_quantized(tensor: &CensusTensor) -> bool {
 }
 
 /// One LFM2 backbone GGUF (`lfm2/backbone.rs`): quantized projections stay
-/// quantized and F32 tensors load dense. With `embeds_tokens`, `token_embd`
-/// is dequantized to an F32 table, and its stored read stays alive until the
-/// backbone finishes loading. Without `output.weight`, the head reads
-/// `token_embd` a second time as a quantized projection.
+/// quantized and F32 tensors load dense. With `embeds_tokens`, token rows are
+/// gathered from the quantized `token_embd` itself; a backbone without
+/// `output.weight` uses that same tensor as its LM head, so it is read and
+/// held once either way.
 fn price_lfm2_backbone(
     ledger: &mut Ledger,
     backbone: &CensusFile,
@@ -1778,10 +1778,6 @@ fn price_lfm2_backbone(
 ) -> Result<()> {
     let tensors = by_name(std::slice::from_ref(backbone));
     let embedding = tensor(&tensors, "token_embd.weight")?;
-    if embeds_tokens {
-        ledger.gguf_dense(embedding, DType::F32)?;
-        ledger.hold(embedding.stored_bytes)?;
-    }
     for (name, tensor) in &tensors {
         if *name == "token_embd.weight" {
             continue;
@@ -1792,11 +1788,10 @@ fn price_lfm2_backbone(
             ledger.gguf_dense(tensor, DType::F32)?;
         }
     }
-    if !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight") {
+    let tied_head =
+        !tensors.contains_key("output.weight") && !tensors.contains_key("dense_2.weight");
+    if embeds_tokens || tied_head {
         ledger.gguf_stored(embedding)?;
-    }
-    if embeds_tokens {
-        ledger.release(embedding.stored_bytes)?;
     }
     Ok(())
 }
@@ -2131,21 +2126,21 @@ pub(super) mod tests {
     /// over 128,000 positions; head dims 2048 / 32 and 512 / 16.
     const LFM_ROPE_TABLES: [(usize, usize); 2] = [(128_000, 64), (128_000, 32)];
 
-    /// LFM2.5-1.2B chat prices the F32 token table beside the quantized
-    /// checkpoint (its Q6_K `token_embd` is read twice: once dequantized,
-    /// once as the tied LM head) and RoPE tables over the 32K chat context.
+    /// LFM2.5-1.2B chat prices the quantized checkpoint once (its Q6_K
+    /// `token_embd` serves the row gather and the tied LM head) plus RoPE
+    /// tables over the 32K chat context.
     /// The generic estimate priced the GGUF bytes alone (728.5 MB on CPU and
     /// Metal) and the 2 GiB catalog figure on CUDA.
     #[test]
-    fn lfm25_chat_prices_the_f32_embedding_head_and_rope_tables() {
+    fn lfm25_chat_prices_the_shared_quantized_table_and_rope_tables() {
         let files = census!("lfm2_5_1_2b_instruct_q4_k_m.json");
         let gguf = &files[0];
         assert_eq!(gguf.tensors.len(), 148);
         let stored: u64 = gguf.tensors.iter().map(|tensor| tensor.stored_bytes).sum();
         assert_eq!(stored, 728_509_440);
-        let embedding_f32 = 65_536 * 2_048 * 4;
         let rope = 32_768 * 32 * 4 * 4;
-        let logical = stored + embedding_f32 + rope;
+        // The quantized table is held once, for the gather and the tied head.
+        let logical = stored + rope;
         for backend in BACKENDS {
             let plan = price_lfm2_chat(gguf, backend, (32_768, 64)).unwrap();
             assert_eq!(plan.logical_resident_bytes, logical, "{backend:?}");
@@ -2272,10 +2267,12 @@ pub(super) mod tests {
                 Box::new(voxtral),
                 [16.50, 8.25, 8.25, 8.25],
             ),
+            // The main backbone gathers token rows from its quantized table
+            // (shared with its tied head) instead of a 0.5 GiB F32 copy.
             (
                 "LFM2.5-Audio-1.5B",
                 Box::new(lfm25_audio),
-                [1.96, 1.96, 1.96, 1.96],
+                [1.46, 1.46, 1.46, 1.46],
             ),
         ];
         for (label, plan, [cpu, metal_exact, metal_allocated, cuda]) in rows {
