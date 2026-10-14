@@ -1,0 +1,481 @@
+//! Decode-step timing for LFM2.5-1.2B on the real GGUF (ignored; needs the
+//! checkpoint). Separates model time from engine overhead: the forward pass
+//! alone, the forward plus a blocking argmax readback, and the full
+//! `decode_step_batch` (mask, finite check, selection) for one row.
+//!
+//! Run: `cargo test -p izwi-core --features metal --release --lib lfm2::chat::bench_tests -- --ignored --nocapture`
+use super::reference_tests::{models_dir_for_bench, Sessions};
+use super::*;
+use crate::backends::DeviceProfile;
+use std::time::Instant;
+
+fn steps() -> usize {
+    std::env::var("IZWI_BENCH_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(128)
+        .min(200)
+}
+
+/// Extra rounds of the serving loop, for attaching a sampling profiler.
+fn profile_rounds() -> usize {
+    std::env::var("IZWI_BENCH_PROFILE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn bench(profile: DeviceProfile) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let backend = format!("{:?}", model.device_kind());
+    let sessions = Sessions::new(&model);
+    let device = model.device.device.clone();
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+    let config = ChatGenerationConfig::default();
+
+    // Warm up (Metal pipeline compilation, pools) before any timing.
+    let mut warm = model
+        .begin_resumable_prefill_state_managed(&prompt, 64, &config, sessions.session(3))
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut warm, &prompt, 0, prompt.len())
+        .unwrap();
+    model.decode_step(&mut warm).unwrap();
+    for _ in 0..16 {
+        model.decode_step_batch(&mut [&mut warm]).unwrap();
+    }
+    drop(warm);
+
+    // Forward only (synchronized once at the end).
+    let mut state = model
+        .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(0))
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+        .unwrap();
+    let mut position = prompt.len();
+    let started = Instant::now();
+    let mut last = None;
+    for _ in 0..steps() {
+        let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
+        last = model
+            .text_model
+            .forward_tokens_retained(
+                &input,
+                position,
+                &mut state.physical_kv,
+                &mut state.shortconv,
+                true,
+            )
+            .unwrap();
+        position += 1;
+    }
+    let _ = last.unwrap().to_vec2::<f32>().unwrap();
+    let forward_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
+
+    // Forward plus a device synchronization per token, and the host time
+    // spent inside the forward call (encoding) alone.
+    let mut state = model
+        .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(3))
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+        .unwrap();
+    let mut position = prompt.len();
+    let mut encode = std::time::Duration::ZERO;
+    let started = Instant::now();
+    for _ in 0..steps() {
+        let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
+        let call = Instant::now();
+        let logits = model
+            .text_model
+            .forward_tokens_retained(
+                &input,
+                position,
+                &mut state.physical_kv,
+                &mut state.shortconv,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        encode += call.elapsed();
+        device.synchronize().unwrap();
+        drop(logits);
+        position += 1;
+    }
+    let sync_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
+    let encode_ms = encode.as_secs_f64() * 1000.0 / steps() as f64;
+    eprintln!(
+        "{backend}: forward+sync {sync_ms:.2} ms/token, host time inside forward {encode_ms:.2} ms"
+    );
+
+    // Forward plus a blocking argmax readback per token.
+    let mut state = model
+        .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(1))
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+        .unwrap();
+    let mut position = prompt.len();
+    let started = Instant::now();
+    for _ in 0..steps() {
+        let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
+        let logits = model
+            .text_model
+            .forward_tokens_retained(
+                &input,
+                position,
+                &mut state.physical_kv,
+                &mut state.shortconv,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let finite = diagnostics::finite_flag(&logits).unwrap();
+        let _ = packed_greedy_selection(&logits, &finite).unwrap();
+        position += 1;
+    }
+    let readback_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
+
+    // The serving step: decode_step_batch with one row.
+    let mut state = model
+        .begin_resumable_prefill_state_managed(&prompt, 4096, &config, sessions.session(2))
+        .unwrap();
+    model
+        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+        .unwrap();
+    model.decode_step(&mut state).unwrap();
+    let started = Instant::now();
+    let mut served = 0;
+    for _ in 0..steps() {
+        if state.finished {
+            break;
+        }
+        model.decode_step_batch(&mut [&mut state]).unwrap();
+        served += 1;
+    }
+    let serving_ms = started.elapsed().as_secs_f64() * 1000.0 / served.max(1) as f64;
+    for _ in 0..profile_rounds() {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 200, &config, sessions.session(2))
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        model.decode_step(&mut state).unwrap();
+        while !state.finished {
+            model.decode_step_batch(&mut [&mut state]).unwrap();
+        }
+    }
+    eprintln!(
+        "{backend}: forward {forward_ms:.2} ms/token ({:.0} tok/s), +argmax readback {readback_ms:.2} ms, decode_step_batch {serving_ms:.2} ms ({:.0} tok/s, {served} steps)",
+        1000.0 / forward_ms,
+        1000.0 / serving_ms
+    );
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_decode_step_timing_cpu() {
+    bench(DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_decode_step_timing_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !profile.device.is_metal() {
+        return;
+    }
+    bench(profile);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF and an NVIDIA GPU"]
+fn lfm25_decode_step_timing_cuda() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Cuda).unwrap();
+    if !profile.device.is_cuda() {
+        return;
+    }
+    bench(profile);
+}
+
+/// GPU time of the decode-shaped (one row) quantized projections alone:
+/// `iterations` back-to-back forwards, one synchronization at the end.
+fn projection_bandwidth(device: &candle_core::Device) {
+    use candle_core::quantized::QMatMul;
+    use candle_core::Module;
+    let path = models_dir_for_bench()
+        .join("LFM2.5-1.2B-Instruct-GGUF")
+        .join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf");
+    if !path.exists() {
+        return;
+    }
+    let loader = GgufLoader::from_path(&path).unwrap();
+    for name in [
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.2.ffn_down.weight",
+        "blk.0.shortconv.in_proj.weight",
+        "blk.0.shortconv.out_proj.weight",
+        "blk.2.attn_k.weight",
+        "token_embd.weight",
+    ] {
+        let qtensor = loader.load_qtensor(name, device).unwrap();
+        let dtype = qtensor.dtype();
+        let bytes = qtensor.storage_size_in_bytes();
+        let (rows, cols) = qtensor.shape().dims2().unwrap();
+        let matmul = QMatMul::from_qtensor(qtensor).unwrap();
+        let input = Tensor::randn(0f32, 1f32, (1, cols), device).unwrap();
+        for _ in 0..8 {
+            let _ = matmul.forward(&input).unwrap();
+        }
+        device.synchronize().unwrap();
+        let iterations = 200;
+        let started = Instant::now();
+        let mut last = None;
+        for _ in 0..iterations {
+            last = Some(matmul.forward(&input).unwrap());
+        }
+        device.synchronize().unwrap();
+        drop(last);
+        let micros = started.elapsed().as_secs_f64() * 1e6 / iterations as f64;
+        eprintln!(
+            "{name:34} {dtype:?} [{rows}x{cols}] {:6.2} MB {micros:8.1} us/call {:6.1} GB/s",
+            bytes as f64 / 1e6,
+            bytes as f64 / micros / 1e3
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_projection_bandwidth_metal() {
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        return;
+    };
+    projection_bandwidth(&device);
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_projection_bandwidth_cpu() {
+    projection_bandwidth(&candle_core::Device::Cpu);
+}
+
+/// GPU time of the per-step selection ops over one 65,536-wide logits row.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "timing"]
+fn lfm25_selection_ops_metal() {
+    let Some(device) = crate::backends::metal_device_if_available(0) else {
+        return;
+    };
+    let logits = Tensor::randn(0f32, 1f32, (1, 65_536), &device).unwrap();
+    let mask = Tensor::zeros(65_536, DType::F32, &device).unwrap();
+    let time = |label: &str, op: &dyn Fn() -> Tensor| {
+        for _ in 0..8 {
+            let _ = op();
+        }
+        device.synchronize().unwrap();
+        let started = Instant::now();
+        let mut last = None;
+        for _ in 0..200 {
+            last = Some(op());
+        }
+        device.synchronize().unwrap();
+        drop(last);
+        eprintln!(
+            "{label:24} {:8.1} us",
+            started.elapsed().as_secs_f64() * 1e6 / 200.0
+        );
+    };
+    time("mask broadcast_add", &|| {
+        logits.broadcast_add(&mask).unwrap()
+    });
+    time("argmax", &|| logits.argmax(D::Minus1).unwrap());
+    time("finite flag", &|| {
+        diagnostics::finite_flag(&logits).unwrap()
+    });
+    time("max_all", &|| logits.max_all().unwrap());
+}
+
+/// Scalar vs one-row batched decode forward, interleaved step by step so
+/// both see the same machine state; each step is synchronized.
+fn scalar_vs_batched(profile: DeviceProfile) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let sessions = Sessions::new(&model);
+    let device = model.device.device.clone();
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+    let config = ChatGenerationConfig::default();
+    let mut new_state = |index| {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(index))
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        state.unconsumed_output = None;
+        state
+    };
+    let mut scalar = new_state(0);
+    let mut batched = new_state(1);
+    let (mut scalar_time, mut batched_time) =
+        (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let steps = steps();
+    for step in 0..steps + 8 {
+        let position = prompt.len() + step;
+        let started = Instant::now();
+        let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
+        let logits = model
+            .text_model
+            .forward_tokens_retained(
+                &input,
+                position,
+                &mut scalar.physical_kv,
+                &mut scalar.shortconv,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let _ = logits.to_vec2::<f32>().unwrap();
+        if step >= 8 {
+            scalar_time += started.elapsed();
+        }
+        let started = Instant::now();
+        let logits = model
+            .text_model
+            .forward_token_ids_retained_batch(
+                &[1234],
+                &[position],
+                &mut [&mut batched.shortconv],
+                &mut [&mut batched.physical_kv],
+            )
+            .unwrap();
+        let _ = logits.to_vec2::<f32>().unwrap();
+        if step >= 8 {
+            batched_time += started.elapsed();
+        }
+    }
+    let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+    eprintln!(
+        "{:?}: scalar forward {:.2} ms/token, one-row batched forward {:.2} ms/token",
+        model.device_kind(),
+        per(scalar_time),
+        per(batched_time)
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_scalar_vs_batched_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        scalar_vs_batched(profile);
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_scalar_vs_batched_cpu() {
+    scalar_vs_batched(DeviceProfile::cpu());
+}
+
+/// One-sync decode step (deferred KV commit, packed greedy readback) vs the
+/// previous three-sync sequence (sealed forward, finite readback, argmax
+/// readback), interleaved step by step on one row each.
+fn one_sync_vs_three(profile: DeviceProfile) {
+    let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let sessions = Sessions::new(&model);
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
+    let config = ChatGenerationConfig::default();
+    let new_state = |index| {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 1024, &config, sessions.session(index))
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        state
+    };
+    let mut old = new_state(0);
+    let mut new = new_state(1);
+    let (mut old_time, mut new_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let steps = steps();
+    for step in 0..steps + 8 {
+        let position = prompt.len() + step;
+        let started = Instant::now();
+        let logits = model
+            .text_model
+            .forward_token_ids_retained_batch(
+                &[1234],
+                &[position],
+                &mut [&mut old.shortconv],
+                &mut [&mut old.physical_kv],
+            )
+            .unwrap();
+        model.tokenizer.validate_logits(&logits).unwrap();
+        let masked = model.mask_non_generatable(&logits).unwrap();
+        let _ = masked.argmax(D::Minus1).unwrap().to_vec1::<u32>().unwrap();
+        if step >= 8 {
+            old_time += started.elapsed();
+        }
+        let started = Instant::now();
+        let (logits, pending) = model
+            .text_model
+            .forward_token_ids_retained_batch_deferred(
+                &[1234],
+                &[position],
+                &[&new.shortconv],
+                &[&new.physical_kv],
+            )
+            .unwrap();
+        let finite = diagnostics::finite_flag(&logits).unwrap();
+        let masked = model.mask_non_generatable(&logits).unwrap();
+        let _ = packed_greedy_selection(&masked, &finite).unwrap();
+        pending
+            .commit(&mut [&mut new.shortconv], &mut [&mut new.physical_kv])
+            .unwrap();
+        if step >= 8 {
+            new_time += started.elapsed();
+        }
+    }
+    let per = |time: std::time::Duration| time.as_secs_f64() * 1000.0 / steps as f64;
+    eprintln!(
+        "{:?}: three-sync step {:.2} ms/token, one-sync step {:.2} ms/token",
+        model.device_kind(),
+        per(old_time),
+        per(new_time)
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUF"]
+fn lfm25_one_sync_vs_three_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if profile.device.is_metal() {
+        one_sync_vs_three(profile);
+    }
+}

@@ -325,6 +325,51 @@ fn direct_shortconv_ring(
     Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2).map_err(Error::from)
 }
 
+/// One decode step's KV writes and next ShortConv states, not yet
+/// committed. Dropping it without [`Self::commit`] or [`Self::abort_with`]
+/// would orphan in-flight writes, so both consume it.
+#[must_use = "a pending decode step must be committed or aborted"]
+pub(crate) struct Lfm2PendingDecodeCommit {
+    completions: KvWriteCompletionCollector,
+    working: Vec<Lfm2ShortConvRuntimeState>,
+    positions: Vec<usize>,
+}
+
+impl Lfm2PendingDecodeCommit {
+    /// Wait for the step's KV writes (already done when the caller has read
+    /// the logits back), then advance every row's cache and ShortConv state.
+    pub(crate) fn commit(
+        self,
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<()> {
+        if states.len() != self.working.len() || caches.len() != self.positions.len() {
+            return Err(self.abort_with(Error::InvalidInput(
+                "LFM2 pending decode commit rows do not match".into(),
+            )));
+        }
+        let completion = Arc::new(self.completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(self.positions[row], 1, completion.clone())?;
+        }
+        for (state, working) in states.iter_mut().zip(self.working) {
+            **state = working;
+        }
+        Ok(())
+    }
+
+    /// Drain the step's writes without committing them, returning `error`
+    /// (annotated if the drain also fails).
+    pub(crate) fn abort_with(self, error: Error) -> Error {
+        match self.completions.drain() {
+            Ok(()) => error,
+            Err(drain) => Error::InferenceError(format!(
+                "LFM2 decode step failed: {error}; fence drain failed: {drain}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Mlp {
     gate: QMatMul,
@@ -1429,6 +1474,36 @@ impl QuantizedLfm2Backbone {
         self.project_last_hidden(&hidden)
     }
 
+    /// [`Self::forward_token_ids_retained_batch`] without waiting for the
+    /// step's KV writes: the logits are returned with the step's pending
+    /// commit, and the rows' caches and ShortConv states stay unchanged until
+    /// [`Lfm2PendingDecodeCommit::commit`]. A caller that reads the logits back
+    /// first commits after the device has already drained, so the step pays
+    /// one synchronization instead of a fence wait before the LM head plus a
+    /// readback after it.
+    pub(crate) fn forward_token_ids_retained_batch_deferred(
+        &self,
+        token_ids: &[u32],
+        positions: &[usize],
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+    ) -> Result<(Tensor, Lfm2PendingDecodeCommit)> {
+        let batch = token_ids.len();
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 retained decode batch is empty".into(),
+            ));
+        }
+        let input = Tensor::from_slice(token_ids, (batch, 1), self.norm.weight.device())?;
+        let embeds = self.embed_tokens(&input)?;
+        let (hidden, pending) =
+            self.forward_embeds_retained_step_batch_deferred(&embeds, positions, states, caches)?;
+        match self.project_last_hidden(&hidden) {
+            Ok(logits) => Ok((logits, pending)),
+            Err(error) => Err(pending.abort_with(error)),
+        }
+    }
+
     fn forward_embeds_retained_step_batch(
         &self,
         input_embeds: &Tensor,
@@ -1436,6 +1511,27 @@ impl QuantizedLfm2Backbone {
         states: &mut [&mut Lfm2ShortConvRuntimeState],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
+        let (hidden, pending) = {
+            let state_refs = states.iter().map(|state| &**state).collect::<Vec<_>>();
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            self.forward_embeds_retained_step_batch_deferred(
+                input_embeds,
+                positions,
+                &state_refs,
+                &cache_refs,
+            )?
+        };
+        pending.commit(states, caches)?;
+        Ok(hidden)
+    }
+
+    fn forward_embeds_retained_step_batch_deferred(
+        &self,
+        input_embeds: &Tensor,
+        positions: &[usize],
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+    ) -> Result<(Tensor, Lfm2PendingDecodeCommit)> {
         let (batch, seq_len, hidden_size) = input_embeds.dims3()?;
         if batch == 0
             || seq_len != 1
@@ -1457,7 +1553,7 @@ impl QuantizedLfm2Backbone {
                 ));
             }
         }
-        let first = &*caches[0];
+        let first = caches[0];
         let slots = caches
             .iter()
             .enumerate()
@@ -1482,16 +1578,13 @@ impl QuantizedLfm2Backbone {
                 let hidden = layer.operator_norm.forward(&hidden_states)?;
                 diagnostics::check_batch_layer(&hidden, "operator norm", layer_idx, positions)?;
                 let hidden = match &layer.kind {
-                    LayerKind::Attention(attention) => {
-                        let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
-                        attention.forward_retained_decode_batch(
-                            &hidden,
-                            positions,
-                            &cache_refs,
-                            lowered.as_ref(),
-                            &mut completions,
-                        )?
-                    }
+                    LayerKind::Attention(attention) => attention.forward_retained_decode_batch(
+                        &hidden,
+                        positions,
+                        caches,
+                        lowered.as_ref(),
+                        &mut completions,
+                    )?,
                     LayerKind::ShortConv(shortconv) => {
                         let mut refs = working.iter_mut().collect::<Vec<_>>();
                         shortconv.forward_retained_decode_batch(&hidden, &mut refs)?
@@ -1537,14 +1630,23 @@ impl QuantizedLfm2Backbone {
             }
         };
         for state in &mut working {
-            state.advance(1)?;
+            if let Err(error) = state.advance(1) {
+                return Err(Lfm2PendingDecodeCommit {
+                    completions,
+                    working: Vec::new(),
+                    positions: Vec::new(),
+                }
+                .abort_with(error));
+            }
         }
-        let completion = Arc::new(completions.seal()?);
-        for (row, cache) in caches.iter_mut().enumerate() {
-            cache.commit_shared_completion(positions[row], 1, completion.clone())?;
-            **states.get_mut(row).expect("state row exists") = working[row].clone();
-        }
-        Ok(hidden)
+        Ok((
+            hidden,
+            Lfm2PendingDecodeCommit {
+                completions,
+                working,
+                positions: positions.to_vec(),
+            },
+        ))
     }
 
     pub(crate) fn forward_embeds_retained_batch(

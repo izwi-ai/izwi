@@ -327,12 +327,11 @@ impl ChatTokenizer {
     }
 
     fn validate_logits(&self, logits: &Tensor) -> Result<()> {
-        let stage = if diagnostics::enabled() {
-            "LFM2 raw logits before sampling (activation diagnostics enabled)"
-        } else {
-            "LFM2 raw logits before sampling (activation diagnostics disabled; set IZWI_LFM2_DIAGNOSTICS=1 in the server process)"
-        };
-        diagnostics::validate_finite(logits, stage)?;
+        diagnostics::validate_finite(logits, logits_stage())?;
+        self.validate_logits_width(logits)
+    }
+
+    fn validate_logits_width(&self, logits: &Tensor) -> Result<()> {
         if logits.dim(D::Minus1)? < self.vocab_size {
             return Err(Error::InferenceError(
                 "LFM2 logits are smaller than tokenizer vocabulary".into(),
@@ -734,46 +733,80 @@ impl Lfm2ChatModel {
         }
         let mut tokens = Vec::with_capacity(states.len());
         let mut positions = Vec::with_capacity(states.len());
-        let mut shortconv = Vec::with_capacity(states.len());
-        let mut caches = Vec::with_capacity(states.len());
         for state in states.iter_mut() {
             tokens.push(state.pending_token.take().expect("pending token checked"));
             positions.push(state.position);
-            shortconv.push(&mut state.shortconv);
-            caches.push(&mut state.physical_kv);
         }
-        let logits = self.text_model.forward_token_ids_retained_batch(
-            &tokens,
-            &positions,
-            &mut shortconv,
-            &mut caches,
-        )?;
-        drop(shortconv);
-        drop(caches);
-        self.tokenizer.validate_logits(&logits)?;
-        let logits = self.mask_non_generatable(&logits)?;
-        // DS9.3: rows collecting logprobs must sample through the resolving
-        // path, which forfeits the batched argmax for the whole envelope.
-        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
-        let next_tokens = if states.iter().all(|state| state.greedy) && !wants_logprobs {
-            argmax_batch(&logits.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?)?
-                .into_iter()
-                .map(|token| (token, None))
-                .collect::<Vec<_>>()
-        } else {
-            let mut sampled = Vec::with_capacity(states.len());
-            for (row, state) in states.iter_mut().enumerate() {
-                let row_logits = logits.i(row)?;
-                sampled.push(self.sample_token(state, &row_logits)?);
-            }
-            sampled
+        // The step's KV writes and ShortConv states are committed only after
+        // the next tokens are read back: by then the device has drained, so
+        // the whole step costs one synchronization.
+        let (logits, pending) = {
+            let shortconv = states.iter().map(|state| &state.shortconv).collect::<Vec<_>>();
+            let caches = states.iter().map(|state| &state.physical_kv).collect::<Vec<_>>();
+            self.text_model.forward_token_ids_retained_batch_deferred(
+                &tokens,
+                &positions,
+                &shortconv,
+                &caches,
+            )?
         };
+        let next_tokens = match self.select_batch_tokens(states, &logits) {
+            Ok(next_tokens) => next_tokens,
+            Err(error) => return Err(pending.abort_with(error)),
+        };
+        {
+            let mut shortconv = Vec::with_capacity(states.len());
+            let mut caches = Vec::with_capacity(states.len());
+            for state in states.iter_mut() {
+                let state = &mut **state;
+                shortconv.push(&mut state.shortconv);
+                caches.push(&mut state.physical_kv);
+            }
+            pending.commit(&mut shortconv, &mut caches)?;
+        }
         let mut steps = Vec::with_capacity(states.len());
         for (state, (next, logprob_entry)) in states.iter_mut().zip(next_tokens) {
             state.position = state.position.saturating_add(1);
             steps.push(self.accept_token(state, next, 1, logprob_entry)?);
         }
         Ok(steps)
+    }
+
+    /// Next token per row from finite, width-checked logits. Plain greedy
+    /// rows read their argmax and the finite flag back in one transfer;
+    /// sampled rows sample first and then read the flag from an idle device,
+    /// so either way the step synchronizes once. No token is accepted from
+    /// non-finite logits.
+    fn select_batch_tokens(
+        &self,
+        states: &mut [&mut ChatDecodeState],
+        logits: &Tensor,
+    ) -> Result<Vec<(u32, Option<crate::engine::TokenLogprob>)>> {
+        self.tokenizer.validate_logits_width(logits)?;
+        let finite = diagnostics::finite_flag(logits)?;
+        let masked = self.mask_non_generatable(logits)?;
+        // DS9.3: rows collecting logprobs must sample through the resolving
+        // path, which forfeits the batched argmax for the whole envelope.
+        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
+        if states.iter().all(|state| state.greedy) && !wants_logprobs {
+            let (ids, all_finite) = packed_greedy_selection(
+                &masked.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?,
+                &finite,
+            )?;
+            if !all_finite {
+                return Err(diagnostics::non_finite_error(logits, logits_stage()));
+            }
+            return Ok(ids.into_iter().map(|id| (id, None)).collect());
+        }
+        let mut sampled = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            let row_logits = masked.i(row)?;
+            sampled.push(self.sample_token(state, &row_logits)?);
+        }
+        if finite.to_vec1::<f32>()?[0] == 0.0 {
+            return Err(diagnostics::non_finite_error(logits, logits_stage()));
+        }
+        Ok(sampled)
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -968,6 +1001,14 @@ pub(crate) fn lfm2_chat_load_layout(
     })
 }
 
+fn logits_stage() -> &'static str {
+    if diagnostics::enabled() {
+        "LFM2 raw logits before sampling (activation diagnostics enabled)"
+    } else {
+        "LFM2 raw logits before sampling (activation diagnostics disabled; set IZWI_LFM2_DIAGNOSTICS=1 in the server process)"
+    }
+}
+
 fn workspace_overflow() -> Error {
     Error::InvalidInput("LFM2 workspace estimate overflow".into())
 }
@@ -1011,13 +1052,22 @@ fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<
     Ok(())
 }
 
-fn argmax_batch(logits: &Tensor) -> Result<Vec<u32>> {
-    logits.dims2()?;
-    logits
-        .argmax(D::Minus1)?
-        .to_dtype(DType::U32)?
-        .to_vec1::<u32>()
-        .map_err(Error::from)
+/// Per-row argmax of `[B, V]` logits read back with a device-side `[1]`
+/// finite flag in one transfer: `(tokens, all_finite)`. Ties pick the first
+/// maximum. Token ids are below 2^24, so the F32 round trip is exact.
+fn packed_greedy_selection(logits: &Tensor, finite: &Tensor) -> Result<(Vec<u32>, bool)> {
+    let (rows, _) = logits.dims2()?;
+    let ids = logits.argmax(D::Minus1)?.to_dtype(DType::F32)?;
+    let packed = Tensor::cat(&[&ids, finite], 0)?.to_vec1::<f32>()?;
+    if packed.len() != rows + 1 {
+        return Err(Error::InferenceError(
+            "LFM2 packed greedy readback has the wrong length".into(),
+        ));
+    }
+    Ok((
+        packed[..rows].iter().map(|id| *id as u32).collect(),
+        packed[rows] != 0.0,
+    ))
 }
 
 /// The template's `content.split("</think>")[-1] | trim` for past assistant
@@ -1071,11 +1121,18 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        assert_eq!(super::argmax_batch(&logits).unwrap(), vec![1, 2, 0]);
+        let finite = super::diagnostics::finite_flag(&logits).unwrap();
         assert_eq!(
-            super::argmax_batch(&logits.narrow(0, 1, 1).unwrap()).unwrap(),
-            vec![2]
+            super::packed_greedy_selection(&logits, &finite).unwrap(),
+            (vec![1, 2, 0], true)
         );
+        assert_eq!(
+            super::packed_greedy_selection(&logits.narrow(0, 1, 1).unwrap(), &finite).unwrap(),
+            (vec![2], true)
+        );
+        let bad = Tensor::from_vec(vec![1f32, f32::NAN], (1, 2), &Device::Cpu).unwrap();
+        let bad_finite = super::diagnostics::finite_flag(&bad).unwrap();
+        assert!(!super::packed_greedy_selection(&bad, &bad_finite).unwrap().1);
     }
 
     #[test]
@@ -1156,3 +1213,7 @@ mod integrity_tests;
 #[cfg(test)]
 #[path = "chat_reference_tests.rs"]
 mod reference_tests;
+
+#[cfg(test)]
+#[path = "chat_bench_tests.rs"]
+mod bench_tests;

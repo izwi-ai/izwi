@@ -78,6 +78,10 @@ fn fixture() -> Fixture {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
+pub(super) fn models_dir_for_bench() -> PathBuf {
+    models_dir()
+}
+
 fn models_dir() -> PathBuf {
     std::env::var_os("IZWI_LFM25_MODELS_DIR")
         .map(PathBuf::from)
@@ -112,7 +116,7 @@ fn messages(raw: &[(String, String)]) -> Vec<ChatMessage> {
         .collect()
 }
 
-struct Sessions {
+pub(super) struct Sessions {
     arena: Arc<dyn KvArena>,
     id: KvArenaId,
     group: KvGroupId,
@@ -120,7 +124,7 @@ struct Sessions {
 }
 
 impl Sessions {
-    fn new(model: &Lfm2ChatModel) -> Self {
+    pub(super) fn new(model: &Lfm2ChatModel) -> Self {
         let layout = Lfm2StateLayout::from_config(&model.config).unwrap();
         let bindings: Vec<KvLayerBinding> = layout
             .attention_model_layers
@@ -178,7 +182,7 @@ impl Sessions {
         }
     }
 
-    fn session(&self, index: u32) -> PhysicalPagedKvCache {
+    pub(super) fn session(&self, index: u32) -> PhysicalPagedKvCache {
         assert!(index < SESSIONS);
         let blocks = (index * PAGES_PER_SESSION..(index + 1) * PAGES_PER_SESSION)
             .map(|block| CacheBlockRef {
