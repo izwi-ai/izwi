@@ -1646,7 +1646,8 @@ fn response_with_statuses(statuses: &[(&str, &str)]) -> Value {
     tag = "Runtime",
     summary = "Check liveness",
     responses(
-        (status = 200, description = "Server process is alive", body = LiveResponse)
+        (status = 200, description = "Server process is alive", body = LiveResponse),
+        (status = 503, description = "Inference runtime failed permanently; restart the process", body = LiveResponse)
     )
 )]
 fn livez() {}
@@ -1878,6 +1879,8 @@ pub struct LiveResponse {
     pub uptime_secs: u64,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub runtime_poisoned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_failure: Option<String>,
 }
 
 #[allow(dead_code)]

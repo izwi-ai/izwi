@@ -303,7 +303,11 @@ pub struct LifecycleSnapshot {
     pub draining: bool,
     pub started_at: u64,
     pub updated_at: u64,
+    /// Every startup warning, reported for operators.
     pub startup_warnings: Vec<String>,
+    /// The subset of startup warnings that keeps readiness failed: a
+    /// configured model that did not preload or warm up.
+    pub preload_failures: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -314,6 +318,7 @@ struct LifecycleInner {
     started_at: u64,
     updated_at: u64,
     startup_warnings: Vec<String>,
+    preload_failures: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -332,12 +337,18 @@ impl ServerLifecycle {
                 started_at: now,
                 updated_at: now,
                 startup_warnings: Vec::new(),
+                preload_failures: Vec::new(),
             })),
         }
     }
 
+    /// Draining is terminal: a startup step that finishes after shutdown
+    /// began must not make the server ready again.
     pub fn mark_ready(&self) {
         self.update(|inner| {
+            if inner.draining {
+                return;
+            }
             inner.phase = "ready".to_string();
             inner.ready = true;
             inner.draining = false;
@@ -352,9 +363,21 @@ impl ServerLifecycle {
         });
     }
 
+    /// Record non-fatal startup warnings (durable-state maintenance). They
+    /// are reported by readiness but do not fail it.
     pub fn record_startup_warnings(&self, warnings: impl IntoIterator<Item = String>) {
         self.update(|inner| {
             inner.startup_warnings.extend(warnings);
+        });
+    }
+
+    /// Record configured models that failed to preload or warm up. They are
+    /// reported with the startup warnings and keep readiness failed.
+    pub fn record_preload_failures(&self, failures: impl IntoIterator<Item = String>) {
+        self.update(|inner| {
+            let failures = failures.into_iter().collect::<Vec<_>>();
+            inner.startup_warnings.extend(failures.iter().cloned());
+            inner.preload_failures.extend(failures);
         });
     }
 
@@ -370,6 +393,7 @@ impl ServerLifecycle {
             started_at: guard.started_at,
             updated_at: guard.updated_at,
             startup_warnings: guard.startup_warnings.clone(),
+            preload_failures: guard.preload_failures.clone(),
         }
     }
 
@@ -988,6 +1012,12 @@ mod tests {
         assert_eq!(draining.phase, "draining");
         assert!(draining.updated_at >= ready.updated_at);
         assert!(draining.updated_at >= now_unix_secs().saturating_sub(1));
+
+        // A startup step finishing after shutdown began cannot undo the drain.
+        lifecycle.mark_ready();
+        let still_draining = lifecycle.snapshot();
+        assert!(!still_draining.ready);
+        assert!(still_draining.draining);
     }
 
     #[tokio::test]

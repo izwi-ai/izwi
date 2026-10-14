@@ -490,16 +490,13 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "Failed to reconcile orphaned artifact cleanup state during startup: {err}"
         )),
     }
-    startup_warnings.extend(preload_configured_models(&state).await);
-    startup_warnings.extend(warmup_preloaded_asr_models(&state).await);
-    if !startup_warnings.is_empty() {
-        state
-            .lifecycle
-            .record_startup_warnings(startup_warnings.clone());
-        for warning in startup_warnings {
-            warn!(warning = %warning, "Startup readiness warning");
-        }
+    let mut preload_failures = preload_configured_models(&state).await;
+    preload_failures.extend(warmup_preloaded_asr_models(&state).await);
+    for warning in startup_warnings.iter().chain(&preload_failures) {
+        warn!(warning = %warning, "Startup readiness warning");
     }
+    state.lifecycle.record_startup_warnings(startup_warnings);
+    state.lifecycle.record_preload_failures(preload_failures);
     state.lifecycle.mark_ready();
 
     info!("Runtime service initialized");
