@@ -5346,14 +5346,19 @@ mod tests {
         assert_eq!(decode.decode_requests[0].num_tokens, 4);
     }
 
+    /// A loaded model's sustained-quantum opt-in outlives the soft SLA on
+    /// every backend; without the opt-in, or from an unloaded profile, the
+    /// row falls back to one token per step.
     #[test]
-    fn sustained_cuda_quantum_survives_soft_sla_only_with_loaded_opt_in() {
+    fn sustained_quantum_survives_soft_sla_only_with_loaded_opt_in() {
         for (backend, loaded, enabled, expected) in [
             (BackendKind::Cuda, true, true, 2),
             (BackendKind::Cuda, true, false, 1),
             (BackendKind::Cuda, false, true, 1),
-            (BackendKind::Cpu, true, true, 1),
-            (BackendKind::Metal, true, true, 1),
+            (BackendKind::Cpu, true, true, 2),
+            (BackendKind::Cpu, true, false, 1),
+            (BackendKind::Metal, true, true, 2),
+            (BackendKind::Metal, false, true, 1),
         ] {
             let mut scheduler = Scheduler::new(SchedulerConfig {
                 max_batch_size: 2,

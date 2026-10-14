@@ -242,6 +242,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
         ))
     }
 
+    /// The loaded model's preferred decode quantum: the decode stage's work
+    /// budget must admit an isolated row's whole quantum, or every quantum
+    /// step fails its work-budget check and rolls back.
+    fn seal_chat_decode_quantum(&self, _tokens: u64) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not support chat decode quantum sealing".into(),
+        ))
+    }
+
     fn seal_qwen3_asr_audio_preparation(
         &self,
         _model: &crate::models::architectures::qwen3::asr::Qwen3AsrModel,
@@ -4497,6 +4506,8 @@ struct ContinuousChatExecutionAdapter {
     /// `(per_token_bytes, max_span_tokens)` of a model that prices its
     /// prefill activations.
     prefill_workspace: OnceLock<(u64, u64)>,
+    /// The loaded model's preferred decode quantum.
+    decode_quantum: OnceLock<u64>,
 }
 
 impl ContinuousChatExecutionAdapter {
@@ -4519,6 +4530,7 @@ impl ContinuousChatExecutionAdapter {
             max_batch_size: max_batch_size.max(1),
             workspace_per_row_bytes: OnceLock::new(),
             prefill_workspace: OnceLock::new(),
+            decode_quantum: OnceLock::new(),
         }
     }
 }
@@ -4578,6 +4590,26 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
         }
         self.prefill_workspace.set(sealed).map_err(|_| {
             Error::ModelLoadError("chat prefill workspace seal raced publication".into())
+        })
+    }
+
+    fn seal_chat_decode_quantum(&self, tokens: u64) -> Result<()> {
+        if tokens == 0 {
+            return Err(Error::ModelLoadError(
+                "chat decode quantum must be positive".into(),
+            ));
+        }
+        if let Some(existing) = self.decode_quantum.get() {
+            return if *existing == tokens {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "chat decode quantum was resealed with a different size".into(),
+                ))
+            };
+        }
+        self.decode_quantum.set(tokens).map_err(|_| {
+            Error::ModelLoadError("chat decode quantum seal raced publication".into())
         })
     }
 
@@ -4658,7 +4690,8 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
                     "continuous decode batch width exceeds work accounting".to_string(),
                 )
             })?
-            .max(CONTINUOUS_CHAT_MAX_DECODE_QUANTUM);
+            .max(CONTINUOUS_CHAT_MAX_DECODE_QUANTUM)
+            .max(self.decode_quantum.get().copied().unwrap_or(1));
         decode.workspace_per_row_bytes = workspace_per_row;
         decode.max_workspace_bytes =
             workspace_per_row
@@ -4855,6 +4888,15 @@ impl LoadedModelBundleDraft {
                 Error::ModelLoadError("loaded bundle has no chat capability to seal".into())
             })?;
         execution.seal_chat_workspace(accelerator_bytes)
+    }
+
+    pub(crate) fn seal_chat_decode_quantum(&self, tokens: u64) -> Result<()> {
+        self.capabilities
+            .get(&CapabilityKind::Chat)
+            .ok_or_else(|| {
+                Error::ModelLoadError("loaded bundle has no chat capability to seal".into())
+            })?
+            .seal_chat_decode_quantum(tokens)
     }
 
     pub(crate) fn seal_chat_prefill_workspace(

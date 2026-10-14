@@ -2537,6 +2537,9 @@ impl ModelLifecycleController {
                 bundle_draft.seal_chat_workspace(
                     loaded.continuous_decode_batch_workspace_per_row_bytes()?,
                 )?;
+                bundle_draft.seal_chat_decode_quantum(
+                    loaded.speculative_decode_profile().0.max(1) as u64,
+                )?;
                 if let Some((per_token_bytes, max_span_tokens)) = loaded.prefill_workspace()? {
                     bundle_draft.seal_chat_prefill_workspace(per_token_bytes, max_span_tokens)?;
                 }
