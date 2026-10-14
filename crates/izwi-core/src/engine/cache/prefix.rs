@@ -313,6 +313,39 @@ pub struct KvPrefixMatch {
     pub host_tail: Option<KvHostTailMatch>,
 }
 
+impl KvPrefixMatch {
+    /// Drop the last matched page, wherever it lives. Host-tail pages extend
+    /// the chain beyond `blocks`, so they must be popped before any device
+    /// block; popping a device block for a host digest would misalign the
+    /// table with the reused cursor and attach zeroed pages as history.
+    pub(crate) fn pop_last_page(&mut self, page_tokens: u32) {
+        if self.page_digests.pop().is_none() {
+            return;
+        }
+        match self.host_tail.as_mut() {
+            Some(tail) if !tail.digests.is_empty() => {
+                tail.digests.pop();
+                tail.slots.pop();
+                if tail.digests.is_empty() {
+                    self.host_tail = None;
+                }
+            }
+            _ => {
+                self.blocks.pop();
+            }
+        }
+        self.reused_tokens = self
+            .reused_tokens
+            .checked_sub(page_tokens)
+            .expect("matched chain holds complete pages");
+        debug_assert_eq!(
+            self.page_digests.len(),
+            self.blocks.len() + self.host_tail.as_ref().map_or(0, |tail| tail.digests.len()),
+            "prefix match digests must cover exactly the device and host pages"
+        );
+    }
+}
+
 /// Non-removing view of one LRU subtree, returned by
 /// [`CommittedPrefixIndex::lru_subtree`] for the DS4 demotion picker. The
 /// keys are cloned so the host chain index can re-register the pages under
@@ -616,6 +649,36 @@ mod tests {
             multimodal_artifact: None,
             cache_salt: [salt; 32],
         }
+    }
+
+    #[test]
+    fn popping_a_matched_page_consumes_the_host_tail_before_device_blocks() {
+        let digest = |byte: u8| [byte; 32];
+        let mut matched = KvPrefixMatch {
+            blocks: vec![block(0), block(1), block(2), block(3)],
+            page_digests: (0..6).map(digest).collect(),
+            reused_tokens: 6 * 4,
+            host_tail: Some(KvHostTailMatch {
+                device_end_tokens: 4 * 4,
+                digests: vec![digest(4), digest(5)],
+                slots: vec![7, 8],
+            }),
+        };
+
+        // Walking back to the snapshot at 4 pages must drop the two host
+        // pages and keep every device block that still backs the cursor.
+        matched.pop_last_page(4);
+        assert_eq!(matched.blocks.len(), 4);
+        assert_eq!(matched.host_tail.as_ref().unwrap().slots, vec![7]);
+        matched.pop_last_page(4);
+        assert_eq!(matched.blocks.len(), 4);
+        assert!(matched.host_tail.is_none());
+        assert_eq!(matched.reused_tokens, 4 * 4);
+
+        matched.pop_last_page(4);
+        assert_eq!(matched.blocks, vec![block(0), block(1), block(2)]);
+        assert_eq!(matched.page_digests.len(), 3);
+        assert_eq!(matched.reused_tokens, 3 * 4);
     }
 
     fn block(index: u32) -> CacheBlockRef {

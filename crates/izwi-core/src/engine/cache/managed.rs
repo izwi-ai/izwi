@@ -1716,12 +1716,7 @@ impl ManagedKvCacheManager {
                         if sharing.index.lookup(digest, boundary)?.is_some() {
                             return Ok(Some(matched.reused_tokens));
                         }
-                        matched.page_digests.pop();
-                        matched.blocks.pop();
-                        matched.reused_tokens = matched
-                            .reused_tokens
-                            .checked_sub(group.page_tokens)
-                            .expect("matched chain holds complete pages");
+                        matched.pop_last_page(group.page_tokens);
                     }
                     continue;
                 }
@@ -4921,6 +4916,7 @@ fn reconcile_tensor_snapshot_attach(
         telemetry.record_tensor_snapshot_truncation();
         prefix_match.blocks.clear();
         prefix_match.page_digests.clear();
+        prefix_match.host_tail = None;
         prefix_match.reused_tokens = 0;
         return Ok(None);
     }
@@ -4934,12 +4930,7 @@ fn reconcile_tensor_snapshot_attach(
         if let Some(domains) = sharing.index.lookup(digest, boundary)? {
             return Ok(Some((boundary, domains)));
         }
-        prefix_match.page_digests.pop();
-        prefix_match.blocks.pop();
-        prefix_match.reused_tokens = prefix_match
-            .reused_tokens
-            .checked_sub(page_tokens)
-            .expect("matched chain holds complete pages");
+        prefix_match.pop_last_page(page_tokens);
         telemetry.record_tensor_snapshot_truncation();
     }
     Ok(None)
