@@ -1633,7 +1633,15 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, false, true)
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            ManagedClaimPolicy::Full,
+            true,
+        )
     }
 
     /// Prepare one scheduled row. `prefix_attach` is false when the row's
@@ -1647,7 +1655,7 @@ impl ManagedKvCacheManager {
         session: &SessionKey,
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
-        incremental: bool,
+        claim: ManagedClaimPolicy,
         prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         self.prepare_with_admission(
@@ -1656,7 +1664,7 @@ impl ManagedKvCacheManager {
             session,
             work,
             request,
-            incremental,
+            claim,
             prefix_attach,
         )
     }
@@ -1765,7 +1773,15 @@ impl ManagedKvCacheManager {
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
     ) -> Result<Option<ManagedCacheReservation>> {
-        self.prepare_with_admission(runtime, txn_id, session, work, request, true, true)
+        self.prepare_with_admission(
+            runtime,
+            txn_id,
+            session,
+            work,
+            request,
+            ManagedClaimPolicy::Incremental,
+            true,
+        )
     }
 
     fn prepare_with_admission(
@@ -1775,7 +1791,7 @@ impl ManagedKvCacheManager {
         session: &SessionKey,
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
-        incremental: bool,
+        claim: ManagedClaimPolicy,
         prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let previous_claim = self
@@ -1789,10 +1805,13 @@ impl ManagedKvCacheManager {
             session,
             work,
             request,
-            incremental,
+            claim,
             prefix_attach,
         );
-        if result.is_ok() && incremental && matches!(work, WorkUnit::SequenceStep { .. }) {
+        if result.is_ok()
+            && claim != ManagedClaimPolicy::Full
+            && matches!(work, WorkUnit::SequenceStep { .. })
+        {
             if let Some(state) = self.models.get_mut(&runtime.plan.model_instance) {
                 if state.capacity_claims.contains_key(session) {
                     state.incremental_claim_sessions.insert(session.clone());
@@ -1882,7 +1901,7 @@ impl ManagedKvCacheManager {
         session: &SessionKey,
         work: &WorkUnit,
         request: Option<&EngineCoreRequest>,
-        incremental: bool,
+        claim: ManagedClaimPolicy,
         prefix_attach: bool,
     ) -> Result<Option<ManagedCacheReservation>> {
         let (
@@ -2029,10 +2048,14 @@ impl ManagedKvCacheManager {
             .map(|policy| policy.max_promotion_pages)
             .unwrap_or(0);
         let installed_claim = if let Some(request) = request {
-            if incremental && sequence_input.is_some() {
-                ensure_incremental_capacity_claim(state, session, request, work)?
-            } else {
-                ensure_capacity_claim(state, session, request)?
+            match claim {
+                ManagedClaimPolicy::Incremental if sequence_input.is_some() => {
+                    ensure_incremental_capacity_claim(state, session, request, work)?
+                }
+                ManagedClaimPolicy::Chunked { quantum_tokens } if sequence_input.is_some() => {
+                    ensure_chunked_capacity_claim(state, session, request, work, quantum_tokens)?
+                }
+                _ => ensure_capacity_claim(state, session, request)?,
             }
         } else {
             false
@@ -4434,6 +4457,130 @@ fn validate_reservation_session_generation(
 /// separate from physical page ownership: pages are still materialized and
 /// written incrementally, while admission cannot overbook the pool and fail at
 /// an arbitrary later decode step.
+/// How a row's logical managed-KV admission claim is sized. Claims never
+/// exceed arena capacity in total and a step runs only when its own claim
+/// covers it, so every policy keeps physical pages within capacity mid-decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedClaimPolicy {
+    /// Prompt plus the whole output budget, claimed once at admission.
+    Full,
+    /// Prompt plus a bounded output quantum, extended as generation proceeds
+    /// (vLLM-style on-demand admission). An omitted OpenAI `max_tokens`
+    /// becomes "rest of context", so a full claim let one default request
+    /// reserve the entire arena and serialize every other request behind it.
+    Chunked { quantum_tokens: u32 },
+    /// Exactly the next scheduled span, including adapter-projected
+    /// speculative spans (the CUDA Qwen3.8 replay-capable route).
+    Incremental,
+}
+
+/// Claim the prompt and the current step, plus up to `quantum_tokens` of
+/// output headroom, never more than the request's prompt-plus-output budget.
+/// Only the current step is required: if other claims leave no room for the
+/// headroom the claim grows just enough for this step, and if not even that
+/// fits the row waits for capacity (`Backpressure`). A claim never shrinks.
+fn ensure_chunked_capacity_claim(
+    state: &mut ManagedKvModelState,
+    session: &SessionKey,
+    request: &EngineCoreRequest,
+    work: &WorkUnit,
+    quantum_tokens: u32,
+) -> Result<bool> {
+    let WorkUnit::SequenceStep { input, phase, .. } = work else {
+        return ensure_capacity_claim(state, session, request);
+    };
+    let prompt = u64::try_from(request.num_prompt_tokens())
+        .map_err(|_| Error::Overloaded("chunked token demand exceeds u64".into()))?;
+    let budget = prompt
+        .checked_add(u64::try_from(request.params.max_tokens.max(1)).unwrap_or(u64::MAX))
+        .ok_or_else(|| Error::Overloaded("chunked token demand overflowed".into()))?;
+    let mut demand_by_arena = HashMap::<KvArenaId, (u64, u64)>::new();
+    for group in &state.runtime.plan.groups {
+        let projected = request.project_paged_state_input(group.domain, *phase, *input)?;
+        let needed = prompt.max(
+            u64::try_from(projected.end)
+                .map_err(|_| Error::Overloaded("chunked token demand exceeds u64".into()))?,
+        );
+        let desired = budget
+            .max(needed)
+            .min(needed.saturating_add(u64::from(quantum_tokens)));
+        // A sliding window retains at most the window, the span being written
+        // and one page of alignment, exactly as the incremental claim prices.
+        let retained = |tokens: u64| -> Result<u64> {
+            Ok(sliding_window_for_domain(&state.contract, group.domain)?
+                .map(|window| {
+                    tokens.min(
+                        u64::from(window)
+                            .saturating_add(projected.len() as u64)
+                            .saturating_add(u64::from(group.page_tokens - 1)),
+                    )
+                })
+                .unwrap_or(tokens))
+        };
+        let page_tokens = u64::from(group.page_tokens);
+        let entry = demand_by_arena.entry(group.arena).or_default();
+        entry.0 = entry
+            .0
+            .checked_add(retained(needed)?.div_ceil(page_tokens))
+            .ok_or_else(|| Error::Overloaded("chunked arena page demand overflow".into()))?;
+        entry.1 = entry
+            .1
+            .checked_add(retained(desired)?.div_ceil(page_tokens))
+            .ok_or_else(|| Error::Overloaded("chunked arena page demand overflow".into()))?;
+    }
+    let mut claims = Vec::with_capacity(demand_by_arena.len());
+    for (arena, (needed_pages, desired_pages)) in demand_by_arena {
+        let group = state
+            .runtime
+            .plan
+            .groups
+            .iter()
+            .find(|group| group.arena == arena)
+            .ok_or_else(|| Error::InferenceError("managed capacity arena disappeared".into()))?;
+        let capacity = u64::from(group.capacity_pages);
+        if needed_pages > capacity {
+            let token_capacity = capacity.saturating_mul(u64::from(group.page_tokens));
+            return Err(Error::Overloaded(format!(
+                "request {} needs {needed_pages} pages for its next step, but managed state arena {} can retain at most {token_capacity} tokens ({capacity} pages of {} tokens)",
+                request.id,
+                group.id.get(),
+                group.page_tokens
+            )));
+        }
+        let previous = state
+            .capacity_claims
+            .get(session)
+            .and_then(|claims| claims.iter().find(|(claimed, _)| *claimed == arena))
+            .map(|(_, pages)| u64::from(*pages))
+            .unwrap_or(0);
+        let others = state
+            .capacity_claims
+            .iter()
+            .filter(|(owner, _)| *owner != session)
+            .flat_map(|(_, claims)| claims)
+            .filter(|(claimed, _)| *claimed == arena)
+            .map(|(_, pages)| u64::from(*pages))
+            .sum::<u64>();
+        let available = capacity.saturating_sub(others);
+        let required = previous.max(needed_pages);
+        if required > available {
+            return Err(Error::Backpressure(format!(
+                "managed KV chunked admission is waiting: request {} needs {required} pages, {others} are claimed by other requests, capacity is {capacity}",
+                request.id
+            )));
+        }
+        let pages = required.max(desired_pages.min(available));
+        claims.push((
+            arena,
+            u32::try_from(pages)
+                .map_err(|_| Error::Overloaded("chunked page claim exceeds u32".into()))?,
+        ));
+    }
+    let newly_installed = !state.capacity_claims.contains_key(session);
+    state.capacity_claims.insert(session.clone(), claims);
+    Ok(newly_installed)
+}
+
 fn ensure_capacity_claim(
     state: &mut ManagedKvModelState,
     session: &SessionKey,
@@ -8494,7 +8641,7 @@ mod tests {
                 &second_session,
                 &sequence_work(0, tokens.len()),
                 Some(&prefix_request(model, tokens.clone())),
-                false,
+                ManagedClaimPolicy::Full,
                 false,
             )
             .expect("second prepare")

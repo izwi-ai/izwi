@@ -18,7 +18,8 @@ use super::cache::composite::{
     unload_composite_retained_state, CompositeRetainedStateRuntimeV2,
 };
 use super::cache::managed::{
-    ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom, StateFitReserve,
+    ManagedClaimPolicy, ManagedKvCacheManager, ManagedStateCapacityRequest, PortableFitHeadroom,
+    StateFitReserve,
 };
 use super::cache::physical::{InvocationPhysicalKey, PhysicalStateManager};
 use super::config::EngineCoreConfig;
@@ -1348,6 +1349,23 @@ impl EngineCore {
         reduced
     }
 
+    /// How a request's managed-KV admission claim is sized. Chat claims grow
+    /// with generation (TTS/ASR retained sessions keep full claims so their
+    /// sealed floors and frame budgets stay guaranteed).
+    fn managed_claim_policy(&self, request: &EngineCoreRequest) -> ManagedClaimPolicy {
+        if self.uses_incremental_chat_capacity(request) {
+            return ManagedClaimPolicy::Incremental;
+        }
+        match u32::try_from(self.config.managed_chat_claim_quantum_tokens) {
+            Ok(quantum_tokens)
+                if quantum_tokens > 0 && request.task_type == super::TaskType::Chat =>
+            {
+                ManagedClaimPolicy::Chunked { quantum_tokens }
+            }
+            _ => ManagedClaimPolicy::Full,
+        }
+    }
+
     fn uses_incremental_chat_capacity(&self, request: &EngineCoreRequest) -> bool {
         self.config.cuda_incremental_chat_enabled()
             && request.task_type == super::TaskType::Chat
@@ -1423,6 +1441,84 @@ impl EngineCore {
         self.clear_execution_state_for_capacity_replay(&victim);
         super::metrics::record_capacity_suspension();
         Ok(true)
+    }
+
+    /// Chunked chat claims grow during generation, so every claim holder of a
+    /// model can end up waiting to grow at once while none can finish. When no
+    /// row ran this step, suspension and preemption freed nothing, and every
+    /// claim holder of a model is among the blocked rows, fail the youngest
+    /// lowest-priority blocked request so the others can complete.
+    async fn fail_claim_deadlocked_session(
+        &mut self,
+        blocked: &[super::scheduler::ScheduledRequest],
+    ) {
+        let mut by_model = HashMap::<ModelInstanceId, Vec<super::SessionKey>>::new();
+        for row in blocked {
+            let Some(request) = self.requests.get(&row.request_id) else {
+                continue;
+            };
+            if !matches!(
+                self.managed_claim_policy(request),
+                ManagedClaimPolicy::Chunked { .. }
+            ) {
+                continue;
+            }
+            let Some(model) = request
+                .managed_cache_runtime()
+                .map(|runtime| runtime.plan().model_instance)
+            else {
+                continue;
+            };
+            by_model.entry(model).or_default().push(row.session_key());
+        }
+        for (model, blocked_sessions) in by_model {
+            let holders = self.managed_kv_cache.capacity_claim_sessions(model);
+            let deadlocked = holders.len() > 1
+                && holders
+                    .iter()
+                    .all(|holder| blocked_sessions.contains(holder));
+            if !deadlocked {
+                continue;
+            }
+            // `blocked` keeps scheduler order (oldest first), so the last
+            // lowest-priority row is the youngest.
+            let Some(victim) = blocked_sessions
+                .iter()
+                .rev()
+                .min_by_key(|session| {
+                    self.requests
+                        .get(&session.request_id)
+                        .map(|request| request.priority)
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            warn!(
+                request_id = %victim.request_id,
+                session_epoch = victim.epoch,
+                claim_holders = holders.len(),
+                "Every managed KV claim holder is waiting to grow; failing the youngest"
+            );
+            let message =
+                "managed KV capacity is exhausted by concurrent requests; retry later".to_string();
+            self.terminate_request_session(
+                &victim,
+                ExecutorOutput::error(victim.request_id.clone(), message.clone()),
+                ExecutionDisposition::Failed(ExecutionFailure {
+                    kind: FailureKind::ResourceExhausted,
+                    scope: FailureScope::Row,
+                    retry: RetryDisposition::Never,
+                    health: HealthImpact::None,
+                    message,
+                }),
+                OutcomeProvenance::failure(
+                    FailureOrigin::AdapterPlanning,
+                    DispatchState::NotStarted,
+                ),
+            )
+            .await;
+        }
     }
 
     async fn preempt_unpublished_session_for_capacity(
@@ -2922,7 +3018,7 @@ impl EngineCore {
                 continue;
             }
             let planned_work = plan.work.clone();
-            let incremental_admission = self.uses_incremental_chat_capacity(&request);
+            let claim_policy = self.managed_claim_policy(&request);
             let prefix_attach = self.scheduler.admits_prefix_attach(&scheduled.request_id);
             let managed_cache = match request.managed_cache_runtime().map(|runtime| {
                 self.managed_kv_cache.prepare_row(
@@ -2931,7 +3027,7 @@ impl EngineCore {
                     &plan.session,
                     &planned_work,
                     Some(&request),
-                    incremental_admission,
+                    claim_policy,
                     prefix_attach,
                 )
             }) {
@@ -4719,6 +4815,9 @@ impl EngineCore {
                     .await?)
         {
             return Ok(None);
+        }
+        if decode_batches.is_empty() && prefill_batches.is_empty() {
+            self.fail_claim_deadlocked_session(&capacity_blocked).await;
         }
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
@@ -10256,6 +10355,113 @@ mod tests {
             )
             .expect("waiter committed table");
         assert_eq!(snapshot.committed_tokens, 4);
+    }
+
+    fn chunked_claim_core(quantum_tokens: usize) -> EngineCore {
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedReceiptExecutor));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 4,
+                max_batch_size: 2,
+                managed_chat_claim_quantum_tokens: quantum_tokens,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        core
+    }
+
+    fn committed_tokens(core: &EngineCore, model: ModelInstanceId, id: &str) -> Option<u32> {
+        let session = core.get_session_key(&id.to_string())?;
+        core.managed_kv_cache
+            .snapshot(model, &session, crate::kv::CacheDomainId::new(1))
+            .map(|snapshot| snapshot.committed_tokens)
+    }
+
+    /// A1: an output budget that covers most of the arena (an omitted OpenAI
+    /// `max_tokens` becomes "rest of context") must not reserve the whole
+    /// arena up front. With chunked claims both requests prefill together;
+    /// full up-front claims serialize the second behind the first.
+    #[tokio::test]
+    async fn chunked_chat_claims_admit_concurrent_requests_that_full_claims_serialize() {
+        for (quantum, both_admitted) in [(16, true), (0, false)] {
+            let model = ModelInstanceId::new(95);
+            let mut core = chunked_claim_core(quantum);
+            for id in ["first", "second"] {
+                let mut request = managed_test_request(&mut core, model, id, (1..=8).collect());
+                // 8 prompt + 40 output tokens = three 16-token pages each, but
+                // the arena holds four pages in total.
+                request.params.max_tokens = 40;
+                core.add_request(request).expect("add");
+            }
+            // A full-prefill row cannot share a step with decode rows; the
+            // scheduler's starvation bound serves it within eight steps.
+            for _ in 0..12 {
+                core.step().await.expect("step");
+            }
+            assert!(committed_tokens(&core, model, "first").is_some_and(|tokens| tokens >= 8));
+            assert_eq!(
+                committed_tokens(&core, model, "second").is_some_and(|tokens| tokens >= 8),
+                both_admitted,
+                "quantum {quantum}"
+            );
+        }
+    }
+
+    /// A1: chunked claims grow during decode. When every claim holder needs to
+    /// grow at once and nothing can be suspended or preempted, the youngest
+    /// request fails instead of every request waiting forever.
+    #[tokio::test]
+    async fn chunked_claim_deadlock_fails_only_the_youngest_request() {
+        let model = ModelInstanceId::new(96);
+        let mut core = chunked_claim_core(16);
+        for id in ["older", "younger"] {
+            let mut request = managed_test_request(&mut core, model, id, (1..=8).collect());
+            request.params.max_tokens = 40;
+            core.add_request(request).expect("add");
+        }
+        let mut outputs = Vec::new();
+        let mut older_peak = 0;
+        for _ in 0..80 {
+            outputs.extend(
+                core.step()
+                    .await
+                    .expect("a claim deadlock must not fail the engine step"),
+            );
+            older_peak = older_peak.max(committed_tokens(&core, model, "older").unwrap_or(0));
+            if outputs
+                .iter()
+                .any(|output| output.request_id == "younger" && output.is_finished)
+            {
+                break;
+            }
+        }
+        let failed = outputs
+            .iter()
+            .find(|output| output.request_id == "younger" && output.is_finished)
+            .expect("the youngest blocked request is failed");
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exhausted by concurrent requests")),
+            "{:?}",
+            failed.error
+        );
+        assert!(core.has_request(&"older".to_string()));
+        for _ in 0..4 {
+            outputs.extend(core.step().await.expect("survivor step"));
+            older_peak = older_peak.max(committed_tokens(&core, model, "older").unwrap_or(0));
+        }
+        // Both held two pages (32 tokens) when they deadlocked; the survivor
+        // grows past that once the younger claim is released.
+        assert!(older_peak > 32, "older peaked at {older_peak}");
     }
 
     /// H2: a row whose managed state can never be prepared fails alone. The
