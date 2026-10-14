@@ -336,6 +336,26 @@ impl InvocationTensorArena {
         self.maximum_bytes
     }
 
+    /// The contract's upper bound for `axis` of `component`, so a model can
+    /// reject over-bound input before doing the work that would produce it.
+    pub(crate) fn component_axis_max(
+        &self,
+        component: StateComponentId,
+        axis: &crate::kv::v2::ShapeAxis,
+    ) -> Option<u64> {
+        let backing = self
+            .components
+            .iter()
+            .find(|backing| backing.semantic.id == component)?;
+        backing
+            .semantic
+            .shape
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.axis == *axis)
+            .map(|dimension| dimension.extent.max())
+    }
+
     pub(crate) fn apply_intent(
         &mut self,
         intent: &DomainStepIntent,
