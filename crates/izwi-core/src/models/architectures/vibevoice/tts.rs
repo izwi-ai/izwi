@@ -3091,12 +3091,12 @@ mod tests {
                     .unwrap();
             host_f32(&latent).unwrap()
         };
+        let Some(metal_device) = crate::backends::metal_device_if_available(0) else {
+            eprintln!("metal device unavailable; VibeVoice F16 latent leg not run");
+            return;
+        };
         let reference = sample(&Device::Cpu, DeviceKind::Cpu, DType::F32);
-        let metal = sample(
-            &Device::new_metal(0).unwrap(),
-            DeviceKind::Metal,
-            DType::F16,
-        );
+        let metal = sample(&metal_device, DeviceKind::Metal, DType::F16);
         let relative = relative_l2(&metal, &reference);
         assert!(relative < 1e-2, "Metal F16 latent relative L2 {relative}");
     }
