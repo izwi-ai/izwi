@@ -2324,6 +2324,23 @@ pub struct RuntimeChatTeardown {
 }
 
 const RUNTIME_CHAT_INVOCATION_EVENT_CAPACITY: usize = 16;
+/// Coalesced text a lagging consumer may owe before the invocation fails.
+const RUNTIME_CHAT_MAX_PENDING_DELTA_BYTES: usize = 1024 * 1024;
+/// How long output may wait on a stalled consumer before the invocation
+/// fails; `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` overrides it.
+pub const DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_SLOW_CONSUMER_TIMEOUT_ENV: &str = "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS";
+
+/// The configured slow-consumer timeout for streamed text output, shared by
+/// the runtime driver and the serving worker's NDJSON relay.
+pub fn stream_slow_consumer_timeout() -> Duration {
+    std::env::var(STREAM_SLOW_CONSUMER_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT)
+}
 
 /// Opaque transport-facing handle for an authoritatively admitted chat request.
 ///
@@ -2912,7 +2929,33 @@ struct RuntimeChatInvocationDriver {
     stream: Option<mpsc::Receiver<StreamingOutput>>,
     stream_order: Option<StreamOutputOrder>,
     streamed_text: String,
+    /// Text the event consumer has not accepted yet. While it exists, later
+    /// deltas merge into it instead of queueing, so a lagging consumer costs
+    /// bytes, not messages, and never cancels the generation by itself.
+    pending_delta: Option<PendingTextDelta>,
+    slow_consumer_timeout: Duration,
     guard: PendingRequestGuard,
+}
+
+struct PendingTextDelta {
+    text: String,
+    logprobs: Vec<crate::engine::TokenLogprob>,
+    since: Instant,
+}
+
+impl PendingTextDelta {
+    fn into_event(self) -> Result<RuntimeChatInvocationEvent> {
+        Ok(RuntimeChatInvocationEvent::TextDelta {
+            text: self.text,
+            logprobs: self.logprobs,
+        })
+    }
+}
+
+enum DeltaOffer {
+    Accepted,
+    ConsumerClosed,
+    Overflow,
 }
 
 enum RuntimeChatCompletion {
@@ -2921,8 +2964,84 @@ enum RuntimeChatCompletion {
 }
 
 impl RuntimeChatInvocationDriver {
-    fn try_send_event(&self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+    /// Best-effort event delivery for cancellation and failure paths, which
+    /// must not wait on the consumer. Pending text goes first so events stay
+    /// ordered; if it cannot be delivered it is discarded with the failed
+    /// generation rather than reordered after the error.
+    fn try_send_event(&mut self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+        if let Some(pending) = self.pending_delta.take() {
+            let _ = self.events.try_send(pending.into_event());
+        }
         self.events.try_send(event).is_ok()
+    }
+
+    /// Queue a text delta, or merge it into the pending delta while the
+    /// consumer lags.
+    fn offer_delta(
+        &mut self,
+        text: String,
+        logprobs: Vec<crate::engine::TokenLogprob>,
+    ) -> DeltaOffer {
+        if let Some(pending) = self.pending_delta.as_mut() {
+            pending.text.push_str(&text);
+            pending.logprobs.extend(logprobs);
+        } else {
+            match self
+                .events
+                .try_send(Ok(RuntimeChatInvocationEvent::TextDelta { text, logprobs }))
+            {
+                Ok(()) => return DeltaOffer::Accepted,
+                Err(mpsc::error::TrySendError::Closed(_)) => return DeltaOffer::ConsumerClosed,
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    let Ok(RuntimeChatInvocationEvent::TextDelta { text, logprobs }) = event else {
+                        unreachable!("only a text delta was offered");
+                    };
+                    self.pending_delta = Some(PendingTextDelta {
+                        text,
+                        logprobs,
+                        since: Instant::now(),
+                    });
+                }
+            }
+        }
+        if self
+            .pending_delta
+            .as_ref()
+            .is_some_and(|pending| pending.text.len() > RUNTIME_CHAT_MAX_PENDING_DELTA_BYTES)
+        {
+            DeltaOffer::Overflow
+        } else {
+            DeltaOffer::Accepted
+        }
+    }
+
+    /// When a stalled consumer exhausts its slow-consumer budget.
+    fn slow_consumer_deadline(&self) -> Option<Instant> {
+        self.pending_delta
+            .as_ref()
+            .map(|pending| pending.since + self.slow_consumer_timeout)
+    }
+
+    /// Deliver a terminal event after any pending text, waiting for the
+    /// consumer up to the slow-consumer budget. Terminal events are never
+    /// dropped for a full channel and never overtake text.
+    async fn send_terminal_event(&mut self, event: Result<RuntimeChatInvocationEvent>) -> bool {
+        let deadline = self
+            .slow_consumer_deadline()
+            .unwrap_or_else(|| Instant::now() + self.slow_consumer_timeout);
+        if let Some(pending) = self.pending_delta.take() {
+            if !matches!(
+                tokio::time::timeout_at(deadline.into(), self.events.send(pending.into_event()))
+                    .await,
+                Ok(Ok(()))
+            ) {
+                return false;
+            }
+        }
+        matches!(
+            tokio::time::timeout_at(deadline.into(), self.events.send(event)).await,
+            Ok(Ok(()))
+        )
     }
 
     async fn finish_with_output(&mut self, output: EngineOutput) -> RuntimeChatTeardownDisposition {
@@ -2931,7 +3050,7 @@ impl RuntimeChatInvocationDriver {
             Err(error) => {
                 self.record_error(&error);
                 self.guard.disarm();
-                let _ = self.try_send_event(Err(error));
+                let _ = self.send_terminal_event(Err(error)).await;
                 return RuntimeChatTeardownDisposition::Failed;
             }
         };
@@ -2942,13 +3061,15 @@ impl RuntimeChatInvocationDriver {
                 &output,
             ));
         self.guard.disarm();
-        let _ = self.try_send_event(Ok(RuntimeChatInvocationEvent::Completed(generation)));
+        let _ = self
+            .send_terminal_event(Ok(RuntimeChatInvocationEvent::Completed(generation)))
+            .await;
         // Engine completion is already physical teardown. A disconnected or
         // slow output consumer cannot turn it back into cancellation.
         RuntimeChatTeardownDisposition::Completed
     }
 
-    fn finish_with_terminal_error(&mut self, error: Error) -> RuntimeChatTeardownDisposition {
+    async fn finish_with_terminal_error(&mut self, error: Error) -> RuntimeChatTeardownDisposition {
         self.record_error(&error);
         self.guard.disarm();
         let disposition = if matches!(error, Error::Cancelled(_)) {
@@ -2956,7 +3077,7 @@ impl RuntimeChatInvocationDriver {
         } else {
             RuntimeChatTeardownDisposition::Failed
         };
-        let _ = self.try_send_event(Err(error));
+        let _ = self.send_terminal_event(Err(error)).await;
         disposition
     }
 
@@ -3005,7 +3126,7 @@ impl RuntimeChatInvocationDriver {
                 Some(self.finish_with_output(output).await)
             }
             RuntimeChatCompletion::Delivered(Err(error)) => {
-                Some(self.finish_with_terminal_error(error))
+                Some(self.finish_with_terminal_error(error).await)
             }
             RuntimeChatCompletion::ChannelClosed => {
                 self.fail_and_confirm(Error::InferenceError(format!(
@@ -3043,6 +3164,7 @@ impl RuntimeChatInvocationDriver {
             if self.cancellation.load(Ordering::Acquire) || self.events.is_closed() {
                 return self.cancel_and_confirm().await;
             }
+            let slow_consumer_deadline = self.slow_consumer_deadline();
 
             if self.stream_order.is_none() && completion_result.is_some() {
                 return self
@@ -3081,6 +3203,29 @@ impl RuntimeChatInvocationDriver {
                         Err(_) => RuntimeChatCompletion::ChannelClosed,
                     });
                 }
+                capacity = async { self.events.reserve().await.is_ok() },
+                    if self.pending_delta.is_some() =>
+                {
+                    // The driver is the only sender, so observed capacity
+                    // stays available for the flush.
+                    let pending = self.pending_delta.take().expect("checked pending delta");
+                    if !capacity || self.events.try_send(pending.into_event()).is_err() {
+                        return self.cancel_and_confirm().await;
+                    }
+                }
+                _ = async {
+                    match slow_consumer_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending().await,
+                    }
+                }, if slow_consumer_deadline.is_some() => {
+                    return self
+                        .fail_and_confirm(Error::Backpressure(format!(
+                            "chat output consumer for {} stalled for {:?}",
+                            self.request_id, self.slow_consumer_timeout
+                        )))
+                        .await;
+                }
                 chunk = async {
                     match self.stream.as_mut() {
                         Some(stream) => stream.recv().await,
@@ -3099,13 +3244,20 @@ impl RuntimeChatInvocationDriver {
                             }
                             if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
                                 self.streamed_text.push_str(&delta);
-                                if !self.try_send_event(Ok(
-                                    RuntimeChatInvocationEvent::TextDelta {
-                                        text: delta,
-                                        logprobs: chunk.logprobs.clone(),
-                                    },
-                                )) {
-                                    return self.cancel_and_confirm().await;
+                                match self.offer_delta(delta, chunk.logprobs) {
+                                    DeltaOffer::Accepted => {}
+                                    DeltaOffer::ConsumerClosed => {
+                                        return self.cancel_and_confirm().await;
+                                    }
+                                    DeltaOffer::Overflow => {
+                                        return self
+                                            .fail_and_confirm(Error::Backpressure(format!(
+                                                "chat output consumer for {} owes more than {} bytes",
+                                                self.request_id,
+                                                RUNTIME_CHAT_MAX_PENDING_DELTA_BYTES
+                                            )))
+                                            .await;
+                                    }
                                 }
                             }
                         }
@@ -4628,6 +4780,8 @@ impl RuntimeService {
             stream,
             stream_order: streaming.then(|| StreamOutputOrder::new(stream_policy)),
             streamed_text: String::new(),
+            pending_delta: None,
+            slow_consumer_timeout: stream_slow_consumer_timeout(),
             guard,
         };
         tokio::spawn(driver.drive());
@@ -8800,6 +8954,134 @@ mod tests {
         );
 
         (observation_request, guard, receiver, residency_variant)
+    }
+
+    struct DriverHarness {
+        stream: mpsc::Sender<StreamingOutput>,
+        completion: oneshot::Sender<Result<EngineOutput>>,
+        events: mpsc::Receiver<Result<RuntimeChatInvocationEvent>>,
+        teardown: oneshot::Receiver<RuntimeChatTeardown>,
+    }
+
+    /// A streaming chat driver over an admitted fixture session, fed by hand
+    /// through its engine stream and completion channels.
+    async fn chat_driver_harness(
+        runtime: &RuntimeService,
+        request_id: &str,
+        event_capacity: usize,
+        slow_consumer_timeout: Duration,
+    ) -> DriverHarness {
+        let (_request, guard, _receiver, _variant) =
+            pending_streaming_guard_fixture(runtime, request_id, None).await;
+        let (stream, stream_rx) = mpsc::channel(64);
+        let (completion, completion_rx) = oneshot::channel();
+        let (event_sender, events) = mpsc::channel(event_capacity);
+        let (teardown_sender, teardown) = oneshot::channel();
+        let driver = RuntimeChatInvocationDriver {
+            request_id: request_id.to_string(),
+            deadline: None,
+            observation_context: RuntimeObservationContext::default(),
+            admission_ms: None,
+            telemetry: runtime.telemetry.clone(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation_wakeup: Arc::new(Notify::new()),
+            events: event_sender,
+            teardown: Some(teardown_sender),
+            completion: completion_rx,
+            stream: Some(stream_rx),
+            stream_order: Some(StreamOutputOrder::new(EngineStreamPolicy::FailOnFull)),
+            streamed_text: String::new(),
+            pending_delta: None,
+            slow_consumer_timeout,
+            guard,
+        };
+        tokio::spawn(driver.drive());
+        DriverHarness {
+            stream,
+            completion,
+            events,
+            teardown,
+        }
+    }
+
+    fn text_chunk(request_id: &str, sequence: usize, text: &str) -> StreamingOutput {
+        let mut chunk = StreamingOutput::new(request_id.to_string(), sequence, Vec::new(), 0);
+        chunk.text = Some(text.to_string());
+        chunk
+    }
+
+    #[tokio::test]
+    async fn chat_driver_coalesces_deltas_for_a_paused_consumer() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "paused-consumer";
+        let mut harness =
+            chat_driver_harness(&runtime, request_id, 2, Duration::from_secs(30)).await;
+        let words = (0..40)
+            .map(|index| format!("w{index} "))
+            .collect::<Vec<_>>();
+        for (sequence, word) in words.iter().enumerate() {
+            harness
+                .stream
+                .send(text_chunk(request_id, sequence, word))
+                .await
+                .expect("driver drains the engine stream");
+        }
+        let mut final_chunk =
+            StreamingOutput::new(request_id.to_string(), words.len(), Vec::new(), 0);
+        final_chunk.is_final = true;
+        harness.stream.send(final_chunk).await.unwrap();
+        drop(harness.stream);
+        let _ = harness
+            .completion
+            .send(Ok(terminal_output(ExecutionFinishReason::Completed)));
+
+        // The consumer stays paused far past the 2-slot channel's capacity.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut text = String::new();
+        let mut deltas = 0;
+        let generation = loop {
+            match harness.events.recv().await.expect("terminal event") {
+                Ok(RuntimeChatInvocationEvent::TextDelta { text: delta, .. }) => {
+                    deltas += 1;
+                    text.push_str(&delta);
+                }
+                Ok(RuntimeChatInvocationEvent::Completed(generation)) => break generation,
+                Err(error) => panic!("paused consumer failed the invocation: {error}"),
+            }
+        };
+        assert_eq!(text, words.concat());
+        assert_eq!(generation.text, words.concat());
+        assert!(deltas < words.len(), "deltas were coalesced, not queued");
+        assert!(harness.events.recv().await.is_none());
+        assert_eq!(
+            harness.teardown.await.expect("teardown").disposition,
+            RuntimeChatTeardownDisposition::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_driver_fails_a_consumer_stalled_past_the_timeout() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "stalled-consumer";
+        let mut harness =
+            chat_driver_harness(&runtime, request_id, 1, Duration::from_millis(50)).await;
+        for sequence in 0..4 {
+            harness
+                .stream
+                .send(text_chunk(request_id, sequence, "x"))
+                .await
+                .unwrap();
+        }
+
+        let teardown = tokio::time::timeout(Duration::from_secs(5), &mut harness.teardown)
+            .await
+            .expect("a stalled consumer is failed after its timeout")
+            .expect("teardown");
+        assert_eq!(teardown.disposition, RuntimeChatTeardownDisposition::Failed);
+        assert!(matches!(
+            harness.events.recv().await,
+            Some(Ok(RuntimeChatInvocationEvent::TextDelta { .. }))
+        ));
     }
 
     #[test]
