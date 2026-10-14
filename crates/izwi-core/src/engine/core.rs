@@ -1500,6 +1500,7 @@ impl EngineCore {
                 claim_holders = holders.len(),
                 "Every managed KV claim holder is waiting to grow; failing the youngest"
             );
+            super::metrics::record_claim_deadlock_abort();
             let message =
                 "managed KV capacity is exhausted by concurrent requests; retry later".to_string();
             self.terminate_request_session(
@@ -1590,6 +1591,7 @@ impl EngineCore {
             blocked_request_id = %blocked_request.id,
             "Released an unpublished lower-priority session for managed KV capacity"
         );
+        super::metrics::record_recompute_preemption();
         Ok(true)
     }
 
@@ -4571,6 +4573,7 @@ impl EngineCore {
         }
 
         if !schedule_result.has_execution_work() && self.pending_terminal_outputs.is_empty() {
+            super::metrics::record_kv_blocked_requests(0);
             return Ok(None);
         }
 
@@ -4657,6 +4660,7 @@ impl EngineCore {
             && decode_requests.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
+            super::metrics::record_kv_blocked_requests(0);
             return Ok(None);
         }
 
@@ -4803,6 +4807,7 @@ impl EngineCore {
         }
         self.rollback_unexecuted_schedule(&transaction_deferred);
         self.defer_unexecuted_schedule_for_capacity(&capacity_blocked);
+        super::metrics::record_kv_blocked_requests(capacity_blocked.len());
         self.resolve_managed_prepare_failures(prepare_failures)
             .await;
         if decode_batches.is_empty()

@@ -5843,6 +5843,8 @@ pub struct ModelRegistry {
     kokoro_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<KokoroTtsModel>>>>>,
     effective_contexts: Arc<std::sync::RwLock<HashMap<ModelVariant, usize>>>,
     kv_storage: Arc<std::sync::RwLock<HashMap<ModelVariant, Vec<KvStorageReport>>>>,
+    /// Which loaded variant owns each managed KV model instance (metric labels).
+    kv_instances: Arc<std::sync::RwLock<HashMap<crate::engine::ModelInstanceId, ModelVariant>>>,
     /// Per loaded model: what admission priced for its weights and what the
     /// device observer saw them occupy (TADM-13).
     weight_residency: Arc<std::sync::RwLock<HashMap<ModelVariant, WeightResidency>>>,
@@ -6132,6 +6134,7 @@ impl ModelRegistry {
             kokoro_models: Arc::new(RwLock::new(HashMap::new())),
             effective_contexts: Arc::new(std::sync::RwLock::new(HashMap::new())),
             kv_storage: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            kv_instances: Arc::new(std::sync::RwLock::new(HashMap::new())),
             weight_residency: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
@@ -6181,6 +6184,22 @@ impl ModelRegistry {
                 entry.push(report);
             }
         }
+        self.kv_instances
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(runtime.plan().model_instance, variant);
+    }
+
+    /// The loaded variant that owns a managed KV model instance, if any.
+    pub(crate) fn kv_instance_variant(
+        &self,
+        model_instance: crate::engine::ModelInstanceId,
+    ) -> Option<ModelVariant> {
+        self.kv_instances
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&model_instance)
+            .copied()
     }
 
     pub(crate) fn publish_effective_context(
@@ -6241,6 +6260,10 @@ impl ModelRegistry {
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&variant);
+        self.kv_instances
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|_, owner| *owner != variant);
     }
 
     pub fn device(&self) -> &DeviceProfile {

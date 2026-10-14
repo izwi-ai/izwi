@@ -207,6 +207,8 @@ pub struct ManagedKvArenaRuntimeSnapshot {
     pub domain_id: u32,
     pub device_ordinal: Option<u32>,
     pub page_tokens: u32,
+    /// Resolved page storage dtype (`f32`, `f16`, `bf16`).
+    pub storage_dtype: String,
     pub token_capacity: u64,
     pub bytes_per_page: u64,
     pub physical_bytes: u64,
@@ -1037,6 +1039,8 @@ impl ManagedKvCacheManager {
                             domain_id: group.domain.get(),
                             device_ordinal: group.arena.device_ordinal,
                             page_tokens: group.page_tokens,
+                            storage_dtype: format!("{:?}", group.storage.dtype())
+                                .to_ascii_lowercase(),
                             token_capacity: u64::from(group.capacity_pages)
                                 .saturating_mul(u64::from(group.page_tokens)),
                             bytes_per_page: group.bytes_per_page,
@@ -4966,7 +4970,8 @@ fn managed_prefix_lookup(
     tokens: &[u32],
     host_page_ceiling: usize,
 ) -> Result<KvPrefixMatch> {
-    Ok(match host_chain {
+    let telemetry = Arc::clone(prefix_index.telemetry());
+    let matched = match host_chain {
         Some(chain) => offload::lookup_longest_with_host(
             prefix_index,
             chain,
@@ -4979,7 +4984,11 @@ fn managed_prefix_lookup(
         None => prefix_index
             .lookup_longest(namespace, tokens, page_tokens)
             .map_err(prefix_error)?,
-    })
+    };
+    // Counted here, at preparation, and not in the index: admission probes
+    // look up the same prompt first and would count every request twice.
+    telemetry.record_prefix_lookup(usize_to_u64(tokens.len()), u64::from(matched.reused_tokens));
+    Ok(matched)
 }
 
 /// DS4.3: outcome of restoring a matched host tail during prepare. The
@@ -5759,6 +5768,74 @@ mod tests {
         next_turn.push(7);
         let resumed = run(&mut manager, &runtime, 44, "newer-next", next_turn);
         assert_eq!(resumed.domains[0].execution_start_tokens, 32);
+    }
+
+    #[test]
+    fn prefix_telemetry_counts_each_prepare_once_and_never_the_probe() {
+        let model = ModelInstanceId::new(707);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                4,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let history = (0..64).collect::<Vec<u32>>();
+        let first = SessionKey::new("history".into(), 1);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                51,
+                &first,
+                &sequence_work(0, history.len()),
+                Some(&prefix_request(model, history.clone())),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        manager
+            .finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        manager.release_session(&first).unwrap();
+        let cold = manager.telemetry_snapshot();
+        assert_eq!((cold.prefix_hits, cold.prefix_misses), (0, 1));
+        assert_eq!(cold.prefix_query_tokens, 63);
+
+        let mut next_turn = history;
+        next_turn.push(7);
+        let request = prefix_request(model, next_turn.clone());
+        assert_eq!(
+            manager.probe_managed_prefix(&runtime, &request).unwrap(),
+            Some(64)
+        );
+        assert_eq!(
+            manager.telemetry_snapshot(),
+            cold,
+            "admission probes are not lookups"
+        );
+
+        let second = SessionKey::new("next-turn".into(), 1);
+        manager
+            .prepare(
+                &runtime,
+                52,
+                &second,
+                &sequence_work(0, next_turn.len()),
+                Some(&request),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        let warm = manager.telemetry_snapshot();
+        assert_eq!((warm.prefix_hits, warm.prefix_misses), (1, 1));
+        assert_eq!(warm.prefix_query_tokens, 63 + 64);
+        assert_eq!(warm.prefix_hit_tokens, 64);
     }
 
     #[test]
@@ -8406,12 +8483,14 @@ mod tests {
             11,
             "host pool holds the demoted chain"
         );
-        // Device-index telemetry only ever saw the device portion: the source
-        // prepare's cold lookup and this one (the chain is fully host-resident
-        // here). The host continuation is proven by the restored execution
-        // cursor below.
-        assert_eq!(telemetry.prefix_misses, 2);
-        assert_eq!(telemetry.reused_tokens, 0);
+        // Lookups are counted once per prepare across both tiers: the source
+        // prepare's cold miss, then this hit served entirely from the host
+        // chain.
+        assert_eq!(telemetry.prefix_misses, 1);
+        assert_eq!(telemetry.prefix_hits, 1);
+        assert_eq!(telemetry.prefix_hit_tokens, 352);
+        assert_eq!(telemetry.reused_tokens, 352);
+        assert_eq!(telemetry.prefix_query_tokens, 2 * (tokens.len() as u64 - 1));
         assert_eq!(
             resumed.domains[0].execution_start_tokens, 352,
             "execution resumes above the restored host tail"

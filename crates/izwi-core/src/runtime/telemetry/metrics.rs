@@ -114,6 +114,9 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
+    pub recompute_preemptions_total: u64,
+    pub claim_deadlock_aborts_total: u64,
+    pub kv_blocked_requests: u64,
     pub continuous_envelope_scalar_fallbacks_total: u64,
     pub physical_execution: EnginePhysicalExecutionMetricsSnapshot,
     /// Exact backend-owned managed arenas, page ownership, and counters.
@@ -1120,6 +1123,33 @@ pub(crate) fn push_engine_labeled_metric(
         payload.push_str(&format!(
             "{prometheus_name}{{{label_name}=\"{label_value}\"}} {value}\n"
         ));
+    }
+}
+
+/// One gauge or counter with several labels per series. Label values are
+/// escaped per the Prometheus text format.
+pub(crate) fn push_engine_multi_labeled_metric(
+    payload: &mut String,
+    name: &str,
+    series: &[(Vec<(&str, String)>, u64)],
+) {
+    let prometheus_name = prometheus_engine_metric_name(name);
+    let metric_type = prometheus_engine_metric_type(name);
+    push_engine_metric_help(payload, name, &prometheus_name);
+    payload.push_str(&format!("# TYPE {prometheus_name} {metric_type}\n"));
+    for (labels, value) in series {
+        let labels = labels
+            .iter()
+            .map(|(label, value)| {
+                let value = value
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                format!("{label}=\"{value}\"")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        payload.push_str(&format!("{prometheus_name}{{{labels}}} {value}\n"));
     }
 }
 

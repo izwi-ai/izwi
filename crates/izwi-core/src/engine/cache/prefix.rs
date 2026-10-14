@@ -497,12 +497,6 @@ impl CoordinatedPrefixIndex {
                 .ok_or(KvPrefixIndexError::CounterOverflow)?;
             previous = Some(hit.digest);
         }
-        if matched.reused_tokens == 0 {
-            self.telemetry.record_prefix_miss();
-        } else {
-            self.telemetry
-                .record_prefix_hit(u64::from(matched.reused_tokens));
-        }
         Ok(matched)
     }
 
