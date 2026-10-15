@@ -71,6 +71,10 @@ const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
 /// Voiced speech that confirms a barge-in. A speech start alone does not
 /// interrupt the assistant: a cough, a door or speaker echo also starts one.
 const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
+/// How long past the silence window frames may stop before the server
+/// assumes the client paused without `input_stream_stop`. Silence is measured
+/// in audio time, so this only has to cover network stalls and jitter.
+const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
@@ -789,7 +793,6 @@ struct StreamingActiveUtterance {
     voiced_ms: f32,
     total_ms: f32,
     silence_ms: f32,
-    started_at: Instant,
     barge_in_confirmed: bool,
 }
 
@@ -1093,7 +1096,6 @@ impl StreamingInputState {
                 voiced_ms: 0.0,
                 total_ms: 0.0,
                 silence_ms: 0.0,
-                started_at: Instant::now(),
                 barge_in_confirmed: false,
             };
             if !self.pre_roll.is_empty() {
@@ -1177,18 +1179,19 @@ impl StreamingInputState {
         }
     }
 
+    /// Ends the active utterance when the client stops sending audio without
+    /// `input_stream_stop`. Silence and the utterance cap are measured in
+    /// audio time by the endpoint detector, so delayed but contiguous frames
+    /// (a network stall) cannot end an utterance early.
     fn on_tick(
         &mut self,
     ) -> Result<Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>, String> {
-        let Some(active) = self.active.as_ref() else {
+        if self.active.is_none() {
             return Ok(None);
-        };
-        if active.started_at.elapsed() >= Duration::from_millis(self.config.max_utterance_ms as u64)
-        {
-            return self.finalize_active_utterance(UtteranceEndReason::MaxDuration);
         }
-
-        let pause_limit = Duration::from_millis(self.config.silence_duration_ms.max(250) as u64);
+        let pause_limit = Duration::from_millis(
+            u64::from(self.config.silence_duration_ms) + CLIENT_PAUSE_STALL_ALLOWANCE_MS,
+        );
         if self
             .last_frame_at
             .is_some_and(|last_frame| last_frame.elapsed() >= pause_limit)
@@ -3940,6 +3943,48 @@ mod tests {
         }
         assert!(starts >= 1, "the burst must start speech");
         assert_eq!(rejections, starts, "every start is rejected as noise");
+    }
+
+    /// SPK-F4: a network stall longer than the silence window, followed by
+    /// the delayed but contiguous frames, continues the same utterance. Only
+    /// a client that stops sending for the stall allowance is paused.
+    #[test]
+    fn network_stall_does_not_end_an_utterance() {
+        let mut input = test_streaming_input();
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+        for frame_seq in 1..=10_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        let utterance_id = input.active.as_ref().expect("speech").utterance_id.clone();
+        let silence_ms = u64::from(input.config.silence_duration_ms);
+
+        input.last_frame_at = Some(Instant::now() - Duration::from_millis(silence_ms + 900));
+        assert!(input.on_tick().expect("tick").is_none());
+        for frame_seq in 11..=20_u32 {
+            let result = input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("late frame");
+            assert!(result.speech_start.is_none());
+            assert!(result.finalized_utterance.is_none());
+        }
+        assert_eq!(
+            input.active.as_ref().expect("same utterance").utterance_id,
+            utterance_id
+        );
+
+        input.last_frame_at = Some(
+            Instant::now() - Duration::from_millis(silence_ms + CLIENT_PAUSE_STALL_ALLOWANCE_MS),
+        );
+        let (commit, _, reason) = input
+            .on_tick()
+            .expect("tick")
+            .expect("a client that stopped sending is paused");
+        assert_eq!(commit.utterance_id, utterance_id);
+        assert!(matches!(reason, UtteranceEndReason::ClientPause));
     }
 
     #[test]
