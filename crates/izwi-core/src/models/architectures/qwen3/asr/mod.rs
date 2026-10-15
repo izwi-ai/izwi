@@ -836,6 +836,11 @@ fn qwen3_asr_invocation_workspace_bytes(domain: &StateDomainSpec, max_tokens: u6
 
 impl InferenceStateContractProvider for Qwen3AsrModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        // The forced aligner runs one cacheless forward per request, as its
+        // `ForcedAlignment` adapter declares.
+        if self.is_forced_aligner {
+            return Ok(InferenceStateCapability::Stateless);
+        }
         Ok(InferenceStateCapability::Managed(
             self.managed_inference_state_contract()?,
         ))
@@ -1700,92 +1705,84 @@ impl Qwen3AsrModel {
         // On Metal a lowered audio or text dtype must pass its own load-time
         // probe, or that component alone reloads in F32 (report 13).
         let check = device.kind.is_metal();
-        let (audio_tower, audio_precision, text_model, text_precision) = if let Some(gguf_path) =
-            gguf_path.as_ref()
-        {
-            let loader = gguf_loader.as_ref().ok_or_else(|| {
-                Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
-            })?;
-            let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
-            let (audio_tower, audio_precision) = load_with_precision_fallback(
-                "Qwen3-ASR audio tower",
-                &audio_selection,
-                check,
-                DType::F32,
-                |audio_dtype| {
-                    let vb_audio = var_builder_from_gguf_filtered(
-                        gguf_path,
-                        audio_dtype,
-                        &device.device,
-                        |name| qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix),
-                    )?;
-                    let vb_audio = if tensor_prefix.is_empty() {
-                        vb_audio
-                    } else {
-                        vb_audio.pp(tensor_prefix)
-                    };
-                    AudioTower::load(audio_cfg.clone(), vb_audio.pp("audio_tower"))
-                },
-                |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, &device.device),
-            )?;
-            let (text_model, text_precision) = load_with_precision_fallback(
-                "Qwen3-ASR text",
-                &text_selection,
-                check,
-                DType::F32,
-                |text_dtype| {
-                    if gguf_qmatmul_text_enabled {
-                        return Qwen3Model::load_gguf_text(
-                            text_cfg.clone(),
-                            loader,
+        let (audio_tower, audio_precision, text_model, text_precision) =
+            if let Some(gguf_path) = gguf_path.as_ref() {
+                let loader = gguf_loader.as_ref().ok_or_else(|| {
+                    Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
+                })?;
+                let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
+                load_qwen3_asr_components(
+                    &audio_selection,
+                    &text_selection,
+                    check,
+                    &device.device,
+                    |audio_dtype| {
+                        let vb_audio = var_builder_from_gguf_filtered(
+                            gguf_path,
+                            audio_dtype,
                             &device.device,
+                            |name| qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix),
+                        )?;
+                        let vb_audio = if tensor_prefix.is_empty() {
+                            vb_audio
+                        } else {
+                            vb_audio.pp(tensor_prefix)
+                        };
+                        AudioTower::load(audio_cfg.clone(), vb_audio.pp("audio_tower"))
+                    },
+                    |text_dtype| {
+                        if gguf_qmatmul_text_enabled {
+                            return Qwen3Model::load_gguf_text(
+                                text_cfg.clone(),
+                                loader,
+                                &device.device,
+                                text_dtype,
+                                tensor_prefix,
+                            );
+                        }
+                        let vb_text = var_builder_from_gguf_filtered(
+                            gguf_path,
                             text_dtype,
-                            tensor_prefix,
-                        );
-                    }
-                    let vb_text = var_builder_from_gguf_filtered(
-                        gguf_path,
-                        text_dtype,
-                        &device.device,
-                        |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
-                    )?;
-                    let vb_text = if tensor_prefix.is_empty() {
-                        vb_text
-                    } else {
-                        vb_text.pp(tensor_prefix)
+                            &device.device,
+                            |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
+                        )?;
+                        let vb_text = if tensor_prefix.is_empty() {
+                            vb_text
+                        } else {
+                            vb_text.pp(tensor_prefix)
+                        };
+                        Qwen3Model::load(text_cfg.clone(), vb_text)
+                    },
+                )?
+            } else {
+                let shard_paths = resolve_safetensors_shards(model_dir)?;
+                let var_builder = |dtype: DType| -> Result<VarBuilder<'static>> {
+                    // SAFETY: the mapped shards are read-only checkpoint files.
+                    let vb = unsafe {
+                        VarBuilder::from_mmaped_safetensors(&shard_paths, dtype, &device.device)?
                     };
-                    Qwen3Model::load(text_cfg.clone(), vb_text)
-                },
-                qwen3_asr_text_self_check,
-            )?;
-            (audio_tower, audio_precision, text_model, text_precision)
-        } else {
-            let (vb_text, vb_audio) = load_safetensors_var_builders(
-                model_dir,
-                &device,
-                text_selection.dtype,
-                audio_selection.dtype,
-            )?;
-            let has_thinker_prefix = vb_text.contains_tensor("thinker.audio_tower.conv2d1.weight");
-            let vb_text = if has_thinker_prefix {
-                vb_text.pp("thinker")
-            } else {
-                vb_text
+                    Ok(
+                        if vb.contains_tensor("thinker.audio_tower.conv2d1.weight") {
+                            vb.pp("thinker")
+                        } else {
+                            vb
+                        },
+                    )
+                };
+                load_qwen3_asr_components(
+                    &audio_selection,
+                    &text_selection,
+                    check,
+                    &device.device,
+                    |audio_dtype| {
+                        AudioTower::load(
+                            audio_cfg.clone(),
+                            var_builder(audio_dtype)?.pp("audio_tower"),
+                        )
+                    },
+                    |text_dtype| Qwen3Model::load(text_cfg.clone(), var_builder(text_dtype)?),
+                )?
             };
-            let vb_audio = if has_thinker_prefix {
-                vb_audio.pp("thinker")
-            } else {
-                vb_audio
-            };
-            let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-            let text_model = Qwen3Model::load(text_cfg, vb_text)?;
-            (
-                audio_tower,
-                PrecisionLoad::unchecked(&audio_selection),
-                text_model,
-                PrecisionLoad::unchecked(&text_selection),
-            )
-        };
         let (audio_dtype, text_dtype) = (audio_precision.loaded, text_precision.loaded);
 
         info!(
@@ -3684,18 +3681,35 @@ fn infer_downsample_hidden_size(loader: &GgufLoader) -> Result<usize> {
     ))
 }
 
-fn load_safetensors_var_builders(
-    model_dir: &Path,
-    device: &DeviceProfile,
-    text_dtype: DType,
-    audio_dtype: DType,
-) -> Result<(VarBuilder<'static>, VarBuilder<'static>)> {
-    let shard_paths = resolve_safetensors_shards(model_dir)?;
-    let vb_text =
-        unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, text_dtype, &device.device)? };
-    let vb_audio =
-        unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, audio_dtype, &device.device)? };
-    Ok((vb_text, vb_audio))
+/// The audio tower and the text model, each read at its selected dtype by
+/// `load_audio` / `load_text`. With `check` (Metal), a dtype below F32 must
+/// pass that component's load-time probe, or the component alone reloads in
+/// F32 (report 13), for GGUF and safetensors checkpoints alike.
+fn load_qwen3_asr_components(
+    audio_selection: &DTypeSelection,
+    text_selection: &DTypeSelection,
+    check: bool,
+    device: &candle_core::Device,
+    load_audio: impl FnMut(DType) -> Result<AudioTower>,
+    load_text: impl FnMut(DType) -> Result<Qwen3Model>,
+) -> Result<(AudioTower, PrecisionLoad, Qwen3Model, PrecisionLoad)> {
+    let (audio_tower, audio_precision) = load_with_precision_fallback(
+        "Qwen3-ASR audio tower",
+        audio_selection,
+        check,
+        DType::F32,
+        load_audio,
+        |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, device),
+    )?;
+    let (text_model, text_precision) = load_with_precision_fallback(
+        "Qwen3-ASR text",
+        text_selection,
+        check,
+        DType::F32,
+        load_text,
+        qwen3_asr_text_self_check,
+    )?;
+    Ok((audio_tower, audio_precision, text_model, text_precision))
 }
 
 fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -6748,7 +6762,7 @@ mod tests {
         }
     }
 
-    fn local_models_root() -> PathBuf {
+    pub(super) fn local_models_root() -> PathBuf {
         std::env::var("IZWI_MODELS_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -6859,10 +6873,154 @@ mod precision_tests {
     use candle_core::{DType, Device};
 
     use super::{
-        qwen3_asr_audio_self_check, qwen3_asr_text_self_check, select_quantized_text_dtype,
+        load_qwen3_asr_components, qwen3_asr_audio_self_check, qwen3_asr_text_self_check,
+        select_quantized_text_dtype, Qwen3AsrModel,
     };
-    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::backends::{DTypeSelection, DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::catalog::ModelFamily;
+    use crate::kernels::numeric_check::PrecisionLoad;
+    use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
+    use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+
+    fn selection(dtype: DType) -> DTypeSelection {
+        DTypeSelection {
+            dtype,
+            reason: "test selection".into(),
+        }
+    }
+
+    /// A Qwen3 speech-family model over the tiny audio tower and text model.
+    fn tiny_model(is_forced_aligner: bool) -> Qwen3AsrModel {
+        let device = Device::Cpu;
+        let tokenizer = super::tokenizer::gguf_shaped_test_tokenizer(Some("qwen3_asr")).unwrap();
+        let specials = tokenizer.specials().clone();
+        let mel = super::MelSpectrogram::new(super::MelConfig {
+            sample_rate: 16_000,
+            n_fft: 400,
+            win_length: None,
+            hop_length: 160,
+            n_mels: 8,
+            f_min: 0.0,
+            f_max: 8_000.0,
+            normalize: true,
+            mel_scale: super::MelScale::Slaney,
+            mel_norm: super::MelNorm::Slaney,
+        })
+        .unwrap();
+        Qwen3AsrModel {
+            audio_preparation_id: 0,
+            device: DeviceProfile::cpu(),
+            audio_dtype: DType::F32,
+            text_dtype: DType::F32,
+            checkpoint_format: "safetensors",
+            gguf_qmatmul_text_enabled: false,
+            is_forced_aligner,
+            timestamp_token_id: None,
+            timestamp_segment_time_ms: None,
+            tokenizer,
+            specials,
+            audio_tower: super::audio::tiny_audio_tower_for_test(&device),
+            text_model: tiny_qwen3_model_for_test(&device),
+            text_context_tokens: Some(128),
+            mel,
+            preprocessor: serde_json::from_str("{}").unwrap(),
+            audio_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
+            text_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
+        }
+    }
+
+    /// QFA-7 / ADM-11: both checkpoint formats load through one helper, so
+    /// a safetensors checkpoint's lowered tier (the 4-bit aligner's F16 text
+    /// on Metal) runs its load-time probe, as the GGUF one always did. F32
+    /// is the reference and is never probed; off Metal nothing is.
+    #[test]
+    fn lowered_tiers_run_their_load_time_probe_on_metal() {
+        let device = Device::Cpu;
+        for check in [true, false] {
+            let mut audio_loads = Vec::new();
+            let mut text_loads = Vec::new();
+            let (_, audio, _, text) = load_qwen3_asr_components(
+                &selection(DType::F32),
+                &selection(DType::F16),
+                check,
+                &device,
+                |dtype| {
+                    audio_loads.push(dtype);
+                    Ok(super::audio::tiny_audio_tower_for_test(&device))
+                },
+                |dtype| {
+                    text_loads.push(dtype);
+                    Ok(tiny_qwen3_model_for_test(&device))
+                },
+            )
+            .unwrap();
+            assert_eq!(audio_loads, [DType::F32]);
+            // A passing probe keeps the tier: one load, no F32 reload.
+            assert_eq!(text_loads, [DType::F16]);
+            assert!(audio.self_check.is_none());
+            assert_eq!(text.loaded, DType::F16);
+            match text.self_check {
+                Some(report) => assert!(check && report.passed, "{}", report.reason),
+                None => assert!(!check),
+            }
+        }
+    }
+
+    /// QFA-11: the aligner's cacheless forward publishes no KV, matching its
+    /// stateless `ForcedAlignment` adapter; Qwen3-ASR keeps its managed
+    /// contract.
+    #[test]
+    fn the_forced_aligner_reports_a_stateless_contract() {
+        let aligner = tiny_model(true).inference_state_contract().unwrap();
+        assert!(matches!(aligner, InferenceStateCapability::Stateless));
+        let asr = tiny_model(false).inference_state_contract().unwrap();
+        assert!(matches!(asr, InferenceStateCapability::Managed(_)));
+    }
+
+    /// The published 4-bit aligner on Metal: the F16 text tier really runs
+    /// its probe, and the loaded model is stateless.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B-4bit checkpoint and a Metal device"]
+    fn forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe() {
+        use std::io::Write;
+        let model_dir = super::tests::local_models_root().join("Qwen3-ForcedAligner-0.6B-4bit");
+        if !model_dir.join("model.safetensors").exists() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped: no checkpoint at {}",
+                model_dir.display()
+            );
+            return;
+        }
+        let device = crate::backends::DeviceSelector::detect_with_preference(Some("metal"))
+            .expect("metal device");
+        let model = Qwen3AsrModel::load(
+            &model_dir,
+            crate::model::ModelVariant::Qwen3ForcedAligner06B4Bit,
+            device,
+        )
+        .expect("load");
+        let _ = writeln!(
+            std::io::stderr(),
+            "text: {:?} -> {:?} ({}); probe {:?}",
+            model.text_precision.requested,
+            model.text_precision.loaded,
+            model.text_precision.reason,
+            model
+                .text_precision
+                .self_check
+                .as_ref()
+                .map(|r| (r.passed, &r.reason)),
+        );
+        assert_eq!(model.text_precision.requested, DType::F16);
+        assert!(model.text_precision.self_check.is_some());
+        assert!(model.audio_precision.self_check.is_none());
+        assert!(matches!(
+            model.inference_state_contract().unwrap(),
+            InferenceStateCapability::Stateless
+        ));
+    }
 
     #[test]
     fn quantized_text_on_metal_takes_the_lm_tier_unless_f32_is_pinned() {

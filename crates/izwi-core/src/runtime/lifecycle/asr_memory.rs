@@ -1367,7 +1367,33 @@ fn aligner_plan(
         mlx_bits: spec.mlx_bits,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
     };
-    price_qwen3_aligner(&files, backend, load).map(Some)
+    price_qwen3_aligner_as_loaded(&files, backend, load).map(Some)
+}
+
+/// The aligner plan as loaded: on Metal a dtype below F32 is kept only if its
+/// load-time probe passes, else that component reloads at F32, so the load
+/// peak also fits that.
+fn price_qwen3_aligner_as_loaded(
+    files: &[CensusFile],
+    backend: BackendKind,
+    load: AlignerLoad,
+) -> Result<AsrResidencyPlan> {
+    let plan = price_qwen3_aligner(files, backend, load)?;
+    if backend == BackendKind::Metal
+        && (load.text_dtype != DType::F32 || load.audio_dtype != DType::F32)
+    {
+        let dense = price_qwen3_aligner(
+            files,
+            backend,
+            AlignerLoad {
+                text_dtype: DType::F32,
+                audio_dtype: DType::F32,
+                ..load
+            },
+        )?;
+        return Ok(plan.with_fallback_peak(&dense));
+    }
+    Ok(plan)
 }
 
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
@@ -2417,7 +2443,7 @@ pub(super) mod tests {
                 None,
             ),
         };
-        price_qwen3_aligner(files, backend, load).unwrap()
+        price_qwen3_aligner_as_loaded(files, backend, load).unwrap()
     }
 
     /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
@@ -3266,6 +3292,41 @@ pub(super) mod tests {
         ] {
             assert!(!super::super::reconciles_device_usage(variant), "{variant}");
         }
+    }
+
+    /// The 4-bit aligner's Metal F16 text tier runs a load-time probe and
+    /// reloads the text at F32 when it fails, so its load peak covers that
+    /// reload; residency stays the F16 tier's. Dense Metal loads F32 and has
+    /// no fallback.
+    #[test]
+    fn aligner_metal_f16_tier_prices_the_f32_fallback_peak() {
+        let _env = env_lock();
+        let files = census!("qwen3_forced_aligner_0_6b_4bit.json");
+        let tiered = aligner(&files, BackendKind::Metal);
+        let load = |text_dtype| AlignerLoad {
+            text_dtype,
+            audio_dtype: DType::F32,
+            mlx_bits: Some(4),
+            fused_projections: true,
+        };
+        let f16 = price_qwen3_aligner(&files, BackendKind::Metal, load(DType::F16)).unwrap();
+        let f32 = price_qwen3_aligner(&files, BackendKind::Metal, load(DType::F32)).unwrap();
+        assert_eq!(tiered.resident_bytes, f16.resident_bytes);
+        assert!(f32.load_peak_bytes > f16.load_peak_bytes);
+        assert_eq!(tiered.load_peak_bytes, f32.load_peak_bytes);
+        let dense = census!("qwen3_forced_aligner_0_6b.json");
+        assert_eq!(
+            aligner(&dense, BackendKind::Metal),
+            price_qwen3_aligner(
+                &dense,
+                BackendKind::Metal,
+                AlignerLoad {
+                    mlx_bits: None,
+                    ..load(DType::F32)
+                },
+            )
+            .unwrap()
+        );
     }
 
     /// Variants without a plan, and checkpoints whose files are missing (the
