@@ -840,13 +840,13 @@ pub(crate) fn effective_frame_budget(
 ) -> Result<usize> {
     let context = model_context.min(cache_capacity);
     let available = context.checked_sub(prompt_tokens).filter(|available| *available > 0)
-        .ok_or_else(|| Error::InvalidInput(format!(
+        .ok_or_else(|| Error::ContextLengthExceeded(format!(
             "Fish S2 prompt length {prompt_tokens} leaves no output room in effective context {context}",
         )))?;
     // Reserve one context position beyond the full output budget for EOS. Never
     // silently shrink the admitted output budget after exact tokenization.
     if requested == 0 || requested >= available {
-        return Err(Error::InvalidInput(format!(
+        return Err(Error::ContextLengthExceeded(format!(
             "Fish S2 segment does not fit effective context: prompt_tokens={prompt_tokens}, requested_frames={requested}, eos_margin=1, context={context}; split the text segment or shorten the voice reference before generating audio",
         )));
     }
@@ -1070,7 +1070,10 @@ mod tests {
             assert!(error
                 .to_string()
                 .contains("segment does not fit effective context"));
+            assert_eq!(error.kind(), crate::error::ErrorKind::ContextLengthExceeded);
         }
+        let error = super::effective_frame_budget(256, 8192, 256, 1).unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::ContextLengthExceeded);
     }
 
     #[test]

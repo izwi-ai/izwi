@@ -488,7 +488,7 @@ impl ModelLifecycleController {
         let mut state = self.state();
         let active_leases = self.model_manager.active_residency_leases(variant);
         if active_leases > 0 {
-            return Err(Error::InferenceError(format!(
+            return Err(Error::ModelBusy(format!(
                 "Cannot unload model {variant}: {active_leases} active inference lease(s) are still held"
             )));
         }

@@ -13,7 +13,7 @@ use izwi_core::{ChatGeneration, ChatMessage, ChatRole, ModelVariant};
 use izwi_serving_client::{DeadlinePhase, InvocationStream, WorkerClientError};
 use izwi_serving_protocol::{
     CancellationBehavior, DeploymentId, InputFormat, ModelAlias, OutputFormat, PolicyRevision,
-    RejectionCode, TaskKind, PROTOCOL_V1,
+    TaskKind, PROTOCOL_V1,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -700,16 +700,9 @@ fn retryable_before_acceptance(error: &WorkerClientError) -> bool {
     match error {
         WorkerClientError::ConnectionNotEstablished(_)
         | WorkerClientError::Deadline(DeadlinePhase::InFlightPermit) => true,
-        WorkerClientError::Rejected { rejection } if !rejection.accepted => matches!(
-            rejection.code,
-            RejectionCode::CapacityExhausted
-                | RejectionCode::QueueWaitExceeded
-                | RejectionCode::WrongWorkerIncarnation
-                | RejectionCode::WrongModelGeneration
-                | RejectionCode::UnknownDeployment
-                | RejectionCode::ModelNotReady
-                | RejectionCode::WorkerDraining
-        ),
+        WorkerClientError::Rejected { rejection } if !rejection.accepted => {
+            crate::error::rejection_class(rejection.code).retryable()
+        }
         _ => false,
     }
 }
@@ -771,6 +764,7 @@ fn map_registry_error(error: WorkerRegistryError) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_serving_protocol::RejectionCode;
     use std::collections::{BTreeMap, BTreeSet};
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};

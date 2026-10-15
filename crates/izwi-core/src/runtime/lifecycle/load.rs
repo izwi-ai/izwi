@@ -1768,7 +1768,7 @@ impl ModelLifecycleController {
                 &pinned_variants,
                 &last_used,
             ) else {
-                return Err(Error::ModelLoadError(format!(
+                return Err(Error::Overloaded(format!(
                     "Cannot load {requested_variant}: the {max_loaded_models}-model residency budget is full and no resident model is idle and available for eviction; unload a model to make room"
                 )));
             };
@@ -1960,7 +1960,7 @@ impl ModelLifecycleController {
                 tracing::warn!(
                     "Cannot fit {requested_variant} model tensors before state allocation: load_peak_bytes={required_bytes}, planning_headroom={planning_headroom}, live_headroom={live_headroom:?}, backend={backend:?}"
                 );
-                return Err(Error::ModelLoadError(format!(
+                return Err(Error::Overloaded(format!(
                     "{}; no idle resident model is available for eviction; unload a model to make room",
                     capacity_shortfall_reason(
                         format_args!("Cannot load {requested_variant}"),
@@ -2092,7 +2092,7 @@ impl ModelLifecycleController {
                 load_authorization,
             ) {
                 Ok(lease) => return Ok(lease),
-                Err(resource_error @ Error::Overloaded(_)) => {
+                Err(Error::Overloaded(resource_error)) => {
                     let resident_variants = self.known_resident_variants().await;
                     let mut active_variants = self.core_engine.active_model_variants().await;
                     active_variants.extend(resident_variants.iter().copied().filter(|variant| {
@@ -2116,7 +2116,7 @@ impl ModelLifecycleController {
                         &pinned_variants,
                         &last_used,
                     ) else {
-                        return Err(Error::ModelLoadError(format!(
+                        return Err(Error::Overloaded(format!(
                             "Cannot reserve memory for {requested_variant}: {resource_error}; no idle resident model is available for eviction; unload a model to make room"
                         )));
                     };
@@ -6444,6 +6444,7 @@ mod tests {
             error.to_string().contains("unload a model to make room"),
             "unexpected error: {error}"
         );
+        assert_eq!(error.kind(), crate::error::ErrorKind::CapacityExhausted);
 
         assert!(runtime
             .model_manager

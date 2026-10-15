@@ -2739,7 +2739,7 @@ mod tests {
             .expect("authentication error must be bounded");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "authentication_error");
-        assert_eq!(body["error"]["code"], "401");
+        assert_eq!(body["error"]["code"], "invalid_api_key");
         assert_eq!(state.metrics.snapshot().auth_rejections, 1);
     }
 
@@ -3280,7 +3280,7 @@ mod tests {
             .expect("body-limit error must be bounded");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["code"], "413");
+        assert_eq!(body["error"]["code"], "payload_too_large");
         assert_eq!(
             body["error"]["message"],
             "Gateway chat request body exceeds the configured limit"

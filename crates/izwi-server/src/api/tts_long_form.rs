@@ -621,12 +621,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         if let Err(error) = result {
             // Exact tokenized reference+text fit is checked inside admitted model
             // preparation. Replan only before this segment has published audio.
-            if !emitted
-                && (error
-                    .to_string()
-                    .contains("Fish S2 segment does not fit effective context")
-                    || error.to_string().contains("leaves no output room"))
-            {
+            if !emitted && error.kind() == izwi_core::ErrorKind::ContextLengthExceeded {
                 let text = &base.text[range.clone()];
                 let count = text.chars().count();
                 if count > 1 {

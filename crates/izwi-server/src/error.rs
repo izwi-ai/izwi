@@ -5,6 +5,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use izwi_core::ErrorKind;
+use izwi_serving_protocol::{InvocationErrorCode, RejectionCode};
 use serde_json::json;
 
 /// Seconds a client should wait before retrying a `503`. Capacity refusals
@@ -12,12 +14,198 @@ use serde_json::json;
 /// usually within seconds.
 const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
 
-/// A model load the runtime refused because device memory or the residency
-/// budget is held by models that are busy right now. The load can succeed
-/// once one of them goes idle, so it is a temporary capacity condition, not
-/// a server fault. Every such refusal ends with this advice.
-fn is_transient_capacity_refusal(message: &str) -> bool {
-    message.contains("unload a model to make room")
+/// The `499` status nginx and izwi use for a request the client cancelled.
+const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// The class of an API error: the one table from which both roles (local
+/// and gateway) take an error's HTTP status, OpenAI `type` and `code`, and
+/// whether it is retryable. Core error kinds and worker protocol codes map
+/// into a class; nothing maps straight to a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorClass {
+    InvalidRequest,
+    ContextLengthExceeded,
+    PayloadTooLarge,
+    UnsupportedMediaType,
+    Unauthenticated,
+    PermissionDenied,
+    NotFound,
+    ModelNotFound,
+    Conflict,
+    RateLimited,
+    Timeout,
+    Cancelled,
+    /// Out of capacity, or not ready (a model loading, a worker draining):
+    /// the same request can succeed shortly.
+    Unavailable,
+    /// A worker answered the gateway with something it could not use.
+    BadGateway,
+    Internal,
+}
+
+impl ErrorClass {
+    pub const ALL: [Self; 15] = [
+        Self::InvalidRequest,
+        Self::ContextLengthExceeded,
+        Self::PayloadTooLarge,
+        Self::UnsupportedMediaType,
+        Self::Unauthenticated,
+        Self::PermissionDenied,
+        Self::NotFound,
+        Self::ModelNotFound,
+        Self::Conflict,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::Cancelled,
+        Self::Unavailable,
+        Self::BadGateway,
+        Self::Internal,
+    ];
+
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::InvalidRequest | Self::ContextLengthExceeded => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::Unauthenticated => StatusCode::UNAUTHORIZED,
+            Self::PermissionDenied => StatusCode::FORBIDDEN,
+            Self::NotFound | Self::ModelNotFound => StatusCode::NOT_FOUND,
+            Self::Conflict => StatusCode::CONFLICT,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::Timeout => StatusCode::REQUEST_TIMEOUT,
+            Self::Cancelled => {
+                StatusCode::from_u16(CLIENT_CLOSED_REQUEST).unwrap_or(StatusCode::REQUEST_TIMEOUT)
+            }
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::BadGateway => StatusCode::BAD_GATEWAY,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// OpenAI's `error.type`.
+    pub fn openai_type(self) -> &'static str {
+        match self {
+            Self::InvalidRequest
+            | Self::ContextLengthExceeded
+            | Self::PayloadTooLarge
+            | Self::UnsupportedMediaType
+            | Self::Conflict => "invalid_request_error",
+            Self::Unauthenticated => "authentication_error",
+            Self::PermissionDenied => "permission_denied_error",
+            Self::NotFound | Self::ModelNotFound => "not_found_error",
+            Self::RateLimited => "rate_limit_error",
+            Self::Unavailable => "service_unavailable_error",
+            Self::Timeout | Self::Cancelled | Self::BadGateway | Self::Internal => "server_error",
+        }
+    }
+
+    /// OpenAI's `error.code`: what went wrong, never the HTTP status.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_value",
+            Self::ContextLengthExceeded => "context_length_exceeded",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::Unauthenticated => "invalid_api_key",
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::ModelNotFound => "model_not_found",
+            Self::Conflict => "conflict",
+            Self::RateLimited => "rate_limit_exceeded",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Unavailable => "service_unavailable",
+            Self::BadGateway => "bad_gateway",
+            Self::Internal => "server_error",
+        }
+    }
+
+    /// OpenAI's `error.param` when the class always names one.
+    pub fn param(self) -> Option<&'static str> {
+        match self {
+            Self::ModelNotFound => Some("model"),
+            _ => None,
+        }
+    }
+
+    /// Whether the same request can succeed if sent again shortly: the
+    /// client may retry, and the gateway tries another worker before a
+    /// worker accepts it.
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::Unavailable | Self::RateLimited)
+    }
+
+    /// The general class of a status, for errors built from a status alone.
+    pub fn from_status(status: StatusCode) -> Self {
+        match status.as_u16() {
+            401 => Self::Unauthenticated,
+            403 => Self::PermissionDenied,
+            404 => Self::NotFound,
+            408 => Self::Timeout,
+            409 => Self::Conflict,
+            413 => Self::PayloadTooLarge,
+            415 => Self::UnsupportedMediaType,
+            429 => Self::RateLimited,
+            CLIENT_CLOSED_REQUEST => Self::Cancelled,
+            502 => Self::BadGateway,
+            503 => Self::Unavailable,
+            code if code < 500 => Self::InvalidRequest,
+            _ => Self::Internal,
+        }
+    }
+}
+
+impl From<ErrorKind> for ErrorClass {
+    fn from(kind: ErrorKind) -> Self {
+        match kind {
+            ErrorKind::InvalidInput => Self::InvalidRequest,
+            ErrorKind::ContextLengthExceeded => Self::ContextLengthExceeded,
+            ErrorKind::ModelNotFound => Self::ModelNotFound,
+            ErrorKind::ModelBusy => Self::Conflict,
+            ErrorKind::CapacityExhausted | ErrorKind::Unavailable => Self::Unavailable,
+            ErrorKind::Timeout => Self::Timeout,
+            ErrorKind::Cancelled => Self::Cancelled,
+            ErrorKind::Internal => Self::Internal,
+        }
+    }
+}
+
+/// The class of a worker's admission rejection. Rejections a different
+/// worker might accept (busy, not ready, draining, routed with stale
+/// identity) are retryable [`ErrorClass::Unavailable`], so the gateway
+/// tries another worker before answering `503`.
+pub(crate) fn rejection_class(code: RejectionCode) -> ErrorClass {
+    match code {
+        RejectionCode::InvalidRequest | RejectionCode::IncompatibleTask => {
+            ErrorClass::InvalidRequest
+        }
+        RejectionCode::ContextLengthExceeded => ErrorClass::ContextLengthExceeded,
+        RejectionCode::Unauthorized | RejectionCode::PolicyDenied => ErrorClass::PermissionDenied,
+        RejectionCode::UnknownDeployment
+        | RejectionCode::WrongWorkerIncarnation
+        | RejectionCode::WrongModelGeneration
+        | RejectionCode::ModelNotReady
+        | RejectionCode::WorkerDraining
+        | RejectionCode::CapacityExhausted
+        | RejectionCode::QueueWaitExceeded => ErrorClass::Unavailable,
+        RejectionCode::DuplicateAttemptConflict => ErrorClass::Conflict,
+        RejectionCode::Unauthenticated
+        | RejectionCode::UnsupportedProtocolVersion
+        | RejectionCode::Unknown => ErrorClass::BadGateway,
+    }
+}
+
+/// The class of a worker's terminal error after it accepted an invocation.
+pub(crate) fn invocation_error_class(code: InvocationErrorCode) -> ErrorClass {
+    match code {
+        InvocationErrorCode::InvalidInput => ErrorClass::InvalidRequest,
+        InvocationErrorCode::DeadlineExceeded => ErrorClass::Timeout,
+        InvocationErrorCode::WorkerUnavailable => ErrorClass::Unavailable,
+        InvocationErrorCode::ExecutionFailed
+        | InvocationErrorCode::OutputLimitExceeded
+        | InvocationErrorCode::Internal
+        | InvocationErrorCode::Unknown => ErrorClass::Internal,
+    }
 }
 
 /// API error type
@@ -38,60 +226,48 @@ pub struct ApiErrorDetail {
 }
 
 impl ApiError {
-    pub fn bad_request(msg: impl Into<String>) -> Self {
+    /// An error of `class`. The detail is recorded only when the class's
+    /// code or param differs from what its status alone would give.
+    pub fn of(class: ErrorClass, msg: impl Into<String>) -> Self {
+        let status = class.status();
+        let detail = (class != ErrorClass::from_status(status) || class.param().is_some())
+            .then_some(ApiErrorDetail {
+                param: class.param(),
+                code: Some(class.code()),
+            });
         Self {
-            status: StatusCode::BAD_REQUEST,
+            status,
             message: msg.into(),
-            detail: None,
+            detail,
         }
+    }
+
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self::of(ErrorClass::InvalidRequest, msg)
     }
 
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::NotFound, msg)
     }
 
     pub fn forbidden(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::PermissionDenied, msg)
     }
 
     pub fn unauthorized(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::Unauthenticated, msg)
     }
 
     pub fn payload_too_large(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::PayloadTooLarge, msg)
     }
 
     pub fn too_many_requests(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::RateLimited, msg)
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::Internal, msg)
     }
 
     /// A `400` about one request parameter, rendered with OpenAI's
@@ -120,60 +296,55 @@ impl ApiError {
         }
     }
 
-    /// OpenAI `context_length_exceeded`: the messages, or the messages plus
-    /// the requested output, do not fit the model's context.
+    /// OpenAI `context_length_exceeded` on a chat request: the messages, or
+    /// the messages plus the requested output, do not fit the model's
+    /// context.
     pub fn context_length_exceeded(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: msg.into(),
-            detail: Some(ApiErrorDetail {
-                param: Some("messages"),
-                code: Some("context_length_exceeded"),
-            }),
-        }
+        Self::of(ErrorClass::ContextLengthExceeded, msg).with_param("messages")
     }
 
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: msg.into(),
-            detail: None,
-        }
+        Self::of(ErrorClass::Unavailable, msg)
     }
 
     /// OpenAI `model_not_found`: the requested model is not served here.
     pub fn model_not_found(msg: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: msg.into(),
-            detail: Some(ApiErrorDetail {
-                param: Some("model"),
-                code: Some("model_not_found"),
-            }),
-        }
+        Self::of(ErrorClass::ModelNotFound, msg)
+    }
+
+    /// The same error about request parameter `param`.
+    pub fn with_param(mut self, param: &'static str) -> Self {
+        let code = self
+            .detail
+            .and_then(|detail| detail.code)
+            .unwrap_or(self.class().code());
+        self.detail = Some(ApiErrorDetail {
+            param: Some(param),
+            code: Some(code),
+        });
+        self
+    }
+
+    /// The class this error's status belongs to. Classes that share a
+    /// status share their type and retryability, so the status decides
+    /// both.
+    pub fn class(&self) -> ErrorClass {
+        ErrorClass::from_status(self.status)
     }
 
     /// The OpenAI error object: the HTTP error body, and the payload of an
     /// error event once a stream has started.
     pub fn openai_body(&self) -> serde_json::Value {
+        let class = self.class();
         json!({
             "error": {
                 "message": self.message,
-                "type": match self.status {
-                    StatusCode::BAD_REQUEST => "invalid_request_error",
-                    StatusCode::UNAUTHORIZED => "authentication_error",
-                    StatusCode::FORBIDDEN => "permission_denied_error",
-                    StatusCode::NOT_FOUND => "not_found_error",
-                    StatusCode::PAYLOAD_TOO_LARGE => "invalid_request_error",
-                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-                    StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
-                    _ => "server_error",
-                },
+                "type": class.openai_type(),
                 "param": self.detail.and_then(|detail| detail.param),
                 "code": self
                     .detail
                     .and_then(|detail| detail.code)
-                    .unwrap_or(self.status.as_str())
+                    .unwrap_or(class.code())
             }
         })
     }
@@ -195,33 +366,11 @@ impl IntoResponse for ApiError {
 
 impl From<izwi_core::Error> for ApiError {
     fn from(err: izwi_core::Error) -> Self {
-        match &err {
-            izwi_core::Error::InvalidInput(_) => ApiError::bad_request(err.to_string()),
-            izwi_core::Error::ContextLengthExceeded(message) => {
-                ApiError::context_length_exceeded(message.clone())
-            }
-            izwi_core::Error::ModelNotFound(_) => ApiError::not_found(err.to_string()),
-            izwi_core::Error::ConfigError(_) => ApiError::bad_request(err.to_string()),
-            izwi_core::Error::ModelLoadError(message) if is_transient_capacity_refusal(message) => {
-                ApiError::service_unavailable(err.to_string())
-            }
-            izwi_core::Error::MissingDependency(_) => {
-                ApiError::service_unavailable(err.to_string())
-            }
-            izwi_core::Error::Timeout(_) => ApiError {
-                status: StatusCode::REQUEST_TIMEOUT,
-                message: err.to_string(),
-                detail: None,
-            },
-            izwi_core::Error::Overloaded(_) | izwi_core::Error::Backpressure(_) => {
-                ApiError::service_unavailable(err.to_string())
-            }
-            izwi_core::Error::Cancelled(_) => ApiError {
-                status: StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
-                message: err.to_string(),
-                detail: None,
-            },
-            _ => ApiError::internal(err.to_string()),
+        let class = ErrorClass::from(err.kind());
+        match err {
+            // OpenAI's message for an overflow is the bare explanation.
+            izwi_core::Error::ContextLengthExceeded(message) => ApiError::of(class, message),
+            err => ApiError::of(class, err.to_string()),
         }
     }
 }
@@ -229,9 +378,174 @@ impl From<izwi_core::Error> for ApiError {
 #[cfg(test)]
 mod tests {
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use izwi_core::ErrorKind;
+    use izwi_serving_protocol::{InvocationErrorCode, RejectionCode};
+    use izwi_serving_worker::{admission_rejection_code, execution_error_code};
     use serde_json::Value;
 
-    use super::ApiError;
+    use super::*;
+
+    async fn body(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The class table: a class's type and retryability follow from its
+    /// status, so an error built from a bare status renders the same way,
+    /// and every code is a word, never an HTTP status.
+    #[test]
+    fn class_table_is_consistent_per_status() {
+        let mut codes = std::collections::HashSet::new();
+        for class in ErrorClass::ALL {
+            let general = ErrorClass::from_status(class.status());
+            assert_eq!(general.status(), class.status(), "{class:?}");
+            assert_eq!(general.openai_type(), class.openai_type(), "{class:?}");
+            assert_eq!(general.retryable(), class.retryable(), "{class:?}");
+            assert!(codes.insert(class.code()), "{class:?} reuses a code");
+            assert!(class.code().parse::<u16>().is_err(), "{class:?}");
+            let error = ApiError::of(class, "x");
+            let rendered = error.openai_body();
+            assert_eq!(rendered["error"]["code"], class.code(), "{class:?}");
+            assert_eq!(rendered["error"]["type"], class.openai_type(), "{class:?}");
+        }
+        assert!(ErrorClass::Unavailable.retryable());
+        assert!(ErrorClass::RateLimited.retryable());
+        assert!(!ErrorClass::Internal.retryable());
+    }
+
+    /// One row per core error kind: the class the local role answers with,
+    /// and the classes the gateway answers with when a worker reports the
+    /// same kind before and after accepting the invocation. Where a row
+    /// differs, the worker's view of the failure differs (see
+    /// `admission_rejection_code`); the table pins every such case.
+    #[test]
+    fn core_kinds_map_alike_on_both_roles() {
+        use ErrorClass as C;
+        let rows = [
+            (
+                ErrorKind::InvalidInput,
+                C::InvalidRequest,
+                C::InvalidRequest,
+                C::InvalidRequest,
+            ),
+            (
+                ErrorKind::ContextLengthExceeded,
+                C::ContextLengthExceeded,
+                C::ContextLengthExceeded,
+                C::InvalidRequest,
+            ),
+            (
+                ErrorKind::ModelNotFound,
+                C::ModelNotFound,
+                C::Unavailable,
+                C::Internal,
+            ),
+            (
+                ErrorKind::ModelBusy,
+                C::Conflict,
+                C::Unavailable,
+                C::Internal,
+            ),
+            (
+                ErrorKind::CapacityExhausted,
+                C::Unavailable,
+                C::Unavailable,
+                C::Unavailable,
+            ),
+            (ErrorKind::Timeout, C::Timeout, C::Unavailable, C::Timeout),
+            (
+                ErrorKind::Cancelled,
+                C::Cancelled,
+                C::Unavailable,
+                C::Internal,
+            ),
+            (
+                ErrorKind::Unavailable,
+                C::Unavailable,
+                C::Unavailable,
+                C::Unavailable,
+            ),
+            (
+                ErrorKind::Internal,
+                C::Internal,
+                C::Unavailable,
+                C::Internal,
+            ),
+        ];
+        for (kind, local, admission, execution) in rows {
+            assert_eq!(ErrorClass::from(kind), local, "{kind:?} local");
+            assert_eq!(
+                rejection_class(admission_rejection_code(kind)),
+                admission,
+                "{kind:?} rejected by a worker"
+            );
+            assert_eq!(
+                invocation_error_class(execution_error_code(kind)),
+                execution,
+                "{kind:?} failed on a worker"
+            );
+        }
+        let covered: std::collections::HashSet<_> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(covered, ErrorKind::ALL.into_iter().collect());
+    }
+
+    /// Worker rejections the gateway retries on another worker are exactly
+    /// the retryable classes, and the rest are answered at once.
+    #[test]
+    fn retryable_rejections_are_the_unavailable_class() {
+        for (code, class) in [
+            (RejectionCode::Unauthenticated, ErrorClass::BadGateway),
+            (RejectionCode::Unauthorized, ErrorClass::PermissionDenied),
+            (
+                RejectionCode::UnsupportedProtocolVersion,
+                ErrorClass::BadGateway,
+            ),
+            (
+                RejectionCode::WrongWorkerIncarnation,
+                ErrorClass::Unavailable,
+            ),
+            (RejectionCode::UnknownDeployment, ErrorClass::Unavailable),
+            (RejectionCode::WrongModelGeneration, ErrorClass::Unavailable),
+            (RejectionCode::IncompatibleTask, ErrorClass::InvalidRequest),
+            (RejectionCode::ModelNotReady, ErrorClass::Unavailable),
+            (RejectionCode::WorkerDraining, ErrorClass::Unavailable),
+            (RejectionCode::CapacityExhausted, ErrorClass::Unavailable),
+            (RejectionCode::QueueWaitExceeded, ErrorClass::Unavailable),
+            (RejectionCode::InvalidRequest, ErrorClass::InvalidRequest),
+            (
+                RejectionCode::DuplicateAttemptConflict,
+                ErrorClass::Conflict,
+            ),
+            (RejectionCode::PolicyDenied, ErrorClass::PermissionDenied),
+            (
+                RejectionCode::ContextLengthExceeded,
+                ErrorClass::ContextLengthExceeded,
+            ),
+            (RejectionCode::Unknown, ErrorClass::BadGateway),
+        ] {
+            assert_eq!(rejection_class(code), class, "{code:?}");
+        }
+        for (code, class) in [
+            (
+                InvocationErrorCode::InvalidInput,
+                ErrorClass::InvalidRequest,
+            ),
+            (InvocationErrorCode::DeadlineExceeded, ErrorClass::Timeout),
+            (
+                InvocationErrorCode::WorkerUnavailable,
+                ErrorClass::Unavailable,
+            ),
+            (InvocationErrorCode::ExecutionFailed, ErrorClass::Internal),
+            (
+                InvocationErrorCode::OutputLimitExceeded,
+                ErrorClass::Internal,
+            ),
+            (InvocationErrorCode::Internal, ErrorClass::Internal),
+            (InvocationErrorCode::Unknown, ErrorClass::Internal),
+        ] {
+            assert_eq!(invocation_error_class(code), class, "{code:?}");
+        }
+    }
 
     #[test]
     fn missing_dependency_maps_to_service_unavailable() {
@@ -243,6 +557,9 @@ mod tests {
         assert!(api_error.message.contains("espeak-ng not found"));
     }
 
+    /// Statuses follow the error's kind, never its text: a load refused for
+    /// capacity is a `503` because the runtime types it as overloaded, and
+    /// the same advice inside a load failure stays a server fault.
     #[test]
     fn runtime_errors_map_to_client_and_capacity_statuses() {
         for (error, status) in [
@@ -255,16 +572,7 @@ mod tests {
                 StatusCode::NOT_FOUND,
             ),
             (
-                izwi_core::Error::ModelLoadError(
-                    "Cannot fit Parakeet-TDT-0.6B-v3 model tensors before state allocation: \
-                     load_peak_bytes=1; no idle resident model is available for eviction; \
-                     unload a model to make room"
-                        .into(),
-                ),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                izwi_core::Error::ModelLoadError(
+                izwi_core::Error::Overloaded(
                     "Cannot load Whisper-Large-v3-Turbo: the 2-model residency budget is full \
                      and no resident model is idle and available for eviction; unload a model \
                      to make room"
@@ -273,8 +581,20 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                izwi_core::Error::ModelLoadError("unload a model to make room".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
                 izwi_core::Error::Overloaded("all ASR slots are busy".into()),
                 StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                izwi_core::Error::ModelBusy("Cannot unload model Kokoro-82M".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                izwi_core::Error::ConfigError("invalid memory budget".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
                 izwi_core::Error::ModelLoadError("safetensors header is corrupt".into()),
@@ -290,6 +610,10 @@ mod tests {
             assert_eq!(api_error.status, status, "{message}");
             assert_eq!(api_error.message, message);
         }
+        let missing = ApiError::from(izwi_core::Error::ModelNotFound("Unknown-ASR".into()));
+        let body = missing.openai_body();
+        assert_eq!(body["error"]["code"], "model_not_found");
+        assert_eq!(body["error"]["param"], "model");
     }
 
     #[tokio::test]
@@ -304,14 +628,10 @@ mod tests {
             "5"
         );
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-
+        let body = body(response).await;
         assert_eq!(body["error"]["type"], "service_unavailable_error");
-        assert_eq!(
-            body["error"]["code"],
-            StatusCode::SERVICE_UNAVAILABLE.as_str()
-        );
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(body["error"]["message"], "missing espeak-ng");
     }
 
     #[tokio::test]
@@ -324,46 +644,44 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-
+        let body = body(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(
-            body["error"]["code"],
-            StatusCode::PAYLOAD_TOO_LARGE.as_str()
-        );
+        assert_eq!(body["error"]["code"], "payload_too_large");
     }
 
     #[tokio::test]
     async fn gateway_auth_and_rate_limit_errors_use_uniform_json_types() {
-        for (error, status, error_type) in [
+        for (error, status, error_type, code) in [
             (
                 ApiError::unauthorized("api key required"),
                 StatusCode::UNAUTHORIZED,
                 "authentication_error",
+                "invalid_api_key",
             ),
             (
                 ApiError::forbidden("inference denied"),
                 StatusCode::FORBIDDEN,
                 "permission_denied_error",
+                "permission_denied",
             ),
             (
                 ApiError::too_many_requests("rate exceeded"),
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
+                "rate_limit_exceeded",
             ),
         ] {
             let response = error.into_response();
             assert_eq!(response.status(), status);
-            let body = to_bytes(response.into_body(), 4096).await.unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
+            let body = body(response).await;
             assert_eq!(body["error"]["type"], error_type);
-            assert_eq!(body["error"]["code"], status.as_str());
+            assert_eq!(body["error"]["code"], code);
         }
     }
 
-    /// D8: context overflow is OpenAI's `context_length_exceeded` 400 on the
-    /// `messages` parameter, so clients can tell it from other bad requests.
+    /// D8: context overflow is OpenAI's `context_length_exceeded` 400, so
+    /// clients can tell it from other bad requests; its message is the bare
+    /// explanation.
     #[tokio::test]
     async fn context_overflow_is_an_openai_context_length_error() {
         let error = ApiError::from(izwi_core::Error::ContextLengthExceeded(
@@ -375,10 +693,12 @@ mod tests {
         );
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let body = body(response).await;
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["error"]["code"], "context_length_exceeded");
-        assert_eq!(body["error"]["param"], "messages");
+        assert_eq!(
+            ApiError::context_length_exceeded("x").openai_body()["error"]["param"],
+            "messages"
+        );
     }
 }

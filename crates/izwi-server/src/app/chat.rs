@@ -2,7 +2,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
 use izwi_serving_client::{InvocationStream, TraceContext, WorkerClient, WorkerClientError};
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, CallerId, ChatContextPolicy, ChatInput,
@@ -10,8 +9,8 @@ use izwi_serving_protocol::{
     ChatRole as WorkerChatRole, ChatTruncation as WorkerChatTruncation, DeploymentId,
     FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
     InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
-    OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode, RequestDigest,
-    RequestId, SchemaVersion, ServiceClass, TaskKind, TenantId, Usage, WorkerFeature,
+    OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RequestDigest, RequestId,
+    SchemaVersion, ServiceClass, TaskKind, TenantId, Usage, WorkerFeature,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -19,7 +18,7 @@ use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::request_context::RequestContext;
-use crate::error::ApiError;
+use crate::error::{invocation_error_class, rejection_class, ApiError, ErrorClass};
 use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
 use crate::ids::new_uuid;
 use crate::state::AppState;
@@ -478,7 +477,7 @@ where
 
     match result.expect("completed generation result must be present") {
         Ok(generation) => Some(ChatStreamEvent::Completed(Box::new(generation))),
-        Err(err) => Some(ChatStreamEvent::Failed(ApiError::from(err))),
+        Err(err) => Some(ChatStreamEvent::Failed(chat_error(err))),
     }
 }
 
@@ -641,7 +640,19 @@ pub async fn generate_chat(
             permit.runtime_context(),
         )
         .await
-        .map_err(ApiError::from)
+        .map_err(chat_error)
+}
+
+/// A local chat failure as an API error. An overflow is about the request's
+/// `messages`, as the gateway reports it.
+fn chat_error(err: izwi_core::Error) -> ApiError {
+    let overflow = err.kind() == izwi_core::ErrorKind::ContextLengthExceeded;
+    let error = ApiError::from(err);
+    if overflow {
+        error.with_param("messages")
+    } else {
+        error
+    }
 }
 
 /// Collect an accepted invocation's whole answer. The tenant lease is
@@ -1222,30 +1233,12 @@ fn identifier_error(error: izwi_serving_protocol::IdentifierError) -> ApiError {
 pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
     match error {
         WorkerClientError::Rejected { rejection } => {
-            let message = rejection.message;
-            match rejection.code {
-                RejectionCode::Unauthorized | RejectionCode::PolicyDenied => {
-                    ApiError::forbidden(message)
-                }
-                RejectionCode::UnknownDeployment | RejectionCode::IncompatibleTask => {
-                    ApiError::bad_request(message)
-                }
-                RejectionCode::WrongWorkerIncarnation
-                | RejectionCode::WrongModelGeneration
-                | RejectionCode::ModelNotReady
-                | RejectionCode::WorkerDraining
-                | RejectionCode::CapacityExhausted
-                | RejectionCode::QueueWaitExceeded => ApiError::service_unavailable(message),
-                RejectionCode::InvalidRequest => ApiError::bad_request(message),
-                RejectionCode::ContextLengthExceeded => ApiError::context_length_exceeded(message),
-                RejectionCode::DuplicateAttemptConflict => ApiError {
-                    status: StatusCode::CONFLICT,
-                    message,
-                    detail: None,
-                },
-                RejectionCode::Unauthenticated
-                | RejectionCode::UnsupportedProtocolVersion
-                | RejectionCode::Unknown => bad_gateway_error(message),
+            let class = rejection_class(rejection.code);
+            let error = ApiError::of(class, rejection.message);
+            if class == ErrorClass::ContextLengthExceeded {
+                error.with_param("messages")
+            } else {
+                error
             }
         }
         WorkerClientError::AdmissionUnknown { .. } => {
@@ -1272,39 +1265,19 @@ pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
 }
 
 fn map_worker_terminal_error(code: InvocationErrorCode, message: String) -> ApiError {
-    match code {
-        InvocationErrorCode::InvalidInput => ApiError::bad_request(message),
-        InvocationErrorCode::DeadlineExceeded => request_timeout_error(message),
-        InvocationErrorCode::WorkerUnavailable => ApiError::service_unavailable(message),
-        InvocationErrorCode::ExecutionFailed
-        | InvocationErrorCode::OutputLimitExceeded
-        | InvocationErrorCode::Internal
-        | InvocationErrorCode::Unknown => ApiError::internal(message),
-    }
+    ApiError::of(invocation_error_class(code), message)
 }
 
 fn request_timeout_error(message: impl Into<String>) -> ApiError {
-    ApiError {
-        status: StatusCode::REQUEST_TIMEOUT,
-        message: message.into(),
-        detail: None,
-    }
+    ApiError::of(ErrorClass::Timeout, message)
 }
 
 fn cancelled_error(message: impl Into<String>) -> ApiError {
-    ApiError {
-        status: StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
-        message: message.into(),
-        detail: None,
-    }
+    ApiError::of(ErrorClass::Cancelled, message)
 }
 
 fn bad_gateway_error(message: impl Into<String>) -> ApiError {
-    ApiError {
-        status: StatusCode::BAD_GATEWAY,
-        message: message.into(),
-        detail: None,
-    }
+    ApiError::of(ErrorClass::BadGateway, message)
 }
 
 /// Start a chat stream on this process's runtime. The request is admitted
@@ -1365,7 +1338,8 @@ where
             request.correlation_id.as_deref(),
             permit.runtime_context(),
         )
-        .await?;
+        .await
+        .map_err(chat_error)?;
 
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     let sink = ChatDeltaSink::new(event_tx.clone(), izwi_core::stream_slow_consumer_timeout());
@@ -1487,7 +1461,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use izwi_core::ChatRole;
+    use izwi_serving_protocol::RejectionCode;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
@@ -1541,7 +1517,7 @@ mod tests {
             })
         };
         let overflow = rejected(RejectionCode::ContextLengthExceeded);
-        let local = ApiError::from(izwi_core::Error::ContextLengthExceeded(
+        let local = chat_error(izwi_core::Error::ContextLengthExceeded(
             "This model's maximum context length is 32 tokens.".into(),
         ));
         assert_eq!(overflow.status, local.status);

@@ -38,8 +38,9 @@ pub mod test_support;
 
 pub use realtime::{RuntimeRealtimeSessionLimits, REALTIME_SESSION_DEFAULT_LIMITS};
 pub use runtime::{
-    warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
-    RuntimeRealtimeAsrExecutor, RuntimeRealtimeTtsExecutor,
+    admission_rejection_code, execution_error_code, warm_up_asr_runtime, warm_up_chat_runtime,
+    warm_up_tts_runtime, RuntimeChatExecutor, RuntimeRealtimeAsrExecutor,
+    RuntimeRealtimeTtsExecutor,
 };
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;

@@ -8,8 +8,8 @@ use izwi_core::{
     engine::{OutputFinishReason, WorkloadClass},
     resolve_chat_sampling, AudioChunk, ChatGenerationControls, ChatMessage as CoreChatMessage,
     ChatRequestConfig, ChatRole as CoreChatRole, ChatSamplingRequest, ChatTruncation,
-    Error as CoreError, GenerationConfig, GenerationParams, GenerationRequest, ModelVariant,
-    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
+    Error as CoreError, ErrorKind, GenerationConfig, GenerationParams, GenerationRequest,
+    ModelVariant, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
     RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition,
     RuntimeHealth, RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
     CHAT_MAX_TOKENS_UNSET,
@@ -346,33 +346,66 @@ fn map_finish_reason(reason: Option<OutputFinishReason>) -> FinishReason {
     }
 }
 
+/// The rejection a worker sends for a core error kind before it accepts an
+/// invocation. The gateway maps the code through the same error classes as
+/// the local role maps the kind, except where the worker's view differs: a
+/// model the gateway routed here that this worker cannot serve right now
+/// (not found, busy, an internal fault, a missing dependency) is "not
+/// ready", so the gateway tries another worker; a queue timeout is a queue
+/// wait; and a cancellation the client did not ask for means the worker is
+/// draining.
+pub fn admission_rejection_code(kind: ErrorKind) -> RejectionCode {
+    match kind {
+        ErrorKind::InvalidInput => RejectionCode::InvalidRequest,
+        ErrorKind::ContextLengthExceeded => RejectionCode::ContextLengthExceeded,
+        ErrorKind::CapacityExhausted => RejectionCode::CapacityExhausted,
+        ErrorKind::Timeout => RejectionCode::QueueWaitExceeded,
+        ErrorKind::Cancelled => RejectionCode::WorkerDraining,
+        ErrorKind::ModelNotFound
+        | ErrorKind::ModelBusy
+        | ErrorKind::Unavailable
+        | ErrorKind::Internal => RejectionCode::ModelNotReady,
+    }
+}
+
+/// The terminal error code a worker sends for a core error kind after it
+/// accepted an invocation.
+pub fn execution_error_code(kind: ErrorKind) -> InvocationErrorCode {
+    match kind {
+        ErrorKind::InvalidInput | ErrorKind::ContextLengthExceeded => {
+            InvocationErrorCode::InvalidInput
+        }
+        ErrorKind::Timeout => InvocationErrorCode::DeadlineExceeded,
+        ErrorKind::CapacityExhausted | ErrorKind::Unavailable => {
+            InvocationErrorCode::WorkerUnavailable
+        }
+        ErrorKind::ModelNotFound
+        | ErrorKind::ModelBusy
+        | ErrorKind::Cancelled
+        | ErrorKind::Internal => InvocationErrorCode::ExecutionFailed,
+    }
+}
+
+/// The message a gateway shows for `error`: an overflow is OpenAI's bare
+/// explanation, as on the local role; anything else is the error's text.
+fn client_message(error: CoreError) -> String {
+    match error {
+        CoreError::ContextLengthExceeded(message) => message,
+        error => error.to_string(),
+    }
+}
+
 fn map_admission_error(error: CoreError) -> AdmissionFailure {
-    let code = match error {
-        CoreError::ContextLengthExceeded(_) => RejectionCode::ContextLengthExceeded,
-        CoreError::Overloaded(_) => RejectionCode::CapacityExhausted,
-        CoreError::Timeout(_) => RejectionCode::QueueWaitExceeded,
-        CoreError::ModelNotFound(_) | CoreError::ModelLoadError(_) => RejectionCode::ModelNotReady,
-        CoreError::Cancelled(_) => RejectionCode::WorkerDraining,
-        CoreError::InvalidInput(_) | CoreError::ConfigError(_) => RejectionCode::InvalidRequest,
-        _ => RejectionCode::ModelNotReady,
-    };
-    AdmissionFailure::new(code, error.to_string())
+    AdmissionFailure::new(
+        admission_rejection_code(error.kind()),
+        client_message(error),
+    )
 }
 
 pub(crate) fn map_execution_error(error: CoreError) -> ExecutionFailure {
-    let code = match error {
-        CoreError::Timeout(_) => InvocationErrorCode::DeadlineExceeded,
-        CoreError::InvalidInput(_) | CoreError::ContextLengthExceeded(_) => {
-            InvocationErrorCode::InvalidInput
-        }
-        CoreError::Overloaded(_) | CoreError::Backpressure(_) => {
-            InvocationErrorCode::WorkerUnavailable
-        }
-        _ => InvocationErrorCode::ExecutionFailed,
-    };
     ExecutionFailure {
-        code,
-        message: error.to_string(),
+        code: execution_error_code(error.kind()),
+        message: client_message(error),
     }
 }
 
@@ -905,5 +938,7 @@ mod tests {
     fn context_overflow_is_its_own_rejection_code() {
         let failure = map_admission_error(CoreError::ContextLengthExceeded("too long".into()));
         assert_eq!(failure.code, RejectionCode::ContextLengthExceeded);
+        // The bare explanation, as the local role reports it.
+        assert_eq!(failure.message, "too long");
     }
 }

@@ -100,7 +100,7 @@ pub use config::{
     BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionCapacity,
     PhysicalExecutionMode, PhysicalInFlightLimit,
 };
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use performance::{
     CpuPerformanceConfig, CpuPerformanceConfigOverrides, CpuProjectionBackend,

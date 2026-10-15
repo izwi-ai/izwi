@@ -621,9 +621,9 @@ async fn unload_after_audio_job_cancellation(
     loop {
         match state.runtime.unload_model(variant).await {
             Ok(()) => return Ok(()),
-            Err(izwi_core::Error::InferenceError(message))
+            Err(err)
                 if cancelled_jobs > 0
-                    && message.contains("active inference lease")
+                    && err.kind() == izwi_core::ErrorKind::ModelBusy
                     && Instant::now() < deadline =>
             {
                 tokio::time::sleep(CANCEL_SETTLE_POLL).await;
