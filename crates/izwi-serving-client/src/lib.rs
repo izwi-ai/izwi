@@ -294,9 +294,17 @@ struct WorkerClientInner {
     http: reqwest::Client,
     endpoint: reqwest::Url,
     credentials: ServiceCredentials,
-    permits: Arc<tokio::sync::Semaphore>,
+    /// Invocations, each holding its permit for the stream's lifetime.
+    invocation_permits: Arc<tokio::sync::Semaphore>,
+    /// Status, descriptor, attempt query, and cancel requests. Kept apart so
+    /// long-running streams can never starve health polls or cancellation.
+    control_permits: Arc<tokio::sync::Semaphore>,
     config: WorkerClientConfig,
 }
+
+/// Concurrent control requests per worker client. Control requests are short
+/// and bounded by `request_timeout`, so a few slots suffice.
+const MAX_CONTROL_IN_FLIGHT: usize = 4;
 
 impl std::fmt::Debug for WorkerClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -360,7 +368,8 @@ impl WorkerClient {
                 http,
                 endpoint,
                 credentials,
-                permits: Arc::new(tokio::sync::Semaphore::new(config.max_in_flight)),
+                invocation_permits: Arc::new(tokio::sync::Semaphore::new(config.max_in_flight)),
+                control_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_IN_FLIGHT)),
                 config,
             }),
         })
@@ -435,7 +444,7 @@ impl WorkerClient {
                 limit: self.inner.config.max_request_json_bytes,
             });
         }
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_control_permit().await?;
         let response = tokio::time::timeout(
             self.inner.config.request_timeout,
             self.authorized(self.inner.http.post(self.url(&format!(
@@ -593,7 +602,7 @@ impl WorkerClient {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, WorkerClientError> {
-        let permit = self.acquire_permit().await?;
+        let permit = self.acquire_control_permit().await?;
         let response = tokio::time::timeout(
             self.inner.config.request_timeout,
             self.authorized(self.inner.http.get(self.url(path))).send(),
@@ -608,10 +617,10 @@ impl WorkerClient {
         result
     }
 
-    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, WorkerClientError> {
+    async fn acquire_control_permit(&self) -> Result<OwnedSemaphorePermit, WorkerClientError> {
         tokio::time::timeout(
             self.inner.config.request_timeout,
-            Arc::clone(&self.inner.permits).acquire_owned(),
+            Arc::clone(&self.inner.control_permits).acquire_owned(),
         )
         .await
         .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::InFlightPermit))?
@@ -628,7 +637,7 @@ impl WorkerClient {
         }
         tokio::time::timeout(
             self.inner.config.request_timeout.min(remaining),
-            Arc::clone(&self.inner.permits).acquire_owned(),
+            Arc::clone(&self.inner.invocation_permits).acquire_owned(),
         )
         .await
         .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::InFlightPermit))?

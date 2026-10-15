@@ -516,6 +516,47 @@ async fn invocation_total_budget_caps_wait_for_a_client_permit() {
     drop(first);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_streams_never_starve_status_or_cancel_requests() {
+    let config = MockWorkerConfig {
+        fault: MockFault::Hang,
+        max_active_invocations: 2,
+        ..MockWorkerConfig::default()
+    };
+    let worker = MockWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            max_in_flight: 1,
+            request_timeout: Duration::from_millis(500),
+            first_output_timeout: Duration::from_secs(5),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+    // The only invocation permit is held by a live stream.
+    let streaming = request(worker.config(), "control-holder");
+    let identity = AttemptIdentity::from(&streaming);
+    let stream = client.invoke(streaming).await.unwrap();
+
+    let started = std::time::Instant::now();
+    client
+        .status()
+        .await
+        .expect("status while a stream is live");
+    client
+        .descriptor()
+        .await
+        .expect("descriptor while a stream is live");
+    client
+        .cancel_attempt(&identity)
+        .await
+        .expect("cancel while a stream is live");
+    assert!(started.elapsed() < Duration::from_millis(400));
+    drop(stream);
+}
+
 #[tokio::test]
 async fn malformed_oversized_and_accepted_then_eof_are_never_success() {
     for (suffix, fault, expected) in [
