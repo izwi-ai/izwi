@@ -72,7 +72,45 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The display prefix of each message-carrying variant. Engine rows carry
+/// errors as display text; [`Error::from_display`] turns that text back
+/// into its variant with this table. `ContextLengthExceeded` displays its
+/// bare message, so it has no prefix to decode.
+const DISPLAY_PREFIXES: &[(&str, fn(String) -> Error)] = &[
+    ("Invalid input: ", Error::InvalidInput),
+    ("Model not found: ", Error::ModelNotFound),
+    ("Model error: ", Error::ModelError),
+    ("Model loading failed: ", Error::ModelLoadError),
+    ("Download failed: ", Error::DownloadError),
+    ("Tokenization error: ", Error::TokenizationError),
+    ("Inference error: ", Error::InferenceError),
+    ("Request timed out: ", Error::Timeout),
+    ("Request cancelled: ", Error::Cancelled),
+    ("Inference capacity unavailable: ", Error::Overloaded),
+    ("Streaming backpressure: ", Error::Backpressure),
+    ("Audio encoding error: ", Error::AudioError),
+    ("Configuration error: ", Error::ConfigError),
+    ("Missing runtime dependency: ", Error::MissingDependency),
+    ("HuggingFace Hub error: ", Error::HfHubError),
+    ("Safetensors error: ", Error::SafetensorsError),
+    ("Unsupported platform: ", Error::UnsupportedPlatform),
+];
+
 impl Error {
+    /// The error whose display text is `message`, as an engine row carries
+    /// it. Text without a variant's prefix is the row's own failure message
+    /// and becomes an `InferenceError`, so no message gains a second prefix.
+    pub(crate) fn from_display(message: String) -> Self {
+        DISPLAY_PREFIXES
+            .iter()
+            .find_map(|(prefix, variant)| {
+                message
+                    .strip_prefix(prefix)
+                    .map(|detail| variant(detail.to_owned()))
+            })
+            .unwrap_or(Self::InferenceError(message))
+    }
+
     /// An error of the same kind with the same message, for reporting one
     /// failure on several rows. Kinds that wrap a foreign error (I/O,
     /// serialization, HTTP) become an `InferenceError` with its text.
@@ -147,6 +185,47 @@ mod tests {
         ));
         assert!(
             matches!(error, Error::Overloaded(message) if message.contains("CUDA_ERROR_OUT_OF_MEMORY"))
+        );
+    }
+
+    /// Every prefixed variant survives the trip through an engine row's
+    /// display text with its variant and message, and text that never had a
+    /// prefix gains exactly one.
+    #[test]
+    fn display_text_round_trips_every_variant() {
+        let detail = || "detail".to_string();
+        for error in [
+            Error::InvalidInput(detail()),
+            Error::ModelNotFound(detail()),
+            Error::ModelError(detail()),
+            Error::ModelLoadError(detail()),
+            Error::DownloadError(detail()),
+            Error::TokenizationError(detail()),
+            Error::InferenceError(detail()),
+            Error::Timeout(detail()),
+            Error::Cancelled(detail()),
+            Error::Overloaded(detail()),
+            Error::Backpressure(detail()),
+            Error::AudioError(detail()),
+            Error::ConfigError(detail()),
+            Error::MissingDependency(detail()),
+            Error::HfHubError(detail()),
+            Error::SafetensorsError(detail()),
+            Error::UnsupportedPlatform(detail()),
+        ] {
+            let text = error.to_string();
+            let decoded = Error::from_display(text.clone());
+            assert_eq!(decoded.to_string(), text);
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&error),
+                "{text}"
+            );
+        }
+        let bare = Error::from_display("unsupported const-set f64".into());
+        assert_eq!(
+            bare.to_string(),
+            "Inference error: unsupported const-set f64"
         );
     }
 

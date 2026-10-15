@@ -166,31 +166,10 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
         return Err(if err == REQUEST_DEADLINE_EXCEEDED {
             Error::Timeout(output.request_id)
         } else {
-            engine_output_error(err)
+            Error::from_display(err)
         });
     }
     Ok(output)
-}
-
-/// The typed error an engine output carries as its display text. Outputs
-/// keep errors as strings, so every failure used to surface as an
-/// `InferenceError` (500), even an input error (400) or a capacity refusal
-/// (503) such as a request beyond its fitted state.
-fn engine_output_error(message: String) -> Error {
-    let typed = |prefix: &str| message.strip_prefix(prefix).map(str::to_owned);
-    if let Some(detail) = typed("Inference capacity unavailable: ") {
-        Error::Overloaded(detail)
-    } else if let Some(detail) = typed("Invalid input: ") {
-        Error::InvalidInput(detail)
-    } else if let Some(detail) = typed("Streaming backpressure: ") {
-        Error::Backpressure(detail)
-    } else if let Some(detail) = typed("Request timed out: ") {
-        Error::Timeout(detail)
-    } else if let Some(detail) = typed("Request cancelled: ") {
-        Error::Cancelled(detail)
-    } else {
-        Error::InferenceError(message)
-    }
 }
 
 #[derive(Debug)]
@@ -11509,27 +11488,38 @@ mod tests {
 
     /// Engine output errors keep their kind: a request beyond its fitted
     /// state is a capacity refusal (503), a malformed one an input error
-    /// (400); only untyped failures stay inference errors (500).
+    /// (400); only untyped failures stay inference errors (500), and an
+    /// inference error is not prefixed twice.
     #[test]
     fn engine_output_errors_keep_their_kind() {
+        let failed = |error: String| {
+            let mut output = terminal_output(ExecutionFinishReason::Completed);
+            output.error = Some(error);
+            runtime_completion(output).unwrap_err()
+        };
         let capacity =
             Error::Overloaded("physical paged append ends at 324, beyond capacity 320".into());
         assert!(matches!(
-            engine_output_error(capacity.to_string()),
+            failed(capacity.to_string()),
             Error::Overloaded(detail) if detail.ends_with("beyond capacity 320")
         ));
         assert!(matches!(
-            engine_output_error(Error::InvalidInput("bad audio".into()).to_string()),
+            failed(Error::InvalidInput("bad audio".into()).to_string()),
             Error::InvalidInput(detail) if detail == "bad audio"
         ));
         assert!(matches!(
-            engine_output_error(Error::Backpressure("slow".into()).to_string()),
+            failed(Error::Backpressure("slow".into()).to_string()),
             Error::Backpressure(_)
         ));
         assert!(matches!(
-            engine_output_error("kernel failed".into()),
+            failed("kernel failed".into()),
             Error::InferenceError(detail) if detail == "kernel failed"
         ));
+        let device = Error::InferenceError("unsupported const-set f64".into());
+        assert_eq!(
+            failed(device.to_string()).to_string(),
+            "Inference error: unsupported const-set f64"
+        );
     }
 
     /// ASR requests are priced by the model's envelope over their audio, not

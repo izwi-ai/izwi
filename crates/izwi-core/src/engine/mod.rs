@@ -1224,7 +1224,7 @@ impl Engine {
             return Err(crate::error::Error::Cancelled(request_id.clone()));
         }
         if let Some(err) = output.error.clone() {
-            return Err(crate::error::Error::InferenceError(err));
+            return Err(crate::error::Error::from_display(err));
         }
         Ok(output)
     }
