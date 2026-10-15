@@ -1,6 +1,6 @@
 ---
 title: "izwi bench"
-description: "Run chat, TTS, ASR, throughput, manifest, and regression comparison benchmarks."
+description: "Run chat, TTS, ASR, manifest, and regression comparison benchmarks."
 icon: "gauge"
 mode: "wide"
 ---
@@ -23,7 +23,6 @@ izwi bench <COMMAND>
 | `chat` | Benchmark chat inference |
 | `tts` | Benchmark TTS inference |
 | `asr` | Benchmark ASR inference |
-| `throughput` | Benchmark system throughput |
 | `run` | Run a benchmark manifest |
 | `compare` | Compare JSON reports and fail on regressions |
 
@@ -269,26 +268,17 @@ through Candle kernels and existing exact fallbacks.
 
 ---
 
-## izwi bench throughput
+## Serving throughput
 
-Benchmark lightweight HTTP server overhead against `/livez`.
+`izwi bench` runs a fixed number of iterations at a fixed concurrency. For
+open-loop load (Poisson arrivals at a request rate, rate sweeps, a prompt
+dataset, per-token inter-token latency and goodput under SLOs) use
+`scripts/bench/run-serving-benchmark.py`; see `docs/dev/SERVING_BENCHMARK.md`.
+Its results JSON uses the same `reports[].report.summary` field names, so
+`izwi bench compare` reads it too.
 
-```bash
-izwi bench throughput [OPTIONS]
-```
-
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-d, --duration <SECONDS>` | Test duration | `30` |
-| `-c, --concurrent <N>` | Concurrent requests | `1` |
-
-### Example
-
-```bash
-izwi bench throughput --duration 60 --concurrent 4
-```
+The former `izwi bench throughput` timed `GET /livez`, not inference, and was
+removed.
 
 ---
 
@@ -325,7 +315,7 @@ iterations = 4
 concurrent = 2
 ```
 
-Supported `command` values are `chat`, `tts`, `asr`, and `throughput`. Relative ASR file paths resolve from the manifest directory.
+Supported `command` values are `chat`, `tts`, and `asr`. Relative ASR file paths resolve from the manifest directory.
 
 Each benchmark can include a `[benchmarks.matrix]` table to generate a cartesian matrix from array values. Scalar values on the benchmark are used as defaults, and matrix values override them per generated case.
 

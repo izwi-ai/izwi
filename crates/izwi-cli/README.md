@@ -149,13 +149,13 @@ izwi chat --model qwen3-0.6b-4bit --system "You are concise."
 izwi bench chat --model Qwen3.5-4B --iterations 5 --max-tokens 128 --warmup
 izwi bench tts --model qwen3-tts-0.6b-base --iterations 5 --concurrent 2
 izwi bench asr --model parakeet-tdt-0.6b-v3 --file data/test.wav --iterations 3 --concurrent 2
-izwi bench throughput --duration 10 --concurrent 2
 izwi --output-format json bench chat --iterations 5
 izwi --output-format json bench run benchmarks/local.toml --artifact-dir benchmarks/results/run-001
 izwi bench compare current.json baseline.json --tolerance-percent 5
 ```
 
-Benchmark manifests support `[benchmarks.matrix]` tables for cartesian runs across fields like `model`, `concurrent`, `max_tokens`, `file`, and `duration_secs`.
+Benchmark manifests support `[benchmarks.matrix]` tables for cartesian runs across fields like `model`, `concurrent`, `max_tokens`, and `file`.
+For open-loop serving load (request-rate sweeps, ITL, goodput) use `scripts/bench/run-serving-benchmark.py`.
 
 ### Config
 
