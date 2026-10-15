@@ -1714,6 +1714,10 @@ pub(super) fn fallback_word_timings_from_words(
         .collect()
 }
 
+/// Spread `words`, in order, over the time anyone speaks: the time-sorted
+/// union of the turns, each stretch taking words in proportion to its length.
+/// Overlapping turns are merged first, so a turn nested in another never takes
+/// a run of words out of order and the timings are monotonic.
 fn fallback_word_timings_with_segments(
     words: &[String],
     segments: &[DiarizationSegment],
@@ -1723,7 +1727,7 @@ fn fallback_word_timings_with_segments(
         return Vec::new();
     }
 
-    let mut windows = segments
+    let mut turns = segments
         .iter()
         .filter_map(|segment| {
             let start = secs_to_ms(segment.start_secs);
@@ -1734,7 +1738,14 @@ fn fallback_word_timings_with_segments(
             (end > start).then_some((start, end))
         })
         .collect::<Vec<_>>();
-    windows.sort_by_key(|(start, _)| *start);
+    turns.sort_by_key(|(start, _)| *start);
+    let mut windows: Vec<(u32, u32)> = Vec::with_capacity(turns.len());
+    for (start, end) in turns {
+        match windows.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => windows.push((start, end)),
+        }
+    }
 
     if windows.is_empty() {
         return fallback_word_timings_from_words(words, duration_secs);
@@ -1906,6 +1917,9 @@ fn attribution_requires_fallback(
     overlap_coverage < MIN_ALIGNMENT_COVERAGE || unattributed_ratio > MAX_UNATTRIBUTED_WORD_RATIO
 }
 
+/// Attribute each timed word to a speaker. Words stay in ASR order, which is
+/// also start order: stitching never lets a start run back before the previous
+/// word, so sorting by time could only ever reorder the transcript.
 fn attribute_words_to_speakers(
     alignments: &[(String, u32, u32)],
     segments: &[DiarizationSegment],
@@ -1944,7 +1958,6 @@ fn attribute_words_to_speakers(
         });
     }
 
-    words.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
     (words, overlap_assigned_words, unattributed_words)
 }
 
@@ -3486,6 +3499,75 @@ mod tests {
         assert_eq!(times, [(0, 300), (400, 1_400), (5_000, 5_300)]);
         assert_eq!(transcript.model_aligned_words, 3);
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    const COUNTING: [&str; 12] = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve",
+    ];
+
+    /// PIPE-4 (fallback_scramble): a turn nested in another (S1 4-6 s inside
+    /// S0 0-10 s) used to take its own run of words, and sorting by time then
+    /// gave "four nine five ten six". The fallback must keep ASR order.
+    #[test]
+    fn turn_guided_fallback_keeps_asr_word_order_over_overlapping_turns() {
+        let turns = [
+            turn("SPEAKER_00", 0.0, 10.0),
+            turn("SPEAKER_01", 4.0, 6.0),
+            turn("SPEAKER_00", 10.0, 12.0),
+        ];
+        let words = COUNTING.map(str::to_string);
+        let timings = fallback_word_timings_with_segments(&words, &turns, 12.0);
+        assert!(
+            timings.windows(2).all(|pair| pair[0].2 <= pair[1].1),
+            "{timings:?}"
+        );
+
+        let failed = TimedWindow {
+            start_ms: 0,
+            end_ms: 12_000,
+            source: AlignmentSource::Failed,
+            note: Some("alignment failed".to_string()),
+            words: COUNTING
+                .iter()
+                .enumerate()
+                .map(|(idx, word)| WindowWord {
+                    word: word.to_string(),
+                    text: if idx == 0 {
+                        word.to_string()
+                    } else {
+                        format!(" {word}")
+                    },
+                    start_ms: idx as u32 * 1_000,
+                    end_ms: idx as u32 * 1_000 + 1_000,
+                })
+                .collect(),
+        };
+        let mut warnings = Vec::new();
+        let transcript = attribute_transcript(vec![failed], &turns, &mut warnings);
+        let order = transcript
+            .words
+            .iter()
+            .map(|word| word.word.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, COUNTING);
+        assert_eq!(transcript.asr_text, COUNTING.join(" "));
+    }
+
+    /// Attribution never reorders words, even if their times disagree.
+    #[test]
+    fn attribution_keeps_asr_order() {
+        let alignments = vec![
+            ("first".to_string(), 2_000, 2_500),
+            ("second".to_string(), 1_000, 1_500),
+        ];
+        let (words, _, _) =
+            attribute_words_to_speakers(&alignments, &[turn("SPEAKER_00", 0.0, 3.0)]);
+        let order = words
+            .iter()
+            .map(|word| word.word.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["first", "second"]);
     }
 
     #[test]
