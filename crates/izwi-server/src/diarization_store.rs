@@ -148,6 +148,9 @@ pub struct DiarizationRecord {
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
+    /// Degraded pipeline steps: an aligner that could not be used, windows
+    /// whose word timings are not the aligner's, a truncated ASR decode.
+    pub warnings: Vec<String>,
     pub summary_status: DiarizationSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -235,6 +238,7 @@ pub struct CompleteDiarizationRecord {
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
+    pub warnings: Vec<String>,
     pub summary_status: DiarizationSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -415,9 +419,9 @@ impl DiarizationStore {
             .alignment_coverage
             .filter(|value| value.is_finite() && *value >= 0.0);
         let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let asr_text = sanitize_transcript_text(record.asr_text.as_str());
+        let raw_transcript = sanitize_transcript_text(record.raw_transcript.as_str());
+        let transcript = sanitize_transcript_text(record.transcript.as_str());
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -493,6 +497,7 @@ impl DiarizationStore {
             asr_text: Set(asr_text),
             raw_transcript: Set(raw_transcript),
             transcript: Set(transcript),
+            warnings_json: Set("[]".to_string()),
             summary_status: Set(summary_status.as_db_value().to_string()),
             summary_model_id: Set(summary_model_id),
             summary_text: Set(summary_text),
@@ -698,15 +703,17 @@ impl DiarizationStore {
             .alignment_coverage
             .filter(|value| value.is_finite() && *value >= 0.0);
         let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let asr_text = sanitize_transcript_text(record.asr_text.as_str());
+        let raw_transcript = sanitize_transcript_text(record.raw_transcript.as_str());
+        let transcript = sanitize_transcript_text(record.transcript.as_str());
         let segments_json =
             serde_json::to_string(&record.segments).context("Failed serializing segments")?;
         let words_json =
             serde_json::to_string(&record.words).context("Failed serializing words")?;
         let utterances_json =
             serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
+        let warnings_json = serde_json::to_string(&sanitize_warnings(record.warnings))
+            .context("Failed serializing diarization warnings")?;
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -796,6 +803,10 @@ impl DiarizationStore {
             .col_expr(
                 diarization_records::Column::Transcript,
                 Expr::value(transcript),
+            )
+            .col_expr(
+                diarization_records::Column::WarningsJson,
+                Expr::value(warnings_json),
             )
             .col_expr(
                 diarization_records::Column::SummaryStatus,
@@ -927,7 +938,8 @@ const DIARIZATION_RECORD_COLUMNS: &str = r#"
     utterances_json,
     speaker_name_overrides_json,
     audio_mime_type,
-    audio_filename
+    audio_filename,
+    warnings_json
 "#;
 
 async fn fetch_record_without_audio(
@@ -1074,6 +1086,7 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         speaker_name_overrides,
         audio_mime_type: row.try_get_by_index(32)?,
         audio_filename: row.try_get_by_index(33)?,
+        warnings: parse_json_vec(row.try_get_by_index(34)?),
     })
 }
 
@@ -1201,6 +1214,24 @@ fn transcript_preview_with_utterances(
     } else {
         truncate_string(&normalized, 180)
     }
+}
+
+/// Transcript text is stored whole (as the words JSON is): the record is the
+/// only copy of a job's transcript, however long the audio.
+fn sanitize_transcript_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        " ".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter_map(|warning| sanitize_optional_text(Some(warning.as_str()), 500))
+        .collect()
 }
 
 fn sanitize_required_text(raw: &str, max_chars: usize) -> String {
@@ -1497,6 +1528,7 @@ mod tests {
             segments: sample_record().segments,
             words: sample_record().words,
             utterances: sample_record().utterances,
+            warnings: Vec::new(),
         }
     }
 
@@ -1699,6 +1731,57 @@ mod tests {
         assert!(completed.processing_error.is_none());
         assert_eq!(completed.speaker_count, 2);
         assert!(!completed.transcript.trim().is_empty());
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// PIPE-9: an hour of speech is well past 40k characters; the stored
+    /// transcript texts must not be cut, and the pipeline warnings persist.
+    #[tokio::test]
+    async fn long_transcripts_and_warnings_round_trip_unchanged() {
+        let (store, root) = build_test_store();
+        let long_text = "word ".repeat(10_000).trim_end().to_string();
+        assert!(long_text.chars().count() > 40_000);
+        let long_transcript = format!("SPEAKER_00 [0.00s - 3600.00s]: {}", "word ".repeat(30_000))
+            .trim_end()
+            .to_string();
+        assert!(long_transcript.chars().count() > 100_000);
+
+        let mut pending = sample_record();
+        pending.processing_status = DiarizationProcessingStatus::Pending;
+        pending.asr_text = long_text.clone();
+        let created = store
+            .create_record(pending)
+            .await
+            .expect("record should be created");
+        assert_eq!(created.asr_text, long_text);
+        assert!(created.warnings.is_empty());
+
+        let warnings = vec![
+            "Forced aligner unavailable (needs 2.77 GB); word timings are estimated, not aligned"
+                .to_string(),
+        ];
+        let mut complete = sample_complete_record();
+        complete.asr_text = long_text.clone();
+        complete.raw_transcript = long_transcript.clone();
+        complete.transcript = long_transcript.clone();
+        complete.alignment_coverage = Some(0.0);
+        complete.warnings = warnings.clone();
+        store
+            .complete_record(created.id.clone(), complete)
+            .await
+            .expect("completion should succeed")
+            .expect("record should exist");
+
+        let stored = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(stored.asr_text, long_text);
+        assert_eq!(stored.raw_transcript, long_transcript);
+        assert_eq!(stored.transcript, long_transcript);
+        assert_eq!(stored.warnings, warnings);
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

@@ -763,6 +763,9 @@ export interface TranscriptionRecord {
   speaker_turns?: SpeakerAttributedAsrTurn[];
   saa_status?: SpeakerAttributedAsrStatus;
   saa_warnings?: string[];
+  /** Aligner windows whose word timings are not the model's, or why word
+   * timestamps are missing. */
+  alignment_warnings?: string[];
   summary_status?: TranscriptionSummaryStatus;
   summary_model_id?: string | null;
   summary_text?: string | null;
@@ -907,6 +910,9 @@ export interface DiarizationRecord {
   asr_text: string;
   raw_transcript: string;
   transcript: string;
+  /** Degraded pipeline steps: an aligner that could not be used, word
+   * timings repaired from speaker turns, a truncated ASR decode. */
+  warnings?: string[];
   summary_status?: DiarizationSummaryStatus;
   summary_model_id?: string | null;
   summary_text?: string | null;

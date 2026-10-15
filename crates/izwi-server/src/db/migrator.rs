@@ -281,6 +281,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         asr_text TEXT NOT NULL,
         raw_transcript TEXT NOT NULL,
         transcript TEXT NOT NULL,
+        warnings_json TEXT NOT NULL DEFAULT '[]',
         summary_status TEXT NOT NULL DEFAULT 'not_requested',
         summary_model_id TEXT NULL,
         summary_text TEXT NULL,
@@ -1073,6 +1074,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         table: "diarization_records",
         column: "summary_updated_at",
         definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
     },
     CompatibilityColumn {
         table: "studio_project_segments",

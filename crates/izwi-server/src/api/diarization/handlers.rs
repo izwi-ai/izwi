@@ -28,8 +28,8 @@ use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, resolve_diarization_asr_model_variant,
     resolve_diarization_model_variant_strict, ChatMessage, ChatRequestConfig, ChatRole,
-    DiarizationConfig, GenerationParams, ModelVariant, RuntimeRequestContext, RuntimeService,
-    WorkloadClass,
+    DiarizationConfig, DiarizationTranscriptResult, GenerationParams, ModelVariant,
+    RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -438,6 +438,7 @@ struct GeneratedDiarizationArtifacts {
     asr_text: String,
     raw_transcript: String,
     transcript: String,
+    warnings: Vec<String>,
     summary_status: DiarizationSummaryStatus,
     summary_model_id: Option<String>,
     segments: Vec<DiarizationSegmentRecord>,
@@ -520,6 +521,7 @@ fn spawn_diarization_processing_task(
                             asr_text: artifacts.asr_text,
                             raw_transcript: artifacts.raw_transcript,
                             transcript: artifacts.transcript,
+                            warnings: artifacts.warnings,
                             summary_status: artifacts.summary_status,
                             summary_model_id: artifacts.summary_model_id,
                             summary_text: None,
@@ -601,7 +603,18 @@ async fn generate_diarization_artifacts(
         )
         .await?;
 
-    let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(diarization_artifacts(
+        output,
+        started.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+/// The record fields of one pipeline result, warnings included, so a record
+/// with estimated timings says so.
+fn diarization_artifacts(
+    output: DiarizationTranscriptResult,
+    processing_time_ms: f64,
+) -> GeneratedDiarizationArtifacts {
     let rtf = if output.duration_secs > 0.0 {
         Some((processing_time_ms / 1000.0) / output.duration_secs as f64)
     } else {
@@ -609,7 +622,7 @@ async fn generate_diarization_artifacts(
     };
     let (summary_status, summary_model_id) = initial_summary_state(output.transcript.as_str());
 
-    Ok(GeneratedDiarizationArtifacts {
+    GeneratedDiarizationArtifacts {
         duration_secs: output.duration_secs as f64,
         processing_time_ms,
         rtf,
@@ -620,6 +633,7 @@ async fn generate_diarization_artifacts(
         asr_text: output.asr_text,
         raw_transcript: output.raw_transcript,
         transcript: output.transcript,
+        warnings: output.warnings,
         summary_status,
         summary_model_id,
         segments: output
@@ -656,7 +670,7 @@ async fn generate_diarization_artifacts(
                 word_end: utterance.word_end,
             })
             .collect(),
-    })
+    }
 }
 
 fn build_rerun_create_request(
@@ -1251,6 +1265,7 @@ mod tests {
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00: hello there".to_string(),
             transcript: "SPEAKER_00: hello there".to_string(),
+            warnings: Vec::new(),
             summary_status: DiarizationSummaryStatus::Ready,
             summary_model_id: Some("Qwen3.5-4B".to_string()),
             summary_text: Some("Speaker 00 greets.".to_string()),
@@ -1263,6 +1278,31 @@ mod tests {
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("meeting.wav".to_string()),
         }
+    }
+
+    /// LIVE-9: a pipeline result whose aligner could not load carries a
+    /// warning, and the record fields keep it instead of looking aligned.
+    #[test]
+    fn pipeline_warnings_reach_the_record() {
+        let warning =
+            "Forced aligner unavailable (needs 2.77 GB); word timings are estimated, not aligned";
+        let output = DiarizationTranscriptResult {
+            segments: Vec::new(),
+            words: Vec::new(),
+            utterances: Vec::new(),
+            asr_text: "hello there".to_string(),
+            raw_transcript: "hello there".to_string(),
+            transcript: "hello there".to_string(),
+            duration_secs: 3.0,
+            speaker_count: 1,
+            alignment_coverage: 0.0,
+            unattributed_words: 0,
+            llm_refined: false,
+            warnings: vec![warning.to_string()],
+        };
+        let artifacts = diarization_artifacts(output, 1_500.0);
+        assert_eq!(artifacts.warnings, [warning]);
+        assert_eq!(artifacts.alignment_coverage, Some(0.0));
     }
 
     fn sample_audio() -> StoredDiarizationAudio {

@@ -189,6 +189,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "asr_text",
             "raw_transcript",
             "transcript",
+            "warnings_json",
             "summary_status",
             "summary_model_id",
             "summary_text",

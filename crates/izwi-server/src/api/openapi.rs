@@ -518,7 +518,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/diarizations/{record_id}",
         "Diarization",
         "diarization record",
-        "Fetch, update, or delete a saved diarization record.",
+        "Fetch, update, or delete a saved diarization record. A record's `warnings` list the degraded pipeline steps behind it (an aligner that could not be used, word timings repaired from speaker turns, a truncated ASR decode).",
         &[("record_id", "Diarization record identifier")],
     );
     add_operation_with_params(

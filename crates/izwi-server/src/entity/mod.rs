@@ -232,6 +232,7 @@ pub mod diarization_records {
         pub asr_text: String,
         pub raw_transcript: String,
         pub transcript: String,
+        pub warnings_json: String,
         pub summary_status: String,
         pub summary_model_id: Option<String>,
         pub summary_text: Option<String>,

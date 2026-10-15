@@ -775,6 +775,7 @@ impl RuntimeService {
             ),
         };
 
+        let mut aligner_unavailable = None;
         let aligner_binding = match self
             .load_capability_for_job(
                 &pipeline_job,
@@ -788,6 +789,7 @@ impl RuntimeService {
             Ok(binding) => Some(binding),
             Err(err) => {
                 warn!("Forced aligner load failed, using heuristic timings: {err}");
+                aligner_unavailable = Some(format!("{aligner_variant} failed to load: {err}"));
                 None
             }
         };
@@ -799,6 +801,8 @@ impl RuntimeService {
                         "Forced aligner {} was loaded but not found in registry",
                         aligner_variant
                     );
+                    aligner_unavailable =
+                        Some(format!("{aligner_variant} is not in the model registry"));
                     None
                 }
             }
@@ -963,6 +967,7 @@ impl RuntimeService {
             single_pass_hit_budget.then_some((0.0, audio.duration_secs)),
             &chunk_texts,
         );
+        warnings.extend(aligner_unavailable.map(|reason| aligner_unavailable_warning(&reason)));
 
         let has_words = asr_windows
             .iter()
@@ -989,9 +994,6 @@ impl RuntimeService {
             drop(aligner_lease);
             timed_windows_from_alignment(&asr_windows, aligned)
         } else {
-            warnings.push(
-                "Forced aligner unavailable; word timings are estimated, not aligned".to_string(),
-            );
             interval_timed_windows(&asr_windows, audio.sample_rate)
         };
 
@@ -1232,6 +1234,12 @@ fn asr_token_budget_warnings(
             warning
         })
         .collect()
+}
+
+/// The warning a transcript carries when its aligner could not be used, so a
+/// record with estimated word timings says so instead of looking aligned.
+fn aligner_unavailable_warning(reason: &str) -> String {
+    format!("Forced aligner unavailable ({reason}); word timings are estimated, not aligned")
 }
 
 /// One ASR pass over the whole file is allowed only when it fits the
@@ -4352,6 +4360,18 @@ Here is the refined transcript:
         assert!(!stitched.words.is_empty());
         let last_end_ms = stitched.words.iter().map(|word| word.end_ms).max().unwrap();
         assert!(last_end_ms > 30_000, "timings must cover the later chunks");
+    }
+
+    /// LIVE-9: an aligner that failed to load must leave a warning naming
+    /// the failure, not a record that looks aligned.
+    #[test]
+    fn aligner_load_failure_becomes_a_warning() {
+        let warning = aligner_unavailable_warning(
+            "Qwen3-ForcedAligner-0.6B failed to load: needs 2.77 GB, 0.19 GB available",
+        );
+        assert!(warning.contains("Forced aligner unavailable"), "{warning}");
+        assert!(warning.contains("needs 2.77 GB"), "{warning}");
+        assert!(warning.contains("estimated, not aligned"), "{warning}");
     }
 
     #[test]
