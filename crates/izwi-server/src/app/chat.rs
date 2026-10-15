@@ -590,9 +590,11 @@ pub(crate) trait ChatBackend: Send {
            + Send;
 }
 
-/// Told how a streaming chat response ended.
+/// Told when a streaming chat response emits text and how it ended.
 pub(crate) trait ChatStreamObserver: Send + 'static {
-    fn record_completion(&mut self) {}
+    /// A delta carrying answer text was sent to the client.
+    fn record_delta(&mut self) {}
+    fn record_completion(&mut self, _generation: &ChatGeneration) {}
     fn record_failure(&mut self) {}
 }
 

@@ -1121,6 +1121,9 @@ fn render_chat_stream(
                     false,
                 ),
                 ChatStreamEvent::Delta { text, logprobs } => {
+                    if !text.is_empty() {
+                        observer.record_delta();
+                    }
                     let (reasoning_content, content) = match splitter.as_mut() {
                         Some(splitter) => {
                             let (reasoning, content) = splitter.push(&text);
@@ -1157,7 +1160,7 @@ fn render_chat_stream(
                     )
                 }
                 ChatStreamEvent::Completed(generation) => {
-                    observer.record_completion();
+                    observer.record_completion(&generation);
                     // Text the splitter still held back is final now.
                     let (tail_reasoning, tail_content) = splitter
                         .as_mut()

@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use izwi_core::runtime::prometheus::{buckets, CounterFamily, HistogramFamily};
 use izwi_core::{ChatGeneration, ServeRuntimeConfig};
 use izwi_hooks::{
     EnterpriseAction, EnterpriseHooks, HookMetadata, QuotaRequest, ResourceDescriptor,
@@ -265,8 +266,12 @@ pub(crate) struct GatewayChatStream {
 }
 
 impl ChatStreamObserver for GatewayChatStream {
-    fn record_completion(&mut self) {
-        self.metrics.record_completion();
+    fn record_delta(&mut self) {
+        self.metrics.record_delta();
+    }
+
+    fn record_completion(&mut self, generation: &ChatGeneration) {
+        self.metrics.record_completion(generation);
     }
 
     fn record_failure(&mut self) {
@@ -279,6 +284,7 @@ impl ChatBackend for GatewayChat<'_> {
 
     async fn generate(self, request: ChatExecutionRequest) -> Result<ChatGeneration, ApiError> {
         let started = Instant::now();
+        let model = request.variant.dir_name();
         let generation = self
             .state
             .chat_dispatcher
@@ -289,9 +295,20 @@ impl ChatBackend for GatewayChat<'_> {
                 self.tenant_work,
             )
             .await;
-        self.state
-            .metrics
-            .record_dispatch(started.elapsed(), generation.is_err());
+        let metrics = &self.state.metrics;
+        metrics.record_dispatch(started.elapsed(), generation.as_ref().err());
+        let chat = &metrics.inner.chat;
+        let elapsed = self.context.received_at().elapsed();
+        match &generation {
+            Ok(generation) => {
+                chat.duration
+                    .observe_duration(&[model, "false", "ok"], elapsed);
+                chat.record_tokens(model, generation);
+            }
+            Err(_) => chat
+                .duration
+                .observe_duration(&[model, "false", "error"], elapsed),
+        }
         generation
     }
 
@@ -300,6 +317,7 @@ impl ChatBackend for GatewayChat<'_> {
         request: ChatExecutionRequest,
     ) -> Result<(mpsc::Receiver<ChatStreamEvent>, GatewayChatStream), ApiError> {
         let started = Instant::now();
+        let model = request.variant.dir_name();
         let events = self
             .state
             .chat_dispatcher
@@ -312,18 +330,34 @@ impl ChatBackend for GatewayChat<'_> {
             .await;
         self.state
             .metrics
-            .record_dispatch(started.elapsed(), events.is_err());
+            .record_dispatch(started.elapsed(), events.as_ref().err());
+        let events = match events {
+            Ok(events) => events,
+            Err(error) => {
+                self.state.metrics.inner.chat.duration.observe_duration(
+                    &[model, "true", "error"],
+                    self.context.received_at().elapsed(),
+                );
+                return Err(error);
+            }
+        };
         Ok((
-            events?,
+            events,
             GatewayChatStream {
                 _admission: self.admission,
-                metrics: self.state.metrics.begin_stream(),
+                metrics: self
+                    .state
+                    .metrics
+                    .begin_stream(model, self.context.received_at()),
             },
         ))
     }
 }
 
-const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 4096;
+/// Every family has a bounded label set (labelled families keep at most
+/// [`GATEWAY_MAX_SERIES`] series), so the exposition stays under this size.
+const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 256 * 1024;
+const GATEWAY_MAX_SERIES: usize = 16;
 
 #[derive(Clone, Default)]
 struct GatewayMetrics {
@@ -355,6 +389,107 @@ struct GatewayMetricCounters {
     http_4xx: AtomicU64,
     http_5xx: AtomicU64,
     http_other: AtomicU64,
+    chat: GatewayChatMetrics,
+}
+
+/// Labelled latency and token metrics. Model labels are the parsed
+/// `ModelVariant` names, a closed set, never request text; routes are the
+/// gateway's own paths; statuses are HTTP codes. No request or tenant ids.
+struct GatewayChatMetrics {
+    duration: HistogramFamily,
+    ttft: HistogramFamily,
+    inter_token: HistogramFamily,
+    prompt_tokens: CounterFamily,
+    completion_tokens: CounterFamily,
+    dispatch: HistogramFamily,
+    http: HistogramFamily,
+}
+
+impl Default for GatewayChatMetrics {
+    fn default() -> Self {
+        Self {
+            duration: HistogramFamily::new(
+                "izwi_gateway_chat_request_duration_seconds",
+                "Chat request latency from gateway ingress to the last byte of the answer; _count is requests by model, stream and outcome.",
+                &["model", "stream", "outcome"],
+                buckets::REQUEST_SECONDS,
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            ttft: HistogramFamily::new(
+                "izwi_gateway_chat_ttft_seconds",
+                "Streaming chat time from gateway ingress to the first answer text sent.",
+                &["model"],
+                buckets::FIRST_OUTPUT_SECONDS,
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            inter_token: HistogramFamily::new(
+                "izwi_gateway_chat_inter_token_latency_seconds",
+                "Gap between successive answer-text deltas of one stream; a worker may coalesce several tokens into one delta.",
+                &["model"],
+                buckets::INTER_TOKEN_SECONDS,
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            prompt_tokens: CounterFamily::new(
+                "izwi_gateway_chat_prompt_tokens_total",
+                "Prompt tokens of completed chat requests.",
+                &["model"],
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            completion_tokens: CounterFamily::new(
+                "izwi_gateway_chat_completion_tokens_total",
+                "Completion tokens of completed chat requests.",
+                &["model"],
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            dispatch: HistogramFamily::new(
+                "izwi_gateway_worker_dispatch_seconds",
+                "Worker call latency (streams stop at acceptance) by outcome: accepted, or the HTTP status the gateway answered.",
+                &["outcome"],
+                buckets::REQUEST_SECONDS,
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+            http: HistogramFamily::new(
+                "izwi_gateway_http_request_duration_seconds",
+                "Time to response headers by gateway route and status.",
+                &["route", "status"],
+                buckets::REQUEST_SECONDS,
+            )
+            .with_max_series(GATEWAY_MAX_SERIES),
+        }
+    }
+}
+
+impl GatewayChatMetrics {
+    fn record_tokens(&self, model: &str, generation: &ChatGeneration) {
+        self.prompt_tokens
+            .add(&[model], generation.prompt_tokens as u64);
+        self.completion_tokens
+            .add(&[model], generation.tokens_generated as u64);
+    }
+
+    fn render(&self, output: &mut String) {
+        self.duration.render(output);
+        self.ttft.render(output);
+        self.inter_token.render(output);
+        self.prompt_tokens.render(output);
+        self.completion_tokens.render(output);
+        self.dispatch.render(output);
+        self.http.render(output);
+    }
+}
+
+/// The gateway route label: its own paths, never the caller's.
+fn gateway_route_label(path: &str) -> &'static str {
+    match path {
+        "/v1/chat/completions" => "/v1/chat/completions",
+        "/v1/realtime/ws" => "/v1/realtime/ws",
+        "/v1/speech-to-text/realtime/ws" => "/v1/speech-to-text/realtime/ws",
+        "/livez" => "/livez",
+        "/readyz" => "/readyz",
+        "/internal/metrics" | "/internal/metrics/prometheus" => "/internal/metrics",
+        "/internal/admin/drain" => "/internal/admin/drain",
+        _ => "other",
+    }
 }
 
 struct GatewayActiveRequestGuard {
@@ -373,11 +508,35 @@ impl Drop for GatewayActiveRequestGuard {
 struct GatewayStreamMetricsGuard {
     metrics: GatewayMetrics,
     terminal_observed: bool,
+    model: &'static str,
+    received_at: Instant,
+    last_delta_at: Option<Instant>,
 }
 
 impl GatewayStreamMetricsGuard {
-    fn record_completion(&mut self) {
-        self.terminal_observed = true;
+    fn record_delta(&mut self) {
+        let now = Instant::now();
+        let chat = &self.metrics.inner.chat;
+        match self.last_delta_at {
+            None => chat
+                .ttft
+                .observe_duration(&[self.model], now - self.received_at),
+            Some(previous) => chat
+                .inter_token
+                .observe_duration(&[self.model], now - previous),
+        }
+        self.last_delta_at = Some(now);
+    }
+
+    fn record_completion(&mut self, generation: &ChatGeneration) {
+        if !self.terminal_observed {
+            self.terminal_observed = true;
+            self.record_duration("ok");
+            self.metrics
+                .inner
+                .chat
+                .record_tokens(self.model, generation);
+        }
     }
 
     fn record_failure(&mut self) {
@@ -387,18 +546,23 @@ impl GatewayStreamMetricsGuard {
                 .routing_dispatch_failures
                 .fetch_add(1, Ordering::Relaxed);
             self.terminal_observed = true;
+            self.record_duration("error");
         }
+    }
+
+    fn record_duration(&self, outcome: &str) {
+        self.metrics
+            .inner
+            .chat
+            .duration
+            .observe_duration(&[self.model, "true", outcome], self.received_at.elapsed());
     }
 }
 
 impl Drop for GatewayStreamMetricsGuard {
     fn drop(&mut self) {
-        if !self.terminal_observed {
-            self.metrics
-                .inner
-                .routing_dispatch_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        // A body dropped before its terminal event failed.
+        self.record_failure();
         self.metrics
             .inner
             .active_streams
@@ -414,25 +578,41 @@ impl GatewayMetrics {
         }
     }
 
-    fn begin_stream(&self) -> GatewayStreamMetricsGuard {
+    fn begin_stream(&self, model: &'static str, received_at: Instant) -> GatewayStreamMetricsGuard {
         self.inner.active_streams.fetch_add(1, Ordering::Relaxed);
         GatewayStreamMetricsGuard {
             metrics: self.clone(),
             terminal_observed: false,
+            model,
+            received_at,
+            last_delta_at: None,
         }
     }
 
-    fn record_dispatch(&self, elapsed: Duration, failed: bool) {
+    fn record_dispatch(&self, elapsed: Duration, error: Option<&ApiError>) {
         self.inner.dispatch_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.dispatch_latency_micros.fetch_add(
             u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        if failed {
+        if error.is_some() {
             self.inner
                 .routing_dispatch_failures
                 .fetch_add(1, Ordering::Relaxed);
         }
+        let outcome = error.map_or("accepted", |error| error.status.as_str());
+        self.inner
+            .chat
+            .dispatch
+            .observe_duration(&[outcome], elapsed);
+    }
+
+    fn record_http_response(&self, path: &str, status: StatusCode, elapsed: Duration) {
+        self.record_http_outcome(status);
+        self.inner
+            .chat
+            .http
+            .observe_duration(&[gateway_route_label(path), status.as_str()], elapsed);
     }
 
     fn record_http_outcome(&self, status: StatusCode) {
@@ -448,7 +628,7 @@ impl GatewayMetrics {
 
     fn render_prometheus(&self, active_tenant_work: u64) -> String {
         let snapshot = self.snapshot();
-        let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
+        let mut output = String::with_capacity(8 * 1024);
         macro_rules! metric {
             ($name:literal, $kind:literal, $help:literal, $value:expr) => {{
                 let _ = writeln!(output, concat!("# HELP ", $name, " ", $help));
@@ -541,6 +721,7 @@ impl GatewayMetrics {
             "HTTP responses outside standard classes.",
             snapshot.http_other
         );
+        self.inner.chat.render(&mut output);
         debug_assert!(output.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
         output
     }
@@ -745,8 +926,12 @@ async fn observe_gateway_http_outcome(
     request: Request,
     next: Next,
 ) -> Response {
+    let started = Instant::now();
+    let path = request.uri().path().to_owned();
     let response = next.run(request).await;
-    state.metrics.record_http_outcome(response.status());
+    state
+        .metrics
+        .record_http_response(&path, response.status(), started.elapsed());
     response
 }
 
@@ -1061,12 +1246,28 @@ mod tests {
             .expect("chat request should build")
     }
 
+    fn test_generation(prompt_tokens: usize, tokens_generated: usize) -> ChatGeneration {
+        ChatGeneration {
+            latency_breakdown: None,
+            finish_reason: None,
+            text: String::new(),
+            prompt_tokens,
+            tokens_generated,
+            generation_time_ms: 0.0,
+            cached_prompt_tokens: None,
+            logprobs: Vec::new(),
+        }
+    }
+
     #[test]
     fn fixed_gateway_metrics_track_lifetimes_latency_and_status_classes() {
         let metrics = GatewayMetrics::default();
         let request = metrics.begin_request();
-        let mut stream = metrics.begin_stream();
-        metrics.record_dispatch(Duration::from_micros(7), true);
+        let mut stream = metrics.begin_stream("model-a", Instant::now());
+        metrics.record_dispatch(
+            Duration::from_micros(7),
+            Some(&ApiError::service_unavailable("down")),
+        );
         for status in [
             StatusCode::CONTINUE,
             StatusCode::OK,
@@ -1087,15 +1288,83 @@ mod tests {
         assert_eq!(active.http_4xx, 1);
         assert_eq!(active.http_5xx, 1);
         assert_eq!(active.http_other, 1);
-        stream.record_completion();
+        stream.record_delta();
+        stream.record_delta();
+        stream.record_delta();
+        stream.record_completion(&test_generation(11, 3));
         drop(stream);
         drop(request);
         assert_eq!(metrics.snapshot().active_requests, 0);
         assert_eq!(metrics.snapshot().active_streams, 0);
-        let abandoned_stream = metrics.begin_stream();
+        let abandoned_stream = metrics.begin_stream("model-a", Instant::now());
         drop(abandoned_stream);
         assert_eq!(metrics.snapshot().routing_dispatch_failures, 2);
-        assert!(metrics.render_prometheus(0).len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+
+        let text = metrics.render_prometheus(0);
+        let counts = izwi_core::runtime::prometheus::check_histograms(&text)
+            .expect("valid histogram exposition");
+        let duration = |outcome: &str| {
+            counts[&format!(
+                "izwi_gateway_chat_request_duration_seconds{{model=\"model-a\",outcome=\"{outcome}\",stream=\"true\"}}"
+            )]
+        };
+        assert_eq!(duration("ok"), 1);
+        // A body dropped before its terminal event is an error.
+        assert_eq!(duration("error"), 1);
+        assert_eq!(
+            counts["izwi_gateway_chat_ttft_seconds{model=\"model-a\"}"],
+            1
+        );
+        // Three deltas: one first output and two gaps.
+        assert_eq!(
+            counts["izwi_gateway_chat_inter_token_latency_seconds{model=\"model-a\"}"],
+            2
+        );
+        assert_eq!(
+            counts["izwi_gateway_worker_dispatch_seconds{outcome=\"503\"}"],
+            1
+        );
+        assert!(text.contains("izwi_gateway_chat_prompt_tokens_total{model=\"model-a\"} 11"));
+        assert!(text.contains("izwi_gateway_chat_completion_tokens_total{model=\"model-a\"} 3"));
+        assert!(text.len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn gateway_metrics_stay_bounded_under_label_churn() {
+        let metrics = GatewayMetrics::default();
+        let models = (0..100)
+            .map(|index| &*Box::leak(format!("model-with-a-long-name-{index:03}").into_boxed_str()))
+            .collect::<Vec<&'static str>>();
+        for model in &models {
+            let mut stream = metrics.begin_stream(model, Instant::now());
+            stream.record_delta();
+            stream.record_delta();
+            stream.record_completion(&test_generation(1, 1));
+            stream.record_failure();
+            metrics.record_dispatch(Duration::from_millis(1), None);
+        }
+        for code in 100..600u16 {
+            let status = StatusCode::from_u16(code).expect("valid status");
+            metrics.record_http_response("/v1/unknown/path", status, Duration::from_millis(1));
+            metrics.record_http_response("/livez", status, Duration::from_millis(1));
+        }
+        let text = metrics.render_prometheus(u64::MAX);
+        assert!(
+            text.len() <= MAX_PROMETHEUS_RESPONSE_BYTES,
+            "{} bytes",
+            text.len()
+        );
+        let counts = izwi_core::runtime::prometheus::check_histograms(&text).unwrap();
+        // Unknown paths share one route label; extra label sets share `other`.
+        assert!(!text.contains("/v1/unknown/path"));
+        assert!(counts
+            .keys()
+            .any(|series| series.contains("model=\"other\"")));
+        let ttft_series = counts
+            .keys()
+            .filter(|series| series.starts_with("izwi_gateway_chat_ttft_seconds{"))
+            .count();
+        assert_eq!(ttft_series, GATEWAY_MAX_SERIES + 1);
     }
 
     async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, TestWorker) {
@@ -1186,6 +1455,72 @@ mod tests {
         assert_eq!(metrics.routing_dispatch_failures, 0);
         assert_eq!(metrics.active_requests, 0);
         assert_eq!(metrics.active_streams, 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_chat_histograms_count_every_dispatched_request() {
+        let model = ModelVariant::Qwen354BGguf;
+        let (state, _worker) = registry_gateway_state(model).await;
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+        let body = |stream: bool| {
+            json!({
+                "model": model.dir_name(),
+                "messages": [{"role": "user", "content": "metrics"}],
+                "stream": stream,
+                "stream_options": stream.then(|| json!({"include_usage": true})),
+                "max_tokens": 32
+            })
+        };
+        let response = send(app.clone(), chat_request(body(false))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let usage = json_body(response).await["usage"].clone();
+        for _ in 0..2 {
+            let response = send(app.clone(), chat_request(body(true))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("bounded SSE body");
+            assert!(String::from_utf8_lossy(&text).contains("[DONE]"));
+        }
+
+        let text = state.metrics.render_prometheus(0);
+        let counts = izwi_core::runtime::prometheus::check_histograms(&text)
+            .expect("valid histogram exposition");
+        let model = model.dir_name();
+        let duration = |stream: &str| {
+            counts[&format!(
+                "izwi_gateway_chat_request_duration_seconds{{model=\"{model}\",outcome=\"ok\",stream=\"{stream}\"}}"
+            )]
+        };
+        assert_eq!(duration("false"), 1);
+        assert_eq!(duration("true"), 2);
+        assert_eq!(
+            counts[&format!("izwi_gateway_chat_ttft_seconds{{model=\"{model}\"}}")],
+            2
+        );
+        assert_eq!(
+            counts["izwi_gateway_worker_dispatch_seconds{outcome=\"accepted\"}"],
+            3
+        );
+        assert_eq!(
+            counts["izwi_gateway_http_request_duration_seconds{route=\"/v1/chat/completions\",status=\"200\"}"],
+            3
+        );
+        let tokens = |name: &str| {
+            izwi_core::runtime::prometheus::parse_exposition(&text)
+                .unwrap()
+                .into_iter()
+                .find(|sample| sample.name == name)
+                .map(|sample| sample.value as u64)
+        };
+        assert_eq!(
+            tokens("izwi_gateway_chat_prompt_tokens_total"),
+            Some(3 * usage["prompt_tokens"].as_u64().unwrap())
+        );
+        assert_eq!(
+            tokens("izwi_gateway_chat_completion_tokens_total"),
+            Some(3 * usage["completion_tokens"].as_u64().unwrap())
+        );
     }
 
     async fn json_body(response: Response) -> serde_json::Value {
@@ -2285,11 +2620,22 @@ mod tests {
         assert!(body.contains("izwi_gateway_active_requests 0"));
         assert!(body.contains("izwi_gateway_active_tenant_work 0"));
         assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
-        assert_eq!(body.matches("# TYPE ").count(), 15);
-        assert!(
-            !body.contains('{'),
-            "metrics must not contain dynamic labels"
-        );
+        assert_eq!(body.matches("# TYPE ").count(), 22);
+        // Labels are the gateway's own fixed vocabulary, never caller text.
+        let samples = izwi_core::runtime::prometheus::parse_exposition(&body)
+            .expect("valid exposition");
+        for sample in &samples {
+            for label in sample.labels.keys() {
+                assert!(
+                    ["route", "status", "le", "model", "stream", "outcome"]
+                        .contains(&label.as_str()),
+                    "{label}"
+                );
+            }
+        }
+        assert!(body.contains(
+            "izwi_gateway_http_request_duration_seconds_count{route=\"/internal/metrics\",status=\"401\"} 2"
+        ));
         for private in [
             TEST_API_KEY,
             TEST_METRICS_API_KEY,

@@ -61,6 +61,11 @@ impl RequestContext {
         principal_namespace(&self.principal)
     }
 
+    /// When this process received the request.
+    pub(crate) fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
     pub(crate) fn remaining_budget(&self, total: Duration) -> Option<Duration> {
         total.checked_sub(self.received_at.elapsed())
     }
