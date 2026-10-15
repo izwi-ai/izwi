@@ -90,6 +90,12 @@ pub struct SchedulerConfig {
     pub enable_decode_quanta: bool,
     /// Maximum decode tokens per request in one scheduler step.
     pub max_decode_tokens_per_request: usize,
+    /// Physical dispatches the core launches per step (its candidate
+    /// dispatch limit). Decode selection never needs more.
+    pub physical_dispatch_limit: usize,
+    /// Rows one dispatch of an unbatched decode stage holds: the physical
+    /// launch limit, which is one unless launches run concurrently.
+    pub unbatched_dispatch_rows: usize,
 }
 
 /// VAD preemption event - signals that user started speaking.
@@ -128,12 +134,15 @@ impl Default for SchedulerConfig {
             power_save_mode: false,
             enable_decode_quanta: false,
             max_decode_tokens_per_request: 2,
+            physical_dispatch_limit: 1,
+            unbatched_dispatch_rows: 1,
         }
     }
 }
 
 impl From<&EngineCoreConfig> for SchedulerConfig {
     fn from(config: &EngineCoreConfig) -> Self {
+        let capacity = config.resolved_physical_execution_capacity();
         Self {
             max_batch_size: config.max_batch_size,
             max_tokens_per_step: config.max_tokens_per_step,
@@ -157,6 +166,8 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             power_save_mode: config.power_save_mode,
             enable_decode_quanta: config.enable_decode_quanta,
             max_decode_tokens_per_request: config.max_decode_tokens_per_request,
+            physical_dispatch_limit: capacity.candidate_dispatch_limit.get(),
+            unbatched_dispatch_rows: capacity.physical_launch_limit.get(),
         }
     }
 }
@@ -411,6 +422,8 @@ pub struct Scheduler {
     /// Committed decode transactions that served only codec or finalization
     /// rows while an AR decode row was ready; bounded the same way.
     audio_only_steps_with_ready_decode: usize,
+    /// Committed non-realtime quanta, stamped on each row they served.
+    service_clock: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +602,9 @@ struct RequestCachePolicy {
     speculative_decode_batch: bool,
     /// Model-preferred prefill span for an isolated request (0: none).
     preferred_prefill_tokens: usize,
+    /// Decode rows one physical dispatch of this model holds; `None` until
+    /// the loaded profile is installed, which leaves selection unclamped.
+    decode_dispatch_rows: Option<usize>,
 }
 
 impl Default for RequestCachePolicy {
@@ -605,11 +621,21 @@ impl Default for RequestCachePolicy {
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
             preferred_prefill_tokens: 0,
+            decode_dispatch_rows: None,
         }
     }
 }
 
 impl RequestCachePolicy {}
+
+/// Decode rows that can share one physical dispatch: the same loaded model,
+/// task and native decode batching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeDispatchKey {
+    model_variant: Option<ModelVariant>,
+    task_type: TaskType,
+    decode_batch: NativeBatchMode,
+}
 
 /// State for a running request.
 #[derive(Debug, Clone)]
@@ -642,6 +668,10 @@ struct RunningRequest {
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
     paused: bool,
+    /// Service clock of this request's last committed quantum or
+    /// capacity-withheld turn; decode rotates through equal-priority rows by
+    /// it (0: never served).
+    last_service: u64,
 }
 
 impl Scheduler {
@@ -671,6 +701,7 @@ impl Scheduler {
             decode_only_steps_with_waiting_incremental_prefill: 0,
             realtime_only_steps_with_ready_decode: 0,
             audio_only_steps_with_ready_decode: 0,
+            service_clock: 0,
         }
     }
 
@@ -851,6 +882,7 @@ impl Scheduler {
                 workload_class: request.workload_class,
                 first_token_emitted: false,
                 paused: false,
+                last_service: 0,
             },
         );
         let initial_service_clock = self.next_realtime_service_clock.saturating_sub(1);
@@ -969,6 +1001,11 @@ impl Scheduler {
         if metadata.sequence_id != session.epoch {
             return false;
         }
+        let decode_dispatch_rows = if profile.decode_batch == NativeBatchMode::None {
+            self.config.unbatched_dispatch_rows
+        } else {
+            profile.max_batch_size
+        };
         metadata.cache_policy = RequestCachePolicy {
             mode: Some(profile.cache_mode),
             // Only an explicit incremental contract is scheduler-resumable.
@@ -986,6 +1023,7 @@ impl Scheduler {
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
             speculative_decode_batch: profile.speculative_decode_batch,
             preferred_prefill_tokens: profile.preferred_prefill_tokens,
+            decode_dispatch_rows: Some(decode_dispatch_rows.max(1)),
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -1321,6 +1359,7 @@ impl Scheduler {
                     metadata.cache_policy.preferred_decode_tokens,
                     metadata.cache_policy.sustained_decode_quantum,
                     metadata.cache_policy.speculative_decode_batch,
+                    r.last_service,
                 ))
             })
             .collect();
@@ -1328,10 +1367,13 @@ impl Scheduler {
         if self.config.enable_adaptive_batching
             && self.config.policy != SchedulingPolicy::WeightedFair
         {
-            // Favor overdue requests first, then requests close to completion.
+            // Favor overdue requests first, rotating among them by last
+            // service, then requests close to completion.
             decode_candidates.sort_by(|a, b| {
-                b.8.partial_cmp(&a.8)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                (b.8 > 0.0)
+                    .cmp(&(a.8 > 0.0))
+                    .then_with(|| a.13.cmp(&b.13))
+                    .then_with(|| b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| b.6.cmp(&a.6))
                     .then_with(|| {
                         b.7.adaptive_score_boost()
@@ -1356,6 +1398,7 @@ impl Scheduler {
                                 self.compare_tenant_service_with(&simulated_tenants, &a.0, &b.0)
                             })
                             .then_with(|| b.2.cmp(&a.2))
+                            .then_with(|| a.13.cmp(&b.13))
                             .then_with(|| {
                                 b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal)
                             })
@@ -1381,8 +1424,12 @@ impl Scheduler {
             decode_candidates = fair_order;
         } else {
             decode_candidates.sort_by(|a, b| match self.config.policy {
-                SchedulingPolicy::FCFS => a.1.cmp(&b.1),
-                SchedulingPolicy::Priority => b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)),
+                SchedulingPolicy::FCFS => a.13.cmp(&b.13).then_with(|| a.1.cmp(&b.1)),
+                SchedulingPolicy::Priority => {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.13.cmp(&b.13))
+                        .then_with(|| a.1.cmp(&b.1))
+                }
                 SchedulingPolicy::WeightedFair => Ordering::Equal,
             });
         }
@@ -1394,6 +1441,12 @@ impl Scheduler {
             .max();
         let effective_prefill_chunk_threshold =
             self.effective_prefill_chunk_threshold(has_decode_demand);
+        // The core launches at most `physical_dispatch_limit` dispatches per
+        // step, each holding one model's rows up to its dispatch width. A row
+        // that would need a further dispatch waits for a later step instead
+        // of beginning a plan the core can only roll back; the rotation by
+        // last service then reaches it (SCH-F2).
+        let mut decode_dispatches: Vec<(DecodeDispatchKey, usize, usize)> = Vec::new();
 
         for (
             request_id,
@@ -1409,6 +1462,7 @@ impl Scheduler {
             preferred_decode_tokens,
             sustained_decode_quantum,
             speculative_decode_batch,
+            _last_service,
         ) in decode_candidates
         {
             if self.config.enable_preemption
@@ -1428,6 +1482,30 @@ impl Scheduler {
             {
                 break;
             }
+            let dispatch = self.requests.get(&request_id).and_then(|metadata| {
+                let rows = metadata.cache_policy.decode_dispatch_rows?;
+                let key = DecodeDispatchKey {
+                    model_variant: metadata.model_variant,
+                    task_type: metadata.task_type,
+                    decode_batch: metadata.cache_policy.decode_batch,
+                };
+                Some((key, rows))
+            });
+            let dispatch_slot = match &dispatch {
+                Some((key, _)) => {
+                    let open = decode_dispatches
+                        .iter()
+                        .position(|(open, used, rows)| open == key && used < rows);
+                    match open {
+                        Some(index) => Some(index),
+                        None if decode_dispatches.len() < self.config.physical_dispatch_limit => {
+                            Some(decode_dispatches.len())
+                        }
+                        None => continue,
+                    }
+                }
+                None => None,
+            };
 
             let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
@@ -1442,6 +1520,12 @@ impl Scheduler {
             );
             if num_tokens == 0 {
                 continue;
+            }
+            if let (Some((key, rows)), Some(index)) = (dispatch, dispatch_slot) {
+                match decode_dispatches.get_mut(index) {
+                    Some((_, used, _)) => *used += 1,
+                    None => decode_dispatches.push((key, 1, rows)),
+                }
             }
 
             let quantum_reason = if num_tokens > 1 {
@@ -1766,6 +1850,7 @@ impl Scheduler {
                 workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
+                last_service: 0,
             };
 
             let plan_id = self.next_plan_id;
@@ -1843,6 +1928,10 @@ impl Scheduler {
             .get(request_id)
             .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental);
         if let Some(running) = self.running.get_mut(request_id) {
+            if tokens_processed > 0 || tokens_generated > 0 {
+                self.service_clock = self.service_clock.saturating_add(1);
+                running.last_service = self.service_clock;
+            }
             if running.audio_decode_in_flight {
                 running.audio_decode_in_flight = false;
                 running.audio_decode_pending = None;
@@ -2251,13 +2340,24 @@ impl Scheduler {
         }
     }
 
-    /// A prefill withheld for managed capacity waits on state that running
+    /// Rows withheld for managed capacity wait on state that running
     /// sequences hold until they finish, so only decode can free it. Clear
-    /// the starvation debt of its prefill mode: the bound then returns the
-    /// next transactions to decode instead of forcing the same prefill
-    /// again with no decode budget, which no commit would ever resolve.
-    pub(crate) fn yield_capacity_blocked_prefill(&mut self, deferred: &[ScheduledRequest]) {
-        for scheduled in deferred.iter().filter(|scheduled| scheduled.is_prefill) {
+    /// the starvation debt of each withheld prefill's mode: the bound then
+    /// returns the next transactions to decode instead of forcing the same
+    /// prefill again with no decode budget, which no commit would ever
+    /// resolve. Each withheld row also takes its rotation turn, so the clamped
+    /// decode selection reaches the other rows rather than retrying it first.
+    pub(crate) fn yield_capacity_blocked(&mut self, deferred: &[ScheduledRequest]) {
+        for scheduled in deferred {
+            if let Some(running) = self.running.get_mut(&scheduled.request_id) {
+                if running.sequence_id == scheduled.sequence_id {
+                    self.service_clock = self.service_clock.saturating_add(1);
+                    running.last_service = self.service_clock;
+                }
+            }
+            if !scheduled.is_prefill {
+                continue;
+            }
             match self
                 .requests
                 .get(&scheduled.request_id)
@@ -3706,6 +3806,7 @@ mod tests {
                 sustained_decode_quantum: false,
                 speculative_decode_batch: false,
                 preferred_prefill_tokens: 0,
+                decode_dispatch_rows: None,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
@@ -5971,6 +6072,7 @@ mod tests {
                 let mut profile =
                     ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
                 profile.decode_batch = NativeBatchMode::Continuous;
+                profile.max_batch_size = 2;
                 profile.preferred_decode_tokens = 4;
                 profile.speculative_decode_batch = speculative_decode_batch;
                 assert!(scheduler
@@ -5995,6 +6097,69 @@ mod tests {
         }
     }
 
+    /// SCH-F2: decode selection never exceeds what the physical dispatches
+    /// of one step hold (dispatch limit x width, not the eight scheduler
+    /// rows), and equal-priority streams rotate by last service so every
+    /// running stream advances.
+    #[test]
+    fn decode_selection_fills_the_physical_width_and_rotates_streams() {
+        for (dispatch_limit, per_step) in [(1usize, 2usize), (2, 4)] {
+            let mut scheduler = Scheduler::new(SchedulerConfig {
+                max_batch_size: 8,
+                physical_dispatch_limit: dispatch_limit,
+                ..Default::default()
+            });
+            let ids = ["rr-0", "rr-1", "rr-2", "rr-3", "rr-4", "rr-5", "rr-6"];
+            for id in ids {
+                let mut request = EngineCoreRequest::tts("hello");
+                request.id = id.to_string();
+                request.prompt_tokens = vec![1];
+                assert!(scheduler.add_request(&request));
+                let epoch = scheduler.get_sequence_id(&request.id).expect("epoch");
+                let mut profile =
+                    ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+                profile.prefill = PrefillMode::Incremental;
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.max_batch_size = 2;
+                assert!(scheduler
+                    .update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+            }
+            let prefill = scheduler.schedule();
+            assert_eq!(prefill.prefill_requests.len(), ids.len());
+            for id in ids {
+                scheduler.update_after_step(&id.to_string(), 1, 1, 1.0);
+            }
+
+            let mut served = HashMap::<RequestId, usize>::new();
+            let rounds = ids.len() * 4 / per_step;
+            for _ in 0..rounds {
+                let step = scheduler.schedule();
+                assert!(step.prefill_requests.is_empty());
+                assert_eq!(
+                    step.decode_requests.len(),
+                    per_step,
+                    "limit {dispatch_limit}"
+                );
+                for row in &step.decode_requests {
+                    *served.entry(row.request_id.clone()).or_default() += 1;
+                    scheduler.update_after_step(
+                        &row.request_id,
+                        row.num_tokens,
+                        row.num_tokens,
+                        1.0,
+                    );
+                }
+            }
+            for id in ids {
+                assert_eq!(
+                    served.get(id),
+                    Some(&4),
+                    "limit {dispatch_limit}: {served:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_decode_quanta_backs_off_when_multiple_decodes_are_active() {
         let config = SchedulerConfig {
@@ -6007,6 +6172,8 @@ mod tests {
             enable_adaptive_batching: false,
             enable_decode_quanta: true,
             max_decode_tokens_per_request: 4,
+            // Two unbatched decode rows run as two physical dispatches.
+            physical_dispatch_limit: 2,
             ..Default::default()
         };
         let mut scheduler = Scheduler::new(config);

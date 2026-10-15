@@ -517,6 +517,15 @@ impl PhysicalBatchAssembly {
     }
 }
 
+/// Chunked-claim holders of one model seen blocked on managed capacity since
+/// its holder set last changed. Claims only grow until a holder releases, so
+/// a holder blocked under an unchanged set is still blocked.
+#[derive(Debug, Default)]
+struct ClaimWaiters {
+    holders: Vec<super::SessionKey>,
+    blocked: HashSet<super::SessionKey>,
+}
+
 /// One session's run of refused batch workspaces.
 #[derive(Debug, Clone, Copy)]
 struct WorkspaceWait {
@@ -695,6 +704,8 @@ pub struct EngineCore {
     workspace_waits: HashMap<super::SessionKey, WorkspaceWait>,
     workspace_row_limits: HashMap<super::SessionKey, usize>,
     workspace_pressure: HashMap<super::SessionKey, super::scheduler::ScheduledRequest>,
+    /// Claim holders seen blocked, per model, for the claim deadlock breaker.
+    claim_waiters: HashMap<ModelInstanceId, ClaimWaiters>,
     retry_policy: LifecycleRetryPolicy,
     #[cfg(test)]
     restart_after_reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -1323,7 +1334,7 @@ impl EngineCore {
         scheduled: &[super::scheduler::ScheduledRequest],
     ) {
         self.rollback_unexecuted_schedule(scheduled);
-        self.scheduler.yield_capacity_blocked_prefill(scheduled);
+        self.scheduler.yield_capacity_blocked(scheduled);
         let retry_at = Instant::now() + self.retry_policy.execution_delay(1);
         for scheduled in scheduled {
             let session = scheduled.session_key();
@@ -1514,8 +1525,10 @@ impl EngineCore {
     /// Chunked chat claims grow during generation, so every claim holder of a
     /// model can end up waiting to grow at once while none can finish. When no
     /// row ran this step, suspension and preemption freed nothing, and every
-    /// claim holder of a model is among the blocked rows, fail the youngest
-    /// lowest-priority blocked request so the others can complete.
+    /// claim holder of a model has been seen blocked since the holder set last
+    /// changed, fail the youngest lowest-priority holder so the others can
+    /// complete. Decode selection is clamped to the physical width, so the
+    /// holders need not all be blocked in the same step.
     async fn fail_claim_deadlocked_session(
         &mut self,
         blocked: &[super::scheduler::ScheduledRequest],
@@ -1540,28 +1553,40 @@ impl EngineCore {
             by_model.entry(model).or_default().push(row.session_key());
         }
         for (model, blocked_sessions) in by_model {
-            let holders = self.managed_kv_cache.capacity_claim_sessions(model);
+            let mut holders = self.managed_kv_cache.capacity_claim_sessions(model);
+            holders.sort_by(|left, right| {
+                (&left.request_id, left.epoch).cmp(&(&right.request_id, right.epoch))
+            });
+            let waiters = self.claim_waiters.entry(model).or_default();
+            if waiters.holders != holders {
+                waiters.holders = holders.clone();
+                waiters.blocked.clear();
+            }
+            waiters.blocked.extend(blocked_sessions);
             let deadlocked = holders.len() > 1
                 && holders
                     .iter()
-                    .all(|holder| blocked_sessions.contains(holder));
+                    .all(|holder| waiters.blocked.contains(holder));
             if !deadlocked {
                 continue;
             }
-            // `blocked` keeps scheduler order (oldest first), so the last
-            // lowest-priority row is the youngest.
-            let Some(victim) = blocked_sessions
+            // Session epochs are scheduler sequence ids, so the highest epoch
+            // among the lowest-priority holders is the youngest.
+            let Some(victim) = holders
                 .iter()
-                .rev()
                 .min_by_key(|session| {
-                    self.requests
-                        .get(&session.request_id)
-                        .map(|request| request.priority)
+                    (
+                        self.requests
+                            .get(&session.request_id)
+                            .map(|request| request.priority),
+                        std::cmp::Reverse(session.epoch),
+                    )
                 })
                 .cloned()
             else {
                 continue;
             };
+            self.claim_waiters.remove(&model);
             warn!(
                 request_id = %victim.request_id,
                 session_epoch = victim.epoch,
@@ -3477,6 +3502,7 @@ impl EngineCore {
             workspace_waits: HashMap::new(),
             workspace_row_limits: HashMap::new(),
             workspace_pressure: HashMap::new(),
+            claim_waiters: HashMap::new(),
             retry_policy: LifecycleRetryPolicy::default(),
             #[cfg(test)]
             restart_after_reset_hook: None,
@@ -10680,9 +10706,12 @@ mod tests {
     }
 
     /// Managed full-prefill rows whose decode quanta emit tokens, so requests
-    /// finish at their output budget.
+    /// finish at their output budget. Records each executed row's plan id,
+    /// request and phase.
+    #[derive(Default)]
     struct ManagedDecodeExecutor {
         prompt_tokens: usize,
+        executed: Arc<Mutex<Vec<(super::super::PlanId, RequestId, bool)>>>,
     }
 
     impl ModelExecutor for ManagedDecodeExecutor {
@@ -10702,6 +10731,16 @@ mod tests {
             execution: super::super::executor::PhysicalBatchExecution<'_>,
         ) -> super::super::executor::PhysicalDispatchResult {
             let dispatch = execution.expected_dispatch();
+            self.executed
+                .lock()
+                .unwrap()
+                .extend(execution.scheduled.iter().map(|scheduled| {
+                    (
+                        scheduled.plan_id,
+                        scheduled.request_id.clone(),
+                        scheduled.is_prefill,
+                    )
+                }));
             Ok(execution
                 .scheduled
                 .iter()
@@ -10781,6 +10820,7 @@ mod tests {
         let prompt: Vec<u32> = (1..=8).collect();
         let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
             prompt_tokens: prompt.len(),
+            ..Default::default()
         }));
         let mut core = EngineCore::new_with_unified_executor(
             EngineCoreConfig {
@@ -10819,6 +10859,70 @@ mod tests {
             }
         }
         assert_eq!(finished.len(), ids.len(), "finished {finished:?}");
+    }
+
+    /// SCH-F2: the scheduler selects no more decode rows than one physical
+    /// dispatch holds (one unbatched row here, with eight scheduler rows), so
+    /// every plan it begins executes, and it rotates through the running
+    /// streams instead of serving the oldest until it finishes.
+    #[tokio::test]
+    async fn clamped_decode_executes_every_plan_and_rotates_all_streams() {
+        let model = ModelInstanceId::new(99);
+        let prompt: Vec<u32> = (1..=8).collect();
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+            prompt_tokens: prompt.len(),
+            executed: executed.clone(),
+        }));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                max_blocks: 64,
+                max_batch_size: 8,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let ids = ["s0", "s1", "s2", "s3"];
+        for id in ids {
+            let mut request = managed_test_request(&mut core, model, id, prompt.clone());
+            request.params.max_tokens = 200;
+            core.add_request(request).expect("add");
+        }
+        let prefilled = |executed: &Mutex<Vec<(super::super::PlanId, RequestId, bool)>>| {
+            executed.lock().unwrap().iter().filter(|row| row.2).count()
+        };
+        for _ in 0..100 {
+            if prefilled(&executed) == ids.len() {
+                break;
+            }
+            core.step().await.expect("prefill step");
+        }
+        assert_eq!(prefilled(&executed), ids.len());
+
+        let start = executed.lock().unwrap().len();
+        for _ in 0..12 {
+            core.step().await.expect("decode step");
+        }
+        let decoded = executed.lock().unwrap()[start..].to_vec();
+        assert_eq!(decoded.len(), 12, "one decode row per step: {decoded:?}");
+        // Plan ids are allocated per scheduled row, so consecutive ids mean
+        // no plan was begun and then rolled back.
+        for pair in decoded.windows(2) {
+            assert_eq!(pair[1].0, pair[0].0 + 1, "{decoded:?}");
+        }
+        for window in decoded.chunks(ids.len()) {
+            let served = window
+                .iter()
+                .map(|row| row.1.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(served.len(), ids.len(), "{decoded:?}");
+        }
     }
 
     /// H2: a row whose managed state can never be prepared fails alone. The
