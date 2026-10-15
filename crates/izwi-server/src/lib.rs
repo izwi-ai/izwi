@@ -81,15 +81,14 @@ use izwi_core::{
 use izwi_hooks::EnterpriseHooks;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    render_approvals_text, CredentialId, DeploymentId, IncarnationId, ModelAlias, ModelGeneration,
-    ModelReadiness, NdjsonLimits, NodeId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
-    TaskKind, WorkerDescriptor, WorkerId, WorkerStatus, MAX_REMAINING_TIME_MS,
+    render_approvals_text, CredentialId, DeploymentId, ModelAlias, ModelGeneration, ModelReadiness,
+    NdjsonLimits, NodeId, PolicyRevision, ServiceBearerToken, ServiceCredentials, TaskKind,
+    WorkerDescriptor, WorkerId, WorkerStatus, MAX_REMAINING_TIME_MS,
 };
 use logging::{LogFormat, SERVICE_NAME, SERVICE_VERSION};
 use persistence::PersistenceContext;
 use state::AppState;
 
-pub use app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
 pub use gateway_fleet::{FleetPartition, FleetPartitionError};
@@ -182,7 +181,8 @@ struct ServerArgs {
     #[arg(long, value_name = "DTYPE")]
     granite_speech_dtype: Option<String>,
 
-    /// Private worker base URL required by gateway mode.
+    /// Legacy one-worker form of `--gateway-worker-endpoint`: the gateway
+    /// routes to this worker through the same registry as an endpoint list.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_ENDPOINT")]
     worker_endpoint: Option<String>,
 
@@ -226,15 +226,17 @@ struct ServerArgs {
     #[arg(long, env = "IZWI_GATEWAY_WORKER_BEARER_TOKEN")]
     worker_bearer_token: Option<String>,
 
-    /// Expected worker process incarnation required by gateway mode.
+    /// Accepted with `--worker-endpoint` for compatibility and ignored: the
+    /// registry fences every attempt to the incarnation it observed and
+    /// adopts a restarted worker.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_INCARNATION")]
     worker_incarnation: Option<String>,
 
-    /// Pinned worker deployment identifier required by gateway mode.
+    /// Chat deployment identifier of the legacy worker endpoint forms.
     #[arg(long, env = "IZWI_GATEWAY_WORKER_DEPLOYMENT")]
     worker_deployment: Option<String>,
 
-    /// Public model served by the pinned worker deployment.
+    /// Public model served through the gateway.
     #[arg(long, env = "IZWI_GATEWAY_PUBLIC_MODEL")]
     public_model: Option<String>,
 
@@ -872,42 +874,25 @@ async fn gateway_state(
     serve_config: &ServeRuntimeConfig,
     enterprise_hooks: EnterpriseHooks,
     perimeter: GatewayPerimeterConfig,
-) -> anyhow::Result<(gateway::GatewayState, Option<GatewayWorkerStatusPoller>)> {
+) -> anyhow::Result<(gateway::GatewayState, GatewayWorkerStatusPoller)> {
     validate_gateway_topology_source(args)?;
-    // The shared approvals file is a registry-mode approval source on its
-    // own (the DS6 rollout channel), so its presence disables pinned mode.
-    let shared_approvals_configured =
-        gateway_shared_approvals::SharedApprovalsConfig::from_env()?.is_some();
-    if args.gateway_worker_endpoints.is_empty()
-        && args.gateway_worker_approvals.is_empty()
-        && !shared_approvals_configured
+    if args.worker_endpoint.is_some()
+        && !(args.gateway_worker_endpoints.is_empty() && args.gateway_worker_approvals.is_empty())
     {
-        if args.gateway_realtime == "on" {
-            anyhow::bail!(
-                "--gateway-realtime requires registry-based worker routing (approvals or endpoints); pinned single-worker mode does not support it"
-            );
-        }
-        let remote = gateway_remote_execution(args, serve_config)?;
-        return Ok((
-            gateway::GatewayState::new(
-                remote,
-                enterprise_hooks,
-                perimeter,
-                serve_config.request_timeout_secs,
-                args.gateway_max_in_flight,
-            ),
-            None,
-        ));
-    }
-
-    if args.worker_endpoint.is_some() {
         anyhow::bail!(
-            "--worker-endpoint cannot be combined with registry worker endpoints or approvals; use it only for pinned compatibility"
+            "--worker-endpoint cannot be combined with registry worker endpoints or approvals; it is the one-worker form of --gateway-worker-endpoint"
         );
     }
     if args.worker_incarnation.is_some() {
-        anyhow::bail!(
-            "--worker-incarnation applies only to pinned --worker-endpoint mode; registry routing validates each discovered incarnation"
+        if args.worker_endpoint.is_none() {
+            anyhow::bail!(
+                "--worker-incarnation applies only to the legacy --worker-endpoint form; registry routing validates each discovered incarnation"
+            );
+        }
+        warn!(
+            service = SERVICE_NAME,
+            version = SERVICE_VERSION,
+            "--worker-incarnation is ignored: the gateway fences every attempt to the worker incarnation it observed and adopts a restarted worker"
         );
     }
 
@@ -919,6 +904,11 @@ async fn gateway_state(
     let public_model = ModelAlias::new(public_model_variant.dir_name())?;
     let (cli_approvals, worker_approvals, shared_approvals_view) =
         configured_gateway_worker_approvals(args, &public_model)?;
+    if worker_approvals.is_empty() && shared_approvals_view.is_none() {
+        anyhow::bail!(
+            "gateway mode requires a worker: --gateway-worker-approval, --gateway-worker-endpoint, --worker-endpoint, or a shared approvals file"
+        );
+    }
     let credentials = gateway_worker_credentials(args)?;
     // With a shared approvals file, runtime view adoption (DS6) can add
     // workers beyond the boot view; the registry capacity follows the
@@ -1245,7 +1235,7 @@ async fn gateway_state(
         }));
     }
 
-    let state = gateway::GatewayState::with_dispatcher(
+    let state = gateway::GatewayState::new(
         dispatcher,
         enterprise_hooks,
         perimeter,
@@ -1315,7 +1305,7 @@ async fn gateway_state(
         interval_ms = polling_interval.as_millis() as u64,
         "Gateway worker status polling started"
     );
-    Ok((state, Some(poller)))
+    Ok((state, poller))
 }
 
 fn initial_gateway_worker_expectation(
@@ -1377,8 +1367,15 @@ fn configured_gateway_worker_approvals(
     Option<gateway_shared_approvals::SharedApprovalsView>,
 )> {
     // Returns (CLI-only approvals, effective merged view, shared file view).
+    // `--worker-endpoint` is the one-worker form of the legacy endpoint list.
+    let legacy_endpoints: Vec<String> = args
+        .gateway_worker_endpoints
+        .iter()
+        .chain(args.worker_endpoint.as_ref())
+        .cloned()
+        .collect();
     let mut merged = if !args.gateway_worker_approvals.is_empty() {
-        if !args.gateway_worker_endpoints.is_empty() {
+        if !legacy_endpoints.is_empty() {
             anyhow::bail!(
                 "--gateway-worker-approval cannot be combined with --gateway-worker-endpoint"
             );
@@ -1389,7 +1386,7 @@ fn configured_gateway_worker_approvals(
             );
         }
         args.gateway_worker_approvals.clone()
-    } else if !args.gateway_worker_endpoints.is_empty() {
+    } else if !legacy_endpoints.is_empty() {
         let deployment_id = DeploymentId::new(required_gateway_value(
             &args.worker_deployment,
             "--worker-deployment",
@@ -1398,10 +1395,10 @@ fn configured_gateway_worker_approvals(
             ModelGeneration::new(args.worker_model_generation.ok_or_else(|| {
                 anyhow::anyhow!("gateway mode requires --worker-model-generation")
             })?)?;
-        args.gateway_worker_endpoints
-            .iter()
+        legacy_endpoints
+            .into_iter()
             .map(|endpoint| gateway_deployments::GatewayWorkerApproval {
-                endpoint: endpoint.clone(),
+                endpoint,
                 identity: gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
                 task: TaskKind::Chat,
                 public_model: legacy_public_model.clone(),
@@ -2037,56 +2034,6 @@ fn gateway_worker_client_config(
         tls,
         ..WorkerClientConfig::default()
     }
-}
-
-fn gateway_remote_execution(
-    args: &ServerArgs,
-    _serve_config: &ServeRuntimeConfig,
-) -> anyhow::Result<app::chat::RemoteChatExecution> {
-    validate_gateway_limits(args)?;
-    let model_generation = ModelGeneration::new(
-        args.worker_model_generation
-            .ok_or_else(|| anyhow::anyhow!("gateway mode requires --worker-model-generation"))?,
-    )?;
-    let model = parse_model_variant(required_gateway_value(
-        &args.public_model,
-        "--public-model",
-    )?)?;
-    let credentials = gateway_worker_credentials(args)?;
-    let worker_tls = gateway_worker_tls::worker_client_tls_from_env()?;
-    let client = WorkerClient::new(
-        required_gateway_value(&args.worker_endpoint, "--worker-endpoint")?,
-        credentials,
-        gateway_worker_client_config(args, worker_tls),
-    )?;
-    validate_gateway_worker_endpoint_policy(
-        args.gateway_topology,
-        client.uses_https(),
-        client.uses_numeric_loopback_http(),
-    )?;
-    app::chat::RemoteChatExecution::new(
-        client,
-        app::chat::RemoteChatExecutionConfig {
-            public_model_variant: model,
-            expected_worker_incarnation: IncarnationId::new(required_gateway_value(
-                &args.worker_incarnation,
-                "--worker-incarnation",
-            )?)?,
-            deployment_id: DeploymentId::new(required_gateway_value(
-                &args.worker_deployment,
-                "--worker-deployment",
-            )?)?,
-            expected_model_generation: model_generation,
-            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
-            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
-            max_output_tokens: 4096,
-            // Leave room for the private event envelope within the worker's
-            // default one-MiB encoded-event bound.
-            max_output_bytes: 512 * 1024,
-            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
-        },
-    )
-    .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn start_batch_runtime_worker(state: &AppState) -> BatchWorkerSupervisor {
@@ -3209,23 +3156,34 @@ mod tests {
             "--worker-model-generation",
             "7",
         ]);
-        let serve_config =
-            resolve_serve_runtime_config_with_env(&args, &ServeRuntimeConfigOverrides::default())
-                .expect("serve configuration should resolve");
-
-        let remote = gateway_remote_execution(&args, &serve_config)
-            .expect("gateway transport configuration should build");
+        resolve_serve_runtime_config_with_env(&args, &ServeRuntimeConfigOverrides::default())
+            .expect("serve configuration should resolve");
         assert_eq!(args.role, ServerRole::Gateway);
+        // `--worker-endpoint` is the one-worker form of the legacy endpoint
+        // list: one registry approval, discovered from the worker.
+        let public_model =
+            ModelAlias::new(ModelVariant::Qwen354BGguf.dir_name()).expect("static model alias");
+        let (cli_approvals, approvals, shared_view) = {
+            let _guard = env_lock();
+            configured_gateway_worker_approvals(&args, &public_model)
+                .expect("legacy worker endpoint should become an approval")
+        };
+        assert!(shared_view.is_none());
+        assert_eq!(cli_approvals, approvals);
         assert_eq!(
-            remote.config().public_model_variant,
-            ModelVariant::Qwen354BGguf
+            approvals,
+            vec![gateway_deployments::GatewayWorkerApproval {
+                endpoint: "http://127.0.0.1:19091".into(),
+                identity:
+                    gateway_deployments::GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint,
+                task: TaskKind::Chat,
+                public_model,
+                deployment_id: DeploymentId::new("qwen3-chat-v1").expect("static deployment"),
+                model_generation: ModelGeneration::new(7).expect("non-zero generation"),
+            }]
         );
-        assert_eq!(remote.config().expected_model_generation.get(), 7);
-        assert_eq!(remote.config().max_queue_wait, Duration::from_millis(250));
-        assert_eq!(
-            remote.config().slow_consumer_timeout,
-            Duration::from_secs(5)
-        );
+        assert_eq!(args.gateway_worker_queue_wait_ms, 250);
+        assert_eq!(args.gateway_slow_consumer_timeout_ms, 5000);
 
         let client_config = gateway_worker_client_config(
             &args,
@@ -3297,7 +3255,10 @@ mod tests {
     }
 
     #[test]
-    fn gateway_configuration_rejects_missing_private_credentials() {
+    fn legacy_worker_endpoint_requires_its_deployment_and_generation() {
+        let public_model =
+            ModelAlias::new(ModelVariant::Qwen354BGguf.dir_name()).expect("static model alias");
+        let _guard = env_lock();
         let args = parse(&[
             "izwi-server",
             "--role",
@@ -3305,9 +3266,69 @@ mod tests {
             "--worker-endpoint",
             "http://127.0.0.1:19091",
         ]);
-        let error = gateway_remote_execution(&args, &ServeRuntimeConfig::default())
+        let error = configured_gateway_worker_approvals(&args, &public_model)
+            .expect_err("gateway configuration must be complete");
+        assert!(error.to_string().contains("--worker-deployment"));
+
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-endpoint",
+            "http://127.0.0.1:19091",
+            "--worker-deployment",
+            "qwen3-chat-v1",
+        ]);
+        let error = configured_gateway_worker_approvals(&args, &public_model)
             .expect_err("gateway configuration must be complete");
         assert!(error.to_string().contains("--worker-model-generation"));
+    }
+
+    #[tokio::test]
+    async fn worker_endpoint_and_incarnation_are_validated_before_any_worker_io() {
+        let perimeter = || {
+            GatewayPerimeterConfig::new_for_test("registry-test-api-key", 1024 * 1024)
+                .expect("test perimeter should be valid")
+        };
+        for (flags, expected) in [
+            (
+                &[
+                    "--worker-endpoint",
+                    "http://127.0.0.1:19091",
+                    "--gateway-worker-endpoint",
+                    "http://127.0.0.1:19092",
+                ][..],
+                "cannot be combined",
+            ),
+            (
+                &["--worker-incarnation", "worker-incarnation-1"][..],
+                "applies only to the legacy --worker-endpoint form",
+            ),
+            (&[][..], "gateway mode requires a worker"),
+        ] {
+            let mut argv = vec![
+                "izwi-server",
+                "--role",
+                "gateway",
+                "--public-model",
+                ModelVariant::Qwen354BGguf.dir_name(),
+            ];
+            argv.extend_from_slice(flags);
+            let args = parse(&argv);
+            let error = {
+                let _guard = env_lock();
+                gateway_state(
+                    &args,
+                    &ServeRuntimeConfig::default(),
+                    EnterpriseHooks::noop(),
+                    perimeter(),
+                )
+                .await
+                .err()
+                .expect("invalid worker configuration must fail")
+            };
+            assert!(error.to_string().contains(expected), "{flags:?}: {error}");
+        }
     }
 
     #[test]
@@ -3381,13 +3402,8 @@ mod tests {
         )
         .await
         .expect("registry gateway configuration should build");
-        assert!(matches!(
-            &state.chat_execution,
-            gateway::GatewayChatExecution::Registry(_)
-        ));
-        let poller = poller.expect("registry mode should retain status pollers");
         assert_eq!(poller.poller_count, 1);
-        assert!(state.chat_execution.readiness_check().await.is_ok());
+        assert!(state.chat_dispatcher.readiness_check().is_ok());
     }
 
     #[tokio::test]
@@ -3438,12 +3454,9 @@ mod tests {
         )
         .await
         .expect("one unavailable approved worker must not fail gateway boot");
-        let poller = poller.expect("registry mode should retain status pollers");
         assert_eq!(poller.poller_count, 1);
-        assert!(state.chat_execution.readiness_check().await.is_ok());
-        let gateway::GatewayChatExecution::Registry(dispatcher) = &state.chat_execution else {
-            panic!("registry mode should route through the registry");
-        };
+        assert!(state.chat_dispatcher.readiness_check().is_ok());
+        let dispatcher = &state.chat_dispatcher;
         let deployment_id = first.config().deployment_id.clone();
         assert_eq!(
             dispatcher

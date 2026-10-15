@@ -307,7 +307,7 @@ stays 503 until at least one fresh compatible worker is adopted.
 
 ### 2. Start the gateway
 
-Prefer typed approvals over the legacy pinned-worker form. For one CPU worker,
+Prefer typed approvals over the legacy `--worker-endpoint` form. For one CPU worker,
 the process shape is:
 
 ```sh
@@ -342,7 +342,7 @@ identities rather than trusting the first descriptor returned by an endpoint:
 v1|HTTPS_URL|NODE_ID|WORKER_ID|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION
 ```
 
-Fleet mode rejects the pinned `--worker-endpoint` form, legacy repeated
+Fleet mode rejects the legacy `--worker-endpoint` form, legacy repeated
 `--gateway-worker-endpoint` values, five-field approvals, plaintext endpoints,
 and missing client identity before descriptor/status network I/O. Bearer
 service authentication remains required in addition to mTLS. This policy does
@@ -362,10 +362,14 @@ CLI pins task/model/deployment/generation, while the gateway freezes the rest of
 the authenticated initial status contract. The node TOML is therefore the
 operator's artifact-revision source of truth for this single-node profile.
 
-Legacy `--worker-endpoint` pins one exact incarnation and should be retained
-only for standalone compatibility. Legacy repeated `--gateway-worker-endpoint`
-entries use one chat deployment/generation supplied separately. Do not mix
-legacy endpoints with typed approvals.
+Legacy `--worker-endpoint` is the one-worker form of
+`--gateway-worker-endpoint`: the gateway routes to it through the same
+registry, so it polls its status, fences every attempt to the incarnation it
+observed, and adopts a restarted worker. `--worker-incarnation` is still
+accepted with it and ignored. Keep it only for standalone compatibility.
+Legacy `--gateway-worker-endpoint` entries (and `--worker-endpoint`) use one
+chat deployment/generation supplied separately. Do not mix legacy endpoints
+with typed approvals.
 
 The registry supports at most 256 configured workers; deployment tables support
 at most 64 pools and 256 replicas per pool. Poll interval must be nonzero and
@@ -591,8 +595,8 @@ subprotocol `izwi-realtime-v1`) and relays sessions to approved realtime
 workers, resolving each admit's task to its stage pool: the approved
 speech_to_text deployment serves ASR-stream sessions, and an approved
 text_to_speech deployment (same public model) serves TTS-stream sessions.
-The gateway is off unless the operator sets the flag; pinned single-worker
-gateway mode rejects it. Boot fails closed only when no realtime stage can be
+The gateway is off unless the operator sets the flag. Boot fails closed only
+when no realtime stage can be
 served at all; a missing individual stage refuses its admits with a policy
 close at session time. Knobs:
 

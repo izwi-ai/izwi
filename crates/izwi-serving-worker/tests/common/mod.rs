@@ -1231,3 +1231,43 @@ pub fn write_tiny_qwen35_moe_fixture(models_dir: &Path) -> PathBuf {
     .unwrap();
     model_dir
 }
+
+/// The gateway's view of one worker: a registry holding only the worker
+/// `client` reaches, approved as it describes itself, behind a dispatcher for
+/// `config`. The status TTL covers a whole test, so nothing needs to poll.
+#[allow(dead_code)]
+pub async fn single_worker_dispatcher(
+    client: izwi_serving_client::WorkerClient,
+    config: izwi_server::RemoteChatDispatchConfig,
+) -> izwi_server::RemoteChatDispatcher {
+    use izwi_server::worker_registry::{
+        ApprovedDeployment, ApprovedWorker, WorkerRegistry, WorkerRegistryConfig,
+    };
+
+    let descriptor = client.descriptor().await.expect("worker descriptor");
+    let status = client.status().await.expect("worker status");
+    let deployment = status
+        .deployments
+        .iter()
+        .find(|deployment| deployment.deployment_id == config.deployment_id)
+        .expect("worker serves the configured deployment");
+    let registry = WorkerRegistry::new(WorkerRegistryConfig {
+        status_ttl: std::time::Duration::from_secs(60 * 60),
+        ..WorkerRegistryConfig::default()
+    })
+    .expect("registry config");
+    registry
+        .approve(ApprovedWorker {
+            approved_deployments: std::collections::BTreeMap::from([(
+                deployment.deployment_id.clone(),
+                ApprovedDeployment::from_loaded(deployment),
+            )]),
+            validated_capacity: status.capacity.max_active_invocations
+                + status.capacity.max_queued_invocations,
+            descriptor,
+            client,
+        })
+        .expect("worker approval");
+    registry.observe_status(status).expect("worker status");
+    izwi_server::RemoteChatDispatcher::new(registry, config).expect("dispatcher config")
+}

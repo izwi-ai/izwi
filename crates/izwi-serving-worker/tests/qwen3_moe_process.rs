@@ -9,12 +9,12 @@
 mod common;
 
 use axum::{body::Body, http::Request};
-use common::{id, write_tiny_qwen3_moe_fixture};
+use common::{id, single_worker_dispatcher, write_tiny_qwen3_moe_fixture};
 use izwi_core::ModelVariant;
 use izwi_hooks::EnterpriseHooks;
+use izwi_server::worker_registry::BackendPolicy;
 use izwi_server::{
-    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatExecution,
-    RemoteChatExecutionConfig,
+    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatDispatchConfig,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
@@ -158,23 +158,23 @@ async fn separate_cpu_worker_executes_tiny_qwen3_moe_over_real_http() {
     assert!((0.0..=100.0).contains(&usage_pct));
     assert_eq!(deployment.observation_cost_units, Some(1));
 
-    let remote = RemoteChatExecution::new(
+    let dispatcher = single_worker_dispatcher(
         client,
-        RemoteChatExecutionConfig {
+        RemoteChatDispatchConfig {
             public_model_variant: ModelVariant::Qwen3Moe30bA3bGguf,
-            expected_worker_incarnation: descriptor.incarnation_id,
             deployment_id: id("qwen3-moe-cpu-v1"),
-            expected_model_generation: ModelGeneration::new(1).unwrap(),
             policy_revision: id("moe-cpu-policy-v1"),
+            backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(2),
             max_output_tokens: 4,
             max_output_bytes: 1024,
             slow_consumer_timeout: Duration::from_secs(5),
+            session_pin: None,
         },
     )
-    .unwrap();
+    .await;
     let gateway = GatewayState::new(
-        remote,
+        dispatcher,
         EnterpriseHooks::noop(),
         GatewayPerimeterConfig::new_for_test("moe-cpu-test-api-key", 1024 * 1024).unwrap(),
         10,

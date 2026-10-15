@@ -2,7 +2,7 @@
 //!
 //! This module deliberately has no `RuntimeService`, persistence, model, or
 //! accelerator initialization path. Its only execution dependency is the
-//! bounded private worker client wrapped by `RemoteChatExecution`.
+//! worker registry behind `RemoteChatDispatcher`.
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use izwi_core::ServeRuntimeConfig;
+use izwi_core::{ChatGeneration, ServeRuntimeConfig};
 use izwi_hooks::{
     EnterpriseAction, EnterpriseHooks, HookMetadata, QuotaRequest, ResourceDescriptor,
 };
@@ -20,15 +20,16 @@ use serde::Serialize;
 use std::fmt::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
+use crate::api::request_context::RequestContext;
 use crate::api::request_context::{attach_gateway_request_context, attach_gateway_request_id};
-use crate::app::chat::{ChatExecutionRequest, RemoteChatExecution};
+use crate::app::chat::{ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver};
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
 use crate::error::ApiError;
 use crate::gateway_rate_quota::{GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig};
@@ -45,7 +46,7 @@ const MAX_GATEWAY_QUOTA_HOOK_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct GatewayState {
-    pub(crate) chat_execution: GatewayChatExecution,
+    pub(crate) chat_dispatcher: RemoteChatDispatcher,
     pub(crate) enterprise_hooks: EnterpriseHooks,
     pub(crate) lifecycle: ServerLifecycle,
     pub(crate) perimeter: GatewayPerimeterConfig,
@@ -64,34 +65,6 @@ pub struct GatewayState {
 
 impl GatewayState {
     pub fn new(
-        remote_chat_execution: RemoteChatExecution,
-        enterprise_hooks: EnterpriseHooks,
-        perimeter: GatewayPerimeterConfig,
-        request_timeout_secs: u64,
-        max_in_flight: usize,
-    ) -> Self {
-        debug_assert!(max_in_flight > 0);
-        let max_output_tokens = remote_chat_execution.max_output_tokens();
-        let tenant_concurrency_config =
-            GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
-                .expect("validated gateway admission limit supports tenant ownership");
-        Self {
-            chat_execution: GatewayChatExecution::Pinned(remote_chat_execution),
-            enterprise_hooks,
-            lifecycle: ServerLifecycle::new(),
-            perimeter,
-            principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
-            request_timeout_secs: request_timeout_secs.max(1),
-            request_admission: Arc::new(Semaphore::new(max_in_flight)),
-            rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
-            tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
-            max_output_tokens,
-            metrics: GatewayMetrics::default(),
-            realtime_relay: None,
-        }
-    }
-
-    pub fn with_dispatcher(
         dispatcher: RemoteChatDispatcher,
         enterprise_hooks: EnterpriseHooks,
         perimeter: GatewayPerimeterConfig,
@@ -104,7 +77,7 @@ impl GatewayState {
             GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
                 .expect("validated gateway admission limit supports tenant ownership");
         Self {
-            chat_execution: GatewayChatExecution::Registry(dispatcher),
+            chat_dispatcher: dispatcher,
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             perimeter,
@@ -255,18 +228,6 @@ impl GatewayState {
         }
     }
 
-    pub(crate) fn record_dispatch_success(&self, elapsed: Duration) {
-        self.metrics.record_dispatch(elapsed, false);
-    }
-
-    pub(crate) fn record_dispatch_failure(&self, elapsed: Duration) {
-        self.metrics.record_dispatch(elapsed, true);
-    }
-
-    pub(crate) fn begin_stream_observation(&self) -> GatewayStreamMetricsGuard {
-        self.metrics.begin_stream()
-    }
-
     pub fn mark_ready(&self) {
         self.lifecycle.mark_ready();
     }
@@ -280,28 +241,86 @@ impl GatewayState {
     }
 }
 
-/// Execution target for the migrated public chat route. `Pinned` preserves the
-/// original one-worker deployment shape while `Registry` selects among fresh,
-/// compatible worker incarnations without changing the public API.
-#[derive(Clone)]
-pub(crate) enum GatewayChatExecution {
-    Pinned(RemoteChatExecution),
-    Registry(RemoteChatDispatcher),
-}
-
-impl GatewayChatExecution {
-    pub(crate) async fn readiness_check(&self) -> Result<(), String> {
-        match self {
-            Self::Pinned(remote) => remote.readiness_check().await,
-            Self::Registry(dispatcher) => dispatcher.readiness_check(),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct GatewayAdmissionGuard {
     _permit: Arc<OwnedSemaphorePermit>,
     _active_request: Arc<GatewayActiveRequestGuard>,
+}
+
+/// Chat through the worker registry for one admitted public request. The
+/// backend owns the request's global admission and tenant lease and counts
+/// its dispatch in the gateway metrics.
+pub(crate) struct GatewayChat<'a> {
+    pub(crate) state: &'a GatewayState,
+    pub(crate) context: &'a RequestContext,
+    pub(crate) admission: GatewayAdmissionGuard,
+    pub(crate) tenant_work: UnboundTenantWorkLease,
+}
+
+/// Holds a streaming response's admission and stream metrics until its body
+/// ends.
+pub(crate) struct GatewayChatStream {
+    _admission: GatewayAdmissionGuard,
+    metrics: GatewayStreamMetricsGuard,
+}
+
+impl ChatStreamObserver for GatewayChatStream {
+    fn record_completion(&mut self) {
+        self.metrics.record_completion();
+    }
+
+    fn record_failure(&mut self) {
+        self.metrics.record_failure();
+    }
+}
+
+impl ChatBackend for GatewayChat<'_> {
+    type StreamGuard = GatewayChatStream;
+
+    async fn generate(self, request: ChatExecutionRequest) -> Result<ChatGeneration, ApiError> {
+        let started = Instant::now();
+        let generation = self
+            .state
+            .chat_dispatcher
+            .generate(
+                self.state.request_timeout_secs,
+                self.context,
+                request,
+                self.tenant_work,
+            )
+            .await;
+        self.state
+            .metrics
+            .record_dispatch(started.elapsed(), generation.is_err());
+        generation
+    }
+
+    async fn stream(
+        self,
+        request: ChatExecutionRequest,
+    ) -> Result<(mpsc::Receiver<ChatStreamEvent>, GatewayChatStream), ApiError> {
+        let started = Instant::now();
+        let events = self
+            .state
+            .chat_dispatcher
+            .stream(
+                self.state.request_timeout_secs,
+                self.context,
+                request,
+                self.tenant_work,
+            )
+            .await;
+        self.state
+            .metrics
+            .record_dispatch(started.elapsed(), events.is_err());
+        Ok((
+            events?,
+            GatewayChatStream {
+                _admission: self.admission,
+                metrics: self.state.metrics.begin_stream(),
+            },
+        ))
+    }
 }
 
 const MAX_PROMETHEUS_RESPONSE_BYTES: usize = 4096;
@@ -351,17 +370,17 @@ impl Drop for GatewayActiveRequestGuard {
     }
 }
 
-pub(crate) struct GatewayStreamMetricsGuard {
+struct GatewayStreamMetricsGuard {
     metrics: GatewayMetrics,
     terminal_observed: bool,
 }
 
 impl GatewayStreamMetricsGuard {
-    pub(crate) fn record_completion(&mut self) {
+    fn record_completion(&mut self) {
         self.terminal_observed = true;
     }
 
-    pub(crate) fn record_failure(&mut self) {
+    fn record_failure(&mut self) {
         if !self.terminal_observed {
             self.metrics
                 .inner
@@ -604,7 +623,7 @@ async fn live_check(State(state): State<GatewayState>) -> Json<GatewayLiveRespon
 
 async fn ready_check(State(state): State<GatewayState>) -> Response {
     let lifecycle = state.lifecycle.snapshot();
-    let worker_result = state.chat_execution.readiness_check().await;
+    let worker_result = state.chat_dispatcher.readiness_check();
     let checks = vec![
         GatewayProbeCheck {
             name: "lifecycle_ready",
@@ -931,15 +950,17 @@ mod tests {
         mock::{MockFault, MockWorker, MockWorkerConfig},
         WorkerClient, WorkerClientConfig,
     };
-    use izwi_serving_protocol::{ModelAlias, ModelGeneration, PolicyRevision, WorkerStatus};
+    use izwi_serving_protocol::{
+        DeploymentId, ModelAlias, ModelGeneration, PolicyRevision, WorkerStatus,
+    };
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use tower::Service;
 
-    use crate::api::request_context::RequestContext;
     use crate::app::remote_chat_dispatch::RemoteChatDispatchConfig;
     use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
+    use crate::test_support::{single_worker_dispatcher, single_worker_dispatcher_with_client};
     use crate::worker_registry::{
         ApprovedDeployment, ApprovedWorker, BackendPolicy, WorkerRegistry, WorkerRegistryConfig,
         WorkerRegistryError,
@@ -1098,62 +1119,8 @@ mod tests {
         let worker = MockWorker::spawn(worker_config)
             .await
             .expect("mock worker should bind");
-        let client = WorkerClient::new(
-            &worker.endpoint(),
-            credentials,
-            WorkerClientConfig::default(),
-        )
-        .expect("worker client should initialize");
-        let descriptor = client
-            .descriptor()
-            .await
-            .expect("descriptor should be available");
-        let status = client.status().await.expect("status should be available");
-        let deployment = status
-            .deployments
-            .first()
-            .expect("mock deployment should exist")
-            .clone();
-        let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
-            .expect("registry should initialize");
-        registry
-            .approve(ApprovedWorker {
-                descriptor,
-                client,
-                approved_deployments: BTreeMap::from([(
-                    deployment.deployment_id.clone(),
-                    ApprovedDeployment::from_loaded(&deployment),
-                )]),
-                validated_capacity: status.capacity.max_active_invocations
-                    + status.capacity.max_queued_invocations,
-            })
-            .expect("worker should be approved");
-        registry
-            .observe_status(status)
-            .expect("initial status should be valid");
-        let dispatcher = RemoteChatDispatcher::new(
-            registry,
-            RemoteChatDispatchConfig {
-                public_model_variant: model,
-                deployment_id: deployment.deployment_id,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                backend_policy: BackendPolicy::ANY,
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-                session_pin: None,
-            },
-        )
-        .expect("dispatcher should initialize");
-        let state = GatewayState::with_dispatcher(
-            dispatcher,
-            EnterpriseHooks::noop(),
-            test_perimeter(),
-            2,
-            4,
-        );
+        let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
         (state, worker)
     }
@@ -1223,6 +1190,146 @@ mod tests {
         assert_eq!(metrics.active_streams, 0);
     }
 
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response should be bounded");
+        serde_json::from_slice(&body).expect("response should be JSON")
+    }
+
+    fn chat_request(body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("chat request should build")
+    }
+
+    async fn wait_for_active(worker: &MockWorker, expected: usize) {
+        for _ in 0..100 {
+            if worker.active_invocations() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(worker.active_invocations(), expected);
+    }
+
+    #[tokio::test]
+    async fn public_chat_rejects_an_incompatible_model_without_worker_dispatch() {
+        let (state, worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let response = send(
+            app,
+            chat_request(json!({
+                "model": ModelVariant::Qwen359BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 32
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(json_body(response).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("incompatible with remote deployment")));
+        assert_eq!(worker.served_invocations(), 0);
+    }
+
+    /// EDGE-F19: out-of-range sampling values are OpenAI-shaped 400s that
+    /// name the parameter, and never reach a worker.
+    #[tokio::test]
+    async fn out_of_range_sampling_values_are_rejected_at_the_edge() {
+        let (state, worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        for (field, value) in [
+            ("temperature", json!(2.5)),
+            ("temperature", json!(-0.1)),
+            ("top_p", json!(0.0)),
+            ("top_p", json!(1.5)),
+            ("top_k", json!(-2)),
+            ("presence_penalty", json!(2.5)),
+            ("frequency_penalty", json!(-3.0)),
+            ("repetition_penalty", json!(0.5)),
+            ("max_tokens", json!(0)),
+            ("max_completion_tokens", json!(0)),
+            ("n", json!(2)),
+        ] {
+            let mut body = json!({
+                "model": ModelVariant::Qwen354BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            body[field] = value.clone();
+            let response = send(app.clone(), chat_request(body)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={value}"
+            );
+            let body = json_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{field}");
+            assert_eq!(body["error"]["param"], field, "{field}={value}");
+            assert_eq!(body["error"]["code"], "invalid_value", "{field}");
+        }
+        assert_eq!(worker.served_invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
+        let model = ModelVariant::Qwen354BGguf;
+        let worker_config = MockWorkerConfig {
+            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+            output_cadence: Duration::from_millis(1),
+            cancellation_delay: Duration::from_millis(150),
+            fault: MockFault::Hang,
+            ..MockWorkerConfig::default()
+        };
+        let credentials = worker_config.credentials.clone();
+        let worker = MockWorker::spawn(worker_config)
+            .await
+            .expect("mock worker should bind");
+        let client = WorkerClient::new(
+            &worker.endpoint(),
+            credentials,
+            WorkerClientConfig {
+                first_output_timeout: Duration::from_millis(30),
+                progress_timeout: Duration::from_millis(30),
+                ..WorkerClientConfig::default()
+            },
+        )
+        .expect("worker client should initialize");
+        let dispatcher = single_worker_dispatcher_with_client(model, client).await;
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let response = send(app, valid_chat_request(32)).await;
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(worker.active_invocations(), 1);
+        wait_for_active(&worker, 0).await;
+    }
+
+    #[tokio::test]
+    async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
+        let model = ModelVariant::Qwen354BGguf;
+        let (state, _worker) = registry_gateway_state_with_config(
+            model,
+            MockWorkerConfig {
+                public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+                fault: MockFault::AcceptedThenDisconnect,
+                ..MockWorkerConfig::default()
+            },
+        )
+        .await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let response = send(app, valid_chat_request(32)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(json_body(response).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("without a terminal event")));
+    }
+
     #[tokio::test]
     async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
         let model = ModelVariant::Qwen354BGguf;
@@ -1233,35 +1340,11 @@ mod tests {
             ..MockWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
-        let generation = worker_config.model_generation;
         let worker = MockWorker::spawn(worker_config)
             .await
             .expect("mock worker should bind");
-        let client = WorkerClient::new(
-            &worker.endpoint(),
-            credentials,
-            WorkerClientConfig::default(),
-        )
-        .expect("worker client should initialize");
-        let remote = RemoteChatExecution::new(
-            client,
-            crate::app::chat::RemoteChatExecutionConfig {
-                public_model_variant: model,
-                expected_worker_incarnation: incarnation,
-                deployment_id: deployment,
-                expected_model_generation: generation,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-            },
-        )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
+        let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
             .with_tenant_concurrency_config(
                 GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
             );
@@ -1335,43 +1418,23 @@ mod tests {
             ..MockWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
-        let generation = worker_config.model_generation;
         let worker = MockWorker::spawn(worker_config.clone())
             .await
             .expect("mock worker should bind");
         let endpoint = worker.endpoint();
-        let bootstrapping = |endpoint: &str| {
-            let client = WorkerClient::new(
-                endpoint,
-                credentials.clone(),
-                WorkerClientConfig::default(),
-            )
-            .expect("worker client should initialize");
-            let remote = RemoteChatExecution::new(
-                client,
-                crate::app::chat::RemoteChatExecutionConfig {
-                    public_model_variant: model,
-                    expected_worker_incarnation: incarnation.clone(),
-                    deployment_id: deployment.clone(),
-                    expected_model_generation: generation,
-                    policy_revision: PolicyRevision::new("test-policy-v1")
-                        .expect("static policy revision"),
-                    max_queue_wait: Duration::ZERO,
-                    max_output_tokens: 128,
-                    max_output_bytes: 4096,
-                    slow_consumer_timeout: Duration::from_millis(100),
-                },
-            )
-            .expect("remote execution should initialize");
-            let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
-                .with_tenant_concurrency_config(
-                    GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
-                );
-            state.lifecycle.mark_ready();
-            let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
-            (app, state)
+        let bootstrapping = |endpoint: String| {
+            let credentials = credentials.clone();
+            async move {
+                let dispatcher = single_worker_dispatcher(model, &endpoint, credentials).await;
+                let state =
+                    GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
+                        .with_tenant_concurrency_config(
+                            GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
+                        );
+                state.lifecycle.mark_ready();
+                let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+                (app, state)
+            }
         };
         let stream_request = || {
             Request::builder()
@@ -1390,7 +1453,7 @@ mod tests {
                 .expect("stream request should build")
         };
 
-        let (app, state) = bootstrapping(&endpoint);
+        let (app, state) = bootstrapping(endpoint.clone()).await;
         let response = send(app.clone(), stream_request()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(worker.active_invocations(), 1);
@@ -1406,9 +1469,9 @@ mod tests {
         );
 
         // A restarted gateway has no memory of the orphaned work. Its fresh
-        // tenant view admits, but the worker authoritatively rejects the
+        // tenant view admits, but the worker's held capacity refuses the
         // second concurrent invocation instead of duplicating execution.
-        let (restarted_app, _) = bootstrapping(&endpoint);
+        let (restarted_app, _) = bootstrapping(endpoint).await;
         let rejected = send(restarted_app.clone(), stream_request()).await;
         assert_ne!(
             rejected.status(),
@@ -1426,7 +1489,7 @@ mod tests {
         let worker_next = MockWorker::spawn(worker_config)
             .await
             .expect("replacement mock worker should bind");
-        let (resumed_app, _) = bootstrapping(&worker_next.endpoint());
+        let (resumed_app, _) = bootstrapping(worker_next.endpoint()).await;
         assert_eq!(
             send(resumed_app, stream_request()).await.status(),
             StatusCode::OK,
@@ -1573,13 +1636,7 @@ mod tests {
             },
         )
         .expect("dispatcher should initialize");
-        let state = GatewayState::with_dispatcher(
-            dispatcher,
-            EnterpriseHooks::noop(),
-            test_perimeter(),
-            5,
-            2,
-        );
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 5, 2);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
         let chat = || {
@@ -1723,13 +1780,7 @@ mod tests {
             },
         )
         .expect("dispatcher should initialize");
-        let state = GatewayState::with_dispatcher(
-            dispatcher,
-            EnterpriseHooks::noop(),
-            test_perimeter(),
-            5,
-            2,
-        );
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 5, 2);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
         let stream_request = |prompt: &str| {
@@ -1813,35 +1864,11 @@ mod tests {
             ..MockWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
-        let generation = worker_config.model_generation;
         let worker = MockWorker::spawn(worker_config)
             .await
             .expect("mock worker should bind");
-        let client = WorkerClient::new(
-            &worker.endpoint(),
-            credentials,
-            WorkerClientConfig::default(),
-        )
-        .expect("worker client should initialize");
-        let remote = RemoteChatExecution::new(
-            client,
-            crate::app::chat::RemoteChatExecutionConfig {
-                public_model_variant: model,
-                expected_worker_incarnation: incarnation,
-                deployment_id: deployment,
-                expected_model_generation: generation,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-            },
-        )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
+        let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(
             state,
@@ -1945,35 +1972,52 @@ mod tests {
             ..MockWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
         let worker = MockWorker::spawn(worker_config)
             .await
             .expect("mock worker should bind");
+        // The registry approved generation 2; the worker still serves 1.
         let client = WorkerClient::new(
             &worker.endpoint(),
             credentials,
             WorkerClientConfig::default(),
         )
         .expect("worker client should initialize");
-        let remote = RemoteChatExecution::new(
-            client,
-            crate::app::chat::RemoteChatExecutionConfig {
+        let descriptor = client
+            .descriptor()
+            .await
+            .expect("descriptor should be available");
+        let status = client.status().await.expect("status should be available");
+        let mut approved = ApprovedDeployment::from_loaded(&status.deployments[0]);
+        approved.model_generation = ModelGeneration::new(2).expect("non-zero stale generation");
+        let deployment_id = approved.deployment_id.clone();
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
+            .expect("registry should initialize");
+        registry
+            .approve(ApprovedWorker {
+                descriptor,
+                client,
+                approved_deployments: BTreeMap::from([(deployment_id.clone(), approved)]),
+                validated_capacity: 1,
+            })
+            .expect("worker should be approved");
+        assert!(registry.observe_status(status).is_err());
+        let dispatcher = RemoteChatDispatcher::new(
+            registry,
+            RemoteChatDispatchConfig {
                 public_model_variant: model,
-                expected_worker_incarnation: incarnation,
-                deployment_id: deployment,
-                expected_model_generation: ModelGeneration::new(2)
-                    .expect("non-zero stale generation"),
+                deployment_id,
                 policy_revision: PolicyRevision::new("test-policy-v1")
                     .expect("static policy revision"),
+                backend_policy: BackendPolicy::ANY,
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
+                session_pin: None,
             },
         )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
+        .expect("dispatcher should initialize");
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
 
@@ -1986,34 +2030,7 @@ mod tests {
     #[tokio::test]
     async fn gateway_admission_rejects_instead_of_queueing() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
-            public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
-        };
-        let client = WorkerClient::new(
-            "http://127.0.0.1:1",
-            worker_config.credentials.clone(),
-            WorkerClientConfig::default(),
-        )
-        .expect("worker client should initialize without connecting");
-        let remote = RemoteChatExecution::new(
-            client,
-            crate::app::chat::RemoteChatExecutionConfig {
-                public_model_variant: model,
-                expected_worker_incarnation: worker_config.incarnation_id,
-                deployment_id: worker_config.deployment_id,
-                expected_model_generation: worker_config.model_generation,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-            },
-        )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
-        state.lifecycle.mark_ready();
+        let state = unreachable_gateway_state(test_perimeter());
         let held_permit = state
             .request_admission
             .clone()
@@ -2116,34 +2133,11 @@ mod tests {
             ..MockWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
-        let generation = worker_config.model_generation;
         let worker = MockWorker::spawn(worker_config)
             .await
             .expect("mock worker should bind");
-        let remote = RemoteChatExecution::new(
-            WorkerClient::new(
-                &worker.endpoint(),
-                credentials,
-                WorkerClientConfig::default(),
-            )
-            .expect("worker client should initialize"),
-            crate::app::chat::RemoteChatExecutionConfig {
-                public_model_variant: model,
-                expected_worker_incarnation: incarnation,
-                deployment_id: deployment,
-                expected_model_generation: generation,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                max_queue_wait: Duration::from_millis(100),
-                max_output_tokens: 32,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-            },
-        )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
+        let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
+        let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
         state.lifecycle.mark_ready();
         let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
         let stream_request = || {
@@ -3011,33 +3005,30 @@ mod tests {
         unreachable_gateway_state_with_hooks(perimeter, EnterpriseHooks::noop())
     }
 
+    /// A gateway whose registry has no workers: a request that passes the
+    /// edge gates fails at worker selection.
     fn unreachable_gateway_state_with_hooks(
         perimeter: GatewayPerimeterConfig,
         hooks: EnterpriseHooks,
     ) -> GatewayState {
-        let worker_config = MockWorkerConfig::default();
-        let client = WorkerClient::new(
-            "http://127.0.0.1:1",
-            worker_config.credentials.clone(),
-            WorkerClientConfig::default(),
-        )
-        .expect("test client should initialize");
-        let remote = RemoteChatExecution::new(
-            client,
-            crate::app::chat::RemoteChatExecutionConfig {
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
+            .expect("registry should initialize");
+        let dispatcher = RemoteChatDispatcher::new(
+            registry,
+            RemoteChatDispatchConfig {
                 public_model_variant: ModelVariant::Qwen354BGguf,
-                expected_worker_incarnation: worker_config.incarnation_id,
-                deployment_id: worker_config.deployment_id,
-                expected_model_generation: worker_config.model_generation,
+                deployment_id: DeploymentId::new("chat-v1").expect("static deployment"),
                 policy_revision: PolicyRevision::new("test-policy-v1").unwrap(),
+                backend_policy: BackendPolicy::ANY,
                 max_queue_wait: Duration::ZERO,
                 max_output_tokens: 16,
                 max_output_bytes: 1024,
                 slow_consumer_timeout: Duration::from_millis(100),
+                session_pin: None,
             },
         )
-        .expect("remote execution should initialize");
-        let state = GatewayState::new(remote, hooks, perimeter, 2, 1);
+        .expect("dispatcher should initialize");
+        let state = GatewayState::new(dispatcher, hooks, perimeter, 2, 1);
         state.lifecycle.mark_ready();
         state
     }

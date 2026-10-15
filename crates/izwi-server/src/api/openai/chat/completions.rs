@@ -1,7 +1,7 @@
 //! OpenAI-compatible chat completions endpoints.
 
 use std::convert::Infallible;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{rejection::JsonRejection, Extension, State},
@@ -16,19 +16,14 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    chat_top_k, generate_chat, generate_remote_chat,
-    generate_remote_chat_with_execution_and_tenant, parse_chat_model, resolve_chat_request_config,
-    spawn_chat_stream, spawn_remote_chat_stream_with_execution,
-    spawn_remote_chat_stream_with_tenant, validate_chat_request_ranges, ChatExecutionRequest,
-    ChatStreamEvent,
+    chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
+    ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver, LocalChat,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::error::ApiError;
-use crate::gateway::{
-    GatewayAdmissionGuard, GatewayChatExecution, GatewayState, GatewayStreamMetricsGuard,
-};
+use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState};
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
@@ -817,37 +812,15 @@ pub async fn completions(
     validate_chat_request_compatibility(&req, compat_profile)?;
     let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
     let reasoning = reasoning_split_mode(&req, &execution_request)?;
-
-    if req.stream.unwrap_or(false) {
-        let model_id = execution_request.variant.dir_name().to_string();
-        let event_rx = if let Some(remote) = state.remote_chat_execution.as_ref() {
-            spawn_remote_chat_stream_with_execution(
-                remote,
-                state.request_timeout_secs,
-                &ctx,
-                execution_request,
-            )
-            .await?
-        } else {
-            spawn_chat_stream(state, execution_request)
-        };
-        let stream_response =
-            render_chat_stream(req, model_id, event_rx, compat_profile, reasoning, None, None);
-        return Ok(stream_response.into_response());
-    }
-
-    let generation = if state.remote_chat_execution.is_some() {
-        generate_remote_chat(&state, &ctx, execution_request).await?
-    } else {
-        generate_chat(&state, execution_request).await?
-    };
-
-    Ok(render_completion_response(
+    complete_chat(
+        LocalChat(state),
+        req,
         variant,
-        generation,
+        execution_request,
         compat_profile,
         reasoning,
-    ))
+    )
+    .await
 }
 
 pub async fn gateway_completions(
@@ -871,85 +844,47 @@ pub async fn gateway_completions(
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
     let tenant_work = state.begin_tenant_work(&ctx)?;
+    let backend = GatewayChat {
+        state: &state,
+        context: &ctx,
+        admission,
+        tenant_work,
+    };
+    complete_chat(
+        backend,
+        req,
+        variant,
+        execution_request,
+        compat_profile,
+        reasoning,
+    )
+    .await
+}
+
+/// Runs a validated chat request on `backend` and renders the OpenAI answer:
+/// an SSE stream, or one completion object.
+async fn complete_chat<B: ChatBackend>(
+    backend: B,
+    req: ChatCompletionRequest,
+    variant: ModelVariant,
+    execution_request: ChatExecutionRequest,
+    compat_profile: OpenAiCompatibilityProfile,
+    reasoning: Option<bool>,
+) -> Result<Response, ApiError> {
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
-        let dispatch_started = Instant::now();
-        let event_rx = match match &state.chat_execution {
-            GatewayChatExecution::Pinned(remote) => {
-                spawn_remote_chat_stream_with_tenant(
-                    remote,
-                    state.request_timeout_secs,
-                    &ctx,
-                    execution_request,
-                    tenant_work,
-                )
-                .await
-            }
-            GatewayChatExecution::Registry(dispatcher) => {
-                dispatcher
-                    .stream(
-                        state.request_timeout_secs,
-                        &ctx,
-                        execution_request,
-                        tenant_work,
-                    )
-                    .await
-            }
-        } {
-            Ok(event_rx) => {
-                state.record_dispatch_success(dispatch_started.elapsed());
-                event_rx
-            }
-            Err(error) => {
-                state.record_dispatch_failure(dispatch_started.elapsed());
-                return Err(error);
-            }
-        };
-        let stream_observation = state.begin_stream_observation();
+        let (event_rx, observer) = backend.stream(execution_request).await?;
         return Ok(render_chat_stream(
             req,
             model_id,
             event_rx,
             compat_profile,
             reasoning,
-            Some(admission),
-            Some(stream_observation),
+            observer,
         )
         .into_response());
     }
-    let dispatch_started = Instant::now();
-    let generation = match match &state.chat_execution {
-        GatewayChatExecution::Pinned(remote) => {
-            generate_remote_chat_with_execution_and_tenant(
-                remote,
-                state.request_timeout_secs,
-                &ctx,
-                execution_request,
-                tenant_work,
-            )
-            .await
-        }
-        GatewayChatExecution::Registry(dispatcher) => {
-            dispatcher
-                .generate(
-                    state.request_timeout_secs,
-                    &ctx,
-                    execution_request,
-                    tenant_work,
-                )
-                .await
-        }
-    } {
-        Ok(generation) => {
-            state.record_dispatch_success(dispatch_started.elapsed());
-            generation
-        }
-        Err(error) => {
-            state.record_dispatch_failure(dispatch_started.elapsed());
-            return Err(error);
-        }
-    };
-    drop(admission);
+    let generation = backend.generate(execution_request).await?;
     Ok(render_completion_response(
         variant,
         generation,
@@ -1145,8 +1080,7 @@ fn render_chat_stream(
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
     compat_profile: OpenAiCompatibilityProfile,
     reasoning: Option<bool>,
-    admission: Option<GatewayAdmissionGuard>,
-    stream_observation: Option<GatewayStreamMetricsGuard>,
+    observer: impl ChatStreamObserver,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
         .stream_options
@@ -1157,8 +1091,7 @@ fn render_chat_stream(
     let created = now_unix_secs();
 
     let stream = async_stream::stream! {
-        let _admission = admission;
-        let mut stream_observation = stream_observation;
+        let mut observer = observer;
         let mut splitter = reasoning.map(super::reasoning::ReasoningSplitter::new);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
@@ -1224,9 +1157,7 @@ fn render_chat_stream(
                     )
                 }
                 ChatStreamEvent::Completed(generation) => {
-                    if let Some(observation) = stream_observation.as_mut() {
-                        observation.record_completion();
-                    }
+                    observer.record_completion();
                     // Text the splitter still held back is final now.
                     let (tail_reasoning, tail_content) = splitter
                         .as_mut()
@@ -1285,15 +1216,11 @@ fn render_chat_stream(
                     )
                 }
                 ChatStreamEvent::Failed(error) => {
-                    if let Some(observation) = stream_observation.as_mut() {
-                        observation.record_failure();
-                    }
+                    observer.record_failure();
                     (openai_chat_stream_error_payload(error), true)
                 }
                 ChatStreamEvent::ShuttingDown => {
-                    if let Some(observation) = stream_observation.as_mut() {
-                        observation.record_failure();
-                    }
+                    observer.record_failure();
                     (
                         openai_chat_stream_error_payload("Server is shutting down"),
                         true,
@@ -1309,9 +1236,7 @@ fn render_chat_stream(
             }
         }
         if let Some(payload) = openai_chat_stream_interruption_payload(saw_terminal) {
-            if let Some(observation) = stream_observation.as_mut() {
-                observation.record_failure();
-            }
+            observer.record_failure();
             yield Ok(Event::default().data(payload));
         }
         yield Ok(Event::default().data("[DONE]"));
@@ -1323,457 +1248,8 @@ fn render_chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-        Router,
-    };
-    use izwi_core::{RuntimeService, ServeRuntimeConfig};
-    use izwi_serving_client::{
-        mock::{MockFault, MockWorker, MockWorkerConfig},
-        WorkerClient, WorkerClientConfig,
-    };
-    use izwi_serving_protocol::{
-        CredentialId, PolicyRevision, ServiceBearerToken, ServiceCredentials,
-    };
+    use axum::http::StatusCode;
     use serde_json::json;
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tower::Service;
-
-    use crate::api::create_router;
-    use crate::app::chat::{RemoteChatExecution, RemoteChatExecutionConfig};
-    use crate::test_support::env_lock;
-
-    struct TempDirGuard(PathBuf);
-
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    async fn remote_chat_app(
-        name: &str,
-        worker_config: MockWorkerConfig,
-        client_credentials: ServiceCredentials,
-        client_config: WorkerClientConfig,
-        generation_override: Option<izwi_serving_protocol::ModelGeneration>,
-    ) -> (Router, MockWorker, TempDirGuard) {
-        let incarnation = worker_config.incarnation_id.clone();
-        let deployment = worker_config.deployment_id.clone();
-        let generation = generation_override.unwrap_or(worker_config.model_generation);
-        let worker = MockWorker::spawn(worker_config)
-            .await
-            .expect("mock worker should start");
-        let client = WorkerClient::new(&worker.endpoint(), client_credentials, client_config)
-            .expect("worker client should initialize");
-        let remote = RemoteChatExecution::new(
-            client,
-            RemoteChatExecutionConfig {
-                public_model_variant: ModelVariant::Qwen354BGguf,
-                expected_worker_incarnation: incarnation,
-                deployment_id: deployment,
-                expected_model_generation: generation,
-                policy_revision: PolicyRevision::new("test-policy-v1")
-                    .expect("static policy revision"),
-                max_queue_wait: Duration::ZERO,
-                max_output_tokens: 128,
-                max_output_bytes: 4096,
-                slow_consumer_timeout: Duration::from_millis(100),
-            },
-        )
-        .expect("remote chat config should be valid");
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!("izwi-remote-chat-{name}-{nanos}"));
-        let models_dir = temp_dir.join("models");
-        std::fs::create_dir_all(&models_dir).expect("models dir should exist");
-        let serve_config = ServeRuntimeConfig {
-            backend: izwi_core::backends::BackendPreference::Cpu,
-            models_dir,
-            ui_enabled: false,
-            request_timeout_secs: 2,
-            ..ServeRuntimeConfig::default()
-        };
-
-        let _env = env_lock();
-        std::env::set_var("IZWI_DB_PATH", temp_dir.join("izwi.sqlite3"));
-        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.join("media"));
-        let runtime =
-            RuntimeService::new(serve_config.engine_config()).expect("runtime should init");
-        let state = AppState::new(runtime, &serve_config)
-            .expect("state should init")
-            .with_remote_chat_execution(remote);
-        std::env::remove_var("IZWI_DB_PATH");
-        std::env::remove_var("IZWI_MEDIA_DIR");
-
-        (
-            create_router(state, &serve_config),
-            worker,
-            TempDirGuard(temp_dir),
-        )
-    }
-
-    fn valid_client_credentials(config: &MockWorkerConfig) -> ServiceCredentials {
-        config.credentials.clone()
-    }
-
-    fn invalid_client_credentials() -> ServiceCredentials {
-        ServiceCredentials {
-            credential_id: CredentialId::new("wrong-credential").expect("static credential"),
-            bearer_token: ServiceBearerToken::new("wrong-secret").expect("static token"),
-        }
-    }
-
-    fn public_chat_request_for_model(model: ModelVariant) -> Request<Body> {
-        Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "model": model.dir_name(),
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "stream": false,
-                    "max_tokens": 32
-                })
-                .to_string(),
-            ))
-            .expect("request should build")
-    }
-
-    fn public_chat_request() -> Request<Body> {
-        public_chat_request_for_model(ModelVariant::Qwen354BGguf)
-    }
-
-    async fn send_public_chat(mut app: Router) -> Response {
-        app.as_service::<Body>()
-            .call(public_chat_request())
-            .await
-            .expect("router request should succeed")
-    }
-
-    async fn send_public_streaming_chat(mut app: Router) -> Response {
-        let mut request = public_chat_request();
-        *request.body_mut() = Body::from(
-            json!({
-                "model": ModelVariant::Qwen354BGguf.dir_name(),
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": true,
-                "max_tokens": 32
-            })
-            .to_string(),
-        );
-        app.as_service::<Body>()
-            .call(request)
-            .await
-            .expect("router request should succeed")
-    }
-
-    async fn response_json(response: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("response body should be bounded");
-        serde_json::from_slice(&bytes).expect("response should contain JSON")
-    }
-
-    async fn wait_for_active(worker: &MockWorker, expected: usize) {
-        for _ in 0..100 {
-            if worker.active_invocations() == expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!(
-            "mock worker active count was {}, expected {expected}",
-            worker.active_invocations()
-        );
-    }
-
-    #[tokio::test]
-    async fn public_chat_routes_over_real_worker_transport() {
-        let worker_config = MockWorkerConfig {
-            output_text: "remote hello".to_string(),
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let (app, _worker, _temp) = remote_chat_app(
-            "success",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = send_public_chat(app).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["choices"][0]["message"]["content"], "remote hello");
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
-        assert_eq!(body["usage"]["prompt_tokens"], 1);
-        assert_eq!(body["usage"]["completion_tokens"], 3);
-    }
-
-    #[tokio::test]
-    async fn public_streaming_chat_preserves_sse_over_worker_transport() {
-        let worker_config = MockWorkerConfig {
-            output_text: "remote streaming hello".into(),
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let (app, worker, _temp) = remote_chat_app(
-            "streaming",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = send_public_streaming_chat(app).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()),
-            Some("text/event-stream")
-        );
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("stream response should remain bounded");
-        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
-        assert!(body.contains("remote streaming hello"));
-        assert!(body.contains("\"finish_reason\":\"stop\""));
-        assert!(body.contains("data: [DONE]"));
-        assert_eq!(worker.active_invocations(), 0);
-    }
-
-    #[tokio::test]
-    async fn dropping_public_remote_stream_cancels_without_early_capacity_release() {
-        let worker_config = MockWorkerConfig {
-            fault: MockFault::Hang,
-            cancellation_delay: Duration::from_millis(100),
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let (app, worker, _temp) = remote_chat_app(
-            "stream-disconnect",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = send_public_streaming_chat(app).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(worker.active_invocations(), 1);
-        drop(response);
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            worker.active_invocations(),
-            1,
-            "cancellation acknowledgement is not teardown proof"
-        );
-        wait_for_active(&worker, 0).await;
-    }
-
-    #[tokio::test]
-    async fn public_chat_rejects_incompatible_public_model_without_worker_dispatch() {
-        let worker_config = MockWorkerConfig::default();
-        let credentials = valid_client_credentials(&worker_config);
-        let (mut app, worker, _temp) = remote_chat_app(
-            "incompatible",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = app
-            .as_service::<Body>()
-            .call(public_chat_request_for_model(ModelVariant::Qwen359BGguf))
-            .await
-            .expect("router request should succeed");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(worker.active_invocations(), 0);
-        let body = response_json(response).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("incompatible with remote deployment")));
-    }
-
-    /// EDGE-F19: out-of-range sampling values are OpenAI-shaped 400s that
-    /// name the parameter, and never reach a worker.
-    #[tokio::test]
-    async fn out_of_range_sampling_values_are_rejected_at_the_edge() {
-        let worker_config = MockWorkerConfig::default();
-        let credentials = valid_client_credentials(&worker_config);
-        let (mut app, worker, _temp) = remote_chat_app(
-            "ranges",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        for (field, value) in [
-            ("temperature", json!(2.5)),
-            ("temperature", json!(-0.1)),
-            ("top_p", json!(0.0)),
-            ("top_p", json!(1.5)),
-            ("top_k", json!(-2)),
-            ("presence_penalty", json!(2.5)),
-            ("frequency_penalty", json!(-3.0)),
-            ("repetition_penalty", json!(0.5)),
-            ("max_tokens", json!(0)),
-            ("max_completion_tokens", json!(0)),
-            ("n", json!(2)),
-        ] {
-            let mut body = json!({
-                "model": ModelVariant::Qwen354BGguf.dir_name(),
-                "messages": [{"role": "user", "content": "hello"}],
-            });
-            body[field] = value.clone();
-            let mut request = public_chat_request();
-            *request.body_mut() = Body::from(body.to_string());
-            let response = app
-                .as_service::<Body>()
-                .call(request)
-                .await
-                .expect("router request should succeed");
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "{field}={value}"
-            );
-            let body = response_json(response).await;
-            assert_eq!(body["error"]["type"], "invalid_request_error", "{field}");
-            assert_eq!(body["error"]["param"], field, "{field}={value}");
-            assert_eq!(body["error"]["code"], "invalid_value", "{field}");
-        }
-        assert_eq!(worker.served_invocations(), 0);
-    }
-
-    #[tokio::test]
-    async fn public_chat_surfaces_stale_model_generation_without_fallback() {
-        let worker_config = MockWorkerConfig::default();
-        let credentials = valid_client_credentials(&worker_config);
-        let stale_generation =
-            izwi_serving_protocol::ModelGeneration::new(2).expect("non-zero generation");
-        let (app, _worker, _temp) = remote_chat_app(
-            "generation",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            Some(stale_generation),
-        )
-        .await;
-
-        let response = send_public_chat(app).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["message"], "model generation changed");
-    }
-
-    #[tokio::test]
-    async fn public_chat_surfaces_authoritative_worker_capacity_rejection() {
-        let worker_config = MockWorkerConfig {
-            output_cadence: Duration::from_millis(150),
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let (app, worker, _temp) = remote_chat_app(
-            "capacity",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let first = tokio::spawn(send_public_chat(app.clone()));
-        wait_for_active(&worker, 1).await;
-        let rejected = send_public_chat(app).await;
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(rejected).await;
-        assert_eq!(body["error"]["message"], "worker capacity is exhausted");
-        assert_eq!(
-            first.await.expect("first request task").status(),
-            StatusCode::OK
-        );
-    }
-
-    #[tokio::test]
-    async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
-        let worker_config = MockWorkerConfig {
-            output_cadence: Duration::from_millis(1),
-            cancellation_delay: Duration::from_millis(150),
-            fault: MockFault::Hang,
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let client_config = WorkerClientConfig {
-            first_output_timeout: Duration::from_millis(30),
-            progress_timeout: Duration::from_millis(30),
-            ..WorkerClientConfig::default()
-        };
-        let (app, worker, _temp) =
-            remote_chat_app("timeout", worker_config, credentials, client_config, None).await;
-
-        let response = send_public_chat(app).await;
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-        assert_eq!(worker.active_invocations(), 1);
-        wait_for_active(&worker, 0).await;
-    }
-
-    #[tokio::test]
-    async fn public_chat_maps_worker_service_auth_failure_without_retry() {
-        let worker_config = MockWorkerConfig::default();
-        let (app, _worker, _temp) = remote_chat_app(
-            "auth",
-            worker_config,
-            invalid_client_credentials(),
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = send_public_chat(app).await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    }
-
-    #[tokio::test]
-    async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
-        let worker_config = MockWorkerConfig {
-            fault: MockFault::AcceptedThenDisconnect,
-            ..MockWorkerConfig::default()
-        };
-        let credentials = valid_client_credentials(&worker_config);
-        let (app, _worker, _temp) = remote_chat_app(
-            "interrupted",
-            worker_config,
-            credentials,
-            WorkerClientConfig::default(),
-            None,
-        )
-        .await;
-
-        let response = send_public_chat(app).await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = response_json(response).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("without a terminal event")));
-    }
 
     #[test]
     fn flattens_text_parts_content() {

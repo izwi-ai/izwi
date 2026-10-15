@@ -10,9 +10,8 @@ use izwi_serving_protocol::{
     ChatRole as WorkerChatRole, ChatTruncation as WorkerChatTruncation, DeploymentId,
     FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
     InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
-    ModelReadiness, OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode,
-    RequestDigest, RequestId, SchemaVersion, ServiceClass, TaskKind, TenantId, Usage,
-    WorkerDescriptor, WorkerFeature, WorkerProcessState,
+    OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode, RequestDigest,
+    RequestId, SchemaVersion, ServiceClass, TaskKind, TenantId, Usage, WorkerFeature,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -161,20 +160,12 @@ pub(crate) struct RemoteWorkerContract {
     pub(crate) features: BTreeSet<WorkerFeature>,
 }
 
-impl RemoteWorkerContract {
-    pub(crate) fn from_descriptor(descriptor: &WorkerDescriptor) -> Option<Self> {
-        Some(Self {
-            protocol_version: descriptor.negotiated_version()?,
-            features: descriptor.features.clone(),
-        })
-    }
-}
-
-/// Pinned Phase 1 route target for plain non-streaming chat. Discovery and
-/// multi-worker selection are deliberately deferred; the worker still makes
-/// authoritative admission and generation checks on every invocation.
+/// One selected worker incarnation as a chat invocation target. Registry
+/// dispatch builds it per attempt from the worker it selected; the worker
+/// still makes authoritative admission and generation checks on every
+/// invocation.
 #[derive(Debug, Clone)]
-pub struct RemoteChatExecutionConfig {
+pub(crate) struct RemoteChatExecutionConfig {
     pub public_model_variant: ModelVariant,
     pub expected_worker_incarnation: IncarnationId,
     pub deployment_id: DeploymentId,
@@ -201,92 +192,25 @@ impl RemoteChatExecutionConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct RemoteChatExecution {
+pub(crate) struct RemoteChatExecution {
     client: WorkerClient,
     config: RemoteChatExecutionConfig,
-    /// Set by registry dispatch from the selected worker; a pinned target
-    /// reads it from the worker's descriptor on first use.
-    contract: Arc<tokio::sync::OnceCell<RemoteWorkerContract>>,
+    /// The selected worker's protocol surface, from the registry.
+    contract: RemoteWorkerContract,
 }
 
 impl RemoteChatExecution {
-    pub fn new(client: WorkerClient, config: RemoteChatExecutionConfig) -> Result<Self, ApiError> {
+    pub(crate) fn new(
+        client: WorkerClient,
+        config: RemoteChatExecutionConfig,
+        contract: RemoteWorkerContract,
+    ) -> Result<Self, ApiError> {
         config.validate()?;
         Ok(Self {
             client,
             config,
-            contract: Arc::new(tokio::sync::OnceCell::new()),
+            contract,
         })
-    }
-
-    pub(crate) fn with_contract(mut self, contract: RemoteWorkerContract) -> Self {
-        self.contract = Arc::new(tokio::sync::OnceCell::new_with(Some(contract)));
-        self
-    }
-
-    /// The target worker's protocol surface. A pinned target fetches its
-    /// descriptor once; the incarnation is fixed, so it never changes.
-    async fn contract(&self) -> Result<&RemoteWorkerContract, ApiError> {
-        self.contract
-            .get_or_try_init(|| async {
-                let descriptor = self
-                    .client
-                    .descriptor()
-                    .await
-                    .map_err(map_worker_client_error)?;
-                if descriptor.incarnation_id != self.config.expected_worker_incarnation {
-                    return Err(ApiError::service_unavailable(
-                        "worker incarnation does not match the pinned gateway target",
-                    ));
-                }
-                RemoteWorkerContract::from_descriptor(&descriptor).ok_or_else(|| {
-                    bad_gateway_error("worker does not advertise a compatible protocol version")
-                })
-            })
-            .await
-    }
-
-    #[cfg(test)]
-    pub fn config(&self) -> &RemoteChatExecutionConfig {
-        &self.config
-    }
-
-    pub(crate) const fn max_output_tokens(&self) -> u32 {
-        self.config.max_output_tokens
-    }
-
-    /// Verify that the pinned worker incarnation still advertises the exact
-    /// chat deployment and model generation configured by the gateway.
-    pub async fn readiness_check(&self) -> Result<(), String> {
-        let status = self
-            .client
-            .status()
-            .await
-            .map_err(|error| format!("worker status request failed: {error}"))?;
-        if status.incarnation_id != self.config.expected_worker_incarnation {
-            return Err("worker incarnation does not match the pinned gateway target".into());
-        }
-        if status.process_state != WorkerProcessState::Running {
-            return Err(format!(
-                "worker process is {:?}, expected running",
-                status.process_state
-            ));
-        }
-        let deployment = status
-            .deployments
-            .iter()
-            .find(|deployment| deployment.deployment_id == self.config.deployment_id)
-            .ok_or_else(|| "pinned chat deployment is not advertised by the worker".to_string())?;
-        if deployment.model_generation != self.config.expected_model_generation {
-            return Err("worker model generation does not match the pinned gateway target".into());
-        }
-        if deployment.public_model.as_str() != self.config.public_model_variant.dir_name() {
-            return Err("worker public model does not match the gateway route model".into());
-        }
-        if deployment.task != TaskKind::Chat || deployment.readiness != ModelReadiness::Ready {
-            return Err("pinned worker deployment is not ready for chat".into());
-        }
-        Ok(())
     }
 }
 
@@ -644,6 +568,54 @@ pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
     parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
+/// The execution target behind the public chat completions route: the
+/// in-process runtime ([`LocalChat`]) or the gateway's worker registry
+/// (`GatewayChat`). A backend value serves exactly one request, so it can own
+/// that request's admission and tenant leases until they are released.
+pub(crate) trait ChatBackend: Send {
+    /// Held by a streaming response until its body ends.
+    type StreamGuard: ChatStreamObserver;
+
+    fn generate(
+        self,
+        request: ChatExecutionRequest,
+    ) -> impl Future<Output = Result<ChatGeneration, ApiError>> + Send;
+
+    /// Returns once the stream has started; its events then arrive on the
+    /// receiver.
+    fn stream(
+        self,
+        request: ChatExecutionRequest,
+    ) -> impl Future<Output = Result<(mpsc::Receiver<ChatStreamEvent>, Self::StreamGuard), ApiError>>
+           + Send;
+}
+
+/// Told how a streaming chat response ended.
+pub(crate) trait ChatStreamObserver: Send + 'static {
+    fn record_completion(&mut self) {}
+    fn record_failure(&mut self) {}
+}
+
+impl ChatStreamObserver for () {}
+
+/// Chat on this process's own runtime.
+pub(crate) struct LocalChat(pub(crate) AppState);
+
+impl ChatBackend for LocalChat {
+    type StreamGuard = ();
+
+    async fn generate(self, request: ChatExecutionRequest) -> Result<ChatGeneration, ApiError> {
+        generate_chat(&self.0, request).await
+    }
+
+    async fn stream(
+        self,
+        request: ChatExecutionRequest,
+    ) -> Result<(mpsc::Receiver<ChatStreamEvent>, ()), ApiError> {
+        Ok((spawn_chat_stream(self.0, request), ()))
+    }
+}
+
 pub async fn generate_chat(
     state: &AppState,
     request: ChatExecutionRequest,
@@ -671,95 +643,15 @@ pub async fn generate_chat(
         .map_err(ApiError::from)
 }
 
-/// Execute the explicitly configured Phase 1 chat slice over the private HTTP
-/// worker contract. This function never falls back to local execution and never
-/// retries a request whose acceptance may be uncertain.
-pub async fn generate_remote_chat(
-    state: &AppState,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-) -> Result<ChatGeneration, ApiError> {
-    let remote = state
-        .remote_chat_execution
-        .as_ref()
-        .ok_or_else(|| ApiError::service_unavailable("Remote chat execution is not configured"))?;
-    generate_remote_chat_with_execution(remote, state.request_timeout_secs, context, request).await
-}
-
-pub async fn generate_remote_chat_with_execution(
-    remote: &RemoteChatExecution,
-    request_timeout_secs: u64,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-) -> Result<ChatGeneration, ApiError> {
-    let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
-    let started = Instant::now();
-    let mut stream = remote
-        .client
-        .invoke(invocation)
-        .await
-        .map_err(map_worker_client_error)?;
-    collect_started_remote_chat(remote, &mut stream, started, |_| {}).await
-}
-
-pub(crate) async fn generate_remote_chat_with_execution_and_tenant(
-    remote: &RemoteChatExecution,
-    request_timeout_secs: u64,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-    tenant_work: UnboundTenantWorkLease,
-) -> Result<ChatGeneration, ApiError> {
-    let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
-    let started = Instant::now();
-    let started_invocation =
-        start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
-            .await
-            .map_err(|failure| map_worker_client_error(failure.error))?;
-    let mut stream = started_invocation.stream;
-    collect_started_remote_chat_with_tenant(
-        remote,
-        &mut stream,
-        started,
-        |_| {},
-        started_invocation.tenant_work,
-    )
-    .await
-}
-
+/// Collect an accepted invocation's whole answer. The tenant lease is
+/// released as soon as a validated terminal event proves the worker stopped;
+/// any other exit drops it, which reconciles the exact attempt.
 pub(crate) async fn collect_started_remote_chat<F>(
     remote: &RemoteChatExecution,
     stream: &mut InvocationStream,
     started: Instant,
-    on_worker_error: F,
-) -> Result<ChatGeneration, ApiError>
-where
-    F: FnMut(&WorkerClientError),
-{
-    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, None).await
-}
-
-pub(crate) async fn collect_started_remote_chat_with_tenant<F>(
-    remote: &RemoteChatExecution,
-    stream: &mut InvocationStream,
-    started: Instant,
-    on_worker_error: F,
-    tenant_work: BoundTenantWorkLease,
-) -> Result<ChatGeneration, ApiError>
-where
-    F: FnMut(&WorkerClientError),
-{
-    collect_started_remote_chat_inner(remote, stream, started, on_worker_error, Some(tenant_work))
-        .await
-}
-
-async fn collect_started_remote_chat_inner<F>(
-    remote: &RemoteChatExecution,
-    stream: &mut InvocationStream,
-    started: Instant,
     mut on_worker_error: F,
-    mut tenant_work: Option<BoundTenantWorkLease>,
+    tenant_work: BoundTenantWorkLease,
 ) -> Result<ChatGeneration, ApiError>
 where
     F: FnMut(&WorkerClientError),
@@ -792,9 +684,7 @@ where
                 finish_reason,
                 usage,
             } => {
-                if let Some(lease) = tenant_work.take() {
-                    lease.confirm_stopped();
-                }
+                tenant_work.confirm_stopped();
                 return worker_chat_generation(
                     text,
                     finish_reason,
@@ -804,15 +694,11 @@ where
                 );
             }
             InvocationEventKind::Error { code, message } => {
-                if let Some(lease) = tenant_work.take() {
-                    lease.confirm_stopped();
-                }
+                tenant_work.confirm_stopped();
                 return Err(map_worker_terminal_error(code, message));
             }
             InvocationEventKind::Cancelled { reason } => {
-                if let Some(lease) = tenant_work.take() {
-                    lease.confirm_stopped();
-                }
+                tenant_work.confirm_stopped();
                 return Err(cancelled_error(
                     reason.unwrap_or_else(|| "Worker cancelled chat invocation".to_string()),
                 ));
@@ -866,7 +752,7 @@ pub(crate) async fn start_remote_chat_invocation_with_tenant(
     }
 }
 
-pub(crate) async fn prepare_remote_chat_invocation(
+pub(crate) fn prepare_remote_chat_invocation(
     remote: &RemoteChatExecution,
     request_timeout_secs: u64,
     context: &RequestContext,
@@ -879,8 +765,6 @@ pub(crate) async fn prepare_remote_chat_invocation(
         )));
     }
     validate_remote_chat_scope(&request)?;
-    let contract = remote.contract().await?;
-
     let remaining = context
         .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
         .filter(|budget| !budget.is_zero())
@@ -888,7 +772,7 @@ pub(crate) async fn prepare_remote_chat_invocation(
     let remaining_time_ms = u64::try_from(remaining.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
-    build_remote_chat_invocation(context, request, remote, contract, remaining_time_ms)
+    build_remote_chat_invocation(context, request, remote, remaining_time_ms)
 }
 
 /// A worker cannot honour a control it does not advertise; refuse it rather
@@ -913,9 +797,9 @@ fn ensure_worker_supports(
 pub(crate) fn retarget_remote_chat_invocation(
     invocation: &InvocationRequest,
     remote: &RemoteChatExecution,
-    contract: &RemoteWorkerContract,
     remaining: Duration,
 ) -> Result<InvocationRequest, ApiError> {
+    let contract = &remote.contract;
     if remaining.is_zero() {
         return Err(request_timeout_error(
             "Chat request deadline expired before alternate dispatch",
@@ -1058,83 +942,15 @@ fn worker_chat_generation(
     })
 }
 
-/// Start an accepted private worker invocation and forward its bounded events
-/// through the existing public chat stream channel. Dropping the receiver
-/// closes the channel, drops the private stream, and schedules exact-attempt
-/// cancellation; neither layer retries the invocation.
-pub async fn spawn_remote_chat_stream_with_execution(
-    remote: &RemoteChatExecution,
-    request_timeout_secs: u64,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
-    let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
-    let worker_stream = remote
-        .client
-        .invoke(invocation)
-        .await
-        .map_err(map_worker_client_error)?;
-    Ok(spawn_started_remote_chat_stream_with_execution(
-        remote,
-        worker_stream,
-        |_| {},
-    ))
-}
-
-pub(crate) async fn spawn_remote_chat_stream_with_tenant(
-    remote: &RemoteChatExecution,
-    request_timeout_secs: u64,
-    context: &RequestContext,
-    request: ChatExecutionRequest,
-    tenant_work: UnboundTenantWorkLease,
-) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
-    let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
-    let started = start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
-        .await
-        .map_err(|failure| map_worker_client_error(failure.error))?;
-    Ok(spawn_started_remote_chat_stream_with_tenant(
-        remote,
-        started.stream,
-        |_| {},
-        started.tenant_work,
-    ))
-}
-
-pub(crate) fn spawn_started_remote_chat_stream_with_execution<F>(
-    remote: &RemoteChatExecution,
-    worker_stream: InvocationStream,
-    on_worker_error: F,
-) -> mpsc::Receiver<ChatStreamEvent>
-where
-    F: Fn(&WorkerClientError) + Send + Sync + 'static,
-{
-    spawn_started_remote_chat_stream_inner(remote, worker_stream, on_worker_error, None)
-}
-
-pub(crate) fn spawn_started_remote_chat_stream_with_tenant<F>(
-    remote: &RemoteChatExecution,
-    worker_stream: InvocationStream,
-    on_worker_error: F,
-    tenant_work: BoundTenantWorkLease,
-) -> mpsc::Receiver<ChatStreamEvent>
-where
-    F: Fn(&WorkerClientError) + Send + Sync + 'static,
-{
-    spawn_started_remote_chat_stream_inner(
-        remote,
-        worker_stream,
-        on_worker_error,
-        Some(tenant_work),
-    )
-}
-
-fn spawn_started_remote_chat_stream_inner<F>(
+/// Forward an accepted private worker invocation's bounded events through
+/// the public chat stream channel. Dropping the receiver closes the channel,
+/// drops the private stream, and schedules exact-attempt cancellation;
+/// neither layer retries the invocation.
+pub(crate) fn spawn_started_remote_chat_stream<F>(
     remote: &RemoteChatExecution,
     mut worker_stream: InvocationStream,
     on_worker_error: F,
-    mut tenant_work: Option<BoundTenantWorkLease>,
+    tenant_work: BoundTenantWorkLease,
 ) -> mpsc::Receiver<ChatStreamEvent>
 where
     F: Fn(&WorkerClientError) + Send + Sync + 'static,
@@ -1148,6 +964,7 @@ where
         let sink = ChatDeltaSink::new(event_tx.clone(), slow_consumer_timeout);
         let mut text = String::new();
         let mut latest_usage = None;
+        let mut tenant_work = Some(tenant_work);
         let terminal = loop {
             let event = tokio::select! {
                 event = worker_stream.next_event() => event,
@@ -1278,9 +1095,9 @@ fn build_remote_chat_invocation(
     context: &RequestContext,
     request: ChatExecutionRequest,
     remote: &RemoteChatExecution,
-    contract: &RemoteWorkerContract,
     remaining_time_ms: u64,
 ) -> Result<InvocationRequest, ApiError> {
+    let contract = &remote.contract;
     let requested_tokens = request.resolved_max_new_tokens();
     let max_tokens = u32::try_from(requested_tokens)
         .unwrap_or(u32::MAX)
@@ -1869,107 +1686,6 @@ mod tests {
             None
         );
         assert!(request.required_worker_features().is_empty());
-    }
-
-    /// A pinned worker's descriptor decides what the gateway sends: a minor-4
-    /// worker gets every control at minor 4; a minor-3 worker gets a 400 for
-    /// a control instead of silently dropping it, and plain requests at
-    /// minor 3 without the context policy.
-    #[tokio::test]
-    async fn a_pinned_worker_gets_only_the_controls_it_advertises() {
-        use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
-        let context = RequestContext::new(
-            "pinned-request".into(),
-            izwi_hooks::Principal::local_anonymous(),
-        );
-        let remote_for = |worker: &MockWorker| {
-            let config = worker.config();
-            RemoteChatExecution::new(
-                WorkerClient::new(
-                    &worker.endpoint(),
-                    config.credentials.clone(),
-                    izwi_serving_client::WorkerClientConfig::default(),
-                )
-                .unwrap(),
-                RemoteChatExecutionConfig {
-                    public_model_variant: ModelVariant::Gemma34BIt,
-                    expected_worker_incarnation: config.incarnation_id.clone(),
-                    deployment_id: config.deployment_id.clone(),
-                    expected_model_generation: config.model_generation,
-                    policy_revision: PolicyRevision::new("policy-1").unwrap(),
-                    max_queue_wait: Duration::from_secs(1),
-                    max_output_tokens: 64,
-                    max_output_bytes: 4096,
-                    slow_consumer_timeout: Duration::from_secs(1),
-                },
-            )
-            .unwrap()
-        };
-        let mut every_control = qwen_request(ModelVariant::Gemma34BIt, None);
-        every_control.seed = Some(7);
-        every_control.stop = vec!["END".into()];
-        every_control.logprobs = Some(true);
-        every_control.response_format_json_object = true;
-
-        let newer = MockWorker::spawn(MockWorkerConfig::default())
-            .await
-            .unwrap();
-        generate_remote_chat_with_execution(
-            &remote_for(&newer),
-            5,
-            &context,
-            every_control.clone(),
-        )
-        .await
-        .unwrap();
-        let invocation = newer.last_invocation().unwrap();
-        assert_eq!(
-            invocation.schema_version,
-            izwi_serving_protocol::PROTOCOL_V1
-        );
-        let InvocationInput::Chat { parameters, .. } = &invocation.input;
-        assert_eq!(parameters.seed, Some(7));
-        assert_eq!(parameters.logprobs, Some(0));
-        assert_eq!(
-            parameters.response_format,
-            Some(ChatResponseFormat::JsonObject)
-        );
-        assert_eq!(
-            parameters.context.and_then(|context| context.max_tokens),
-            Some(32)
-        );
-
-        let older = MockWorker::spawn(MockWorkerConfig {
-            protocol_version: izwi_serving_protocol::SchemaVersion::new(1, 3),
-            chat_features: BTreeSet::new(),
-            ..MockWorkerConfig::default()
-        })
-        .await
-        .unwrap();
-        let remote = remote_for(&older);
-        let error = generate_remote_chat_with_execution(&remote, 5, &context, every_control)
-            .await
-            .unwrap_err();
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.detail.and_then(|detail| detail.param), Some("seed"));
-        assert_eq!(older.served_invocations(), 0);
-
-        generate_remote_chat_with_execution(
-            &remote,
-            5,
-            &context,
-            qwen_request(ModelVariant::Gemma34BIt, None),
-        )
-        .await
-        .unwrap();
-        let invocation = older.last_invocation().unwrap();
-        assert_eq!(
-            invocation.schema_version,
-            izwi_serving_protocol::SchemaVersion::new(1, 3)
-        );
-        let InvocationInput::Chat { parameters, .. } = &invocation.input;
-        assert_eq!(parameters.context, None);
-        assert!(parameters.temperature.is_some());
     }
 
     fn qwen_request(variant: ModelVariant, enable_thinking: Option<bool>) -> ChatExecutionRequest {

@@ -6,12 +6,14 @@
 mod common;
 
 use axum::{body::Body, http::Request};
-use common::{id, write_tiny_lfm_fixture, write_tiny_lfm_fixture_with_context};
+use common::{
+    id, single_worker_dispatcher, write_tiny_lfm_fixture, write_tiny_lfm_fixture_with_context,
+};
 use izwi_core::ModelVariant;
 use izwi_hooks::EnterpriseHooks;
+use izwi_server::worker_registry::BackendPolicy;
 use izwi_server::{
-    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatExecution,
-    RemoteChatExecutionConfig,
+    create_gateway_router, GatewayPerimeterConfig, GatewayState, RemoteChatDispatchConfig,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
@@ -219,23 +221,23 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
     assert!(tokens_per_s.is_finite() && tokens_per_s > 0.0);
     assert_eq!(deployment.observation_cost_units, Some(1));
 
-    let remote = RemoteChatExecution::new(
+    let dispatcher = single_worker_dispatcher(
         client,
-        RemoteChatExecutionConfig {
+        RemoteChatDispatchConfig {
             public_model_variant: ModelVariant::Lfm2512BInstructGguf,
-            expected_worker_incarnation: descriptor.incarnation_id,
             deployment_id: id("lfm25-cpu-v1"),
-            expected_model_generation: ModelGeneration::new(1).unwrap(),
             policy_revision: id("real-cpu-policy-v1"),
+            backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(2),
             max_output_tokens: 1,
             max_output_bytes: 1024,
             slow_consumer_timeout: Duration::from_secs(5),
+            session_pin: None,
         },
     )
-    .unwrap();
+    .await;
     let gateway = GatewayState::new(
-        remote,
+        dispatcher,
         EnterpriseHooks::noop(),
         GatewayPerimeterConfig::new_for_test("real-cpu-test-api-key", 1024 * 1024).unwrap(),
         10,

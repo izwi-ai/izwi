@@ -1,6 +1,5 @@
 //! Application state management with high-concurrency optimizations
 
-use crate::app::chat::RemoteChatExecution;
 use crate::artifact_store::{ArtifactStore, ArtifactStoreLimits};
 use crate::batch_runtime::{store::BatchRuntimeStore, worker::BatchWorkerHealth};
 use crate::chat_store::ChatStore;
@@ -418,9 +417,6 @@ impl ServerLifecycle {
 pub struct AppState {
     /// Runtime service reference - using Arc for cheap clones
     pub runtime: Arc<RuntimeService>,
-    /// Optional Phase 1 remote boundary for plain non-streaming chat.
-    /// Local mode leaves this unset and retains the existing execution path.
-    pub remote_chat_execution: Option<RemoteChatExecution>,
     /// Enterprise integration hooks. Community builds use no-op hooks.
     pub enterprise_hooks: EnterpriseHooks,
     /// Startup-resolved persistence providers. Older unit helpers may omit this.
@@ -529,7 +525,6 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
-            remote_chat_execution: None,
             enterprise_hooks,
             persistence: None,
             lifecycle: ServerLifecycle::new(),
@@ -622,7 +617,6 @@ impl AppState {
 
         Ok(Self {
             runtime: Arc::new(runtime),
-            remote_chat_execution: None,
             enterprise_hooks,
             persistence: Some(persistence),
             lifecycle: ServerLifecycle::new(),
@@ -650,12 +644,6 @@ impl AppState {
             media_ingest,
             batch_worker_health,
         })
-    }
-
-    #[allow(dead_code)] // Wired by the gateway-role configuration in the next slice.
-    pub fn with_remote_chat_execution(mut self, execution: RemoteChatExecution) -> Self {
-        self.remote_chat_execution = Some(execution);
-        self
     }
 
     /// Acquire a permit for a specific workload class.

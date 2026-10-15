@@ -14,18 +14,19 @@ mod common;
 use axum::{body::Body, http::Request, Router};
 #[cfg(feature = "metal")]
 use common::metal_leg_device;
-use common::{id, write_tiny_lfm_fixture};
+use common::{id, single_worker_dispatcher, write_tiny_lfm_fixture};
 use izwi_core::{
     backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeService,
     ServeRuntimeConfig,
 };
 use izwi_hooks::EnterpriseHooks;
+use izwi_server::worker_registry::BackendPolicy;
 use izwi_server::{
     create_gateway_router, create_local_router, GatewayPerimeterConfig, GatewayState,
-    RemoteChatExecution, RemoteChatExecutionConfig,
+    RemoteChatDispatchConfig,
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
-use izwi_serving_protocol::{ModelGeneration, ServiceBearerToken, ServiceCredentials};
+use izwi_serving_protocol::{ServiceBearerToken, ServiceCredentials};
 use serde_json::{json, Value};
 use std::{net::TcpListener, path::Path, process::Stdio, time::Duration};
 use tower::ServiceExt;
@@ -146,33 +147,30 @@ async fn gateway_to_worker(
         },
     )
     .unwrap();
-    let descriptor = tokio::time::timeout(startup_deadline, async {
-        loop {
-            match client.descriptor().await {
-                Ok(descriptor) => break descriptor,
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
+    tokio::time::timeout(startup_deadline, async {
+        while client.descriptor().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .expect("worker loads and warms the tiny model before its startup deadline");
-    let remote = RemoteChatExecution::new(
+    let dispatcher = single_worker_dispatcher(
         client,
-        RemoteChatExecutionConfig {
+        RemoteChatDispatchConfig {
             public_model_variant: VARIANT,
-            expected_worker_incarnation: descriptor.incarnation_id,
             deployment_id: id(DEPLOYMENT),
-            expected_model_generation: ModelGeneration::new(1).unwrap(),
             policy_revision: id("parity-policy-v1"),
+            backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(5),
             max_output_tokens: CONTEXT_TOKENS,
             max_output_bytes: 64 * 1024,
             slow_consumer_timeout: Duration::from_secs(5),
+            session_pin: None,
         },
     )
-    .unwrap();
+    .await;
     let gateway = GatewayState::new(
-        remote,
+        dispatcher,
         EnterpriseHooks::noop(),
         GatewayPerimeterConfig::new_for_test(GATEWAY_API_KEY, 1024 * 1024).unwrap(),
         30,

@@ -19,11 +19,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::chat::{
-    collect_started_remote_chat_with_tenant, map_worker_client_error,
-    prepare_remote_chat_invocation, retarget_remote_chat_invocation,
-    spawn_started_remote_chat_stream_with_tenant, start_remote_chat_invocation_with_tenant,
-    ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution, RemoteChatExecutionConfig,
-    RemoteWorkerContract,
+    collect_started_remote_chat, map_worker_client_error, prepare_remote_chat_invocation,
+    retarget_remote_chat_invocation, spawn_started_remote_chat_stream,
+    start_remote_chat_invocation_with_tenant, ChatExecutionRequest, ChatStreamEvent,
+    RemoteChatExecution, RemoteChatExecutionConfig, RemoteWorkerContract,
 };
 use super::fleet_coordinator::{FleetClaimGuard, FleetCoordinator};
 use crate::api::request_context::RequestContext;
@@ -310,7 +309,7 @@ impl RemoteChatDispatcher {
         let key = selected.key.clone();
         let _dispatch = selected.dispatch;
         let registry = self.registry.clone();
-        collect_started_remote_chat_with_tenant(
+        collect_started_remote_chat(
             &remote,
             &mut stream,
             started,
@@ -344,7 +343,7 @@ impl RemoteChatDispatcher {
         let registry = self.registry.clone();
         let key = selected.key.clone();
         let slow_consumer_timeout = self.config.slow_consumer_timeout;
-        let mut worker_events = spawn_started_remote_chat_stream_with_tenant(
+        let mut worker_events = spawn_started_remote_chat_stream(
             &remote,
             stream,
             move |error| report_stream_error(&registry, &key, error),
@@ -441,7 +440,7 @@ impl RemoteChatDispatcher {
         let fleet_claim = self.claim_for(&selected).await;
         let remote = self.execution_for(&selected)?;
         let invocation =
-            prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request).await?;
+            prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
         let started = Instant::now();
 
         let retry_delay = match start_remote_chat_invocation_with_tenant(
@@ -512,12 +511,8 @@ impl RemoteChatDispatcher {
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
             .ok_or_else(alternate_deadline_error)?;
-        let alternate_invocation = retarget_remote_chat_invocation(
-            &invocation,
-            &alternate_remote,
-            &worker_contract(&alternate),
-            remaining,
-        )?;
+        let alternate_invocation =
+            retarget_remote_chat_invocation(&invocation, &alternate_remote, remaining)?;
         match start_remote_chat_invocation_with_tenant(
             &alternate_remote,
             alternate_invocation,
@@ -645,8 +640,8 @@ impl RemoteChatDispatcher {
                 max_output_bytes: self.config.max_output_bytes,
                 slow_consumer_timeout: self.config.slow_consumer_timeout,
             },
+            worker_contract(selected),
         )
-        .map(|remote| remote.with_contract(worker_contract(selected)))
     }
 }
 
