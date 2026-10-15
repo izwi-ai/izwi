@@ -2140,14 +2140,13 @@ fn update_streaming_state(
     state.fifo_preds.extend(chunk_preds.clone());
 
     if fifo_len + chunk_payload.len() > cfg.fifo_len {
+        // NeMo: max(update_period, chunk - fifo_len + fifo) in signed
+        // arithmetic. The branch guarantees chunk + fifo > fifo_len, so
+        // subtracting from the sum never saturates.
+        let overflow = (chunk_payload.len() + fifo_len) - cfg.fifo_len;
         let pop_out_len = cfg
             .spkcache_update_period
-            .max(
-                chunk_payload
-                    .len()
-                    .saturating_sub(cfg.fifo_len)
-                    .saturating_add(fifo_len),
-            )
+            .max(overflow)
             .min(fifo_len + chunk_payload.len());
         let pop_out_embs = state.fifo[..pop_out_len].to_vec();
         let pop_out_preds = state.fifo_preds[..pop_out_len].to_vec();
@@ -2272,7 +2271,10 @@ fn compress_spkcache(
         .into_iter()
         .take(cfg.spkcache_len)
         .collect::<Vec<_>>();
-    selected.sort_by_key(|a| a.flat_index);
+    // NeMo `_get_topk_indices` maps every -inf pick to `max_index` before
+    // sorting, so disabled slots follow all kept frames and silence pads.
+    // The order feeds position-dependent attention over the cache.
+    selected.sort_by_key(|a| (a.score == f32::NEG_INFINITY, a.flat_index));
 
     let mut spkcache = Vec::with_capacity(cfg.spkcache_len);
     let mut spkcache_preds = Vec::with_capacity(cfg.spkcache_len);
@@ -4956,6 +4958,116 @@ mod tests {
             second_chunk_preds,
             vec![vec![0.0, 0.9, 0.0, 0.0], vec![0.0, 0.8, 0.0, 0.0]]
         );
+    }
+
+    /// SRT-2, NeMo `streaming_update`: with chunk 6 < FIFO 188 the pop is
+    /// `max(update_period, chunk - fifo_len + fifo)` = max(144, 4) = 144,
+    /// leaving 48 FIFO frames, not the 186 a saturating subtraction pops.
+    #[test]
+    fn update_streaming_state_pops_update_period_when_chunk_shorter_than_fifo() {
+        let cfg = SortformerStreamingConfig {
+            spkcache_len: 188,
+            fifo_len: 188,
+            chunk_len: 6,
+            spkcache_update_period: 144,
+            chunk_left_context: 0,
+            chunk_right_context: 0,
+            spkcache_sil_frames_per_spk: 3,
+            ..streaming_cfg_for_test()
+        };
+        let mut state = SortformerStreamingState::new(2);
+        state.fifo = (0..186).map(|i| vec![i as f32, 0.0]).collect();
+        let chunk = (186..192).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>();
+        let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; 192];
+
+        let (state, _, _) = update_streaming_state(state, &chunk, &preds, 0, 0, true, cfg).unwrap();
+
+        assert_eq!(state.spkcache.len(), 144);
+        assert_eq!(state.fifo.len(), 48);
+        assert_eq!(state.fifo[0], vec![144.0, 0.0]);
+        assert_eq!(state.fifo[47], vec![191.0, 0.0]);
+    }
+
+    /// The pop arithmetic against NeMo's signed formula on hand-computed
+    /// cases: `min(max(period, chunk - fifo_len + fifo), fifo + chunk)`.
+    #[test]
+    fn update_streaming_state_pop_length_follows_nemo_signed_formula() {
+        // (fifo_len, update_period, current fifo, chunk, expected pop)
+        let cases = [
+            (188, 144, 186, 6, 144),
+            (188, 144, 183, 6, 144),
+            (40, 300, 0, 340, 300),
+            (40, 300, 40, 340, 340),
+            (40, 300, 40, 120, 160),
+            (0, 188, 0, 188, 188),
+            (8, 12, 8, 20, 20),
+            (8, 12, 4, 20, 16),
+        ];
+        for (fifo_len, period, current, chunk_len, expected) in cases {
+            let cfg = SortformerStreamingConfig {
+                spkcache_len: 4096,
+                fifo_len,
+                chunk_len,
+                spkcache_update_period: period,
+                ..streaming_cfg_for_test()
+            };
+            let mut state = SortformerStreamingState::new(2);
+            state.fifo = vec![vec![0.0, 0.0]; current];
+            let chunk = vec![vec![1.0, 1.0]; chunk_len];
+            let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; current + chunk_len];
+            let (state, _, _) =
+                update_streaming_state(state, &chunk, &preds, 0, 0, true, cfg).unwrap();
+            assert_eq!(
+                state.spkcache.len(),
+                expected,
+                "fifo_len {fifo_len}, period {period}, fifo {current}, chunk {chunk_len}"
+            );
+            assert_eq!(state.fifo.len(), current + chunk_len - expected);
+        }
+    }
+
+    /// SRT-1, NeMo `_get_topk_indices`: every selected -inf pick becomes
+    /// `max_index` before the sort, so the disabled slots land after all
+    /// kept frames and silence pads instead of at their flat index.
+    #[test]
+    fn compress_spkcache_places_disabled_slots_at_the_end_like_nemo() {
+        let cfg = SortformerStreamingConfig {
+            spkcache_len: 16,
+            spkcache_sil_frames_per_spk: 1,
+            ..streaming_cfg_for_test()
+        };
+        let emb_seq = (0..20).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>();
+        let mut preds = vec![vec![0.05; 4]; 20];
+        for frame in 0..3 {
+            preds[frame][0] = 0.9;
+        }
+        for frame in 5..7 {
+            preds[frame][1] = 0.9;
+        }
+        let silence = vec![-1.0, -1.0];
+
+        let (cache, cache_preds) = compress_spkcache(&emb_seq, &preds, &silence, cfg).unwrap();
+
+        // Kept: speaker 0's frames 0-2 then its silence pad, speaker 1's
+        // frames 5-6 then its pad, the pads of speakers 2 and 3, and the
+        // seven disabled -inf picks last.
+        let mut expected = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            silence.clone(),
+            vec![5.0, 0.0],
+            vec![6.0, 0.0],
+        ];
+        expected.extend(std::iter::repeat_n(silence.clone(), 10));
+        assert_eq!(cache, expected);
+        for (row, pred) in cache.iter().zip(&cache_preds) {
+            if *row == silence {
+                assert_eq!(pred, &vec![0.0; 4]);
+            } else {
+                assert_eq!(pred, &preds[row[0] as usize]);
+            }
+        }
     }
 
     #[test]

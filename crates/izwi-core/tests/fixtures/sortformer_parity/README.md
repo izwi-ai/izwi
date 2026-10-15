@@ -37,6 +37,10 @@ Profiles (80 ms frames, chunk / right context / FIFO / update period / speaker c
   340/40/40/300/264, left context 0; `test_small` 16/0/0/16/32 and `test_small_rc` 16/4/8/12/32
   exercise compression, FIFO and right context in 10 s.
 
+Nemotron-3 `yaml` on diarization-2 is asserted only up to its first speaker-cache compression
+(42.24 s): that compression meets an exact score tie across the top-k cut, and which tied frames
+`torch.topk` keeps is implementation-defined (izwi keeps the lowest indices).
+
 Segments are NeMo's default post-processing (onset = offset = 0.5, no padding or minimum
 durations) on raw channel ids, as `[start, end, channel]`.
 
