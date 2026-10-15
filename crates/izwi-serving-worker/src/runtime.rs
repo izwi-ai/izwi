@@ -268,6 +268,7 @@ fn chat_request(
     );
     let chat_config = ChatRequestConfig {
         truncation,
+        tools: parameters.tools.clone(),
         ..ChatRequestConfig::default()
     };
     (params, chat_config, max_tokens_ceiling)
@@ -808,6 +809,7 @@ mod tests {
                 max_tokens: Some(16),
                 truncation: WireChatTruncation::Disabled,
             }),
+            tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
         };
         let (params, chat_config, ceiling) = chat_request(VARIANT, &parameters, 64);
         assert_eq!(
@@ -825,6 +827,7 @@ mod tests {
         assert!(params.constrain_json_object);
         assert_eq!(params.max_tokens, 16);
         assert_eq!(chat_config.truncation, ChatTruncation::Disabled);
+        assert_eq!(chat_config.tools, parameters.tools);
         assert_eq!(ceiling, Some(64));
 
         let expected = resolve_chat_sampling(

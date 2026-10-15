@@ -120,6 +120,7 @@ pub fn minor4_chat_features() -> BTreeSet<WorkerFeature> {
         WorkerFeature::ChatLogprobs,
         WorkerFeature::ChatJsonObject,
         WorkerFeature::ChatContextPolicy,
+        WorkerFeature::ChatTools,
     ])
 }
 

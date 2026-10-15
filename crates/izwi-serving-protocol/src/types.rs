@@ -10,6 +10,8 @@ pub const MAX_CHAT_MESSAGES: usize = 256;
 pub const MAX_CHAT_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_STOP_SEQUENCES: usize = 16;
 pub const MAX_STOP_SEQUENCE_BYTES: usize = 1024;
+/// The most function tools one chat request may declare.
+pub const MAX_CHAT_TOOLS: usize = 128;
 pub const MAX_CALLER_REGIONS: usize = 32;
 pub const MAX_REMAINING_TIME_MS: u64 = 86_400_000; // 24 hours
 
@@ -268,6 +270,9 @@ pub enum WorkerFeature {
     /// Minor 4: applies `ChatParameters::context` (the caller's own output
     /// budget and truncation choice) exactly as the local server does.
     ChatContextPolicy,
+    /// Minor 4: renders `ChatParameters::tools` into the prompt with the
+    /// model family's tool-calling template.
+    ChatTools,
     /// A feature from a newer protocol minor; it satisfies no requirement.
     #[serde(other)]
     Unknown,
@@ -287,7 +292,8 @@ impl WorkerFeature {
             | Self::ChatPenalties
             | Self::ChatLogprobs
             | Self::ChatJsonObject
-            | Self::ChatContextPolicy => 4,
+            | Self::ChatContextPolicy
+            | Self::ChatTools => 4,
             Self::Unknown => u16::MAX,
         }
     }
@@ -447,6 +453,12 @@ pub struct ChatParameters {
     /// that does not fit drops its oldest turns and shortens the budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ChatContextPolicy>,
+    /// Minor 4, `WorkerFeature::ChatTools`: OpenAI function tool
+    /// definitions for the prompt (at most [`MAX_CHAT_TOOLS`] objects). The
+    /// worker streams the model's tool-call markup as text; the caller
+    /// parses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl ChatParameters {
@@ -467,7 +479,7 @@ impl ChatParameters {
             .map(|(_, name, _)| name)
     }
 
-    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 8] {
+    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 9] {
         [
             (self.seed.is_some(), "seed", WorkerFeature::ChatSeed),
             (
@@ -501,6 +513,7 @@ impl ChatParameters {
                 "truncation",
                 WorkerFeature::ChatContextPolicy,
             ),
+            (!self.tools.is_empty(), "tools", WorkerFeature::ChatTools),
         ]
     }
 }
@@ -610,6 +623,10 @@ pub enum ContractValidationError {
     InvalidContextPolicy,
     #[error("chat parameters contain too many or oversized stop sequences")]
     InvalidStopSequences,
+    #[error(
+        "chat parameters declare more than {MAX_CHAT_TOOLS} tools or a tool that is not an object"
+    )]
+    InvalidTools,
     #[error("output limits must be non-zero")]
     InvalidOutputLimits,
     #[error("remaining execution budget must be non-zero")]
@@ -682,6 +699,11 @@ impl InvocationRequest {
                         .any(|stop| stop.is_empty() || stop.len() > MAX_STOP_SEQUENCE_BYTES)
                 {
                     return Err(ContractValidationError::InvalidStopSequences);
+                }
+                if parameters.tools.len() > MAX_CHAT_TOOLS
+                    || parameters.tools.iter().any(|tool| !tool.is_object())
+                {
+                    return Err(ContractValidationError::InvalidTools);
                 }
             }
         }

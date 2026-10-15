@@ -44,6 +44,7 @@ fn minor4_chat_descriptor() -> WorkerDescriptor {
         WorkerFeature::ChatLogprobs,
         WorkerFeature::ChatJsonObject,
         WorkerFeature::ChatContextPolicy,
+        WorkerFeature::ChatTools,
     ]);
     descriptor
 }
@@ -172,6 +173,7 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             max_tokens: Some(16),
             truncation: ChatTruncation::Disabled,
         }),
+        tools: vec![json!({"type": "function", "function": {"name": "now"}})],
     };
     request.validate().unwrap();
     let encoded = serde_json::to_value(&request).unwrap();
@@ -187,7 +189,8 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             "presence_penalty": 0.5,
             "logprobs": 2,
             "response_format": "json_object",
-            "context": {"max_tokens": 16, "truncation": "disabled"}
+            "context": {"max_tokens": 16, "truncation": "disabled"},
+            "tools": [{"type": "function", "function": {"name": "now"}}]
         })
     );
     assert_eq!(
@@ -356,6 +359,19 @@ fn minor4_parameters_are_range_checked() {
     assert_eq!(
         request.validate(),
         Err(ContractValidationError::InvalidContextPolicy)
+    );
+    let InvocationInput::Chat { parameters, .. } = &mut request.input;
+    parameters.context = None;
+    parameters.tools = vec![json!("not a tool")];
+    assert_eq!(
+        request.validate(),
+        Err(ContractValidationError::InvalidTools)
+    );
+    let InvocationInput::Chat { parameters, .. } = &mut request.input;
+    parameters.tools = vec![json!({}); MAX_CHAT_TOOLS + 1];
+    assert_eq!(
+        request.validate(),
+        Err(ContractValidationError::InvalidTools)
     );
 }
 

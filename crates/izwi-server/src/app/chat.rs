@@ -123,6 +123,7 @@ impl ChatExecutionRequest {
             response_format: self
                 .response_format_json_object
                 .then_some(ChatResponseFormat::JsonObject),
+            tools: self.chat_config.tools.clone(),
             context: features
                 .contains(&WorkerFeature::ChatContextPolicy)
                 .then(|| ChatContextPolicy {
@@ -1068,11 +1069,10 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
             "Remote chat execution currently supports text-only requests",
         ));
     }
-    // The worker protocol carries the sampling and output controls (each
-    // gated by a worker feature) but not tools, reasoning controls or
+    // The worker protocol carries the sampling and output controls and the
+    // tools (each gated by a worker feature) but not reasoning controls or
     // media; those are refused, never silently dropped.
     let unsupported = [
-        ("tools", !request.chat_config.tools.is_empty()),
         (
             "enable_thinking",
             request.chat_config.enable_thinking.is_some(),
@@ -1638,8 +1638,8 @@ mod tests {
         assert_eq!(params.stop_sequences, ["END"]);
     }
 
-    /// Sampling and output controls travel to the worker (each gated by a
-    /// feature); tools and reasoning controls still cannot, and are refused.
+    /// Sampling and output controls and tools travel to the worker (each
+    /// gated by a feature); reasoning controls still cannot, and are refused.
     #[test]
     fn remote_chat_scope_refuses_only_what_the_protocol_cannot_carry() {
         let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
@@ -1647,18 +1647,22 @@ mod tests {
         request.top_k = Some(9);
         request.logprobs = Some(true);
         request.response_format_json_object = true;
-        validate_remote_chat_scope(&request).expect("sampling controls are in scope");
-        let mut thinking = qwen_request(ModelVariant::Gemma34BIt, Some(true));
+        request.chat_config.tools = vec![serde_json::json!({"type": "function"})];
+        validate_remote_chat_scope(&request).expect("sampling controls and tools are in scope");
+        assert_eq!(
+            request.worker_chat_parameters(&BTreeSet::new()).tools,
+            request.chat_config.tools
+        );
+        assert!(request
+            .required_worker_features()
+            .contains(&WorkerFeature::ChatTools));
+        let thinking = qwen_request(ModelVariant::Gemma34BIt, Some(true));
         let error = validate_remote_chat_scope(&thinking).expect_err("thinking is refused");
         assert!(
             error.message.contains("`enable_thinking`"),
             "{}",
             error.message
         );
-        thinking.chat_config.enable_thinking = None;
-        thinking.chat_config.tools = vec![serde_json::json!({"type": "function"})];
-        let error = validate_remote_chat_scope(&thinking).expect_err("tools are refused");
-        assert!(error.message.contains("`tools`"), "{}", error.message);
     }
 
     /// The D8 policy carries the caller's own budget (none when unset) and

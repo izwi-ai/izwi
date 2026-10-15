@@ -121,7 +121,7 @@ pub use runtime::{
     VOICE_STREAM_BACKPRESSURE_TOTAL, VOICE_TTS_FIRST_AUDIO_SECONDS, VOICE_TURN_FIRST_AUDIO_SECONDS,
 };
 pub use runtime::{
-    chat_supports_json_object, resolve_chat_max_tokens, resolve_chat_sampling,
+    chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
     validate_asr_language, AsrTranscription, ChatGeneration, ChatGenerationControls,
     ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationResult, DiarizationSegment,
     DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,

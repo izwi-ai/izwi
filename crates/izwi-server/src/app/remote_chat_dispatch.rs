@@ -1425,6 +1425,7 @@ mod tests {
                     max_tokens: Some(32),
                     truncation: WorkerChatTruncation::Disabled,
                 }),
+                tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
             }
         );
     }
@@ -1439,6 +1440,8 @@ mod tests {
         request.logprobs = Some(true);
         request.top_logprobs = Some(2);
         request.response_format_json_object = true;
+        request.chat_config.tools =
+            vec![serde_json::json!({"type": "function", "function": {"name": "now"}})];
         request
     }
 
@@ -1466,7 +1469,7 @@ mod tests {
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
         register_minor3(&registry, "worker-a", "inc-a", client(&older.endpoint()));
         let dispatcher = dispatcher(registry);
-        let cases: [(&str, fn(&mut ChatExecutionRequest)); 6] = [
+        let cases: [(&str, fn(&mut ChatExecutionRequest)); 7] = [
             ("seed", |request| request.seed = Some(7)),
             ("stop", |request| request.stop = vec!["END".into()]),
             ("top_k", |request| request.top_k = Some(9)),
@@ -1476,6 +1479,9 @@ mod tests {
             ("logprobs", |request| request.logprobs = Some(true)),
             ("response_format", |request| {
                 request.response_format_json_object = true
+            }),
+            ("tools", |request| {
+                request.chat_config.tools = vec![serde_json::json!({"type": "function"})]
             }),
         ];
         for (parameter, apply) in cases {

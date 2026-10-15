@@ -213,6 +213,9 @@ async fn main() -> anyhow::Result<()> {
         if izwi_core::chat_supports_json_object(process.variant) {
             features.insert(WorkerFeature::ChatJsonObject);
         }
+        if izwi_core::chat_supports_tools(process.variant) {
+            features.insert(WorkerFeature::ChatTools);
+        }
     }
     let descriptor = WorkerDescriptor {
         schema_version: PROTOCOL_V1,

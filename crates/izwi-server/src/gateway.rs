@@ -2755,7 +2755,7 @@ mod tests {
                 "role": "user",
                 "content": "test message with no local paths"
             }],
-            "tools": [{"type": "function", "function": {"name": "test"}}],
+            "enable_thinking": true,
             "max_tokens": 16
         });
         let response = send_raw(
