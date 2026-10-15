@@ -995,11 +995,12 @@ impl RuntimeService {
         let AttributedTranscript {
             asr_text,
             words,
+            word_texts,
             model_aligned_words,
             unattributed_words,
         } = attribute_transcript(timed_windows, &diarization.segments, &mut warnings);
 
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &word_texts);
         let raw_transcript = if utterances.is_empty() {
             asr_text.clone()
         } else {
@@ -1345,9 +1346,12 @@ struct TimedWindow {
 }
 
 /// A word of the stitched transcript; `model` when the aligner timed it.
+/// `text` is what the word adds to the stitched text: its source text with
+/// the spacing before it.
 #[derive(Debug, Clone, PartialEq)]
 struct StitchedWord {
     word: String,
+    text: String,
     start_ms: u32,
     end_ms: u32,
     model: bool,
@@ -1527,19 +1531,20 @@ fn stitch_timed_windows(windows: &[TimedWindow]) -> StitchedTranscript {
             let follows_in_source = word_idx
                 .checked_sub(1)
                 .is_some_and(|previous| previous_kept == Some((idx, previous)));
-            if follows_in_source {
-                text.push_str(&word.text);
+            let rendered = if follows_in_source {
+                word.text.clone()
             } else {
                 let token = word.text.trim_start();
-                text.push_str(spacing_between(&text, token));
-                text.push_str(token);
-            }
+                format!("{}{token}", spacing_between(&text, token))
+            };
+            text.push_str(&rendered);
             previous_kept = Some((idx, word_idx));
             let start_ms = word.start_ms.max(previous_end_ms);
             let end_ms = word.end_ms.max(start_ms);
             previous_end_ms = end_ms;
             words.push(StitchedWord {
                 word: word.word.clone(),
+                text: rendered,
                 start_ms,
                 end_ms,
                 model: window.source == AlignmentSource::Model,
@@ -1553,10 +1558,12 @@ fn stitch_timed_windows(windows: &[TimedWindow]) -> StitchedTranscript {
 /// start and ends at most this much later.
 const OUTLIER_WORD_SPAN_MS: u32 = 1_000;
 
-/// The transcript's words timed and attributed to speakers.
+/// The transcript's words timed and attributed to speakers, with the text
+/// that renders each word in the transcript (see [`StitchedWord`]).
 struct AttributedTranscript {
     asr_text: String,
     words: Vec<DiarizationWord>,
+    word_texts: Vec<String>,
     model_aligned_words: usize,
     unattributed_words: usize,
 }
@@ -1630,6 +1637,7 @@ fn attribute_transcript(
     AttributedTranscript {
         asr_text: stitched.text,
         words,
+        word_texts: stitched.words.into_iter().map(|word| word.text).collect(),
         model_aligned_words,
         unattributed_words,
     }
@@ -2063,17 +2071,31 @@ fn interval_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> f32 {
     (a_end.min(b_end) - a_start.max(b_start)).max(0.0)
 }
 
-fn build_utterances(words: &[DiarizationWord]) -> Vec<DiarizationUtterance> {
+/// Utterances of consecutive same-speaker words. An utterance's text is the
+/// transcript's own text for its words: `word_texts[i]` renders word `i`
+/// (its source text with the spacing before it), so punctuation, casing and
+/// unspaced scripts (CJK) are kept.
+fn build_utterances(words: &[DiarizationWord], word_texts: &[String]) -> Vec<DiarizationUtterance> {
     if words.is_empty() {
         return Vec::new();
     }
+    let render = |first: usize, last: usize| {
+        (first..=last)
+            .map(|idx| match word_texts.get(idx) {
+                Some(text) => text.clone(),
+                None => format!(" {}", words[idx].word),
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
+    };
 
     let mut utterances = Vec::new();
     let mut current = DiarizationUtterance {
         speaker: words[0].speaker.clone(),
         start_secs: words[0].start_secs,
         end_secs: words[0].end_secs,
-        text: words[0].word.clone(),
+        text: String::new(),
         word_start: 0,
         word_end: 0,
     };
@@ -2083,7 +2105,6 @@ fn build_utterances(words: &[DiarizationWord]) -> Vec<DiarizationUtterance> {
         let same_speaker = word.speaker == current.speaker;
 
         if same_speaker && gap <= MAX_UTTERANCE_GAP_SECS {
-            append_token(&mut current.text, &word.word);
             current.end_secs = current.end_secs.max(word.end_secs);
             current.word_end = idx;
             continue;
@@ -2094,36 +2115,29 @@ fn build_utterances(words: &[DiarizationWord]) -> Vec<DiarizationUtterance> {
             speaker: word.speaker.clone(),
             start_secs: word.start_secs,
             end_secs: word.end_secs,
-            text: word.word.clone(),
+            text: String::new(),
             word_start: idx,
             word_end: idx,
         };
     }
 
     utterances.push(current);
-    merge_adjacent_same_speaker_utterances(utterances)
+    let mut utterances = merge_adjacent_same_speaker_utterances(utterances);
+    for utterance in &mut utterances {
+        utterance.text = render(utterance.word_start, utterance.word_end);
+    }
+    utterances
 }
 
+/// Merge consecutive utterances of one speaker. Texts are rendered after
+/// merging, from the merged word range.
 fn merge_adjacent_same_speaker_utterances(
     utterances: Vec<DiarizationUtterance>,
 ) -> Vec<DiarizationUtterance> {
-    if utterances.len() <= 1 {
-        return utterances;
-    }
-
     let mut merged: Vec<DiarizationUtterance> = Vec::with_capacity(utterances.len());
     for utterance in utterances {
         if let Some(previous) = merged.last_mut() {
             if previous.speaker == utterance.speaker {
-                let next_text = utterance.text.trim();
-                if !next_text.is_empty() {
-                    if previous.text.is_empty() {
-                        previous.text.push_str(next_text);
-                    } else {
-                        previous.text.push(' ');
-                        previous.text.push_str(next_text);
-                    }
-                }
                 previous.end_secs = previous.end_secs.max(utterance.end_secs);
                 previous.word_end = utterance.word_end;
                 continue;
@@ -2477,23 +2491,6 @@ fn average_run_confidence(words: &[DiarizationWord], start: usize, end: usize) -
 
 fn run_has_overlap_backed_words(words: &[DiarizationWord], start: usize, end: usize) -> bool {
     words[start..=end].iter().any(|word| word.overlaps_segment)
-}
-
-fn append_token(target: &mut String, token: &str) {
-    if target.is_empty() {
-        target.push_str(token);
-        return;
-    }
-
-    let punct_only = token
-        .chars()
-        .all(|ch| !ch.is_alphanumeric() && ch != '\'' && ch != '-');
-    if punct_only {
-        target.push_str(token);
-    } else {
-        target.push(' ');
-        target.push_str(token);
-    }
 }
 
 fn format_utterance_transcript(utterances: &[DiarizationUtterance]) -> String {
@@ -3639,6 +3636,79 @@ mod tests {
         assert_eq!(unattributed, 0);
     }
 
+    /// Words of `text` in `language` over `secs` of audio, attributed to
+    /// `turns`, and their utterances.
+    fn rendered_utterances(
+        text: &str,
+        language: Option<&str>,
+        secs: usize,
+        turns: &[DiarizationSegment],
+    ) -> (Vec<DiarizationWord>, Vec<DiarizationUtterance>) {
+        let rate = PIPELINE_SAMPLE_RATE as usize;
+        let window = SampleWindow::new(0, secs * rate, text.to_string(), language);
+        let timed = interval_timed_windows(&[window], PIPELINE_SAMPLE_RATE);
+        let attributed = attribute_transcript(timed, turns, &mut Vec::new());
+        let utterances = build_utterances(&attributed.words, &attributed.word_texts);
+        (attributed.words, utterances)
+    }
+
+    /// PIPE-11: utterances keep the transcript's punctuation and casing, and
+    /// CJK joins without separators.
+    #[test]
+    fn utterances_render_the_transcript_text() {
+        let turns = [turn("SPEAKER_00", 0.0, 4.0)];
+        let (words, utterances) = rendered_utterances("你好，世界。", Some("Chinese"), 4, &turns);
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| word.word.as_str())
+                .collect::<Vec<_>>(),
+            ["你", "好，", "世", "界。"]
+        );
+        assert_eq!(utterances.len(), 1);
+        assert_eq!(utterances[0].text, "你好，世界。");
+
+        let (_, utterances) = rendered_utterances("Hello, world.", Some("English"), 4, &turns);
+        assert_eq!(utterances[0].text, "Hello, world.");
+        assert_eq!(
+            format_utterance_transcript(&utterances),
+            "SPEAKER_00 [0.00s - 4.00s]: Hello, world."
+        );
+    }
+
+    /// Rendering does not change attribution: each word keeps the speaker of
+    /// its timing, and each utterance the text of its words.
+    #[test]
+    fn utterance_text_follows_speaker_attribution() {
+        let turns = [turn("SPEAKER_00", 0.0, 2.6), turn("SPEAKER_01", 2.6, 8.0)];
+        let (words, utterances) =
+            rendered_utterances("Hello, world. 你好，世界。", Some("Chinese"), 8, &turns);
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| (word.word.as_str(), word.speaker.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Hello,", "SPEAKER_00"),
+                ("world.", "SPEAKER_00"),
+                ("你", "SPEAKER_01"),
+                ("好，", "SPEAKER_01"),
+                ("世", "SPEAKER_01"),
+                ("界。", "SPEAKER_01"),
+            ]
+        );
+        assert_eq!(
+            utterances
+                .iter()
+                .map(|utterance| (utterance.speaker.as_str(), utterance.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("SPEAKER_00", "Hello, world."),
+                ("SPEAKER_01", "你好，世界。")
+            ]
+        );
+    }
+
     #[test]
     fn build_utterances_merges_small_gaps_for_same_speaker() {
         let words = vec![
@@ -3668,7 +3738,7 @@ mod tests {
             },
         ];
 
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &[]);
         assert_eq!(utterances.len(), 2);
         assert_eq!(utterances[0].speaker, "SPEAKER_00");
         assert!(utterances[0].text.contains("hello world"));
@@ -3720,7 +3790,7 @@ mod tests {
             },
         ];
 
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &[]);
         assert_eq!(utterances.len(), 2, "{utterances:#?}");
         assert_eq!(utterances[0].speaker, "SPEAKER_00");
         assert_eq!(utterances[0].start_secs, 0.0);
@@ -3889,7 +3959,7 @@ mod tests {
         ];
 
         normalize_phrase_speakers(&mut words, &segments);
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &[]);
 
         assert_eq!(utterances.len(), 2);
         assert_eq!(utterances[0].speaker, "SPEAKER_01");
@@ -3989,7 +4059,7 @@ mod tests {
         ];
 
         normalize_phrase_speakers(&mut words, &segments);
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &[]);
 
         assert_eq!(words[0].speaker, "SPEAKER_00");
         assert_eq!(words[2].speaker, "SPEAKER_01");
@@ -4148,7 +4218,7 @@ mod tests {
 
         stabilize_word_speakers(&mut words);
         normalize_phrase_speakers(&mut words, &segments);
-        let utterances = build_utterances(&words);
+        let utterances = build_utterances(&words, &[]);
 
         assert!(utterances.len() >= 4, "{utterances:#?}");
         assert_eq!(utterances[0].speaker, "SPEAKER_01");
