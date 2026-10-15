@@ -27,6 +27,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, MissedTickBehavior},
 };
+use tracing::{info, warn};
 
 const MAX_CLI_ARGUMENTS: usize = 24;
 const MAX_CPU_IDS: usize = 1024;
@@ -34,9 +35,13 @@ const MAX_DEVICE_DECLARATIONS: usize = 64;
 const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 16 * 1024;
 const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\ndiagnostic_output=truncated\n";
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A path the supervisor keeps a Prometheus textfile at (for a node
+/// exporter's textfile collector); unset writes none.
+const METRICS_TEXTFILE_ENV: &str = "IZWI_SUPERVISOR_METRICS_TEXTFILE";
 
 #[tokio::main]
 async fn main() -> Result<(), SupervisorError> {
+    init_tracing()?;
     let options = match CliOptions::parse(env::args_os().skip(1))? {
         ParseOutcome::Run(options) => options,
         ParseOutcome::Help => {
@@ -45,6 +50,39 @@ async fn main() -> Result<(), SupervisorError> {
         }
     };
     run(*options).await
+}
+
+/// Supervisor logs go to stderr: text by default, one JSON object per line
+/// with `IZWI_LOG_FORMAT=json`. `RUST_LOG` overrides the info-level filter.
+fn init_tracing() -> Result<(), SupervisorError> {
+    use std::io::IsTerminal;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "izwi_serving_supervisor=info".into());
+    let registry = tracing_subscriber::registry().with(filter);
+    match env::var("IZWI_LOG_FORMAT").ok().as_deref() {
+        None | Some("text") => registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(std::io::stderr().is_terminal()),
+            )
+            .init(),
+        Some("json") => registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(std::io::stderr),
+            )
+            .init(),
+        Some(other) => {
+            return Err(SupervisorError::InvalidOption(format!(
+                "IZWI_LOG_FORMAT={other:?} (expected text or json)"
+            )))
+        }
+    }
+    Ok(())
 }
 
 async fn run(options: CliOptions) -> Result<(), SupervisorError> {
@@ -198,7 +236,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             .collect();
         autoscale::reconcile_min_set(&approvals_path, &node, &desired)
             .map_err(|error| SupervisorError::Autoscale(error.to_string()))?;
-        eprintln!(
+        info!(
             "autoscaling: reconciled {} to the min set of {} autoscaled deployment(s)",
             approvals_path.display(),
             scaler.deployments().len()
@@ -250,7 +288,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             .ok_or_else(|| SupervisorError::CanaryWorkerNotFound {
                 worker_id: canary_id.clone(),
             })?;
-        eprintln!(
+        info!(
             "launching canary worker {} first; remaining workers will start after it reaches readiness",
             canary_id
         );
@@ -266,7 +304,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         .await;
         note_slot_launched(&mut autoscaler, &slots[canary_index]);
         if slots[canary_index].process.is_none() {
-            eprintln!(
+            warn!(
                 "canary worker {} failed to reach readiness; aborting rollout",
                 canary_id
             );
@@ -274,7 +312,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                 worker_id: canary_id.clone(),
             });
         }
-        eprintln!(
+        info!(
             "canary worker {} is ready; launching remaining workers",
             canary_id
         );
@@ -340,17 +378,25 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         )
         .await
         {
-            RolloutOutcome::Committed | RolloutOutcome::DegradedAbort => {
+            outcome @ (RolloutOutcome::Committed | RolloutOutcome::DegradedAbort) => {
+                if matches!(outcome, RolloutOutcome::Committed) {
+                    metrics.rollouts_committed += 1;
+                } else {
+                    metrics.rollouts_degraded += 1;
+                }
                 let prepared = rollout.take().expect("rollout is present");
                 replacement_slots = prepared.replacements;
                 target_node = Some(prepared.target);
             }
             RolloutOutcome::Aborted => {
+                metrics.rollouts_aborted += 1;
                 rollout.take();
             }
         }
     }
 
+    let metrics_textfile = env::var_os(METRICS_TEXTFILE_ENV).map(PathBuf::from);
+    let mut written_metrics = String::new();
     let mut poll = tokio::time::interval(SUPERVISION_POLL_INTERVAL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut next_autoscale_eval = Instant::now()
@@ -408,6 +454,19 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                                 started_at,
                                 &mut metrics,
                             ).await;
+                        }
+                    }
+                }
+                if let Some(path) = metrics_textfile.as_deref() {
+                    let rendered =
+                        supervisor_prometheus(&slots, &replacement_slots, &metrics);
+                    if rendered != written_metrics {
+                        match write_metrics_textfile(path, &rendered) {
+                            Ok(()) => written_metrics = rendered,
+                            Err(error) => warn!(
+                                "supervisor metrics textfile {} write failed: {error}",
+                                path.display()
+                            ),
                         }
                     }
                 }
@@ -495,7 +554,7 @@ fn prepare_rollout(
             if state.plan_digest != plan_digest {
                 return Err(SupervisorError::RolloutStateDigestMismatch);
             }
-            eprintln!(
+            info!(
                 "resuming rollout in state {} (plan digest matches)",
                 state.phase.as_str()
             );
@@ -504,7 +563,7 @@ fn prepare_rollout(
         Some(state) => {
             rollout::clear_state(runtime_directory)?;
             rollout::clear_approvals_backup(runtime_directory)?;
-            eprintln!(
+            info!(
                 "cleared terminal rollout state ({}) before staging the new rollout",
                 state.phase.as_str()
             );
@@ -540,7 +599,7 @@ fn prepare_rollout(
         }
     };
     rollout::persist_state(runtime_directory, &state)?;
-    eprintln!(
+    info!(
         "rollout prepared: {} rolling deployment(s), canary {}, window {}s, commit grace {}s, abort grace {}s",
         spec.rolling.len(),
         spec.canary_worker_id,
@@ -584,7 +643,7 @@ fn reconcile_fresh_start_state(
     }
     rollout::clear_state(runtime_directory)?;
     rollout::clear_approvals_backup(runtime_directory)?;
-    eprintln!("cleared terminal rollout state ({})", state.phase.as_str());
+    info!("cleared terminal rollout state ({})", state.phase.as_str());
     Ok(())
 }
 
@@ -630,7 +689,7 @@ async fn execute_rollout(
             )
             .await;
             if slot.process.is_none() {
-                eprintln!(
+                warn!(
                     "replacement worker {} failed to reach readiness; aborting rollout",
                     slot.worker_id
                 );
@@ -663,7 +722,7 @@ async fn execute_rollout(
                 });
             prepared.state.updated_at_ms = now_ms();
             if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-                eprintln!("rollout state persist failed: {error}");
+                warn!("rollout state persist failed: {error}");
             }
         }
         if *shutdown.borrow() {
@@ -694,7 +753,7 @@ async fn execute_rollout(
                 Ok(view)
             })
     {
-        eprintln!("rollout window view failed to write: {error}; nothing changed");
+        warn!("rollout window view failed to write: {error}; nothing changed");
         return RolloutOutcome::DegradedAbort;
     }
     let deadline_ms = prepared
@@ -705,9 +764,9 @@ async fn execute_rollout(
     prepared.state.window_deadline_ms = Some(deadline_ms);
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        eprintln!("rollout state persist failed: {error}");
+        warn!("rollout state persist failed: {error}");
     }
-    eprintln!(
+    info!(
         "rollout window open: both generations approved; cutover fires when the successor generation is observed Ready; drain starts in {}s",
         deadline_ms.saturating_sub(now_ms()) / 1000
     );
@@ -743,7 +802,7 @@ async fn execute_rollout(
                         continue;
                     };
                     if matches!(process.try_wait(), Ok(Some(_))) {
-                        eprintln!(
+                        warn!(
                             "replacement worker {} exited during the rollout window; aborting rollout",
                             slot.worker_id
                         );
@@ -776,9 +835,9 @@ async fn execute_rollout(
     prepared.state.window_deadline_ms = None;
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        eprintln!("rollout state persist failed: {error}");
+        warn!("rollout state persist failed: {error}");
     }
-    eprintln!(
+    info!(
         "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
     );
     if let Err(error) =
@@ -788,9 +847,7 @@ async fn execute_rollout(
                 Ok(view)
             })
     {
-        eprintln!(
-            "rollout commit view failed to write: {error}; the window view stays in place"
-        );
+        warn!("rollout commit view failed to write: {error}; the window view stays in place");
         return RolloutOutcome::DegradedAbort;
     }
     // Mirror the abort grace: the gateways adopt the commit view on their
@@ -798,7 +855,7 @@ async fn execute_rollout(
     // then, so draining it immediately would turn that interval into shed
     // requests. Shutdown drains everything anyway, so it ends the wait.
     if !prepared.spec.commit_grace.is_zero() {
-        eprintln!(
+        info!(
             "waiting {}s for gateway approval refresh before draining the old generation",
             prepared.spec.commit_grace.as_secs()
         );
@@ -817,9 +874,9 @@ async fn execute_rollout(
     prepared.state.phase = RolloutPhase::Committed;
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        eprintln!("rollout state persist failed: {error}");
+        warn!("rollout state persist failed: {error}");
     }
-    eprintln!(
+    info!(
         "rollout committed: the target config's generations are admission-eligible; repoint the service definition at the target node config"
     );
     RolloutOutcome::Committed
@@ -838,19 +895,19 @@ async fn abort_rollout(
     policy: &ShutdownPolicy,
     reason: &str,
 ) -> bool {
-    eprintln!("rollout aborted ({reason}): restoring the previous approval view");
+    warn!("rollout aborted ({reason}): restoring the previous approval view");
     if let Err(error) = rollout::restore_approvals(
         runtime_directory,
         &prepared.approvals_path,
         &prepared.state.approvals_backup_digest,
     ) {
-        eprintln!(
+        warn!(
             "rollout abort could not restore approvals: {error}; workers keep running and the state stays resumable"
         );
         return false;
     }
     if honor_grace && !prepared.spec.abort_grace.is_zero() {
-        eprintln!(
+        info!(
             "waiting {}s for gateway approval refresh before stopping replacement workers",
             prepared.spec.abort_grace.as_secs()
         );
@@ -866,28 +923,28 @@ async fn abort_rollout(
     }
     while let Some(result) = drains.join_next().await {
         match result {
-            Ok((worker_id, Ok(report))) => eprintln!(
+            Ok((worker_id, Ok(report))) => info!(
                 "replacement worker {worker_id} stopped with {:?} ({})",
                 report.outcome, report.exit_status
             ),
             Ok((worker_id, Err(error))) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("replacement worker {worker_id} stop failed: {error}");
+                warn!("replacement worker {worker_id} stop failed: {error}");
             }
             Err(error) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("replacement worker stop task failed: {error}");
+                warn!("replacement worker stop task failed: {error}");
             }
         }
     }
     prepared.state.phase = RolloutPhase::Aborted;
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(runtime_directory, &prepared.state) {
-        eprintln!("rollout state persist failed: {error}");
+        warn!("rollout state persist failed: {error}");
     }
     let _ = rollout::clear_state(runtime_directory);
     let _ = rollout::clear_approvals_backup(runtime_directory);
-    eprintln!(
+    info!(
         "rollout abort complete: the previous approval view is restored and the replacement workers are stopped"
     );
     true
@@ -914,17 +971,17 @@ async fn drain_selected(
     }
     while let Some(result) = drains.join_next().await {
         match result {
-            Ok((worker_id, Ok(report))) => eprintln!(
+            Ok((worker_id, Ok(report))) => info!(
                 "worker {worker_id} drained with {:?} ({})",
                 report.outcome, report.exit_status
             ),
             Ok((worker_id, Err(error))) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker {worker_id} drain failed: {error}");
+                warn!("worker {worker_id} drain failed: {error}");
             }
             Err(error) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker drain task failed: {error}");
+                warn!("worker drain task failed: {error}");
             }
         }
     }
@@ -1073,6 +1130,9 @@ struct SupervisorMetrics {
     stop_failures: u64,
     autoscale_ups: u64,
     autoscale_downs: u64,
+    rollouts_committed: u64,
+    rollouts_aborted: u64,
+    rollouts_degraded: u64,
 }
 
 impl WorkerSlot {
@@ -1109,7 +1169,7 @@ impl WorkerSlot {
             RestartDecision::RestartAfter(delay) => {
                 metrics.restarts_scheduled = metrics.restarts_scheduled.saturating_add(1);
                 self.restart_at = Some(Instant::now() + delay);
-                eprintln!(
+                info!(
                     "worker {} unavailable; restart scheduled in {} ms",
                     self.worker_id,
                     delay.as_millis()
@@ -1118,7 +1178,7 @@ impl WorkerSlot {
             RestartDecision::Quarantine => {
                 metrics.quarantines = metrics.quarantines.saturating_add(1);
                 self.restart_at = None;
-                eprintln!(
+                warn!(
                     "worker {} exceeded its bounded restart budget and is quarantined",
                     self.worker_id
                 );
@@ -1338,6 +1398,119 @@ fn runtime_diagnostic(
     output.finish()
 }
 
+/// Supervisor counters and worker-state gauges in the Prometheus text format.
+/// Only events change it, so it is rewritten only when it differs.
+fn supervisor_prometheus(
+    slots: &[WorkerSlot],
+    replacement_slots: &[WorkerSlot],
+    metrics: &SupervisorMetrics,
+) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} {kind}");
+        let _ = writeln!(output, "{name} {value}");
+    };
+    let all = || slots.iter().chain(replacement_slots);
+    let count = |predicate: &dyn Fn(&WorkerSlot) -> bool| {
+        all().filter(|slot| predicate(slot)).count() as u64
+    };
+    metric(
+        "izwi_supervisor_workers",
+        "gauge",
+        "Configured worker slots.",
+        all().count() as u64,
+    );
+    metric(
+        "izwi_supervisor_workers_running",
+        "gauge",
+        "Worker slots with a ready process.",
+        count(&|slot| slot.process.is_some()),
+    );
+    metric(
+        "izwi_supervisor_workers_quarantined",
+        "gauge",
+        "Worker slots quarantined after exhausting their restart budget.",
+        count(&|slot| slot.restart.is_quarantined()),
+    );
+    metric(
+        "izwi_supervisor_workers_restart_pending",
+        "gauge",
+        "Worker slots waiting for a scheduled restart.",
+        count(&|slot| slot.process.is_none() && slot.restart_at.is_some()),
+    );
+    for (name, help, value) in [
+        (
+            "izwi_supervisor_launch_attempts_total",
+            "Worker launch attempts.",
+            metrics.launch_attempts,
+        ),
+        (
+            "izwi_supervisor_readiness_failures_total",
+            "Launches that failed readiness.",
+            metrics.readiness_failures,
+        ),
+        (
+            "izwi_supervisor_restarts_scheduled_total",
+            "Worker restarts scheduled.",
+            metrics.restarts_scheduled,
+        ),
+        (
+            "izwi_supervisor_quarantines_total",
+            "Workers quarantined.",
+            metrics.quarantines,
+        ),
+        (
+            "izwi_supervisor_unexpected_exits_total",
+            "Workers that exited unexpectedly.",
+            metrics.unexpected_exits,
+        ),
+        (
+            "izwi_supervisor_stop_failures_total",
+            "Worker stops that failed.",
+            metrics.stop_failures,
+        ),
+        (
+            "izwi_supervisor_autoscale_ups_total",
+            "Autoscaling scale-ups.",
+            metrics.autoscale_ups,
+        ),
+        (
+            "izwi_supervisor_autoscale_downs_total",
+            "Autoscaling scale-downs.",
+            metrics.autoscale_downs,
+        ),
+        (
+            "izwi_supervisor_rollouts_committed_total",
+            "Rollouts committed.",
+            metrics.rollouts_committed,
+        ),
+        (
+            "izwi_supervisor_rollouts_aborted_total",
+            "Rollouts aborted cleanly.",
+            metrics.rollouts_aborted,
+        ),
+        (
+            "izwi_supervisor_rollouts_degraded_total",
+            "Rollout aborts that could not restore the approvals.",
+            metrics.rollouts_degraded,
+        ),
+    ] {
+        metric(name, "counter", help, value);
+    }
+    output
+}
+
+/// Replace `path` atomically, so a collector never reads a partial file.
+fn write_metrics_textfile(path: &Path, contents: &str) -> io::Result<()> {
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    std::fs::write(&temporary, contents)?;
+    std::fs::rename(&temporary, path)
+}
+
 fn spawn_diagnostic_signal_listener(sender: mpsc::Sender<()>) {
     #[cfg(unix)]
     tokio::spawn(async move {
@@ -1427,7 +1600,7 @@ async fn launch_slot(
     ) {
         Ok(spec) => spec,
         Err(error) => {
-            eprintln!(
+            warn!(
                 "worker {} launch specification failed: {error}",
                 slot.worker_id
             );
@@ -1443,7 +1616,7 @@ async fn launch_slot(
     ) {
         Ok(expected) => expected,
         Err(error) => {
-            eprintln!("worker {} identity setup failed: {error}", slot.worker_id);
+            warn!("worker {} identity setup failed: {error}", slot.worker_id);
             metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
             slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
             return;
@@ -1461,7 +1634,7 @@ async fn launch_slot(
     ) {
         Ok(process) => process,
         Err(error) => {
-            eprintln!("worker {} spawn failed: {error}", slot.worker_id);
+            warn!("worker {} spawn failed: {error}", slot.worker_id);
             metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
             slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
             return;
@@ -1478,7 +1651,7 @@ async fn launch_slot(
     match readiness {
         Some(Ok(_)) => {
             metrics.readiness_successes = metrics.readiness_successes.saturating_add(1);
-            eprintln!(
+            info!(
                 "worker {} ready as incarnation {}",
                 slot.worker_id,
                 process.readiness().expected().incarnation_id()
@@ -1489,17 +1662,17 @@ async fn launch_slot(
         }
         Some(Err(error)) => {
             metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
-            eprintln!("worker {} failed readiness: {error}", slot.worker_id);
+            warn!("worker {} failed readiness: {error}", slot.worker_id);
             if let Err(stop_error) = process.drain_and_stop(&node.config().shutdown).await {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker {} cleanup failed: {stop_error}", slot.worker_id);
+                warn!("worker {} cleanup failed: {stop_error}", slot.worker_id);
             }
             slot.record_failure(supervisor_started_at, process_started_at.elapsed(), metrics);
         }
         None => {
             if let Err(error) = process.drain_and_stop(&node.config().shutdown).await {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker {} shutdown cleanup failed: {error}", slot.worker_id);
+                warn!("worker {} shutdown cleanup failed: {error}", slot.worker_id);
             }
         }
     }
@@ -1539,14 +1712,14 @@ fn observe_exits(
                     {
                         state.note_stopped();
                     }
-                    eprintln!(
+                    info!(
                         "autoscaling: draining worker {} exited cleanly ({status}); slot returned to standby",
                         slot.worker_id
                     );
                     continue;
                 }
                 metrics.unexpected_exits = metrics.unexpected_exits.saturating_add(1);
-                eprintln!("worker {} exited with {status}", slot.worker_id);
+                warn!("worker {} exited with {status}", slot.worker_id);
                 let uptime = slot
                     .process_started_at
                     .map_or(Duration::ZERO, |started| started.elapsed());
@@ -1563,7 +1736,7 @@ fn observe_exits(
                 if !slot.exit_observation_failed {
                     metrics.exit_observation_failures =
                         metrics.exit_observation_failures.saturating_add(1);
-                    eprintln!("worker {} exit observation failed: {error}", slot.worker_id);
+                    warn!("worker {} exit observation failed: {error}", slot.worker_id);
                     slot.exit_observation_failed = true;
                 }
                 // A failed observation does not prove the process exited. Retain
@@ -1717,10 +1890,10 @@ fn admit_pending_workers(
                     state.note_scaled_up(now_ms, &worker);
                 }
                 metrics.autoscale_ups = metrics.autoscale_ups.saturating_add(1);
-                eprintln!("autoscaling: worker {worker} is ready and approved; scale-up complete");
+                info!("autoscaling: worker {worker} is ready and approved; scale-up complete");
             }
             Err(error) => {
-                eprintln!(
+                warn!(
                     "autoscaling: approvals publish for worker {worker} failed: {error}; retrying next evaluation"
                 );
                 all_admitted = false;
@@ -1747,11 +1920,11 @@ async fn poll_deployment(
         let status = match tokio::time::timeout(poll_budget, process.client().status()).await {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
-                eprintln!("autoscaling: worker {worker} status poll failed: {error}");
+                warn!("autoscaling: worker {worker} status poll failed: {error}");
                 return None;
             }
             Err(_) => {
-                eprintln!("autoscaling: worker {worker} status poll timed out");
+                warn!("autoscaling: worker {worker} status poll timed out");
                 return None;
             }
         };
@@ -1785,11 +1958,11 @@ async fn scale_up(
     worker: WorkerId,
 ) {
     let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
-        eprintln!("autoscaling: scale-up candidate {worker} has no slot; abandoned");
+        warn!("autoscaling: scale-up candidate {worker} has no slot; abandoned");
         return;
     };
     if let Err(rejection) = ledger.reserve(&worker) {
-        eprintln!("autoscaling: {rejection}");
+        info!("autoscaling: {rejection}");
         return;
     }
     slot.restart_at = None;
@@ -1797,7 +1970,7 @@ async fn scale_up(
         deployment: deployment_id.clone(),
         phase: AutoscalePhase::Admitting,
     });
-    eprintln!("autoscaling: deployment {deployment_id} scaled up; launching standby {worker}");
+    info!("autoscaling: deployment {deployment_id} scaled up; launching standby {worker}");
     launch_slot(
         node,
         locks,
@@ -1814,7 +1987,7 @@ async fn scale_up(
             deployment: deployment_id.clone(),
             phase: AutoscalePhase::Standby,
         });
-        eprintln!("autoscaling: standby {worker} failed its launch; it remains standby");
+        warn!("autoscaling: standby {worker} failed its launch; it remains standby");
     }
 }
 
@@ -1834,7 +2007,7 @@ async fn mark_draining(
     worker: WorkerId,
 ) {
     if let Err(error) = autoscale::remove_worker(approvals_path, node, &worker) {
-        eprintln!(
+        warn!(
             "autoscaling: could not unapprove worker {worker}: {error}; retrying next evaluation"
         );
         return;
@@ -1844,7 +2017,7 @@ async fn mark_draining(
     };
     if let Some(process) = slot.process.as_mut() {
         if let Err(error) = process.begin_drain().await {
-            eprintln!("autoscaling: worker {worker} admission stop failed: {error}");
+            warn!("autoscaling: worker {worker} admission stop failed: {error}");
         }
     }
     slot.autoscale = Some(AutoscaleSlotState {
@@ -1856,7 +2029,7 @@ async fn mark_draining(
         .expect("deployment ids come from the autoscaler")
         .note_draining(now_ms, &worker);
     metrics.autoscale_downs = metrics.autoscale_downs.saturating_add(1);
-    eprintln!(
+    info!(
         "autoscaling: worker {worker} marked draining; waiting for zero active work before stopping it"
     );
 }
@@ -1881,13 +2054,13 @@ async fn stop_drained(
             .drain_and_stop(&node.config().shutdown.clone())
             .await
         {
-            Ok(report) => eprintln!(
+            Ok(report) => info!(
                 "autoscaling: worker {worker} stopped with {:?} ({})",
                 report.outcome, report.exit_status
             ),
             Err(error) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("autoscaling: worker {worker} stop failed: {error}");
+                warn!("autoscaling: worker {worker} stop failed: {error}");
             }
         }
     }
@@ -1901,7 +2074,7 @@ async fn stop_drained(
         .deployment_mut(deployment_id)
         .expect("deployment ids come from the autoscaler")
         .note_stopped();
-    eprintln!(
+    info!(
         "autoscaling: worker {worker} drained and stopped; the slot returned to the standby pool"
     );
 }
@@ -1931,17 +2104,17 @@ async fn drain_all(
     }
     while let Some(result) = drains.join_next().await {
         match result {
-            Ok((worker_id, Ok(report))) => eprintln!(
+            Ok((worker_id, Ok(report))) => info!(
                 "worker {worker_id} stopped with {:?} ({})",
                 report.outcome, report.exit_status
             ),
             Ok((worker_id, Err(error))) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker {worker_id} shutdown failed: {error}")
+                warn!("worker {worker_id} shutdown failed: {error}")
             }
             Err(error) => {
                 metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                eprintln!("worker shutdown task failed: {error}")
+                warn!("worker shutdown task failed: {error}")
             }
         }
     }
@@ -2303,6 +2476,11 @@ the supervisor admits nothing before that worker reports readiness."
         "Rollout (DS6): --rollout-plan PATH starts or resumes a blue-green rollout declared by the plan;\n\
   --rollout-abort restores the pre-rollout approvals and clears state; --rollout-status reports persisted rollout state.\n\
   All three require --config."
+    );
+    eprintln!(
+        "Logs go to stderr as text, or one JSON object per line with IZWI_LOG_FORMAT=json; worker\n\
+  stdout and stderr are relayed line by line with the worker id. IZWI_SUPERVISOR_METRICS_TEXTFILE=PATH\n\
+  keeps supervisor counters and worker-state gauges there in the Prometheus text format."
     );
     #[cfg(unix)]
     eprintln!(

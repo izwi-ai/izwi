@@ -8,12 +8,14 @@ use izwi_serving_protocol::{
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, io, process::ExitStatus, time::Duration};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin},
     time::Instant,
 };
 
 pub const MAX_READINESS_DIAGNOSTIC_BYTES: usize = 1024;
+/// A worker output line longer than this is relayed in pieces.
+const MAX_RELAYED_LINE_BYTES: usize = 64 * 1024;
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Immutable identity that a freshly launched worker must prove before it is usable.
@@ -247,6 +249,61 @@ pub enum IdentityMismatch {
     DeploymentFailed,
 }
 
+/// Annotate one worker output line with its worker id: a JSON object line
+/// gains a leading `"worker_id"` field and stays JSON; any other line gets a
+/// `worker_id | ` prefix.
+pub fn annotate_worker_line(worker_id: &str, line: &[u8]) -> Vec<u8> {
+    let id = serde_json::to_string(worker_id).expect("a string serializes");
+    let trimmed = line.trim_ascii_start();
+    let mut annotated = Vec::with_capacity(line.len() + id.len() + 16);
+    if let Some(rest) = trimmed.strip_prefix(b"{") {
+        annotated.extend_from_slice(b"{\"worker_id\":");
+        annotated.extend_from_slice(id.as_bytes());
+        if !rest.trim_ascii_start().starts_with(b"}") {
+            annotated.push(b',');
+        }
+        annotated.extend_from_slice(rest);
+    } else {
+        annotated.extend_from_slice(worker_id.as_bytes());
+        annotated.extend_from_slice(b" | ");
+        annotated.extend_from_slice(line);
+    }
+    if !annotated.ends_with(b"\n") {
+        annotated.push(b'\n');
+    }
+    annotated
+}
+
+/// Copy a worker's stdout or stderr to the supervisor's own, one annotated
+/// line at a time, until the worker closes it.
+async fn relay_worker_output<R>(output: R, worker_id: String, to_stderr: bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use std::io::Write as _;
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(output);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_RELAYED_LINE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+            .await;
+        match read {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let annotated = annotate_worker_line(&worker_id, &line);
+                let _ = if to_stderr {
+                    std::io::stderr().lock().write_all(&annotated)
+                } else {
+                    std::io::stdout().lock().write_all(&annotated)
+                };
+            }
+        }
+    }
+}
+
 /// A child process plus the only parent-side writer for its ownership pipe.
 ///
 /// Dropping this value closes stdin and asks a managed worker to fail closed. Tokio's
@@ -282,12 +339,22 @@ impl SupervisedWorker {
         let client = WorkerClient::new(&expected.endpoint, credentials, client_config)
             .map_err(LifecycleError::Client)?;
         let mut command = tokio::process::Command::from(spec.command());
-        command.kill_on_drop(true);
+        command
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().map_err(LifecycleError::Spawn)?;
         let ownership_stdin = child
             .stdin
             .take()
             .ok_or(LifecycleError::OwnershipPipeUnavailable)?;
+        let worker_id = expected.worker_id().as_str();
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(relay_worker_output(stdout, worker_id.to_string(), false));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(relay_worker_output(stderr, worker_id.to_string(), true));
+        }
         Ok(Self {
             child,
             ownership_stdin: Some(ownership_stdin),
@@ -672,6 +739,23 @@ fn jittered_delay_ms(base: u64, maximum: u64, percent: u8, sample: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_output_lines_carry_their_worker_id() {
+        assert_eq!(
+            annotate_worker_line("worker-a", b"plain text line\n"),
+            b"worker-a | plain text line\n"
+        );
+        // A JSON line stays one JSON object with the id as a field.
+        let json = annotate_worker_line("worker-a", br#"{"level":"INFO","message":"ready"}"#);
+        let value: serde_json::Value = serde_json::from_slice(&json).expect("still JSON");
+        assert_eq!(value["worker_id"], "worker-a");
+        assert_eq!(value["message"], "ready");
+        assert!(json.ends_with(b"\n"));
+        let empty = annotate_worker_line("w\"q", b"{}\n");
+        let value: serde_json::Value = serde_json::from_slice(&empty).expect("JSON");
+        assert_eq!(value["worker_id"], "w\"q");
+    }
     use izwi_serving_protocol::{
         CancellationBehavior, Capability, CapacitySnapshot, InputFormat, LoadedDeployment,
         OutputFormat, SchemaVersion, TaskKind, WorkerFeature, PROTOCOL_V1,
