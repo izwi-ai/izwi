@@ -3,6 +3,8 @@
 pub mod audio;
 pub mod chat;
 pub mod compat;
+pub mod convert;
+mod lfm_tools;
 pub mod models;
 pub mod responses;
 

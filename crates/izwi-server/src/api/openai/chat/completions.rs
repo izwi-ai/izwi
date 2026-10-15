@@ -14,14 +14,15 @@ use serde::{Deserialize, Serialize};
 use crate::api::openai::compat::{
     compatibility_profile, strict_guardrail_message, OpenAiCompatibilityProfile,
 };
+use crate::api::openai::convert::{
+    append_assistant_tool_calls, flatten_content, tool_result_message, InboundContent,
+};
 use crate::api::request_context::{RequestContext, StreamOutcome};
 use crate::app::chat::{
     chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
     ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver, LocalChat,
 };
-use crate::app::chat_content::{
-    flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
-};
+use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::ApiError;
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState};
 use crate::ids::new_uuid;
@@ -135,38 +136,9 @@ pub struct ChatCompletionStreamOptions {
 pub struct OpenAiInboundMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Option<OpenAiInboundContent>,
+    pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum OpenAiInboundContent {
-    Text(String),
-    Parts(Vec<OpenAiInboundContentPart>),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAiInboundContentPart {
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub input_text: Option<String>,
-    #[serde(default)]
-    pub image_url: Option<serde_json::Value>,
-    #[serde(default)]
-    pub input_image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video_url: Option<serde_json::Value>,
-    #[serde(default)]
-    pub input_video: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -368,33 +340,15 @@ fn to_core_messages_with_media(
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut core = Vec::with_capacity(messages.len());
     let mut media_inputs = Vec::new();
-    // LFM2.5 has its own tool-call wire format and a native `tool` turn.
-    let lfm_tools = variant.family() == ModelFamily::Lfm2Chat;
 
     for message in messages {
         let role = parse_role(&message.role)?;
         let flattened = flatten_content(message.content)?;
         let mut content = flattened.runtime_text.clone();
 
-        if role == InboundMessageRole::Assistant
-            && message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|tool_calls| !tool_calls.is_empty())
-        {
+        if role == InboundMessageRole::Assistant {
             let tool_calls = message.tool_calls.as_deref().unwrap_or(&[]);
-            if lfm_tools {
-                // The upstream template writes the calls right after the text.
-                content.push_str(&super::lfm_tools::render_tool_calls(tool_calls)?);
-            } else {
-                let tool_call_xml = render_tool_calls_xml(tool_calls)?;
-                if !tool_call_xml.is_empty() {
-                    if !content.trim().is_empty() {
-                        content.push_str("\n\n");
-                    }
-                    content.push_str(&tool_call_xml);
-                }
-            }
+            append_assistant_tool_calls(variant, &mut content, tool_calls)?;
         }
 
         match role {
@@ -451,20 +405,7 @@ fn to_core_messages_with_media(
                     ));
                 }
                 media_inputs.extend(flattened.media_inputs);
-
-                if lfm_tools {
-                    core.push(ChatMessage {
-                        role: ChatRole::Tool,
-                        content,
-                    });
-                } else {
-                    let wrapped =
-                        format!("<tool_response>\n{}\n</tool_response>", content.trim());
-                    core.push(ChatMessage {
-                        role: ChatRole::User,
-                        content: wrapped,
-                    });
-                }
+                core.push(tool_result_message(variant, content));
             }
         }
     }
@@ -482,106 +423,6 @@ fn parse_role(raw: &str) -> Result<InboundMessageRole, ApiError> {
             "Unsupported chat message role: {}",
             other
         ))),
-    }
-}
-
-fn flatten_content(
-    content: Option<OpenAiInboundContent>,
-) -> Result<FlattenedMultimodalContent, ApiError> {
-    match content {
-        None => Ok(FlattenedMultimodalContent::default()),
-        Some(OpenAiInboundContent::Text(text)) => Ok(FlattenedMultimodalContent {
-            display_text: text.clone(),
-            runtime_text: text,
-            media_inputs: Vec::new(),
-        }),
-        Some(OpenAiInboundContent::Parts(parts)) => {
-            flatten_content_parts(&content_parts_to_values(&parts)?).map_err(ApiError::bad_request)
-        }
-    }
-}
-
-fn content_parts_to_values(
-    parts: &[OpenAiInboundContentPart],
-) -> Result<Vec<serde_json::Value>, ApiError> {
-    parts
-        .iter()
-        .map(|part| serde_json::to_value(part).map_err(|err| ApiError::internal(err.to_string())))
-        .collect()
-}
-
-fn render_tool_calls_xml(tool_calls: &[serde_json::Value]) -> Result<String, ApiError> {
-    let mut rendered = Vec::with_capacity(tool_calls.len());
-
-    for tool_call in tool_calls {
-        let function_obj = tool_call.get("function").unwrap_or(tool_call);
-        let name = function_obj
-            .get("name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
-
-        let args = normalize_tool_call_arguments(function_obj.get("arguments"));
-        let mut block = String::new();
-        block.push_str("<tool_call>\n");
-        block.push_str(&format!("<function={name}>\n"));
-
-        let mut keys: Vec<String> = args.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let value = args.get(&key).cloned().unwrap_or(serde_json::Value::Null);
-            block.push_str(&format!("<parameter={key}>\n"));
-            block.push_str(&tool_parameter_text(&value));
-            block.push_str("\n</parameter>\n");
-        }
-
-        block.push_str("</function>\n</tool_call>");
-        rendered.push(block);
-    }
-
-    Ok(rendered.join("\n"))
-}
-
-fn normalize_tool_call_arguments(
-    raw: Option<&serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    match raw {
-        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
-        Some(serde_json::Value::Object(map)) => map.clone(),
-        Some(serde_json::Value::String(raw_string)) => {
-            match serde_json::from_str::<serde_json::Value>(raw_string) {
-                Ok(serde_json::Value::Object(map)) => map,
-                Ok(value) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("arguments".to_string(), value);
-                    map
-                }
-                Err(_) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert(
-                        "arguments".to_string(),
-                        serde_json::Value::String(raw_string.clone()),
-                    );
-                    map
-                }
-            }
-        }
-        Some(value) => {
-            let mut map = serde_json::Map::new();
-            map.insert("arguments".to_string(), value.clone());
-            map
-        }
-    }
-}
-
-fn tool_parameter_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-        }
-        _ => value.to_string(),
     }
 }
 
@@ -676,7 +517,7 @@ fn build_assistant_response_parts(
     Option<Vec<OpenAiOutputToolCall>>,
     &'static str,
 ) {
-    let (lfm_text, lfm_calls) = super::lfm_tools::extract_tool_calls(&text);
+    let (lfm_text, lfm_calls) = crate::api::openai::lfm_tools::extract_tool_calls(&text);
     if !lfm_calls.is_empty() {
         let tool_calls = lfm_calls
             .into_iter()
@@ -1279,40 +1120,9 @@ fn render_chat_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::openai::convert::InboundContentPart;
     use axum::http::StatusCode;
     use serde_json::json;
-
-    #[test]
-    fn flattens_text_parts_content() {
-        let flattened = flatten_content(Some(OpenAiInboundContent::Parts(vec![
-            OpenAiInboundContentPart {
-                kind: Some("text".to_string()),
-                text: Some("hello".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            OpenAiInboundContentPart {
-                kind: Some("input_text".to_string()),
-                text: None,
-                input_text: Some("world".to_string()),
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten content");
-
-        assert_eq!(flattened.runtime_text, "helloworld");
-        assert!(!flattened.has_media());
-    }
 
     #[test]
     fn closed_chat_stream_emits_explicit_error_without_terminal_event() {
@@ -1330,100 +1140,6 @@ mod tests {
             Some("server_error")
         );
         assert!(openai_chat_stream_interruption_payload(true).is_none());
-    }
-
-    #[test]
-    fn flattens_multimodal_parts_without_inlining_tokens() {
-        let flattened = flatten_content(Some(OpenAiInboundContent::Parts(vec![
-            OpenAiInboundContentPart {
-                kind: Some("text".to_string()),
-                text: Some("Before ".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            OpenAiInboundContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({"url":"https://example.com/cat.png"})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            OpenAiInboundContentPart {
-                kind: Some("video".to_string()),
-                text: None,
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: Some(json!({"url":"https://example.com/clip.mp4"})),
-                video_url: None,
-                input_video: None,
-            },
-            OpenAiInboundContentPart {
-                kind: Some("text".to_string()),
-                text: Some(" after".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten content");
-
-        assert_eq!(flattened.display_text, "Before  after");
-        assert!(flattened.runtime_text.contains("<|image_pad|>"));
-        assert!(flattened.runtime_text.contains("<|video_pad|>"));
-        assert_eq!(flattened.media_inputs.len(), 2);
-    }
-
-    #[test]
-    fn flatten_content_rejects_multimodal_part_without_source() {
-        let err = flatten_content(Some(OpenAiInboundContent::Parts(vec![
-            OpenAiInboundContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect_err("missing source should fail");
-
-        assert!(err.message.contains("missing a usable"));
-    }
-
-    #[test]
-    fn renders_assistant_tool_calls_to_qwen_xml() {
-        let xml = render_tool_calls_xml(&[json!({
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "arguments": "{\"city\":\"Harare\",\"unit\":\"celsius\"}"
-            }
-        })])
-        .expect("tool call xml should render");
-
-        assert!(xml.contains("<tool_call>"));
-        assert!(xml.contains("<function=get_weather>"));
-        assert!(xml.contains("<parameter=city>\nHarare\n</parameter>"));
-        assert!(xml.contains("<parameter=unit>\ncelsius\n</parameter>"));
     }
 
     #[test]
@@ -1455,7 +1171,7 @@ mod tests {
     fn lfm25_tool_turns_use_the_lfm_wire_format() {
         let text = |role: &str, content: &str| OpenAiInboundMessage {
             role: role.to_string(),
-            content: Some(OpenAiInboundContent::Text(content.to_string())),
+            content: Some(InboundContent::Text(content.to_string())),
             tool_calls: None,
         };
         let messages = vec![
@@ -1514,19 +1230,17 @@ mod tests {
             ModelVariant::Qwen314BGguf,
             vec![OpenAiInboundMessage {
                 role: "user".to_string(),
-                content: Some(OpenAiInboundContent::Parts(vec![
-                    OpenAiInboundContentPart {
-                        kind: Some("image_url".to_string()),
-                        text: None,
-                        input_text: None,
-                        image_url: Some(json!({"url":"https://example.com/cat.png"})),
-                        input_image: None,
-                        image: None,
-                        video: None,
-                        video_url: None,
-                        input_video: None,
-                    },
-                ])),
+                content: Some(InboundContent::Parts(vec![InboundContentPart {
+                    kind: Some("image_url".to_string()),
+                    text: None,
+                    input_text: None,
+                    image_url: Some(json!({"url":"https://example.com/cat.png"})),
+                    input_image: None,
+                    image: None,
+                    video: None,
+                    video_url: None,
+                    input_video: None,
+                }])),
                 tool_calls: None,
             }],
             None,
@@ -1551,7 +1265,7 @@ mod tests {
             model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
-                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
             }],
             max_tokens: None,
@@ -1593,7 +1307,7 @@ mod tests {
             model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
-                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
             }],
             max_tokens: None,
@@ -1659,7 +1373,7 @@ mod tests {
             model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
                 role: "user".to_string(),
-                content: Some(OpenAiInboundContent::Text("hello".to_string())),
+                content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
             }],
             max_tokens: None,

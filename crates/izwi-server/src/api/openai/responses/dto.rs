@@ -1,6 +1,8 @@
 use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
 use serde::{Deserialize, Serialize};
 
+use crate::api::openai::convert::InboundContent;
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesCreateRequest {
@@ -61,38 +63,9 @@ pub struct ResponseInputItem {
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
-    pub content: Option<ResponseInputContent>,
+    pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ResponseInputContent {
-    Text(String),
-    Parts(Vec<ResponseInputContentPart>),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ResponseInputContentPart {
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub input_text: Option<String>,
-    #[serde(default)]
-    pub image_url: Option<serde_json::Value>,
-    #[serde(default)]
-    pub input_image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video: Option<serde_json::Value>,
-    #[serde(default)]
-    pub video_url: Option<serde_json::Value>,
-    #[serde(default)]
-    pub input_video: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

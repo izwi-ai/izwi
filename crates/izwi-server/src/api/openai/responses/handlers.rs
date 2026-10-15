@@ -9,25 +9,26 @@ use axum::{
     Json,
 };
 
+use crate::api::openai::convert::{
+    append_assistant_tool_calls, flatten_content, tool_result_message,
+};
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     chat_top_k, generate_chat, resolve_chat_request_config, spawn_chat_stream,
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
-use crate::app::chat_content::{
-    flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
-};
+use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::ApiError;
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
 use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole, ModelVariant};
 
 use super::dto::{
-    ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputContent,
-    ResponseInputItemContent, ResponseInputItemObject, ResponseInputItemsList,
-    ResponseInputTokensDetails, ResponseObject, ResponseOutputContent, ResponseOutputItem,
-    ResponseStreamCompletedPayload, ResponseStreamCreatedPayload, ResponseStreamDeltaPayload,
-    ResponseStreamEnvelope, ResponseUsage, ResponsesCreateRequest,
+    ResponseDeletedObject, ResponseError, ResponseInput, ResponseInputItemContent,
+    ResponseInputItemObject, ResponseInputItemsList, ResponseInputTokensDetails, ResponseObject,
+    ResponseOutputContent, ResponseOutputItem, ResponseStreamCompletedPayload,
+    ResponseStreamCreatedPayload, ResponseStreamDeltaPayload, ResponseStreamEnvelope,
+    ResponseUsage, ResponsesCreateRequest,
 };
 
 const RESPONSE_STREAM_INTERRUPTED_ERROR: &str = "Response stream ended before a terminal event";
@@ -58,9 +59,6 @@ pub async fn create_response(
         model_variant,
         req.instructions.as_deref(),
         req.input.clone(),
-        req.enable_thinking,
-        req.tools.clone(),
-        req.tool_choice.clone(),
     )?;
     validate_media_inputs_for_variant(model_variant, &media_inputs)
         .map_err(ApiError::bad_request)?;
@@ -588,17 +586,13 @@ struct NormalizedInputItem {
     role: String,
     display_content: String,
     runtime_content: String,
-    is_tool: bool,
     media_inputs: Vec<ChatMediaInput>,
 }
 
 fn build_input_messages(
-    _model_variant: ModelVariant,
+    model_variant: ModelVariant,
     instructions: Option<&str>,
     input: Option<ResponseInput>,
-    _enable_thinking: Option<bool>,
-    _tools: Option<Vec<serde_json::Value>>,
-    _tool_choice: Option<serde_json::Value>,
 ) -> Result<
     (
         Vec<ChatMessage>,
@@ -630,13 +624,12 @@ fn build_input_messages(
             role: "user".to_string(),
             display_content: text.clone(),
             runtime_content: text,
-            is_tool: false,
             media_inputs: Vec::new(),
         }],
-        Some(ResponseInput::One(item)) => vec![normalize_input_item(item)?],
+        Some(ResponseInput::One(item)) => vec![normalize_input_item(model_variant, item)?],
         Some(ResponseInput::Many(items)) => items
             .into_iter()
-            .map(normalize_input_item)
+            .map(|item| normalize_input_item(model_variant, item))
             .collect::<Result<Vec<_>, _>>()?,
     };
 
@@ -687,18 +680,10 @@ fn build_input_messages(
                 });
             }
             ResponseInboundRole::Tool => {
-                let wrapped = if item.is_tool {
-                    format!(
-                        "<tool_response>\n{}\n</tool_response>",
-                        item.runtime_content.trim()
-                    )
-                } else {
-                    item.runtime_content.clone()
-                };
-                messages.push(ChatMessage {
-                    role: ChatRole::User,
-                    content: wrapped,
-                });
+                messages.push(tool_result_message(
+                    model_variant,
+                    item.runtime_content.clone(),
+                ));
                 stored.push(StoredResponseInputItem {
                     role,
                     content: item.display_content,
@@ -711,6 +696,7 @@ fn build_input_messages(
 }
 
 fn normalize_input_item(
+    variant: ModelVariant,
     item: super::dto::ResponseInputItem,
 ) -> Result<NormalizedInputItem, ApiError> {
     let role = item
@@ -721,19 +707,9 @@ fn normalize_input_item(
 
     let flattened = flatten_content(item.content)?;
     let mut runtime_content = flattened.runtime_text.clone();
-    if role == "assistant"
-        && item
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-    {
-        let tool_xml = render_tool_calls_xml(item.tool_calls.as_deref().unwrap_or(&[]))?;
-        if !tool_xml.is_empty() {
-            if !runtime_content.trim().is_empty() {
-                runtime_content.push_str("\n\n");
-            }
-            runtime_content.push_str(&tool_xml);
-        }
+    if role == "assistant" {
+        let tool_calls = item.tool_calls.as_deref().unwrap_or(&[]);
+        append_assistant_tool_calls(variant, &mut runtime_content, tool_calls)?;
     }
 
     if runtime_content.trim().is_empty() && !flattened.has_media() {
@@ -746,25 +722,8 @@ fn normalize_input_item(
         role: role.clone(),
         display_content: flattened.display_text,
         runtime_content,
-        is_tool: role == "tool",
         media_inputs: flattened.media_inputs,
     })
-}
-
-fn flatten_content(
-    content: Option<ResponseInputContent>,
-) -> Result<FlattenedMultimodalContent, ApiError> {
-    match content {
-        None => Ok(FlattenedMultimodalContent::default()),
-        Some(ResponseInputContent::Text(text)) => Ok(FlattenedMultimodalContent {
-            display_text: text.clone(),
-            runtime_text: text,
-            media_inputs: Vec::new(),
-        }),
-        Some(ResponseInputContent::Parts(parts)) => {
-            flatten_content_parts(&content_parts_to_values(&parts)?).map_err(ApiError::bad_request)
-        }
-    }
 }
 
 fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
@@ -777,90 +736,6 @@ fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
             "Unsupported response input role: {}",
             other
         ))),
-    }
-}
-
-fn content_parts_to_values(
-    parts: &[super::dto::ResponseInputContentPart],
-) -> Result<Vec<serde_json::Value>, ApiError> {
-    parts
-        .iter()
-        .map(|part| serde_json::to_value(part).map_err(|err| ApiError::internal(err.to_string())))
-        .collect()
-}
-
-fn render_tool_calls_xml(tool_calls: &[serde_json::Value]) -> Result<String, ApiError> {
-    let mut rendered = Vec::with_capacity(tool_calls.len());
-
-    for tool_call in tool_calls {
-        let function_obj = tool_call.get("function").unwrap_or(tool_call);
-        let name = function_obj
-            .get("name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                ApiError::bad_request("Each assistant tool call must include `function.name`")
-            })?;
-
-        let args = normalize_tool_call_arguments(function_obj.get("arguments"));
-        let mut block = String::new();
-        block.push_str("<tool_call>\n");
-        block.push_str(&format!("<function={name}>\n"));
-
-        let mut keys: Vec<String> = args.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            let value = args.get(&key).cloned().unwrap_or(serde_json::Value::Null);
-            block.push_str(&format!("<parameter={key}>\n"));
-            block.push_str(&tool_parameter_text(&value));
-            block.push_str("\n</parameter>\n");
-        }
-
-        block.push_str("</function>\n</tool_call>");
-        rendered.push(block);
-    }
-
-    Ok(rendered.join("\n"))
-}
-
-fn normalize_tool_call_arguments(
-    raw: Option<&serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    match raw {
-        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
-        Some(serde_json::Value::Object(map)) => map.clone(),
-        Some(serde_json::Value::String(raw_string)) => {
-            match serde_json::from_str::<serde_json::Value>(raw_string) {
-                Ok(serde_json::Value::Object(map)) => map,
-                Ok(value) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("arguments".to_string(), value);
-                    map
-                }
-                Err(_) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert(
-                        "arguments".to_string(),
-                        serde_json::Value::String(raw_string.clone()),
-                    );
-                    map
-                }
-            }
-        }
-        Some(value) => {
-            let mut map = serde_json::Map::new();
-            map.insert("arguments".to_string(), value.clone());
-            map
-        }
-    }
-}
-
-fn tool_parameter_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-        }
-        _ => value.to_string(),
     }
 }
 
@@ -929,8 +804,9 @@ fn sse_event(event_name: &str, payload: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::dto::{ResponseInputContentPart, ResponseInputItem};
+    use super::super::dto::ResponseInputItem;
     use super::*;
+    use crate::api::openai::convert::{InboundContent, InboundContentPart};
     use crate::test_support::env_lock;
     use izwi_core::{backends::BackendPreference, RuntimeService, ServeRuntimeConfig};
     use serde_json::json;
@@ -985,9 +861,6 @@ mod tests {
             ModelVariant::Qwen359BGguf,
             Some("Be concise."),
             Some(ResponseInput::Text("Hello".to_string())),
-            None,
-            None,
-            None,
         )
         .expect("build input messages");
 
@@ -999,111 +872,15 @@ mod tests {
     }
 
     #[test]
-    fn flattens_part_content() {
-        let flattened = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("input_text".to_string()),
-                text: None,
-                input_text: Some("part1".to_string()),
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("text".to_string()),
-                text: Some("part2".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten");
-        assert_eq!(flattened.runtime_text, "part1part2");
-        assert!(!flattened.has_media());
-    }
-
-    #[test]
-    fn flattens_multimodal_parts_without_inlining_tokens() {
-        let flattened = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("text".to_string()),
-                text: Some("Look ".to_string()),
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({"url":"https://example.com/img.png"})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-            ResponseInputContentPart {
-                kind: Some("video".to_string()),
-                text: None,
-                input_text: None,
-                image_url: None,
-                input_image: None,
-                image: None,
-                video: Some(json!({"url":"https://example.com/clip.mp4"})),
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect("flatten");
-        assert_eq!(flattened.display_text, "Look ");
-        assert!(flattened.runtime_text.contains("<|image_pad|>"));
-        assert!(flattened.runtime_text.contains("<|video_pad|>"));
-        assert_eq!(flattened.media_inputs.len(), 2);
-    }
-
-    #[test]
-    fn flatten_content_rejects_multimodal_part_without_source() {
-        let err = flatten_content(Some(ResponseInputContent::Parts(vec![
-            ResponseInputContentPart {
-                kind: Some("image_url".to_string()),
-                text: None,
-                input_text: None,
-                image_url: Some(json!({})),
-                input_image: None,
-                image: None,
-                video: None,
-                video_url: None,
-                input_video: None,
-            },
-        ])))
-        .expect_err("missing source should fail");
-
-        assert!(err.message.contains("missing a usable"));
-    }
-
-    #[test]
     fn normalizes_input_item_default_role() {
         let item = ResponseInputItem {
             role: None,
-            content: Some(ResponseInputContent::Text("hello".to_string())),
+            content: Some(InboundContent::Text("hello".to_string())),
             tool_calls: None,
         };
-        let normalized = normalize_input_item(item).expect("normalize");
+        let normalized = normalize_input_item(ModelVariant::Qwen359BGguf, item).expect("normalize");
         assert_eq!(normalized.role, "user");
         assert_eq!(normalized.runtime_content, "hello");
-        assert!(!normalized.is_tool);
         assert!(normalized.media_inputs.is_empty());
     }
 
@@ -1121,15 +898,49 @@ mod tests {
             })]),
         };
 
-        let normalized = normalize_input_item(item).expect("normalize tool call");
+        let normalized =
+            normalize_input_item(ModelVariant::Qwen359BGguf, item).expect("normalize tool call");
         assert_eq!(normalized.role, "assistant");
-        assert!(!normalized.is_tool);
         assert!(normalized.media_inputs.is_empty());
         assert!(normalized.runtime_content.contains("<tool_call>"));
         assert!(normalized
             .runtime_content
             .contains("<function=get_weather>"));
         assert!(normalized.runtime_content.contains("<parameter=city>"));
+    }
+
+    /// Responses renders tool turns in the model family's format, as chat
+    /// completions does.
+    #[test]
+    fn lfm25_tool_turns_use_the_lfm_wire_format() {
+        let item = |role: &str, content: Option<&str>, tool_calls| ResponseInputItem {
+            role: Some(role.to_string()),
+            content: content.map(|text| InboundContent::Text(text.to_string())),
+            tool_calls,
+        };
+        let (messages, _, _) = build_input_messages(
+            ModelVariant::Lfm2512BInstructGguf,
+            None,
+            Some(ResponseInput::Many(vec![
+                item("user", Some("Weather in Paris?"), None),
+                item(
+                    "assistant",
+                    None,
+                    Some(vec![json!({
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    })]),
+                ),
+                item("tool", Some("{\"temperature_c\": 21}"), None),
+            ])),
+        )
+        .expect("tool turns normalize");
+        assert_eq!(
+            messages[1].content,
+            "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
+        );
+        assert_eq!(messages[2].role, ChatRole::Tool);
+        assert_eq!(messages[2].content, "{\"temperature_c\": 21}");
     }
 
     #[test]
@@ -1139,24 +950,19 @@ mod tests {
             None,
             Some(ResponseInput::Many(vec![ResponseInputItem {
                 role: Some("user".to_string()),
-                content: Some(ResponseInputContent::Parts(vec![
-                    ResponseInputContentPart {
-                        kind: Some("image_url".to_string()),
-                        text: None,
-                        input_text: None,
-                        image_url: Some(json!({"url":"https://example.com/img.png"})),
-                        input_image: None,
-                        image: None,
-                        video: None,
-                        video_url: None,
-                        input_video: None,
-                    },
-                ])),
+                content: Some(InboundContent::Parts(vec![InboundContentPart {
+                    kind: Some("image_url".to_string()),
+                    text: None,
+                    input_text: None,
+                    image_url: Some(json!({"url":"https://example.com/img.png"})),
+                    input_image: None,
+                    image: None,
+                    video: None,
+                    video_url: None,
+                    input_video: None,
+                }])),
                 tool_calls: None,
             }])),
-            None,
-            None,
-            None,
         )
         .expect("multimodal input should normalize");
 
