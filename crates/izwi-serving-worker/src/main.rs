@@ -165,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("warm selected realtime TTS model before binding")?;
         }
+        TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     }
     // Resident model memory stays charged to this worker's runtime and resource
     // lease. Only the transient node-wide load stage is released here.
@@ -236,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
             )?;
             serve_worker(worker, &process).await
         }
+        TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     };
     result
 }
@@ -521,6 +523,7 @@ impl WorkerProcessConfig {
                 TaskKind::Chat => "LFM2.5-1.2B-Instruct-GGUF",
                 TaskKind::SpeechToText => "Nemotron-3.5-ASR-Streaming-0.6B",
                 TaskKind::TextToSpeech => "Kokoro-82M",
+                TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
             },
         );
         let variant = match task {
@@ -568,6 +571,7 @@ impl WorkerProcessConfig {
                     ),
                 }
             }
+            TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
         };
         let assignment = parse_assignment()?;
         let max_active_invocations = parse_env("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
@@ -652,7 +656,9 @@ impl WorkerProcessConfig {
     fn thread_budget(&self) -> usize {
         match &self.assignment {
             DeviceAssignment::Cpu { thread_budget, .. } => usize::from(*thread_budget),
-            DeviceAssignment::Metal { .. } | DeviceAssignment::Cuda { .. } => 1,
+            DeviceAssignment::Metal { .. }
+            | DeviceAssignment::Cuda { .. }
+            | DeviceAssignment::Unknown => 1,
         }
     }
 }
@@ -953,6 +959,7 @@ fn runtime_assignment(assignment: &DeviceAssignment) -> anyhow::Result<RuntimeDe
                 .context("CUDA device index does not fit this platform")?,
             expected_device_uuid: device_uuid.as_str().into(),
         },
+        DeviceAssignment::Unknown => bail!("parse_assignment yields only known backends"),
     })
 }
 
@@ -1088,6 +1095,7 @@ fn execution_profile(
             },
         ),
         TaskKind::TextToSpeech => ("fp32", "native-tts-realtime"),
+        TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     })
 }
 
@@ -1122,6 +1130,7 @@ fn loaded_deployment(
         TaskKind::Chat => (InputFormat::ChatMessages, OutputFormat::Text, false),
         TaskKind::SpeechToText => (InputFormat::PcmAudio, OutputFormat::Text, true),
         TaskKind::TextToSpeech => (InputFormat::Text, OutputFormat::PcmAudio, true),
+        TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
     };
     let (max_context_tokens, max_output_tokens) = if realtime {
         // Realtime sessions carry audio or bounded text, not chat context;

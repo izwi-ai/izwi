@@ -10,8 +10,8 @@ use izwi_serving_protocol::{
     InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind, InvocationRejection,
     InvocationRequest, NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials,
     WorkerDescriptor, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1,
-    SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
-    WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
+    PROTOCOL_VERSION_HEADER, SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME,
+    SERVICE_CREDENTIAL_ID_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
@@ -663,6 +663,9 @@ impl WorkerClient {
                 SERVICE_CREDENTIAL_ID_HEADER,
                 self.inner.credentials.credential_id.as_str(),
             )
+            // A worker leaves out of its answers what this version cannot
+            // decode.
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_V1.to_string())
     }
 
     fn url(&self, path: &str) -> reqwest::Url {
@@ -1106,7 +1109,9 @@ impl InvocationStream {
                     self.client.inner.config.progress_timeout,
                 );
             }
-            InvocationEventKind::TextDelta { .. } | InvocationEventKind::Usage { .. } => {}
+            InvocationEventKind::TextDelta { .. }
+            | InvocationEventKind::Usage { .. }
+            | InvocationEventKind::Unknown => {}
         }
         if event.is_terminal() {
             self.terminal_seen = true;

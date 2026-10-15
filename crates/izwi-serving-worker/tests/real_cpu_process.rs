@@ -120,6 +120,7 @@ fn chat_request(
                 top_p: Some(1.0),
                 seed: Some(0),
                 stop: Vec::new(),
+                ..ChatParameters::default()
             },
         },
     }

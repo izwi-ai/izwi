@@ -1,4 +1,4 @@
-use crate::{ConfigError, ValidatedNodeConfig};
+use crate::{ConfigError, ValidatedNodeConfig, WorkerConfig};
 use izwi_serving_protocol::{
     DeviceAssignment, IncarnationId, ServiceBearerToken, TaskKind, WorkerId,
 };
@@ -70,6 +70,7 @@ impl WorkerLockPaths {
             DeviceAssignment::Cpu { .. } => format!("cpu-worker:{worker_id}"),
             DeviceAssignment::Metal { device_id, .. } => format!("metal:{device_id}"),
             DeviceAssignment::Cuda { device_uuid, .. } => format!("cuda:{device_uuid}"),
+            DeviceAssignment::Unknown => format!("unknown-worker:{worker_id}"),
         };
         Self {
             ownership: namespace.resource_path(resource_identity.as_bytes()),
@@ -276,6 +277,7 @@ pub fn build_child_launch_spec(
             TaskKind::Chat => "chat",
             TaskKind::SpeechToText => "speech_to_text",
             TaskKind::TextToSpeech => "text_to_speech",
+            TaskKind::Unknown => return Err(unknown_protocol_value(worker, "deployment.task")),
         }
         .into(),
     );
@@ -447,6 +449,9 @@ pub fn build_child_launch_spec(
                 host_memory_limit_bytes.to_string().into(),
             );
         }
+        DeviceAssignment::Unknown => {
+            return Err(unknown_protocol_value(worker, "assignment.backend"));
+        }
     }
 
     Ok(ChildLaunchSpec {
@@ -456,6 +461,14 @@ pub fn build_child_launch_spec(
         clear_environment: true,
         environment,
         pipe_stdin_for_ownership: true,
+    })
+}
+
+/// Validation rejects these, so a validated node never reaches them.
+fn unknown_protocol_value(worker: &WorkerConfig, field: &'static str) -> LaunchSpecError {
+    LaunchSpecError::InvalidConfig(ConfigError::UnknownProtocolValue {
+        worker: worker.worker_id.clone(),
+        field,
     })
 }
 
@@ -521,6 +534,7 @@ mod tests {
             BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
             BackendKind::Metal => WorkerBinaryFlavor::Metal,
             BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
+            BackendKind::Unknown => unreachable!("tests build known backends"),
         };
         NodeConfig {
             schema_version: NODE_CONFIG_SCHEMA_VERSION,
@@ -606,13 +620,14 @@ mod tests {
                 host_device_index: 3,
                 total_memory_bytes: *device_memory_limit_bytes + 1,
             }),
-            DeviceAssignment::Cpu { .. } => {}
+            DeviceAssignment::Cpu { .. } | DeviceAssignment::Unknown => {}
         }
         let backend = assignment.backend();
         let flavor = match backend {
             BackendKind::Cpu => WorkerBinaryFlavor::Cpu,
             BackendKind::Metal => WorkerBinaryFlavor::Metal,
             BackendKind::Cuda => WorkerBinaryFlavor::Cuda,
+            BackendKind::Unknown => unreachable!("tests build known backends"),
         };
         let catalog = BinaryCatalog::new([(
             flavor,

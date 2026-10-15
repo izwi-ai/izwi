@@ -68,6 +68,8 @@ impl GatewayWorkerApproval {
             TaskKind::Chat => "chat",
             TaskKind::TextToSpeech => "text_to_speech",
             TaskKind::SpeechToText => "speech_to_text",
+            // Parsing never yields an unknown task.
+            TaskKind::Unknown => "unknown",
         };
         let tail = format!(
             "{}|{}|{}|{}",

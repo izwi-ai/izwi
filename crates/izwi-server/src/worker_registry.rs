@@ -276,6 +276,7 @@ impl BackendPolicy {
             BackendKind::Cpu => self.cpu,
             BackendKind::Metal => self.metal,
             BackendKind::Cuda => self.cuda,
+            BackendKind::Unknown => false,
         }
     }
 }
@@ -1377,6 +1378,7 @@ mod tests {
                 device_memory_limit_bytes: 1024,
                 host_memory_limit_bytes: 1024,
             },
+            BackendKind::Unknown => DeviceAssignment::Unknown,
         };
         WorkerDescriptor {
             schema_version: PROTOCOL_V1,

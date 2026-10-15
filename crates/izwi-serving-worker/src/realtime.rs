@@ -29,10 +29,10 @@ use futures::{
 };
 use izwi_serving_protocol::{
     decode_realtime_audio_frame, encode_realtime_audio_frame, AttemptState, InvocationErrorCode,
-    InvocationEvent, InvocationEventKind, ModelReadiness, PermittedAction, RealtimeAudioCodec,
-    RealtimeAudioSpec, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
-    RealtimeSessionBounds, RealtimeSessionCloseCode, RealtimeStageInput, RequestDigest, TaskKind,
-    WorkerFeature, MAX_REALTIME_AUDIO_FRAME_BYTES, MAX_REALTIME_INPUT_TEXT_BYTES, PROTOCOL_V1,
+    InvocationEvent, InvocationEventKind, ModelReadiness, PermittedAction, RealtimeAudioSpec,
+    RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeSessionBounds,
+    RealtimeSessionCloseCode, RealtimeStageInput, RequestDigest, TaskKind, WorkerFeature,
+    MAX_REALTIME_AUDIO_FRAME_BYTES, MAX_REALTIME_INPUT_TEXT_BYTES, PROTOCOL_V1,
     REALTIME_SUBPROTOCOL,
 };
 use std::{
@@ -459,11 +459,8 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                 return;
             }
         };
-        let RealtimeAudioSpec {
-            codec: RealtimeAudioCodec::PcmI16Le,
-            sample_rate,
-            channels: _,
-        } = spec;
+        // Admission validated the spec: mono PCM16.
+        let sample_rate = spec.sample_rate;
 
         let mut stream: Option<Box<dyn RealtimeAsrStageStream>> = None;
         let mut last_audio_sequence: Option<u32> = None;

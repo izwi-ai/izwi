@@ -300,7 +300,11 @@ pub async fn connect(
                         output_audio,
                     };
                 }
-                Ok(RealtimeServerFrame::Event { .. } | RealtimeServerFrame::Pong) => {
+                Ok(
+                    RealtimeServerFrame::Event { .. }
+                    | RealtimeServerFrame::Pong
+                    | RealtimeServerFrame::Unknown,
+                ) => {
                     return Err(RealtimeClientError::Protocol(
                         "admitted frame must be the first server frame".into(),
                     ));
@@ -488,7 +492,8 @@ impl RealtimeSession {
                             let event = self.validate_event(event)?;
                             return Ok(Some(event));
                         }
-                        RealtimeServerFrame::Pong => continue,
+                        // A frame type from a newer minor is skipped.
+                        RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown => continue,
                         RealtimeServerFrame::Admitted { .. } => {
                             return Err(RealtimeClientError::Protocol(
                                 "duplicate admitted frame".into(),
@@ -576,7 +581,8 @@ impl RealtimeSession {
                             }
                             self.pending_events.push_back(event);
                         }
-                        RealtimeServerFrame::Pong => continue,
+                        // A frame type from a newer minor is skipped.
+                        RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown => continue,
                         RealtimeServerFrame::Admitted { .. } => {
                             return Err(RealtimeClientError::Protocol(
                                 "duplicate admitted frame".into(),
@@ -707,7 +713,9 @@ impl RealtimeSession {
                 }
                 self.terminal_seen = true;
             }
-            InvocationEventKind::TextDelta { .. } | InvocationEventKind::Usage { .. } => {
+            InvocationEventKind::TextDelta { .. }
+            | InvocationEventKind::Usage { .. }
+            | InvocationEventKind::Unknown => {
                 if !self.accepted_seen {
                     return Err(RealtimeClientError::Protocol(
                         "stream event arrived before accepted".into(),

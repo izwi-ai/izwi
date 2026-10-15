@@ -136,6 +136,27 @@ pub struct MockWorkerConfig {
     /// DS9.3: logprob entries the mock attaches to every text delta. `None`
     /// keeps `TextDelta::logprobs` absent on the wire.
     pub delta_logprobs: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
+    /// The protocol version the mock implements. A version before minor 4
+    /// models an older worker: it advertises only that version and no
+    /// minor-4 chat feature.
+    pub protocol_version: SchemaVersion,
+    /// Minor-4 chat features the mock advertises (all by default). A chat
+    /// invocation that needs another feature is rejected as invalid, like
+    /// the real worker does.
+    pub chat_features: BTreeSet<WorkerFeature>,
+}
+
+/// Every minor-4 chat feature.
+pub fn minor4_chat_features() -> BTreeSet<WorkerFeature> {
+    BTreeSet::from([
+        WorkerFeature::ChatSeed,
+        WorkerFeature::ChatStopSequences,
+        WorkerFeature::ChatTopK,
+        WorkerFeature::ChatPenalties,
+        WorkerFeature::ChatLogprobs,
+        WorkerFeature::ChatJsonObject,
+        WorkerFeature::ChatContextPolicy,
+    ])
 }
 
 /// Configurable engine-signal values a mock worker advertises so gateway
@@ -188,6 +209,8 @@ impl Default for MockWorkerConfig {
             realtime_tts: None,
             usage_cached_input_tokens: None,
             delta_logprobs: None,
+            protocol_version: PROTOCOL_V1,
+            chat_features: minor4_chat_features(),
         }
     }
 }
@@ -205,6 +228,13 @@ impl MockWorkerConfig {
         }
         if self.realtime.is_some() && self.realtime_tts.is_some() {
             return Err("realtime and realtime_tts stages are mutually exclusive");
+        }
+        if self
+            .chat_features
+            .iter()
+            .any(|feature| feature.introduced_in_minor() > self.protocol_version.minor)
+        {
+            return Err("chat features must exist in the mock's protocol version");
         }
         Ok(())
     }
@@ -232,6 +262,7 @@ struct MockState {
     attempts: Mutex<AttemptTable>,
     status_sequence: AtomicU64,
     served_invocations: AtomicU64,
+    last_chat_parameters: Mutex<Option<ChatParameters>>,
 }
 
 impl MockState {
@@ -340,6 +371,7 @@ impl MockWorker {
             attempts: Mutex::new(AttemptTable::default()),
             status_sequence: AtomicU64::new(0),
             served_invocations: AtomicU64::new(0),
+            last_chat_parameters: Mutex::new(None),
             config,
         });
         let mut router = Router::new()
@@ -390,6 +422,16 @@ impl MockWorker {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
     }
 
+    /// The chat parameters of the last invocation this worker received, as
+    /// decoded from the wire.
+    pub fn last_chat_parameters(&self) -> Option<ChatParameters> {
+        self.state
+            .last_chat_parameters
+            .lock()
+            .expect("mock parameter record poisoned")
+            .clone()
+    }
+
     pub fn attempt_remaining_time_ms(&self, attempt_id: &AttemptId) -> Option<u64> {
         self.state
             .attempts
@@ -411,9 +453,31 @@ async fn descriptor(State(state): State<Arc<MockState>>, headers: HeaderMap) -> 
     if !state.authenticate(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(WorkerDescriptor {
-        schema_version: PROTOCOL_V1,
-        supported_protocol_versions: vec![PROTOCOL_V1],
+    let peer = headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(SchemaVersion::parse)
+        .unwrap_or(UNDECLARED_PEER_VERSION);
+    let mut features = if realtime_enabled(&state.config) {
+        BTreeSet::from([
+            WorkerFeature::Streaming,
+            WorkerFeature::Cancellation,
+            WorkerFeature::AttemptQuery,
+            WorkerFeature::RealtimeSocket,
+        ])
+    } else {
+        BTreeSet::from([
+            WorkerFeature::Streaming,
+            WorkerFeature::Cancellation,
+            WorkerFeature::AttemptQuery,
+        ])
+    };
+    if !realtime_enabled(&state.config) {
+        features.extend(state.config.chat_features.iter().copied());
+    }
+    let descriptor = WorkerDescriptor {
+        schema_version: state.config.protocol_version,
+        supported_protocol_versions: vec![state.config.protocol_version],
         worker_id: state.config.worker_id.clone(),
         node_id: state.config.node_id.clone(),
         incarnation_id: state.config.incarnation_id.clone(),
@@ -423,22 +487,9 @@ async fn descriptor(State(state): State<Arc<MockState>>, headers: HeaderMap) -> 
             affinity: Vec::new(),
             host_memory_limit_bytes: 64 * 1024 * 1024,
         },
-        features: if realtime_enabled(&state.config) {
-            BTreeSet::from([
-                WorkerFeature::Streaming,
-                WorkerFeature::Cancellation,
-                WorkerFeature::AttemptQuery,
-                WorkerFeature::RealtimeSocket,
-            ])
-        } else {
-            BTreeSet::from([
-                WorkerFeature::Streaming,
-                WorkerFeature::Cancellation,
-                WorkerFeature::AttemptQuery,
-            ])
-        },
-    })
-    .into_response()
+        features,
+    };
+    Json(descriptor.for_peer(peer)).into_response()
 }
 
 async fn status(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
@@ -616,6 +667,23 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
             StatusCode::SERVICE_UNAVAILABLE,
             RejectionCode::ModelNotReady,
             "deployment is not ready",
+        );
+    }
+    let InvocationInput::Chat { parameters, .. } = &request.input;
+    *state
+        .last_chat_parameters
+        .lock()
+        .expect("mock parameter record poisoned") = Some(parameters.clone());
+    if let Some(missing) = parameters
+        .required_features()
+        .into_iter()
+        .find(|feature| !state.config.chat_features.contains(feature))
+    {
+        return rejection(
+            &request,
+            StatusCode::BAD_REQUEST,
+            RejectionCode::InvalidRequest,
+            format!("worker does not advertise {missing:?}"),
         );
     }
 

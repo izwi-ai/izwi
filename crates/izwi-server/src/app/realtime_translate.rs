@@ -246,7 +246,7 @@ fn map_worker_error_code(code: InvocationErrorCode) -> RealtimeErrorCode {
         }
         InvocationErrorCode::OutputLimitExceeded => RealtimeErrorCode::BufferLimit,
         InvocationErrorCode::WorkerUnavailable => RealtimeErrorCode::ModelUnavailable,
-        InvocationErrorCode::Internal => RealtimeErrorCode::Internal,
+        InvocationErrorCode::Internal | InvocationErrorCode::Unknown => RealtimeErrorCode::Internal,
     }
 }
 
@@ -791,7 +791,10 @@ async fn handle_invocation_event(
     event: InvocationEvent,
 ) -> bool {
     match event.event {
-        InvocationEventKind::Accepted { .. } | InvocationEventKind::Usage { .. } => {}
+        // An event type from a newer protocol minor is not terminal.
+        InvocationEventKind::Accepted { .. }
+        | InvocationEventKind::Usage { .. }
+        | InvocationEventKind::Unknown => {}
         InvocationEventKind::TextDelta { text, .. } => {
             if let Some(partial) = session.transcript.push(text) {
                 match session.wire {

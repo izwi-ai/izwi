@@ -148,6 +148,7 @@ impl WorkerConfig {
                     return Err(WorkerConfigError::UnsupportedDeployment);
                 }
             }
+            TaskKind::Unknown => return Err(WorkerConfigError::UnsupportedDeployment),
         }
         if self.max_active_invocations == 0 {
             return Err(WorkerConfigError::ZeroActiveCapacity);
@@ -1106,7 +1107,18 @@ async fn descriptor<E: InvocationExecutor>(
             .fetch_add(1, Ordering::Relaxed);
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.config.descriptor.clone()).into_response()
+    let peer = peer_protocol_version(&headers);
+    Json(state.config.descriptor.for_peer(peer)).into_response()
+}
+
+/// The protocol version a gateway declared in [`PROTOCOL_VERSION_HEADER`],
+/// or [`UNDECLARED_PEER_VERSION`] for gateways from before the header.
+fn peer_protocol_version(headers: &HeaderMap) -> SchemaVersion {
+    headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(SchemaVersion::parse)
+        .unwrap_or(UNDECLARED_PEER_VERSION)
 }
 
 /// Map managed-KV engine counters onto the deployment's optional routing
@@ -2422,7 +2434,11 @@ fn rejection_status(code: RejectionCode) -> StatusCode {
         RejectionCode::CapacityExhausted | RejectionCode::QueueWaitExceeded => {
             StatusCode::TOO_MANY_REQUESTS
         }
-        RejectionCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        RejectionCode::InvalidRequest | RejectionCode::ContextLengthExceeded => {
+            StatusCode::BAD_REQUEST
+        }
+        // A worker never sends a code it does not know.
+        RejectionCode::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -2670,6 +2686,57 @@ mod tests {
             InvocationEventKind::Completed { .. }
         ));
         assert_eq!(service.active_invocations(), 0);
+    }
+
+    /// DP-F11: a gateway from before minor 4 sends no version header and
+    /// cannot decode minor-4 features, so the worker leaves them out for it.
+    #[tokio::test]
+    async fn descriptor_leaves_out_features_the_gateway_cannot_decode() {
+        let mut config = config();
+        config.descriptor.features.insert(WorkerFeature::ChatSeed);
+        let service = WorkerService::new(
+            config,
+            HealthExecutor {
+                health: Arc::new(Mutex::new(RuntimeHealth::Healthy)),
+            },
+        )
+        .unwrap();
+        let descriptor = |version: Option<&str>| {
+            let mut request = authorized_request("GET", WORKER_DESCRIPTOR_PATH, Body::empty());
+            if let Some(version) = version {
+                request
+                    .headers_mut()
+                    .insert(PROTOCOL_VERSION_HEADER, version.parse().unwrap());
+            }
+            let router = service.router();
+            async move {
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+        for (version, advertised) in [
+            (None, false),
+            (Some("1.3"), false),
+            (Some("not-a-version"), false),
+            (Some("1.4"), true),
+            (Some("1.9"), true),
+        ] {
+            let features = descriptor(version).await["features"].clone();
+            assert_eq!(
+                features
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("chat_seed")),
+                advertised,
+                "{version:?}: {features}"
+            );
+            assert!(features
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("streaming")));
+        }
     }
 
     struct HealthExecutor {

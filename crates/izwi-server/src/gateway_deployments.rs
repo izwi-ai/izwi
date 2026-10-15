@@ -494,10 +494,12 @@ mod tests {
                     TaskKind::Chat => InputFormat::ChatMessages,
                     TaskKind::TextToSpeech => InputFormat::ChatMessages,
                     TaskKind::SpeechToText => InputFormat::EncodedAudio,
+                    TaskKind::Unknown => InputFormat::Unknown,
                 }]),
                 output_formats: BTreeSet::from([match task {
                     TaskKind::Chat | TaskKind::SpeechToText => OutputFormat::Text,
                     TaskKind::TextToSpeech => OutputFormat::EncodedAudio,
+                    TaskKind::Unknown => OutputFormat::Unknown,
                 }]),
                 max_input_bytes: 4096,
                 max_context_tokens: (task == TaskKind::Chat).then_some(4096),

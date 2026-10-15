@@ -372,8 +372,9 @@ async fn run_relay_session(
                 return;
             }
         },
-        // Protocol validate rejects chat admits before this point.
-        TaskKind::Chat => {
+        // Protocol validate rejects chat and unknown-task admits before
+        // this point.
+        TaskKind::Chat | TaskKind::Unknown => {
             close_client(
                 &mut client_sink,
                 Some(RealtimeSessionCloseCode::ProtocolViolation),
@@ -948,7 +949,9 @@ pub(crate) async fn dial_worker_session(
                             admitted_message,
                         });
                     }
-                    RealtimeServerFrame::Event { .. } | RealtimeServerFrame::Pong => {
+                    RealtimeServerFrame::Event { .. }
+                    | RealtimeServerFrame::Pong
+                    | RealtimeServerFrame::Unknown => {
                         return Err(WorkerDialError::Protocol(
                             "admitted frame must be the first server frame",
                         ));

@@ -136,6 +136,7 @@ async fn collect_lane_outputs(
                         top_p: Some(1.0),
                         seed: Some(0),
                         stop: Vec::new(),
+                        ..ChatParameters::default()
                     },
                 },
             })
@@ -430,6 +431,7 @@ async fn collect_prefix_lane_with_env(
                         top_p: Some(1.0),
                         seed: Some(0),
                         stop: Vec::new(),
+                        ..ChatParameters::default()
                     },
                 },
             })

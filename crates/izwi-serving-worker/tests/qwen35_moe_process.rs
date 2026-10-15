@@ -131,6 +131,7 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
                     top_p: Some(1.0),
                     seed: Some(0),
                     stop: Vec::new(),
+                    ..ChatParameters::default()
                 },
             },
         })

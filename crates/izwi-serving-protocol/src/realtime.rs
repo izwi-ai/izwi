@@ -53,6 +53,9 @@ pub const REALTIME_AUDIO_FLAG_FINAL: u8 = 0b0000_0001;
 pub enum RealtimeAudioCodec {
     /// Little-endian signed 16-bit PCM, interleaved if channels > 1.
     PcmI16Le,
+    /// A codec from a newer protocol minor; it fails validation.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Declared audio format for one direction of a realtime session.
@@ -275,6 +278,9 @@ pub enum RealtimeServerFrame {
     Event {
         event: InvocationEvent,
     },
+    /// A frame type from a newer protocol minor, which a receiver skips.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Fixed-layout binary audio frame: 16-byte header followed by the codec

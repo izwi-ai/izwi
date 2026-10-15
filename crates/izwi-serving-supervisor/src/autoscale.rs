@@ -518,6 +518,11 @@ impl ResourceLedger {
                 self.reserved_cuda_memory
                     .insert(device_uuid.clone(), device);
             }
+            DeviceAssignment::Unknown => {
+                return Err(rejection(
+                    "worker assignment backend is unknown".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -564,6 +569,8 @@ impl ResourceLedger {
                     *reserved = reserved.saturating_sub(*device_memory_limit_bytes);
                 }
             }
+            // `reserve` never admits it.
+            DeviceAssignment::Unknown => {}
         }
     }
 }

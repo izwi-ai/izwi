@@ -672,7 +672,8 @@ where
             }
         };
         match event.event {
-            InvocationEventKind::Accepted { .. } => {}
+            // An event type from a newer protocol minor is not terminal.
+            InvocationEventKind::Accepted { .. } | InvocationEventKind::Unknown => {}
             InvocationEventKind::TextDelta {
                 text: delta,
                 logprobs,
@@ -905,7 +906,9 @@ fn worker_chat_generation(
     Ok(ChatGeneration {
         latency_breakdown: None,
         finish_reason: Some(match finish_reason {
-            WorkerFinishReason::Stop => izwi_core::engine::OutputFinishReason::StopToken,
+            WorkerFinishReason::Stop | WorkerFinishReason::Unknown => {
+                izwi_core::engine::OutputFinishReason::StopToken
+            }
             WorkerFinishReason::Length => izwi_core::engine::OutputFinishReason::MaxTokens,
         }),
         text,
@@ -1052,6 +1055,8 @@ where
                     }
                 }
                 InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
+                // An event type from a newer protocol minor is not terminal.
+                InvocationEventKind::Unknown => {}
                 InvocationEventKind::Completed {
                     finish_reason,
                     usage,
@@ -1180,6 +1185,7 @@ fn build_remote_chat_invocation(
             top_p: Some(sampling.top_p),
             seed: None,
             stop: request.stop,
+            ..WorkerChatParameters::default()
         },
     };
     let request_id = RequestId::new(new_uuid()).map_err(identifier_error)?;
@@ -1297,14 +1303,15 @@ pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
                 | RejectionCode::CapacityExhausted
                 | RejectionCode::QueueWaitExceeded => ApiError::service_unavailable(message),
                 RejectionCode::InvalidRequest => ApiError::bad_request(message),
+                RejectionCode::ContextLengthExceeded => ApiError::context_length_exceeded(message),
                 RejectionCode::DuplicateAttemptConflict => ApiError {
                     status: StatusCode::CONFLICT,
                     message,
                     detail: None,
                 },
-                RejectionCode::Unauthenticated | RejectionCode::UnsupportedProtocolVersion => {
-                    bad_gateway_error(message)
-                }
+                RejectionCode::Unauthenticated
+                | RejectionCode::UnsupportedProtocolVersion
+                | RejectionCode::Unknown => bad_gateway_error(message),
             }
         }
         WorkerClientError::AdmissionUnknown { .. } => {
@@ -1337,7 +1344,8 @@ fn map_worker_terminal_error(code: InvocationErrorCode, message: String) -> ApiE
         InvocationErrorCode::WorkerUnavailable => ApiError::service_unavailable(message),
         InvocationErrorCode::ExecutionFailed
         | InvocationErrorCode::OutputLimitExceeded
-        | InvocationErrorCode::Internal => ApiError::internal(message),
+        | InvocationErrorCode::Internal
+        | InvocationErrorCode::Unknown => ApiError::internal(message),
     }
 }
 
@@ -1577,6 +1585,51 @@ mod tests {
         assert_eq!(
             unmeasured.cached_prompt_tokens, None,
             "unmeasured cache stays absent so the public surface renders zero"
+        );
+    }
+
+    /// D8 over the wire: a worker's context overflow is the same OpenAI
+    /// `context_length_exceeded` 400 the local server returns, and codes or
+    /// finish reasons from a newer worker never read as success.
+    #[test]
+    fn worker_context_overflow_and_newer_codes_map_like_the_local_server() {
+        let rejected = |code| {
+            map_worker_client_error(WorkerClientError::Rejected {
+                rejection: izwi_serving_protocol::InvocationRejection::new(
+                    RequestId::new("request-1").unwrap(),
+                    AttemptId::new("attempt-1").unwrap(),
+                    code,
+                    "This model's maximum context length is 32 tokens.",
+                ),
+            })
+        };
+        let overflow = rejected(RejectionCode::ContextLengthExceeded);
+        let local = ApiError::from(izwi_core::Error::ContextLengthExceeded(
+            "This model's maximum context length is 32 tokens.".into(),
+        ));
+        assert_eq!(overflow.status, local.status);
+        assert_eq!(overflow.message, local.message);
+        assert_eq!(overflow.detail, local.detail);
+
+        assert_eq!(
+            rejected(RejectionCode::Unknown).status,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            map_worker_terminal_error(InvocationErrorCode::Unknown, "new".into()).status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let generation = worker_chat_generation(
+            String::new(),
+            WorkerFinishReason::Unknown,
+            None,
+            std::time::Instant::now(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            generation.finish_reason,
+            Some(izwi_core::engine::OutputFinishReason::StopToken)
         );
     }
 

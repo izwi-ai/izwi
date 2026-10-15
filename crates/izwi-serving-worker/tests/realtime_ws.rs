@@ -358,7 +358,9 @@ async fn next_frame(ws: &mut WsStream) -> NextFrame {
             Message::Text(text) => match serde_json::from_str::<RealtimeServerFrame>(&text) {
                 Ok(RealtimeServerFrame::Admitted { .. }) => return NextFrame::Admitted,
                 Ok(RealtimeServerFrame::Event { event }) => return NextFrame::Event(event),
-                Ok(RealtimeServerFrame::Pong) => return NextFrame::Other,
+                Ok(RealtimeServerFrame::Pong | RealtimeServerFrame::Unknown) => {
+                    return NextFrame::Other
+                }
                 Err(_) => return NextFrame::Other,
             },
             Message::Binary(bytes) => match decode_realtime_audio_frame(&bytes) {

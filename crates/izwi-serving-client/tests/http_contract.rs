@@ -195,6 +195,74 @@ async fn generic_http_503_is_not_a_safe_rejection() {
     server.abort();
 }
 
+/// DP-F11: the client declares its protocol version, so a worker shows it
+/// the minor-4 chat features that a gateway without the header (minor 3)
+/// cannot decode; an older worker negotiates its own minor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descriptor_negotiates_the_minor_and_its_features() {
+    let worker = MockWorker::spawn(MockWorkerConfig::default())
+        .await
+        .unwrap();
+    let descriptor = client(&worker).descriptor().await.unwrap();
+    assert_eq!(descriptor.negotiated_version(), Some(PROTOCOL_V1));
+    assert!(descriptor.features.contains(&WorkerFeature::ChatSeed));
+
+    let undeclared: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{}{}",
+            worker.endpoint(),
+            WORKER_DESCRIPTOR_PATH.trim_start_matches('/')
+        ))
+        .header(
+            SERVICE_AUTHORIZATION_HEADER,
+            format!(
+                "{SERVICE_AUTH_SCHEME} {}",
+                worker.config().credentials.bearer_token.expose_secret()
+            ),
+        )
+        .header(
+            SERVICE_CREDENTIAL_ID_HEADER,
+            worker.config().credentials.credential_id.as_str(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        undeclared["features"],
+        serde_json::json!(["streaming", "cancellation", "attempt_query"])
+    );
+
+    let minor3 = MockWorker::spawn(MockWorkerConfig {
+        protocol_version: SchemaVersion::new(1, 3),
+        chat_features: BTreeSet::new(),
+        ..MockWorkerConfig::default()
+    })
+    .await
+    .unwrap();
+    let descriptor = client(&minor3).descriptor().await.unwrap();
+    assert_eq!(
+        descriptor.negotiated_version(),
+        Some(SchemaVersion::new(1, 3))
+    );
+    // A knob the worker does not advertise is refused, never ignored.
+    let mut seeded = request(minor3.config(), "seeded");
+    let InvocationInput::Chat { parameters, .. } = &mut seeded.input;
+    parameters.seed = Some(7);
+    assert!(matches!(
+        client(&minor3).invoke_collect(seeded).await,
+        Err(WorkerClientError::Rejected { rejection }) if rejection.code == RejectionCode::InvalidRequest
+    ));
+    assert_eq!(
+        minor3
+            .last_chat_parameters()
+            .and_then(|parameters| parameters.seed),
+        Some(7)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
     let worker = MockWorker::spawn(MockWorkerConfig::default())

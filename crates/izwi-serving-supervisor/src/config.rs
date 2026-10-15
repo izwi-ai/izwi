@@ -285,6 +285,13 @@ impl NodeConfig {
                         "aggregate host memory budget",
                     )?;
                 }
+                // `validate_common` already rejected it.
+                DeviceAssignment::Unknown => {
+                    return Err(ConfigError::UnknownProtocolValue {
+                        worker: worker.worker_id.clone(),
+                        field: "assignment.backend",
+                    })
+                }
             }
         }
 
@@ -342,6 +349,7 @@ pub struct WorkerConfig {
 
 impl WorkerConfig {
     fn validate_common(&self) -> Result<(), ConfigError> {
+        self.reject_unknown_protocol_values()?;
         validate_env_name(&self.bearer_token_env)?;
         validate_path_length("models_directory", &self.deployment.models_directory)?;
         if self.max_active_invocations == 0 {
@@ -425,6 +433,12 @@ impl WorkerConfig {
                 shared_memory_limit_bytes,
                 ..
             } => (*shared_memory_limit_bytes, "shared_memory_limit_bytes"),
+            DeviceAssignment::Unknown => {
+                return Err(ConfigError::UnknownProtocolValue {
+                    worker: self.worker_id.clone(),
+                    field: "assignment.backend",
+                })
+            }
         };
         if self.host_kv_pool_budget_bytes > limit {
             return Err(ConfigError::KvPoolBudgetExceedsWorkerLimit {
@@ -452,6 +466,37 @@ pub struct DeploymentConfig {
     pub tokenizer_revision: Option<ArtifactRevision>,
     pub capability: CapabilityProfileConfig,
     pub models_directory: PathBuf,
+}
+
+impl WorkerConfig {
+    /// Protocol enums decode a value from a newer protocol minor as
+    /// `Unknown`; in an operator's node file that is a typo, not a value.
+    fn reject_unknown_protocol_values(&self) -> Result<(), ConfigError> {
+        let deployment = &self.deployment;
+        let capability = &deployment.capability;
+        let field = if matches!(self.assignment, DeviceAssignment::Unknown) {
+            "assignment.backend"
+        } else if deployment.task == TaskKind::Unknown {
+            "deployment.task"
+        } else if deployment.backend == BackendKind::Unknown {
+            "deployment.backend"
+        } else if capability.cancellation == CancellationBehavior::Unknown {
+            "deployment.capability.cancellation"
+        } else if capability
+            .accepted_input_formats
+            .contains(&InputFormat::Unknown)
+        {
+            "deployment.capability.accepted_input_formats"
+        } else if capability.output_formats.contains(&OutputFormat::Unknown) {
+            "deployment.capability.output_formats"
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::UnknownProtocolValue {
+            worker: self.worker_id.clone(),
+            field,
+        })
+    }
 }
 
 impl DeploymentConfig {
@@ -942,6 +987,11 @@ pub enum ConfigError {
         threads: u16,
         cpus: usize,
     },
+    #[error("worker {worker} {field} names a value this supervisor does not know")]
+    UnknownProtocolValue {
+        worker: WorkerId,
+        field: &'static str,
+    },
     #[error("aggregate CPU budget requests {requested} threads; {available} are effective")]
     CpuOvercommit { requested: u64, available: usize },
     #[error("duplicate exclusive {backend:?} device assignment {device}")]
@@ -1252,6 +1302,7 @@ fn reserve_exclusive(
         BackendKind::Cpu => 0,
         BackendKind::Metal => 1,
         BackendKind::Cuda => 2,
+        BackendKind::Unknown => 3,
     };
     if devices.insert((backend_key, device.clone())) {
         Ok(())
@@ -1712,6 +1763,53 @@ max_output_tokens = 32
             NodeConfig::parse_bounded(unknown_capability_field.as_bytes()),
             Err(ConfigError::Toml(_))
         ));
+    }
+
+    /// Protocol enums tolerate values from newer minors as `Unknown`; in a
+    /// node file such a value is a typo and fails validation.
+    #[test]
+    fn rejects_protocol_values_the_supervisor_does_not_know() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+        type Mutation = fn(&mut WorkerConfig);
+        let mutations: [(&str, Mutation); 6] = [
+            ("assignment.backend", |worker| {
+                worker.assignment = DeviceAssignment::Unknown
+            }),
+            ("deployment.task", |worker| {
+                worker.deployment.task = TaskKind::Unknown
+            }),
+            ("deployment.backend", |worker| {
+                worker.deployment.backend = BackendKind::Unknown
+            }),
+            ("deployment.capability.cancellation", |worker| {
+                worker.deployment.capability.cancellation = CancellationBehavior::Unknown
+            }),
+            ("deployment.capability.accepted_input_formats", |worker| {
+                worker
+                    .deployment
+                    .capability
+                    .accepted_input_formats
+                    .insert(InputFormat::Unknown);
+            }),
+            ("deployment.capability.output_formats", |worker| {
+                worker
+                    .deployment
+                    .capability
+                    .output_formats
+                    .insert(OutputFormat::Unknown);
+            }),
+        ];
+        for (expected, mutate) in mutations {
+            let mut config = cpu_config(directory.path());
+            mutate(&mut config.workers[0]);
+            match config.validate(&inventory(), &binaries) {
+                Err(ConfigError::UnknownProtocolValue { field, .. }) => {
+                    assert_eq!(field, expected)
+                }
+                other => panic!("{expected}: expected UnknownProtocolValue, got {other:?}"),
+            }
+        }
     }
 
     #[test]
