@@ -251,9 +251,13 @@ The supervisor:
 6. monitors exits with bounded exponential backoff, jitter, stable-uptime reset,
    and restart-window quarantine.
 
-Do not start the gateway until every configured worker needed at gateway startup
-is Ready. Gateway startup reads every approved endpoint synchronously and fails
-if one is unavailable or violates its approval.
+Gateway startup reads every approved endpoint once. Approvals that cannot work
+at all (an empty or duplicated endpoint, an endpoint the topology forbids, two
+endpoints answering as one logical worker) fail startup. An approved worker
+that is unavailable or does not yet match its approval does not: the gateway
+starts without it, logs a warning, and retries the adoption every status-poll
+interval, so one down replica never takes a restarting gateway down. `/readyz`
+stays 503 until at least one fresh compatible worker is adopted.
 
 ### 2. Start the gateway
 
@@ -833,7 +837,8 @@ Operate it like the rest of the supervisor:
 | Supervisor validate-only reports a missing secret | The exact `bearer_token_env` name and service-manager environment | Supply the secret out of band; do not add it to TOML or argv |
 | Config rejects host memory, CPUs, endpoint, or device | Operator inventory, aggregate budgets, real directories/executable, loopback ports | Correct the allocation; never enable backend fallback |
 | Worker never becomes Ready | Worker log for manifest, strict backend, budget-pair, load/warm-up, or identity failure | Leave it unadvertised; fix the pinned contract or resource assignment |
-| Gateway exits during startup | Every approved endpoint must answer authenticated descriptor/status and match task/model/deployment/generation | Start/fix workers first; do not weaken approval checks |
+| Gateway exits during startup | Empty, duplicated or topology-forbidden endpoints; two endpoints reporting the same logical worker | Fix the approvals; do not weaken approval checks |
+| Approved worker never adopted | Warning "Approved worker is not adoptable yet" at startup, then retries at debug level; the endpoint must answer authenticated descriptor/status and match task/model/deployment/generation | Start or fix the worker; the gateway adopts it without a restart |
 | `/readyz` is 503 | Lifecycle/draining and `compatible_worker_ready` detail; status TTL/poll; matching JSON+SSE capability | Restore a fresh matching worker or correct the static approval |
 | Public route returns 401 | Public bearer key reference/value | Rotate/fix the environment; caller identity headers cannot repair auth |
 | Public route returns 403 or 503 from policy | Enterprise inference policy result or hook health | Repair policy service/rules; do not bypass the hook |

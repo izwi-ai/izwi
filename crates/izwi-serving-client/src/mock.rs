@@ -323,6 +323,15 @@ impl std::fmt::Debug for MockWorker {
 
 impl MockWorker {
     pub async fn spawn(config: MockWorkerConfig) -> Result<Self, std::io::Error> {
+        Self::spawn_at(config, std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await
+    }
+
+    /// Like [`Self::spawn`], at a fixed address: a test can approve the
+    /// endpoint first and start the worker behind it later.
+    pub async fn spawn_at(
+        config: MockWorkerConfig,
+        address: std::net::SocketAddr,
+    ) -> Result<Self, std::io::Error> {
         config.validate().map_err(std::io::Error::other)?;
         let max_request_bytes = config.max_request_bytes;
         let realtime_enabled = config.realtime.is_some() || config.realtime_tts.is_some();
@@ -351,7 +360,7 @@ impl MockWorker {
         let router = router
             .layer(DefaultBodyLimit::max(max_request_bytes))
             .with_state(Arc::clone(&state));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = tokio::net::TcpListener::bind(address).await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
