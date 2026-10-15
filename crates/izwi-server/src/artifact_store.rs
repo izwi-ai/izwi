@@ -3165,6 +3165,11 @@ mod tests {
             root.path().join("pcm-limit.sqlite3"),
         ));
         metadata.set_pcm_replay_entry_limit_for_test(1);
+        // Both clocks are fixed so the 10 ms reservations cannot expire
+        // before the writes land, however slowly the test runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        metadata.set_test_clock(clock.clone());
+        provider.set_now_unix_ms(1_000);
         let metadata = Arc::new(metadata);
         let mut store = ArtifactStore::new(
             metadata.clone(),
@@ -3219,7 +3224,9 @@ mod tests {
             1
         );
         assert_eq!(provider.object_count(), 2);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(store.cleanup_due(64).await.unwrap().completed, 0);
+        clock.store(1_010, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_010);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
         assert_eq!(provider.object_count(), 1);
     }
