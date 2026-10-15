@@ -2732,9 +2732,18 @@ mod tests {
         let lease_expiry = requested.lease_expires_at;
         let attempt_token = requested.attempt_token.clone();
         assert_eq!(requested.status, RuntimeStageStatus::Running);
-        assert_eq!(
-            requested.cancellation_state,
-            Some(RuntimeCancellationState::Requested)
+        // The worker polls every 10 ms and may already have moved the request
+        // on to ExecutionStopping; either way the running stage carries it.
+        assert!(
+            matches!(
+                requested.cancellation_state,
+                Some(
+                    RuntimeCancellationState::Requested
+                        | RuntimeCancellationState::ExecutionStopping
+                )
+            ),
+            "{:?}",
+            requested.cancellation_state
         );
         assert!(owner.is_some());
         assert!(lease_expiry.is_some());
