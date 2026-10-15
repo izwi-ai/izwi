@@ -28,3 +28,4 @@ pub mod voice;
 pub mod voice_realtime;
 
 pub use router::create_router;
+pub(crate) use router::DESKTOP_CORS_ORIGINS;

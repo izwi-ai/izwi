@@ -15,10 +15,11 @@ use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::attach_enterprise_request_context;
+use crate::local_security::{guard_local_request, LocalRequestGuard};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
 
-const DESKTOP_CORS_ORIGINS: &[&str] = &[
+pub(crate) const DESKTOP_CORS_ORIGINS: &[&str] = &[
     "tauri://localhost",
     "http://tauri.localhost",
     "https://tauri.localhost",
@@ -115,6 +116,10 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .layer(middleware::from_fn_with_state(
             middleware_state,
             attach_enterprise_request_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            LocalRequestGuard::new(serve_config),
+            guard_local_request,
         ));
     // CORS is the outermost layer so browser preflights are answered before
     // authentication, which would otherwise reject them for lacking a key.
@@ -2937,6 +2942,58 @@ mod tests {
         )
         .await;
         assert_eq!(authorized.status(), StatusCode::OK);
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn local_router_rejects_cross_site_writes_and_rebound_hosts() {
+        let (app, temp_dir) = test_api_app("local_router_csrf_guard", false);
+        let load = |headers: &[(header::HeaderName, &str)]| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/admin/models/Qwen3-TTS-12Hz-0.6B-Base/unload");
+            for (name, value) in headers {
+                builder = builder.header(name.clone(), *value);
+            }
+            builder.body(Body::empty()).expect("request should build")
+        };
+
+        let cross_site = send_request(
+            app.clone(),
+            load(&[
+                (header::HOST, "127.0.0.1:8080"),
+                (header::ORIGIN, "https://attacker.example"),
+            ]),
+        )
+        .await;
+        assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+
+        let form = send_request(app.clone(), load(&[(header::CONTENT_TYPE, "text/plain")])).await;
+        assert_eq!(form.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let rebound = send_request(
+            app.clone(),
+            Request::builder()
+                .uri("/v1/admin/models")
+                .header(header::HOST, "attacker.example:8080")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+        assert_eq!(rebound.status(), StatusCode::FORBIDDEN);
+
+        let same_origin = send_request(
+            app,
+            load(&[
+                (header::HOST, "localhost:8080"),
+                (header::ORIGIN, "http://localhost:8080"),
+                (header::CONTENT_TYPE, "application/json"),
+            ]),
+        )
+        .await;
+        assert_ne!(same_origin.status(), StatusCode::FORBIDDEN);
+        assert_ne!(same_origin.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         drop(temp_dir);
     }

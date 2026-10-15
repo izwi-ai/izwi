@@ -9,8 +9,19 @@
 //! The key is enforced through the enterprise `AuthProvider` seam: it wraps
 //! whatever provider the build supplies, so the principal (and therefore the
 //! tenant) still comes from that provider.
+//!
+//! Independently of the key, [`guard_local_request`] protects browsers'
+//! access to the server: a loopback-bound server only answers loopback `Host`
+//! names (DNS rebinding), and writes and WebSocket upgrades from another
+//! site's page are rejected by `Origin`, plus form content types that a
+//! cross-site form can send without a CORS preflight.
 
 use async_trait::async_trait;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use izwi_core::ServeRuntimeConfig;
 use izwi_hooks::{
     AuthProvider, EnterpriseHooks, HookError, HookResult, Principal, RequestEnvelope,
 };
@@ -19,6 +30,8 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::api::DESKTOP_CORS_ORIGINS;
+use crate::error::ApiError;
 use crate::gateway_security::{constant_time_eq, is_loopback_host, validate_secret};
 
 pub(crate) const API_KEY_ENV: &str = "IZWI_API_KEY";
@@ -185,6 +198,156 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+/// Host and Origin policy for browser-reachable local requests.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalRequestGuard {
+    loopback_bind: bool,
+    bound_host: String,
+    any_origin: bool,
+    allowed_origins: Arc<[String]>,
+}
+
+impl LocalRequestGuard {
+    pub(crate) fn new(serve_config: &ServeRuntimeConfig) -> Self {
+        let any_origin = serve_config.cors_enabled
+            && (serve_config.cors_origins.is_empty()
+                || serve_config
+                    .cors_origins
+                    .iter()
+                    .any(|origin| origin.trim() == "*"));
+        let allowed_origins = if serve_config.cors_enabled {
+            serve_config
+                .cors_origins
+                .iter()
+                .map(|origin| origin.trim().to_ascii_lowercase())
+                .collect()
+        } else {
+            Arc::from([])
+        };
+        Self {
+            loopback_bind: is_loopback_host(&serve_config.host),
+            bound_host: host_name(&serve_config.host).to_ascii_lowercase(),
+            any_origin,
+            allowed_origins,
+        }
+    }
+
+    fn check(
+        &self,
+        method: &Method,
+        headers: &HeaderMap,
+        authority: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or(authority);
+        if self.loopback_bind
+            && host.is_some_and(|host| {
+                let name = host_name(host);
+                !is_loopback_name(name) && !name.eq_ignore_ascii_case(&self.bound_host)
+            })
+        {
+            return Err(ApiError::forbidden(
+                "Host header is not allowed for a loopback-bound server",
+            ));
+        }
+
+        let writes = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+        let upgrade = headers.contains_key(header::UPGRADE);
+        if !writes && !upgrade {
+            return Ok(());
+        }
+        // Browsers always send Origin on cross-origin writes and WebSocket
+        // handshakes; non-browser clients usually send none.
+        if let Some(origin) = headers.get(header::ORIGIN) {
+            let allowed = origin
+                .to_str()
+                .is_ok_and(|origin| self.origin_allowed(origin, host));
+            if !allowed {
+                return Err(ApiError::forbidden("Cross-origin request rejected"));
+            }
+        }
+        if writes && has_form_content_type(headers) {
+            return Err(ApiError {
+                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                message: "Use application/json or multipart/form-data".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn origin_allowed(&self, origin: &str, host: Option<&str>) -> bool {
+        let origin = origin.trim().to_ascii_lowercase();
+        if origin == "null" {
+            return false;
+        }
+        if self.any_origin
+            || DESKTOP_CORS_ORIGINS.contains(&origin.as_str())
+            || self
+                .allowed_origins
+                .iter()
+                .any(|allowed| *allowed == origin)
+        {
+            return true;
+        }
+        let Some(authority) = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+        else {
+            return false;
+        };
+        // Pages served from this machine (the Vite dev server's proxy keeps
+        // its own Origin) and same-origin pages are trusted.
+        is_loopback_name(host_name(authority))
+            || host.is_some_and(|host| authority.eq_ignore_ascii_case(host.trim()))
+    }
+}
+
+pub(crate) async fn guard_local_request(
+    State(guard): State<LocalRequestGuard>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let authority = req.uri().authority().map(|authority| authority.as_str());
+    if let Err(err) = guard.check(req.method(), req.headers(), authority) {
+        return err.into_response();
+    }
+    next.run(req).await
+}
+
+/// Host name without port or IPv6 brackets.
+fn host_name(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    }
+}
+
+fn is_loopback_name(name: &str) -> bool {
+    is_loopback_host(name) || name.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// Content types a cross-site HTML form can send without a CORS preflight,
+/// other than multipart (which upload routes accept). No route takes them.
+fn has_form_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| {
+            let essence = essence.trim();
+            essence.eq_ignore_ascii_case("text/plain")
+                || essence.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +468,173 @@ mod tests {
             .authenticate(&envelope("POST", "/livez", &[]))
             .await
             .is_err());
+    }
+
+    fn guard_for(host: &str, cors_enabled: bool, cors_origins: &[&str]) -> LocalRequestGuard {
+        LocalRequestGuard::new(&ServeRuntimeConfig {
+            host: host.to_string(),
+            cors_enabled,
+            cors_origins: cors_origins
+                .iter()
+                .map(|origin| origin.to_string())
+                .collect(),
+            ..ServeRuntimeConfig::default()
+        })
+    }
+
+    fn check(
+        guard: &LocalRequestGuard,
+        method: Method,
+        headers: &[(header::HeaderName, &str)],
+    ) -> Option<StatusCode> {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(name.clone(), value.parse().unwrap());
+        }
+        guard.check(&method, &map, None).err().map(|err| err.status)
+    }
+
+    #[test]
+    fn loopback_bind_rejects_foreign_host_headers() {
+        let guard = guard_for("127.0.0.1", false, &[]);
+        for host in [
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "[::1]:8080",
+            "tauri.localhost",
+            "LOCALHOST",
+        ] {
+            assert_eq!(
+                check(&guard, Method::GET, &[(header::HOST, host)]),
+                None,
+                "{host}"
+            );
+        }
+        assert_eq!(check(&guard, Method::GET, &[]), None);
+        for host in [
+            "attacker.example:8080",
+            "attacker.example",
+            "192.168.1.5:8080",
+        ] {
+            assert_eq!(
+                check(&guard, Method::GET, &[(header::HOST, host)]),
+                Some(StatusCode::FORBIDDEN),
+                "{host}"
+            );
+        }
+        // A network bind is reachable by any name; the API key guards it.
+        let network = guard_for("0.0.0.0", false, &[]);
+        assert_eq!(
+            check(
+                &network,
+                Method::GET,
+                &[(header::HOST, "my-mac.local:8080")]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_site_writes_and_websockets_are_rejected_by_origin() {
+        let guard = guard_for("0.0.0.0", false, &[]);
+        let host = (header::HOST, "192.168.1.5:8080");
+        for origin in [
+            "http://192.168.1.5:8080",
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+        ] {
+            assert_eq!(
+                check(
+                    &guard,
+                    Method::POST,
+                    &[host.clone(), (header::ORIGIN, origin)]
+                ),
+                None,
+                "{origin}"
+            );
+        }
+        assert_eq!(check(&guard, Method::POST, &[host.clone()]), None);
+        for origin in [
+            "https://attacker.example",
+            "null",
+            "http://192.168.1.5:9999",
+        ] {
+            assert_eq!(
+                check(
+                    &guard,
+                    Method::DELETE,
+                    &[host.clone(), (header::ORIGIN, origin)]
+                ),
+                Some(StatusCode::FORBIDDEN),
+                "{origin}"
+            );
+        }
+        let evil = (header::ORIGIN, "https://attacker.example");
+        assert_eq!(
+            check(&guard, Method::GET, &[host.clone(), evil.clone()]),
+            None
+        );
+        assert_eq!(
+            check(
+                &guard,
+                Method::GET,
+                &[host.clone(), evil.clone(), (header::UPGRADE, "websocket")]
+            ),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        let configured = guard_for("0.0.0.0", true, &["https://App.Example"]);
+        assert_eq!(
+            check(
+                &configured,
+                Method::POST,
+                &[(header::ORIGIN, "https://app.example")]
+            ),
+            None
+        );
+        assert_eq!(
+            check(&configured, Method::POST, &[evil.clone()]),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let wildcard = guard_for("0.0.0.0", true, &["*"]);
+        assert_eq!(check(&wildcard, Method::POST, &[evil]), None);
+    }
+
+    #[test]
+    fn writes_with_form_content_types_are_rejected() {
+        let guard = guard_for("127.0.0.1", false, &[]);
+        for content_type in [
+            "text/plain",
+            "application/x-www-form-urlencoded; charset=utf-8",
+        ] {
+            assert_eq!(
+                check(
+                    &guard,
+                    Method::POST,
+                    &[(header::CONTENT_TYPE, content_type)]
+                ),
+                Some(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+                "{content_type}"
+            );
+        }
+        for content_type in ["application/json", "multipart/form-data; boundary=x"] {
+            assert_eq!(
+                check(
+                    &guard,
+                    Method::POST,
+                    &[(header::CONTENT_TYPE, content_type)]
+                ),
+                None,
+                "{content_type}"
+            );
+        }
+        assert_eq!(check(&guard, Method::POST, &[]), None);
+        assert_eq!(
+            check(&guard, Method::GET, &[(header::CONTENT_TYPE, "text/plain")]),
+            None
+        );
     }
 
     #[test]
