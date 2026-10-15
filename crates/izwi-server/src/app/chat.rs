@@ -796,25 +796,20 @@ fn remote_logprobs(
 #[derive(Default)]
 struct RemoteLogprobCollector {
     entries: Vec<izwi_core::engine::TokenLogprob>,
-    overflow: bool,
 }
 
 impl RemoteLogprobCollector {
+    /// Records one delta's entries and returns the ones it kept: a streamed
+    /// delta carries only its own logprobs, and the cumulative list is kept
+    /// for the terminal generation.
     fn extend(
         &mut self,
         entries: Option<Vec<izwi_serving_protocol::TokenLogprob>>,
     ) -> Vec<izwi_core::engine::TokenLogprob> {
-        let mapped = remote_logprobs(entries);
-        if !self.overflow {
-            let room = REMOTE_CHAT_LOGPROB_ENTRY_LIMIT.saturating_sub(self.entries.len());
-            if mapped.len() <= room {
-                self.entries.extend(mapped.iter().cloned());
-            } else {
-                self.entries.extend(mapped.into_iter().take(room));
-                self.overflow = true;
-            }
-        }
-        self.entries.clone()
+        let mut mapped = remote_logprobs(entries);
+        mapped.truncate(REMOTE_CHAT_LOGPROB_ENTRY_LIMIT.saturating_sub(self.entries.len()));
+        self.entries.extend(mapped.iter().cloned());
+        mapped
     }
 
     fn finish(self) -> Vec<izwi_core::engine::TokenLogprob> {
@@ -1499,6 +1494,39 @@ mod tests {
             unmeasured.cached_prompt_tokens, None,
             "unmeasured cache stays absent so the public surface renders zero"
         );
+    }
+
+    #[test]
+    fn streamed_remote_logprobs_are_per_delta_and_cumulative_at_the_end() {
+        let entry = |token: &str| izwi_serving_protocol::TokenLogprob {
+            token: token.into(),
+            logprob: -0.5,
+            bytes: token.as_bytes().to_vec(),
+            top_logprobs: Vec::new(),
+        };
+        let tokens = |entries: &[izwi_core::engine::TokenLogprob]| {
+            entries
+                .iter()
+                .map(|entry| entry.token.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut collector = RemoteLogprobCollector::default();
+        assert_eq!(
+            tokens(&collector.extend(Some(vec![entry("a"), entry("b")]))),
+            ["a", "b"]
+        );
+        assert_eq!(tokens(&collector.extend(Some(vec![entry("c")]))), ["c"]);
+        assert!(collector.extend(None).is_empty());
+        assert_eq!(tokens(&collector.finish()), ["a", "b", "c"]);
+
+        let mut full = RemoteLogprobCollector::default();
+        full.extend(Some(vec![entry("x"); REMOTE_CHAT_LOGPROB_ENTRY_LIMIT - 1]));
+        assert_eq!(
+            tokens(&full.extend(Some(vec![entry("y"), entry("z")]))),
+            ["y"]
+        );
+        assert!(full.extend(Some(vec![entry("w")])).is_empty());
+        assert_eq!(full.finish().len(), REMOTE_CHAT_LOGPROB_ENTRY_LIMIT);
     }
 
     #[test]
