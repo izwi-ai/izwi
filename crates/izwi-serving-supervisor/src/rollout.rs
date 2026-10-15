@@ -42,6 +42,9 @@ pub const MAX_ROLLOUT_PLAN_BYTES: usize = 64 * 1024;
 pub const MAX_ROLLOUT_WINDOW_SECS: u64 = 3600;
 /// Hard ceiling on the post-abort routing grace.
 pub const MAX_ROLLOUT_ABORT_GRACE_SECS: u64 = 300;
+/// Hard ceiling on the gateway approvals refresh interval a plan may declare
+/// (the gateway's `IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS` upper bound).
+pub const MAX_GATEWAY_APPROVALS_REFRESH_SECS: u64 = 3600;
 /// Rollout state file name inside the supervisor's runtime directory.
 pub const ROLLOUT_STATE_FILE: &str = "rollout-state.json";
 /// Pre-rollout approvals backup file name inside the runtime directory.
@@ -79,17 +82,29 @@ pub struct RolloutPlan {
     /// The replacement worker launched first; the rollout aborts if it fails
     /// readiness.
     canary_worker_id: String,
-    /// Soak window between opening the rollout window and draining the old
-    /// generation. Zero skips the wait.
-    #[serde(default = "default_window_secs")]
-    window_secs: u64,
+    /// How often the gateways re-read the shared approvals file: their
+    /// `IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS`, in seconds. The coordinator
+    /// cannot ask the gateways when they adopted a view, so the window and
+    /// the commit grace are sized from this interval.
+    #[serde(default = "default_gateway_approvals_refresh_secs")]
+    gateway_approvals_refresh_secs: u64,
+    /// Soak window between opening the rollout window and writing the
+    /// commit view. At least two gateway refresh intervals, so every gateway
+    /// adopts the window view (and cuts over) before the commit view lands;
+    /// unset defaults to exactly two.
+    window_secs: Option<u64>,
     /// Grace between restoring the approvals on abort and stopping the
     /// replacement workers, so the gateway stops routing to them first.
     #[serde(default = "default_abort_grace_secs")]
     abort_grace_secs: u64,
+    /// Grace between writing the commit view and draining the old
+    /// generation, so every gateway adopts the commit view and stops routing
+    /// to the old workers first. At least one gateway refresh interval;
+    /// unset defaults to exactly one.
+    commit_grace_secs: Option<u64>,
 }
 
-fn default_window_secs() -> u64 {
+fn default_gateway_approvals_refresh_secs() -> u64 {
     30
 }
 
@@ -119,6 +134,10 @@ pub struct RolloutSpec {
     /// waits this long before stopping the replacement workers so the
     /// gateway's approvals refresh stops routing to them first.
     pub abort_grace: Duration,
+    /// After the commit view is written, the coordinator waits this long
+    /// before draining the old generation so the gateways' approvals
+    /// refresh stops routing to it first.
+    pub commit_grace: Duration,
 }
 
 impl RolloutSpec {
@@ -194,9 +213,21 @@ impl RolloutPlan {
                 "canary_worker_id must be 1..=256 bytes".to_string(),
             ));
         }
-        if self.window_secs > MAX_ROLLOUT_WINDOW_SECS {
+        let refresh = self.gateway_approvals_refresh_secs;
+        if !(1..=MAX_GATEWAY_APPROVALS_REFRESH_SECS).contains(&refresh) {
+            return Err(RolloutError::InvalidPlan(format!(
+                "gateway_approvals_refresh_secs must be between 1 and {MAX_GATEWAY_APPROVALS_REFRESH_SECS}"
+            )));
+        }
+        if self.window_secs() > MAX_ROLLOUT_WINDOW_SECS {
             return Err(RolloutError::InvalidPlan(format!(
                 "window_secs must be at most {MAX_ROLLOUT_WINDOW_SECS}"
+            )));
+        }
+        if self.window_secs() < refresh.saturating_mul(2) {
+            return Err(RolloutError::InvalidPlan(format!(
+                "window_secs must be at least twice gateway_approvals_refresh_secs ({}s) so every gateway adopts the window view before the commit view",
+                refresh.saturating_mul(2)
             )));
         }
         if self.abort_grace_secs > MAX_ROLLOUT_ABORT_GRACE_SECS {
@@ -204,7 +235,27 @@ impl RolloutPlan {
                 "abort_grace_secs must be at most {MAX_ROLLOUT_ABORT_GRACE_SECS}"
             )));
         }
+        if self.commit_grace_secs() > MAX_ROLLOUT_WINDOW_SECS {
+            return Err(RolloutError::InvalidPlan(format!(
+                "commit_grace_secs must be at most {MAX_ROLLOUT_WINDOW_SECS}"
+            )));
+        }
+        if self.commit_grace_secs() < refresh {
+            return Err(RolloutError::InvalidPlan(format!(
+                "commit_grace_secs must be at least gateway_approvals_refresh_secs ({refresh}s) so every gateway stops routing to the old generation before it drains"
+            )));
+        }
         Ok(())
+    }
+
+    fn window_secs(&self) -> u64 {
+        self.window_secs
+            .unwrap_or_else(|| self.gateway_approvals_refresh_secs.saturating_mul(2))
+    }
+
+    fn commit_grace_secs(&self) -> u64 {
+        self.commit_grace_secs
+            .unwrap_or(self.gateway_approvals_refresh_secs)
     }
 
     /// Digest binding the plan to its target config bytes; persisted rollout
@@ -217,9 +268,13 @@ impl RolloutPlan {
         hasher.update([0]);
         hasher.update(self.canary_worker_id.as_bytes());
         hasher.update([0]);
-        hasher.update(self.window_secs.to_le_bytes());
+        hasher.update(self.window_secs().to_le_bytes());
         hasher.update([0]);
         hasher.update(self.abort_grace_secs.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(self.gateway_approvals_refresh_secs.to_le_bytes());
+        hasher.update([0]);
+        hasher.update(self.commit_grace_secs().to_le_bytes());
         hasher.update([0]);
         hasher.update(target_config_bytes);
         format!("sha256:{:x}", hasher.finalize())
@@ -371,8 +426,9 @@ impl RolloutPlan {
         Ok(RolloutSpec {
             rolling,
             canary_worker_id: self.canary_worker_id.clone(),
-            window: Duration::from_secs(self.window_secs),
+            window: Duration::from_secs(self.window_secs()),
             abort_grace: Duration::from_secs(self.abort_grace_secs),
+            commit_grace: Duration::from_secs(self.commit_grace_secs()),
         })
     }
 }
@@ -749,7 +805,7 @@ mod tests {
 
     fn plan_toml(target: &str, approvals: &str, canary: &str, window: u64) -> String {
         format!(
-            "schema_version = 1\ntarget_node_config = \"{target}\"\nshared_approvals_path = \"{approvals}\"\ncanary_worker_id = \"{canary}\"\nwindow_secs = {window}\n"
+            "schema_version = 1\ntarget_node_config = \"{target}\"\nshared_approvals_path = \"{approvals}\"\ncanary_worker_id = \"{canary}\"\ngateway_approvals_refresh_secs = 5\nwindow_secs = {window}\n"
         )
     }
 
@@ -836,7 +892,8 @@ mod tests {
             plan_toml("/tmp/t.toml", "/tmp/a.txt", "worker-b", 30).as_bytes(),
         )
         .unwrap();
-        assert_eq!(plan.window_secs, 30);
+        assert_eq!(plan.window_secs(), 30);
+        assert_eq!(plan.commit_grace_secs(), 5);
         assert_eq!(plan.canary_worker_id, "worker-b");
 
         let oversized = vec![b' '; MAX_ROLLOUT_PLAN_BYTES + 1];
@@ -867,6 +924,40 @@ mod tests {
             RolloutPlan::parse_bounded(unbounded_window.as_bytes()).unwrap_err(),
             RolloutError::InvalidPlan(_)
         ));
+    }
+
+    #[test]
+    fn window_and_commit_grace_cover_the_gateway_approvals_refresh() {
+        let header = "schema_version = 1\ntarget_node_config = \"/tmp/t.toml\"\nshared_approvals_path = \"/tmp/a.txt\"\ncanary_worker_id = \"w\"\n";
+        // Unset values derive from the gateway's default 30s refresh: two
+        // refresh intervals of window and one of commit grace.
+        let defaults = RolloutPlan::parse_bounded(header.as_bytes()).unwrap();
+        assert_eq!(defaults.window_secs(), 60);
+        assert_eq!(defaults.commit_grace_secs(), 30);
+
+        let declared = format!("{header}gateway_approvals_refresh_secs = 2\n");
+        let plan = RolloutPlan::parse_bounded(declared.as_bytes()).unwrap();
+        assert_eq!(plan.window_secs(), 4);
+        assert_eq!(plan.commit_grace_secs(), 2);
+
+        // A window shorter than two refreshes can commit before a gateway
+        // ever adopted the window view; a commit grace shorter than one
+        // refresh drains the old generation while it is still routed.
+        for invalid in [
+            format!("{header}window_secs = 30\n"),
+            format!("{header}gateway_approvals_refresh_secs = 2\nwindow_secs = 3\n"),
+            format!("{header}gateway_approvals_refresh_secs = 2\ncommit_grace_secs = 1\n"),
+            format!("{header}gateway_approvals_refresh_secs = 0\n"),
+            format!("{header}gateway_approvals_refresh_secs = 3601\n"),
+        ] {
+            assert!(
+                matches!(
+                    RolloutPlan::parse_bounded(invalid.as_bytes()).unwrap_err(),
+                    RolloutError::InvalidPlan(_)
+                ),
+                "{invalid} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -954,6 +1045,7 @@ mod tests {
             canary_worker_id: "worker-b".to_string(),
             window: Duration::from_secs(10),
             abort_grace: Duration::from_secs(5),
+            commit_grace: Duration::from_secs(5),
         }
     }
 

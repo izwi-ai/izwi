@@ -541,10 +541,11 @@ fn prepare_rollout(
     };
     rollout::persist_state(runtime_directory, &state)?;
     eprintln!(
-        "rollout prepared: {} rolling deployment(s), canary {}, window {}s, abort grace {}s",
+        "rollout prepared: {} rolling deployment(s), canary {}, window {}s, commit grace {}s, abort grace {}s",
         spec.rolling.len(),
         spec.canary_worker_id,
         spec.window.as_secs(),
+        spec.commit_grace.as_secs(),
         spec.abort_grace.as_secs()
     );
     Ok(PreparedRollout {
@@ -791,6 +792,20 @@ async fn execute_rollout(
             "rollout commit view failed to write: {error}; the window view stays in place"
         );
         return RolloutOutcome::DegradedAbort;
+    }
+    // Mirror the abort grace: the gateways adopt the commit view on their
+    // next approvals refresh and keep routing to the old generation until
+    // then, so draining it immediately would turn that interval into shed
+    // requests. Shutdown drains everything anyway, so it ends the wait.
+    if !prepared.spec.commit_grace.is_zero() {
+        eprintln!(
+            "waiting {}s for gateway approval refresh before draining the old generation",
+            prepared.spec.commit_grace.as_secs()
+        );
+        tokio::select! {
+            () = tokio::time::sleep(prepared.spec.commit_grace) => {}
+            _ = shutdown.wait_for(|stop| *stop) => {}
+        }
     }
     drain_selected(
         current_slots,

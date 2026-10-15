@@ -136,6 +136,16 @@ struct Rig {
 
 impl Rig {
     fn build(window_secs: u64, abort_grace_secs: u64) -> Self {
+        Self::build_with_commit_grace(window_secs, abort_grace_secs, 1)
+    }
+
+    /// The rig's gateways are modelled with a 1s approvals refresh, the
+    /// smallest the gateway accepts, so windows of 2s and up are valid.
+    fn build_with_commit_grace(
+        window_secs: u64,
+        abort_grace_secs: u64,
+        commit_grace_secs: u64,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap().keep();
         let run_dir = root.join("run");
         let work_dir = root.join("work");
@@ -268,7 +278,7 @@ impl Rig {
         std::fs::write(
             &plan,
             format!(
-                "schema_version = 1\ntarget_node_config = \"{}\"\nshared_approvals_path = \"{}\"\ncanary_worker_id = \"{}\"\nwindow_secs = {window_secs}\nabort_grace_secs = {abort_grace_secs}\n",
+                "schema_version = 1\ntarget_node_config = \"{}\"\nshared_approvals_path = \"{}\"\ncanary_worker_id = \"{}\"\ngateway_approvals_refresh_secs = 1\nwindow_secs = {window_secs}\nabort_grace_secs = {abort_grace_secs}\ncommit_grace_secs = {commit_grace_secs}\n",
                 target_config.display(),
                 approvals.display(),
                 REPLACEMENT.worker_id,
@@ -437,7 +447,8 @@ fn canary_readiness_failure_aborts_and_restores_approvals() {
 
 #[test]
 fn promote_path_commits_and_drains_the_old_generation() {
-    let rig = Rig::build(2, 1);
+    let commit_grace = Duration::from_secs(3);
+    let rig = Rig::build_with_commit_grace(2, 1, commit_grace.as_secs());
     let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
 
     // Window view: both generations approved, and the persisted state
@@ -450,18 +461,24 @@ fn promote_path_commits_and_drains_the_old_generation() {
     });
     assert!(window_open, "the window view must approve both generations");
 
-    // Commit view: only the successor generation remains, with the state
-    // recording the commit and the replacement worker record.
-    let committed = wait_until(Duration::from_secs(60), || {
+    // Commit view: only the successor generation remains.
+    let commit_view = wait_until(Duration::from_secs(60), || {
         let approvals = read_file(&rig.approvals);
-        let state = read_file(&rig.state_file());
         approvals.contains("chat-prod|2")
             && !approvals.contains("chat-prod|1")
             && approvals.contains("asr-prod|4")
-            && state.contains("committed")
-            && state.contains("worker-new")
     });
-    assert!(committed, "the commit view must replace the old generation");
+    assert!(
+        commit_view,
+        "the commit view must replace the old generation"
+    );
+    let commit_view_seen = Instant::now();
+    // The gateways keep routing to the old generation until their next
+    // approvals refresh, so it must keep serving through the commit grace.
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation must not drain the moment the commit view lands"
+    );
 
     // The old generation drained only after it stopped serving; its fake
     // writes the exit marker when stdin (the ownership pipe) closes.
@@ -469,6 +486,18 @@ fn promote_path_commits_and_drains_the_old_generation() {
         rig.root.join("worker-old.exited").exists()
     });
     assert!(old_exited, "the old worker must drain to exit");
+    assert!(
+        commit_view_seen.elapsed() >= commit_grace / 2,
+        "the old generation drained {:?} after the commit view was seen, inside the {commit_grace:?} grace",
+        commit_view_seen.elapsed()
+    );
+
+    // The state records the commit and the replacement worker record.
+    let committed = wait_until(Duration::from_secs(30), || {
+        let state = read_file(&rig.state_file());
+        state.contains("committed") && state.contains("worker-new")
+    });
+    assert!(committed, "the rollout state must record the commit");
 
     terminate(&mut supervisor);
 }

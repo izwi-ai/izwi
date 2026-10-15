@@ -681,9 +681,20 @@ schema_version = 1
 target_node_config = "/etc/izwi/node-v2.toml"   # absolute path; validated in full before anything changes
 shared_approvals_path = "/etc/izwi/shared-approvals.toml"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
 canary_worker_id = "chat-worker-2"              # replacement launched first; its readiness failure aborts
-window_secs = 30                                # soak window between cutover and draining the old generation (0–3600)
+gateway_approvals_refresh_secs = 30             # the gateways' IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS, in seconds (1–3600, default 30)
+window_secs = 60                                # soak window before the commit view (≥ 2× the refresh, ≤ 3600; default 2× the refresh)
+commit_grace_secs = 30                          # wait after the commit view before draining the old generation (≥ the refresh, ≤ 3600; default the refresh)
 abort_grace_secs = 30                           # wait after an abort restore before stopping replacements (0–300)
 ```
+
+The supervisor cannot ask the gateways when they adopted a view, so the
+timings are sized from the refresh interval the plan declares: a window of at
+least two refreshes lets every gateway adopt the window view (and cut over)
+before the commit view lands, and a commit grace of at least one refresh lets
+every gateway stop routing to the old generation before it drains. Declare
+the gateways' real refresh interval; plan validation rejects shorter windows
+and graces. Gateway-acknowledged adoption replaces these timers in a later
+release.
 
 The target config's non-rolling workers and node identity must match the
 running config exactly; only the rolling deployments' generations advance.
@@ -705,8 +716,9 @@ The supervisor then:
    write — and persists `window_open` state; the gateway adopts the view at
    runtime and moves admission to the new generation the moment it observes
    it Ready (never two eligible generations, never zero);
-3. after the soak window writes the commit view (new generation only) and
-   drains the old workers — the point of no return — then records
+3. after the soak window writes the commit view (new generation only), waits
+   `commit_grace_secs` for the gateways to adopt it, and drains the old
+   workers — the point of no return — then records
    `committed` and keeps supervising the replacements; repoint the service
    definition at the target config for the next supervisor restart.
 
