@@ -298,8 +298,7 @@ impl ChatStreamCompletion {
 const CHAT_STREAM_CAPACITY: usize = 64;
 const CHAT_STREAM_BACKPRESSURE_ERROR: &str =
     "Chat stream consumer is too slow; generation was cancelled";
-#[cfg(not(test))]
-const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// The slow-consumer timeout of the test stream spawners.
 #[cfg(test)]
 const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -485,10 +484,6 @@ where
 
 fn backpressure_error() -> ApiError {
     ApiError::service_unavailable(CHAT_STREAM_BACKPRESSURE_ERROR)
-}
-
-async fn send_chat_terminal(event_tx: mpsc::Sender<ChatStreamEvent>, event: ChatStreamEvent) {
-    send_chat_terminal_with_timeout(event_tx, event, CHAT_TERMINAL_SEND_TIMEOUT).await;
 }
 
 async fn send_chat_terminal_with_timeout(
@@ -1420,11 +1415,12 @@ where
         let permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                send_chat_terminal(
+                send_chat_terminal_with_timeout(
                     event_tx,
                     ChatStreamEvent::Failed(ApiError::service_unavailable(
                         "Server is shutting down",
                     )),
+                    CHAT_TERMINAL_SEND_TIMEOUT,
                 )
                 .await;
                 return;
