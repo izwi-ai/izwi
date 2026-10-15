@@ -526,6 +526,19 @@ Do not replace the local server with the gateway for desktop or local workflows.
 `--role local` remains the compatibility profile and continues to own its
 runtime, SQLite/provider state, and full route set.
 
+**Diarization and forced alignment run in the full server only.** Workers
+take one of three task kinds (`IZWI_WORKER_TASK`: `chat`, `speech_to_text`,
+`text_to_speech`). There is no diarization or forced-alignment task kind, so
+no `izwi-serving-worker` loads a Sortformer diarizer or the Qwen3 forced
+aligner. `/v1/diarizations`, `/v1/audio/align` and word timestamps on
+`/v1/audio/transcriptions` (which run the aligner) are served only by the full
+server (`--role local`), whose load admission prices these models from their
+checkpoints. A worker's capacity snapshot reports invocation, queue and
+session counts with no memory signal, so autoscaling could not react to
+these models' memory refusals in any case. When several servers share one
+records database, give each its own `IZWI_NODE_ID` (see "Servers sharing one
+records database" under Fleet operation).
+
 ### Realtime relay preview (DS3.6, off by default)
 
 `IZWI_GATEWAY_REALTIME=on` exposes `GET /v1/realtime/ws` (WebSocket,
