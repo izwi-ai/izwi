@@ -6940,6 +6940,61 @@ mod metal_f16_text_tests {
     }
 }
 
+#[cfg(all(test, feature = "metal"))]
+mod metal_residency_tests {
+    use super::tests::local_models_root;
+    use super::*;
+    use crate::backends::DeviceSelector;
+
+    /// Lane 8a saw the dense aligner's Metal growth after the load fence
+    /// exceed its plan by 28 x 40 MiB, the size of the F32 pre-fusion Q/K/V
+    /// and gate/up weights. Measured (2026-10-15, 16 GB M-series), after one
+    /// sync and unchanged after a second, so Candle's pool does not hold the
+    /// excess (a sync drops every unused pooled buffer): dense F32 text 5.28
+    /// GiB fused vs 4.19 unfused (`IZWI_QWEN3_DENSE_PROJECTION_FUSION=0`;
+    /// plan 4.18); dense F16 text 3.24 fused (plan 2.69); 4-bit 3.13 fused
+    /// vs 2.70 unfused (plan 2.68). The excess is live, fusion-only and equal
+    /// to the pre-fusion weights at the text dtype; it is not priced yet.
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner checkpoints and a Metal device"]
+    fn forced_aligner_metal_residency_survives_a_second_sync() {
+        use std::io::Write;
+        const GIB: f64 = (1u64 << 30) as f64;
+        for (dir_name, variant) in [
+            (
+                "Qwen3-ForcedAligner-0.6B",
+                ModelVariant::Qwen3ForcedAligner06B,
+            ),
+            (
+                "Qwen3-ForcedAligner-0.6B-4bit",
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+            ),
+        ] {
+            let device = DeviceSelector::detect_with_preference(Some("metal")).expect("metal");
+            let metal = device.device.as_metal_device().unwrap().clone();
+            let allocated = || metal.metal_device().current_allocated_size() as f64 / GIB;
+            device.device.synchronize().unwrap();
+            let before = allocated();
+            let model =
+                Qwen3AsrModel::load(&local_models_root().join(dir_name), variant, device.clone())
+                    .expect("load");
+            let loaded = allocated() - before;
+            device.device.synchronize().unwrap();
+            let synced = allocated() - before;
+            device.device.synchronize().unwrap();
+            let synced_twice = allocated() - before;
+            let _ = writeln!(
+                std::io::stderr(),
+                "{dir_name}: {loaded:.3} GiB after load, {synced:.3} after a sync, \
+                 {synced_twice:.3} after a second sync"
+            );
+            assert!((synced_twice - synced).abs() < 1.0 / 1024.0, "{dir_name}");
+            drop(model);
+            device.device.synchronize().unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod precision_tests {
     use candle_core::{DType, Device};
