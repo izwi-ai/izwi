@@ -11,6 +11,7 @@ pub(crate) mod audio_io;
 mod broker;
 mod capabilities;
 mod chat;
+mod chat_request;
 mod conformance;
 mod coordinator;
 mod diarization;
@@ -41,6 +42,7 @@ pub(crate) use asr::{
     invocation_decode_room,
 };
 pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
+pub use chat_request::{resolve_chat_sampling, ChatSamplingRequest, ResolvedChatSampling};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,

@@ -122,6 +122,12 @@ pub use runtime::{
     VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
 };
 pub use runtime::{
+    resolve_chat_sampling, validate_asr_language, AsrTranscription, ChatGeneration,
+    ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationResult, DiarizationSegment,
+    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
+    GenerationResult, ResolvedChatSampling, TtsStopReason, TtsStreamingMode,
+};
+pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,
     trace_contract_for_phase, AudioChunk, CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot,
     GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions,
@@ -138,11 +144,6 @@ pub use runtime::{
     TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
     TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
     TRACE_STREAMING_MODE,
-};
-pub use runtime::{
-    validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,
-    DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult, TtsStopReason, TtsStreamingMode,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
