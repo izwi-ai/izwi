@@ -5,12 +5,14 @@ mod physical;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{
     batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
-    ModuleT, VarBuilder,
+    VarBuilder,
 };
 use izwi_vad::{speech_mask_for_frames_f32, VadRegionConfig};
 use rustfft::num_complex::Complex;
@@ -20,6 +22,9 @@ use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpd
 use crate::backends::{DeviceKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{
+    batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -169,6 +174,7 @@ struct SortformerEncoderConfig {
     target: Option<String>,
     xscaling: Option<bool>,
     subsampling: Option<String>,
+    conv_norm_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +203,17 @@ fn resolve_encoder_kind(cfg: Option<&SortformerEncoderConfig>) -> Result<Sortfor
         _ => Err(Error::ModelLoadError(format!(
             "unsupported Sortformer encoder target {:?} with subsampling {:?}",
             cfg.target, cfg.subsampling
+        ))),
+    }
+}
+
+/// The Conformer conv module folds an inference BatchNorm into its depthwise
+/// kernel at load; any other normalization fails closed.
+fn validate_conv_norm_type(cfg: Option<&SortformerEncoderConfig>) -> Result<()> {
+    match cfg.and_then(|cfg| cfg.conv_norm_type.as_deref()) {
+        None | Some("batch_norm") => Ok(()),
+        Some(other) => Err(Error::ModelLoadError(format!(
+            "unsupported Sortformer conv_norm_type {other:?}; only batch_norm is served"
         ))),
     }
 }
@@ -1163,6 +1180,7 @@ impl SortformerDiarizerModel {
         serde_json::json!({
             "streaming_profile": self.model.streaming_profile.name(),
             "streaming": streaming,
+            "kernels": self.model.encoder.kernel_diagnostics(),
         })
     }
 
@@ -1575,12 +1593,13 @@ impl SortformerInferenceModel {
         let preprocessor = SortformerPreprocessor::load(vb, preprocessor_cfg)?;
         let encoder_kind = resolve_encoder_kind(encoder_cfg.as_ref())?;
         let encoder = match encoder_kind {
-            SortformerEncoderKind::Conformer => SortformerAcousticEncoder::Conformer(
-                SortformerConformerEncoder::load(
+            SortformerEncoderKind::Conformer => {
+                validate_conv_norm_type(encoder_cfg.as_ref())?;
+                SortformerAcousticEncoder::Conformer(SortformerConformerEncoder::load(
                     vb.pp("encoder"),
                     encoder_cfg.and_then(|cfg| cfg.xscaling).unwrap_or(true),
-                )?,
-            ),
+                )?)
+            }
             SortformerEncoderKind::FeatureStackingRope => {
                 SortformerAcousticEncoder::FeatureStackingRope(SortformerRopeEncoder::load(
                     vb.pp("encoder"),
@@ -2731,16 +2750,31 @@ impl SortformerPreprocessor {
     }
 }
 
+/// Per-model engagement counters for the channel-independent depthwise
+/// convolutions (SRT-5), reported under `kernels` in `family_diagnostics`.
+#[derive(Debug, Default)]
+struct SortformerPathCounters {
+    conformer_depthwise_conv1d: AtomicU64,
+}
+
+impl SortformerPathCounters {
+    fn conformer_depthwise_conv1d(&self) -> u64 {
+        self.conformer_depthwise_conv1d.load(Ordering::Relaxed)
+    }
+}
+
 struct SortformerConformerEncoder {
     pre_encode: ConvSubsamplingDw,
     layers: Vec<ConformerLayer>,
     d_model: usize,
     input_scale: f64,
     frame_stride_samples: usize,
+    counters: Arc<SortformerPathCounters>,
 }
 
 impl SortformerConformerEncoder {
     fn load(vb: VarBuilder, xscaling: bool) -> Result<Self> {
+        let counters = Arc::new(SortformerPathCounters::default());
         let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"))?;
 
         let mut layers = Vec::new();
@@ -2750,7 +2784,7 @@ impl SortformerConformerEncoder {
             if !layer_vb.contains_tensor("norm_out.weight") {
                 break;
             }
-            layers.push(ConformerLayer::load(layer_vb)?);
+            layers.push(ConformerLayer::load(layer_vb, &counters)?);
             idx += 1;
         }
         if layers.is_empty() {
@@ -2770,6 +2804,7 @@ impl SortformerConformerEncoder {
                 1.0
             },
             frame_stride_samples: 160 * 8,
+            counters,
         })
     }
 
@@ -2906,7 +2941,7 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, counters: &Arc<SortformerPathCounters>) -> Result<Self> {
         let d_model = vb
             .pp("norm_out")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -2925,7 +2960,7 @@ impl ConformerLayer {
         let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), d_model)?;
 
         let norm_conv = layer_norm(d_model, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"), d_model)?;
+        let conv = ConformerConv::load(vb.pp("conv"), d_model, counters)?;
 
         let norm_ff2 = layer_norm(d_model, 1e-5, vb.pp("norm_feed_forward2"))?;
         let ff2 = FeedForward::load(vb.pp("feed_forward2"), d_model, ff_dim)?;
@@ -2997,14 +3032,24 @@ impl FeedForward {
 
 struct ConformerConv {
     pointwise_conv1: Conv1d,
-    depthwise_conv: Conv1d,
-    batch_norm: candle_nn::BatchNorm,
+    /// The depthwise kernel `(C, 1, K)` and bias with the inference
+    /// BatchNorm folded in. The shared shift-and-accumulate op runs 2K + 2
+    /// element-wise ops instead of Candle's one convolution per channel
+    /// (SRT-5).
+    depthwise_weight: Tensor,
+    depthwise_bias: Tensor,
+    depthwise_spec: DepthwiseConv1dSpec,
     pointwise_conv2: Conv1d,
     d_model: usize,
+    counters: Arc<SortformerPathCounters>,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder, d_model: usize) -> Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        d_model: usize,
+        counters: &Arc<SortformerPathCounters>,
+    ) -> Result<Self> {
         let kernel_size = vb
             .pp("depthwise_conv")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -3019,6 +3064,8 @@ impl ConformerConv {
             vb.pp("pointwise_conv1"),
         )?;
 
+        // Loaded as a grouped Conv1d for the layout checks; only its
+        // weight and bias are used.
         let depthwise_conv = mlx::load_conv1d(
             d_model,
             d_model,
@@ -3032,6 +3079,18 @@ impl ConformerConv {
         )?;
 
         let batch_norm = batch_norm(d_model, 1e-5, vb.pp("batch_norm"))?;
+        let (scale, shift) = batch_norm_affine(
+            batch_norm.running_mean(),
+            batch_norm.running_var(),
+            batch_norm.eps(),
+            batch_norm.weight_and_bias(),
+        )?;
+        let (depthwise_weight, depthwise_bias) = fold_channel_affine(
+            depthwise_conv.weight(),
+            depthwise_conv.bias(),
+            &scale,
+            &shift,
+        )?;
 
         let pointwise_conv2 = mlx::load_conv1d(
             d_model,
@@ -3043,10 +3102,12 @@ impl ConformerConv {
 
         Ok(Self {
             pointwise_conv1,
-            depthwise_conv,
-            batch_norm,
+            depthwise_weight,
+            depthwise_bias,
+            depthwise_spec: DepthwiseConv1dSpec::symmetric((kernel_size - 1) / 2),
             pointwise_conv2,
             d_model,
+            counters: Arc::clone(counters),
         })
     }
 
@@ -3058,8 +3119,15 @@ impl ConformerConv {
         let x_b = x.i((.., self.d_model.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = self.depthwise_conv.forward(&x)?;
-        x = self.batch_norm.forward_t(&x, false)?;
+        x = depthwise_conv1d(
+            &x,
+            &self.depthwise_weight,
+            Some(&self.depthwise_bias),
+            self.depthwise_spec,
+        )?;
+        self.counters
+            .conformer_depthwise_conv1d
+            .fetch_add(1, Ordering::Relaxed);
         x = swish(&x)?;
         x = self.pointwise_conv2.forward(&x)?;
 
@@ -3421,6 +3489,22 @@ impl SortformerAcousticEncoder {
         match self {
             Self::Conformer(encoder) => encoder.d_model(),
             Self::FeatureStackingRope(encoder) => encoder.d_model,
+        }
+    }
+
+    /// Which convolution paths ran, so a deploy shows the fast paths engaged.
+    fn kernel_diagnostics(&self) -> serde_json::Value {
+        let shared_total = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        match self {
+            Self::Conformer(encoder) => serde_json::json!({
+                "conformer_depthwise_conv1d": "shift_accumulate_folded_batch_norm",
+                "conformer_depthwise_conv1d_calls": encoder.counters.conformer_depthwise_conv1d(),
+                "shared_depthwise_conv1d_calls_total": shared_total,
+            }),
+            // Feature stacking and RoPE attention: no depthwise convolution.
+            Self::FeatureStackingRope(_) => serde_json::json!({
+                "shared_depthwise_conv1d_calls_total": shared_total,
+            }),
         }
     }
 }
@@ -6021,6 +6105,248 @@ mod tests {
         match previous {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
+        }
+    }
+
+    /// Deterministic values in [-scale, scale) + offset.
+    fn random_values(len: usize, seed: u64, scale: f32, offset: f32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = (state >> 40) as f32 / (1u64 << 24) as f32;
+                (unit * 2.0 - 1.0) * scale + offset
+            })
+            .collect()
+    }
+
+    fn random_tensor(shape: &[usize], seed: u64, scale: f32, offset: f32) -> Tensor {
+        let values = random_values(shape.iter().product(), seed, scale, offset);
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    }
+
+    /// NaN-safe: a NaN or infinite difference counts as infinitely far.
+    fn tensor_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims());
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| {
+                let d = (x - y).abs();
+                if d.is_finite() {
+                    d
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
+    }
+
+    const SYNTHETIC_D_MODEL: usize = 16;
+    const SYNTHETIC_CONV_CHANNELS: usize = 4;
+    const SYNTHETIC_FEATURE_BINS: usize = 16;
+
+    /// A synthetic v2.1-shaped Conformer encoder checkpoint: dw_striding
+    /// subsampling (4 channels, 16 mel bins), `layers` Conformer layers of
+    /// width 16 (2 heads), FFN 32, depthwise kernel 9 with BatchNorm.
+    fn conformer_encoder_tensors(layers: usize) -> HashMap<String, Tensor> {
+        let d = SYNTHETIC_D_MODEL;
+        let c = SYNTHETIC_CONV_CHANNELS;
+        let mut tensors = HashMap::new();
+        let mut seed = 0x5EED_0001_u64;
+        let mut insert = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            seed += 0x9E37_79B9;
+            tensors.insert(
+                format!("encoder.{name}"),
+                random_tensor(shape, seed, scale, offset),
+            );
+        };
+        for conv in ["0", "2", "5"] {
+            insert(
+                format!("pre_encode.conv.{conv}.weight"),
+                &[c, 1, 3, 3],
+                0.5,
+                0.0,
+            );
+            insert(format!("pre_encode.conv.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        for conv in ["3", "6"] {
+            insert(
+                format!("pre_encode.conv.{conv}.weight"),
+                &[c, c, 1, 1],
+                0.5,
+                0.0,
+            );
+            insert(format!("pre_encode.conv.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        let out_in = c * SYNTHETIC_FEATURE_BINS / 8;
+        insert("pre_encode.out.weight".into(), &[d, out_in], 0.3, 0.0);
+        insert("pre_encode.out.bias".into(), &[d], 0.1, 0.0);
+        for layer in 0..layers {
+            let l = format!("layers.{layer}.");
+            for norm in [
+                "norm_feed_forward1",
+                "norm_self_att",
+                "norm_conv",
+                "norm_feed_forward2",
+                "norm_out",
+            ] {
+                insert(format!("{l}{norm}.weight"), &[d], 0.1, 1.0);
+                insert(format!("{l}{norm}.bias"), &[d], 0.1, 0.0);
+            }
+            for ff in ["feed_forward1", "feed_forward2"] {
+                insert(format!("{l}{ff}.linear1.weight"), &[32, d], 0.25, 0.0);
+                insert(format!("{l}{ff}.linear1.bias"), &[32], 0.1, 0.0);
+                insert(format!("{l}{ff}.linear2.weight"), &[d, 32], 0.18, 0.0);
+                insert(format!("{l}{ff}.linear2.bias"), &[d], 0.1, 0.0);
+            }
+            insert(format!("{l}self_attn.pos_bias_u"), &[2, d / 2], 0.1, 0.0);
+            insert(format!("{l}self_attn.pos_bias_v"), &[2, d / 2], 0.1, 0.0);
+            for linear in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+                insert(format!("{l}self_attn.{linear}.weight"), &[d, d], 0.25, 0.0);
+                insert(format!("{l}self_attn.{linear}.bias"), &[d], 0.1, 0.0);
+            }
+            insert(
+                format!("{l}self_attn.linear_pos.weight"),
+                &[d, d],
+                0.25,
+                0.0,
+            );
+            insert(
+                format!("{l}conv.pointwise_conv1.weight"),
+                &[2 * d, d, 1],
+                0.25,
+                0.0,
+            );
+            insert(format!("{l}conv.pointwise_conv1.bias"), &[2 * d], 0.1, 0.0);
+            insert(
+                format!("{l}conv.depthwise_conv.weight"),
+                &[d, 1, 9],
+                0.3,
+                0.0,
+            );
+            insert(format!("{l}conv.depthwise_conv.bias"), &[d], 0.1, 0.0);
+            insert(format!("{l}conv.batch_norm.weight"), &[d], 0.2, 1.0);
+            insert(format!("{l}conv.batch_norm.bias"), &[d], 0.1, 0.0);
+            insert(format!("{l}conv.batch_norm.running_mean"), &[d], 0.2, 0.0);
+            insert(format!("{l}conv.batch_norm.running_var"), &[d], 0.4, 0.8);
+            insert(
+                format!("{l}conv.pointwise_conv2.weight"),
+                &[d, d, 1],
+                0.25,
+                0.0,
+            );
+            insert(format!("{l}conv.pointwise_conv2.bias"), &[d], 0.1, 0.0);
+        }
+        tensors
+    }
+
+    fn conformer_encoder_fixture(layers: usize) -> SortformerConformerEncoder {
+        let vb =
+            VarBuilder::from_tensors(conformer_encoder_tensors(layers), DType::F32, &Device::Cpu);
+        SortformerConformerEncoder::load(vb.pp("encoder"), true).unwrap()
+    }
+
+    /// SRT-5: the Conformer conv module (shared shift-and-accumulate op with
+    /// the folded BatchNorm) matches Candle's per-channel grouped conv1d
+    /// followed by the unfolded BatchNorm.
+    #[test]
+    fn conformer_conv_folded_depthwise_matches_grouped_conv_and_batch_norm() {
+        use candle_nn::ModuleT;
+
+        let d = SYNTHETIC_D_MODEL;
+        let tensors = conformer_encoder_tensors(1);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let vb = vb.pp("encoder.layers.0.conv");
+        let counters = Arc::new(SortformerPathCounters::default());
+        let conv = ConformerConv::load(vb.clone(), d, &counters).unwrap();
+
+        let grouped = Conv1d::new(
+            vb.get((d, 1, 9), "depthwise_conv.weight").unwrap(),
+            Some(vb.get(d, "depthwise_conv.bias").unwrap()),
+            Conv1dConfig {
+                padding: 4,
+                groups: d,
+                ..Default::default()
+            },
+        );
+        let norm = batch_norm(d, 1e-5, vb.pp("batch_norm")).unwrap();
+        for (batch, time, seed) in [(1, 37, 11), (2, 9, 12), (1, 1, 13)] {
+            let x = random_tensor(&[batch, time, d], seed, 1.0, 0.0);
+            let h = conv
+                .pointwise_conv1
+                .forward(&x.transpose(1, 2).unwrap())
+                .unwrap();
+            let h = h
+                .i((.., ..d, ..))
+                .unwrap()
+                .broadcast_mul(&ops::sigmoid(&h.i((.., d.., ..)).unwrap()).unwrap())
+                .unwrap();
+            let h = grouped.forward(&h).unwrap();
+            let h = norm.forward_t(&h, false).unwrap();
+            let expected = conv
+                .pointwise_conv2
+                .forward(&swish(&h).unwrap())
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let actual = conv.forward(&x).unwrap();
+            let diff = tensor_max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "batch {batch} time {time}: max |diff| {diff}");
+        }
+        assert_eq!(counters.conformer_depthwise_conv1d(), 3);
+    }
+
+    /// SRT-5 engagement: every Conformer layer's depthwise conv runs through
+    /// the shared op, once per layer per streaming chunk.
+    #[test]
+    fn conformer_encoder_runs_each_depthwise_conv_through_the_shared_op() {
+        let layers = 3;
+        let encoder = conformer_encoder_fixture(layers);
+        let shared_before = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        let chunks = 4;
+        for chunk in 0..chunks {
+            let mel_frames = 40 + 8 * chunk;
+            let features_t = random_tensor(
+                &[1, mel_frames, SYNTHETIC_FEATURE_BINS],
+                100 + chunk as u64,
+                1.0,
+                0.0,
+            );
+            let (pre, len) = encoder.pre_encode(&features_t, mel_frames).unwrap();
+            let (encoded, _) = encoder.forward_pre_encoded(&pre, len).unwrap();
+            assert_eq!(encoded.dims3().unwrap(), (1, len, SYNTHETIC_D_MODEL));
+            assert_eq!(
+                encoder.counters.conformer_depthwise_conv1d(),
+                ((chunk + 1) * layers) as u64
+            );
+        }
+        // Other tests may run concurrently; the shared counter only grows.
+        assert!(
+            crate::kernels::depthwise_conv::depthwise_conv1d_calls()
+                >= shared_before + (chunks * layers) as u64
+        );
+        let diagnostics = SortformerAcousticEncoder::Conformer(encoder).kernel_diagnostics();
+        assert_eq!(
+            diagnostics["conformer_depthwise_conv1d_calls"],
+            serde_json::json!(chunks * layers)
+        );
+    }
+
+    #[test]
+    fn conformer_conv_norm_type_fails_closed_unless_batch_norm() {
+        let cfg = |norm: Option<&str>| SortformerEncoderConfig {
+            conv_norm_type: norm.map(str::to_string),
+            ..SortformerEncoderConfig::default()
+        };
+        assert!(validate_conv_norm_type(None).is_ok());
+        assert!(validate_conv_norm_type(Some(&cfg(None))).is_ok());
+        assert!(validate_conv_norm_type(Some(&cfg(Some("batch_norm")))).is_ok());
+        for other in ["layer_norm", "group_norm", "fused_batch_norm"] {
+            assert!(validate_conv_norm_type(Some(&cfg(Some(other)))).is_err());
         }
     }
 }

@@ -695,3 +695,92 @@ fn opt_in_vad_gate_keeps_quiet_speech_within_one_frame() {
         "the gate dropped quiet speech: {uncovered:?}\nungated {ungated:?}\ngated {gated:?}"
     );
 }
+
+/// Per-chunk CPU time and RTF of the streaming forward on diarization-2
+/// (116 s) for v2.1 `model` and `card_high` and Nemotron-3 `card_offline`;
+/// the best of two runs. `IZWI_SORTFORMER_BENCH_DUMP=<tag>` writes each
+/// run's probabilities to `target/sortformer-bench/<run>-<tag>.f32`, and
+/// `IZWI_SORTFORMER_BENCH_BASELINE=<tag>` prints the max |Δp| against
+/// that dump, so a change can show it is bit-exact or bounded.
+#[test]
+#[ignore = "requires the local Sortformer checkpoints and prepared parity audio"]
+fn sortformer_streaming_timings_on_diarization_2() {
+    let dump_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/sortformer-bench");
+    let dump_tag = std::env::var("IZWI_SORTFORMER_BENCH_DUMP").ok();
+    let baseline_tag = std::env::var("IZWI_SORTFORMER_BENCH_BASELINE").ok();
+    for (fixture_name, profile, load) in [
+        (
+            "v21-diarization-2.json",
+            "model",
+            load_v21 as fn() -> Option<SortformerDiarizerModel>,
+        ),
+        ("v21-diarization-2.json", "card_high", load_v21),
+        (
+            "nemotron3-diarization-2.json",
+            "card_offline",
+            load_nemotron3,
+        ),
+    ] {
+        let reference = fixture(fixture_name);
+        let Some(samples) = parity_audio(reference["audio"].as_str().expect("audio")) else {
+            return;
+        };
+        let Some(model) = load() else {
+            continue;
+        };
+        let cfg = fixture_streaming_config(&model, &reference["runs"][profile]["streaming"]);
+        let feature_frames = model.model.preprocessor.feature_frame_count(samples.len());
+        let chunks = plan_streaming_feature_chunks(feature_frames, cfg).len();
+        let mut best = f64::INFINITY;
+        let mut probs = Vec::new();
+        for _ in 0..2 {
+            let start = std::time::Instant::now();
+            probs = probabilities(&model, &samples, cfg);
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        let duration = samples.len() as f64 / f64::from(TARGET_SAMPLE_RATE);
+        let run = format!("{}-{profile}", fixture_name.trim_end_matches(".json"));
+        println!(
+            "bench {run}: {chunks} chunks, {:.1} ms/chunk, total {best:.2} s, RTF {:.4}",
+            best * 1e3 / chunks as f64,
+            best / duration
+        );
+        // Production loading engages the fast paths: every chunk runs each
+        // Conformer layer's depthwise conv through the shared op.
+        let kernels = model.family_diagnostics()["kernels"].clone();
+        println!("bench {run} kernels: {kernels}");
+        if let Some(calls) = kernels.get("conformer_depthwise_conv1d_calls") {
+            let expected = 2 * chunks * PRODUCTION_CONFORMER_LAYERS;
+            assert_eq!(
+                calls.as_u64(),
+                Some(expected as u64),
+                "{run} depthwise calls"
+            );
+        }
+        let flat = probs.iter().flatten().copied().collect::<Vec<f32>>();
+        if let Some(tag) = &dump_tag {
+            std::fs::create_dir_all(&dump_dir).expect("create bench dump dir");
+            let bytes = flat
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>();
+            std::fs::write(dump_dir.join(format!("{run}-{tag}.f32")), bytes)
+                .expect("write bench dump");
+        }
+        if let Some(tag) = &baseline_tag {
+            let path = dump_dir.join(format!("{run}-{tag}.f32"));
+            let baseline = std::fs::read(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect::<Vec<f32>>();
+            assert_eq!(baseline.len(), flat.len(), "{run} baseline length");
+            let bit_exact = baseline
+                .iter()
+                .zip(&flat)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            let max_abs = max_abs_diff(std::slice::from_ref(&flat), &[baseline]);
+            println!("bench {run} vs {tag}: max|dp| = {max_abs:.3e}, bit-exact = {bit_exact}");
+        }
+    }
+}
