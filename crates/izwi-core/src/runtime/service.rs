@@ -3180,8 +3180,13 @@ impl RuntimeChatInvocationDriver {
                     let Some(stream_order) = self.stream_order.as_ref() else {
                         unreachable!("non-streaming invocation handled above");
                     };
-                    if let Err(error) = stream_order.require_final(&self.request_id) {
-                        return self.fail_and_confirm(error).await;
+                    // A model that fails mid-stream closes its stream without
+                    // a final marker; its own error is the one to report.
+                    let failed = matches!(completion, RuntimeChatCompletion::Delivered(Err(_)));
+                    if !failed {
+                        if let Err(error) = stream_order.require_final(&self.request_id) {
+                            return self.fail_and_confirm(error).await;
+                        }
                     }
                     return self.finish_completion(completion).await;
                 }
@@ -9082,6 +9087,40 @@ mod tests {
         assert_eq!(
             harness.teardown.await.expect("teardown").disposition,
             RuntimeChatTeardownDisposition::Completed
+        );
+    }
+
+    /// A model that fails mid-stream ends its stream without a final marker;
+    /// the invocation reports the model's error, not the missing marker.
+    #[tokio::test]
+    async fn chat_driver_reports_the_model_error_of_a_failed_stream() {
+        let runtime = RuntimeService::new(EngineConfig::default()).expect("runtime");
+        let request_id = "failed-stream";
+        let mut harness =
+            chat_driver_harness(&runtime, request_id, 4, Duration::from_secs(30)).await;
+        harness
+            .stream
+            .send(text_chunk(request_id, 0, "partial"))
+            .await
+            .unwrap();
+        let _ = harness.completion.send(Err(Error::InferenceError(
+            "model rejected the answer".into(),
+        )));
+        drop(harness.stream);
+
+        assert!(matches!(
+            harness.events.recv().await,
+            Some(Ok(RuntimeChatInvocationEvent::TextDelta { .. }))
+        ));
+        match harness.events.recv().await {
+            Some(Err(Error::InferenceError(message))) => {
+                assert_eq!(message, "model rejected the answer")
+            }
+            other => panic!("expected the model error, got {other:?}"),
+        }
+        assert_eq!(
+            harness.teardown.await.expect("teardown").disposition,
+            RuntimeChatTeardownDisposition::Failed
         );
     }
 
