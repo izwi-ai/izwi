@@ -83,6 +83,19 @@ Validate argument routing and capability classification without compiling:
 scripts/bench/test-run-kv-cache-matrix.sh
 ```
 
+## Serving benchmark
+
+`run-serving-benchmark.py` drives chat completions on the local role or the
+gateway with Poisson arrivals, request-rate sweeps or a concurrency cap. It
+reports TTFT, pooled per-delta ITL, TPOT, throughput, goodput under SLOs and
+server-side counted metrics, and has a report-only regression profile per
+backend. See [docs/dev/SERVING_BENCHMARK.md](../../docs/dev/SERVING_BENCHMARK.md).
+
+```bash
+python3 scripts/bench/run-serving-benchmark.py --model LFM2.5-1.2B-Instruct-GGUF \
+  --request-rate 1,2,4,inf --num-prompts 200 --output serving.json
+```
+
 ## Backend model evidence
 
 `run-model-evidence.sh` wraps an existing strict benchmark manifest in a
