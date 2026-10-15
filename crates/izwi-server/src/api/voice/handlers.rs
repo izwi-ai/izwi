@@ -401,12 +401,7 @@ fn format_voice_session_transcript(detail: &VoiceSessionDetail) -> String {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    let message = err.to_string();
-    if message.contains("Invalid voice mode") || message.contains("Missing required") {
-        return ApiError::bad_request(message);
-    }
-
-    ApiError::internal(format!("Voice storage error: {err}"))
+    crate::error::store_api_error(err, "Voice storage error")
 }
 
 fn map_observation_store_error(err: anyhow::Error) -> ApiError {

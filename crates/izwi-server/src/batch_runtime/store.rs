@@ -9,6 +9,7 @@ use super::types::{
 use super::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};
 use crate::{
     db::{raw, write_transaction_options, StoreDatabase},
+    error::StoreError,
     ids::new_uuid,
     speech_history_store::{
         sanitize_audio_mime_type, sanitize_optional_text, NewSpeechHistoryRecord,
@@ -2708,7 +2709,7 @@ impl BatchRuntimeStore {
         let owned = u64::try_from(row.try_get_by_index::<i64>(1)?)?;
         let (global_limit, tenant_limit) = self.tts_admission_limits();
         if active >= global_limit as u64 || owned >= tenant_limit as u64 {
-            bail!("Speech job admission capacity exhausted: active={active}/{global_limit}, tenant={owned}/{tenant_limit}");
+            return Err(StoreError::capacity(format!("Speech job admission capacity exhausted: active={active}/{global_limit}, tenant={owned}/{tenant_limit}")).into());
         }
         Ok(())
     }
@@ -2833,40 +2834,44 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<DurableTextTtsAcceptanceOutcome> {
         anyhow::ensure!(
             input.projection.route_kind == SpeechRouteKind::TextToSpeech,
-            "Durable text TTS acceptance requires a text-to-speech projection"
+            StoreError::invalid("Durable text TTS acceptance requires a text-to-speech projection")
         );
         anyhow::ensure!(
             input.projection.processing_status == SpeechHistoryProcessingStatus::Pending
                 && input.projection.processing_error.is_none(),
-            "Durable text TTS acceptance requires a clean pending projection"
+            StoreError::invalid("Durable text TTS acceptance requires a clean pending projection")
         );
         anyhow::ensure!(
             input.projection.audio_bytes.is_empty()
                 && input.projection.reference_text.is_none()
                 && input.projection.saved_voice_id.is_none(),
-            "Durable text TTS acceptance does not accept reference or output media"
+            StoreError::invalid(
+                "Durable text TTS acceptance does not accept reference or output media"
+            )
         );
         anyhow::ensure!(
             input.projection.generation_time_ms == 0.0
                 && input.projection.audio_duration_secs.is_none()
                 && input.projection.rtf.is_none()
                 && input.projection.tokens_generated.is_none(),
-            "Durable text TTS acceptance requires an unexecuted projection"
+            StoreError::invalid("Durable text TTS acceptance requires an unexecuted projection")
         );
         anyhow::ensure!(
             input.max_attempts > 0,
-            "Durable text TTS acceptance requires at least one attempt"
+            StoreError::invalid("Durable text TTS acceptance requires at least one attempt")
         );
         anyhow::ensure!(
             input.queue_class == QueueClass::BatchTts,
-            "Durable text TTS acceptance requires the batch TTS queue"
+            StoreError::invalid("Durable text TTS acceptance requires the batch TTS queue")
         );
         validate_bounded_field("stage kind", &input.stage_kind, 128)?;
 
         anyhow::ensure!(
             !input.projection.input_text.is_empty()
                 && input.projection.input_text.len() <= MAX_DURABLE_TTS_TEXT_BYTES,
-            "Durable text TTS input must be between 1 and {MAX_DURABLE_TTS_TEXT_BYTES} bytes"
+            StoreError::too_large(format!(
+                "Durable text TTS input must be between 1 and {MAX_DURABLE_TTS_TEXT_BYTES} bytes"
+            ))
         );
         for (name, value) in [
             ("model ID", input.projection.model_id.as_deref()),
@@ -2887,11 +2892,15 @@ impl BatchRuntimeStore {
         )?;
         anyhow::ensure!(
             input.projection.audio_mime_type.len() <= MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES,
-            "Durable text TTS audio MIME type exceeds {MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES} bytes"
+            StoreError::invalid(format!(
+                "Durable text TTS audio MIME type exceeds {MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES} bytes"
+            ))
         );
 
         let model_id = sanitize_optional_text(input.projection.model_id.as_deref(), 160)
-            .ok_or_else(|| anyhow!("Durable text TTS acceptance requires a model ID"))?;
+            .ok_or_else(|| {
+                StoreError::invalid("Durable text TTS acceptance requires a model ID")
+            })?;
         let speaker = sanitize_optional_text(input.projection.speaker.as_deref(), 120);
         let language = sanitize_optional_text(input.projection.language.as_deref(), 80);
         let voice_description =
@@ -2899,7 +2908,7 @@ impl BatchRuntimeStore {
         let input_text = input.projection.input_text.trim().to_string();
         anyhow::ensure!(
             !input_text.is_empty(),
-            "Durable text TTS acceptance requires non-empty input text"
+            StoreError::invalid("Durable text TTS acceptance requires non-empty input text")
         );
         let speed = input
             .projection
@@ -2912,23 +2921,27 @@ impl BatchRuntimeStore {
             &input.request_json,
             MAX_DURABLE_TTS_REQUEST_JSON_BYTES,
             "Durable text TTS request",
-        )?;
+        )
+        .map_err(|err| StoreError::too_large(err.to_string()))?;
         let model_snapshot_json_string = bounded_json_string(
             &input.model_snapshot_json,
             MAX_DURABLE_TTS_METADATA_JSON_BYTES,
             "Durable text TTS model snapshot",
-        )?;
+        )
+        .map_err(|err| StoreError::invalid(err.to_string()))?;
         let retry_policy_json_string = bounded_json_string(
             &input.retry_policy_json,
             MAX_DURABLE_TTS_METADATA_JSON_BYTES,
             "Durable text TTS retry policy",
-        )?;
+        )
+        .map_err(|err| StoreError::invalid(err.to_string()))?;
         let resource_hints = input.resource_hints.normalized();
         let resource_hints_json = bounded_json_string(
             &json!(resource_hints.clone()),
             MAX_DURABLE_TTS_METADATA_JSON_BYTES,
             "Durable text TTS resource hints",
-        )?;
+        )
+        .map_err(|err| StoreError::invalid(err.to_string()))?;
         let admission_tenant = speech_admission_tenant(&input.request_json)?;
 
         if let Some(reservation) = input.reservation.as_ref() {
@@ -6420,7 +6433,7 @@ fn validate_optional_field_bytes(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         value.is_none_or(|value| value.len() <= max_bytes),
-        "{name} exceeds {max_bytes} bytes"
+        StoreError::invalid(format!("{name} exceeds {max_bytes} bytes"))
     );
     Ok(())
 }
@@ -8991,12 +9004,17 @@ mod tests {
             .await
             .unwrap();
         store.create_job(admission_job(1)).await.unwrap();
-        assert!(store
+        let exhausted = store
             .preflight_speech_admission(Some([1; 32]))
             .await
-            .unwrap_err()
+            .unwrap_err();
+        assert!(exhausted
             .to_string()
             .contains("Speech job admission capacity exhausted"));
+        assert_eq!(
+            crate::error::store_api_error(exhausted, "storage").status,
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[tokio::test]
@@ -9810,24 +9828,46 @@ mod tests {
             [1, 1, 1, 1, 1, 1]
         );
 
+        // Rejections carry their class: the handler maps them by it, never
+        // by their text.
+        let status = |error: anyhow::Error| crate::error::store_api_error(error, "storage").status;
         let mut oversized_text = durable_text_tts_acceptance(None);
         oversized_text.projection.input_text = "x".repeat(MAX_DURABLE_TTS_TEXT_BYTES + 1);
-        assert!(store
+        let error = store
             .accept_durable_text_tts(oversized_text)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("input must be between"));
+            .unwrap_err();
+        assert!(error.to_string().contains("input must be between"));
+        assert_eq!(status(error), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let mut oversized_request = durable_text_tts_acceptance(None);
+        oversized_request.request_json =
+            json!({"input": "x".repeat(MAX_DURABLE_TTS_REQUEST_JSON_BYTES)});
+        let error = store
+            .accept_durable_text_tts(oversized_request)
+            .await
+            .unwrap_err();
+        assert_eq!(status(error), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
 
         let mut oversized_metadata = durable_text_tts_acceptance(None);
         oversized_metadata.model_snapshot_json =
             json!({"metadata": "x".repeat(MAX_DURABLE_TTS_METADATA_JSON_BYTES)});
-        assert!(store
+        let error = store
             .accept_durable_text_tts(oversized_metadata)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("model snapshot exceeds"));
+            .unwrap_err();
+        assert!(error.to_string().contains("model snapshot exceeds"));
+        assert_eq!(status(error), axum::http::StatusCode::BAD_REQUEST);
+
+        let mut long_speaker = durable_text_tts_acceptance(None);
+        long_speaker.projection.speaker =
+            Some("x".repeat(MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES + 1));
+        let error = store
+            .accept_durable_text_tts(long_speaker)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("speaker exceeds"));
+        assert_eq!(status(error), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(
             durable_text_tts_row_counts(&store).await,
             [1, 1, 1, 1, 1, 1]

@@ -602,9 +602,8 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 }
 
 fn map_store_or_not_found(err: anyhow::Error) -> ApiError {
-    let error_text = err.to_string();
-    if error_text.contains("Thread not found") {
-        ApiError::not_found("Thread not found")
+    if crate::error::StoreError::find(&err).is_some() {
+        crate::error::store_api_error(err, "Chat storage error")
     } else {
         map_store_error(err)
     }
@@ -825,7 +824,12 @@ mod tests {
              (code: 517) database is locked"
         );
 
-        let missing = map_store_or_not_found(anyhow::anyhow!("Thread not found"));
+        let missing =
+            map_store_or_not_found(crate::error::StoreError::not_found("Thread not found").into());
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        assert_eq!(missing.message, "Thread not found");
+        // The text alone no longer decides the status.
+        let text = map_store_or_not_found(anyhow::anyhow!("Thread not found"));
+        assert_eq!(text.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

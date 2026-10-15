@@ -855,16 +855,6 @@ async fn create_record(
                     Some(err.message.clone()),
                 )
                 .await;
-            if err
-                .message
-                .contains("Speech job admission capacity exhausted")
-            {
-                return Err(ApiError {
-                    status: StatusCode::TOO_MANY_REQUESTS,
-                    message: err.message,
-                    detail: None,
-                });
-            }
             return Err(err);
         }
 
@@ -1012,7 +1002,7 @@ async fn accept_durable_text_tts_record(
                 .release_durable_idempotency(reservation)
                 .await;
         }
-        return Err(map_durable_tts_acceptance_error(err));
+        return Err(map_store_error(err));
     }
 
     let projection = NewSpeechHistoryRecord {
@@ -1072,7 +1062,7 @@ async fn accept_durable_text_tts_record(
                     .release_durable_idempotency(reservation)
                     .await;
             }
-            return Err(map_durable_tts_acceptance_error(err));
+            return Err(map_store_error(err));
         }
     };
 
@@ -1119,25 +1109,6 @@ fn durable_text_tts_request_digest(request: &BatchSpeechRequest) -> Result<Strin
             "Text-to-speech idempotency request cannot be canonicalized: {err}"
         ))
     })
-}
-
-fn map_durable_tts_acceptance_error(err: anyhow::Error) -> ApiError {
-    let message = err.to_string();
-    if message.contains("Speech job admission capacity exhausted") {
-        return ApiError::too_many_requests(message);
-    }
-    if message.contains("Durable text TTS input") || message.contains("Durable text TTS request") {
-        return ApiError::payload_too_large(message);
-    }
-    if message.starts_with("Durable text TTS")
-        || message.contains("speaker exceeds")
-        || message.contains("language exceeds")
-        || message.contains("voice description exceeds")
-        || message.contains("correlation ID exceeds")
-    {
-        return ApiError::bad_request(message);
-    }
-    map_store_error(err)
 }
 
 async fn create_pending_record(
@@ -1616,9 +1587,11 @@ async fn execute_batch_tts_stage(
     {
         Ok(record) => record,
         Err(err) => {
+            // The yield crosses the long-form planner as an inference error's
+            // text; the marker's own display identifies it.
             if err
                 .message
-                .contains("speech_stage_yield: committed segment boundary")
+                .contains(&crate::batch_runtime::worker::SpeechStageYield.to_string())
             {
                 return Err(crate::batch_runtime::worker::SpeechStageYield.into());
             }
@@ -2834,7 +2807,7 @@ fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Speech history storage error: {err}"))
+    crate::error::store_api_error(err, "Speech history storage error")
 }
 
 fn map_media_ingest_error(err: MediaIngestError) -> ApiError {

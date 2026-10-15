@@ -375,6 +375,56 @@ impl From<izwi_core::Error> for ApiError {
     }
 }
 
+/// A storage failure a request handler can act on. Stores return `anyhow`
+/// errors; this one rides inside them so handlers map it by class instead
+/// of by its text.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct StoreError {
+    class: ErrorClass,
+    message: String,
+}
+
+impl StoreError {
+    pub(crate) fn new(class: ErrorClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::InvalidRequest, message)
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::NotFound, message)
+    }
+
+    pub(crate) fn too_large(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::PayloadTooLarge, message)
+    }
+
+    /// A per-tenant or global admission limit: `429`.
+    pub(crate) fn capacity(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::RateLimited, message)
+    }
+
+    /// The typed store error anywhere in `err`'s chain.
+    pub(crate) fn find(err: &anyhow::Error) -> Option<&Self> {
+        err.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+/// The API error for a store failure: a [`StoreError`] keeps its class and
+/// message; anything else is a server fault described by `context`.
+pub(crate) fn store_api_error(err: anyhow::Error, context: &str) -> ApiError {
+    match StoreError::find(&err) {
+        Some(store) => ApiError::of(store.class, store.message.clone()),
+        None => ApiError::internal(format!("{context}: {err:#}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
@@ -700,5 +750,27 @@ mod tests {
             ApiError::context_length_exceeded("x").openai_body()["error"]["param"],
             "messages"
         );
+    }
+
+    /// A typed store error keeps its class; any other store failure is a
+    /// server fault, whatever its text says.
+    #[test]
+    fn store_errors_map_by_class_not_text() {
+        let capacity = store_api_error(
+            StoreError::capacity("Speech job admission capacity exhausted").into(),
+            "storage",
+        );
+        assert_eq!(capacity.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(capacity.message, "Speech job admission capacity exhausted");
+        let wrapped = store_api_error(
+            anyhow::Error::from(StoreError::too_large("input too long")).context("accepting"),
+            "storage",
+        );
+        assert_eq!(wrapped.status, StatusCode::PAYLOAD_TOO_LARGE);
+        let text = store_api_error(
+            anyhow::anyhow!("Speech job admission capacity exhausted"),
+            "storage",
+        );
+        assert_eq!(text.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

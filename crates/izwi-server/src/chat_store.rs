@@ -15,6 +15,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::db::{raw, write_transaction_options, StoreDatabase};
 use crate::entity::{chat_messages, chat_threads};
+use crate::error::StoreError;
 use crate::ids::new_uuid;
 
 const DEFAULT_THREAD_TITLE: &str = "New chat";
@@ -101,7 +102,7 @@ impl ChatStore {
             .one(db)
             .await
             .context("Failed to load chat thread")?
-            .ok_or_else(|| anyhow!("Thread not found"))?;
+            .ok_or_else(|| StoreError::not_found("Thread not found"))?;
         let previous_timestamp = latest_thread_message_timestamp(db, &thread_id)
             .await?
             .unwrap_or(thread.updated_at)
@@ -259,7 +260,7 @@ impl ChatStore {
             .one(&tx)
             .await
             .context("Failed to load chat thread")?
-            .ok_or_else(|| anyhow!("Thread not found"))?;
+            .ok_or_else(|| StoreError::not_found("Thread not found"))?;
 
         let previous_timestamp = latest_thread_message_timestamp(&tx, &thread_id)
             .await?
@@ -353,7 +354,7 @@ impl ChatStore {
             .one(&tx)
             .await
             .context("Failed to load chat thread")?
-            .ok_or_else(|| anyhow!("Thread not found"))?;
+            .ok_or_else(|| StoreError::not_found("Thread not found"))?;
         let previous_timestamp = latest_thread_message_timestamp(&tx, &user_message.thread_id)
             .await?
             .unwrap_or(thread.updated_at)

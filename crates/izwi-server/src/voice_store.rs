@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::db::{raw, StoreDatabase};
 use crate::entity::{voice_profiles, voice_sessions, voice_turns};
+use crate::error::StoreError;
 use crate::ids::new_uuid;
 use crate::voice_defaults::{DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID};
 
@@ -204,7 +205,7 @@ impl VoiceStore {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
         let system_prompt = sanitize_prompt(Some(system_prompt.as_str()))
-            .ok_or_else(|| anyhow!("Missing required session system prompt"))?;
+            .ok_or_else(|| StoreError::invalid("Missing required session system prompt"))?;
         let result = voice_sessions::Entity::update_many()
             .col_expr(
                 voice_sessions::Column::SystemPrompt,
@@ -698,7 +699,7 @@ fn sanitize_mode(raw: &str) -> anyhow::Result<String> {
     match raw.trim() {
         "modular" => Ok("modular".to_string()),
         "unified" => Ok("unified".to_string()),
-        other => Err(anyhow!("Invalid voice mode '{other}'")),
+        other => Err(StoreError::invalid(format!("Invalid voice mode '{other}'")).into()),
     }
 }
 
@@ -724,7 +725,8 @@ fn sanitize_prompt(raw: Option<&str>) -> Option<String> {
 }
 
 fn sanitize_required_text(raw: &str, max_len: usize) -> anyhow::Result<String> {
-    sanitize_optional_text(Some(raw), max_len).ok_or_else(|| anyhow!("Missing required text value"))
+    sanitize_optional_text(Some(raw), max_len)
+        .ok_or_else(|| StoreError::invalid("Missing required text value").into())
 }
 
 fn sanitize_optional_text(raw: Option<&str>, max_len: usize) -> Option<String> {
@@ -770,6 +772,19 @@ fn now_unix_millis_i64() -> i64 {
 mod tests {
     use super::*;
     use crate::test_support::env_lock;
+
+    /// Invalid input is typed, so the voice API answers `400` by its class
+    /// rather than by matching its text.
+    #[test]
+    fn invalid_voice_input_is_a_client_error() {
+        for error in [
+            sanitize_mode("duplex").unwrap_err(),
+            sanitize_required_text("  ", 10).unwrap_err(),
+        ] {
+            let api_error = crate::error::store_api_error(error, "Voice storage error");
+            assert_eq!(api_error.status, axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
 
     #[tokio::test]
     async fn initializes_default_profile_and_persists_sessions() {
