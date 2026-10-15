@@ -463,14 +463,12 @@ async fn attach_enterprise_request_context_with_hooks(
     response
 }
 
+/// Use the caller's x-request-id only when it passes the gateway's bounded
+/// charset; anything else (oversized, control or log-breaking characters,
+/// duplicates) is replaced with a fresh id instead of being echoed into logs,
+/// headers and engine correlation.
 fn resolve_correlation_id(req: &mut Request) -> String {
-    let correlation_id = req
-        .headers()
-        .get(REQUEST_ID_HEADER)
-        .and_then(header_to_string)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let correlation_id = resolve_gateway_correlation_id(req).unwrap_or_else(|generated| generated);
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
@@ -708,6 +706,52 @@ mod tests {
             .await
             .expect("body should read");
         assert_eq!(body, supplied.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn local_request_ids_are_bounded_like_the_gateway() {
+        let hooks = izwi_hooks::EnterpriseHooks::noop();
+        let app = Router::new()
+            .route("/", get(echo_context_and_header))
+            .layer(middleware::from_fn(move |req, next| {
+                let hooks = hooks.clone();
+                async move {
+                    attach_enterprise_request_context_with_hooks(&hooks, None, req, next).await
+                }
+            }));
+        let echo = |supplied: String| {
+            let app = app.clone();
+            async move {
+                let response = send_request(
+                    app,
+                    Request::builder()
+                        .uri("/")
+                        .header(HeaderName::from_static(REQUEST_ID_HEADER), supplied)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await;
+                let returned = response.headers()[REQUEST_ID_HEADER]
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should read");
+                (returned, String::from_utf8(body.to_vec()).unwrap())
+            }
+        };
+
+        let (returned, body) = echo("client-request-123".to_string()).await;
+        assert_eq!(returned, "client-request-123");
+        assert_eq!(body, "client-request-123|client-request-123");
+
+        for invalid in ["has spaces in it".to_string(), "x".repeat(129)] {
+            let (returned, body) = echo(invalid.clone()).await;
+            assert_ne!(returned, invalid);
+            Uuid::parse_str(&returned).expect("invalid ids are replaced with a UUID");
+            assert_eq!(body, format!("{returned}|{returned}"));
+        }
     }
 
     async fn send_request(mut app: Router, request: Request<Body>) -> Response {
