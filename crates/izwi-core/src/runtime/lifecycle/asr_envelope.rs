@@ -34,7 +34,7 @@ use crate::model::ModelVariant;
 use crate::models::architectures::parakeet::asr::parakeet_preparation_bytes;
 use crate::models::architectures::qwen3::asr::{
     qwen3_aligner_max_words, qwen3_audio_cnn_chunk_bytes, qwen3_audio_cnn_slice_chunks,
-    QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS,
+    QWEN3_ALIGNER_MAX_AUDIO_SECONDS,
 };
 use crate::models::architectures::qwen3::core::QWEN3_STATELESS_QUERY_BLOCK;
 
@@ -282,7 +282,7 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
         // windows after the ×8 stem) under a 5,000-class timestamp head; the
         // prompt is the window's audio and about 3.5 tokens per word.
         _ if variant.family() == ModelFamily::Qwen3ForcedAligner => AsrEnvelopeGeometry {
-            max_chunk_secs: QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS as f32,
+            max_chunk_secs: QWEN3_ALIGNER_MAX_AUDIO_SECONDS as f32,
             encoder_positions_per_sec: 13.0,
             encoder_window_secs: Some(8.0),
             encoder: stack(1024, 4096, 16),

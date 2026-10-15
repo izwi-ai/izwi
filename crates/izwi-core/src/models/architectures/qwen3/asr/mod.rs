@@ -1341,7 +1341,11 @@ impl Qwen3AsrDiagnostics {
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
 const QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS: usize = 1_200;
-pub(crate) const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
+/// One forced-alignment window on every backend (D1, as upstream). Its
+/// forward working set is reserved per window by the forced-alignment
+/// envelope; the convolution stem runs by slices and the portable prefill by
+/// query blocks, so the window fits on CPU and Metal as well as CUDA.
+pub(crate) const QWEN3_ALIGNER_MAX_AUDIO_SECONDS: usize = 180;
 /// Alignable words (or CJK characters) one aligner window accepts per second
 /// of audio. Fast speech runs about 5 per second; the bound keeps the prompt
 /// (about 3.5 tokens per word) proportional to the encoded window.
@@ -1498,13 +1502,12 @@ fn qwen3_asr_effective_max_frames(
     sample_rate: usize,
     hop_length: usize,
 ) -> usize {
-    if !cuda_device_observed {
-        return configured_max_frames;
-    }
     let seconds = if forced_aligner {
-        QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS
-    } else {
+        QWEN3_ALIGNER_MAX_AUDIO_SECONDS
+    } else if cuda_device_observed {
         QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS
+    } else {
+        return configured_max_frames;
     };
     seconds
         .saturating_mul(sample_rate.max(1))
@@ -5162,41 +5165,49 @@ mod tests {
         assert!(error.to_string().contains("context conflict"));
         assert!(error.to_string().contains("Qwen/Qwen3-ASR-0.6B"));
     }
+    /// D1: one 180 s aligner window on every backend, rejected (not
+    /// truncated) above it; the configured 30 s ASR frame count no longer
+    /// bounds the aligner on CPU/Metal.
     #[test]
-    fn forced_aligner_rejects_over_limit_audio_on_every_backend() {
+    fn forced_aligner_takes_one_180_s_window_on_every_backend() {
         let configured = 3_000;
-        assert_eq!(
-            qwen3_asr_admit_frames(3_000, false, true, configured, 16_000, 160).unwrap(),
-            3_000
-        );
-        let error = qwen3_asr_admit_frames(3_001, false, true, configured, 16_000, 160)
-            .expect_err("CPU/Metal aligner must reject, not truncate, over-limit audio");
-        assert!(matches!(error, Error::InvalidInput(_)), "{error}");
-        assert!(error.to_string().contains("30.0 s"), "{error}");
-        assert!(qwen3_asr_admit_frames(4_000, false, true, configured, 16_000, 160).is_err());
-        assert_eq!(
-            qwen3_asr_admit_frames(18_000, true, true, configured, 16_000, 160).unwrap(),
-            18_000
-        );
-        assert!(qwen3_asr_admit_frames(18_001, true, true, configured, 16_000, 160).is_err());
+        for cuda in [false, true] {
+            assert_eq!(
+                qwen3_asr_effective_max_frames(cuda, true, configured, 16_000, 160),
+                18_000
+            );
+            assert_eq!(
+                qwen3_asr_admit_frames(3_001, cuda, true, configured, 16_000, 160).unwrap(),
+                3_001
+            );
+            assert_eq!(
+                qwen3_asr_admit_frames(18_000, cuda, true, configured, 16_000, 160).unwrap(),
+                18_000
+            );
+            let error = qwen3_asr_admit_frames(18_001, cuda, true, configured, 16_000, 160)
+                .expect_err("the aligner must reject, not truncate, over-limit audio");
+            assert!(matches!(error, Error::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains("180.0 s"), "{error}");
+        }
     }
 
     #[test]
     fn forced_aligner_window_hint_fits_the_frame_limit() {
         let (n_fft, hop) = (400, 160);
-        for maximum in [3_000usize, 18_000] {
-            let samples = qwen3_aligner_max_window_samples(maximum, hop);
-            assert_eq!(
-                qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
-                maximum
-            );
-            assert_eq!(
-                qwen3_asr_mel_frame_count(samples + hop, n_fft, hop).unwrap(),
-                maximum + 1
-            );
+        let maximum = 18_000usize;
+        let samples = qwen3_aligner_max_window_samples(maximum, hop);
+        assert_eq!(
+            qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
+            maximum
+        );
+        assert_eq!(
+            qwen3_asr_mel_frame_count(samples + hop, n_fft, hop).unwrap(),
+            maximum + 1
+        );
+        for cuda in [false, true] {
             assert!(qwen3_asr_admit_frames(
                 qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
-                maximum == 18_000,
+                cuda,
                 true,
                 3_000,
                 16_000,
@@ -5204,8 +5215,8 @@ mod tests {
             )
             .is_ok());
         }
-        // A 30.0 s window encodes 3001 frames, so the CPU/Metal hint is 29.99 s.
-        assert_eq!(qwen3_aligner_max_window_samples(3_000, hop), 479_840);
+        // A 180.0 s window encodes 18001 frames, so the hint is 179.99 s.
+        assert_eq!(samples, 2_879_840);
     }
 
     #[test]
@@ -5236,10 +5247,6 @@ mod tests {
         assert_eq!(
             qwen3_asr_effective_max_frames(true, false, configured, 16_000, 160),
             120_000
-        );
-        assert_eq!(
-            qwen3_asr_effective_max_frames(true, true, configured, 16_000, 160),
-            18_000
         );
         assert_eq!(
             qwen3_asr_admit_frames(120_000, true, false, configured, 16_000, 160).unwrap(),

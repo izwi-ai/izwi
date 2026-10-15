@@ -967,6 +967,142 @@ mod tests {
         );
     }
 
+    /// D1: one 180 s window against the old 30 s windows, on the real
+    /// checkpoint (`IZWI_ALIGNER_DEVICE=cpu|metal`): `test.wav` twice
+    /// (59.4 s), and optionally a long cut (`IZWI_ALIGNER_LONG_WAV` with its
+    /// transcript in `IZWI_ALIGNER_LONG_TEXT`). `IZWI_ALIGNER_MODE` picks
+    /// `single`, `windowed`, `both` (default) or `load` (for footprint
+    /// baselines); `IZWI_ALIGNER_DUMP` names a directory for the words.
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint (IZWI_ALIGNER_DEVICE=cpu|metal)"]
+    fn forced_aligner_single_window_matches_30_s_windows() {
+        use crate::models::architectures::qwen3::asr::Qwen3AsrModel;
+        use crate::{DeviceSelector, ModelVariant};
+        use std::io::Write;
+
+        let models = std::env::var("IZWI_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_local_dir()
+                    .expect("data dir")
+                    .join("izwi")
+                    .join("models")
+            });
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let decode = |path: &std::path::Path| {
+            let bytes = std::fs::read(path).expect("audio");
+            crate::runtime::audio_io::decode_audio_bytes_canonical(&bytes).expect("decode")
+        };
+        let (once, rate) = decode(&data.join("test.wav"));
+        let text = std::fs::read_to_string(data.join("test.md")).expect("test.md");
+        let mut cases = vec![(
+            "test.wav x2".to_string(),
+            [once.as_slice(), once.as_slice()].concat(),
+            format!("{} {}", text.trim(), text.trim()),
+        )];
+        if let (Ok(wav), Ok(transcript)) = (
+            std::env::var("IZWI_ALIGNER_LONG_WAV"),
+            std::env::var("IZWI_ALIGNER_LONG_TEXT"),
+        ) {
+            let (samples, long_rate) = decode(std::path::Path::new(&wav));
+            assert_eq!(long_rate, rate);
+            let transcript = std::fs::read_to_string(transcript).expect("long transcript");
+            cases.push((wav, samples, transcript.trim().to_string()));
+        }
+
+        let device_name = std::env::var("IZWI_ALIGNER_DEVICE").unwrap_or_else(|_| "cpu".into());
+        let mode = std::env::var("IZWI_ALIGNER_MODE").unwrap_or_else(|_| "both".into());
+        let device = DeviceSelector::detect_with_preference(Some(&device_name)).expect("device");
+        let model = Qwen3AsrModel::load(
+            &models.join("Qwen3-ForcedAligner-0.6B"),
+            ModelVariant::Qwen3ForcedAligner06B,
+            device,
+        )
+        .expect("load aligner");
+        let limit = model.max_audio_seconds_hint().expect("aligner window");
+        assert!((limit - 179.99).abs() < 0.01, "window {limit} s");
+        if mode == "load" {
+            return;
+        }
+        // The pre-D1 CPU/Metal window: 3,000 mel frames.
+        let window_30 = 479_840usize;
+        for (label, samples, text) in cases {
+            let duration_ms = samples_to_ms(samples.len(), rate);
+            let whole = window(0, samples.len(), &text);
+            let align = |window: &SampleWindow, check: bool| {
+                align_window_checked(&samples, rate, window, check, |audio, text| {
+                    model.force_align_detailed(audio, rate, text, None)
+                })
+            };
+            let timed = |label: &str, run: &dyn Fn() -> WindowedAlignment| {
+                let started = std::time::Instant::now();
+                let alignment = run();
+                let words = alignment.words();
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{device_name} {label}: {} words in {:.1} s, sources {:?}",
+                    words.len(),
+                    started.elapsed().as_secs_f64(),
+                    alignment
+                        .windows
+                        .iter()
+                        .map(|window| (window.start_ms, window.end_ms, window.source))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(alignment.source(), AlignmentSource::Model, "{label}");
+                assert!(words.windows(2).all(|pair| pair[1].1 >= pair[0].2));
+                words
+            };
+            let single = (mode != "windowed").then(|| {
+                timed(&format!("{label} single"), &|| WindowedAlignment {
+                    windows: vec![align(&whole, true)],
+                    duration_ms,
+                })
+            });
+            let windowed = (mode != "single").then(|| {
+                timed(&format!("{label} 30 s windows"), &|| {
+                    let mut planner = LongTextPlanner::new(&samples, rate, &whole, window_30);
+                    let mut windows = Vec::new();
+                    while let Some(planned) = planner.next_window(&samples) {
+                        let aligned = align(&planned.window, false);
+                        windows.push(planner.absorb(&planned, aligned));
+                    }
+                    WindowedAlignment {
+                        windows,
+                        duration_ms,
+                    }
+                })
+            });
+            if let Ok(dir) = std::env::var("IZWI_ALIGNER_DUMP") {
+                let name = label.rsplit('/').next().unwrap_or(&label).replace(' ', "_");
+                for (kind, words) in [("single", &single), ("windowed", &windowed)] {
+                    if let Some(words) = words {
+                        let path = format!("{dir}/{device_name}-{name}-{kind}.json");
+                        std::fs::write(path, serde_json::to_string(words).unwrap()).unwrap();
+                    }
+                }
+            }
+            if let (Some(single), Some(windowed)) = (single, windowed) {
+                assert_eq!(single.len(), windowed.len(), "{label}");
+                let drift = single
+                    .iter()
+                    .zip(&windowed)
+                    .flat_map(|(a, b)| [a.1.abs_diff(b.1), a.2.abs_diff(b.2)])
+                    .collect::<Vec<_>>();
+                let over_80 = drift.iter().filter(|value| **value > 80).count();
+                let mean = drift.iter().map(|value| u64::from(*value)).sum::<u64>() as f64
+                    / drift.len().max(1) as f64;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{device_name} {label} single vs 30 s windows: mean {mean:.1} ms, max {} ms, \
+                     {over_80}/{} boundaries > 80 ms",
+                    drift.iter().max().copied().unwrap_or(0),
+                    drift.len()
+                );
+            }
+        }
+    }
+
     /// Drive the planner the way the runtime does, one aligner call per
     /// planned sub-window.
     fn run_long_text<F>(
