@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +14,6 @@ use izwi_serving_protocol::{
     PROTOCOL_V1,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 
@@ -359,67 +357,177 @@ const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const CHAT_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Default)]
-struct ChatStreamBackpressure {
-    full: AtomicBool,
-    notify: Notify,
+/// Upper bound on text merged for a lagging consumer. A consumer that owes
+/// this much is not catching up, so the stream is cancelled.
+const MAX_COALESCED_DELTA_BYTES: usize = 4 * 1024 * 1024;
+
+/// Text deltas on their way to a chat stream consumer. While the consumer
+/// lags (the bounded channel is full), deltas and their logprobs merge, in
+/// order, into one pending delta that is sent as a single event once the
+/// consumer frees a slot. A lagging consumer therefore costs bytes, not
+/// queued events; only one that accepts nothing for the slow-consumer
+/// timeout, or owes more than `MAX_COALESCED_DELTA_BYTES`, stalls the stream.
+struct ChatDeltaSink {
+    event_tx: mpsc::Sender<ChatStreamEvent>,
+    slow_consumer_timeout: Duration,
+    outbox: std::sync::Mutex<ChatDeltaOutbox>,
+    pending_ready: Notify,
 }
 
-impl ChatStreamBackpressure {
-    fn trip(&self) {
-        self.full.store(true, Ordering::Release);
-        self.notify.notify_one();
+#[derive(Default)]
+struct ChatDeltaOutbox {
+    pending: Option<PendingChatDelta>,
+    stalled: bool,
+}
+
+struct PendingChatDelta {
+    text: String,
+    logprobs: Vec<izwi_core::engine::TokenLogprob>,
+    since: tokio::time::Instant,
+}
+
+impl ChatDeltaSink {
+    fn new(event_tx: mpsc::Sender<ChatStreamEvent>, slow_consumer_timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            event_tx,
+            slow_consumer_timeout,
+            outbox: std::sync::Mutex::new(ChatDeltaOutbox::default()),
+            pending_ready: Notify::new(),
+        })
     }
 
-    fn is_tripped(&self) -> bool {
-        self.full.load(Ordering::Acquire)
+    fn outbox(&self) -> std::sync::MutexGuard<'_, ChatDeltaOutbox> {
+        self.outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn notified(&self) {
-        if self.is_tripped() {
+    fn is_stalled(&self) -> bool {
+        self.outbox().stalled
+    }
+
+    /// Sends a delta now, or merges it into the pending delta while the
+    /// consumer lags. Never blocks, so a synchronous runtime callback can
+    /// call it.
+    fn offer(&self, text: String, logprobs: Vec<izwi_core::engine::TokenLogprob>) {
+        let mut outbox = self.outbox();
+        if outbox.stalled || self.event_tx.is_closed() {
             return;
         }
-        self.notify.notified().await;
+        if outbox.pending.is_none() && self.event_tx.capacity() > 0 {
+            // Deltas are the only events sent while a generation runs, and
+            // they are sent under this lock, so the free slot is still free.
+            let _ = self
+                .event_tx
+                .try_send(ChatStreamEvent::Delta { text, logprobs });
+            return;
+        }
+        let pending = outbox.pending.get_or_insert_with(|| PendingChatDelta {
+            text: String::new(),
+            logprobs: Vec::new(),
+            since: tokio::time::Instant::now(),
+        });
+        pending.text.push_str(&text);
+        pending.logprobs.extend(logprobs);
+        if pending.text.len() > MAX_COALESCED_DELTA_BYTES {
+            outbox.stalled = true;
+        }
+        drop(outbox);
+        self.pending_ready.notify_one();
+    }
+
+    fn send_pending(&self, permit: mpsc::Permit<'_, ChatStreamEvent>) {
+        let mut outbox = self.outbox();
+        if let Some(pending) = outbox.pending.take() {
+            permit.send(ChatStreamEvent::Delta {
+                text: pending.text,
+                logprobs: pending.logprobs,
+            });
+        }
+    }
+
+    /// Delivers the pending delta whenever the consumer frees a slot, and
+    /// completes only once the consumer has stalled.
+    async fn stalled(&self) {
+        loop {
+            let since = {
+                let outbox = self.outbox();
+                if outbox.stalled {
+                    return;
+                }
+                outbox.pending.as_ref().map(|pending| pending.since)
+            };
+            let Some(since) = since else {
+                self.pending_ready.notified().await;
+                continue;
+            };
+            tokio::select! {
+                permit = self.event_tx.reserve() => match permit {
+                    Ok(permit) => self.send_pending(permit),
+                    // The consumer is gone; callers watch the closed channel.
+                    Err(_) => std::future::pending().await,
+                },
+                () = tokio::time::sleep_until(since + self.slow_consumer_timeout) => {
+                    self.outbox().stalled = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Delivers any pending delta and then `terminal`, each within the
+    /// slow-consumer timeout. A terminal event never overtakes text: if the
+    /// pending delta cannot be delivered the stream ends as failed.
+    async fn finish(&self, terminal: ChatStreamEvent) {
+        let (stalled, pending_since) = {
+            let outbox = self.outbox();
+            (
+                outbox.stalled,
+                outbox.pending.as_ref().map(|pending| pending.since),
+            )
+        };
+        if stalled {
+            // The consumer already spent its budget.
+            let _ = self.event_tx.try_send(terminal);
+            return;
+        }
+        if let Some(since) = pending_since {
+            let deadline = since + self.slow_consumer_timeout;
+            match tokio::time::timeout_at(deadline, self.event_tx.reserve()).await {
+                Ok(Ok(permit)) => self.send_pending(permit),
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    let _ = self.event_tx.try_send(ChatStreamEvent::Failed(
+                        CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
+        send_chat_terminal_with_timeout(
+            self.event_tx.clone(),
+            terminal,
+            self.slow_consumer_timeout,
+        )
+        .await;
     }
 }
 
-fn try_send_chat_delta(
-    event_tx: &mpsc::Sender<ChatStreamEvent>,
-    backpressure: &ChatStreamBackpressure,
-    delta: String,
-    logprobs: Vec<izwi_core::engine::TokenLogprob>,
-) {
-    match event_tx.try_send(ChatStreamEvent::Delta {
-        text: delta,
-        logprobs,
-    }) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => backpressure.trip(),
-        // The receiver has gone away, so there is nobody to notify with a
-        // terminal event. `event_tx.closed()` cancels the generation task.
-        Err(TrySendError::Closed(_)) => {}
-    }
-}
-
-async fn resolve_chat_terminal<F>(
-    event_tx: &mpsc::Sender<ChatStreamEvent>,
-    backpressure: Arc<ChatStreamBackpressure>,
-    generation: F,
-) -> Option<ChatStreamEvent>
+async fn resolve_chat_terminal<F>(sink: &ChatDeltaSink, generation: F) -> Option<ChatStreamEvent>
 where
     F: Future<Output = izwi_core::Result<ChatGeneration>>,
 {
     tokio::pin!(generation);
     let result = tokio::select! {
         result = &mut generation => Some(result),
-        _ = event_tx.closed() => return None,
-        _ = backpressure.notified() => None,
+        _ = sink.event_tx.closed() => return None,
+        _ = sink.stalled() => None,
     };
 
-    // A generation can produce the overflowing delta and complete in the same
-    // poll. Check the latch even when the generation branch wins the select so
-    // a dropped delta can never be reported as a successful completion.
-    if result.is_none() || backpressure.is_tripped() {
+    // A generation can overflow the merged delta and complete in the same
+    // poll. Check the latch even when the generation branch wins the select
+    // so lost text can never be reported as a successful completion.
+    if result.is_none() || sink.is_stalled() {
         return Some(ChatStreamEvent::Failed(
             CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
         ));
@@ -933,13 +1041,16 @@ where
     tokio::spawn(async move {
         let started = Instant::now();
         let mut logprob_entries = RemoteLogprobCollector::default();
-        let backpressure = Arc::new(ChatStreamBackpressure::default());
+        let sink = ChatDeltaSink::new(event_tx.clone(), slow_consumer_timeout);
         let mut text = String::new();
         let mut latest_usage = None;
         let terminal = loop {
             let event = tokio::select! {
                 event = worker_stream.next_event() => event,
                 () = event_tx.closed() => return,
+                () = sink.stalled() => {
+                    break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
+                }
             };
             let event = match event {
                 Ok(Some(event)) => event,
@@ -967,11 +1078,11 @@ where
                         break ChatStreamEvent::Failed(error.message);
                     }
                     let entries = logprob_entries.extend(logprobs);
-                    try_send_chat_delta(&event_tx, &backpressure, delta, entries);
+                    sink.offer(delta, entries);
                     if event_tx.is_closed() {
                         return;
                     }
-                    if backpressure.is_tripped() {
+                    if sink.is_stalled() {
                         break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
                     }
                 }
@@ -1020,7 +1131,7 @@ where
         // reconciliation. On a validated terminal event the lease was already
         // consumed above, so this is a no-op.
         drop(tenant_work);
-        send_chat_terminal_with_timeout(event_tx, terminal, slow_consumer_timeout).await;
+        sink.finish(terminal).await;
     });
     event_rx
 }
@@ -1326,7 +1437,7 @@ where
     let correlation_id = request.correlation_id;
 
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
-    let backpressure = Arc::new(ChatStreamBackpressure::default());
+    let sink = ChatDeltaSink::new(event_tx.clone(), izwi_core::stream_slow_consumer_timeout());
     tokio::spawn(async move {
         async move {
             let permit = match state
@@ -1352,17 +1463,16 @@ where
                 correlation_id.as_deref(),
                 permit.runtime_context(),
                 {
-                    let event_tx = event_tx.clone();
-                    let backpressure = backpressure.clone();
+                    let sink = sink.clone();
                     move |delta: String, logprobs: Vec<izwi_core::engine::TokenLogprob>| {
-                        try_send_chat_delta(&event_tx, &backpressure, delta, logprobs);
+                        sink.offer(delta, logprobs);
                     }
                 },
             );
-            let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+            let terminal = resolve_chat_terminal(&sink, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
-                send_chat_terminal(event_tx, terminal).await;
+                sink.finish(terminal).await;
             }
         }
         .await;
@@ -1383,11 +1493,11 @@ fn spawn_chat_stream_with_task<G, Fut>(
     generation_task: G,
 ) -> mpsc::Receiver<ChatStreamEvent>
 where
-    G: FnOnce(mpsc::Sender<ChatStreamEvent>, Arc<ChatStreamBackpressure>) -> Fut + Send + 'static,
+    G: FnOnce(Arc<ChatDeltaSink>) -> Fut + Send + 'static,
     Fut: Future<Output = izwi_core::Result<ChatGeneration>> + Send + 'static,
 {
     let (event_tx, event_rx) = mpsc::channel(capacity);
-    let backpressure = Arc::new(ChatStreamBackpressure::default());
+    let sink = ChatDeltaSink::new(event_tx.clone(), CHAT_TERMINAL_SEND_TIMEOUT);
 
     tokio::spawn(async move {
         let permit = match semaphore.acquire_owned().await {
@@ -1402,11 +1512,11 @@ where
             return;
         }
 
-        let generation = generation_task(event_tx.clone(), backpressure.clone());
-        let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+        let generation = generation_task(sink.clone());
+        let terminal = resolve_chat_terminal(&sink, generation).await;
         drop(permit);
         if let Some(terminal) = terminal {
-            send_chat_terminal(event_tx, terminal).await;
+            sink.finish(terminal).await;
         }
     });
 
@@ -1420,13 +1530,13 @@ fn spawn_chat_stream_with_task_and_keepalive<G, Fut, K>(
     generation_task: G,
 ) -> (mpsc::Receiver<ChatStreamEvent>, ChatStreamCompletion)
 where
-    G: FnOnce(mpsc::Sender<ChatStreamEvent>, Arc<ChatStreamBackpressure>) -> Fut + Send + 'static,
+    G: FnOnce(Arc<ChatDeltaSink>) -> Fut + Send + 'static,
     Fut: Future<Output = izwi_core::Result<ChatGeneration>> + Send + 'static,
     K: Send + 'static,
 {
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     let (completion_tx, completion_rx) = oneshot::channel();
-    let backpressure = Arc::new(ChatStreamBackpressure::default());
+    let sink = ChatDeltaSink::new(event_tx.clone(), CHAT_TERMINAL_SEND_TIMEOUT);
 
     tokio::spawn(async move {
         async move {
@@ -1434,11 +1544,11 @@ where
             if event_tx.send(ChatStreamEvent::Started).await.is_err() {
                 return;
             }
-            let generation = generation_task(event_tx.clone(), backpressure.clone());
-            let terminal = resolve_chat_terminal(&event_tx, backpressure, generation).await;
+            let generation = generation_task(sink.clone());
+            let terminal = resolve_chat_terminal(&sink, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
-                send_chat_terminal(event_tx, terminal).await;
+                sink.finish(terminal).await;
             }
         }
         .await;
@@ -1789,22 +1899,21 @@ mod tests {
     #[tokio::test]
     async fn streaming_chat_allows_long_running_generations_to_complete() {
         let semaphore = Arc::new(Semaphore::new(1));
-        let mut event_rx =
-            spawn_chat_stream_with_task(semaphore, 4, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "Hello".to_string(), Vec::new());
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                try_send_chat_delta(&event_tx, &backpressure, " world".to_string(), Vec::new());
-                Ok(ChatGeneration {
-                    text: "Hello world".to_string(),
-                    prompt_tokens: 12,
-                    tokens_generated: 2,
-                    generation_time_ms: 25.0,
-                    latency_breakdown: None,
-                    finish_reason: None,
-                    cached_prompt_tokens: None,
-                    logprobs: Vec::new(),
-                })
-            });
+        let mut event_rx = spawn_chat_stream_with_task(semaphore, 4, |sink| async move {
+            sink.offer("Hello".to_string(), Vec::new());
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            sink.offer(" world".to_string(), Vec::new());
+            Ok(ChatGeneration {
+                text: "Hello world".to_string(),
+                prompt_tokens: 12,
+                tokens_generated: 2,
+                generation_time_ms: 25.0,
+                latency_breakdown: None,
+                finish_reason: None,
+                cached_prompt_tokens: None,
+                logprobs: Vec::new(),
+            })
+        });
 
         match event_rx.recv().await {
             Some(ChatStreamEvent::Started) => {}
@@ -1830,40 +1939,95 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn saturated_chat_stream_emits_explicit_terminal_failure() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let mut event_rx =
-            spawn_chat_stream_with_task(semaphore, 2, |event_tx, backpressure| async move {
-                try_send_chat_delta(&event_tx, &backpressure, "first".to_string(), Vec::new());
-                try_send_chat_delta(&event_tx, &backpressure, "overflow".to_string(), Vec::new());
-                // Completion in the same poll as the overflow must not win the
-                // race and turn a truncated stream into apparent success.
-                Ok(ChatGeneration {
-                    text: "firstoverflow".to_string(),
-                    prompt_tokens: 1,
-                    tokens_generated: 2,
-                    generation_time_ms: 1.0,
-                    latency_breakdown: None,
-                    finish_reason: None,
-                    cached_prompt_tokens: None,
-                    logprobs: Vec::new(),
-                })
-            });
+    /// Drains a chat stream: its concatenated delta text, the number of
+    /// delta events, and the event that ended it (None if it just closed).
+    async fn drain_chat_stream(
+        event_rx: &mut mpsc::Receiver<ChatStreamEvent>,
+    ) -> (String, usize, Option<ChatStreamEvent>) {
+        let (mut text, mut deltas) = (String::new(), 0);
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ChatStreamEvent::Started => {}
+                ChatStreamEvent::Delta { text: delta, .. } => {
+                    text.push_str(&delta);
+                    deltas += 1;
+                }
+                terminal => return (text, deltas, Some(terminal)),
+            }
+        }
+        (text, deltas, None)
+    }
 
-        assert!(matches!(
-            event_rx.recv().await,
-            Some(ChatStreamEvent::Started)
-        ));
-        assert!(matches!(
-            event_rx.recv().await,
-            Some(ChatStreamEvent::Delta { text, .. }) if text == "first"
-        ));
-        assert!(matches!(
-            event_rx.recv().await,
-            Some(ChatStreamEvent::Failed(error)) if error == CHAT_STREAM_BACKPRESSURE_ERROR
-        ));
-        assert!(event_rx.recv().await.is_none());
+    #[tokio::test]
+    async fn paused_chat_reader_receives_coalesced_text_without_cancellation() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let expected = (0..100)
+            .map(|index| format!("t{index} "))
+            .collect::<String>();
+        let mut event_rx = spawn_chat_stream_with_task(semaphore, 2, |sink| async move {
+            for index in 0..100 {
+                sink.offer(format!("t{index} "), Vec::new());
+            }
+            // Completion in the same poll as the burst must still deliver
+            // the merged text ahead of the terminal event.
+            Ok(ChatGeneration {
+                text: (0..100).map(|index| format!("t{index} ")).collect(),
+                prompt_tokens: 1,
+                tokens_generated: 100,
+                generation_time_ms: 1.0,
+                latency_breakdown: None,
+                finish_reason: None,
+                cached_prompt_tokens: None,
+                logprobs: Vec::new(),
+            })
+        });
+
+        // Pause for less than the slow-consumer timeout, then read.
+        tokio::time::sleep(CHAT_TERMINAL_SEND_TIMEOUT / 3).await;
+        let (text, deltas, terminal) = drain_chat_stream(&mut event_rx).await;
+        assert_eq!(text, expected);
+        assert!(
+            deltas < 100,
+            "a lagging reader gets merged deltas: {deltas}"
+        );
+        assert!(
+            matches!(&terminal, Some(ChatStreamEvent::Completed(generation)) if generation.text == expected),
+            "{terminal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_reader_stalled_past_the_timeout_cancels_generation() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let generation_dropped = Arc::new(AtomicBool::new(false));
+        let dropped = generation_dropped.clone();
+        struct GenerationDrop(Arc<AtomicBool>);
+        impl Drop for GenerationDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let mut event_rx = spawn_chat_stream_with_task(semaphore.clone(), 2, |sink| async move {
+            let _drop = GenerationDrop(dropped);
+            for index in 0..10 {
+                sink.offer(format!("t{index} "), Vec::new());
+            }
+            std::future::pending::<()>().await;
+            unreachable!("a stalled reader cancels the generation")
+        });
+
+        tokio::time::sleep(CHAT_TERMINAL_SEND_TIMEOUT * 3).await;
+        assert!(generation_dropped.load(Ordering::Acquire));
+        assert_eq!(semaphore.available_permits(), 1);
+        // The stalled reader gets no completion: at most the explicit
+        // failure, otherwise a closed channel the SSE encoder reports.
+        match drain_chat_stream(&mut event_rx).await {
+            (_, _, None) => {}
+            (_, _, Some(ChatStreamEvent::Failed(error))) => {
+                assert_eq!(error, CHAT_STREAM_BACKPRESSURE_ERROR)
+            }
+            (_, _, other) => panic!("unexpected terminal {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1873,10 +2037,8 @@ mod tests {
         let release_generation = Arc::new(Notify::new());
         let started = generation_started.clone();
         let release = release_generation.clone();
-        let mut event_rx = spawn_chat_stream_with_task(
-            semaphore.clone(),
-            1,
-            move |_event_tx, _backpressure| async move {
+        let mut event_rx =
+            spawn_chat_stream_with_task(semaphore.clone(), 1, move |_sink| async move {
                 started.notify_one();
                 release.notified().await;
                 Ok(ChatGeneration {
@@ -1889,8 +2051,7 @@ mod tests {
                     cached_prompt_tokens: None,
                     logprobs: Vec::new(),
                 })
-            },
-        );
+            });
 
         generation_started.notified().await;
         assert_eq!(semaphore.available_permits(), 0);
@@ -1953,7 +2114,7 @@ mod tests {
         let (mut event_rx, completion) = spawn_chat_stream_with_task_and_keepalive(
             Arc::new(Semaphore::new(1)),
             keepalive,
-            move |_event_tx, _backpressure| async move {
+            move |_sink| async move {
                 let _drop = GenerationDrop(generation_drop_for_task);
                 started.notify_one();
                 std::future::pending::<()>().await;

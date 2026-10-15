@@ -1312,6 +1312,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_public_reader_receives_every_worker_delta() {
+        let count = FORWARDED_CHAT_STREAM_CAPACITY * 3;
+        let worker =
+            ScriptedWorker::spawn(ScriptedResponse::ManyDeltas(count), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let mut public_events = dispatcher(registry)
+            .stream(
+                2,
+                &RequestContext::new("test-request".into(), Principal::local_anonymous()),
+                request(),
+                tenant_work(),
+            )
+            .await
+            .unwrap();
+
+        // The worker's burst outruns both relay channels while the reader
+        // pauses for less than the 100 ms slow-consumer timeout.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut text = String::new();
+        let terminal = loop {
+            match public_events.recv().await {
+                Some(ChatStreamEvent::Delta { text: delta, .. }) => text.push_str(&delta),
+                Some(ChatStreamEvent::Started) => {}
+                terminal => break terminal,
+            }
+        };
+        assert!(
+            matches!(terminal, Some(ChatStreamEvent::Completed(_))),
+            "{terminal:?}"
+        );
+        assert_eq!(text, "x".repeat(count));
+    }
+
+    #[tokio::test]
     async fn non_draining_public_stream_cannot_retain_registry_dispatch() {
         let worker = ScriptedWorker::spawn(
             ScriptedResponse::ManyDeltas(FORWARDED_CHAT_STREAM_CAPACITY * 3),
