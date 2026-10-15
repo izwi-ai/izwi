@@ -7,10 +7,11 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, AttemptQueryResponse, CancelAttemptRequest, CancelAttemptResponse,
-    InvocationEvent, InvocationEventKind, InvocationRejection, InvocationRequest,
-    NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials, WorkerDescriptor,
-    WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1, SERVICE_AUTHORIZATION_HEADER,
-    SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
+    InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind, InvocationRejection,
+    InvocationRequest, NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials,
+    WorkerDescriptor, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1,
+    SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
+    WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
@@ -256,6 +257,11 @@ pub enum WorkerClientError {
     HttpStatus { status: StatusCode, body: String },
     #[error("worker rejected invocation with {rejection:?}")]
     Rejected { rejection: InvocationRejection },
+    /// The worker answered but could not finish admission within the queue
+    /// budget. The attempt may still be admitted, so it is never retried
+    /// elsewhere; the worker is busy, not failing.
+    #[error("worker admission outcome is unknown: {message}")]
+    AdmissionUnknown { message: String },
     #[error("worker response body exceeded {limit} bytes")]
     ResponseTooLarge { limit: usize },
     #[error("invalid worker JSON response: {0}")]
@@ -701,20 +707,36 @@ impl WorkerClient {
         )
         .await
         {
-            Ok(bytes) => match serde_json::from_slice::<InvocationRejection>(&bytes) {
-                Ok(rejection)
-                    if rejection.is_valid()
-                        && rejection.schema_version.major == PROTOCOL_V1.major
-                        && rejection.request_id == request.request_id
-                        && rejection.attempt_id == request.attempt_id =>
-                {
-                    WorkerClientError::Rejected { rejection }
+            Ok(bytes) => {
+                if status == StatusCode::GATEWAY_TIMEOUT {
+                    if let Ok(unknown) =
+                        serde_json::from_slice::<InvocationAdmissionUnknown>(&bytes)
+                    {
+                        if unknown.schema_version.major == PROTOCOL_V1.major
+                            && unknown.request_id == request.request_id
+                            && unknown.attempt_id == request.attempt_id
+                        {
+                            return WorkerClientError::AdmissionUnknown {
+                                message: unknown.message,
+                            };
+                        }
+                    }
                 }
-                _ => WorkerClientError::HttpStatus {
-                    status,
-                    body: lossy_bounded(&bytes),
-                },
-            },
+                match serde_json::from_slice::<InvocationRejection>(&bytes) {
+                    Ok(rejection)
+                        if rejection.is_valid()
+                            && rejection.schema_version.major == PROTOCOL_V1.major
+                            && rejection.request_id == request.request_id
+                            && rejection.attempt_id == request.attempt_id =>
+                    {
+                        WorkerClientError::Rejected { rejection }
+                    }
+                    _ => WorkerClientError::HttpStatus {
+                        status,
+                        body: lossy_bounded(&bytes),
+                    },
+                }
+            }
             Err(error) => error,
         }
     }
@@ -1172,6 +1194,10 @@ MAECAQ==
         assert!(
             WorkerClientError::Deadline(DeadlinePhase::InFlightPermit).proves_attempt_unaccepted()
         );
+        assert!(!WorkerClientError::AdmissionUnknown {
+            message: "busy".into()
+        }
+        .proves_attempt_unaccepted());
 
         let mut accepted_rejection = InvocationRejection::new(
             RequestId::new("request-2").expect("static request ID"),

@@ -1339,6 +1339,9 @@ pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
                 }
             }
         }
+        WorkerClientError::AdmissionUnknown { .. } => {
+            ApiError::service_unavailable(error.to_string())
+        }
         WorkerClientError::Deadline(_) => request_timeout_error(error.to_string()),
         WorkerClientError::InvalidInvocation(validation) => {
             ApiError::bad_request(validation.to_string())

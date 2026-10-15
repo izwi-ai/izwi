@@ -494,6 +494,19 @@ impl InvocationRejection {
     }
 }
 
+/// Body of a `504` invocation response whose runtime admission did not finish
+/// within the request's queue budget. The worker may still own the attempt,
+/// so this is not a rejection: the caller must not retry it elsewhere and
+/// reconciles it by query or cancel. It reports a busy worker, not an
+/// unreachable one. Workers before this type sent a plain-text `504`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationAdmissionUnknown {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub attempt_id: AttemptId,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationErrorCode {

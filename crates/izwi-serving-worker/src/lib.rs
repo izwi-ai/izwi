@@ -1548,7 +1548,14 @@ async fn invoke<E: InvocationExecutor>(
                     .fetch_add(1, Ordering::Relaxed);
                 return (
                     StatusCode::GATEWAY_TIMEOUT,
-                    "runtime admission outcome is unknown; query or cancel this attempt",
+                    Json(InvocationAdmissionUnknown {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request.request_id.clone(),
+                        attempt_id: request.attempt_id.clone(),
+                        message: "runtime admission outcome is unknown; query or cancel this \
+                                  attempt"
+                            .into(),
+                    }),
                 )
                     .into_response();
             }
@@ -3096,6 +3103,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         assert!(serde_json::from_slice::<InvocationRejection>(&body).is_err());
+        let unknown: InvocationAdmissionUnknown = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unknown.attempt_id, request.attempt_id);
         assert!(!completed.load(Ordering::Acquire));
         assert_eq!(service.active_invocations(), 1);
 

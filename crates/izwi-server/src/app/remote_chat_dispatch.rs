@@ -679,7 +679,11 @@ fn report_start_error(
     selected: &SelectedWorker,
     error: &WorkerClientError,
 ) {
-    if matches!(error, WorkerClientError::Rejected { rejection } if !rejection.accepted) {
+    // A typed rejection or an unknown admission outcome is an authenticated
+    // answer from a live worker (busy at worst), never a transport strike.
+    if matches!(error, WorkerClientError::Rejected { rejection } if !rejection.accepted)
+        || matches!(error, WorkerClientError::AdmissionUnknown { .. })
+    {
         let _ = registry.report_worker_reachable(&selected.key);
     } else {
         report_stream_error(registry, &selected.key, error);
@@ -742,11 +746,11 @@ mod tests {
     use izwi_serving_client::{WorkerClient, WorkerClientConfig};
     use izwi_serving_protocol::{
         ArtifactRevision, BackendKind, Capability, CapacitySnapshot, CredentialId,
-        DeviceAssignment, FinishReason, IncarnationId, InvocationEvent, InvocationEventKind,
-        InvocationInput, InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration,
-        ModelReadiness, NodeId, ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor,
-        WorkerFeature, WorkerId, WorkerProcessState, WorkerStatus, INVOCATIONS_PATH,
-        NDJSON_MEDIA_TYPE,
+        DeviceAssignment, FinishReason, IncarnationId, InvocationAdmissionUnknown, InvocationEvent,
+        InvocationEventKind, InvocationInput, InvocationRejection, InvocationRequest,
+        LoadedDeployment, ModelGeneration, ModelReadiness, NodeId, ServiceBearerToken,
+        ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature, WorkerId, WorkerProcessState,
+        WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
     };
 
     use crate::batch_runtime::store::BatchRuntimeStore;
@@ -776,6 +780,7 @@ mod tests {
     #[derive(Clone)]
     enum ScriptedResponse {
         Reject(RejectionCode),
+        AdmissionUnknown,
         AcceptedWithoutAcknowledgement,
         PartialThenDisconnect,
         ManyDeltas(usize),
@@ -850,6 +855,19 @@ mod tests {
                         code,
                         "scripted rejection",
                     ))
+                    .unwrap(),
+                ))
+                .unwrap(),
+            ScriptedResponse::AdmissionUnknown => Response::builder()
+                .status(StatusCode::GATEWAY_TIMEOUT)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&InvocationAdmissionUnknown {
+                        schema_version: PROTOCOL_V1,
+                        request_id: request.request_id,
+                        attempt_id: request.attempt_id,
+                        message: "scripted admission timeout".into(),
+                    })
                     .unwrap(),
                 ))
                 .unwrap(),
@@ -1269,6 +1287,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(worker.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_admission_is_a_busy_worker_not_a_circuit_strike() {
+        let worker =
+            ScriptedWorker::spawn(ScriptedResponse::AdmissionUnknown, Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let dispatcher = dispatcher(registry);
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+
+        // More slow admissions than the circuit's failure threshold (3).
+        for _ in 0..4 {
+            let error = dispatcher
+                .generate(2, &context, request(), tenant_work())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+                error.message
+            );
+        }
+        // An unknown outcome is never retried elsewhere, and the circuit
+        // stays closed, so every request still reached the worker.
+        assert_eq!(worker.requests().len(), 4);
     }
 
     #[tokio::test]
