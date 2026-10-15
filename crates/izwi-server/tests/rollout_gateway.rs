@@ -2,7 +2,7 @@
 //! runtime and cuts over generations with zero dropped requests.
 //!
 //! One real `izwi-server` gateway process reads its worker approvals from a
-//! shared approvals file; two `MockWorker`s serve generation 1 and
+//! shared approvals file; two `TestWorker`s serve generation 1 and
 //! generation 2 of the same deployment on real loopback TCP. The test
 //! drives the coordinator's view transitions by rewriting the file exactly
 //! as the supervisor's rollout coordinator does (atomic rename) while a
@@ -25,12 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
-use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
 use izwi_serving_protocol::{ModelAlias, ModelGeneration, NodeId, WorkerId};
+use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
 const GATEWAY_API_KEY: &str = "rollout-rig-api-key";
 const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
-const DEPLOYMENT_ID: &str = "mock-chat-v1";
+const DEPLOYMENT_ID: &str = "test-chat-v1";
 
 async fn reserve_port() -> u16 {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -39,21 +39,21 @@ async fn reserve_port() -> u16 {
     probe.local_addr().expect("probe addr").port()
 }
 
-fn worker_config(worker_id: &str, generation: u64, marker: &str) -> MockWorkerConfig {
-    MockWorkerConfig {
+fn worker_config(worker_id: &str, generation: u64, marker: &str) -> TestWorkerConfig {
+    TestWorkerConfig {
         worker_id: WorkerId::new(worker_id).expect("static worker id"),
         node_id: NodeId::new("rollout-node").expect("static node id"),
         public_model: ModelAlias::new(MODEL.dir_name()).expect("static model alias"),
         model_generation: ModelGeneration::new(generation).expect("static generation"),
         output_text: marker.to_string(),
         // The CLI dispatcher requires capacity for its 4096-token output
-        // budget; the mock's 1024-token default would fail eligibility.
+        // budget; the test worker's 1024-token default would fail eligibility.
         max_output_tokens: 8_192,
         // A rollout target needs observable headroom: at capacity 1 a status
         // poll landing mid-request reports zero available credits and the
         // registry finds no eligible worker for that instant.
         max_active_invocations: 4,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     }
 }
 
@@ -116,8 +116,8 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
                 MODEL.dir_name(),
             ])
             .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
             .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "100")
             .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
             .env("IZWI_GATEWAY_TENANT_MAX_CONCURRENT", "32")
@@ -289,20 +289,20 @@ async fn rollout_views_cut_over_generations_with_zero_dropped_requests() {
 
     // Both generations are live before the gateway boots; the file starts
     // with the predecessor only.
-    let old_worker = MockWorker::spawn(worker_config(
+    let old_worker = TestWorker::spawn(worker_config(
         "rollout-worker-old",
         1,
         "old-generation-response",
     ))
     .await
-    .expect("old mock worker spawns");
-    let new_worker = MockWorker::spawn(worker_config(
+    .expect("old test worker spawns");
+    let new_worker = TestWorker::spawn(worker_config(
         "rollout-worker-new",
         2,
         "new-generation-response",
     ))
     .await
-    .expect("new mock worker spawns");
+    .expect("new test worker spawns");
     let original_view = format!(
         "# fleet approvals\n{}\n",
         approval_line(

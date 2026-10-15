@@ -18,8 +18,6 @@ use serde::de::DeserializeOwned;
 use std::{collections::VecDeque, fmt, io::Cursor, pin::Pin, sync::Arc, time::Duration};
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
-#[cfg(any(test, feature = "mock-worker"))]
-pub mod mock;
 pub mod realtime;
 
 pub const DEFAULT_MAX_REQUEST_JSON_BYTES: usize = 1024 * 1024;

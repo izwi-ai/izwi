@@ -3,15 +3,15 @@
 //! without constructing an engine. The negative control is structural and
 //! observable: the process starts with no model artifacts or models directory
 //! anywhere, which is only possible because gateway mode owns no
-//! RuntimeService. An inference request succeeding through the mock worker
+//! RuntimeService. An inference request succeeding through the test worker
 //! proves the request was executed remotely, not locally.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
-use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
 use izwi_serving_protocol::ModelAlias;
+use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
 const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
 
@@ -19,11 +19,11 @@ const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
 async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() {
     let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
-    let worker_config = MockWorkerConfig {
+    let worker_config = TestWorkerConfig {
         public_model: model_alias,
         output_text: "gateway-process-t01".to_string(),
         // The CLI dispatcher requires capacity for its 4096-token output
-        // budget; the mock's 1024-token default would fail eligibility.
+        // budget; the test worker's 1024-token default would fail eligibility.
         max_output_tokens: 8_192,
         // DS9.1: the worker reports managed-prefix cached tokens through
         // protocol minor 3 and the gateway must surface them in the public
@@ -41,11 +41,11 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
                 bytes: b"gateway".to_vec(),
             }],
         }]),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(worker_config)
+    let worker = TestWorker::spawn(worker_config)
         .await
-        .expect("mock worker should bind a real loopback TCP listener");
+        .expect("test worker should bind a real loopback TCP listener");
 
     // Reserve a port the same way an operator would: bind, learn it, release.
     let port = {
@@ -57,9 +57,9 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
     let _endpoint = format!("http://127.0.0.1:{port}");
 
     // Standalone compatibility approval: URL|TASK|PUBLIC_MODEL|DEPLOYMENT|GEN.
-    // The mock's static deployment identity is mock-chat-v1 @ generation 1.
+    // The test worker's default deployment identity is test-chat-v1 @ generation 1.
     let approval = format!(
-        "{}|chat|{}|mock-chat-v1|1",
+        "{}|chat|{}|test-chat-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
@@ -78,8 +78,8 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
             &approval,
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())
@@ -124,7 +124,7 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
     };
     assert_eq!(readyz.status(), 200);
 
-    // Inference: authenticated request must be executed by the mock worker and
+    // Inference: authenticated request must be executed by the test worker and
     // relayed with the exact public JSON shape (no local engine is possible:
     // the process started without any model artifacts on disk).
     let response = client
@@ -208,15 +208,15 @@ const SCOPED_OPS_KEY: &str = "ds05-scoped-ops-metrics-key";
 async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_store() {
     let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
-    let worker_config = MockWorkerConfig {
+    let worker_config = TestWorkerConfig {
         public_model: model_alias,
         output_text: "gateway-process-ds05".to_string(),
         max_output_tokens: 8_192,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(worker_config)
+    let worker = TestWorker::spawn(worker_config)
         .await
-        .expect("mock worker should bind a real loopback TCP listener");
+        .expect("test worker should bind a real loopback TCP listener");
 
     let storage = tempfile::tempdir().expect("temp storage dir");
     let manifest_path = storage.path().join("principals.json");
@@ -235,7 +235,7 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
         probe.local_addr().expect("probe addr").port()
     };
     let approval = format!(
-        "{}|chat|{}|mock-chat-v1|1",
+        "{}|chat|{}|test-chat-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
@@ -264,8 +264,8 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
         )
         .env("IZWI_TEST_PROCESS_SCOPED_A", SCOPED_INFERENCE_KEY)
         .env("IZWI_TEST_PROCESS_SCOPED_B", SCOPED_OPS_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())
@@ -405,30 +405,30 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
     // The gateway always boots its chat route, so one chat worker is
     // approved alongside the realtime ASR worker under test.
-    let chat_worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+    let chat_worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-chat-node").expect("identity"),
         public_model: model_alias.clone(),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock chat worker binds");
-    let worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+    .expect("test chat worker binds");
+    let worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-asr-v1")
             .expect("static identity"),
         public_model: model_alias,
-        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+        realtime: Some(izwi_serving_worker::test_support::TestAsrStage {
             delta_per_frame: "partial ".into(),
             final_text: "gateway relayed transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
         }),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock realtime worker binds");
+    .expect("test realtime worker binds");
 
     let port = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -437,7 +437,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
         probe.local_addr().expect("probe addr").port()
     };
     let approval = format!(
-        "{}|speech_to_text|{}|mock-asr-v1|1",
+        "{}|speech_to_text|{}|test-asr-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
@@ -454,7 +454,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
             model.dir_name(),
             "--gateway-worker-approval",
             &format!(
-                "{}|chat|{}|mock-chat-v1|1",
+                "{}|chat|{}|test-chat-v1|1",
                 chat_worker.endpoint(),
                 model.dir_name()
             ),
@@ -464,8 +464,8 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
             "on",
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())
@@ -536,7 +536,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
         attempt_id: AttemptId::try_from("gateway-attempt-1").expect("identity"),
         expected_worker_incarnation: izwi_serving_protocol::IncarnationId::try_from("ignored")
             .expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-asr-v1")
             .expect("identity"),
         expected_model_generation: ModelGeneration::new(1).unwrap(),
         caller: GatewayAttestedCallerContext {
@@ -679,31 +679,31 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
 
     let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
-    let chat_worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+    let chat_worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-chat-node").expect("identity"),
         public_model: model_alias.clone(),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock chat worker binds");
-    let tts_worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-tts-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-tts-node").expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-tts-v1")
+    .expect("test chat worker binds");
+    let tts_worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-tts-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-tts-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-tts-v1")
             .expect("static identity"),
         public_model: model_alias,
-        realtime_tts: Some(izwi_serving_client::mock::MockTtsRealtimeKnobs {
+        realtime_tts: Some(izwi_serving_worker::test_support::TestTtsStage {
             chunk_bytes: 32,
             chunk_count: 2,
             push_cadence: Duration::from_millis(1),
             output_sample_rate: 24_000,
             disconnect_after_frames: None,
         }),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock tts worker binds");
+    .expect("test tts worker binds");
 
     let port = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -723,13 +723,13 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
             model.dir_name(),
             "--gateway-worker-approval",
             &format!(
-                "{}|chat|{}|mock-chat-v1|1",
+                "{}|chat|{}|test-chat-v1|1",
                 chat_worker.endpoint(),
                 model.dir_name()
             ),
             "--gateway-worker-approval",
             &format!(
-                "{}|text_to_speech|{}|mock-tts-v1|1",
+                "{}|text_to_speech|{}|test-tts-v1|1",
                 tts_worker.endpoint(),
                 model.dir_name()
             ),
@@ -737,8 +737,8 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
             "on",
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())
@@ -807,7 +807,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
         attempt_id: AttemptId::try_from("gateway-tts-attempt-1").expect("identity"),
         expected_worker_incarnation: izwi_serving_protocol::IncarnationId::try_from("ignored")
             .expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-tts-v1")
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-tts-v1")
             .expect("identity"),
         expected_model_generation: ModelGeneration::new(1).unwrap(),
         caller: GatewayAttestedCallerContext {
@@ -985,30 +985,30 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
 
     let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
-    let chat_worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+    let chat_worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-chat-node").expect("identity"),
         public_model: model_alias.clone(),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock chat worker binds");
-    let worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+    .expect("test chat worker binds");
+    let worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-asr-v1")
             .expect("static identity"),
         public_model: model_alias,
-        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+        realtime: Some(izwi_serving_worker::test_support::TestAsrStage {
             delta_per_frame: "partial ".into(),
             final_text: "gateway translated transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
         }),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock realtime worker binds");
+    .expect("test realtime worker binds");
 
     let port = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1029,13 +1029,13 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
             model.dir_name(),
             "--gateway-worker-approval",
             &format!(
-                "{}|chat|{}|mock-chat-v1|1",
+                "{}|chat|{}|test-chat-v1|1",
                 chat_worker.endpoint(),
                 model.dir_name()
             ),
             "--gateway-worker-approval",
             &format!(
-                "{}|speech_to_text|{}|mock-asr-v1|1",
+                "{}|speech_to_text|{}|test-asr-v1|1",
                 worker.endpoint(),
                 model.dir_name()
             ),
@@ -1043,8 +1043,8 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
             "on",
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())
@@ -1220,30 +1220,30 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
 
     let model = ModelVariant::Qwen354BGguf;
     let model_alias = ModelAlias::new(model.dir_name()).expect("static model alias");
-    let chat_worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-chat-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-chat-node").expect("identity"),
+    let chat_worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-chat-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-chat-node").expect("identity"),
         public_model: model_alias.clone(),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock chat worker binds");
-    let worker = MockWorker::spawn(MockWorkerConfig {
-        worker_id: izwi_serving_protocol::WorkerId::try_from("mock-asr-worker").expect("identity"),
-        node_id: izwi_serving_protocol::NodeId::try_from("mock-asr-node").expect("identity"),
-        deployment_id: izwi_serving_protocol::DeploymentId::try_from("mock-asr-v1")
+    .expect("test chat worker binds");
+    let worker = TestWorker::spawn(TestWorkerConfig {
+        worker_id: izwi_serving_protocol::WorkerId::try_from("test-asr-worker").expect("identity"),
+        node_id: izwi_serving_protocol::NodeId::try_from("test-asr-node").expect("identity"),
+        deployment_id: izwi_serving_protocol::DeploymentId::try_from("test-asr-v1")
             .expect("static identity"),
         public_model: model_alias,
-        realtime: Some(izwi_serving_client::mock::MockRealtimeKnobs {
+        realtime: Some(izwi_serving_worker::test_support::TestAsrStage {
             delta_per_frame: "partial ".into(),
             final_text: "gateway translated transcript".into(),
             push_cadence: Duration::from_millis(1),
             disconnect_after_frames: None,
         }),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
-    .expect("mock realtime worker binds");
+    .expect("test realtime worker binds");
 
     let port = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1264,13 +1264,13 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
             model.dir_name(),
             "--gateway-worker-approval",
             &format!(
-                "{}|chat|{}|mock-chat-v1|1",
+                "{}|chat|{}|test-chat-v1|1",
                 chat_worker.endpoint(),
                 model.dir_name()
             ),
             "--gateway-worker-approval",
             &format!(
-                "{}|speech_to_text|{}|mock-asr-v1|1",
+                "{}|speech_to_text|{}|test-asr-v1|1",
                 worker.endpoint(),
                 model.dir_name()
             ),
@@ -1278,8 +1278,8 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
             "on",
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         .stdout(Stdio::null())

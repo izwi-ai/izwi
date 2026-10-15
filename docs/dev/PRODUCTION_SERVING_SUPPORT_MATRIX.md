@@ -4,7 +4,7 @@ Status: exact-profile support statement, not a production-readiness certificate
 
 This matrix applies to Izwi's separated gateway/supervisor/worker architecture.
 It does not change the support contract of the existing `--role local` desktop
-and CLI workflows. A source path, parser test, mock worker, or compilation result
+and CLI workflows. A source path, parser test, scripted-runtime worker, or compilation result
 is never promoted to real hardware or performance evidence.
 
 ## Current profile cells
@@ -12,7 +12,7 @@ is never promoted to real hardware or performance evidence.
 | Topology | Gateway | Worker/backend | Model/artifact evidence | Current status |
 |---|---|---|---|---|
 | One machine, one device | One hardware-independent gateway | One supervised CPU worker | Generated tiny GGUF for the already-supported `LFM2.5-1.2B-Instruct-GGUF` route completed JSON and SSE through a subprocess worker | Development vertical slice proven; not a production model, capacity, soak, or performance certificate |
-| One machine, multiple devices | One gateway | Multiple independent mock workers | Deterministic chat replicas prove compatible routing, independent request identity, worker-authoritative capacity, retry fencing, and failure isolation | Mock transport evidence only; no physical multi-device claim |
+| One machine, multiple devices | One gateway | Multiple independent scripted-runtime workers | Deterministic chat replicas prove compatible routing, independent request identity, worker-authoritative capacity, retry fencing, and failure isolation | Scripted-runtime evidence only; no physical multi-device claim |
 | One machine, Apple silicon | One gateway | Metal worker (metal-feature build, device identity `metal:<registryID>` verified at startup) | **Real Metal inference executed**: 120 gateway-routed generations through a metal worker (debug build, tiny synthetic fixture, `benchmarks/manifests/ds07-metal-baseline.json`); `backend_parity.rs` proves greedy Metal outputs equal CPU outputs on the fixture, including the DS1.5 committed-prefix attach leg (`benchmarks/manifests/ds15-metal-summary.json`); supervisor launch + exact device identity process-evidenced (`multi_lane_launch.rs`) | Development Metal lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
 | One machine, NVIDIA | One gateway | CUDA-capable worker binary via `--cuda-worker-binary` | The supervisor accepts, validates, and launches CUDA assignments with exact declared UUID and device-visibility environment (process test `multi_lane_launch.rs`); no CUDA toolchain or NVIDIA device was available in this work session | Supervision code-complete; CUDA execution not run — no CUDA or multi-GPU support claim |
 | Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the worker terminates TLS/mTLS from bounded file references (supervised workers stay loopback-only), but no separate-machine handshake or artifact path was exercised | Not supported as an operational profile |
@@ -97,7 +97,7 @@ runbook section "Coordinated blue-green rollout".
 
 | Scope | Status | Evidence |
 |---|---|---|
-| One supervisor + one gateway over one shared approvals file (single node) | Supported on the process-evidenced lane | Supervisor process tests (`tests/rollout.rs`): canary-failure abort with byte-identical approvals restore, promotion through window → drain → commit with on-disk view assertions, replacement-exit abort, SIGKILL resume with fail-closed fresh start, status/abort command semantics; gateway rig (real gateway process, mock workers on real TCP, T37 pattern): continuous traffic across window → abort-restore and window → commit with zero failed requests, and the draining predecessor receives nothing after cutover |
+| One supervisor + one gateway over one shared approvals file (single node) | Supported on the process-evidenced lane | Supervisor process tests (`tests/rollout.rs`): canary-failure abort with byte-identical approvals restore, promotion through window → drain → commit with on-disk view assertions, replacement-exit abort, SIGKILL resume with fail-closed fresh start, status/abort command semantics; gateway rig (real gateway process, scripted-runtime workers on real TCP, T37 pattern): continuous traffic across window → abort-restore and window → commit with zero failed requests, and the draining predecessor receives nothing after cutover |
 | Fleet-wide (multi-gateway) cutover | Not implemented — the coordinator writes one shared approvals file; each additional gateway adopts the same views, but no multi-gateway rollout rig or fleet-wide abort evidence exists | Recorded `not implemented`, never `supported` |
 
 `draining_old` is the point of no return (worker control-pipe EOF cannot be
@@ -152,7 +152,7 @@ semantics, and older workers tolerate the new fields.
 
 | Scope | Status | Evidence |
 |---|---|---|
-| `usage.cached_tokens` (DS9.1) | Supported | Scheduler-authoritative managed-prefix cursor through `ChatGeneration` into public `usage.prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (responses); mock knob for tests; process test proves 64 cached tokens flow worker→public (`b2fb8415`) |
+| `usage.cached_tokens` (DS9.1) | Supported | Scheduler-authoritative managed-prefix cursor through `ChatGeneration` into public `usage.prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (responses); scripted-runtime knob for tests; process test proves 64 cached tokens flow worker→public (`b2fb8415`) |
 | `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming `choices[].logprobs`, streaming `delta.logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
 | `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`) |
 | `response_format: json_object` on own-sampler families; `json_schema` everywhere | Documented 400, never silently ignored | Rejection is the recorded spike decision pending the schema→FSM follow-up (`c1f4b1af`) |

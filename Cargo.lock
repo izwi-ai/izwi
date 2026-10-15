@@ -3811,6 +3811,7 @@ dependencies = [
  "izwi-hooks",
  "izwi-serving-client",
  "izwi-serving-protocol",
+ "izwi-serving-worker",
  "izwi-vad",
  "libc",
  "rand 0.8.5",
@@ -3839,8 +3840,6 @@ dependencies = [
 name = "izwi-serving-client"
 version = "0.1.0-beta-18"
 dependencies = [
- "async-stream",
- "axum",
  "bytes",
  "futures",
  "izwi-serving-protocol",

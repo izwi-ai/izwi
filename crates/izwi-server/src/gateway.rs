@@ -946,10 +946,7 @@ mod tests {
         AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookError, HookResult,
         PolicyEngine, QuotaDecision, QuotaLimiter, QuotaRequest,
     };
-    use izwi_serving_client::{
-        mock::{MockFault, MockWorker, MockWorkerConfig},
-        WorkerClient, WorkerClientConfig,
-    };
+    use izwi_serving_client::{WorkerClient, WorkerClientConfig};
     use izwi_serving_protocol::{
         DeploymentId, ModelAlias, ModelGeneration, PolicyRevision, WorkerStatus,
     };
@@ -965,6 +962,7 @@ mod tests {
         ApprovedDeployment, ApprovedWorker, BackendPolicy, WorkerRegistry, WorkerRegistryConfig,
         WorkerRegistryError,
     };
+    use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig, WorkerScript};
 
     const TEST_API_KEY: &str = "test-public-api-key-123456";
     const TEST_METRICS_API_KEY: &str = "test-metrics-api-key-654321";
@@ -1100,12 +1098,12 @@ mod tests {
         assert!(metrics.render_prometheus(0).len() <= MAX_PROMETHEUS_RESPONSE_BYTES);
     }
 
-    async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, MockWorker) {
+    async fn registry_gateway_state(model: ModelVariant) -> (GatewayState, TestWorker) {
         registry_gateway_state_with_config(
             model,
-            MockWorkerConfig {
+            TestWorkerConfig {
                 public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-                ..MockWorkerConfig::default()
+                ..TestWorkerConfig::default()
             },
         )
         .await
@@ -1113,12 +1111,12 @@ mod tests {
 
     async fn registry_gateway_state_with_config(
         model: ModelVariant,
-        worker_config: MockWorkerConfig,
-    ) -> (GatewayState, MockWorker) {
+        worker_config: TestWorkerConfig,
+    ) -> (GatewayState, TestWorker) {
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
         let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
@@ -1157,7 +1155,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("response should be JSON")
                 ["choices"][0]["message"]["content"],
-            "deterministic mock response"
+            "deterministic test response"
         );
 
         let streaming = Request::builder()
@@ -1181,7 +1179,7 @@ mod tests {
             .await
             .expect("SSE response should be bounded");
         let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
-        assert!(body.contains("deterministic mock response"));
+        assert!(body.contains("deterministic test response"));
         assert!(body.contains("data: [DONE]"));
         let metrics = state.metrics.snapshot();
         assert_eq!(metrics.dispatch_calls, 2);
@@ -1206,7 +1204,7 @@ mod tests {
             .expect("chat request should build")
     }
 
-    async fn wait_for_active(worker: &MockWorker, expected: usize) {
+    async fn wait_for_active(worker: &TestWorker, expected: usize) {
         for _ in 0..100 {
             if worker.active_invocations() == expected {
                 return;
@@ -1277,17 +1275,17 @@ mod tests {
     #[tokio::test]
     async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             output_cadence: Duration::from_millis(1),
             cancellation_delay: Duration::from_millis(150),
-            fault: MockFault::Hang,
-            ..MockWorkerConfig::default()
+            script: WorkerScript::Hang,
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let client = WorkerClient::new(
             &worker.endpoint(),
             credentials,
@@ -1314,10 +1312,10 @@ mod tests {
         let model = ModelVariant::Qwen354BGguf;
         let (state, _worker) = registry_gateway_state_with_config(
             model,
-            MockWorkerConfig {
+            TestWorkerConfig {
                 public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-                fault: MockFault::AcceptedThenDisconnect,
-                ..MockWorkerConfig::default()
+                script: WorkerScript::LoseAfterAccept,
+                ..TestWorkerConfig::default()
             },
         )
         .await;
@@ -1333,16 +1331,16 @@ mod tests {
     #[tokio::test]
     async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            fault: MockFault::Hang,
+            script: WorkerScript::Hang,
             cancellation_delay: Duration::from_millis(100),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
         let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
             .with_tenant_concurrency_config(
@@ -1411,16 +1409,16 @@ mod tests {
     #[tokio::test]
     async fn gateway_crash_cannot_duplicate_execution_and_recovery_is_explicit() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            fault: MockFault::Hang,
+            script: WorkerScript::Hang,
             cancellation_delay: Duration::from_millis(100),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config.clone())
+        let worker = TestWorker::spawn(worker_config.clone())
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let endpoint = worker.endpoint();
         let bootstrapping = |endpoint: String| {
             let credentials = credentials.clone();
@@ -1486,9 +1484,9 @@ mod tests {
         // (fate sharing), and a fresh worker under the same approved identity
         // resumes service for the restarted gateway.
         drop(worker);
-        let worker_next = MockWorker::spawn(worker_config)
+        let worker_next = TestWorker::spawn(worker_config)
             .await
-            .expect("replacement mock worker should bind");
+            .expect("replacement test worker should bind");
         let (resumed_app, _) = bootstrapping(worker_next.endpoint()).await;
         assert_eq!(
             send(resumed_app, stream_request()).await.status(),
@@ -1502,11 +1500,11 @@ mod tests {
         let model = ModelVariant::Qwen354BGguf;
         let (state, worker) = registry_gateway_state_with_config(
             model,
-            MockWorkerConfig {
+            TestWorkerConfig {
                 public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-                fault: MockFault::Hang,
+                script: WorkerScript::Hang,
                 cancellation_delay: Duration::from_millis(100),
-                ..MockWorkerConfig::default()
+                ..TestWorkerConfig::default()
             },
         )
         .await;
@@ -1560,7 +1558,7 @@ mod tests {
         drop(admitted_again);
     }
 
-    async fn approve_worker(registry: &WorkerRegistry, worker: &MockWorker) -> WorkerStatus {
+    async fn approve_worker(registry: &WorkerRegistry, worker: &TestWorker) -> WorkerStatus {
         let client = WorkerClient::new(
             &worker.endpoint(),
             worker.config().credentials.clone(),
@@ -1575,7 +1573,7 @@ mod tests {
         let deployment = status
             .deployments
             .first()
-            .expect("mock deployment should exist")
+            .expect("test deployment should exist")
             .clone();
         registry
             .approve(ApprovedWorker {
@@ -1598,20 +1596,20 @@ mod tests {
     #[tokio::test]
     async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
         let model = ModelVariant::Qwen354BGguf;
-        let deployment_id = MockWorkerConfig::default().deployment_id;
-        let incarnation = |suffix: &str| MockWorkerConfig {
-            worker_id: "mock-worker-fleet".try_into().expect("test id valid"),
-            node_id: "mock-node-fleet".try_into().expect("test id valid"),
-            incarnation_id: format!("mock-incarnation-{suffix}")
+        let deployment_id = TestWorkerConfig::default().deployment_id;
+        let incarnation = |suffix: &str| TestWorkerConfig {
+            worker_id: "test-worker-fleet".try_into().expect("test id valid"),
+            node_id: "test-node-fleet".try_into().expect("test id valid"),
+            incarnation_id: format!("test-incarnation-{suffix}")
                 .try_into()
                 .expect("test incarnation should be valid"),
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
             output_text: format!("from-{suffix}"),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
-        let worker_a = MockWorker::spawn(incarnation("one"))
+        let worker_a = TestWorker::spawn(incarnation("one"))
             .await
-            .expect("first mock worker should bind");
+            .expect("first test worker should bind");
         // Short status TTL keeps the loss simulation fast; production uses
         // seconds, which only changes how long a dead worker shadows routing.
         let registry = WorkerRegistry::new(WorkerRegistryConfig {
@@ -1628,7 +1626,7 @@ mod tests {
                 policy_revision: PolicyRevision::new("test-policy-v1")
                     .expect("static policy revision"),
                 backend_policy: BackendPolicy::ANY,
-                max_queue_wait: Duration::ZERO,
+                max_queue_wait: Duration::from_secs(1),
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
@@ -1677,9 +1675,9 @@ mod tests {
         );
 
         // A replacement incarnation for the same logical worker takes over.
-        let worker_b = MockWorker::spawn(incarnation("two"))
+        let worker_b = TestWorker::spawn(incarnation("two"))
             .await
-            .expect("replacement mock worker should bind");
+            .expect("replacement test worker should bind");
         approve_worker(&registry, &worker_b).await;
         let second = send(app.clone(), chat()).await;
         assert_eq!(second.status(), StatusCode::OK);
@@ -1703,15 +1701,15 @@ mod tests {
     #[tokio::test]
     async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_without_retry() {
         let model = ModelVariant::Qwen354BGguf;
-        let deployment_id = MockWorkerConfig::default().deployment_id;
-        let replica = |suffix: &str, output_text: &str| MockWorkerConfig {
-            worker_id: format!("mock-replica-{suffix}")
+        let deployment_id = TestWorkerConfig::default().deployment_id;
+        let replica = |suffix: &str, output_text: &str| TestWorkerConfig {
+            worker_id: format!("test-replica-{suffix}")
                 .try_into()
                 .expect("test worker id should be valid"),
-            node_id: format!("mock-node-{suffix}")
+            node_id: format!("test-node-{suffix}")
                 .try_into()
                 .expect("test node id should be valid"),
-            incarnation_id: format!("mock-incarnation-{suffix}")
+            incarnation_id: format!("test-incarnation-{suffix}")
                 .try_into()
                 .expect("test incarnation should be valid"),
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
@@ -1719,14 +1717,14 @@ mod tests {
             // Once the first delta is observed, this leaves a deterministic
             // window in which the first worker still owns its sole permit.
             output_cadence: Duration::from_secs(1),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
-        let worker_a = MockWorker::spawn(replica("a", "replica-a-only"))
+        let worker_a = TestWorker::spawn(replica("a", "replica-a-only"))
             .await
-            .expect("first mock replica should bind");
-        let worker_b = MockWorker::spawn(replica("b", "replica-b-only"))
+            .expect("first test replica should bind");
+        let worker_b = TestWorker::spawn(replica("b", "replica-b-only"))
             .await
-            .expect("second mock replica should bind");
+            .expect("second test replica should bind");
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
             .expect("registry should initialize");
 
@@ -1745,7 +1743,7 @@ mod tests {
             let deployment = status
                 .deployments
                 .first()
-                .expect("mock deployment should exist")
+                .expect("test deployment should exist")
                 .clone();
             registry
                 .approve(ApprovedWorker {
@@ -1772,7 +1770,7 @@ mod tests {
                 policy_revision: PolicyRevision::new("test-policy-v1")
                     .expect("static policy revision"),
                 backend_policy: BackendPolicy::ANY,
-                max_queue_wait: Duration::ZERO,
+                max_queue_wait: Duration::from_secs(1),
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
@@ -1859,14 +1857,14 @@ mod tests {
     #[tokio::test]
     async fn gateway_router_uses_only_the_remote_worker_and_hides_local_routes() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
         let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
         state.lifecycle.mark_ready();
@@ -1923,7 +1921,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).expect("response should be JSON")
                 ["choices"][0]["message"]["content"],
-            "deterministic mock response"
+            "deterministic test response"
         );
 
         let streaming_request = Request::builder()
@@ -1947,7 +1945,7 @@ mod tests {
             .await
             .expect("SSE response should be bounded");
         let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
-        assert!(body.contains("deterministic mock response"));
+        assert!(body.contains("deterministic test response"));
         assert!(body.contains("\"completion_tokens\":3"));
         assert!(body.contains("data: [DONE]"));
 
@@ -1967,14 +1965,14 @@ mod tests {
     #[tokio::test]
     async fn gateway_readiness_rejects_a_stale_model_generation() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         // The registry approved generation 2; the worker still serves 1.
         let client = WorkerClient::new(
             &worker.endpoint(),
@@ -2009,7 +2007,7 @@ mod tests {
                 policy_revision: PolicyRevision::new("test-policy-v1")
                     .expect("static policy revision"),
                 backend_policy: BackendPolicy::ANY,
-                max_queue_wait: Duration::ZERO,
+                max_queue_wait: Duration::from_secs(1),
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
@@ -2126,16 +2124,16 @@ mod tests {
     #[tokio::test]
     async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker_config = MockWorkerConfig {
+        let worker_config = TestWorkerConfig {
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            fault: MockFault::Hang,
+            script: WorkerScript::Hang,
             cancellation_delay: Duration::from_millis(100),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
         let credentials = worker_config.credentials.clone();
-        let worker = MockWorker::spawn(worker_config)
+        let worker = TestWorker::spawn(worker_config)
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
         let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
         state.lifecycle.mark_ready();
@@ -3020,7 +3018,7 @@ mod tests {
                 deployment_id: DeploymentId::new("chat-v1").expect("static deployment"),
                 policy_revision: PolicyRevision::new("test-policy-v1").unwrap(),
                 backend_policy: BackendPolicy::ANY,
-                max_queue_wait: Duration::ZERO,
+                max_queue_wait: Duration::from_secs(1),
                 max_output_tokens: 16,
                 max_output_bytes: 1024,
                 slow_consumer_timeout: Duration::from_millis(100),

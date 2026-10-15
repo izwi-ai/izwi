@@ -70,7 +70,9 @@ pub(crate) async fn single_worker_dispatcher_with_client(
             policy_revision: izwi_serving_protocol::PolicyRevision::new("test-policy-v1")
                 .expect("static policy revision"),
             backend_policy: BackendPolicy::ANY,
-            max_queue_wait: std::time::Duration::ZERO,
+            // A worker answers "admission unknown" once runtime admission
+            // outlasts this wait, so it must cover a test runtime's admission.
+            max_queue_wait: std::time::Duration::from_secs(1),
             max_output_tokens: 128,
             max_output_bytes: 4096,
             slow_consumer_timeout: std::time::Duration::from_millis(100),

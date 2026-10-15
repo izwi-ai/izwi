@@ -1,6 +1,6 @@
 //! DS5.2 multi-process fleet rig: two real `izwi-server` gateway processes
 //! (distinct `IZWI_GATEWAY_ID`s, one shared coordination database) route
-//! chat through mock workers over real loopback TCP, proving the
+//! chat through test workers over real loopback TCP, proving the
 //! multi-gateway profile with processes rather than in-process doubles:
 //!
 //! - T07 — concurrent admission from two gateways never exceeds the shared
@@ -21,7 +21,7 @@
 //!   gateway keeps serving while its peer is dead.
 //!
 //! Deviation from the DS5.2 text: the two "worker processes" are two
-//! in-process `MockWorker` instances on real loopback TCP listeners (no
+//! in-process `TestWorker` instances on real loopback TCP listeners (no
 //! worker binary exists to spawn); the gateways treat them identically to
 //! separate worker processes and every property under test lives in the
 //! gateway processes and the shared store.
@@ -32,8 +32,8 @@ use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
 use izwi_server::batch_runtime::store::BatchRuntimeStore;
-use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
 use izwi_serving_protocol::{ModelAlias, WorkerId};
+use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
 const GATEWAY_API_KEY: &str = "fleet-rig-api-key";
 const WORKER_ONE_ID: &str = "fleet-rig-worker-1";
@@ -75,7 +75,7 @@ impl Drop for GatewayProcess {
     }
 }
 
-fn worker_config(worker_id: &str, marker: &str) -> MockWorkerConfig {
+fn worker_config(worker_id: &str, marker: &str) -> TestWorkerConfig {
     worker_config_with_capacity(worker_id, marker, 1)
 }
 
@@ -83,21 +83,21 @@ fn worker_config_with_capacity(
     worker_id: &str,
     marker: &str,
     max_active_invocations: usize,
-) -> MockWorkerConfig {
-    MockWorkerConfig {
+) -> TestWorkerConfig {
+    TestWorkerConfig {
         worker_id: WorkerId::new(worker_id).expect("static worker id"),
         public_model: ModelAlias::new(MODEL.dir_name()).expect("static model alias"),
         output_text: marker.to_string(),
         // The CLI dispatcher requires capacity for its 4096-token output
-        // budget; the mock's 1024-token default would fail eligibility.
+        // budget; the test worker's 1024-token default would fail eligibility.
         max_output_tokens: 8_192,
         max_active_invocations,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     }
 }
 
-fn approval_for(worker: &MockWorker, model_dir: &str) -> String {
-    format!("{}|chat|{}|mock-chat-v1|1", worker.endpoint(), model_dir)
+fn approval_for(worker: &TestWorker, model_dir: &str) -> String {
+    format!("{}|chat|{}|test-chat-v1|1", worker.endpoint(), model_dir)
 }
 
 async fn spawn_gateway(
@@ -158,8 +158,8 @@ async fn spawn_gateway_once(
             MODEL.dir_name(),
         ])
         .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "mock-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "mock-secret-token")
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
         .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "100")
         .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
         // Headroom above the default tenant limits so bursts exercise fleet
@@ -279,7 +279,7 @@ async fn claim_until(claims: &BatchRuntimeStore, worker_id: &str, ttl_ms: u64) -
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let claim = claims
-            .try_claim_fleet_capacity(worker_id, "mock-incarnation-1", "gateway-rig", 1, ttl_ms)
+            .try_claim_fleet_capacity(worker_id, "test-incarnation-1", "gateway-rig", 1, ttl_ms)
             .await
             .expect("rig claim");
         if let Some(claim) = claim {
@@ -304,9 +304,9 @@ fn response_marker(body: &serde_json::Value) -> String {
 async fn fleet_gateways_share_atomic_admission_across_processes() {
     let root = tempfile::tempdir().expect("temp dir");
     let fleet_db = root.path().join("t07-fleet.sqlite3");
-    let worker = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+    let worker = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
         .await
-        .expect("mock worker binds");
+        .expect("test worker binds");
     let approval = approval_for(&worker, MODEL.dir_name());
 
     let gateway_a = spawn_gateway(
@@ -395,13 +395,13 @@ async fn fleet_partition_keeps_combined_quota_within_the_configured_budget() {
     // Headroom above the sequential request pace: the poller snapshot can
     // trail the worker's true state by one poll interval, so a capacity-1
     // worker would shed 503s mid-burst and drown the rate-limit signal.
-    let worker = MockWorker::spawn(worker_config_with_capacity(
+    let worker = TestWorker::spawn(worker_config_with_capacity(
         WORKER_ONE_ID,
         WORKER_ONE_MARKER,
         16,
     ))
     .await
-    .expect("mock worker binds");
+    .expect("test worker binds");
     let approval = approval_for(&worker, MODEL.dir_name());
 
     // Total tenant budget: 60 requests/minute with a burst bucket of 32.
@@ -485,12 +485,12 @@ async fn fleet_partition_keeps_combined_quota_within_the_configured_budget() {
 async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
     let root = tempfile::tempdir().expect("temp dir");
     let fleet_db = root.path().join("p81-fleet.sqlite3");
-    let worker_one = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+    let worker_one = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
         .await
-        .expect("mock worker binds");
-    let worker_two = MockWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
+        .expect("test worker binds");
+    let worker_two = TestWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
         .await
-        .expect("mock worker binds");
+        .expect("test worker binds");
     // The CLI set stays explicit (worker one); the shared file AUGMENTS it
     // with worker two. Duplicate endpoints across the two sources fail
     // closed at startup, so the rig keeps the sets disjoint and asserts the
@@ -590,12 +590,12 @@ async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
 async fn fleet_capacity_claims_steer_dispatch_between_workers() {
     let root = tempfile::tempdir().expect("temp dir");
     let fleet_db = root.path().join("steer-fleet.sqlite3");
-    let worker_one = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+    let worker_one = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
         .await
-        .expect("mock worker binds");
-    let worker_two = MockWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
+        .expect("test worker binds");
+    let worker_two = TestWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
         .await
-        .expect("mock worker binds");
+        .expect("test worker binds");
     let approvals = vec![
         approval_for(&worker_one, MODEL.dir_name()),
         approval_for(&worker_two, MODEL.dir_name()),
@@ -664,12 +664,12 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
 async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
     let root = tempfile::tempdir().expect("temp dir");
     let fleet_db = root.path().join("crash-fleet.sqlite3");
-    let worker_one = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+    let worker_one = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
         .await
-        .expect("mock worker binds");
-    let worker_two = MockWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
+        .expect("test worker binds");
+    let worker_two = TestWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
         .await
-        .expect("mock worker binds");
+        .expect("test worker binds");
     let approvals = vec![
         approval_for(&worker_one, MODEL.dir_name()),
         approval_for(&worker_two, MODEL.dir_name()),
@@ -698,7 +698,7 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
     // ever releases it, so only TTL expiry can free worker one again.
     let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
     let _dead_claim = claims
-        .try_claim_fleet_capacity(WORKER_ONE_ID, "mock-incarnation-1", "gateway-a", 1, 3_000)
+        .try_claim_fleet_capacity(WORKER_ONE_ID, "test-incarnation-1", "gateway-a", 1, 3_000)
         .await
         .expect("forged claim")
         .expect("the crashed gateway's claim holds");
@@ -793,12 +793,12 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
         .await
         .expect("migrations run on the cleaned database");
 
-    let worker_one = MockWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
+    let worker_one = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
         .await
-        .expect("mock worker binds");
-    let worker_two = MockWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
+        .expect("test worker binds");
+    let worker_two = TestWorker::spawn(worker_config(WORKER_TWO_ID, WORKER_TWO_MARKER))
         .await
-        .expect("mock worker binds");
+        .expect("test worker binds");
     let approvals = vec![
         approval_for(&worker_one, MODEL.dir_name()),
         approval_for(&worker_two, MODEL.dir_name()),
@@ -853,7 +853,7 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
     let held = rig
         .try_claim_fleet_capacity(
             WORKER_ONE_ID,
-            "mock-incarnation-1",
+            "test-incarnation-1",
             "gateway-rig",
             1,
             60_000,

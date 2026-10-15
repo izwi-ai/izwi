@@ -1028,17 +1028,17 @@ to unrelated local-engine tests elsewhere in the repository.
 
 | Lane | Current evidence | Operational status |
 |---|---|---|
-| Deterministic mock worker | Real-loopback HTTP contract and public gateway tests cover auth/version/bounds, success, incompatible model/deployment, authoritative capacity rejection, timeout, lost acknowledgement, partial stream, cancellation, two replicas, circuit fencing, and the bounded one-alternate policy. The focused alternate-dispatch suite passed 7/7 in this work session, including bounded backoff/jitter. | Implementation/test evidence only; not production readiness |
+| Scripted-runtime worker | The real worker service over a scripted runtime (`izwi-serving-worker` `test-support`), on real loopback sockets: the client contract suites and public gateway tests cover auth/version/bounds, success, incompatible model/deployment, authoritative capacity rejection, timeout, lost acknowledgement, partial stream, cancellation, two replicas, circuit fencing, and the bounded one-alternate policy. The focused alternate-dispatch suite passed 7/7 in this work session, including bounded backoff/jitter. | Implementation/test evidence only; not production readiness |
 | Real CPU execution | A subprocess worker loaded/warmed a generated tiny supported LFM2 GGUF and completed public JSON and SSE chat through the gateway | Proven development-path process separation; not a production model/resource/performance certificate |
 | Metal compilation and execution | A metal-feature worker served 120 gateway-routed generations on the tiny fixture; `backend_parity.rs` proves greedy Metal outputs equal CPU outputs; supervisor launch with exact device identity is process-evidenced (`multi_lane_launch.rs`) | Development lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
 | CUDA compilation | Compile-checked by the `cargo-cuda-compile` lane; no serving-specific CUDA execution was run | Compilation only |
 | Real CUDA execution | The supervisor accepts, validates and launches CUDA assignments with the exact declared UUID (`multi_lane_launch.rs`); no NVIDIA device was available to execute on | Not established |
-| Physical multi-GPU | Parser/topology and mock-replica tests only | Not established |
+| Physical multi-GPU | Parser/topology and scripted-runtime replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
 | Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals with monotonic observations, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). MySQL coordination SQL is written but unvalidated. Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,
 artifact/state, mTLS, HA, accelerator, overload, soak, and performance gates in
-the implementation plan. Two mock workers returning responses—or one tiny CPU
+the implementation plan. Two scripted-runtime workers returning responses—or one tiny CPU
 fixture completing chat—does not make the system production-ready.

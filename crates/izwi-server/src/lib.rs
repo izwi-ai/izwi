@@ -2650,10 +2650,10 @@ mod tests {
     use super::*;
     use crate::test_support::env_lock;
     use izwi_core::ModelVariant;
-    use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
     use izwi_serving_protocol::{
         IncarnationId, ModelAlias, NodeId, WorkerDescriptor, WorkerId, WorkerStatus,
     };
+    use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -3365,16 +3365,16 @@ mod tests {
     async fn registry_gateway_configuration_approves_worker_without_runtime() {
         let model = ModelVariant::Qwen354BGguf;
         let public_model = ModelAlias::new(model.dir_name()).expect("static model alias");
-        let first = MockWorker::spawn(MockWorkerConfig {
+        let first = TestWorker::spawn(TestWorkerConfig {
             worker_id: WorkerId::new("gateway-worker-a").expect("static worker id"),
             node_id: NodeId::new("gateway-node-a").expect("static node id"),
             incarnation_id: IncarnationId::new("gateway-incarnation-a")
                 .expect("static incarnation"),
             public_model: public_model.clone(),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         })
         .await
-        .expect("mock worker should bind");
+        .expect("test worker should bind");
         let credentials = first.config().credentials.clone();
         let mut args = parse(&[
             "izwi-server",
@@ -3410,17 +3410,17 @@ mod tests {
     async fn registry_gateway_boots_past_an_unavailable_worker_and_adopts_it_later() {
         let model = ModelVariant::Qwen354BGguf;
         let public_model = ModelAlias::new(model.dir_name()).expect("static model alias");
-        let worker_config = |name: &str| MockWorkerConfig {
+        let worker_config = |name: &str| TestWorkerConfig {
             worker_id: WorkerId::new(format!("gateway-worker-{name}")).expect("static worker id"),
             node_id: NodeId::new("gateway-node-a").expect("static node id"),
             incarnation_id: IncarnationId::new(format!("gateway-incarnation-{name}"))
                 .expect("static incarnation"),
             public_model: public_model.clone(),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
-        let first = MockWorker::spawn(worker_config("a"))
+        let first = TestWorker::spawn(worker_config("a"))
             .await
-            .expect("mock worker should bind");
+            .expect("test worker should bind");
         // The second approved worker is down at boot: nothing listens yet.
         let late_address = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("probe binds")
@@ -3467,9 +3467,9 @@ mod tests {
         );
 
         // Once the worker comes up, the gateway adopts it without a restart.
-        let _late = MockWorker::spawn_at(worker_config("b"), late_address)
+        let _late = TestWorker::spawn_at(worker_config("b"), late_address)
             .await
-            .expect("late mock worker should bind its approved address");
+            .expect("late test worker should bind its approved address");
         let adopted = tokio::time::timeout(Duration::from_secs(10), async {
             while dispatcher
                 .registry()
@@ -3491,14 +3491,16 @@ mod tests {
     #[tokio::test]
     async fn registry_gateway_boot_rejects_two_endpoints_for_one_logical_worker() {
         let model = ModelVariant::Qwen354BGguf;
-        let config = MockWorkerConfig {
+        let config = TestWorkerConfig {
             worker_id: WorkerId::new("gateway-worker-a").expect("static worker id"),
             node_id: NodeId::new("gateway-node-a").expect("static node id"),
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         };
-        let first = MockWorker::spawn(config.clone()).await.expect("mock binds");
-        let second = MockWorker::spawn(config).await.expect("mock binds");
+        let first = TestWorker::spawn(config.clone())
+            .await
+            .expect("test worker binds");
+        let second = TestWorker::spawn(config).await.expect("test worker binds");
         let credentials = first.config().credentials.clone();
         let mut args = parse(&[
             "izwi-server",
@@ -3535,16 +3537,16 @@ mod tests {
     #[tokio::test]
     async fn restarted_worker_reapproval_pins_stable_identity_and_deployment() {
         let model = ModelVariant::Qwen354BGguf;
-        let worker = MockWorker::spawn(MockWorkerConfig {
+        let worker = TestWorker::spawn(TestWorkerConfig {
             worker_id: WorkerId::new("restart-worker").expect("static worker id"),
             node_id: NodeId::new("restart-node").expect("static node id"),
             incarnation_id: IncarnationId::new("restart-incarnation-1")
                 .expect("static incarnation"),
             public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
-            ..MockWorkerConfig::default()
+            ..TestWorkerConfig::default()
         })
         .await
-        .expect("mock worker should bind");
+        .expect("test worker should bind");
         let client = WorkerClient::new(
             &worker.endpoint(),
             worker.config().credentials.clone(),
@@ -4038,16 +4040,16 @@ mod tests {
     }
 
     async fn reconnect_expectation(
-        config: izwi_serving_client::mock::MockWorkerConfig,
+        config: izwi_serving_worker::test_support::TestWorkerConfig,
     ) -> (
-        izwi_serving_client::mock::MockWorker,
+        izwi_serving_worker::test_support::TestWorker,
         GatewayWorkerExpectation,
         WorkerDescriptor,
         WorkerStatus,
     ) {
         use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 
-        let worker = MockWorker::spawn(config).await.expect("mock binds");
+        let worker = TestWorker::spawn(config).await.expect("test worker binds");
         let client = WorkerClient::new(
             &worker.endpoint(),
             worker.config().credentials.clone(),
@@ -4072,13 +4074,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_refresh_never_waits_on_a_hung_fleet_store() {
-        use izwi_serving_client::mock::MockWorkerConfig;
+        use izwi_serving_worker::test_support::TestWorkerConfig;
 
         let registry =
             worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
                 .expect("registry initializes");
         let (_worker, expected, descriptor, status) =
-            reconnect_expectation(MockWorkerConfig::default()).await;
+            reconnect_expectation(TestWorkerConfig::default()).await;
         approve_gateway_worker(&registry, &expected, descriptor, status.clone())
             .expect("initial approval");
 
@@ -4116,22 +4118,22 @@ mod tests {
 
     #[tokio::test]
     async fn restarted_worker_reconnects_with_same_generation_and_fails_closed_on_drift() {
-        use izwi_serving_client::mock::MockWorkerConfig;
         use izwi_serving_protocol::{IncarnationId, ModelGeneration, WorkerId};
+        use izwi_serving_worker::test_support::TestWorkerConfig;
 
         let registry =
             worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
                 .expect("registry initializes");
-        let base = MockWorkerConfig {
-            worker_id: WorkerId::new("mock-worker-1").expect("test id"),
-            node_id: NodeId::new("mock-node-1").expect("test id"),
-            ..MockWorkerConfig::default()
+        let base = TestWorkerConfig {
+            worker_id: WorkerId::new("test-worker-1").expect("test id"),
+            node_id: NodeId::new("test-node-1").expect("test id"),
+            ..TestWorkerConfig::default()
         };
 
         // Generation 1, incarnation 1: initial approval.
         let (worker_a, expected_a, descriptor_a, status_a) =
-            reconnect_expectation(MockWorkerConfig {
-                incarnation_id: IncarnationId::new("mock-incarnation-1").expect("test id"),
+            reconnect_expectation(TestWorkerConfig {
+                incarnation_id: IncarnationId::new("test-incarnation-1").expect("test id"),
                 ..base.clone()
             })
             .await;
@@ -4141,8 +4143,8 @@ mod tests {
         // The worker restarts with the same generation but a new incarnation.
         // The poller's refresh path re-approves it without operator action.
         drop(worker_a);
-        let (_worker_b, expected_b, _, _) = reconnect_expectation(MockWorkerConfig {
-            incarnation_id: IncarnationId::new("mock-incarnation-2").expect("test id"),
+        let (_worker_b, expected_b, _, _) = reconnect_expectation(TestWorkerConfig {
+            incarnation_id: IncarnationId::new("test-incarnation-2").expect("test id"),
             ..base.clone()
         })
         .await;
@@ -4158,8 +4160,8 @@ mod tests {
         // A restart that changes the model generation fails closed: the
         // expectation pins the operator-approved generation, so a worker
         // advertising a new generation is never silently adopted.
-        let (_worker_c, mut expected_c, _, _) = reconnect_expectation(MockWorkerConfig {
-            incarnation_id: IncarnationId::new("mock-incarnation-3").expect("test id"),
+        let (_worker_c, mut expected_c, _, _) = reconnect_expectation(TestWorkerConfig {
+            incarnation_id: IncarnationId::new("test-incarnation-3").expect("test id"),
             model_generation: ModelGeneration::new(2).expect("non-zero"),
             ..base
         })

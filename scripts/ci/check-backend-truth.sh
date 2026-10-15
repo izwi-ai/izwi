@@ -375,15 +375,14 @@ run_cargo_serving() {
     require_command cargo
 
     # Every serving crate's unit and integration tests (the client's contract
-    # tests need its mock worker), plus the gateway process suites. The
-    # fleet rig's gateway pairs share one coordination database per test, so
-    # it runs serially.
+    # suites run in the worker crate, against the real worker), plus the
+    # gateway process suites. The fleet rig's gateway pairs share one
+    # coordination database per test, so it runs serially.
     cargo test --locked --no-fail-fast \
         -p izwi-serving-protocol \
         -p izwi-serving-client \
         -p izwi-serving-supervisor \
-        -p izwi-serving-worker \
-        --features izwi-serving-client/mock-worker
+        -p izwi-serving-worker
     cargo test --locked --no-fail-fast -p izwi-server \
         --test gateway_only_process \
         --test rollout_gateway

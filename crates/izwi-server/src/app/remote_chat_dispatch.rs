@@ -1083,7 +1083,7 @@ mod tests {
             status_sequence,
             credits,
             PROTOCOL_V1,
-            izwi_serving_client::mock::minor4_chat_features(),
+            izwi_serving_worker::test_support::minor4_chat_features(),
         );
     }
 
