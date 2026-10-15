@@ -5,9 +5,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use candle_core::{DType, Tensor};
 #[cfg(test)]
-use candle_core::D;
-use candle_core::{DType, IndexOp, Tensor};
+use candle_core::{IndexOp, D};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,9 +26,9 @@ use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
-use crate::models::shared::sampling::ChatSampler;
+use crate::models::shared::sampling::{sample_chat_rows, ChatSampler};
 use crate::models::shared::weights::gguf::GgufLoader;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 #[derive(Debug, Clone)]
 pub struct ChatGenerationOutput {
@@ -52,7 +52,7 @@ pub struct ChatDecodeState {
     prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    assembled: String,
+    decoder: IncrementalDecoder,
     max_new_tokens: usize,
     finished: bool,
     /// DS9.3: logprob entries produced by the current decode step, drained
@@ -68,7 +68,7 @@ pub(crate) struct ChatDecodeCheckpoint {
     prefill_progress: usize,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    assembled: String,
+    decoder: IncrementalDecoder,
     finished: bool,
 }
 
@@ -121,7 +121,7 @@ impl ChatDecodeState {
             prefill_progress: self.prefill_progress,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
-            assembled: self.assembled.clone(),
+            decoder: self.decoder.clone(),
             finished: self.finished,
         };
         Ok(checkpoint)
@@ -135,7 +135,7 @@ impl ChatDecodeState {
         self.prefill_progress = checkpoint.prefill_progress;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
-        self.assembled = checkpoint.assembled;
+        self.decoder = checkpoint.decoder;
         self.finished = checkpoint.finished;
     }
 }
@@ -221,13 +221,13 @@ impl ChatTokenizer {
         self.inner.encode(text)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
+    /// The text `id` adds to the generated sequence. Ids past the vocabulary
+    /// add nothing, as a whole-sequence decode skips them.
+    fn decode_next(&self, decoder: &mut IncrementalDecoder, id: u32) -> Result<String> {
+        if id as usize >= self.vocab_size {
+            return Ok(String::new());
+        }
+        self.inner.decode_incrementally(decoder, id)
     }
 }
 
@@ -465,7 +465,7 @@ impl Qwen3ChatModel {
                 .flatten()
                 .collect(),
             ),
-            assembled: String::new(),
+            decoder: IncrementalDecoder::new(true),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             pending_logprobs: Vec::new(),
@@ -570,13 +570,7 @@ impl Qwen3ChatModel {
         let text_model = &self.text_model;
 
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
-            state.finished = true;
-            return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: true,
-            });
+            return self.finish_decode(state, String::new());
         }
 
         if let Some(pending) = state.pending_token.take() {
@@ -590,38 +584,7 @@ impl Qwen3ChatModel {
             Error::InferenceError("Qwen3 decode quantum has no unconsumed model output".into())
         })?;
         let (next, logprob_entry) = self.sample_token(state, &output)?;
-
-        if next == self.tokenizer.specials.im_end
-            || next == self.tokenizer.specials.eos
-            || self.tokenizer.specials.eos_alt == Some(next)
-            || state.sampler.is_configured_stop(next)
-        {
-            state.finished = true;
-            return Ok(ChatDecodeStep {
-                delta: String::new(),
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: true,
-            });
-        }
-
-        Self::record_logprob(state, logprob_entry);
-        state.generated_ids.push(next);
-        state.pending_token = Some(next);
-        let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-        let delta = text_delta(&state.assembled, &decoded);
-        state.assembled = decoded;
-
-        if state.generated_ids.len() >= state.max_new_tokens {
-            state.finished = true;
-        }
-
-        Ok(ChatDecodeStep {
-            delta,
-            text: state.assembled.trim().to_string(),
-            tokens_generated: state.generated_ids.len(),
-            finished: state.finished,
-        })
+        self.accept_token(state, next, logprob_entry)
     }
 
     /// Decode one token for a changing set of independent chat sessions in a
@@ -639,6 +602,14 @@ impl Qwen3ChatModel {
             return Err(Error::InferenceError(
                 "continuous Qwen3 decode crossed a quantum with unconsumed model output"
                     .to_string(),
+            ));
+        }
+        if states
+            .iter()
+            .any(|state| state.finished || state.generated_ids.len() >= state.max_new_tokens)
+        {
+            return Err(Error::InvalidInput(
+                "Continuous chat batch contains a terminal decode state".to_string(),
             ));
         }
 
@@ -662,51 +633,84 @@ impl Qwen3ChatModel {
             text_model.forward_managed_decode_batch(&input_ids, &positions, &mut caches)?;
         for state in states.iter_mut() {
             state.pos = state.pos.saturating_add(1);
+            state.pending_logprobs.clear();
         }
 
-        let mut steps = Vec::with_capacity(states.len());
-        for (row, state) in states.iter_mut().enumerate() {
-            if state.finished || state.generated_ids.len() >= state.max_new_tokens {
-                return Err(Error::InvalidInput(
-                    "Continuous chat batch contains a terminal decode state".to_string(),
-                ));
-            }
+        // Every row samples from one readback of the whole step.
+        let next_logits = next_logits.reshape((states.len(), ()))?;
+        let mut samplers = states
+            .iter_mut()
+            .map(|state| &mut state.sampler)
+            .collect::<Vec<_>>();
+        let sampled = sample_chat_rows(&mut samplers, &next_logits, self.tokenizer.vocab_size)?;
+        states
+            .iter_mut()
+            .zip(sampled)
+            .map(|(state, (next, raw))| {
+                let entry = raw
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
+                self.accept_token(state, next, entry)
+            })
+            .collect()
+    }
 
-            let row_output = next_logits.i(row)?.unsqueeze(0)?;
-            let (next, logprob_entry) = self.sample_token(state, &row_output)?;
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-                || state.sampler.is_configured_stop(next)
-            {
-                state.finished = true;
-                steps.push(ChatDecodeStep {
-                    delta: String::new(),
-                    text: state.assembled.trim().to_string(),
-                    tokens_generated: state.generated_ids.len(),
-                    finished: true,
-                });
-                continue;
-            }
-
-            Self::record_logprob(state, logprob_entry);
-            state.generated_ids.push(next);
-            state.pending_token = Some(next);
-            let decoded = self.tokenizer.decode_text(&state.generated_ids)?;
-            let delta = text_delta(&state.assembled, &decoded);
-            state.assembled = decoded;
-            if state.generated_ids.len() >= state.max_new_tokens {
-                state.finished = true;
-            }
-            steps.push(ChatDecodeStep {
-                delta,
-                text: state.assembled.trim().to_string(),
-                tokens_generated: state.generated_ids.len(),
-                finished: state.finished,
-            });
+    /// Emit `next`, or end the row on a stop token. Text is decoded
+    /// incrementally, so a step costs the same however long the reply is.
+    fn accept_token(
+        &self,
+        state: &mut ChatDecodeState,
+        next: u32,
+        logprob_entry: Option<crate::engine::TokenLogprob>,
+    ) -> Result<ChatDecodeStep> {
+        if next == self.tokenizer.specials.im_end
+            || next == self.tokenizer.specials.eos
+            || self.tokenizer.specials.eos_alt == Some(next)
+            || state.sampler.is_configured_stop(next)
+        {
+            return self.finish_decode(state, String::new());
         }
 
-        Ok(steps)
+        Self::record_logprob(state, logprob_entry);
+        state.generated_ids.push(next);
+        state.pending_token = Some(next);
+        let delta = self.tokenizer.decode_next(&mut state.decoder, next)?;
+        if state.generated_ids.len() >= state.max_new_tokens {
+            return self.finish_decode(state, delta);
+        }
+        Ok(ChatDecodeStep {
+            delta,
+            text: String::new(),
+            tokens_generated: state.generated_ids.len(),
+            finished: false,
+        })
+    }
+
+    /// Finish the row: flush text the decoder still holds (an incomplete
+    /// UTF-8 sequence decodes as a whole-sequence decode renders it) and
+    /// return the whole text, which only a terminal step carries.
+    fn finish_decode(
+        &self,
+        state: &mut ChatDecodeState,
+        mut delta: String,
+    ) -> Result<ChatDecodeStep> {
+        state.finished = true;
+        let suffix = self
+            .tokenizer
+            .inner
+            .finish_incremental_decode(&mut state.decoder)?;
+        delta.push_str(&suffix);
+        Ok(ChatDecodeStep {
+            delta,
+            text: state.decoder.decoded_text().trim().to_string(),
+            tokens_generated: state.generated_ids.len(),
+            finished: true,
+        })
     }
 
     pub fn supports_incremental_decode(&self) -> bool {
@@ -970,18 +974,6 @@ fn take_quantum_argmax(output: &mut Option<Tensor>) -> Result<u32> {
     argmax_last_sequence_output(&output)
 }
 
-fn text_delta(previous: &str, current: &str) -> String {
-    if let Some(delta) = current.strip_prefix(previous) {
-        return delta.to_string();
-    }
-    let common = previous
-        .chars()
-        .zip(current.chars())
-        .take_while(|(a, b)| a == b)
-        .count();
-    current.chars().skip(common).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1059,5 +1051,269 @@ mod tests {
 
         let dtype = select_qwen3_dense_dtype(&profile, None, Some(DType::F16)).unwrap();
         assert_eq!(dtype, DType::F16);
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::backends::{DeviceCapabilities, DeviceKind};
+    use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+    use crate::models::shared::attention::physical::test_physical_caches_on;
+    use crate::models::shared::telemetry::thread_host_reads;
+    use candle_core::Device;
+
+    const PROMPT: [u32; 3] = [0, 1, 7];
+
+    /// Byte-level pieces for the tiny model's eight ids: "a", " ", the two
+    /// bytes of "é", the three bytes of "€", and "b".
+    const SPLIT_PIECES: &str = r#"{"a":0,"Ġ":1,"Ã":2,"©":3,"â":4,"Ĥ":5,"¬":6,"b":7}"#;
+    /// Eight whole-character pieces.
+    const ASCII_PIECES: &str = r#"{"a":0,"Ġ":1,"b":2,"c":3,"Ġd":4,"e":5,"f":6,"g":7}"#;
+
+    /// The tiny model with a byte-level WordLevel tokenizer over `pieces`.
+    /// The specials sit past the vocabulary, so a row ends only at its token
+    /// budget.
+    fn tiny_chat_model(device: &Device, pieces: &str) -> Qwen3ChatModel {
+        let inner = Tokenizer::from_hf_json_bytes(
+            format!(
+                r#"{{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}},
+            "model":{{"type":"WordLevel","unk_token":"a","vocab":{pieces}}}
+        }}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        Qwen3ChatModel {
+            device: DeviceProfile {
+                device: device.clone(),
+                kind: if device.is_metal() {
+                    DeviceKind::Metal
+                } else {
+                    DeviceKind::Cpu
+                },
+                capabilities: DeviceCapabilities::default(),
+                memory_pool: None,
+            },
+            compute_dtype: DType::F32,
+            tokenizer: ChatTokenizer {
+                inner,
+                vocab_size: 8,
+                specials: SpecialTokenIds {
+                    im_start: 8,
+                    im_end: 9,
+                    eos: 9,
+                    eos_alt: None,
+                },
+            },
+            text_model: tiny_qwen3_model_for_test(device),
+            prefix_reuse: false,
+        }
+    }
+
+    fn prefilled_rows(
+        model: &Qwen3ChatModel,
+        device: &Device,
+        configs: &[ChatGenerationConfig],
+        max_new_tokens: usize,
+    ) -> Vec<ChatDecodeState> {
+        let capacity = PROMPT.len() + max_new_tokens + 1;
+        test_physical_caches_on(device, 1, 1, 2, capacity, configs.len())
+            .into_iter()
+            .zip(configs)
+            .map(|(cache, config)| {
+                let mut state = model
+                    .begin_resumable_prefill_managed(&PROMPT, max_new_tokens, config, cache)
+                    .unwrap();
+                model
+                    .continue_resumable_prefill(&mut state, &PROMPT, 0, PROMPT.len())
+                    .unwrap();
+                state
+            })
+            .collect()
+    }
+
+    /// Each row's generated ids, streamed deltas and terminal text, decoded
+    /// through the continuous batch after one single-row step per row.
+    fn generate(
+        model: &Qwen3ChatModel,
+        device: &Device,
+        configs: &[ChatGenerationConfig],
+        max_new_tokens: usize,
+    ) -> Vec<(Vec<u32>, Vec<String>, String)> {
+        let mut states = prefilled_rows(model, device, configs, max_new_tokens);
+        let mut deltas = vec![Vec::new(); states.len()];
+        let mut texts = vec![None; states.len()];
+        let mut record = |row: usize, step: ChatDecodeStep| {
+            deltas[row].push(step.delta);
+            if step.finished {
+                texts[row] = Some(step.text);
+            } else {
+                assert!(step.text.is_empty(), "a non-terminal step copied the text");
+            }
+        };
+        for (row, state) in states.iter_mut().enumerate() {
+            record(row, model.decode_step(state).unwrap());
+        }
+        loop {
+            let (rows, mut live): (Vec<usize>, Vec<&mut ChatDecodeState>) = states
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, state)| !state.finished)
+                .unzip();
+            if live.is_empty() {
+                break;
+            }
+            let steps = model.decode_step_batch(&mut live).unwrap();
+            for (row, step) in rows.into_iter().zip(steps) {
+                record(row, step);
+            }
+        }
+        states
+            .into_iter()
+            .zip(deltas)
+            .zip(texts)
+            .map(|((state, deltas), text)| (state.generated_ids, deltas, text.unwrap()))
+            .collect()
+    }
+
+    /// The deltas the old path streamed: the whole sequence decoded again
+    /// after every token and diffed against the previous decode.
+    fn whole_sequence_deltas(model: &Qwen3ChatModel, ids: &[u32]) -> Vec<String> {
+        let mut previous = String::new();
+        (1..=ids.len())
+            .map(|end| {
+                let current = model.tokenizer.inner.decode(&ids[..end]).unwrap();
+                let delta = match current.strip_prefix(previous.as_str()) {
+                    Some(delta) => delta.to_string(),
+                    None => {
+                        let common = previous
+                            .chars()
+                            .zip(current.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        current.chars().skip(common).collect()
+                    }
+                };
+                previous = current;
+                delta
+            })
+            .collect()
+    }
+
+    /// A greedy and two seeded 2,048-token runs through the continuous
+    /// batch stream exactly the whole-sequence decode, and step for step
+    /// what the old whole-sequence path streamed wherever that was
+    /// well-formed. Returns how many characters the runs split across
+    /// tokens.
+    fn assert_stream_matches_whole_sequence_decode(device: &Device, pieces: &str) -> usize {
+        let model = tiny_chat_model(device, pieces);
+        let sampled = |seed, top_k| ChatGenerationConfig {
+            temperature: 1.5,
+            top_k,
+            seed,
+            ..ChatGenerationConfig::default()
+        };
+        let configs = [
+            ChatGenerationConfig::default(),
+            sampled(11, 0),
+            sampled(12, 6),
+        ];
+        let max_new_tokens = 2_048;
+        let mut split_characters = 0;
+        let rows = generate(&model, device, &configs, max_new_tokens);
+        for (row, (ids, deltas, text)) in rows.iter().enumerate() {
+            assert_eq!(ids.len(), max_new_tokens, "row {row} ended early");
+            assert_eq!(deltas.len(), ids.len(), "row {row}: one step per token");
+            let whole = model.tokenizer.inner.decode(ids).unwrap();
+            assert_eq!(deltas.concat(), whole, "row {row}: stream != whole decode");
+            assert_eq!(text, whole.trim(), "row {row}: terminal text");
+            // The old stream sent a U+FFFD for a split character before
+            // the character itself; elsewhere both streams agree per step.
+            let old = whole_sequence_deltas(&model, ids);
+            if old.iter().all(|delta| !delta.contains('\u{FFFD}')) {
+                assert_eq!(deltas, &old, "row {row}: per-step deltas");
+            }
+            split_characters += whole.matches(['é', '€']).count();
+        }
+        split_characters
+    }
+
+    fn assert_streams_on(device: &Device) {
+        assert_eq!(
+            assert_stream_matches_whole_sequence_decode(device, ASCII_PIECES),
+            0
+        );
+        assert!(
+            assert_stream_matches_whole_sequence_decode(device, SPLIT_PIECES) > 0,
+            "the runs never split a character across tokens"
+        );
+    }
+
+    #[test]
+    fn incremental_stream_matches_whole_sequence_decode_on_cpu() {
+        assert_streams_on(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn incremental_stream_matches_whole_sequence_decode_on_metal() {
+        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+            "qwen3 incremental_stream_matches_whole_sequence_decode_on_metal",
+        ) else {
+            return;
+        };
+        assert_streams_on(&device);
+    }
+
+    /// A step of a multi-row batch reads the device back once, whatever mix
+    /// of greedy, sampled and logprob rows it holds.
+    fn assert_one_readback_per_batch_step(device: &Device) {
+        let model = tiny_chat_model(device, ASCII_PIECES);
+        let configs = [
+            ChatGenerationConfig::default(),
+            ChatGenerationConfig {
+                temperature: 0.8,
+                top_k: 4,
+                seed: 5,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig {
+                logprobs: true,
+                top_logprobs: 2,
+                ..ChatGenerationConfig::default()
+            },
+        ];
+        let mut states = prefilled_rows(&model, device, &configs, 32);
+        for state in &mut states {
+            model.decode_step(state).unwrap();
+        }
+        for _ in 0..16 {
+            let mut rows = states.iter_mut().collect::<Vec<_>>();
+            let before = thread_host_reads();
+            let steps = model.decode_step_batch(&mut rows).unwrap();
+            assert_eq!(thread_host_reads() - before, 1, "readbacks per step");
+            assert_eq!(steps.len(), 3);
+            assert_eq!(states[2].pending_logprobs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn continuous_batch_reads_back_once_per_step_on_cpu() {
+        assert_one_readback_per_batch_step(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn continuous_batch_reads_back_once_per_step_on_metal() {
+        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+            "qwen3 continuous_batch_reads_back_once_per_step_on_metal",
+        ) else {
+            return;
+        };
+        assert_one_readback_per_batch_step(&device);
     }
 }
