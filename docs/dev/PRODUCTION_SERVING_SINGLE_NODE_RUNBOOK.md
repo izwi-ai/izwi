@@ -879,7 +879,11 @@ to share worker observations and capacity claims. Each gateway publishes its
 polled worker statuses (monotonic per incarnation; incarnation changes always
 win) and claims one short-lived capacity unit per dispatch; selection steers
 away from peer-filled workers while the worker remains the atomic admission
-arbiter, so a lost race degrades to one alternate dispatch. Claims expire by
+arbiter, so a lost race degrades to one alternate dispatch. A claim covers
+only the transit from selection to the worker's acceptance and is released
+when the worker accepts: from then on the worker's own status reports the
+work. Peer views count other gateways' claims only, since each gateway already
+tracks its own dispatches locally. Unreleased claims expire by
 TTL — `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS`, bounded 100ms–300s, default 30000 —
 which is the crash-recovery path: no explicit recovery protocol. A slow
 background sweep additionally reaps expired claims and prunes observation

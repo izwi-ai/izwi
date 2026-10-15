@@ -347,6 +347,35 @@ impl BatchRuntimeStore {
         Ok(u64::try_from(count)?)
     }
 
+    /// Count live (unexpired) claims for one worker held by gateways other
+    /// than `gateway_id`. A gateway already accounts for its own in-transit
+    /// dispatches in its local registry, so counting its own claims again
+    /// would shadow the same credit twice.
+    pub async fn count_live_peer_fleet_claims(
+        &self,
+        worker_id: &str,
+        gateway_id: &str,
+    ) -> anyhow::Result<u64> {
+        validate_fleet_id("worker ID", worker_id)?;
+        validate_fleet_id("gateway ID", gateway_id)?;
+        let now = self.fleet_now();
+        let db = self.connection().await?;
+        let count = db
+            .query_one_raw(raw::statement(
+                db,
+                "SELECT COUNT(*) FROM fleet_capacity_claims WHERE worker_id = ?1 AND gateway_id <> ?2 AND expires_at > ?3",
+                vec![
+                    worker_id.to_string().into(),
+                    gateway_id.to_string().into(),
+                    now.into(),
+                ],
+            )?)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Fleet capacity count returned no row"))?
+            .try_get_by_index::<i64>(0)?;
+        Ok(u64::try_from(count)?)
+    }
+
     /// Delete expired claims, bounded to `limit` rows. Crash recovery for
     /// gateways that disappear without releasing their claims.
     pub async fn reap_expired_fleet_claims(&self, limit: usize) -> anyhow::Result<u64> {
@@ -648,6 +677,34 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(store.count_live_fleet_claims("worker-a").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn peer_claim_count_excludes_the_observing_gateway() {
+        let (store, _root) = test_store_at(1_000);
+        for gateway in ["gateway-a", "gateway-a", "gateway-b"] {
+            store
+                .try_claim_fleet_capacity("worker-a", "inc-1", gateway, 4, 60_000)
+                .await
+                .unwrap()
+                .expect("claim");
+        }
+        assert_eq!(store.count_live_fleet_claims("worker-a").await.unwrap(), 3);
+        assert_eq!(
+            store
+                .count_live_peer_fleet_claims("worker-a", "gateway-a")
+                .await
+                .unwrap(),
+            1,
+            "a gateway's own claims are already its local dispatches"
+        );
+        assert_eq!(
+            store
+                .count_live_peer_fleet_claims("worker-a", "gateway-b")
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]

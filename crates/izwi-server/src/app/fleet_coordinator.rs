@@ -6,6 +6,18 @@
 //! publishes short-lived capacity claims to the shared fleet store so peer
 //! selection steers away from workers that are already spoken for.
 //!
+//! A claim covers only the transit window between selection and the
+//! worker's acceptance. Once the worker accepts, its own status reports the
+//! work (`available_admission_credits` already excludes it), so the claim is
+//! released at acceptance; holding it to the end of the stream would count
+//! the same credit twice. A peer samples a worker's status and that worker's
+//! claim count in the same poll, so it sees an invocation either as a claim
+//! or as consumed credit. The only overlap is the brief gap between the
+//! worker answering the status poll and the claim count query; a dispatch
+//! that over-steers through it costs one worker-arbitrated alternate. Peer
+//! counts exclude this gateway's own claims, which its registry already
+//! tracks as local dispatches.
+//!
 //! Authority stays exactly where it was: the worker atomically accepts or
 //! rejects every invocation, and a lost fleet race only costs one alternate
 //! dispatch through the existing bounded retry path. Claims expire by TTL,
@@ -198,7 +210,7 @@ impl FleetCoordinator {
         let _ = self.store.observe_fleet_worker(&observation).await;
         let claims = self
             .store
-            .count_live_fleet_claims(status.worker_id.as_str())
+            .count_live_peer_fleet_claims(status.worker_id.as_str(), &self.gateway_id)
             .await
             .unwrap_or_else(|_| {
                 self.snapshot.cluster_claims(&WorkerInstanceKey {
@@ -350,6 +362,47 @@ mod tests {
             new.claim(&key, 1).await.is_some(),
             "capacity is reusable after the predecessor's claim is released"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_counts_peer_claims_but_not_this_gateways_own() {
+        // A gateway's in-transit dispatches are already local registry
+        // reservations; counting its own claims again would shadow each
+        // credit twice until the next poll.
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("shared-fleet.sqlite3");
+        let build = |gateway: &str| {
+            Arc::new(FleetCoordinator::new(
+                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
+                gateway.to_string(),
+            ))
+        };
+        let own = build("gateway-own");
+        let peer = build("gateway-peer");
+        let key = worker_key();
+        let _own_claim = own.claim(&key, 4).await.expect("own claim");
+        let _peer_claim = peer.claim(&key, 4).await.expect("peer claim");
+        let status = WorkerStatus {
+            schema_version: izwi_serving_protocol::PROTOCOL_V1,
+            worker_id: key.worker_id.clone(),
+            node_id: izwi_serving_protocol::NodeId::new("node-a").unwrap(),
+            incarnation_id: key.incarnation_id.clone(),
+            status_sequence: 1,
+            process_state: izwi_serving_protocol::WorkerProcessState::Running,
+            deployments: Vec::new(),
+            capacity: izwi_serving_protocol::CapacitySnapshot {
+                max_active_invocations: 4,
+                active_invocations: 0,
+                max_queued_invocations: 0,
+                queued_invocations: 0,
+                max_sessions: 0,
+                reserved_sessions: 0,
+                available_admission_credits: 4,
+                outstanding_cost_units: 0,
+            },
+        };
+        own.publish_and_refresh(&status).await;
+        assert_eq!(own.snapshot_view().cluster_claims(&key), 1);
     }
 
     #[tokio::test]

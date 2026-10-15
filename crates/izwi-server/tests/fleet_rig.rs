@@ -273,8 +273,8 @@ where
 }
 
 /// Claim a worker's single fleet credit for the rig. A gateway releases its
-/// own dispatch claims asynchronously, so the credit may still be held for a
-/// moment after the request that took it completed; retry until it frees.
+/// own dispatch claim asynchronously once the worker accepts, so the credit
+/// may still be held for a moment after that request; retry until it frees.
 async fn claim_until(claims: &BatchRuntimeStore, worker_id: &str, ttl_ms: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -614,8 +614,9 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
 
     // The gateway learns the rig's claim on its poller cadence, so converge
     // on the steered dispatch first. From then on the claim stays visible, so
-    // every served request must avoid the claimed worker; only a shed (the
-    // gateway's own claim on the peer not yet released) may be retried.
+    // every served request must avoid the claimed worker; only a shed (a
+    // status poll that still shows the previous request holding the peer's
+    // single credit) may be retried.
     let client = reqwest::Client::new();
     chat_until(
         &client,

@@ -301,14 +301,12 @@ impl RemoteChatDispatcher {
             mut stream,
             tenant_work,
             selected,
-            fleet_claim,
             started,
         } = self
             .start(request_timeout_secs, context, request, false, tenant_work)
             .await?;
         let key = selected.key.clone();
         let _dispatch = selected.dispatch;
-        let _fleet_claim = fleet_claim;
         let registry = self.registry.clone();
         collect_started_remote_chat_with_tenant(
             &remote,
@@ -337,7 +335,6 @@ impl RemoteChatDispatcher {
             stream,
             tenant_work,
             selected,
-            fleet_claim,
             ..
         } = self
             .start(request_timeout_secs, context, request, true, tenant_work)
@@ -358,7 +355,6 @@ impl RemoteChatDispatcher {
             // Dropping either receiver propagates cancellation toward the
             // exact accepted attempt; there is intentionally no reselection.
             let _dispatch = selected.dispatch;
-            let _fleet_claim = fleet_claim;
             loop {
                 let event = tokio::select! {
                     event = worker_events.recv() => event,
@@ -438,8 +434,9 @@ impl RemoteChatDispatcher {
         // Best-effort cluster visibility: publish this dispatch to peer
         // gateways when coordinated, but never gate on it. A lost race only
         // costs one worker-arbitrated attempt through the existing alternate
-        // path below.
-        let mut fleet_claim = self.claim_for(&selected).await;
+        // path below. The claim covers only the transit to acceptance: from
+        // then on the worker's own status reports the work.
+        let fleet_claim = self.claim_for(&selected).await;
         let remote = self.execution_for(&selected)?;
         let invocation =
             prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
@@ -457,6 +454,7 @@ impl RemoteChatDispatcher {
                     .dispatch
                     .mark_accepted()
                     .map_err(map_registry_error)?;
+                drop(fleet_claim);
                 if let Some((pins, key)) = pin_key.as_ref() {
                     pins.record(*key, selected.key.clone(), Instant::now());
                 }
@@ -465,7 +463,6 @@ impl RemoteChatDispatcher {
                     stream: started_invocation.stream,
                     tenant_work: started_invocation.tenant_work,
                     selected,
-                    fleet_claim,
                     started,
                 });
             }
@@ -486,7 +483,7 @@ impl RemoteChatDispatcher {
 
         let excluded = selected.key.clone();
         drop(selected);
-        drop(fleet_claim.take());
+        drop(fleet_claim);
         let remaining_before_backoff = context
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
@@ -527,6 +524,7 @@ impl RemoteChatDispatcher {
                     .dispatch
                     .mark_accepted()
                     .map_err(map_registry_error)?;
+                drop(alternate_fleet_claim);
                 if let Some((pins, key)) = pin_key.as_ref() {
                     pins.record(*key, alternate.key.clone(), Instant::now());
                 }
@@ -535,7 +533,6 @@ impl RemoteChatDispatcher {
                     stream: started_invocation.stream,
                     tenant_work: started_invocation.tenant_work,
                     selected: alternate,
-                    fleet_claim: alternate_fleet_claim,
                     started,
                 })
             }
@@ -652,7 +649,6 @@ struct StartedDispatch {
     stream: InvocationStream,
     tenant_work: BoundTenantWorkLease,
     selected: SelectedWorker,
-    fleet_claim: Option<FleetClaimGuard>,
     started: Instant,
 }
 
@@ -785,6 +781,9 @@ mod tests {
         PartialThenDisconnect,
         ManyDeltas(usize),
         Success(String),
+        /// Accepts, then keeps the stream open without further events: an
+        /// in-flight invocation that holds one worker credit.
+        AcceptThenHold,
     }
 
     #[derive(Clone)]
@@ -899,6 +898,21 @@ mod tests {
                 });
                 accepted_response(&request, following)
             }
+            ScriptedResponse::AcceptThenHold => {
+                use futures::StreamExt as _;
+
+                let accepted = accepted_response(&request, Vec::new());
+                let first = axum::body::to_bytes(accepted.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let held = futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                    .chain(futures::stream::pending());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, NDJSON_MEDIA_TYPE)
+                    .body(Body::from_stream(held))
+                    .unwrap()
+            }
             ScriptedResponse::Success(text) => accepted_response(
                 &request,
                 vec![
@@ -1002,6 +1016,24 @@ mod tests {
         worker_client: WorkerClient,
         status_sequence: u64,
     ) {
+        register_with_credits(
+            registry,
+            worker_name,
+            incarnation_name,
+            worker_client,
+            status_sequence,
+            1,
+        );
+    }
+
+    fn register_with_credits(
+        registry: &WorkerRegistry,
+        worker_name: &str,
+        incarnation_name: &str,
+        worker_client: WorkerClient,
+        status_sequence: u64,
+        credits: u32,
+    ) {
         let loaded = deployment();
         let descriptor = WorkerDescriptor {
             schema_version: PROTOCOL_V1,
@@ -1025,30 +1057,46 @@ mod tests {
                     loaded.deployment_id.clone(),
                     ApprovedDeployment::from_loaded(&loaded),
                 )]),
-                validated_capacity: 1,
+                validated_capacity: credits,
             })
             .unwrap();
         registry
-            .observe_status(WorkerStatus {
-                schema_version: PROTOCOL_V1,
-                worker_id: descriptor.worker_id,
-                node_id: descriptor.node_id,
-                incarnation_id: descriptor.incarnation_id,
+            .observe_status(worker_status(
+                worker_name,
+                incarnation_name,
                 status_sequence,
-                process_state: WorkerProcessState::Running,
-                deployments: vec![loaded],
-                capacity: CapacitySnapshot {
-                    max_active_invocations: 1,
-                    active_invocations: 0,
-                    max_queued_invocations: 0,
-                    queued_invocations: 0,
-                    max_sessions: 0,
-                    reserved_sessions: 0,
-                    available_admission_credits: 1,
-                    outstanding_cost_units: 0,
-                },
-            })
+                credits,
+                0,
+            ))
             .unwrap();
+    }
+
+    fn worker_status(
+        worker_name: &str,
+        incarnation_name: &str,
+        status_sequence: u64,
+        credits: u32,
+        active: u32,
+    ) -> WorkerStatus {
+        WorkerStatus {
+            schema_version: PROTOCOL_V1,
+            worker_id: id::<WorkerId>(worker_name),
+            node_id: id::<NodeId>("node-a"),
+            incarnation_id: id(incarnation_name),
+            status_sequence,
+            process_state: WorkerProcessState::Running,
+            deployments: vec![deployment()],
+            capacity: CapacitySnapshot {
+                max_active_invocations: credits,
+                active_invocations: active,
+                max_queued_invocations: 0,
+                queued_invocations: 0,
+                max_sessions: 0,
+                reserved_sessions: 0,
+                available_admission_credits: credits.saturating_sub(active),
+                outstanding_cost_units: 0,
+            },
+        }
     }
 
     fn dispatcher(registry: WorkerRegistry) -> RemoteChatDispatcher {
@@ -1558,6 +1606,80 @@ mod tests {
             0,
             "the dispatch claim guard must release its cluster claim when the request completes"
         );
+    }
+
+    #[tokio::test]
+    async fn accepted_work_releases_its_fleet_claim_so_free_credits_stay_dispatchable() {
+        // Four credits, two accepted in-flight streams from gateway A: the
+        // worker reports two free credits, which must not be shadowed again by
+        // the accepted streams' claims, for A or for its peer gateway B.
+        let worker = ScriptedWorker::spawn(ScriptedResponse::AcceptThenHold, Duration::ZERO).await;
+        let root = tempfile::tempdir().unwrap();
+        let fleet_db = root.path().join("fleet.sqlite3");
+        let gateway = |gateway_id: &str| {
+            let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+            register_with_credits(
+                &registry,
+                "worker-a",
+                "inc-a",
+                client(&worker.endpoint()),
+                1,
+                4,
+            );
+            let coordinator = Arc::new(crate::app::fleet_coordinator::FleetCoordinator::new(
+                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(fleet_db.clone())),
+                gateway_id.to_string(),
+            ));
+            let dispatcher =
+                dispatcher(registry.clone()).with_fleet_coordinator(Arc::clone(&coordinator));
+            (registry, coordinator, dispatcher)
+        };
+        let (registry_a, coordinator_a, dispatcher_a) = gateway("gateway-a");
+        let (registry_b, coordinator_b, dispatcher_b) = gateway("gateway-b");
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(
+                dispatcher_a
+                    .stream(2, &context, request(), tenant_work())
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Guards release on a spawned task; give a released claim time to
+        // land before the polls sample the store. A claim held to the end of
+        // the stream never lands, and the dispatches below then shed.
+        let store = coordinator_a.store();
+        for _ in 0..200 {
+            if store.count_live_fleet_claims("worker-a").await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Both gateways' next status polls report the two accepted streams.
+        let status = worker_status("worker-a", "inc-a", 2, 4, 2);
+        for (registry, coordinator) in
+            [(&registry_a, &coordinator_a), (&registry_b, &coordinator_b)]
+        {
+            registry.observe_status(status.clone()).unwrap();
+            coordinator.publish_and_refresh(&status).await;
+        }
+
+        for (name, dispatcher) in [
+            ("gateway A", &dispatcher_a),
+            ("peer gateway B", &dispatcher_b),
+        ] {
+            let next = dispatcher
+                .stream(2, &context, request(), tenant_work())
+                .await;
+            assert!(
+                next.is_ok(),
+                "{name} must still dispatch to the two free credits: {:?}",
+                next.err()
+            );
+            held.push(next.unwrap());
+        }
+        assert_eq!(worker.requests().len(), 4);
     }
 
     #[tokio::test]
