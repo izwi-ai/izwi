@@ -43,8 +43,8 @@ pub(crate) use asr::{
 };
 pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
 pub use chat_request::{
-    resolve_chat_max_tokens, resolve_chat_sampling, ChatSamplingRequest, ResolvedChatSampling,
-    CHAT_MAX_TOKENS_UNSET,
+    chat_supports_json_object, resolve_chat_max_tokens, resolve_chat_sampling,
+    ChatGenerationControls, ChatSamplingRequest, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,
 };
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,

@@ -185,6 +185,21 @@ async fn main() -> anyhow::Result<()> {
     ) {
         features.insert(WorkerFeature::RealtimeSocket);
     }
+    if process.task == TaskKind::Chat {
+        // `RuntimeChatExecutor` maps every minor-4 chat control the way the
+        // local server does.
+        features.extend([
+            WorkerFeature::ChatSeed,
+            WorkerFeature::ChatStopSequences,
+            WorkerFeature::ChatTopK,
+            WorkerFeature::ChatPenalties,
+            WorkerFeature::ChatLogprobs,
+            WorkerFeature::ChatContextPolicy,
+        ]);
+        if izwi_core::chat_supports_json_object(process.variant) {
+            features.insert(WorkerFeature::ChatJsonObject);
+        }
+    }
     let descriptor = WorkerDescriptor {
         schema_version: PROTOCOL_V1,
         supported_protocol_versions: vec![PROTOCOL_V1],

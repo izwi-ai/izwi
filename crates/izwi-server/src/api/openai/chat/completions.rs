@@ -32,8 +32,8 @@ use crate::gateway::{
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
-    ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
-    ChatTruncation, ModelFamily, ModelVariant,
+    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort,
+    ChatRole, ChatTemplateKwargs, ChatTruncation, ModelFamily, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -993,15 +993,7 @@ fn ensure_response_format_supported(
     variant: ModelVariant,
     response_format: &OpenAiResponseFormat,
 ) -> Result<(), ApiError> {
-    if response_format.kind == "json_object"
-        && !matches!(
-            variant.family(),
-            ModelFamily::Qwen3Chat
-                | ModelFamily::Gemma3Chat
-                | ModelFamily::Lfm2Chat
-                | ModelFamily::Qwen35MoeChat
-        )
-    {
+    if response_format.kind == "json_object" && !chat_supports_json_object(variant) {
         return Err(ApiError::bad_request(format!(
             "constrained decoding (`response_format: json_object`) is not supported for model {variant}; it requires a grammar-aware sampler"
         )));

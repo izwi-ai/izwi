@@ -83,6 +83,17 @@ async fn run_conversation(
     chat_config: ChatRequestConfig,
     streaming: bool,
 ) -> izwi_core::Result<ChatRun> {
+    run_capped_conversation(runtime, messages, params, chat_config, streaming, None).await
+}
+
+async fn run_capped_conversation(
+    runtime: &RuntimeService,
+    messages: Vec<ChatMessage>,
+    params: GenerationParams,
+    chat_config: ChatRequestConfig,
+    streaming: bool,
+    max_tokens_ceiling: Option<usize>,
+) -> izwi_core::Result<ChatRun> {
     let runtime_context = RuntimeRequestContext::new(WorkloadClass::Interactive)
         .with_deadline(Instant::now() + Duration::from_secs(30));
     let mut invocation = runtime
@@ -94,6 +105,7 @@ async fn run_conversation(
             correlation_id: None,
             runtime_context,
             streaming,
+            max_tokens_ceiling,
         })
         .await?;
     let mut deltas = Vec::new();
@@ -358,4 +370,58 @@ async fn an_output_budget_that_does_not_fit_is_rejected_unless_unset_or_truncate
             .expect("an unset or truncated budget runs");
         assert!(run.generation.tokens_generated <= remaining);
     }
+}
+
+/// A worker caps the budget at its gateway's ceiling after D8 resolves it:
+/// an unset budget runs to the ceiling instead of the rest of the context,
+/// and an explicit budget that does not fit is still rejected.
+#[tokio::test]
+async fn a_ceiling_caps_the_budget_without_hiding_an_overflow() {
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(models.path(), RuntimeDeviceAssignment::Cpu).await;
+    let conversation = || vec![message(ChatRole::User, "hello")];
+    let uncapped = run_conversation(
+        &runtime,
+        conversation(),
+        greedy(CHAT_MAX_TOKENS_UNSET),
+        Default::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        uncapped.generation.tokens_generated > 3,
+        "the fixture runs on"
+    );
+    let prompt = uncapped.generation.prompt_tokens;
+
+    let capped = run_capped_conversation(
+        &runtime,
+        conversation(),
+        greedy(CHAT_MAX_TOKENS_UNSET),
+        Default::default(),
+        false,
+        Some(3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(capped.generation.tokens_generated, 3);
+    assert_eq!(
+        capped.generation.finish_reason,
+        Some(izwi_core::engine::OutputFinishReason::MaxTokens)
+    );
+
+    let too_long = 32 - prompt + 1;
+    expect_context_length_error(
+        run_capped_conversation(
+            &runtime,
+            conversation(),
+            greedy(too_long),
+            Default::default(),
+            false,
+            Some(3),
+        )
+        .await,
+        &format!("({prompt} in the messages, {too_long} in the completion)"),
+    );
 }

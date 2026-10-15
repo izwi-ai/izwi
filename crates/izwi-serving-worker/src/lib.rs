@@ -1288,6 +1288,18 @@ async fn invoke<E: InvocationExecutor>(
             None,
         );
     }
+    // A control this worker did not advertise is refused, never ignored.
+    let InvocationInput::Chat { parameters, .. } = &request.input;
+    if let Some(parameter) = parameters.first_unsupported(&state.config.descriptor.features) {
+        return counted_rejection(
+            &state,
+            &request,
+            StatusCode::BAD_REQUEST,
+            RejectionCode::InvalidRequest,
+            format!("this worker does not support `{parameter}`"),
+            None,
+        );
+    }
     if !request
         .caller
         .permitted_actions
@@ -2411,7 +2423,7 @@ fn rejection(
     let mut rejection = InvocationRejection::new(
         request.request_id.clone(),
         request.attempt_id.clone(),
-        code,
+        code.for_peer(request.schema_version),
         bounded_message(message.into()),
     );
     rejection.retry_after_ms = retry_after_ms;
@@ -2737,6 +2749,70 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("streaming")));
         }
+    }
+
+    struct OverflowExecutor;
+
+    #[async_trait]
+    impl InvocationExecutor for OverflowExecutor {
+        async fn admit(
+            &self,
+            _request: &InvocationRequest,
+        ) -> Result<AdmittedInvocation, AdmissionFailure> {
+            Err(AdmissionFailure::new(
+                RejectionCode::ContextLengthExceeded,
+                "This model's maximum context length is 32 tokens.",
+            ))
+        }
+    }
+
+    async fn rejection_for(
+        service: &WorkerService<OverflowExecutor>,
+        request: &InvocationRequest,
+    ) -> (StatusCode, InvocationRejection) {
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(request).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A control the worker does not advertise is refused, never ignored;
+    /// a rejection code a gateway cannot decode becomes the older one.
+    #[tokio::test]
+    async fn invocations_honour_advertised_controls_and_the_gateway_minor() {
+        let service = WorkerService::new(config(), OverflowExecutor).unwrap();
+        let mut seeded = invocation();
+        let InvocationInput::Chat { parameters, .. } = &mut seeded.input;
+        parameters.seed = Some(7);
+        let (status, rejection) = rejection_for(&service, &seeded).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::InvalidRequest);
+        assert!(
+            rejection.message.contains("`seed`"),
+            "{}",
+            rejection.message
+        );
+
+        let (status, rejection) = rejection_for(&service, &invocation()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::ContextLengthExceeded);
+        let mut minor3 = invocation();
+        minor3.schema_version = SchemaVersion::new(1, 3);
+        let (status, rejection) = rejection_for(&service, &minor3).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, RejectionCode::InvalidRequest);
+        assert_eq!(
+            rejection.message,
+            "This model's maximum context length is 32 tokens."
+        );
     }
 
     struct HealthExecutor {

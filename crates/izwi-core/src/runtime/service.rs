@@ -2294,6 +2294,11 @@ pub struct RuntimeChatInvocationRequest {
     pub runtime_context: RuntimeRequestContext,
     /// Require native model streaming and expose committed text deltas.
     pub streaming: bool,
+    /// A cap on the output budget that is not part of the request, such as
+    /// a gateway's per-deployment ceiling. The budget is resolved from
+    /// `params.max_tokens` first, so an explicit budget that does not fit
+    /// the context is still rejected (D8); `None` leaves it uncapped.
+    pub max_tokens_ceiling: Option<usize>,
 }
 
 /// Ordered output emitted by an admitted chat invocation.

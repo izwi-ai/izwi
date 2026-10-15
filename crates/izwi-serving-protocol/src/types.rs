@@ -452,24 +452,56 @@ pub struct ChatParameters {
 impl ChatParameters {
     /// The features a worker must advertise to honour these parameters.
     pub fn required_features(&self) -> BTreeSet<WorkerFeature> {
+        self.knobs()
+            .into_iter()
+            .filter_map(|(set, _, feature)| set.then_some(feature))
+            .collect()
+    }
+
+    /// The OpenAI name of the first parameter set here that a worker
+    /// advertising `features` cannot honour.
+    pub fn first_unsupported(&self, features: &BTreeSet<WorkerFeature>) -> Option<&'static str> {
+        self.knobs()
+            .into_iter()
+            .find(|(set, _, feature)| *set && !features.contains(feature))
+            .map(|(_, name, _)| name)
+    }
+
+    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 8] {
         [
-            (self.seed.is_some(), WorkerFeature::ChatSeed),
-            (!self.stop.is_empty(), WorkerFeature::ChatStopSequences),
-            (self.top_k.is_some(), WorkerFeature::ChatTopK),
+            (self.seed.is_some(), "seed", WorkerFeature::ChatSeed),
             (
-                self.repetition_penalty.is_some() || self.presence_penalty.is_some(),
+                !self.stop.is_empty(),
+                "stop",
+                WorkerFeature::ChatStopSequences,
+            ),
+            (self.top_k.is_some(), "top_k", WorkerFeature::ChatTopK),
+            (
+                self.repetition_penalty.is_some(),
+                "repetition_penalty",
                 WorkerFeature::ChatPenalties,
             ),
-            (self.logprobs.is_some(), WorkerFeature::ChatLogprobs),
+            (
+                self.presence_penalty.is_some(),
+                "presence_penalty",
+                WorkerFeature::ChatPenalties,
+            ),
+            (
+                self.logprobs.is_some(),
+                "logprobs",
+                WorkerFeature::ChatLogprobs,
+            ),
             (
                 self.response_format.is_some(),
+                "response_format",
                 WorkerFeature::ChatJsonObject,
             ),
-            (self.context.is_some(), WorkerFeature::ChatContextPolicy),
+            (
+                self.context.is_some(),
+                "truncation",
+                WorkerFeature::ChatContextPolicy,
+            ),
         ]
-        .into_iter()
-        .filter_map(|(set, feature)| set.then_some(feature))
-        .collect()
     }
 }
 
@@ -682,6 +714,17 @@ pub enum RejectionCode {
     /// A code from a newer protocol minor: a rejection that is not retried.
     #[serde(other)]
     Unknown,
+}
+
+impl RejectionCode {
+    /// This code as a peer speaking `peer` can decode it: a code added after
+    /// the peer's minor becomes the older code that covered it.
+    pub const fn for_peer(self, peer: SchemaVersion) -> Self {
+        match self {
+            Self::ContextLengthExceeded if peer.minor < 4 => Self::InvalidRequest,
+            code => code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

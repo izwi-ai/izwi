@@ -142,6 +142,7 @@ impl RuntimeService {
             correlation_id,
             runtime_context,
             streaming,
+            max_tokens_ceiling,
         } = invocation;
         let admitted = self
             .build_chat_request_with_params_and_config(
@@ -152,6 +153,7 @@ impl RuntimeService {
                 correlation_id.as_deref(),
                 runtime_context,
                 streaming,
+                max_tokens_ceiling,
             )
             .await?;
         self.start_admitted_chat_invocation(admitted).await
@@ -196,6 +198,7 @@ impl RuntimeService {
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
         streaming: bool,
+        max_tokens_ceiling: Option<usize>,
     ) -> Result<AdmittedEngineRequest> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
@@ -314,24 +317,23 @@ impl RuntimeService {
                 }
 
                 let requested_max_tokens = params.max_tokens.max(1);
-                params.max_tokens = chat_completion_budget(
+                let budget = chat_completion_budget(
                     prompt_tokens.len(),
                     requested_max_tokens,
                     context_limit,
                     chat_config.truncation,
                 )?;
-                if params.max_tokens < requested_max_tokens
-                    && requested_max_tokens != CHAT_MAX_TOKENS_UNSET
-                {
+                if budget < requested_max_tokens && requested_max_tokens != CHAT_MAX_TOKENS_UNSET {
                     warn!(
                         model = %variant,
                         requested_max_tokens,
-                        max_tokens = params.max_tokens,
+                        max_tokens = budget,
                         prompt_tokens = prompt_tokens.len(),
                         context_limit,
                         "clamped chat completion budget to the remaining context"
                     );
                 }
+                params.max_tokens = budget.min(max_tokens_ceiling.unwrap_or(usize::MAX));
                 let mut request = ChatRuntimeRequest::from_messages(
                     variant,
                     messages,
@@ -404,6 +406,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 false,
+                None,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
@@ -483,6 +486,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 false,
+                None,
             )
             .await?;
         let output = self.run_admitted_request(admitted).await?;
@@ -682,6 +686,7 @@ impl RuntimeService {
                 correlation_id,
                 runtime_context,
                 true,
+                None,
             )
             .await?;
         let mut streamed_text = String::new();

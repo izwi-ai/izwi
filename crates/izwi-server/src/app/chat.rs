@@ -24,9 +24,9 @@ use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, resolve_chat_max_tokens, resolve_chat_sampling, ChatGeneration,
-    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatSamplingRequest,
-    ChatTemplateKwargs, ChatTruncation, GenerationParams, ModelVariant, ResolvedChatSampling,
-    WorkloadClass,
+    ChatGenerationControls, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig,
+    ChatSamplingRequest, ChatTemplateKwargs, ChatTruncation, GenerationParams, ModelVariant,
+    ResolvedChatSampling, WorkloadClass,
 };
 
 #[derive(Debug, Clone)]
@@ -76,21 +76,22 @@ impl ChatExecutionRequest {
     }
 
     fn resolved_generation_params(&self) -> GenerationParams {
-        let mut params = self
-            .resolved_sampling()
-            .into_generation_params(self.resolved_max_new_tokens());
-        params.seed = self.seed;
-        params.stop_sequences = self.stop.clone();
-        if self.logprobs.unwrap_or(false) {
-            params.logprobs = true;
-        }
-        if let Some(top_logprobs) = self.top_logprobs {
-            params.top_logprobs = top_logprobs as usize;
-        }
-        if self.response_format_json_object {
-            params.constrain_json_object = true;
-        }
-        params
+        self.resolved_sampling().into_generation_params(
+            self.resolved_max_new_tokens(),
+            ChatGenerationControls {
+                seed: self.seed,
+                stop: self.stop.clone(),
+                logprobs: self.requested_logprobs(),
+                constrain_json_object: self.response_format_json_object,
+            },
+        )
+    }
+
+    /// `Some(top_logprobs)` when the request asked for logprobs.
+    fn requested_logprobs(&self) -> Option<usize> {
+        self.logprobs
+            .unwrap_or(false)
+            .then(|| self.top_logprobs.map_or(0, usize::from))
     }
 
     fn resolved_chat_config(&self) -> ChatRequestConfig {

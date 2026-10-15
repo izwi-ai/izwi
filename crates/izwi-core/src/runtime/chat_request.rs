@@ -2,6 +2,7 @@
 //! gateway and the worker), so the same request samples the same way on
 //! each of them.
 
+use crate::catalog::ModelFamily;
 use crate::engine::GenerationParams;
 use crate::model::ModelVariant;
 
@@ -42,20 +43,57 @@ pub struct ResolvedChatSampling {
     pub presence_penalty: f32,
 }
 
+/// A chat request's controls besides sampling and its output budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatGenerationControls {
+    /// OpenAI `seed`.
+    pub seed: Option<u64>,
+    /// OpenAI `stop` strings.
+    pub stop: Vec<String>,
+    /// OpenAI `logprobs: true` with `top_logprobs` alternatives (0 when the
+    /// request set none); `None` collects no logprobs.
+    pub logprobs: Option<usize>,
+    /// OpenAI `response_format: json_object`.
+    pub constrain_json_object: bool,
+}
+
 impl ResolvedChatSampling {
-    /// Generation parameters with this sampling and output budget; every
-    /// other field keeps its default.
-    pub fn into_generation_params(self, max_tokens: usize) -> GenerationParams {
+    /// Generation parameters with this sampling, output budget and
+    /// controls; every other field keeps its default. Every chat entry
+    /// path (local server, gateway, worker) builds its request here.
+    pub fn into_generation_params(
+        self,
+        max_tokens: usize,
+        controls: ChatGenerationControls,
+    ) -> GenerationParams {
         GenerationParams {
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
             repetition_penalty: self.repetition_penalty,
             presence_penalty: self.presence_penalty,
+            seed: controls.seed,
             max_tokens,
+            stop_sequences: controls.stop,
+            logprobs: controls.logprobs.is_some(),
+            top_logprobs: controls.logprobs.unwrap_or(0),
+            constrain_json_object: controls.constrain_json_object,
             ..Default::default()
         }
     }
+}
+
+/// Whether a chat model's sampler can constrain output to one JSON value
+/// (`response_format: json_object`, DS9.2). Other models reject the
+/// request rather than ignore it.
+pub fn chat_supports_json_object(variant: ModelVariant) -> bool {
+    matches!(
+        variant.family(),
+        ModelFamily::Qwen3Chat
+            | ModelFamily::Gemma3Chat
+            | ModelFamily::Lfm2Chat
+            | ModelFamily::Qwen35MoeChat
+    )
 }
 
 /// Resolve a chat request's sampling. Each value comes from the request when
@@ -292,6 +330,48 @@ mod tests {
                 "{variant:?}"
             );
         }
+    }
+
+    #[test]
+    fn generation_params_carry_every_chat_control() {
+        let params = sampling(0.2, 0.3, 7, 1.2, -0.4).into_generation_params(
+            16,
+            ChatGenerationControls {
+                seed: Some(9),
+                stop: vec!["END".into()],
+                logprobs: Some(2),
+                constrain_json_object: true,
+            },
+        );
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (0.2, 0.3, 7)
+        );
+        assert_eq!(
+            (params.repetition_penalty, params.presence_penalty),
+            (1.2, -0.4)
+        );
+        assert_eq!(params.seed, Some(9));
+        assert_eq!(params.stop_sequences, vec!["END".to_string()]);
+        assert!(params.logprobs);
+        assert_eq!(params.top_logprobs, 2);
+        assert!(params.constrain_json_object);
+        assert_eq!(params.max_tokens, 16);
+
+        let plain = sampling(0.2, 0.3, 7, 1.2, -0.4)
+            .into_generation_params(16, ChatGenerationControls::default());
+        assert!(!plain.logprobs && plain.top_logprobs == 0 && !plain.constrain_json_object);
+        assert!(plain.seed.is_none() && plain.stop_sequences.is_empty());
+    }
+
+    #[test]
+    fn json_object_needs_a_grammar_aware_sampler() {
+        assert!(chat_supports_json_object(
+            ModelVariant::Lfm2512BInstructGguf
+        ));
+        assert!(chat_supports_json_object(ModelVariant::Qwen36Moe35BA3BFp8));
+        assert!(chat_supports_json_object(ModelVariant::Gemma34BIt));
+        assert!(!chat_supports_json_object(ModelVariant::Qwen3827BFp8));
     }
 
     #[test]

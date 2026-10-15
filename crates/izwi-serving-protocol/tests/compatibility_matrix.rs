@@ -358,3 +358,44 @@ fn minor4_parameters_are_range_checked() {
         Err(ContractValidationError::InvalidContextPolicy)
     );
 }
+
+#[test]
+fn rejection_codes_downgrade_for_a_gateway_that_cannot_decode_them() {
+    let minor3 = SchemaVersion::new(1, 3);
+    assert_eq!(
+        RejectionCode::ContextLengthExceeded.for_peer(minor3),
+        RejectionCode::InvalidRequest
+    );
+    assert_eq!(
+        RejectionCode::ContextLengthExceeded.for_peer(PROTOCOL_V1),
+        RejectionCode::ContextLengthExceeded
+    );
+    assert_eq!(
+        RejectionCode::CapacityExhausted.for_peer(minor3),
+        RejectionCode::CapacityExhausted
+    );
+}
+
+#[test]
+fn unsupported_parameters_are_named_by_their_openai_name() {
+    let parameters = ChatParameters {
+        presence_penalty: Some(0.5),
+        logprobs: Some(0),
+        ..ChatParameters::default()
+    };
+    assert_eq!(
+        parameters.first_unsupported(&BTreeSet::new()),
+        Some("presence_penalty")
+    );
+    assert_eq!(
+        parameters.first_unsupported(&BTreeSet::from([WorkerFeature::ChatPenalties])),
+        Some("logprobs")
+    );
+    assert_eq!(
+        parameters.first_unsupported(&BTreeSet::from([
+            WorkerFeature::ChatPenalties,
+            WorkerFeature::ChatLogprobs
+        ])),
+        None
+    );
+}

@@ -674,16 +674,12 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
         .last_chat_parameters
         .lock()
         .expect("mock parameter record poisoned") = Some(parameters.clone());
-    if let Some(missing) = parameters
-        .required_features()
-        .into_iter()
-        .find(|feature| !state.config.chat_features.contains(feature))
-    {
+    if let Some(parameter) = parameters.first_unsupported(&state.config.chat_features) {
         return rejection(
             &request,
             StatusCode::BAD_REQUEST,
             RejectionCode::InvalidRequest,
-            format!("worker does not advertise {missing:?}"),
+            format!("this worker does not support `{parameter}`"),
         );
     }
 
