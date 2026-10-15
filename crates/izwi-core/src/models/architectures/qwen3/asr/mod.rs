@@ -1528,6 +1528,28 @@ pub(crate) fn forced_alignment_words(text: &str) -> Vec<String> {
     extract_alignment_words(text)
 }
 
+/// Byte ranges in `text` of the words [`forced_alignment_words`] returns.
+pub(crate) fn forced_alignment_word_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut current: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        if is_east_asian_char(ch) {
+            if let Some(start) = current.take() {
+                ranges.push(start..idx);
+            }
+            ranges.push(idx..idx + ch.len_utf8());
+        } else if is_alignment_word_char(ch) {
+            current.get_or_insert(idx);
+        } else if let Some(start) = current.take() {
+            ranges.push(start..idx);
+        }
+    }
+    if let Some(start) = current {
+        ranges.push(start..text.len());
+    }
+    ranges
+}
+
 /// Most alignable words one aligner window of `audio_seconds` accepts.
 pub(crate) fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
     let proportional = if audio_seconds.is_finite() && audio_seconds > 0.0 {
@@ -3297,33 +3319,10 @@ fn batched_decode_argmax(output: &Tensor) -> Result<Vec<u32>> {
 }
 
 fn extract_alignment_words(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    let flush = |buffer: &mut String, out: &mut Vec<String>| {
-        if buffer.is_empty() {
-            return;
-        }
-        out.push(buffer.clone());
-        buffer.clear();
-    };
-
-    for ch in text.chars() {
-        if is_east_asian_char(ch) {
-            flush(&mut current, &mut words);
-            words.push(ch.to_string());
-            continue;
-        }
-
-        if is_alignment_word_char(ch) {
-            current.push(ch);
-        } else {
-            flush(&mut current, &mut words);
-        }
-    }
-    flush(&mut current, &mut words);
-
-    words
+    forced_alignment_word_ranges(text)
+        .into_iter()
+        .map(|range| text[range].to_string())
+        .collect()
 }
 
 fn is_alignment_word_char(ch: char) -> bool {
