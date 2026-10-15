@@ -6,7 +6,9 @@
 //! RuntimeService. An inference request succeeding through the test worker
 //! proves the request was executed remotely, not locally.
 
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
@@ -14,6 +16,107 @@ use izwi_serving_protocol::ModelAlias;
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
 const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
+
+/// A gateway binary serving on a port the OS assigned it. The gateway binds
+/// port 0 and logs the address it got; reserving a port here and releasing
+/// it for the gateway to bind raced other processes ("Address already in
+/// use").
+struct GatewayProcess {
+    child: Child,
+    port: u16,
+    /// Every stdout and stderr line, for failure messages.
+    output: Arc<Mutex<String>>,
+    /// Stdout lines after the one announcing the address.
+    lines: mpsc::Receiver<String>,
+}
+
+impl GatewayProcess {
+    fn spawn(command: &mut Command) -> Self {
+        if !command.get_envs().any(|(key, _)| key == "RUST_LOG") {
+            command.env("RUST_LOG", "izwi_server=info");
+        }
+        let mut child = command
+            .args(["--port", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("gateway binary spawns");
+        let output = Arc::new(Mutex::new(String::new()));
+        let (lines_tx, lines) = mpsc::channel();
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        for (stream, lines_tx) in [
+            (Box::new(stdout) as Box<dyn Read + Send>, Some(lines_tx)),
+            (Box::new(stderr), None),
+        ] {
+            let output = Arc::clone(&output);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    if let Ok(mut output) = output.lock() {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                    if let Some(lines_tx) = &lines_tx {
+                        let _ = lines_tx.send(line);
+                    }
+                }
+            });
+        }
+        let mut gateway = Self {
+            child,
+            port: 0,
+            output,
+            lines,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        gateway.port = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match gateway.lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Some(port) = listening_port(&line) {
+                        break port;
+                    }
+                }
+                Err(_) => panic!("gateway never listened; output:\n{}", gateway.output()),
+            }
+        };
+        gateway
+    }
+
+    fn output(&self) -> String {
+        self.output
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or_default()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+}
+
+impl Drop for GatewayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The port in the gateway's "Gateway listening on http://HOST:PORT" log
+/// line, in text or JSON format.
+fn listening_port(line: &str) -> Option<u16> {
+    let address = line.split("Gateway listening on http://").nth(1)?;
+    let address = address.split(['"', ' ']).next()?;
+    let port = address.rsplit(':').next()?;
+    let digits = port
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(port.len());
+    port[..digits].parse().ok()
+}
 
 #[tokio::test]
 async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() {
@@ -47,15 +150,6 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
         .await
         .expect("test worker should bind a real loopback TCP listener");
 
-    // Reserve a port the same way an operator would: bind, learn it, release.
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
-    let _endpoint = format!("http://127.0.0.1:{port}");
-
     // Standalone compatibility approval: URL|TASK|PUBLIC_MODEL|DEPLOYMENT|GEN.
     // The test worker's default deployment identity is test-chat-v1 @ generation 1.
     let approval = format!(
@@ -64,35 +158,25 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
         model.dir_name()
     );
 
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &approval,
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    // Drain diagnostics so bounded startup/restart logs cannot fill the pipe.
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for _ in BufReader::new(stderr).lines() {}
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &approval,
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -228,56 +312,41 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
     )
     .expect("manifest write");
 
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
     let approval = format!(
         "{}|chat|{}|test-chat-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
 
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &approval,
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env(
-            "IZWI_GATEWAY_PRINCIPAL_KEYS_MANIFEST",
-            manifest_path.display().to_string(),
-        )
-        .env(
-            "IZWI_DB_PATH",
-            storage.path().join("gateway.sqlite3").display().to_string(),
-        )
-        .env("IZWI_TEST_PROCESS_SCOPED_A", SCOPED_INFERENCE_KEY)
-        .env("IZWI_TEST_PROCESS_SCOPED_B", SCOPED_OPS_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for _ in BufReader::new(stderr).lines() {}
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &approval,
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env(
+                "IZWI_GATEWAY_PRINCIPAL_KEYS_MANIFEST",
+                manifest_path.display().to_string(),
+            )
+            .env(
+                "IZWI_DB_PATH",
+                storage.path().join("gateway.sqlite3").display().to_string(),
+            )
+            .env("IZWI_TEST_PROCESS_SCOPED_A", SCOPED_INFERENCE_KEY)
+            .env("IZWI_TEST_PROCESS_SCOPED_B", SCOPED_OPS_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -430,61 +499,39 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     .await
     .expect("test realtime worker binds");
 
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
     let approval = format!(
         "{}|speech_to_text|{}|test-asr-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
 
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|chat|{}|test-chat-v1|1",
-                chat_worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-worker-approval",
-            &approval,
-            "--gateway-realtime",
-            "on",
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_store = std::sync::Arc::clone(&stderr_capture);
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut collected) = stderr_store.lock() {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                }
-            }
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|chat|{}|test-chat-v1|1",
+                    chat_worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-worker-approval",
+                &approval,
+                "--gateway-realtime",
+                "on",
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -502,13 +549,7 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     if !ready {
         let _ = gateway.kill();
         let _ = gateway.wait();
-        panic!(
-            "gateway never became ready; stderr:\n{}",
-            stderr_capture
-                .lock()
-                .map(|buf| buf.clone())
-                .unwrap_or_default()
-        );
+        panic!("gateway never became ready; output:\n{}", gateway.output());
     }
 
     // Public client: the perimeter API key, the v1 subprotocol, and the same
@@ -705,59 +746,37 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     .await
     .expect("test tts worker binds");
 
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|chat|{}|test-chat-v1|1",
-                chat_worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|text_to_speech|{}|test-tts-v1|1",
-                tts_worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-realtime",
-            "on",
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_store = std::sync::Arc::clone(&stderr_capture);
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut collected) = stderr_store.lock() {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                }
-            }
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|chat|{}|test-chat-v1|1",
+                    chat_worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|text_to_speech|{}|test-tts-v1|1",
+                    tts_worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-realtime",
+                "on",
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -775,13 +794,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     if !ready {
         let _ = gateway.kill();
         let _ = gateway.wait();
-        panic!(
-            "gateway never became ready; stderr:\n{}",
-            stderr_capture
-                .lock()
-                .map(|buf| buf.clone())
-                .unwrap_or_default()
-        );
+        panic!("gateway never became ready; output:\n{}", gateway.output());
     }
 
     let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
@@ -1010,60 +1023,37 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     .await
     .expect("test realtime worker binds");
 
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
-
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|chat|{}|test-chat-v1|1",
-                chat_worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|speech_to_text|{}|test-asr-v1|1",
-                worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-realtime",
-            "on",
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_store = std::sync::Arc::clone(&stderr_capture);
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut collected) = stderr_store.lock() {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                }
-            }
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|chat|{}|test-chat-v1|1",
+                    chat_worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|speech_to_text|{}|test-asr-v1|1",
+                    worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-realtime",
+                "on",
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -1081,13 +1071,7 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     if !ready {
         let _ = gateway.kill();
         let _ = gateway.wait();
-        panic!(
-            "gateway never became ready; stderr:\n{}",
-            stderr_capture
-                .lock()
-                .map(|buf| buf.clone())
-                .unwrap_or_default()
-        );
+        panic!("gateway never became ready; output:\n{}", gateway.output());
     }
 
     // Public legacy client: the alias path, the perimeter API key, no
@@ -1245,60 +1229,37 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     .await
     .expect("test realtime worker binds");
 
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
-
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|chat|{}|test-chat-v1|1",
-                chat_worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-worker-approval",
-            &format!(
-                "{}|speech_to_text|{}|test-asr-v1|1",
-                worker.endpoint(),
-                model.dir_name()
-            ),
-            "--gateway-realtime",
-            "on",
-        ])
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("gateway binary spawns");
-    let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_store = std::sync::Arc::clone(&stderr_capture);
-    if let Some(stderr) = gateway.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if let Ok(mut collected) = stderr_store.lock() {
-                    collected.push_str(&line);
-                    collected.push('\n');
-                }
-            }
-        });
-    }
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|chat|{}|test-chat-v1|1",
+                    chat_worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-worker-approval",
+                &format!(
+                    "{}|speech_to_text|{}|test-asr-v1|1",
+                    worker.endpoint(),
+                    model.dir_name()
+                ),
+                "--gateway-realtime",
+                "on",
+            ])
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -1316,13 +1277,7 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     if !ready {
         let _ = gateway.kill();
         let _ = gateway.wait();
-        panic!(
-            "gateway never became ready; stderr:\n{}",
-            stderr_capture
-                .lock()
-                .map(|buf| buf.clone())
-                .unwrap_or_default()
-        );
+        panic!("gateway never became ready; output:\n{}", gateway.output());
     }
 
     let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
@@ -1521,49 +1476,32 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
     })
     .await
     .expect("test worker binds");
-    let port = {
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("probe listener binds");
-        probe.local_addr().expect("probe addr").port()
-    };
     let approval = format!(
         "{}|chat|{}|test-chat-v1|1",
         worker.endpoint(),
         model.dir_name()
     );
-    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
-        .args([
-            "--role",
-            "gateway",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--public-model",
-            model.dir_name(),
-            "--gateway-worker-approval",
-            &approval,
-        ])
-        .env("IZWI_LOG_FORMAT", "json")
-        .env("RUST_LOG", "izwi_server=info")
-        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
-        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
-        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
-        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
-        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("gateway binary spawns");
-    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
-    let stdout = gateway.stdout.take().expect("piped stdout");
-    std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = lines_tx.send(line);
-        }
-    });
+    let mut gateway = GatewayProcess::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+            .args([
+                "--role",
+                "gateway",
+                "--host",
+                "127.0.0.1",
+                "--public-model",
+                model.dir_name(),
+                "--gateway-worker-approval",
+                &approval,
+            ])
+            .env("IZWI_LOG_FORMAT", "json")
+            .env("RUST_LOG", "izwi_server=info")
+            .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+            .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+            .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+            .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000"),
+    );
+    let port = gateway.port;
 
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -1604,7 +1542,8 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let request_span = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let line = lines_rx
+        let line = gateway
+            .lines
             .recv_timeout(remaining)
             .expect("the gateway logs the chat request as JSON");
         let Ok(line) = serde_json::from_str::<serde_json::Value>(&line) else {

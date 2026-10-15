@@ -546,7 +546,7 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
     };
     let addr = format!("{}:{}", bind.host, bind.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Server listening on http://{}", addr);
+    info!("Server listening on http://{}", listener.local_addr()?);
 
     let preload_state = state.clone();
     serve_local(
@@ -777,7 +777,7 @@ async fn run_gateway(
     let app = gateway::create_gateway_router(state.clone(), &serve_config);
     let addr = format!("{}:{}", serve_config.host, serve_config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("Gateway listening on http://{}", addr);
+    info!("Gateway listening on http://{}", listener.local_addr()?);
 
     let shutdown_state = state.clone();
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
