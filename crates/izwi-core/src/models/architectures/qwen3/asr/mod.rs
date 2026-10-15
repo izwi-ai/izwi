@@ -268,7 +268,6 @@ impl Qwen3AsrModel {
             QWEN3_ASR_SAMPLE_RATE,
             mel.n_fft,
             mel.hop_length,
-            qwen_asr_drop_last_mel_frame(),
             self.device.device.is_cuda(),
             self.preprocessor.nb_max_frames,
         )?;
@@ -1462,21 +1461,21 @@ fn qwen3_asr_mel_frame_count(samples: usize, n_fft: usize, hop_length: usize) ->
         .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel frame count overflow".to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The front end's sample and frame counts for `input_samples`. The mel drops
+/// the last centre-padded frame, as [`qwen3_log_mel`] does.
 fn qwen3_asr_frontend_geometry(
     input_samples: usize,
     input_sample_rate: u32,
     output_sample_rate: u32,
     n_fft: usize,
     hop_length: usize,
-    drop_last: bool,
     cuda_device_observed: bool,
     configured_max_frames: usize,
 ) -> Result<Qwen3AsrFrontendGeometry> {
     let resampled_samples =
         qwen3_asr_resampled_sample_count(input_samples, input_sample_rate, output_sample_rate)?;
     let mel_frames_before_drop = qwen3_asr_mel_frame_count(resampled_samples, n_fft, hop_length)?;
-    let mel_last_frame_dropped = drop_last && mel_frames_before_drop > 0;
+    let mel_last_frame_dropped = mel_frames_before_drop > 0;
     let mel_frames_before_truncate =
         mel_frames_before_drop.saturating_sub(usize::from(mel_last_frame_dropped));
     let mel_frames = qwen3_asr_admit_frames(
@@ -1517,12 +1516,18 @@ fn qwen3_asr_effective_max_frames(
         .unwrap_or(0)
 }
 
-/// Longest aligner input (16 kHz samples) whose centre-padded mel, which
-/// keeps the final frame, has at most `maximum_frames` frames.
-fn qwen3_aligner_max_window_samples(maximum_frames: usize, hop_length: usize) -> usize {
-    maximum_frames
-        .saturating_sub(1)
-        .saturating_mul(hop_length.max(1))
+/// Whisper log-mel features as `WhisperFeatureExtractor` computes them for
+/// Qwen3-ASR and the forced aligner: the centre-padded STFT without its last
+/// frame, then clamped to `max - 8` and scaled, with the max taken over the
+/// kept frames. Returns frame-major features and their frame count, one
+/// frame per hop of audio (`samples / hop` for an even FFT size).
+fn qwen3_log_mel(mel: &MelSpectrogram, samples: &[f32]) -> Result<(Vec<f32>, usize)> {
+    debug_assert!(!mel.config().normalize);
+    let (mut flat, frames) = mel.compute_flat(samples)?;
+    let kept = frames.saturating_sub(1);
+    flat.truncate(kept * mel.config().n_mels);
+    MelSpectrogram::whisper_normalize_flat(&mut flat);
+    Ok((flat, kept))
 }
 
 /// Most alignable words one aligner window of `audio_seconds` accepts.
@@ -1644,7 +1649,8 @@ impl Qwen3AsrModel {
             n_mels: preprocessor.feature_size.max(1),
             f_min: 0.0,
             f_max: 8_000.0,
-            normalize: true,
+            // Normalized in `qwen3_log_mel`, after the last frame is dropped.
+            normalize: false,
             mel_scale: MelScale::Slaney,
             mel_norm: MelNorm::Slaney,
         };
@@ -1887,13 +1893,9 @@ impl Qwen3AsrModel {
             self.mel.config().hop_length,
         );
         if maximum_frames > 0 {
+            // One mel frame per hop of audio: the window is exactly the frame
+            // limit's audio (180 s for the aligner).
             let hop = self.mel.config().hop_length.max(1);
-            if self.is_forced_aligner {
-                // The aligner keeps every centre-padded frame, so the window is
-                // the longest audio whose frame count still fits.
-                let samples = qwen3_aligner_max_window_samples(maximum_frames, hop);
-                return Some(samples as f32 / sample_rate);
-            }
             return Some(maximum_frames as f32 * hop as f32 / sample_rate);
         }
         if self.preprocessor.n_samples > 0 {
@@ -1936,7 +1938,6 @@ impl Qwen3AsrModel {
             QWEN3_ASR_SAMPLE_RATE,
             mel.n_fft,
             mel.hop_length,
-            qwen_asr_drop_last_mel_frame(),
             self.device.device.is_cuda(),
             self.preprocessor.nb_max_frames,
         )?;
@@ -2214,7 +2215,6 @@ impl Qwen3AsrModel {
 
         let mel_config = self.mel.config();
         let n_mels = mel_config.n_mels;
-        let drop_last = qwen_asr_drop_last_mel_frame();
         let mut host_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let geometry = qwen3_asr_frontend_geometry(
@@ -2223,7 +2223,6 @@ impl Qwen3AsrModel {
                 QWEN3_ASR_SAMPLE_RATE,
                 mel_config.n_fft,
                 mel_config.hop_length,
-                drop_last,
                 self.device.device.is_cuda(),
                 self.preprocessor.nb_max_frames,
             )?;
@@ -2247,11 +2246,11 @@ impl Qwen3AsrModel {
             }
 
             let mel_started = Instant::now();
-            let (mut flat, actual_frames) = self.mel.compute_flat(&resampled)?;
-            if actual_frames != geometry.mel_frames_before_drop {
+            let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
+            if actual_frames != geometry.mel_frames_before_truncate {
                 return Err(Error::InferenceError(format!(
                     "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
-                    geometry.mel_frames_before_drop
+                    geometry.mel_frames_before_truncate
                 )));
             }
             flat.truncate(
@@ -2825,26 +2824,19 @@ impl Qwen3AsrModel {
             )));
         }
 
-        let mel_spec = self.mel.compute(&audio)?;
+        let (flat, frames) = qwen3_log_mel(&self.mel, &audio)?;
         qwen3_asr_admit_frames(
-            mel_spec.len(),
+            frames,
             self.device.device.is_cuda(),
             true,
             self.preprocessor.nb_max_frames,
             self.mel.config().sample_rate,
             self.mel.config().hop_length,
         )?;
-
-        let n_mels = self.mel.config().n_mels;
-        if mel_spec.is_empty() {
+        if frames == 0 {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
-
-        let frames = mel_spec.len();
-        let mut flat = Vec::with_capacity(frames * n_mels);
-        for frame in mel_spec.iter() {
-            flat.extend_from_slice(frame);
-        }
+        let n_mels = self.mel.config().n_mels;
 
         let mel = Tensor::from_vec(flat, (frames, n_mels), &self.device.device)?
             .transpose(0, 1)?
@@ -4549,10 +4541,6 @@ fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
     false
 }
 
-fn qwen_asr_drop_last_mel_frame() -> bool {
-    env_bool("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME").unwrap_or(false)
-}
-
 fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().and_then(|raw| {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -4562,14 +4550,6 @@ fn env_bool(name: &str) -> Option<bool> {
             _ => None,
         }
     })
-}
-
-fn apply_qwen_mel_frame_policy(mel_spec: &mut Vec<Vec<f32>>, drop_last: bool) -> bool {
-    if drop_last && !mel_spec.is_empty() {
-        mel_spec.pop();
-        return true;
-    }
-    false
 }
 
 fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
@@ -5062,32 +5042,29 @@ mod tests {
         }
     }
 
+    /// With the last centre-padded frame dropped, 180.0 s encodes exactly the
+    /// 18,000-frame limit, so the window hint is 180.0 s; one more hop is
+    /// rejected.
     #[test]
     fn forced_aligner_window_hint_fits_the_frame_limit() {
-        let (n_fft, hop) = (400, 160);
-        let maximum = 18_000usize;
-        let samples = qwen3_aligner_max_window_samples(maximum, hop);
-        assert_eq!(
-            qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
-            maximum
-        );
-        assert_eq!(
-            qwen3_asr_mel_frame_count(samples + hop, n_fft, hop).unwrap(),
-            maximum + 1
-        );
+        let frames = |samples: usize| {
+            qwen3_asr_frontend_geometry(samples, 16_000, 16_000, 400, 160, false, 0)
+                .unwrap()
+                .mel_frames
+        };
+        let window = 180 * 16_000;
+        assert_eq!(frames(window), 18_000);
+        assert_eq!(frames(window + 159), 18_000);
+        assert_eq!(frames(window + 160), 18_001);
+        assert_eq!(frames(30 * 16_000), 3_000);
         for cuda in [false, true] {
-            assert!(qwen3_asr_admit_frames(
-                qwen3_asr_mel_frame_count(samples, n_fft, hop).unwrap(),
-                cuda,
-                true,
-                3_000,
-                16_000,
-                hop
-            )
-            .is_ok());
+            for (samples, admitted) in [(window, true), (window + 160, false)] {
+                assert_eq!(
+                    qwen3_asr_admit_frames(frames(samples), cuda, true, 3_000, 16_000, 160).is_ok(),
+                    admitted
+                );
+            }
         }
-        // A 180.0 s window encodes 18001 frames, so the hint is 179.99 s.
-        assert_eq!(samples, 2_879_840);
     }
 
     #[test]
@@ -5282,19 +5259,12 @@ mod tests {
         }
 
         // The exact 30 s prompt plus the 512-token decode cap fits a sequence.
-        let frontend = qwen3_asr_frontend_geometry(
-            30 * 16_000,
-            16_000,
-            16_000,
-            400,
-            160,
-            false,
-            false,
-            12_000,
-        )
-        .unwrap();
+        let frontend =
+            qwen3_asr_frontend_geometry(30 * 16_000, 16_000, 16_000, 400, 160, false, 12_000)
+                .unwrap();
         let audio_tokens = audio::get_cnn_output_lengths(&[frontend.mel_frames])[0];
-        assert_eq!(audio_tokens, 391);
+        // 3,000 frames, as WhisperFeatureExtractor gives (QFA-4).
+        assert_eq!(audio_tokens, 390);
         let prompt = build_qwen_asr_prompt_tokens(
             &test_specials(Some(7)),
             audio_tokens,
@@ -6224,17 +6194,69 @@ mod tests {
         );
     }
 
+    fn qwen3_test_mel(n_mels: usize) -> MelSpectrogram {
+        MelSpectrogram::new(MelConfig {
+            sample_rate: QWEN3_ASR_SAMPLE_RATE as usize,
+            n_fft: 400,
+            win_length: None,
+            hop_length: 160,
+            n_mels,
+            f_min: 0.0,
+            f_max: 8_000.0,
+            normalize: false,
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
+        })
+        .expect("Qwen3 mel frontend")
+    }
+
+    /// QFA-4: 24 kHz fox.wav (3.6 s) gives WhisperFeatureExtractor's 360
+    /// frames, not the 361 centre-padded STFT frames.
     #[test]
-    fn qwen_mel_frame_policy_is_opt_in() {
-        let mut mel = vec![vec![1.0], vec![2.0], vec![3.0]];
-        assert!(!apply_qwen_mel_frame_policy(&mut mel, false));
-        assert_eq!(mel.len(), 3);
+    fn qwen3_mel_keeps_the_whisper_frame_count() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+        let (audio, rate) =
+            crate::audio::decode_audio_bytes_to_mono(&std::fs::read(path).expect("fox.wav"))
+                .expect("decode fox.wav");
+        assert_eq!((audio.len(), rate), (86_400, 24_000));
+        let resampled = resample(&audio, rate, QWEN3_ASR_SAMPLE_RATE).expect("resample");
+        let mel = qwen3_test_mel(128);
+        let (flat, frames) = qwen3_log_mel(&mel, &resampled).expect("mel");
+        assert_eq!(frames, 360);
+        assert_eq!(flat.len(), 360 * 128);
+        let geometry = qwen3_asr_frontend_geometry(
+            audio.len(),
+            rate,
+            QWEN3_ASR_SAMPLE_RATE,
+            400,
+            160,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(geometry.mel_frames, 360);
+        assert_eq!(geometry.mel_frames_before_drop, 361);
+    }
 
-        assert!(apply_qwen_mel_frame_policy(&mut mel, true));
-        assert_eq!(mel, vec![vec![1.0], vec![2.0]]);
-
-        let mut empty: Vec<Vec<f32>> = Vec::new();
-        assert!(!apply_qwen_mel_frame_policy(&mut empty, true));
+    /// The `max - 8` floor comes from the kept frames only: a burst at the
+    /// very end is loudest in the dropped frame, which must not raise the
+    /// floor of the others.
+    #[test]
+    fn qwen3_mel_floor_ignores_the_dropped_frame() {
+        let mut audio = vec![0.0f32; 16_000];
+        for (idx, sample) in audio[15_960..].iter_mut().enumerate() {
+            *sample = if idx % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        let mel = qwen3_test_mel(16);
+        let (raw, frames) = mel.compute_flat(&audio).expect("raw mel");
+        let max = |values: &[f32]| values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_all = max(&raw);
+        let max_kept = max(&raw[..(frames - 1) * 16]);
+        assert!(max_all > max_kept + 1.0, "{max_all} vs {max_kept}");
+        let (features, kept) = qwen3_log_mel(&mel, &audio).expect("features");
+        assert_eq!(kept, frames - 1);
+        let floor = features.iter().copied().fold(f32::INFINITY, f32::min);
+        assert_eq!(floor, (max_kept - 8.0 + 4.0) / 4.0);
     }
 
     #[test]
@@ -6247,7 +6269,7 @@ mod tests {
             n_mels: 8,
             f_min: 0.0,
             f_max: 8_000.0,
-            normalize: true,
+            normalize: false,
             mel_scale: MelScale::Slaney,
             mel_norm: MelNorm::Slaney,
         })
@@ -6261,6 +6283,7 @@ mod tests {
                 let resampled =
                     resample(&audio, sample_rate, QWEN3_ASR_SAMPLE_RATE).expect("resample");
                 let (_, actual_frames) = mel.compute_flat(&resampled).expect("mel frames");
+                let (_, kept_frames) = qwen3_log_mel(&mel, &resampled).expect("kept frames");
 
                 let geometry = qwen3_asr_frontend_geometry(
                     input_samples,
@@ -6269,26 +6292,13 @@ mod tests {
                     mel.config().n_fft,
                     mel.config().hop_length,
                     false,
-                    false,
                     0,
                 )
                 .expect("frontend geometry");
                 assert_eq!(geometry.resampled_samples, resampled.len());
                 assert_eq!(geometry.mel_frames_before_drop, actual_frames);
-                assert_eq!(geometry.mel_frames, actual_frames);
-
-                let dropped = qwen3_asr_frontend_geometry(
-                    input_samples,
-                    sample_rate,
-                    QWEN3_ASR_SAMPLE_RATE,
-                    mel.config().n_fft,
-                    mel.config().hop_length,
-                    true,
-                    false,
-                    0,
-                )
-                .expect("dropped geometry");
-                assert_eq!(dropped.mel_frames, actual_frames.saturating_sub(1));
+                assert_eq!(geometry.mel_frames, kept_frames);
+                assert_eq!(kept_frames, actual_frames - 1);
             }
         }
     }
@@ -6919,7 +6929,7 @@ mod precision_tests {
             n_mels: 8,
             f_min: 0.0,
             f_max: 8_000.0,
-            normalize: true,
+            normalize: false,
             mel_scale: super::MelScale::Slaney,
             mel_norm: super::MelNorm::Slaney,
         })

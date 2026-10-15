@@ -1089,12 +1089,12 @@ mod tests {
         )
         .expect("load aligner");
         let limit = model.max_audio_seconds_hint().expect("aligner window");
-        assert!((limit - 179.99).abs() < 0.01, "window {limit} s");
+        assert_eq!(limit, 180.0, "window {limit} s");
         if mode == "load" {
             return;
         }
         // The pre-D1 CPU/Metal window: 3,000 mel frames.
-        let window_30 = 479_840usize;
+        let window_30 = 480_000usize;
         for (label, samples, text) in cases {
             let duration_ms = samples_to_ms(samples.len(), rate);
             let whole = window(0, samples.len(), &text);
