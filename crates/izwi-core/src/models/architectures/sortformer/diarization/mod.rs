@@ -3552,7 +3552,7 @@ impl SortformerRopeLayer {
         let h = x.broadcast_add(&attn_out)?;
         let ff = self
             .ff_out
-            .forward(&self.ff_in.forward(&self.norm2.forward(&h)?)?.gelu()?)?;
+            .forward(&self.ff_in.forward(&self.norm2.forward(&h)?)?.gelu_erf()?)?;
         h.broadcast_add(&ff).map_err(Error::from)
     }
 
@@ -5359,6 +5359,64 @@ mod tests {
         assert!(encoder
             .rope_cos_sin(NEMOTRON3_ROPE_MAX_POSITIONS + 1, &Device::Cpu)
             .is_err());
+    }
+
+    /// NeMo's `FeedForward` and HF's `hidden_act: gelu` use the exact erf
+    /// GELU; candle's `gelu()` is the tanh approximation (NDZ-2).
+    #[test]
+    fn rope_layer_ffn_uses_exact_erf_gelu() {
+        let d_model = 8;
+        let identity = Tensor::eye(d_model, DType::F32, &Device::Cpu).unwrap();
+        let zeros = |shape: &[usize]| Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap();
+        let ones = |len: usize| Tensor::ones(len, DType::F32, &Device::Cpu).unwrap();
+        let tensors = std::collections::HashMap::from([
+            ("norm1.weight".to_string(), ones(d_model)),
+            ("norm1.bias".to_string(), zeros(&[d_model])),
+            ("norm2.weight".to_string(), ones(d_model)),
+            ("norm2.bias".to_string(), zeros(&[d_model])),
+            // Zero attention leaves h = x, so the block is x + ffn(norm2(x)).
+            (
+                "attn.w_qkv.weight".to_string(),
+                zeros(&[3 * d_model, d_model]),
+            ),
+            (
+                "attn.out_proj.weight".to_string(),
+                zeros(&[d_model, d_model]),
+            ),
+            ("attn.out_proj.bias".to_string(), zeros(&[d_model])),
+            ("ffn.net.0.weight".to_string(), identity.clone()),
+            ("ffn.net.0.bias".to_string(), zeros(&[d_model])),
+            ("ffn.net.3.weight".to_string(), identity),
+            ("ffn.net.3.bias".to_string(), zeros(&[d_model])),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let layer = SortformerRopeLayer::load(vb, d_model, 2, 4).unwrap();
+        let values = (0..3 * d_model)
+            .map(|i| ((i * 7) % 11) as f32 - 5.0)
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (1, 3, d_model), &Device::Cpu).unwrap();
+        let (cos, sin) = (
+            Tensor::ones((3, 4), DType::F32, &Device::Cpu).unwrap(),
+            zeros(&[3, 4]),
+        );
+
+        let actual = layer.forward(&x, &cos, &sin).unwrap();
+        let normed = layer.norm2.forward(&x).unwrap();
+        let expected = (&x + normed.gelu_erf().unwrap()).unwrap();
+        let max_abs = (actual - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            max_abs <= 1e-6,
+            "FFN activation is not exact GELU: {max_abs:e}"
+        );
     }
 
     #[test]
