@@ -127,6 +127,21 @@ and evidence: runbook section "Signal-driven worker autoscaling (DS7)".
 Not a production soak or hardware-capacity certificate; scale state is
 in-memory by design (a supervisor restart returns to the declared min set).
 
+## Worker protocol minor 4: one chat contract
+
+A chat request runs on a worker exactly as on the local server. The worker
+builds its engine request with the same izwi-core resolver (family sampling
+profiles, seed, stop, top-k, penalties, logprobs, JSON mode, and the D8 output
+budget and truncation), and the gateway sends each control only to a worker
+that advertises its `WorkerFeature`; otherwise it returns a `400`
+(`unsupported_parameter`), never dropping the control.
+
+| Scope | Status | Evidence |
+|---|---|---|
+| Version negotiation and forward-compatible enums | Supported | Every worker-sent enum decodes a later variant as `Unknown`; the gateway sends `x-izwi-protocol-version` and the worker leaves out what an older gateway cannot decode; invocations carry the negotiated minor. JSON-literal old/new matrix in `crates/izwi-serving-protocol/tests/compatibility_matrix.rs` |
+| Mixed fleets (minor 3 and minor 4 workers) | Supported | Controls route only to workers advertising them; plain requests still run on minor-3 workers at minor 3, which keep automatic truncation (`controls_route_only_to_workers_that_advertise_them`, `a_pinned_worker_gets_only_the_controls_it_advertises`) |
+| Rolling upgrade order | Either order from minor 4 on; minor-3 gateways decode minor-4 workers through the version header filter | Same tests |
+
 ## API completeness surface (DS9)
 
 OpenAI-shape API-completeness additions on the chat surface. All protocol

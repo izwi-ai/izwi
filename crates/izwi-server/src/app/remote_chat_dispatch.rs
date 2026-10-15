@@ -5,7 +5,7 @@
 //! one alternate attempt only when the first attempt is provably unaccepted;
 //! uncertain acceptance and accepted execution never fail over.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ use super::chat::{
     prepare_remote_chat_invocation, retarget_remote_chat_invocation,
     spawn_started_remote_chat_stream_with_tenant, start_remote_chat_invocation_with_tenant,
     ChatExecutionRequest, ChatStreamEvent, RemoteChatExecution, RemoteChatExecutionConfig,
+    RemoteWorkerContract,
 };
 use super::fleet_coordinator::{FleetClaimGuard, FleetCoordinator};
 use crate::api::request_context::RequestContext;
@@ -278,6 +279,7 @@ impl RemoteChatDispatcher {
                     input_bytes: 0,
                     context_tokens: None,
                     output_tokens: Some(1),
+                    required_features: BTreeSet::new(),
                 })
         });
         if !compatible {
@@ -430,7 +432,7 @@ impl RemoteChatDispatcher {
                 .select_and_reserve_preferring(&selection, worker),
             (None, None) => self.registry.select_and_reserve(&selection),
         }
-        .map_err(map_registry_error)?;
+        .map_err(|error| self.selection_error(error, &selection, &request))?;
         // Best-effort cluster visibility: publish this dispatch to peer
         // gateways when coordinated, but never gate on it. A lost race only
         // costs one worker-arbitrated attempt through the existing alternate
@@ -439,7 +441,7 @@ impl RemoteChatDispatcher {
         let fleet_claim = self.claim_for(&selected).await;
         let remote = self.execution_for(&selected)?;
         let invocation =
-            prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request)?;
+            prepare_remote_chat_invocation(&remote, request_timeout_secs, context, request).await?;
         let started = Instant::now();
 
         let retry_delay = match start_remote_chat_invocation_with_tenant(
@@ -510,8 +512,12 @@ impl RemoteChatDispatcher {
             .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
             .filter(|budget| !budget.is_zero())
             .ok_or_else(alternate_deadline_error)?;
-        let alternate_invocation =
-            retarget_remote_chat_invocation(&invocation, &alternate_remote, remaining)?;
+        let alternate_invocation = retarget_remote_chat_invocation(
+            &invocation,
+            &alternate_remote,
+            &worker_contract(&alternate),
+            remaining,
+        )?;
         match start_remote_chat_invocation_with_tenant(
             &alternate_remote,
             alternate_invocation,
@@ -593,7 +599,36 @@ impl RemoteChatDispatcher {
             // bytes are bounded here and context limits are enforced there.
             context_tokens: None,
             output_tokens: Some(output_tokens),
+            required_features: request.required_worker_features(),
         })
+    }
+
+    /// No eligible worker is a 503, unless workers are ready and only the
+    /// features the request's controls need are missing: that is the
+    /// request's 400, as on a worker that refuses the control.
+    fn selection_error(
+        &self,
+        error: WorkerRegistryError,
+        selection: &WorkerSelectionRequest,
+        request: &ChatExecutionRequest,
+    ) -> ApiError {
+        if error == WorkerRegistryError::NoEligibleWorker && !selection.required_features.is_empty()
+        {
+            let without_features = WorkerSelectionRequest {
+                required_features: BTreeSet::new(),
+                ..selection.clone()
+            };
+            if let (true, Some(parameter)) = (
+                self.registry.has_fresh_compatible_worker(&without_features),
+                request.first_feature_gated_parameter(),
+            ) {
+                return ApiError::unsupported_param(
+                    parameter,
+                    format!("No ready worker for this model supports `{parameter}`"),
+                );
+            }
+        }
+        map_registry_error(error)
     }
 
     fn execution_for(&self, selected: &SelectedWorker) -> Result<RemoteChatExecution, ApiError> {
@@ -611,6 +646,14 @@ impl RemoteChatDispatcher {
                 slow_consumer_timeout: self.config.slow_consumer_timeout,
             },
         )
+        .map(|remote| remote.with_contract(worker_contract(selected)))
+    }
+}
+
+fn worker_contract(selected: &SelectedWorker) -> RemoteWorkerContract {
+    RemoteWorkerContract {
+        protocol_version: selected.protocol_version,
+        features: selected.features.clone(),
     }
 }
 
@@ -742,12 +785,14 @@ mod tests {
     use izwi_hooks::Principal;
     use izwi_serving_client::{WorkerClient, WorkerClientConfig};
     use izwi_serving_protocol::{
-        ArtifactRevision, BackendKind, Capability, CapacitySnapshot, CredentialId,
-        DeviceAssignment, FinishReason, IncarnationId, InvocationAdmissionUnknown, InvocationEvent,
-        InvocationEventKind, InvocationInput, InvocationRejection, InvocationRequest,
-        LoadedDeployment, ModelGeneration, ModelReadiness, NodeId, ServiceBearerToken,
-        ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature, WorkerId, WorkerProcessState,
-        WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
+        ArtifactRevision, BackendKind, Capability, CapacitySnapshot, ChatContextPolicy,
+        ChatParameters as WorkerChatParameters, ChatResponseFormat,
+        ChatTruncation as WorkerChatTruncation, CredentialId, DeviceAssignment, FinishReason,
+        IncarnationId, InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind,
+        InvocationInput, InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration,
+        ModelReadiness, NodeId, SchemaVersion, ServiceBearerToken, ServiceCredentials, Usage,
+        WorkerDescriptor, WorkerFeature, WorkerId, WorkerProcessState, WorkerStatus,
+        INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
     };
 
     use crate::batch_runtime::store::BatchRuntimeStore;
@@ -1035,10 +1080,55 @@ mod tests {
         status_sequence: u64,
         credits: u32,
     ) {
+        register_with_surface(
+            registry,
+            worker_name,
+            incarnation_name,
+            worker_client,
+            status_sequence,
+            credits,
+            PROTOCOL_V1,
+            izwi_serving_client::mock::minor4_chat_features(),
+        );
+    }
+
+    /// A worker before minor 4: it advertises its own minor and no chat
+    /// control feature.
+    fn register_minor3(
+        registry: &WorkerRegistry,
+        worker_name: &str,
+        incarnation_name: &str,
+        worker_client: WorkerClient,
+    ) {
+        register_with_surface(
+            registry,
+            worker_name,
+            incarnation_name,
+            worker_client,
+            1,
+            1,
+            SchemaVersion::new(1, 3),
+            BTreeSet::new(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_with_surface(
+        registry: &WorkerRegistry,
+        worker_name: &str,
+        incarnation_name: &str,
+        worker_client: WorkerClient,
+        status_sequence: u64,
+        credits: u32,
+        protocol_version: SchemaVersion,
+        chat_features: BTreeSet<WorkerFeature>,
+    ) {
         let loaded = deployment();
+        let mut features = BTreeSet::from([WorkerFeature::Streaming, WorkerFeature::Cancellation]);
+        features.extend(chat_features);
         let descriptor = WorkerDescriptor {
-            schema_version: PROTOCOL_V1,
-            supported_protocol_versions: vec![PROTOCOL_V1],
+            schema_version: protocol_version,
+            supported_protocol_versions: vec![protocol_version],
             worker_id: id::<WorkerId>(worker_name),
             node_id: id::<NodeId>("node-a"),
             incarnation_id: id(incarnation_name),
@@ -1048,7 +1138,7 @@ mod tests {
                 affinity: Vec::new(),
                 host_memory_limit_bytes: 1024,
             },
-            features: BTreeSet::from([WorkerFeature::Streaming, WorkerFeature::Cancellation]),
+            features,
         };
         registry
             .approve(ApprovedWorker {
@@ -1300,8 +1390,10 @@ mod tests {
         assert_eq!(parameters.stop, ["END"]);
     }
 
+    /// DP-F2: every control a request sets reaches a worker that advertises
+    /// it, with the negotiated version and the D8 context policy.
     #[tokio::test]
-    async fn parameters_the_worker_cannot_honour_are_rejected_before_dispatch() {
+    async fn worker_receives_every_control_it_advertises() {
         let worker =
             ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
@@ -1312,12 +1404,79 @@ mod tests {
             client(&worker.endpoint()),
             1,
         );
-        let dispatcher = dispatcher(registry);
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        dispatcher(registry)
+            .generate(2, &context, every_control(), tenant_work())
+            .await
+            .unwrap();
+        let requests = worker.requests();
+        assert_eq!(requests[0].schema_version, PROTOCOL_V1);
+        let InvocationInput::Chat { parameters, .. } = &requests[0].input;
+        assert_eq!(
+            *parameters,
+            WorkerChatParameters {
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                seed: Some(7),
+                stop: vec!["END".into()],
+                top_k: Some(9),
+                repetition_penalty: Some(1.25),
+                presence_penalty: Some(0.5),
+                logprobs: Some(2),
+                response_format: Some(ChatResponseFormat::JsonObject),
+                context: Some(ChatContextPolicy {
+                    max_tokens: Some(32),
+                    truncation: WorkerChatTruncation::Disabled,
+                }),
+            }
+        );
+    }
 
-        let cases: [(&str, fn(&mut ChatExecutionRequest)); 3] = [
+    fn every_control() -> ChatExecutionRequest {
+        let mut request = request();
+        request.seed = Some(7);
+        request.stop = vec!["END".into()];
+        request.top_k = Some(9);
+        request.repetition_penalty = Some(1.25);
+        request.presence_penalty = Some(0.5);
+        request.logprobs = Some(true);
+        request.top_logprobs = Some(2);
+        request.response_format_json_object = true;
+        request
+    }
+
+    /// A control goes only to a worker that advertises it: a mixed fleet
+    /// routes it to the newer worker, and a fleet without one refuses it
+    /// with a 400 instead of letting a worker drop it. A plain request still
+    /// runs on an older worker, at its minor and without the context policy.
+    #[tokio::test]
+    async fn controls_route_only_to_workers_that_advertise_them() {
+        let older =
+            ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+        let newer =
+            ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register_minor3(&registry, "worker-a", "inc-a", client(&older.endpoint()));
+        register(&registry, "worker-b", "inc-b", client(&newer.endpoint()), 1);
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        dispatcher(registry)
+            .generate(2, &context, every_control(), tenant_work())
+            .await
+            .unwrap();
+        assert!(older.requests().is_empty());
+        assert_eq!(newer.requests().len(), 1);
+
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register_minor3(&registry, "worker-a", "inc-a", client(&older.endpoint()));
+        let dispatcher = dispatcher(registry);
+        let cases: [(&str, fn(&mut ChatExecutionRequest)); 6] = [
+            ("seed", |request| request.seed = Some(7)),
+            ("stop", |request| request.stop = vec!["END".into()]),
+            ("top_k", |request| request.top_k = Some(9)),
+            ("presence_penalty", |request| {
+                request.presence_penalty = Some(0.5)
+            }),
             ("logprobs", |request| request.logprobs = Some(true)),
-            ("top_logprobs", |request| request.top_logprobs = Some(2)),
             ("response_format", |request| {
                 request.response_format_json_object = true
             }),
@@ -1330,18 +1489,30 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_REQUEST, "{parameter}");
-            assert!(error.message.contains(parameter), "{}", error.message);
+            assert_eq!(
+                error.detail.and_then(|detail| detail.param),
+                Some(parameter)
+            );
+            assert_eq!(
+                error.detail.and_then(|detail| detail.code),
+                Some("unsupported_parameter")
+            );
         }
-        assert!(worker.requests().is_empty());
+        assert!(older.requests().is_empty());
 
         // An explicit `logprobs: false` asks for nothing the worker lacks.
-        let mut disabled = request();
-        disabled.logprobs = Some(false);
+        let mut plain = request();
+        plain.logprobs = Some(false);
         dispatcher
-            .generate(2, &context, disabled, tenant_work())
+            .generate(2, &context, plain, tenant_work())
             .await
             .unwrap();
-        assert_eq!(worker.requests().len(), 1);
+        let requests = older.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].schema_version, SchemaVersion::new(1, 3));
+        let InvocationInput::Chat { parameters, .. } = &requests[0].input;
+        assert_eq!(parameters.context, None);
+        assert_eq!(parameters.temperature, Some(1.0));
     }
 
     #[tokio::test]

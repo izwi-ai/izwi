@@ -257,9 +257,9 @@ async fn descriptor_negotiates_the_minor_and_its_features() {
     ));
     assert_eq!(
         minor3
-            .last_chat_parameters()
-            .and_then(|parameters| parameters.seed),
-        Some(7)
+            .last_invocation()
+            .map(|invocation| invocation.attempt_id),
+        Some(id("attempt", "seeded"))
     );
 }
 

@@ -242,9 +242,8 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     );
     assert!(body.contains("[DONE]"), "terminal stream marker expected");
 
-    // The family allows json_object locally, but the worker protocol cannot
-    // carry the constraint yet, so the gateway refuses it with an
-    // OpenAI-shaped 400 instead of returning unconstrained text.
+    // JSON mode reaches the worker (protocol minor 4) instead of a 400; the
+    // local/remote parity suite compares the constrained output itself.
     let constrained = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -262,13 +261,10 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         ))
         .unwrap();
     let response = app.oneshot(constrained).await.unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert!(body["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("response_format")));
+    assert_eq!(body["object"], "chat.completion");
 }

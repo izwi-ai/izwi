@@ -262,7 +262,7 @@ struct MockState {
     attempts: Mutex<AttemptTable>,
     status_sequence: AtomicU64,
     served_invocations: AtomicU64,
-    last_chat_parameters: Mutex<Option<ChatParameters>>,
+    last_invocation: Mutex<Option<InvocationRequest>>,
 }
 
 impl MockState {
@@ -371,7 +371,7 @@ impl MockWorker {
             attempts: Mutex::new(AttemptTable::default()),
             status_sequence: AtomicU64::new(0),
             served_invocations: AtomicU64::new(0),
-            last_chat_parameters: Mutex::new(None),
+            last_invocation: Mutex::new(None),
             config,
         });
         let mut router = Router::new()
@@ -422,13 +422,13 @@ impl MockWorker {
         self.state.config.max_active_invocations - self.state.capacity.available_permits()
     }
 
-    /// The chat parameters of the last invocation this worker received, as
-    /// decoded from the wire.
-    pub fn last_chat_parameters(&self) -> Option<ChatParameters> {
+    /// The last chat invocation this worker received, as decoded from the
+    /// wire.
+    pub fn last_invocation(&self) -> Option<InvocationRequest> {
         self.state
-            .last_chat_parameters
+            .last_invocation
             .lock()
-            .expect("mock parameter record poisoned")
+            .expect("mock invocation record poisoned")
             .clone()
     }
 
@@ -669,11 +669,11 @@ async fn invoke(State(state): State<Arc<MockState>>, headers: HeaderMap, body: B
             "deployment is not ready",
         );
     }
-    let InvocationInput::Chat { parameters, .. } = &request.input;
     *state
-        .last_chat_parameters
+        .last_invocation
         .lock()
-        .expect("mock parameter record poisoned") = Some(parameters.clone());
+        .expect("mock invocation record poisoned") = Some(request.clone());
+    let InvocationInput::Chat { parameters, .. } = &request.input;
     if let Some(parameter) = parameters.first_unsupported(&state.config.chat_features) {
         return rejection(
             &request,

@@ -5,15 +5,17 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use izwi_serving_client::{InvocationStream, WorkerClient, WorkerClientError};
 use izwi_serving_protocol::{
-    AttemptId, AttemptIdentity, CallerId, ChatInput, ChatMessage as WorkerChatMessage,
-    ChatParameters as WorkerChatParameters, ChatRole as WorkerChatRole, DeploymentId,
+    AttemptId, AttemptIdentity, CallerId, ChatContextPolicy, ChatInput,
+    ChatMessage as WorkerChatMessage, ChatParameters as WorkerChatParameters, ChatResponseFormat,
+    ChatRole as WorkerChatRole, ChatTruncation as WorkerChatTruncation, DeploymentId,
     FinishReason as WorkerFinishReason, GatewayAttestedCallerContext, IncarnationId,
     InvocationErrorCode, InvocationEventKind, InvocationInput, InvocationRequest, ModelGeneration,
     ModelReadiness, OutputFormat, OutputLimits, PermittedAction, PolicyRevision, RejectionCode,
-    RequestDigest, RequestId, ServiceClass, TaskKind, TenantId, Usage, WorkerProcessState,
-    PROTOCOL_V1,
+    RequestDigest, RequestId, SchemaVersion, ServiceClass, TaskKind, TenantId, Usage,
+    WorkerDescriptor, WorkerFeature, WorkerProcessState,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,7 +28,7 @@ use izwi_core::{
     parse_chat_model_variant, resolve_chat_max_tokens, resolve_chat_sampling, ChatGeneration,
     ChatGenerationControls, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig,
     ChatSamplingRequest, ChatTemplateKwargs, ChatTruncation, GenerationParams, ModelVariant,
-    ResolvedChatSampling, WorkloadClass,
+    ResolvedChatSampling, WorkloadClass, CHAT_MAX_TOKENS_UNSET,
 };
 
 #[derive(Debug, Clone)]
@@ -97,6 +99,75 @@ impl ChatExecutionRequest {
     fn resolved_chat_config(&self) -> ChatRequestConfig {
         self.chat_config.clone()
     }
+
+    /// The worker parameters for this request on a worker advertising
+    /// `features`. Temperature and top-p are sent resolved (a worker before
+    /// minor 4 decodes greedily without them; a later one resolves the same
+    /// profile); every other control is sent only when the request set it,
+    /// so a later worker resolves the rest of the profile itself. The D8
+    /// context policy is sent to every worker that takes it.
+    fn worker_chat_parameters(&self, features: &BTreeSet<WorkerFeature>) -> WorkerChatParameters {
+        let sampling = self.resolved_sampling();
+        let saturating = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        WorkerChatParameters {
+            temperature: Some(sampling.temperature),
+            top_p: Some(sampling.top_p),
+            seed: self.seed,
+            stop: self.stop.clone(),
+            top_k: self.top_k.map(saturating),
+            repetition_penalty: self.repetition_penalty,
+            presence_penalty: self.presence_penalty,
+            logprobs: self
+                .logprobs
+                .unwrap_or(false)
+                .then(|| self.top_logprobs.unwrap_or(0)),
+            response_format: self
+                .response_format_json_object
+                .then_some(ChatResponseFormat::JsonObject),
+            context: features
+                .contains(&WorkerFeature::ChatContextPolicy)
+                .then(|| ChatContextPolicy {
+                    max_tokens: match self.resolved_max_new_tokens() {
+                        CHAT_MAX_TOKENS_UNSET => None,
+                        max_tokens => Some(saturating(max_tokens)),
+                    },
+                    truncation: match self.chat_config.truncation {
+                        ChatTruncation::Disabled => WorkerChatTruncation::Disabled,
+                        ChatTruncation::Auto => WorkerChatTruncation::Auto,
+                    },
+                }),
+        }
+    }
+
+    /// The worker features this request needs: one per control it set.
+    pub(crate) fn required_worker_features(&self) -> BTreeSet<WorkerFeature> {
+        self.worker_chat_parameters(&BTreeSet::new())
+            .required_features()
+    }
+
+    /// The OpenAI name of the first control this request set that needs a
+    /// worker feature.
+    pub(crate) fn first_feature_gated_parameter(&self) -> Option<&'static str> {
+        self.worker_chat_parameters(&BTreeSet::new())
+            .first_unsupported(&BTreeSet::new())
+    }
+}
+
+/// The protocol surface of one worker incarnation, from its descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteWorkerContract {
+    /// The version negotiated with the worker; invocations carry it.
+    pub(crate) protocol_version: SchemaVersion,
+    pub(crate) features: BTreeSet<WorkerFeature>,
+}
+
+impl RemoteWorkerContract {
+    pub(crate) fn from_descriptor(descriptor: &WorkerDescriptor) -> Option<Self> {
+        Some(Self {
+            protocol_version: descriptor.negotiated_version()?,
+            features: descriptor.features.clone(),
+        })
+    }
 }
 
 /// Pinned Phase 1 route target for plain non-streaming chat. Discovery and
@@ -133,12 +204,46 @@ impl RemoteChatExecutionConfig {
 pub struct RemoteChatExecution {
     client: WorkerClient,
     config: RemoteChatExecutionConfig,
+    /// Set by registry dispatch from the selected worker; a pinned target
+    /// reads it from the worker's descriptor on first use.
+    contract: Arc<tokio::sync::OnceCell<RemoteWorkerContract>>,
 }
 
 impl RemoteChatExecution {
     pub fn new(client: WorkerClient, config: RemoteChatExecutionConfig) -> Result<Self, ApiError> {
         config.validate()?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            contract: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+
+    pub(crate) fn with_contract(mut self, contract: RemoteWorkerContract) -> Self {
+        self.contract = Arc::new(tokio::sync::OnceCell::new_with(Some(contract)));
+        self
+    }
+
+    /// The target worker's protocol surface. A pinned target fetches its
+    /// descriptor once; the incarnation is fixed, so it never changes.
+    async fn contract(&self) -> Result<&RemoteWorkerContract, ApiError> {
+        self.contract
+            .get_or_try_init(|| async {
+                let descriptor = self
+                    .client
+                    .descriptor()
+                    .await
+                    .map_err(map_worker_client_error)?;
+                if descriptor.incarnation_id != self.config.expected_worker_incarnation {
+                    return Err(ApiError::service_unavailable(
+                        "worker incarnation does not match the pinned gateway target",
+                    ));
+                }
+                RemoteWorkerContract::from_descriptor(&descriptor).ok_or_else(|| {
+                    bad_gateway_error("worker does not advertise a compatible protocol version")
+                })
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -588,7 +693,7 @@ pub async fn generate_remote_chat_with_execution(
     request: ChatExecutionRequest,
 ) -> Result<ChatGeneration, ApiError> {
     let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
     let started = Instant::now();
     let mut stream = remote
         .client
@@ -606,7 +711,7 @@ pub(crate) async fn generate_remote_chat_with_execution_and_tenant(
     tenant_work: UnboundTenantWorkLease,
 ) -> Result<ChatGeneration, ApiError> {
     let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
     let started = Instant::now();
     let started_invocation =
         start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
@@ -761,7 +866,7 @@ pub(crate) async fn start_remote_chat_invocation_with_tenant(
     }
 }
 
-pub(crate) fn prepare_remote_chat_invocation(
+pub(crate) async fn prepare_remote_chat_invocation(
     remote: &RemoteChatExecution,
     request_timeout_secs: u64,
     context: &RequestContext,
@@ -774,6 +879,7 @@ pub(crate) fn prepare_remote_chat_invocation(
         )));
     }
     validate_remote_chat_scope(&request)?;
+    let contract = remote.contract().await?;
 
     let remaining = context
         .remaining_budget(Duration::from_secs(request_timeout_secs.max(1)))
@@ -782,12 +888,32 @@ pub(crate) fn prepare_remote_chat_invocation(
     let remaining_time_ms = u64::try_from(remaining.as_millis())
         .unwrap_or(u64::MAX)
         .max(1);
-    build_remote_chat_invocation(context, request, remote, remaining_time_ms)
+    build_remote_chat_invocation(context, request, remote, contract, remaining_time_ms)
 }
 
+/// A worker cannot honour a control it does not advertise; refuse it rather
+/// than let the worker drop it.
+fn ensure_worker_supports(
+    parameters: &WorkerChatParameters,
+    contract: &RemoteWorkerContract,
+) -> Result<(), ApiError> {
+    match parameters.first_unsupported(&contract.features) {
+        Some(parameter) => Err(ApiError::unsupported_param(
+            parameter,
+            format!("The selected worker does not support `{parameter}`"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The same invocation for an alternate worker. Registry selection gives it
+/// every feature the request's own controls need; the D8 context policy is
+/// dropped for an alternate that does not take it, which then keeps its
+/// ceiling-as-budget behaviour.
 pub(crate) fn retarget_remote_chat_invocation(
     invocation: &InvocationRequest,
     remote: &RemoteChatExecution,
+    contract: &RemoteWorkerContract,
     remaining: Duration,
 ) -> Result<InvocationRequest, ApiError> {
     if remaining.is_zero() {
@@ -799,6 +925,15 @@ pub(crate) fn retarget_remote_chat_invocation(
         .unwrap_or(u64::MAX)
         .max(1);
     let mut alternate = invocation.clone();
+    alternate.schema_version = contract.protocol_version;
+    let InvocationInput::Chat { parameters, .. } = &mut alternate.input;
+    if !contract
+        .features
+        .contains(&WorkerFeature::ChatContextPolicy)
+    {
+        parameters.context = None;
+    }
+    ensure_worker_supports(parameters, contract)?;
     alternate.attempt_id = AttemptId::new(new_uuid()).map_err(identifier_error)?;
     alternate.expected_worker_incarnation = remote.config.expected_worker_incarnation.clone();
     alternate.deployment_id = remote.config.deployment_id.clone();
@@ -934,7 +1069,7 @@ pub async fn spawn_remote_chat_stream_with_execution(
     request: ChatExecutionRequest,
 ) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
     let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
     let worker_stream = remote
         .client
         .invoke(invocation)
@@ -955,7 +1090,7 @@ pub(crate) async fn spawn_remote_chat_stream_with_tenant(
     tenant_work: UnboundTenantWorkLease,
 ) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
     let invocation =
-        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request)?;
+        prepare_remote_chat_invocation(remote, request_timeout_secs, context, request).await?;
     let started = start_remote_chat_invocation_with_tenant(remote, invocation, tenant_work)
         .await
         .map_err(|failure| map_worker_client_error(failure.error))?;
@@ -1113,9 +1248,9 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
             "Remote chat execution currently supports text-only requests",
         ));
     }
-    // The worker protocol carries only messages, temperature, top_p, stop
-    // strings and the output limits; any other control is refused, never
-    // silently dropped.
+    // The worker protocol carries the sampling and output controls (each
+    // gated by a worker feature) but not tools, reasoning controls or
+    // media; those are refused, never silently dropped.
     let unsupported = [
         ("tools", !request.chat_config.tools.is_empty()),
         (
@@ -1130,16 +1265,6 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
             "preserve_thinking",
             request.chat_config.preserve_thinking.is_some(),
         ),
-        ("top_k", request.top_k.is_some()),
-        ("repetition_penalty", request.repetition_penalty.is_some()),
-        ("presence_penalty", request.presence_penalty.is_some()),
-        ("seed", request.seed.is_some()),
-        ("logprobs", request.logprobs == Some(true)),
-        (
-            "top_logprobs",
-            request.top_logprobs.is_some_and(|count| count > 0),
-        ),
-        ("response_format", request.response_format_json_object),
     ];
     if let Some((parameter, _)) = unsupported.iter().find(|(_, requested)| *requested) {
         return Err(ApiError::bad_request(format!(
@@ -1153,6 +1278,7 @@ fn build_remote_chat_invocation(
     context: &RequestContext,
     request: ChatExecutionRequest,
     remote: &RemoteChatExecution,
+    contract: &RemoteWorkerContract,
     remaining_time_ms: u64,
 ) -> Result<InvocationRequest, ApiError> {
     let requested_tokens = request.resolved_max_new_tokens();
@@ -1160,11 +1286,8 @@ fn build_remote_chat_invocation(
         .unwrap_or(u32::MAX)
         .min(remote.config.max_output_tokens)
         .max(1);
-    // Send the temperature and top-p the local path would sample with,
-    // including the model family's published profile, so a worker never
-    // falls back to greedy decoding for a request that did not set them.
-    // The profile's top-k and penalties have no protocol field yet.
-    let sampling = request.resolved_sampling();
+    let parameters = request.worker_chat_parameters(&contract.features);
+    ensure_worker_supports(&parameters, contract)?;
     let input = InvocationInput::Chat {
         input: ChatInput {
             messages: request
@@ -1181,13 +1304,7 @@ fn build_remote_chat_invocation(
                 })
                 .collect(),
         },
-        parameters: WorkerChatParameters {
-            temperature: Some(sampling.temperature),
-            top_p: Some(sampling.top_p),
-            seed: None,
-            stop: request.stop,
-            ..WorkerChatParameters::default()
-        },
+        parameters,
     };
     let request_id = RequestId::new(new_uuid()).map_err(identifier_error)?;
     let attempt_id = AttemptId::new(new_uuid()).map_err(identifier_error)?;
@@ -1221,7 +1338,7 @@ fn build_remote_chat_invocation(
     )?;
 
     let invocation = InvocationRequest {
-        schema_version: PROTOCOL_V1,
+        schema_version: contract.protocol_version,
         request_id,
         attempt_id,
         expected_worker_incarnation: remote.config.expected_worker_incarnation.clone(),
@@ -1701,16 +1818,158 @@ mod tests {
         assert_eq!(params.stop_sequences, ["END"]);
     }
 
-    /// The worker protocol cannot carry a seed yet, so the gateway refuses
-    /// one rather than sampling with a different seed.
+    /// Sampling and output controls travel to the worker (each gated by a
+    /// feature); tools and reasoning controls still cannot, and are refused.
     #[test]
-    fn remote_chat_scope_refuses_a_seed() {
+    fn remote_chat_scope_refuses_only_what_the_protocol_cannot_carry() {
         let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
-        validate_remote_chat_scope(&request).expect("a plain request is in scope");
         request.seed = Some(7);
-        let error = validate_remote_chat_scope(&request).expect_err("seed is refused");
+        request.top_k = Some(9);
+        request.logprobs = Some(true);
+        request.response_format_json_object = true;
+        validate_remote_chat_scope(&request).expect("sampling controls are in scope");
+        let mut thinking = qwen_request(ModelVariant::Gemma34BIt, Some(true));
+        let error = validate_remote_chat_scope(&thinking).expect_err("thinking is refused");
+        assert!(
+            error.message.contains("`enable_thinking`"),
+            "{}",
+            error.message
+        );
+        thinking.chat_config.enable_thinking = None;
+        thinking.chat_config.tools = vec![serde_json::json!({"type": "function"})];
+        let error = validate_remote_chat_scope(&thinking).expect_err("tools are refused");
+        assert!(error.message.contains("`tools`"), "{}", error.message);
+    }
+
+    /// The D8 policy carries the caller's own budget (none when unset) and
+    /// truncation, and goes only to a worker that takes it.
+    #[test]
+    fn the_context_policy_carries_the_callers_budget() {
+        let features = BTreeSet::from([WorkerFeature::ChatContextPolicy]);
+        let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
+        request.max_tokens = None;
+        request.chat_config.truncation = ChatTruncation::Auto;
+        assert_eq!(
+            request.worker_chat_parameters(&features).context,
+            Some(ChatContextPolicy {
+                max_tokens: None,
+                truncation: WorkerChatTruncation::Auto,
+            })
+        );
+        request.max_completion_tokens = Some(5_000_000_000);
+        assert_eq!(
+            request
+                .worker_chat_parameters(&features)
+                .context
+                .and_then(|context| context.max_tokens),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            request.worker_chat_parameters(&BTreeSet::new()).context,
+            None
+        );
+        assert!(request.required_worker_features().is_empty());
+    }
+
+    /// A pinned worker's descriptor decides what the gateway sends: a minor-4
+    /// worker gets every control at minor 4; a minor-3 worker gets a 400 for
+    /// a control instead of silently dropping it, and plain requests at
+    /// minor 3 without the context policy.
+    #[tokio::test]
+    async fn a_pinned_worker_gets_only_the_controls_it_advertises() {
+        use izwi_serving_client::mock::{MockWorker, MockWorkerConfig};
+        let context = RequestContext::new(
+            "pinned-request".into(),
+            izwi_hooks::Principal::local_anonymous(),
+        );
+        let remote_for = |worker: &MockWorker| {
+            let config = worker.config();
+            RemoteChatExecution::new(
+                WorkerClient::new(
+                    &worker.endpoint(),
+                    config.credentials.clone(),
+                    izwi_serving_client::WorkerClientConfig::default(),
+                )
+                .unwrap(),
+                RemoteChatExecutionConfig {
+                    public_model_variant: ModelVariant::Gemma34BIt,
+                    expected_worker_incarnation: config.incarnation_id.clone(),
+                    deployment_id: config.deployment_id.clone(),
+                    expected_model_generation: config.model_generation,
+                    policy_revision: PolicyRevision::new("policy-1").unwrap(),
+                    max_queue_wait: Duration::from_secs(1),
+                    max_output_tokens: 64,
+                    max_output_bytes: 4096,
+                    slow_consumer_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap()
+        };
+        let mut every_control = qwen_request(ModelVariant::Gemma34BIt, None);
+        every_control.seed = Some(7);
+        every_control.stop = vec!["END".into()];
+        every_control.logprobs = Some(true);
+        every_control.response_format_json_object = true;
+
+        let newer = MockWorker::spawn(MockWorkerConfig::default())
+            .await
+            .unwrap();
+        generate_remote_chat_with_execution(
+            &remote_for(&newer),
+            5,
+            &context,
+            every_control.clone(),
+        )
+        .await
+        .unwrap();
+        let invocation = newer.last_invocation().unwrap();
+        assert_eq!(
+            invocation.schema_version,
+            izwi_serving_protocol::PROTOCOL_V1
+        );
+        let InvocationInput::Chat { parameters, .. } = &invocation.input;
+        assert_eq!(parameters.seed, Some(7));
+        assert_eq!(parameters.logprobs, Some(0));
+        assert_eq!(
+            parameters.response_format,
+            Some(ChatResponseFormat::JsonObject)
+        );
+        assert_eq!(
+            parameters.context.and_then(|context| context.max_tokens),
+            Some(32)
+        );
+
+        let older = MockWorker::spawn(MockWorkerConfig {
+            protocol_version: izwi_serving_protocol::SchemaVersion::new(1, 3),
+            chat_features: BTreeSet::new(),
+            ..MockWorkerConfig::default()
+        })
+        .await
+        .unwrap();
+        let remote = remote_for(&older);
+        let error = generate_remote_chat_with_execution(&remote, 5, &context, every_control)
+            .await
+            .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert!(error.message.contains("`seed`"), "{}", error.message);
+        assert_eq!(error.detail.and_then(|detail| detail.param), Some("seed"));
+        assert_eq!(older.served_invocations(), 0);
+
+        generate_remote_chat_with_execution(
+            &remote,
+            5,
+            &context,
+            qwen_request(ModelVariant::Gemma34BIt, None),
+        )
+        .await
+        .unwrap();
+        let invocation = older.last_invocation().unwrap();
+        assert_eq!(
+            invocation.schema_version,
+            izwi_serving_protocol::SchemaVersion::new(1, 3)
+        );
+        let InvocationInput::Chat { parameters, .. } = &invocation.input;
+        assert_eq!(parameters.context, None);
+        assert!(parameters.temperature.is_some());
     }
 
     fn qwen_request(variant: ModelVariant, enable_thinking: Option<bool>) -> ChatExecutionRequest {

@@ -107,6 +107,19 @@ impl ApiError {
         }
     }
 
+    /// OpenAI `unsupported_parameter`: a valid parameter this deployment
+    /// cannot honour.
+    pub fn unsupported_param(param: &'static str, msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+            detail: Some(ApiErrorDetail {
+                param: Some(param),
+                code: Some("unsupported_parameter"),
+            }),
+        }
+    }
+
     /// OpenAI `context_length_exceeded`: the messages, or the messages plus
     /// the requested output, do not fit the model's context.
     pub fn context_length_exceeded(msg: impl Into<String>) -> Self {

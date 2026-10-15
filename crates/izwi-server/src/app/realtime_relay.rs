@@ -697,6 +697,7 @@ pub(crate) fn realtime_selection_request(
         input_bytes: 0,
         context_tokens: None,
         output_tokens: None,
+        required_features: Default::default(),
     }
 }
 

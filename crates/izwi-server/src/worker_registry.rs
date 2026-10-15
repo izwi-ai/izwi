@@ -297,6 +297,9 @@ pub struct WorkerSelectionRequest {
     pub input_bytes: u64,
     pub context_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    /// Features the worker must advertise, one per request control that
+    /// needs one (minor 4).
+    pub required_features: BTreeSet<WorkerFeature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +318,10 @@ pub struct SelectedWorker {
     pub model_generation: ModelGeneration,
     pub backend: BackendKind,
     pub client: WorkerClient,
+    /// The worker's advertised features and the protocol version
+    /// negotiated with it.
+    pub features: BTreeSet<WorkerFeature>,
+    pub protocol_version: SchemaVersion,
     pub dispatch: LocalDispatchGuard,
     /// Observed admission credits at select time, after local and cluster
     /// claims are accounted. Fleet coordinators use this as the atomic cap
@@ -874,19 +881,29 @@ impl WorkerRegistry {
             .or(warm)
             .or(selected)
             .ok_or(WorkerRegistryError::NoEligibleWorker)?;
-        let (selected_client, node_id, circuit_probe) = {
+        let (selected_client, node_id, circuit_probe, features, protocol_version) = {
             let record = inner
                 .workers
                 .get_mut(&key)
                 .expect("selected worker remains registered under the registry lock");
+            let descriptor = &record.registration.descriptor;
+            // Eligibility already required a shared major.
+            let protocol_version = request
+                .protocol_version
+                .negotiate(&descriptor.supported_protocol_versions)
+                .ok_or(WorkerRegistryError::IncompatibleProtocol)?;
+            let features = descriptor.features.clone();
+            let node_id = descriptor.node_id.clone();
             let circuit_probe = matches!(record.circuit, WorkerCircuitState::Open { .. });
             if circuit_probe {
                 record.circuit = WorkerCircuitState::HalfOpenProbe;
             }
             (
                 record.registration.client.clone(),
-                record.registration.descriptor.node_id.clone(),
+                node_id,
                 circuit_probe,
+                features,
+                protocol_version,
             )
         };
         let backend = deployment.backend;
@@ -908,6 +925,8 @@ impl WorkerRegistry {
             model_generation,
             backend,
             client: selected_client,
+            features,
+            protocol_version,
             dispatch: LocalDispatchGuard {
                 registry: Arc::downgrade(&self.inner),
                 dispatch_id,
@@ -1277,6 +1296,9 @@ fn eligible_deployment<'a>(
                         .features
                         .contains(&WorkerFeature::Cancellation))
         })
+        || !request
+            .required_features
+            .is_subset(&record.registration.descriptor.features)
         || request.input_bytes > capability.max_input_bytes
         || request.context_tokens.is_some_and(|requested| {
             capability
@@ -1511,6 +1533,7 @@ mod tests {
             input_bytes: 128,
             context_tokens: Some(64),
             output_tokens: Some(32),
+            required_features: BTreeSet::new(),
         }
     }
 
