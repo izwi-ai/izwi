@@ -16,6 +16,7 @@
 
 use serde::Serialize;
 
+use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::asr::{forced_alignment_words, qwen3_aligner_max_words};
@@ -160,13 +161,14 @@ pub(crate) struct SampleWindow {
 /// words. Zero for a variant without one.
 pub(crate) fn forced_alignment_window_workspace(
     variant: ModelVariant,
+    backend: BackendKind,
     window: &SampleWindow,
     sample_rate: u32,
 ) -> Result<JobResourceObservation> {
     let samples = window.end_sample.saturating_sub(window.start_sample);
     let secs = samples as f32 / sample_rate.max(1) as f32;
     let words = forced_alignment_words(&window.text).len();
-    Ok(forced_alignment_envelope(variant, secs, words)?
+    Ok(forced_alignment_envelope(variant, secs, words, backend)?
         .map(|envelope| {
             JobResourceObservation::new(envelope.host_bytes, envelope.accelerator_bytes)
         })
@@ -602,7 +604,6 @@ mod tests {
     /// allocated while the forward runs, and releases it with the stage.
     #[tokio::test]
     async fn aligner_window_stage_reserves_its_forward_working_set() {
-        use crate::backends::BackendKind;
         use crate::engine::ResourceAmount;
         use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
         use crate::runtime::types::RuntimeRequestContext;
@@ -613,7 +614,9 @@ mod tests {
         let variant = ModelVariant::Qwen3ForcedAligner06B;
         let workspace = |secs: usize, text: &str| {
             let window = window(0, secs * rate as usize, text);
-            let workspace = forced_alignment_window_workspace(variant, &window, rate).unwrap();
+            let workspace =
+                forced_alignment_window_workspace(variant, BackendKind::Metal, &window, rate)
+                    .unwrap();
             workspace.host_bytes + workspace.accelerator_bytes
         };
         let words = |count: usize| vec!["word"; count].join(" ");
@@ -625,6 +628,7 @@ mod tests {
         assert_eq!(
             forced_alignment_window_workspace(
                 ModelVariant::Qwen3Asr06BGguf,
+                BackendKind::Metal,
                 &window(0, 30 * rate as usize, "a b"),
                 rate
             )
@@ -647,6 +651,7 @@ mod tests {
             .unwrap();
         let observation = forced_alignment_window_workspace(
             variant,
+            BackendKind::Metal,
             &window(0, 180 * rate as usize, &words(450)),
             rate,
         )

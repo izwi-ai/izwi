@@ -63,6 +63,12 @@ const BLOCKED_SCORE_PLANES: u64 = 3;
 /// Fixed host allowance for request bookkeeping, tokenization and buffers
 /// the formulas do not name.
 const HOST_BASE_BYTES: u64 = 16 * 1024 * 1024;
+/// Candle's Metal pool rounds every buffer up to a power of two and reuses a
+/// free buffer only when it is at least as large (`buf_size`,
+/// `find_available_buffer` in `metal_backend/device.rs`), so a Metal working
+/// set can take up to twice its tensor bytes. A 175 s aligner window
+/// measured 1.6×; the aligner's Metal envelope is priced at the bound.
+const METAL_POOL_ROUNDING: u64 = 2;
 
 /// What one ASR request holds while it runs, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -478,15 +484,17 @@ pub(crate) fn request_envelope(
     let words = geometry
         .forced_alignment
         .map(|_| qwen3_aligner_max_words(f64::from(audio_secs.min(geometry.max_chunk_secs))));
-    geometry_envelope(geometry, audio_secs, words).map(Some)
+    geometry_envelope(geometry, audio_secs, words, backend).map(Some)
 }
 
 /// The working set of one forced-alignment window of `audio_secs` holding
-/// `words` words, or `None` for a variant that is not a forced aligner.
+/// `words` words on `backend`, or `None` for a variant that is not a forced
+/// aligner.
 pub(crate) fn forced_alignment_envelope(
     variant: ModelVariant,
     audio_secs: f32,
     words: usize,
+    backend: BackendKind,
 ) -> Result<Option<AsrRequestEnvelope>> {
     let Some(geometry) = envelope_geometry(variant).filter(|g| g.forced_alignment.is_some()) else {
         return Ok(None);
@@ -496,13 +504,14 @@ pub(crate) fn forced_alignment_envelope(
     } else {
         0.0
     };
-    geometry_envelope(geometry, audio_secs, Some(words)).map(Some)
+    geometry_envelope(geometry, audio_secs, Some(words), backend).map(Some)
 }
 
 fn geometry_envelope(
     geometry: AsrEnvelopeGeometry,
     audio_secs: f32,
     words: Option<usize>,
+    backend: BackendKind,
 ) -> Result<AsrRequestEnvelope> {
     let secs = audio_secs.min(geometry.max_chunk_secs);
     let samples = positions(CANONICAL_SAMPLE_RATE as f32, secs);
@@ -547,9 +556,14 @@ fn geometry_envelope(
         product(&[alignment.scored_rows_per_word, words]).map(|rows| rows.max(1))
     })?;
     let logits = product(&[logits_rows, geometry.vocab, F32_BYTES])?;
+    let mut accelerator_bytes = sum(&[encoder.max(prefill).max(stem), logits])?;
+    // The ASR families keep their established Metal pricing.
+    if geometry.forced_alignment.is_some() && backend == BackendKind::Metal {
+        accelerator_bytes = product(&[accelerator_bytes, METAL_POOL_ROUNDING])?;
+    }
     Ok(AsrRequestEnvelope {
         host_bytes,
-        accelerator_bytes: sum(&[encoder.max(prefill).max(stem), logits])?,
+        accelerator_bytes,
     })
 }
 
@@ -644,8 +658,9 @@ mod tests {
         );
 
         // The forced aligner (ADM-5): one window, at its most words, grows
-        // with the window and stops at the 180 s limit, within 1.5 GiB. It
-        // is reserved per window stage, never held at load.
+        // with the window and stops at the 180 s limit, within 2 GiB on Metal
+        // (pool rounding included). It is reserved per window stage, never
+        // held at load.
         for variant in ALIGNER_VARIANTS {
             let window = max_chunk_secs(variant).expect("aligner window");
             assert_eq!(window, 180.0);
@@ -662,7 +677,7 @@ mod tests {
             let at_window = envelope(variant, window);
             assert_eq!(envelope(variant, 3_600.0), at_window, "{variant}");
             assert!(
-                at_window.total_bytes().unwrap() < 3 * GIB / 2,
+                at_window.total_bytes().unwrap() < 2 * GIB,
                 "{variant}: {at_window:?}"
             );
             assert_eq!(
@@ -685,7 +700,7 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let variant = ModelVariant::Qwen3ForcedAligner06B;
         let window = |secs: f32, words: usize| {
-            forced_alignment_envelope(variant, secs, words)
+            forced_alignment_envelope(variant, secs, words, BackendKind::Cpu)
                 .unwrap()
                 .expect("aligner envelope")
         };
@@ -694,17 +709,25 @@ mod tests {
         assert!(window(60.0, 80).host_bytes > window(30.0, 80).host_bytes);
         assert_eq!(window(f32::NAN, 10), window(0.0, 10));
         assert_eq!(
-            forced_alignment_envelope(ModelVariant::Qwen3Asr06BGguf, 30.0, 80).unwrap(),
+            forced_alignment_envelope(ModelVariant::Qwen3Asr06BGguf, 30.0, 80, BackendKind::Cpu)
+                .unwrap(),
             None
         );
         for secs in [30.0f32, 60.0, 120.0, 180.0] {
             let words = qwen3_aligner_max_words(f64::from(secs));
             let bound = window(secs, words);
             let typical = window(secs, (secs * 2.7).ceil() as usize);
+            let metal = forced_alignment_envelope(variant, secs, words, BackendKind::Metal)
+                .unwrap()
+                .unwrap();
+            assert_eq!(metal.accelerator_bytes, 2 * bound.accelerator_bytes);
+            assert_eq!(metal.host_bytes, bound.host_bytes);
             eprintln!(
-                "aligner envelope {secs} s: {} MiB at {words} words, {} MiB at 2.7 words/s",
+                "aligner envelope {secs} s: CPU {} MiB at {words} words, {} MiB at 2.7 words/s; \
+                 Metal {} MiB at {words} words",
                 bound.total_bytes().unwrap() / MIB,
-                typical.total_bytes().unwrap() / MIB
+                typical.total_bytes().unwrap() / MIB,
+                metal.total_bytes().unwrap() / MIB
             );
         }
         // 180 s at the 10 words/s bound: an 8,642-token prompt.

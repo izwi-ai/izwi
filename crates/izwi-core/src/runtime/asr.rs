@@ -4164,6 +4164,7 @@ impl RuntimeService {
         // set is reserved here, for this stage only (ADM-5).
         let workspace = forced_alignment_window_workspace(
             contract.metadata.model_variant,
+            self.backend_router.context().backend_kind,
             &window,
             sample_rate,
         )?;
