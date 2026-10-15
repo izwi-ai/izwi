@@ -5,15 +5,24 @@
 //! the text spoken in it, and every window's timings are rebased by the
 //! window start. A window the aligner rejects or times degenerately keeps
 //! interval timings and says so in its [`AlignmentSource`].
+//!
+//! A window longer than the aligner's limit with one text (a bare
+//! `/v1/audio/align` request, or a transcript without chunk texts) is aligned
+//! by [`LongTextPlanner`]: sequential sub-windows cut at low-energy points,
+//! each given a generous share of the remaining words. The aligner pushes
+//! words that are not in a sub-window's audio to its end, so only words that
+//! end clearly inside it are kept and the next sub-window starts where the
+//! last kept word ended.
 
 use serde::Serialize;
 
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::asr::forced_alignment_words;
+use crate::models::architectures::qwen3::asr::{forced_alignment_words, qwen3_aligner_max_words};
 use crate::models::registry::ForcedAlignmentOutput;
 use crate::runtime::diarization::{
     alignment_is_suspicious, fallback_word_timings_from_words, samples_to_ms,
 };
+use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig};
 
 /// The text spoken in `[start_secs, end_secs)` of the audio.
 #[derive(Debug, Clone, PartialEq)]
@@ -179,11 +188,15 @@ pub(crate) fn sample_windows(
 
 /// Align one window with `align` (audio slice, text) and rebase the result
 /// by the window start. Degenerate or failed alignments keep interval
-/// timings over the window, flagged by their source.
-pub(crate) fn align_window<F>(
+/// timings over the window, flagged by their source. `check_plausibility`
+/// also flags collapsed timings; [`LongTextPlanner`] sub-windows skip it,
+/// since their surplus words are expected to pile up at the window end and
+/// the planner trims them itself.
+pub(crate) fn align_window_checked<F>(
     samples: &[f32],
     sample_rate: u32,
     window: &SampleWindow,
+    check_plausibility: bool,
     align: F,
 ) -> AlignedWindow
 where
@@ -222,17 +235,18 @@ where
             None,
         ),
         Ok(output)
-            if !output.words.is_empty()
-                && !alignment_is_suspicious(&output.words, words.len(), duration_secs) =>
+            if output.words.is_empty()
+                || (check_plausibility
+                    && alignment_is_suspicious(&output.words, words.len(), duration_secs)) =>
         {
-            (AlignmentSource::Model, output.words, None, None)
+            (
+                AlignmentSource::Heuristic,
+                fallback_word_timings_from_words(&words, duration_secs),
+                Some("the aligner's timings were implausible".to_string()),
+                None,
+            )
         }
-        Ok(_) => (
-            AlignmentSource::Heuristic,
-            fallback_word_timings_from_words(&words, duration_secs),
-            Some("the aligner's timings were implausible".to_string()),
-            None,
-        ),
+        Ok(output) => (AlignmentSource::Model, output.words, None, None),
         Err(err) => (
             AlignmentSource::Failed,
             fallback_word_timings_from_words(&words, duration_secs),
@@ -269,9 +283,262 @@ where
     }
 }
 
+/// Words kept from a sub-window must end at least this long before its
+/// end; later ones may be surplus words the aligner piled up there.
+const LONG_TEXT_GUARD_MS: u32 = 1_000;
+/// Words offered to a sub-window beyond its speech-proportional estimate.
+/// Offering too many is safe (the surplus piles up and is trimmed); offering
+/// too few would stretch the offered words over speech that is not theirs.
+const LONG_TEXT_SURPLUS_RATIO: f64 = 1.3;
+const LONG_TEXT_SURPLUS_WORDS: usize = 12;
+/// Energy frame for the speech estimate.
+const LONG_TEXT_FRAME_MS: usize = 20;
+/// Frames at least this fraction of the loud (95th percentile) frame RMS
+/// count as speech, above an absolute floor.
+const LONG_TEXT_SPEECH_RELATIVE: f32 = 0.1;
+const LONG_TEXT_SPEECH_FLOOR_RMS: f32 = 1e-3;
+
+/// A sub-window to align next and what it was offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedWindow {
+    pub(crate) window: SampleWindow,
+    /// Words the speech share of the sub-window predicts.
+    estimate: usize,
+    /// Whether the sub-window runs to the end of the long window.
+    last: bool,
+}
+
+/// Plans the sub-windows of one window longer than the aligner's limit and
+/// keeps the words each sub-window aligned inside it (see the module docs).
+pub(crate) struct LongTextPlanner {
+    words: Vec<String>,
+    next_word: usize,
+    cursor: usize,
+    end: usize,
+    max_window: usize,
+    sample_rate: u32,
+    origin: usize,
+    frame: usize,
+    /// Prefix sums of speech frames from `origin`.
+    speech_prefix: Vec<usize>,
+}
+
+impl LongTextPlanner {
+    pub(crate) fn new(
+        samples: &[f32],
+        sample_rate: u32,
+        window: &SampleWindow,
+        max_window_samples: usize,
+    ) -> Self {
+        let end = window.end_sample.min(samples.len());
+        let origin = window.start_sample.min(end);
+        let frame = (sample_rate as usize * LONG_TEXT_FRAME_MS / 1000).max(1);
+        let rms = samples[origin..end]
+            .chunks(frame)
+            .map(|chunk| {
+                (chunk.iter().map(|sample| sample * sample).sum::<f32>() / chunk.len() as f32)
+                    .sqrt()
+            })
+            .collect::<Vec<_>>();
+        let mut sorted = rms.clone();
+        sorted.sort_by(f32::total_cmp);
+        let loud = sorted
+            .get(sorted.len().saturating_mul(95) / 100)
+            .or(sorted.last())
+            .copied()
+            .unwrap_or(0.0);
+        let threshold = (loud * LONG_TEXT_SPEECH_RELATIVE).max(LONG_TEXT_SPEECH_FLOOR_RMS);
+        let mut speech_prefix = Vec::with_capacity(rms.len() + 1);
+        speech_prefix.push(0);
+        for value in rms {
+            let last = *speech_prefix.last().unwrap_or(&0);
+            speech_prefix.push(last + usize::from(value >= threshold));
+        }
+        Self {
+            words: forced_alignment_words(&window.text),
+            next_word: 0,
+            cursor: origin,
+            end,
+            max_window: max_window_samples.max(1),
+            sample_rate,
+            origin,
+            frame,
+            speech_prefix,
+        }
+    }
+
+    fn speech_frames(&self, from: usize, to: usize) -> usize {
+        let index = |sample: usize| {
+            ((sample.saturating_sub(self.origin)) / self.frame).min(self.speech_prefix.len() - 1)
+        };
+        self.speech_prefix[index(to)] - self.speech_prefix[index(from)]
+    }
+
+    /// The end of the next sub-window: a low-energy point at most the
+    /// aligner's limit after the cursor.
+    fn cut_after_cursor(&self, samples: &[f32]) -> usize {
+        let max_secs = self.max_window as f32 / self.sample_rate.max(1) as f32;
+        let search_secs = (max_secs / 6.0).min(4.0);
+        let config = AsrLongFormConfig {
+            target_chunk_secs: max_secs - search_secs,
+            hard_max_chunk_secs: max_secs,
+            overlap_secs: 0.0,
+            silence_search_secs: search_secs,
+            min_chunk_secs: max_secs / 2.0,
+            ..AsrLongFormConfig::default()
+        };
+        let horizon = self.end.min(self.cursor + 2 * self.max_window);
+        let cut = plan_audio_chunks(
+            &samples[self.cursor..horizon],
+            self.sample_rate,
+            &config,
+            Some(max_secs),
+        )
+        .first()
+        .map(|chunk| self.cursor + chunk.end_sample)
+        .unwrap_or(self.cursor + self.max_window);
+        cut.clamp(self.cursor + 1, self.cursor + self.max_window)
+    }
+
+    /// The next sub-window, or `None` once every word or all audio is used.
+    pub(crate) fn next_window(&mut self, samples: &[f32]) -> Option<PlannedWindow> {
+        loop {
+            let remaining_words = self.words.len() - self.next_word;
+            if remaining_words == 0 || self.cursor >= self.end {
+                return None;
+            }
+            let last = self.end - self.cursor <= self.max_window;
+            let cut = if last {
+                self.end
+            } else {
+                self.cut_after_cursor(samples)
+            };
+            let speech_here = self.speech_frames(self.cursor, cut);
+            if !last && speech_here == 0 {
+                // No speech: no words to place here.
+                self.cursor = cut;
+                continue;
+            }
+            let estimate = if last {
+                remaining_words
+            } else {
+                let speech_rest = self.speech_frames(self.cursor, self.end);
+                let (part, whole) = if speech_rest > 0 {
+                    (speech_here, speech_rest)
+                } else {
+                    (cut - self.cursor, self.end - self.cursor)
+                };
+                ((remaining_words * part).div_ceil(whole.max(1))).clamp(1, remaining_words)
+            };
+            let window_secs = (cut - self.cursor) as f64 / f64::from(self.sample_rate.max(1));
+            let offered = if last {
+                remaining_words
+            } else {
+                ((estimate as f64 * LONG_TEXT_SURPLUS_RATIO).ceil() as usize
+                    + LONG_TEXT_SURPLUS_WORDS)
+                    .min(qwen3_aligner_max_words(window_secs))
+                    .clamp(estimate, remaining_words)
+            };
+            return Some(PlannedWindow {
+                window: SampleWindow {
+                    start_sample: self.cursor,
+                    end_sample: cut,
+                    text: self.words[self.next_word..self.next_word + offered].join(" "),
+                },
+                estimate,
+                last,
+            });
+        }
+    }
+
+    /// Keep the words `aligned` placed inside `planned` and advance past
+    /// them. Words that end within the guard of the sub-window end, and every
+    /// word after them, go to the next sub-window, which starts at the last
+    /// kept word or, when the model placed nothing more in the sub-window,
+    /// two guards before its end. A sub-window the model could not time
+    /// takes its speech-estimated share of words with interval timings.
+    pub(crate) fn absorb(
+        &mut self,
+        planned: &PlannedWindow,
+        aligned: AlignedWindow,
+    ) -> AlignedWindow {
+        if planned.last {
+            self.next_word = self.words.len();
+            self.cursor = self.end;
+            return aligned;
+        }
+        let cut = planned.window.end_sample;
+        let cut_ms = samples_to_ms(cut, self.sample_rate);
+        if aligned.source == AlignmentSource::Model {
+            let mut words = aligned.words;
+            let kept = words
+                .iter()
+                .take_while(|(_, _, end)| end.saturating_add(LONG_TEXT_GUARD_MS) <= cut_ms)
+                .count();
+            words.truncate(kept);
+            let guard =
+                (u64::from(LONG_TEXT_GUARD_MS) * u64::from(self.sample_rate) / 1000) as usize;
+            let quiet_from = cut - (2 * guard).min((cut - self.cursor) / 2);
+            let last_end = words.last().map_or(0, |word| {
+                (u64::from(word.2) * u64::from(self.sample_rate) / 1000) as usize
+            });
+            self.next_word += kept;
+            self.cursor = last_end.max(quiet_from).clamp(self.cursor + 1, cut);
+            return AlignedWindow {
+                start_ms: aligned.start_ms,
+                end_ms: samples_to_ms(self.cursor, self.sample_rate),
+                source: AlignmentSource::Model,
+                words,
+                detail: None,
+                error: None,
+            };
+        }
+
+        let count = planned.estimate.min(self.words.len() - self.next_word);
+        let start_ms = samples_to_ms(planned.window.start_sample, self.sample_rate);
+        let duration_secs = (planned.window.end_sample - planned.window.start_sample) as f32
+            / self.sample_rate.max(1) as f32;
+        let words = fallback_word_timings_from_words(
+            &self.words[self.next_word..self.next_word + count],
+            duration_secs,
+        )
+        .into_iter()
+        .map(|(word, start, end)| {
+            (
+                word,
+                start_ms.saturating_add(start),
+                start_ms.saturating_add(end),
+            )
+        })
+        .collect();
+        self.next_word += count;
+        self.cursor = planned.window.end_sample;
+        AlignedWindow {
+            start_ms,
+            end_ms: cut_ms,
+            source: aligned.source,
+            words,
+            detail: aligned.detail,
+            error: aligned.error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn align_window<F>(
+        samples: &[f32],
+        sample_rate: u32,
+        window: &SampleWindow,
+        align: F,
+    ) -> AlignedWindow
+    where
+        F: FnOnce(&[f32], &str) -> Result<ForcedAlignmentOutput>,
+    {
+        align_window_checked(samples, sample_rate, window, true, align)
+    }
 
     fn window(start_sample: usize, end_sample: usize, text: &str) -> SampleWindow {
         SampleWindow {
@@ -490,39 +757,233 @@ mod tests {
         let device = DeviceSelector::detect_with_preference(Some(&device_name)).expect("device");
         let model = Qwen3AsrModel::load(&model_dir, ModelVariant::Qwen3ForcedAligner06B, device)
             .expect("load aligner");
-        let windows = [
-            window(0, once.len(), text),
-            window(once.len(), samples.len(), text),
-        ];
-        let alignment = WindowedAlignment {
-            windows: windows
-                .iter()
-                .map(|window| {
-                    align_window(&samples, rate, window, |audio, text| {
-                        model.force_align_detailed(audio, rate, text, None)
-                    })
-                })
-                .collect(),
+        let doubled = format!("{text} {text}");
+        let first_copy_words = forced_alignment_words(text).len();
+        let align = |window: &SampleWindow, check: bool| {
+            align_window_checked(&samples, rate, window, check, |audio, text| {
+                model.force_align_detailed(audio, rate, text, None)
+            })
+        };
+        let report = |label: &str, alignment: &WindowedAlignment| {
+            let words = alignment.words();
+            let second_start = words[first_copy_words].1;
+            let last_end = words.last().expect("words").2;
+            eprintln!(
+                "{device_name} {label}: {} words, duration {duration_ms} ms, second copy starts {second_start} ms, last word ends {last_end} ms, windows {:?}",
+                words.len(),
+                alignment
+                    .windows
+                    .iter()
+                    .map(|window| (window.start_ms, window.end_ms, window.source, window.words.len()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(words.len(), 2 * first_copy_words, "{label}");
+            assert_eq!(alignment.source(), AlignmentSource::Model, "{label}");
+            assert!(
+                second_start >= 29_000,
+                "{label}: second copy starts at {second_start} ms"
+            );
+            assert!(
+                last_end >= 58_000,
+                "{label}: last word ends at {last_end} ms"
+            );
+            assert!(
+                words.iter().all(|(_, _, end)| *end <= duration_ms),
+                "{label}"
+            );
+            assert!(
+                words.windows(2).all(|pair| pair[1].1 >= pair[0].2),
+                "{label}"
+            );
+            words
+        };
+
+        // Windows from known (range, text) pairs, as long-form ASR chunks give.
+        let by_chunk = WindowedAlignment {
+            windows: [
+                window(0, once.len(), text),
+                window(once.len(), samples.len(), text),
+            ]
+            .iter()
+            .map(|window| align(window, true))
+            .collect(),
             duration_ms,
         };
-        let words = alignment.words();
-        let first_copy_words = forced_alignment_words(text).len();
-        let second_start = words[first_copy_words].1;
-        let last_end = words.last().expect("words").2;
+        let chunk_words = report("chunk windows", &by_chunk);
+
+        // One text for the whole audio, as a bare /v1/audio/align request.
+        let max_window = (f64::from(model.max_audio_seconds_hint().expect("aligner window"))
+            * f64::from(rate))
+        .floor() as usize;
+        let whole = window(0, samples.len(), &doubled);
+        let mut planner = LongTextPlanner::new(&samples, rate, &whole, max_window);
+        let mut windows = Vec::new();
+        while let Some(planned) = planner.next_window(&samples) {
+            assert!(planned.window.end_sample - planned.window.start_sample <= max_window);
+            let aligned = align(&planned.window, false);
+            windows.push(planner.absorb(&planned, aligned));
+        }
+        let planned = WindowedAlignment {
+            windows,
+            duration_ms,
+        };
+        let planned_words = report("long-text planner", &planned);
+        let drift = chunk_words
+            .iter()
+            .zip(&planned_words)
+            .flat_map(|(a, b)| [a.1.abs_diff(b.1), a.2.abs_diff(b.2)])
+            .collect::<Vec<_>>();
+        let over_80 = drift.iter().filter(|value| **value > 80).count();
+        let max_drift = drift.iter().max().copied().unwrap_or(0);
+        let mean_drift =
+            drift.iter().map(|value| u64::from(*value)).sum::<u64>() / drift.len().max(1) as u64;
         eprintln!(
-            "{device_name}: {} words, duration {duration_ms} ms, second copy starts {second_start} ms, last word ends {last_end} ms, sources {:?}",
-            words.len(),
-            alignment.windows.iter().map(|window| window.source).collect::<Vec<_>>()
+            "{device_name} planner vs chunk windows: {over_80}/{} boundaries > 80 ms, max {max_drift} ms, mean {mean_drift} ms",
+            drift.len()
         );
-        assert_eq!(words.len(), 2 * first_copy_words);
-        assert_eq!(alignment.source(), AlignmentSource::Model);
-        assert!(
-            second_start >= 29_000,
-            "second copy starts at {second_start} ms"
+    }
+
+    /// Drive the planner the way the runtime does, one aligner call per
+    /// planned sub-window.
+    fn run_long_text<F>(
+        samples: &[f32],
+        rate: u32,
+        window: &SampleWindow,
+        max_window: usize,
+        aligner: F,
+    ) -> Vec<AlignedWindow>
+    where
+        F: Fn(&SampleWindow, &str) -> Result<ForcedAlignmentOutput>,
+    {
+        let mut planner = LongTextPlanner::new(samples, rate, window, max_window);
+        let mut out = Vec::new();
+        while let Some(planned) = planner.next_window(samples) {
+            assert!(planned.window.end_sample - planned.window.start_sample <= max_window);
+            let aligned = align_window_checked(samples, rate, &planned.window, false, |_, text| {
+                aligner(&planned.window, text)
+            });
+            out.push(planner.absorb(&planned, aligned));
+            assert!(out.len() < 100, "planner must make progress");
+        }
+        out
+    }
+
+    /// Word `w{k}` is spoken at 500k..500k+300 ms. Like the real aligner, a
+    /// word whose speech is not in the window piles up at the window end.
+    fn timeline_aligner(
+        rate: u32,
+    ) -> impl Fn(&SampleWindow, &str) -> Result<ForcedAlignmentOutput> {
+        move |window, text| {
+            let start_ms = samples_to_ms(window.start_sample, rate);
+            let length_ms = samples_to_ms(window.end_sample, rate) - start_ms;
+            Ok(ForcedAlignmentOutput {
+                words: forced_alignment_words(text)
+                    .into_iter()
+                    .map(|word| {
+                        let k: u32 = word[1..].parse().unwrap();
+                        let (true_start, true_end) = (k * 500, k * 500 + 300);
+                        if true_end <= start_ms + length_ms {
+                            let relative = true_start.saturating_sub(start_ms);
+                            (word, relative, true_end - start_ms)
+                        } else {
+                            (word, length_ms - 80, length_ms - 80)
+                        }
+                    })
+                    .collect(),
+                interval_fallback: false,
+            })
+        }
+    }
+
+    #[test]
+    fn long_text_is_aligned_in_sub_windows_within_the_limit() {
+        let rate = 16_000u32;
+        let samples = vec![0.1f32; 70 * rate as usize];
+        let text = (0..140)
+            .map(|k| format!("w{k}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let max_window = 30 * rate as usize - 160;
+        let aligned = run_long_text(
+            &samples,
+            rate,
+            &window(0, samples.len(), &text),
+            max_window,
+            timeline_aligner(rate),
         );
-        assert!(last_end >= 58_000, "last word ends at {last_end} ms");
-        assert!(words.iter().all(|(_, _, end)| *end <= duration_ms));
+
+        assert!(aligned.len() >= 3, "{} windows", aligned.len());
+        assert!(aligned
+            .iter()
+            .all(|window| window.source == AlignmentSource::Model));
+        let alignment = WindowedAlignment {
+            windows: aligned,
+            duration_ms: 70_000,
+        };
+        let words = alignment.words();
+        assert_eq!(words.len(), 140);
+        for (k, (word, start, end)) in words.iter().enumerate() {
+            let k = k as u32;
+            assert_eq!(word, &format!("w{k}"));
+            assert_eq!((*start, *end), (k * 500, k * 500 + 300), "{word}");
+        }
+    }
+
+    #[test]
+    fn long_text_windows_that_fail_keep_flagged_interval_timings() {
+        let rate = 16_000u32;
+        let samples = vec![0.1f32; 70 * rate as usize];
+        let text = (0..140)
+            .map(|k| format!("w{k}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let aligned = run_long_text(
+            &samples,
+            rate,
+            &window(0, samples.len(), &text),
+            30 * rate as usize,
+            |_, _| Err(Error::InferenceError("aligner unavailable".into())),
+        );
+        assert!(aligned.len() >= 3);
+        assert!(aligned
+            .iter()
+            .all(|window| window.source == AlignmentSource::Failed));
+        let alignment = WindowedAlignment {
+            windows: aligned,
+            duration_ms: 70_000,
+        };
+        let words = alignment.words();
+        assert_eq!(words.len(), 140);
         assert!(words.windows(2).all(|pair| pair[1].1 >= pair[0].2));
+        assert!(words.last().unwrap().2 > 60_000);
+        assert_eq!(alignment.source(), AlignmentSource::Failed);
+    }
+
+    #[test]
+    fn long_text_skips_silent_stretches() {
+        let rate = 16_000u32;
+        // 10 s speech, 40 s silence, 20 s speech; words only where speech is.
+        let mut samples = vec![0.1f32; 70 * rate as usize];
+        samples[10 * rate as usize..50 * rate as usize].fill(0.0);
+        let words = (0..20)
+            .chain(100..140)
+            .map(|k| format!("w{k}"))
+            .collect::<Vec<_>>();
+        let aligned = run_long_text(
+            &samples,
+            rate,
+            &window(0, samples.len(), &words.join(" ")),
+            30 * rate as usize,
+            timeline_aligner(rate),
+        );
+        let alignment = WindowedAlignment {
+            windows: aligned,
+            duration_ms: 70_000,
+        };
+        let aligned_words = alignment.words();
+        assert_eq!(aligned_words.len(), 60);
+        assert_eq!(aligned_words[20].0, "w100");
+        assert_eq!(aligned_words[20].1, 50_000, "{:?}", alignment.windows);
     }
 
     #[test]

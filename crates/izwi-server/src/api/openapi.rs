@@ -1759,7 +1759,7 @@ fn create_transcription() {}
         )
     ),
     responses(
-        (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text", body = AlignmentResponse),
+        (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text. Audio longer than the aligner's window (30 s on CPU/Metal, 180 s on CUDA) is aligned in sub-windows cut at quiet points; alignment_source and warnings report windows timed by interval fallback.", body = AlignmentResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
         (status = 415, description = "Unsupported media type", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)

@@ -41,7 +41,8 @@ use crate::runtime::audio_io::{
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
 use crate::runtime::diarization::samples_to_ms;
 use crate::runtime::forced_alignment::{
-    align_window, sample_windows, AlignedWindow, AlignmentWindow, SampleWindow, WindowedAlignment,
+    align_window_checked, sample_windows, AlignedWindow, AlignmentWindow, LongTextPlanner,
+    SampleWindow, WindowedAlignment,
 };
 use crate::runtime::request::AsrRuntimeRequest;
 #[cfg(test)]
@@ -3902,6 +3903,25 @@ impl RuntimeService {
         .into_words_or_error()
     }
 
+    /// Align one transcript against the whole audio. Audio longer than the
+    /// aligner's window is aligned in sub-windows (see [`LongTextPlanner`]);
+    /// each reports where its timings came from.
+    pub async fn force_align_bytes_windowed_with_model_and_language(
+        &self,
+        audio_bytes: &[u8],
+        reference_text: &str,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<WindowedAlignment> {
+        self.force_align_input(
+            AsrAudioInput::Bytes(audio_bytes),
+            ForcedAlignmentText::Whole(reference_text),
+            language,
+            model_id,
+        )
+        .await
+    }
+
     /// Align each window's text against its own range of the audio, one
     /// coordinator stage per window, with times rebased to the whole file.
     /// A window the aligner cannot align keeps interval timings and reports
@@ -4051,8 +4071,10 @@ impl RuntimeService {
     }
 
     /// Run each window as its own aligner stage, so other jobs interleave
-    /// between windows. Shared by the alignment API and the diarization
-    /// pipeline; the caller holds the aligner's residency lease.
+    /// between windows. A window longer than the aligner's limit is split by
+    /// [`LongTextPlanner`] into sub-windows, each its own stage. Shared by the
+    /// alignment API and the diarization pipeline; the caller holds the
+    /// aligner's residency lease.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn align_sample_windows(
         &self,
@@ -4065,39 +4087,106 @@ impl RuntimeService {
         language: Option<String>,
         stage_kind: &str,
     ) -> Result<Vec<AlignedWindow>> {
+        let max_window = model
+            .max_audio_seconds_hint()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (f64::from(seconds) * f64::from(sample_rate)).floor() as usize);
         let mut aligned = Vec::with_capacity(windows.len());
         for window in windows {
-            let model = model.clone();
-            let samples = samples.clone();
-            let language = language.clone();
-            aligned.push(
-                self.coordinator
-                    .run_loaded_blocking_stage(
+            let Some(max_window) = max_window
+                .filter(|max| window.end_sample.saturating_sub(window.start_sample) > *max)
+            else {
+                aligned.push(
+                    self.align_window_stage(
                         job,
-                        contract.clone(),
-                        WorkUnit::AtomicJob {
-                            kind: stage_kind.to_string(),
-                        },
-                        move || {
-                            Ok(align_window(
-                                &samples,
-                                sample_rate,
-                                &window,
-                                |audio, text| {
-                                    model.force_align_detailed(
-                                        audio,
-                                        sample_rate,
-                                        text,
-                                        language.as_deref(),
-                                    )
-                                },
-                            ))
-                        },
+                        &contract,
+                        &model,
+                        &samples,
+                        sample_rate,
+                        window,
+                        &language,
+                        stage_kind,
+                        true,
                     )
                     .await?,
-            );
+                );
+                continue;
+            };
+            // The energy scan covers the whole window: run it off the
+            // async workers.
+            let planner_samples = samples.clone();
+            let mut planner = self
+                .coordinator
+                .run_host_blocking_stage(job, move || {
+                    Ok(LongTextPlanner::new(
+                        &planner_samples,
+                        sample_rate,
+                        &window,
+                        max_window,
+                    ))
+                })
+                .await?;
+            while let Some(planned) = planner.next_window(&samples) {
+                let sub_window = self
+                    .align_window_stage(
+                        job,
+                        &contract,
+                        &model,
+                        &samples,
+                        sample_rate,
+                        planned.window.clone(),
+                        &language,
+                        stage_kind,
+                        false,
+                    )
+                    .await?;
+                aligned.push(planner.absorb(&planned, sub_window));
+            }
         }
         Ok(aligned)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn align_window_stage(
+        &self,
+        job: &JobLease,
+        contract: &LoadedExecutionContract,
+        model: &Arc<NativeAsrModel>,
+        samples: &Arc<[f32]>,
+        sample_rate: u32,
+        window: SampleWindow,
+        language: &Option<String>,
+        stage_kind: &str,
+        check_plausibility: bool,
+    ) -> Result<AlignedWindow> {
+        let model = model.clone();
+        let samples = samples.clone();
+        let language = language.clone();
+        self.coordinator
+            .run_loaded_blocking_stage(
+                job,
+                contract.clone(),
+                WorkUnit::AtomicJob {
+                    kind: stage_kind.to_string(),
+                },
+                move || {
+                    Ok(align_window_checked(
+                        &samples,
+                        sample_rate,
+                        &window,
+                        check_plausibility,
+                        |audio, text| {
+                            model.force_align_detailed(
+                                audio,
+                                sample_rate,
+                                text,
+                                language.as_deref(),
+                            )
+                        },
+                    ))
+                },
+            )
+            .await
     }
 }
 
