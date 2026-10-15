@@ -30,7 +30,10 @@ fn init_tracing() -> anyhow::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "izwi_serving_worker=info,izwi_core=info".into());
-    let registry = tracing_subscriber::registry().with(filter);
+    // Request spans go to an OTLP collector only when one is configured.
+    let registry = tracing_subscriber::registry().with(filter).with(
+        izwi_serving_client::otlp::otlp_layer_from_env("izwi-serving-worker"),
+    );
     match std::env::var("IZWI_LOG_FORMAT").ok().as_deref() {
         None | Some("text") => registry.with(tracing_subscriber::fmt::layer()).init(),
         Some("json") => registry

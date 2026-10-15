@@ -23,13 +23,17 @@ pub fn init_tracing(log_format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "izwi_server=warn,izwi_core=warn,tower_http=warn".into());
 
+    // Request spans go to an OTLP collector only when one is configured.
+    let otlp = izwi_serving_client::otlp::otlp_layer_from_env(SERVICE_NAME);
     match log_format {
         LogFormat::Text => tracing_subscriber::registry()
             .with(filter)
+            .with(otlp)
             .with(tracing_subscriber::fmt::layer())
             .init(),
         LogFormat::Json => tracing_subscriber::registry()
             .with(filter)
+            .with(otlp)
             .with(json_layer(std::io::stdout))
             .init(),
     }
