@@ -2267,6 +2267,9 @@ pub struct RuntimeService {
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
+    /// Uploads the diarization pipeline decoded itself (PIPE-14): callers
+    /// that pass decoded samples add none.
+    pub(crate) diarization_audio_decodes: Arc<AtomicU64>,
     pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
@@ -3462,6 +3465,7 @@ impl RuntimeService {
             step_driver_task: Mutex::new(None),
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
+            diarization_audio_decodes: Arc::new(AtomicU64::new(0)),
             loaded_tts_variant,
             max_loaded_models,
             model_lifecycle,
@@ -7636,6 +7640,12 @@ impl RuntimeService {
 
     pub fn coordinator_snapshot(&self) -> CoordinatorSnapshot {
         self.coordinator.snapshot()
+    }
+
+    /// Uploads the diarization pipeline has decoded itself; a job given
+    /// decoded samples adds none (PIPE-14).
+    pub fn diarization_audio_decodes(&self) -> u64 {
+        self.diarization_audio_decodes.load(Ordering::Relaxed)
     }
 
     pub fn is_draining(&self) -> bool {

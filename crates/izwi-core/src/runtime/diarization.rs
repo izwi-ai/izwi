@@ -79,6 +79,18 @@ struct PipelineAudio {
     duration_secs: f32,
 }
 
+impl PipelineAudio {
+    /// Canonical 16 kHz mono samples, within the one-hour bound.
+    fn from_canonical(samples: Vec<f32>) -> Result<Self> {
+        validate_pipeline_sample_count(samples.len())?;
+        Ok(Self {
+            duration_secs: samples.len() as f32 / PIPELINE_SAMPLE_RATE as f32,
+            samples: samples.into(),
+            sample_rate: PIPELINE_SAMPLE_RATE,
+        })
+    }
+}
+
 fn diarization_input_observation(
     retained_input_bytes: usize,
     retained_audio_copies: &[usize],
@@ -387,6 +399,29 @@ enum DiarizationAudioInput<'a> {
     Bytes(&'a [u8]),
 }
 
+/// The audio of one transcript-pipeline job: an encoded upload, or its
+/// canonical 16 kHz mono samples decoded by the caller (PIPE-14).
+enum TranscriptAudioInput<'a> {
+    Encoded(DiarizationAudioInput<'a>),
+    Samples(Vec<f32>),
+}
+
+impl TranscriptAudioInput<'_> {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Encoded(input) => {
+                if input.input_bytes() == 0 {
+                    return Err(Error::InvalidInput(
+                        "diarization request missing audio input".to_string(),
+                    ));
+                }
+                input.validate_retained_size()
+            }
+            Self::Samples(samples) => validate_pipeline_sample_count(samples.len()),
+        }
+    }
+}
+
 enum OwnedDiarizationAudioInput {
     Base64(String),
     Bytes(Vec<u8>),
@@ -593,6 +628,116 @@ impl RuntimeService {
         .await
     }
 
+    /// Admit one transcript-pipeline job with its audio as 16 kHz samples.
+    /// Encoded input is decoded once, in an admitted host stage under the
+    /// decode allowance, and its encoded bytes are dropped once decoded;
+    /// decoded input is admitted at its retained size and never decoded
+    /// again (PIPE-14). Waits while admitted work holds the memory the job
+    /// needs (P1V-2), unless it is cancelled meanwhile.
+    async fn admit_pipeline_audio(
+        &self,
+        audio_input: TranscriptAudioInput<'_>,
+        cancellation: &crate::runtime::coordinator::JobCancellation,
+    ) -> Result<(JobLease, PipelineAudio)> {
+        let backend = self.backend_context().backend_kind;
+        let (spec, observed_bytes) = match &audio_input {
+            TranscriptAudioInput::Encoded(input) => {
+                let input_bytes = input.input_bytes();
+                let mut spec = self.coordinator_job_for_input(
+                    uuid::Uuid::new_v4().to_string(),
+                    CoordinatorLane::Pipeline,
+                    RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
+                    input_bytes,
+                );
+                spec.resources = spec
+                    .resources
+                    .checked_add(diarization_decode_resources(backend))?;
+                (spec, input_bytes)
+            }
+            TranscriptAudioInput::Samples(samples) => {
+                let sample_bytes = std::mem::size_of_val(samples.as_slice());
+                let mut spec = self.coordinator_job_for_input(
+                    uuid::Uuid::new_v4().to_string(),
+                    CoordinatorLane::Pipeline,
+                    RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
+                    0,
+                );
+                spec.resources = diarization_retained_resources(
+                    backend,
+                    JobResourceObservation::host(sample_bytes as u64),
+                )?;
+                (spec, sample_bytes)
+            }
+        };
+        let observed_bytes = u64::try_from(observed_bytes)
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
+        // A cancelled job fails its next stage and drops its leases (PIPE-7).
+        let pipeline_job = wait_for_held_capacity(pipeline_capacity_wait(), || {
+            let spec = spec.clone();
+            async move {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled(
+                        "diarization was cancelled before admission".to_string(),
+                    ));
+                }
+                self.coordinator
+                    .admit_observed(spec, JobResourceObservation::host(observed_bytes))
+                    .await
+            }
+        })
+        .await?
+        .with_cancellation(cancellation.clone());
+        let audio_input = match audio_input {
+            TranscriptAudioInput::Samples(samples) => {
+                return Ok((pipeline_job, PipelineAudio::from_canonical(samples)?));
+            }
+            TranscriptAudioInput::Encoded(input) => input,
+        };
+        let input_bytes = audio_input.input_bytes();
+        let owned_audio_input = audio_input.into_owned_for_job(&pipeline_job).await?;
+        pipeline_job.record_materialized_usage(JobResourceObservation::host(
+            u64::try_from(
+                input_bytes
+                    .checked_add(owned_audio_input.retained_bytes())
+                    .ok_or_else(|| {
+                        Error::Overloaded("diarization retained input overflowed".to_string())
+                    })?,
+            )
+            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
+        ))?;
+        let observation_job = pipeline_job.clone();
+        let decodes = self.diarization_audio_decodes.clone();
+        let audio = self
+            .coordinator
+            .run_host_blocking_stage(&pipeline_job, move || {
+                let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
+                decodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
+                let peak_usage = diarization_input_observation(
+                    input_bytes,
+                    &[
+                        audio_bytes.capacity(),
+                        retained_source.as_ref().map_or(0, String::capacity),
+                    ],
+                    &audio,
+                )?;
+                // The job's copy of the encoded bytes ends with the decode;
+                // only the caller's input and the samples stay.
+                drop(audio_bytes);
+                let steady_usage = diarization_input_observation(input_bytes, &[], &audio)?;
+                settle_decoded_job(
+                    &observation_job,
+                    backend,
+                    peak_usage,
+                    steady_usage,
+                    retained_source,
+                )?;
+                Ok(audio)
+            })
+            .await?;
+        Ok((pipeline_job, audio))
+    }
+
     async fn diarize_input(
         &self,
         audio_input: DiarizationAudioInput<'_>,
@@ -708,7 +853,7 @@ impl RuntimeService {
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
         self.diarize_with_transcript_input(
-            DiarizationAudioInput::Base64(audio_base64),
+            TranscriptAudioInput::Encoded(DiarizationAudioInput::Base64(audio_base64)),
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
@@ -730,7 +875,7 @@ impl RuntimeService {
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
         self.diarize_with_transcript_input(
-            DiarizationAudioInput::Bytes(audio_bytes),
+            TranscriptAudioInput::Encoded(DiarizationAudioInput::Bytes(audio_bytes)),
             diarization_model_id,
             asr_model_id,
             aligner_model_id,
@@ -741,9 +886,35 @@ impl RuntimeService {
         .await
     }
 
+    /// Run the pipeline over canonical 16 kHz mono `samples` the caller has
+    /// already decoded, so the upload is decoded once per job (PIPE-14).
+    /// Audio over one hour is refused.
+    pub async fn diarize_with_transcript_samples(
+        &self,
+        samples: Vec<f32>,
+        diarization_model_id: Option<&str>,
+        asr_model_id: Option<&str>,
+        aligner_model_id: Option<&str>,
+        llm_model_id: Option<&str>,
+        config: &DiarizationConfig,
+        options: &DiarizationPipelineOptions,
+    ) -> Result<DiarizationTranscriptResult> {
+        self.diarize_with_transcript_input(
+            TranscriptAudioInput::Samples(samples),
+            diarization_model_id,
+            asr_model_id,
+            aligner_model_id,
+            llm_model_id,
+            config,
+            options,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn diarize_with_transcript_input(
         &self,
-        audio_input: DiarizationAudioInput<'_>,
+        audio_input: TranscriptAudioInput<'_>,
         diarization_model_id: Option<&str>,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
@@ -752,13 +923,7 @@ impl RuntimeService {
         options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
         let enable_llm_refinement = options.enable_llm_refinement;
-        let input_bytes = audio_input.input_bytes();
-        if input_bytes == 0 {
-            return Err(Error::InvalidInput(
-                "diarization request missing audio input".to_string(),
-            ));
-        }
-        audio_input.validate_retained_size()?;
+        audio_input.validate()?;
         let diarization_variant = resolve_diarization_model_variant(diarization_model_id);
         // Refuse an ASR or aligner the pipeline cannot run before diarizing:
         // the ASR's long-form graph must run as one blocking stage (the
@@ -782,97 +947,18 @@ impl RuntimeService {
             false,
         )?;
         self.record_diarization_transcript_pipeline(enable_llm_refinement);
-        let mut spec = self.coordinator_job_for_input(
-            uuid::Uuid::new_v4().to_string(),
-            CoordinatorLane::Pipeline,
-            RuntimeRequestContext::new(crate::engine::WorkloadClass::Background),
-            input_bytes,
-        );
-        spec.resources = spec.resources.checked_add(diarization_decode_resources(
-            self.backend_context().backend_kind,
-        ))?;
-        let observed_input_bytes = u64::try_from(input_bytes)
-            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
-        // Wait while admitted work holds the memory this job needs (P1V-2),
-        // unless it is cancelled meanwhile. A cancelled job fails its next
-        // stage and drops its leases (PIPE-7).
-        let pipeline_job = wait_for_held_capacity(pipeline_capacity_wait(), || {
-            let spec = spec.clone();
-            async move {
-                if options.cancellation.is_cancelled() {
-                    return Err(Error::Cancelled(
-                        "diarization was cancelled before admission".to_string(),
-                    ));
-                }
-                self.coordinator
-                    .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-                    .await
-            }
-        })
-        .await?
-        .with_cancellation(options.cancellation.clone());
-        let owned_audio_input = audio_input.into_owned_for_job(&pipeline_job).await?;
-        pipeline_job.record_materialized_usage(JobResourceObservation::host(
-            u64::try_from(
-                input_bytes
-                    .checked_add(owned_audio_input.retained_bytes())
-                    .ok_or_else(|| {
-                        Error::Overloaded("diarization retained input overflowed".to_string())
-                    })?,
-            )
-            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
-        ))?;
-        let diarization_model_id = diarization_model_id.map(ToOwned::to_owned);
-        let asr_model_id = asr_model_id.map(ToOwned::to_owned);
-        let aligner_model_id = aligner_model_id.map(ToOwned::to_owned);
+        let (pipeline_job, audio) = self
+            .admit_pipeline_audio(audio_input, &options.cancellation)
+            .await?;
         let llm_model_id = llm_model_id.map(ToOwned::to_owned);
         let config = config.clone();
-        let observation_job = pipeline_job.clone();
-        let backend = self.backend_context().backend_kind;
-        let (runtime_request, audio) = self
-            .coordinator
-            .run_host_blocking_stage(&pipeline_job, move || {
-                let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
-                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                let runtime_request = DiarizationRuntimeRequest::from_bytes(
-                    diarization_variant,
-                    audio_bytes,
-                    config,
-                )?
-                .with_pipeline_models(
-                    diarization_model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                )
-                .with_llm_refinement(enable_llm_refinement);
-                let steady_usage =
-                    diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
-                let peak_usage = diarization_input_observation(
-                    input_bytes,
-                    &[
-                        runtime_audio_bytes(&runtime_request.audio),
-                        retained_source.as_ref().map_or(0, String::capacity),
-                    ],
-                    &audio,
-                )?;
-                settle_decoded_job(
-                    &observation_job,
-                    backend,
-                    peak_usage,
-                    steady_usage,
-                    retained_source,
-                )?;
-                Ok((runtime_request, audio))
-            })
-            .await?;
 
         let diarization = self
             .diarize_samples_stage(
                 &pipeline_job,
                 audio.clone(),
                 diarization_variant,
-                runtime_request.config.clone(),
+                config.clone(),
             )
             .await?;
 
@@ -1160,11 +1246,11 @@ impl RuntimeService {
         let mut llm_refined = false;
         // Refinement runs its own chat job, outside this job's stages.
         pipeline_job.ensure_not_cancelled()?;
-        if runtime_request.enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
+        if enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
             // Refinement is optional polish: an unresolvable refiner model is
             // the same class of failure as a failed completion — return the
             // raw speaker transcript instead of discarding the whole run.
-            match resolve_chat_variant(runtime_request.llm_model_id.as_deref()) {
+            match resolve_chat_variant(llm_model_id.as_deref()) {
                 Ok(llm_variant) => {
                     let polished = self
                         .polish_diarized_transcript(
@@ -1183,7 +1269,7 @@ impl RuntimeService {
                 Err(err) => {
                     warn!(
                         "Refinement model {} is unavailable, returning raw speaker transcript: {err}",
-                        runtime_request.llm_model_id.as_deref().unwrap_or("default"),
+                        llm_model_id.as_deref().unwrap_or("default"),
                     );
                 }
             }
@@ -1290,25 +1376,26 @@ fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
     resolve_diarization_llm_variant(model_id).map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
-fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
-    let audio_bytes = base64_decode(audio_base64)?;
-    decode_pipeline_audio_bytes(&audio_bytes)
-}
-
 fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
     let (samples, sample_rate) = decode_audio_bytes_canonical(audio_bytes)?;
-    let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE)?;
-    let duration_secs = if PIPELINE_SAMPLE_RATE > 0 {
-        normalized.len() as f32 / PIPELINE_SAMPLE_RATE as f32
-    } else {
-        0.0
-    };
+    debug_assert_eq!(sample_rate, PIPELINE_SAMPLE_RATE);
+    PipelineAudio::from_canonical(samples)
+}
 
-    Ok(PipelineAudio {
-        samples: normalized.into(),
-        sample_rate: PIPELINE_SAMPLE_RATE,
-        duration_secs,
-    })
+/// The pipeline's one-hour bound, on the decoded length (PIPE-14).
+fn validate_pipeline_sample_count(samples: usize) -> Result<()> {
+    if samples == 0 {
+        return Err(Error::InvalidInput(
+            "diarization request missing audio input".to_string(),
+        ));
+    }
+    if samples > MAX_PIPELINE_SAMPLES {
+        return Err(Error::InvalidInput(format!(
+            "diarization audio is {:.1} s long, over the {MAX_PIPELINE_DURATION_SECONDS} s limit",
+            samples as f64 / f64::from(PIPELINE_SAMPLE_RATE)
+        )));
+    }
+    Ok(())
 }
 
 fn pipeline_chunk_config() -> AsrLongFormConfig {
@@ -2941,40 +3028,6 @@ fn is_seconds_token(token: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if audio.is_empty() || src_rate == 0 || dst_rate == 0 || src_rate == dst_rate {
-        let mut output = Vec::new();
-        output.try_reserve_exact(audio.len()).map_err(|_| {
-            Error::Overloaded("Unable to reserve bounded diarization audio".to_string())
-        })?;
-        output.extend_from_slice(audio);
-        return Ok(output);
-    }
-
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let out_len = ((audio.len() as f64) * ratio).round().max(1.0) as usize;
-    if out_len > MAX_PIPELINE_SAMPLES {
-        return Err(Error::InvalidInput(format!(
-            "Resampled diarization audio would contain {out_len} samples, exceeding the {MAX_PIPELINE_SAMPLES}-sample production limit"
-        )));
-    }
-    let mut out = Vec::new();
-    out.try_reserve_exact(out_len).map_err(|_| {
-        Error::Overloaded("Unable to reserve bounded resampled diarization audio".to_string())
-    })?;
-    out.resize(out_len, 0.0f32);
-
-    for (idx, sample) in out.iter_mut().enumerate() {
-        let src_pos = idx as f64 / ratio;
-        let left = src_pos.floor() as usize;
-        let right = (left + 1).min(audio.len().saturating_sub(1));
-        let frac = (src_pos - left as f64) as f32;
-        *sample = audio[left] * (1.0 - frac) + audio[right] * frac;
-    }
-
-    Ok(out)
-}
-
 fn secs_to_ms(value: f32) -> u32 {
     if !value.is_finite() || value <= 0.0 {
         0
@@ -3630,13 +3683,74 @@ mod tests {
         );
     }
 
+    /// PIPE-14: the one-hour bound applies to the decoded length (the old
+    /// guard sat in a 16 kHz -> 16 kHz resample that returned before it).
     #[test]
-    fn resampler_rejects_output_beyond_pipeline_duration_before_allocation() {
-        let input = vec![0.0f32; MAX_PIPELINE_DURATION_SECONDS + 1];
-        let error = resample_linear(&input, 1, PIPELINE_SAMPLE_RATE)
-            .expect_err("one sample beyond the one-hour contract must fail");
-        assert!(matches!(error, Error::InvalidInput(_)));
-        assert!(error.to_string().contains("production limit"));
+    fn pipeline_audio_is_bounded_by_its_decoded_length() {
+        assert!(validate_pipeline_sample_count(MAX_PIPELINE_SAMPLES).is_ok());
+        for samples in [0, MAX_PIPELINE_SAMPLES + 1] {
+            assert!(matches!(
+                validate_pipeline_sample_count(samples),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+        let audio = PipelineAudio::from_canonical(vec![0.25; 16_000]).unwrap();
+        assert_eq!(
+            (audio.sample_rate, audio.duration_secs),
+            (PIPELINE_SAMPLE_RATE, 1.0)
+        );
+    }
+
+    /// PIPE-14: each job decodes its upload once. The pipeline decodes an
+    /// encoded upload once and never decodes samples it is given; PCM over
+    /// one hour is refused on its length.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn pipeline_decodes_each_upload_once() {
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // No checkpoints exist here: every job fails at the Sortformer load,
+        // after its audio is admitted.
+        let runtime = RuntimeService::new(crate::config::EngineConfig {
+            models_dir: std::env::temp_dir().join("izwi-diarization-decode-once"),
+            ..crate::config::EngineConfig::default()
+        })
+        .expect("runtime");
+        let config = DiarizationConfig::default();
+        let options = DiarizationPipelineOptions::default();
+        let one_second = vec![0.1_f32; 16_000];
+        let wav = crate::runtime::asr_no_speech::tests::wav_bytes(&one_second, 16_000);
+
+        runtime
+            .diarize_with_transcript_bytes(&wav, None, None, None, None, &config, &options)
+            .await
+            .expect_err("no Sortformer checkpoint");
+        assert_eq!(runtime.diarization_audio_decodes(), 1);
+
+        runtime
+            .diarize_with_transcript_samples(one_second, None, None, None, None, &config, &options)
+            .await
+            .expect_err("no Sortformer checkpoint");
+        assert_eq!(runtime.diarization_audio_decodes(), 1);
+
+        let error = runtime
+            .diarize_with_transcript_samples(
+                vec![0.0; MAX_PIPELINE_SAMPLES + 1],
+                None,
+                None,
+                None,
+                None,
+                &config,
+                &options,
+            )
+            .await
+            .expect_err("over an hour of audio");
+        assert!(
+            matches!(&error, Error::InvalidInput(message) if message.contains("3600 s limit")),
+            "{error}"
+        );
+        assert_eq!(runtime.coordinator_snapshot().active_jobs, 0);
     }
 
     #[test]

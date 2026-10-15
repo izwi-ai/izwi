@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
+    decode_audio_payload_canonical_with_diagnostics, decode_base64_audio_payload,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
@@ -85,6 +85,10 @@ pub struct RerunDiarizationRecordRequest {
 #[derive(Debug, Default)]
 struct ParsedDiarizationCreateRequest {
     audio_bytes: Vec<u8>,
+    /// The upload as canonical 16 kHz mono samples, decoded once when the
+    /// request was validated (PIPE-14); a rerun has none and decodes the
+    /// stored audio in the pipeline.
+    decoded_samples: Option<Vec<f32>>,
     audio_mime_type: Option<String>,
     audio_filename: Option<String>,
     model_id: Option<String>,
@@ -526,8 +530,18 @@ fn spawn_diarization_processing_task(
             return;
         }
 
-        let audio_bytes = match diarization_store.get_audio(record_id.clone()).await {
-            Ok(Some(audio)) => audio.audio_bytes,
+        let mut parsed = parsed;
+        // A create hands over the samples its validation decoded; a rerun
+        // reads the stored upload, which the pipeline decodes (PIPE-14).
+        let audio = match parsed.decoded_samples.take() {
+            Some(samples) => Ok(Some(JobAudio::Samples(samples))),
+            None => diarization_store
+                .get_audio(record_id.clone())
+                .await
+                .map(|audio| audio.map(|audio| JobAudio::Encoded(audio.audio_bytes))),
+        };
+        let audio = match audio {
+            Ok(Some(audio)) => audio,
             Ok(None) => {
                 let _ = diarization_store
                     .update_processing_status(
@@ -553,7 +567,7 @@ fn spawn_diarization_processing_task(
         match generate_diarization_artifacts(
             &state,
             runtime.clone(),
-            audio_bytes.as_slice(),
+            audio,
             &parsed,
             job.cancellation(),
             correlation_id.as_deref(),
@@ -653,39 +667,72 @@ fn diarization_job_span(record_id: &str, correlation_id: Option<&str>) -> tracin
     )
 }
 
+/// The audio a diarization job runs on.
+enum JobAudio {
+    /// Canonical 16 kHz mono samples, already decoded.
+    Samples(Vec<f32>),
+    /// A stored upload the pipeline decodes.
+    Encoded(Vec<u8>),
+}
+
 async fn generate_diarization_artifacts(
     state: &AppState,
     runtime: Arc<RuntimeService>,
-    audio_bytes: &[u8],
+    audio: JobAudio,
     parsed: &ParsedDiarizationCreateRequest,
     cancellation: &JobCancellation,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let started = Instant::now();
+    let (model_id, asr_model_id, aligner_model_id, llm_model_id) = (
+        parsed.model_id.as_deref(),
+        parsed.asr_model_id.as_deref(),
+        parsed.aligner_model_id.as_deref(),
+        parsed.llm_model_id.as_deref(),
+    );
+    let config = DiarizationConfig {
+        min_speakers: parsed.min_speakers,
+        max_speakers: parsed.max_speakers,
+        min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
+        min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
+        vad_gate: parsed.vad_gate,
+    };
+    let options = DiarizationPipelineOptions {
+        enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+        language: parsed.language.clone(),
+        cancellation: cancellation.clone(),
+    };
     // Keep diarization processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
-    let output = runtime
-        .diarize_with_transcript_bytes(
-            audio_bytes,
-            parsed.model_id.as_deref(),
-            parsed.asr_model_id.as_deref(),
-            parsed.aligner_model_id.as_deref(),
-            parsed.llm_model_id.as_deref(),
-            &DiarizationConfig {
-                min_speakers: parsed.min_speakers,
-                max_speakers: parsed.max_speakers,
-                min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
-                min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
-                vad_gate: parsed.vad_gate,
-            },
-            &DiarizationPipelineOptions {
-                enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
-                language: parsed.language.clone(),
-                cancellation: cancellation.clone(),
-            },
-        )
-        .await?;
+    let output = match audio {
+        JobAudio::Samples(samples) => {
+            runtime
+                .diarize_with_transcript_samples(
+                    samples,
+                    model_id,
+                    asr_model_id,
+                    aligner_model_id,
+                    llm_model_id,
+                    &config,
+                    &options,
+                )
+                .await?
+        }
+        JobAudio::Encoded(bytes) => {
+            runtime
+                .diarize_with_transcript_bytes(
+                    &bytes,
+                    model_id,
+                    asr_model_id,
+                    aligner_model_id,
+                    llm_model_id,
+                    &config,
+                    &options,
+                )
+                .await?
+        }
+    };
 
     Ok(diarization_artifacts(
         output,
@@ -769,6 +816,7 @@ fn build_rerun_create_request(
 ) -> ParsedDiarizationCreateRequest {
     ParsedDiarizationCreateRequest {
         audio_bytes: source_audio.audio_bytes,
+        decoded_samples: None,
         audio_mime_type: Some(source_audio.audio_mime_type),
         audio_filename: source_audio.audio_filename,
         model_id: source_record.model_id.clone(),
@@ -1094,7 +1142,9 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             .map_err(|err| ApiError::bad_request(format!("Invalid JSON payload: {err}")))?;
 
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &audio_payload)?;
+        let (audio_payload, decoded_samples) =
+            decode_audio_payload_canonical_with_diagnostics("diarization.create", audio_payload)
+                .await?;
         let audio_filename = sanitize_optional(payload.audio_filename);
         let audio_mime_type = sanitize_optional(payload.audio_mime_type)
             .or_else(|| audio_payload.content_type_hint().map(str::to_string))
@@ -1108,6 +1158,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
 
         return Ok(ParsedDiarizationCreateRequest {
             audio_bytes: audio_payload.bytes,
+            decoded_samples: Some(decoded_samples),
             audio_mime_type,
             audio_filename,
             model_id: sanitize_optional(payload.model_id),
@@ -1148,10 +1199,15 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
-                        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &payload)?;
+                        let (payload, samples) = decode_audio_payload_canonical_with_diagnostics(
+                            "diarization.create",
+                            payload,
+                        )
+                        .await?;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_filename = payload.filename;
                         out.audio_bytes = payload.bytes;
+                        out.decoded_samples = Some(samples);
                     }
                 }
                 "audio_base64" => {
@@ -1163,11 +1219,16 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
-                        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &payload)?;
+                        let (payload, samples) = decode_audio_payload_canonical_with_diagnostics(
+                            "diarization.create",
+                            payload,
+                        )
+                        .await?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
                         out.audio_bytes = payload.bytes;
+                        out.decoded_samples = Some(samples);
                     }
                 }
                 "audio_mime_type" => {
@@ -1480,6 +1541,7 @@ mod tests {
             .expect("request should parse");
 
         assert!(!parsed.audio_bytes.is_empty());
+        assert_eq!(parsed.decoded_samples.as_ref().map(Vec::len), Some(4));
         assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(
             parsed.model_id.as_deref(),
@@ -1582,6 +1644,90 @@ mod tests {
         );
         assert_eq!(overridden.language.as_deref(), Some("Spanish"));
         assert_eq!(overridden.vad_gate, Some(false));
+    }
+
+    /// PIPE-14: a job decodes its upload once. A create keeps the samples
+    /// its validation decoded and drops the encoded bytes once they are
+    /// stored, so the pipeline decodes nothing; a rerun has only the stored
+    /// upload, which the pipeline decodes once.
+    #[tokio::test]
+    async fn each_job_decodes_its_upload_once() {
+        use izwi_core::{backends::BackendPreference, ServeRuntimeConfig};
+        let (state, _temp_dir) = {
+            let _guard = crate::test_support::env_lock();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let models_dir = temp_dir.path().join("models");
+            std::fs::create_dir_all(&models_dir).unwrap();
+            std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("decode-once.sqlite3"));
+            std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+            let serve_config = ServeRuntimeConfig {
+                backend: BackendPreference::Cpu,
+                models_dir,
+                ..ServeRuntimeConfig::default()
+            };
+            let runtime = RuntimeService::new(serve_config.engine_config()).unwrap();
+            let state = AppState::new(runtime, &serve_config).unwrap();
+            std::env::remove_var("IZWI_DB_PATH");
+            std::env::remove_var("IZWI_MEDIA_DIR");
+            (state, temp_dir)
+        };
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&vec![0.1; 16_000], AudioFormat::Wav)
+            .unwrap();
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": base64::engine::general_purpose::STANDARD.encode(&wav)
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        // No checkpoints exist here: each job fails at the Sortformer load,
+        // after its audio reached the pipeline.
+        let run = |mut parsed: ParsedDiarizationCreateRequest| {
+            let state = state.clone();
+            async move {
+                let record = create_pending_record(&state, &mut parsed).await.unwrap();
+                assert!(parsed.audio_bytes.is_empty(), "the store owns the upload");
+                spawn_diarization_processing_task(
+                    state.clone(),
+                    30,
+                    record.id.clone(),
+                    parsed,
+                    None,
+                );
+                for _ in 0..500 {
+                    let current = state
+                        .diarization_store
+                        .get_record(record.id.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if current.processing_status == DiarizationProcessingStatus::Failed {
+                        return current;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("the job never finished");
+            }
+        };
+
+        let parsed = parse_create_request(request).await.unwrap();
+        assert_eq!(parsed.decoded_samples.as_ref().map(Vec::len), Some(16_000));
+        let created = run(parsed).await;
+        assert_eq!(state.runtime.diarization_audio_decodes(), 0);
+
+        let source_audio = state
+            .diarization_store
+            .get_audio(created.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let rerun = build_rerun_create_request(&created, source_audio, Default::default());
+        assert!(rerun.decoded_samples.is_none());
+        run(rerun).await;
+        assert_eq!(state.runtime.diarization_audio_decodes(), 1);
     }
 
     /// PIPE-18: a job's pipeline logs carry its record id and the request's
