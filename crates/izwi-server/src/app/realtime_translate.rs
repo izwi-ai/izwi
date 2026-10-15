@@ -1189,6 +1189,7 @@ async fn dial_asr_worker(
         &selected.client.endpoint(),
         relay.worker_credentials(),
         &admit,
+        &context.trace,
     )
     .await
     {

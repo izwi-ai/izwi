@@ -1505,3 +1505,133 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     let _ = gateway.kill();
     let _ = gateway.wait();
 }
+
+/// Process-level W3C trace leg: the real gateway binary, logging JSON,
+/// continues a caller's `traceparent`, logs the trace id on the request, and
+/// names its own span as the parent on the worker invocation.
+#[tokio::test]
+async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
+    const CALLER_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const CALLER_SPAN: &str = "00f067aa0ba902b7";
+    let model = ModelVariant::Qwen354BGguf;
+    let worker = TestWorker::spawn(TestWorkerConfig {
+        public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+        max_output_tokens: 8_192,
+        ..TestWorkerConfig::default()
+    })
+    .await
+    .expect("test worker binds");
+    let port = {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe listener binds");
+        probe.local_addr().expect("probe addr").port()
+    };
+    let approval = format!(
+        "{}|chat|{}|test-chat-v1|1",
+        worker.endpoint(),
+        model.dir_name()
+    );
+    let mut gateway = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .args([
+            "--role",
+            "gateway",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--public-model",
+            model.dir_name(),
+            "--gateway-worker-approval",
+            &approval,
+        ])
+        .env("IZWI_LOG_FORMAT", "json")
+        .env("RUST_LOG", "izwi_server=info")
+        .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+        .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
+        .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "200")
+        .env("IZWI_GATEWAY_WORKER_STATUS_TTL_MS", "5000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("gateway binary spawns");
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    let stdout = gateway.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = lines_tx.send(line);
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match client.get(format!("{base}/readyz")).send().await {
+            Ok(response) if response.status().is_success() => break,
+            _ if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+            other => panic!(
+                "gateway never became ready: {:?}",
+                other.map(|r| r.status())
+            ),
+        }
+    }
+    let response = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {GATEWAY_API_KEY}"))
+        .header("traceparent", format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"))
+        .json(&serde_json::json!({
+            "model": model.dir_name(),
+            "messages": [{"role": "user", "content": "trace me"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("chat request reaches the gateway");
+    assert_eq!(response.status(), 200);
+
+    // The gateway's own JSON log line for the request carries the caller's
+    // trace, the caller's span as parent, and a span id of its own.
+    let span_of = |line: &serde_json::Value| -> Option<serde_json::Value> {
+        line["spans"]
+            .as_array()?
+            .iter()
+            .find(|span| span["name"] == "http_request" && span["path"] == "/v1/chat/completions")
+            .cloned()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request_span = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let line = lines_rx
+            .recv_timeout(remaining)
+            .expect("the gateway logs the chat request as JSON");
+        let Ok(line) = serde_json::from_str::<serde_json::Value>(&line) else {
+            panic!("every gateway log line is JSON: {line}");
+        };
+        if line["message"] == "HTTP request completed" {
+            if let Some(span) = span_of(&line) {
+                break span;
+            }
+        }
+    };
+    assert_eq!(request_span["trace_id"], CALLER_TRACE);
+    assert_eq!(request_span["parent_span_id"], CALLER_SPAN);
+    let gateway_span = request_span["span_id"]
+        .as_str()
+        .expect("gateway span id")
+        .to_string();
+    assert_ne!(gateway_span, CALLER_SPAN);
+
+    // The worker received that span as the parent of its invocation.
+    let sent = worker
+        .received_traceparents()
+        .into_iter()
+        .find(|value| value.contains(CALLER_TRACE))
+        .expect("the worker invocation carried the caller's trace");
+    assert_eq!(sent, format!("00-{CALLER_TRACE}-{gateway_span}-01"));
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+}

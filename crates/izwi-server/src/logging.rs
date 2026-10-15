@@ -30,13 +30,23 @@ pub fn init_tracing(log_format: LogFormat) {
             .init(),
         LogFormat::Json => tracing_subscriber::registry()
             .with(filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .flatten_event(true)
-                    .with_current_span(true)
-                    .with_span_list(true),
-            )
+            .with(json_layer(std::io::stdout))
             .init(),
     }
+}
+
+/// The JSON log line shape: event fields at the top level, plus the current
+/// span and the span list, so request ids and W3C trace ids reach every line
+/// logged inside a request.
+pub(crate) fn json_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_writer(writer)
 }

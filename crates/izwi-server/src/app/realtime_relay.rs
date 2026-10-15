@@ -30,8 +30,9 @@ use izwi_serving_protocol::{
     InvocationEventKind, ModelAlias, ModelGeneration, OutputFormat, PermittedAction,
     PolicyRevision, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
     RealtimeSessionCloseCode, RequestId, ServiceClass, ServiceCredentials, SessionId, TaskKind,
-    TenantId, WorkerId, PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH,
+    TenantId, TraceContext, WorkerId, PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH,
     SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
+    TRACEPARENT_HEADER,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -462,6 +463,7 @@ async fn run_relay_session(
         &selected.client.endpoint(),
         relay.worker_credentials(),
         &admit,
+        &context.trace,
     )
     .await
     {
@@ -863,6 +865,7 @@ pub(crate) async fn dial_worker_session(
     endpoint: &str,
     credentials: &ServiceCredentials,
     admit: &RealtimeSessionAdmit,
+    trace: &TraceContext,
 ) -> Result<WorkerSide, WorkerDialError> {
     let base = endpoint.trim_end_matches('/');
     let ws_url = if let Some(rest) = base.strip_prefix("https://") {
@@ -890,6 +893,9 @@ pub(crate) async fn dial_worker_session(
         WorkerDialError::Protocol("worker credential id is not a valid header value")
     })?;
     headers.insert(SERVICE_CREDENTIAL_ID_HEADER, credential);
+    let traceparent = HeaderValue::from_str(&trace.header_value())
+        .map_err(|_| WorkerDialError::Protocol("traceparent is not a valid header value"))?;
+    headers.insert(TRACEPARENT_HEADER, traceparent);
 
     let handshake = tokio_tungstenite::connect_async(request);
     let (mut stream, response) = tokio::time::timeout(WORKER_ADMIT_TIMEOUT, handshake)

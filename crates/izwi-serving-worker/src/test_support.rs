@@ -318,6 +318,8 @@ impl TestWorkerConfig {
 struct Observed {
     admitted: AtomicU64,
     invocations: Mutex<Vec<InvocationRequest>>,
+    /// The `traceparent` of every request the worker received, in order.
+    traceparents: Mutex<Vec<String>>,
 }
 
 /// A real worker on a loopback socket. Dropping it stops accepting
@@ -364,7 +366,22 @@ impl TestWorker {
             inner: listener,
             cuts: cuts.subscribe(),
         };
-        let router = service.router();
+        let seen = Arc::clone(&observed);
+        let router = service.router().layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                if let Some(value) = request
+                    .headers()
+                    .get(TRACEPARENT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    seen.traceparents
+                        .lock()
+                        .expect("test worker record poisoned")
+                        .push(value.to_string());
+                }
+                next.run(request)
+            },
+        ));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
@@ -406,6 +423,15 @@ impl TestWorker {
             .expect("test worker record poisoned")
             .last()
             .cloned()
+    }
+
+    /// The `traceparent` headers the worker received, oldest first.
+    pub fn received_traceparents(&self) -> Vec<String> {
+        self.observed
+            .traceparents
+            .lock()
+            .expect("test worker record poisoned")
+            .clone()
     }
 
     /// The time budget an admitted attempt arrived with.

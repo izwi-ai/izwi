@@ -188,7 +188,9 @@ pub async fn realtime_socket<E: InvocationExecutor>(
         .protocols([REALTIME_SUBPROTOCOL])
         .max_message_size(REALTIME_WS_MAX_MESSAGE_BYTES)
         .max_frame_size(REALTIME_WS_MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| run_realtime_session(state, runner, socket))
+        .on_upgrade(move |socket| {
+            tracing::Instrument::in_current_span(run_realtime_session(state, runner, socket))
+        })
 }
 
 async fn run_realtime_session<E: InvocationExecutor>(

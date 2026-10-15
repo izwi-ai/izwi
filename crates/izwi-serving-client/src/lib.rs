@@ -5,13 +5,14 @@
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+pub use izwi_serving_protocol::TraceContext;
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, AttemptQueryResponse, CancelAttemptRequest, CancelAttemptResponse,
     InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind, InvocationRejection,
     InvocationRequest, NdjsonDecodeError, NdjsonDecoder, NdjsonLimits, ServiceCredentials,
     WorkerDescriptor, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE, PROTOCOL_V1,
     PROTOCOL_VERSION_HEADER, SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME,
-    SERVICE_CREDENTIAL_ID_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
+    SERVICE_CREDENTIAL_ID_HEADER, TRACEPARENT_HEADER, WORKER_DESCRIPTOR_PATH, WORKER_STATUS_PATH,
 };
 use reqwest::{redirect::Policy, StatusCode};
 use serde::de::DeserializeOwned;
@@ -472,7 +473,17 @@ impl WorkerClient {
     /// Starts exactly one invocation POST. This method never retries.
     pub async fn invoke(
         &self,
+        request: InvocationRequest,
+    ) -> Result<InvocationStream, WorkerClientError> {
+        self.invoke_traced(request, None).await
+    }
+
+    /// Like [`Self::invoke`], naming `trace` as the worker span's parent in a
+    /// W3C `traceparent` header.
+    pub async fn invoke_traced(
+        &self,
         mut request: InvocationRequest,
+        trace: Option<&TraceContext>,
     ) -> Result<InvocationStream, WorkerClientError> {
         request.validate()?;
         let total_deadline = Instant::now()
@@ -520,15 +531,15 @@ impl WorkerClient {
             .config
             .request_timeout
             .min(total_deadline.saturating_duration_since(Instant::now()));
-        let response = tokio::time::timeout(
-            header_budget,
-            self.authorized(self.inner.http.post(self.url(INVOCATIONS_PATH)))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(encoded)
-                .send(),
-        )
-        .await
-        .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?;
+        let mut post = self
+            .authorized(self.inner.http.post(self.url(INVOCATIONS_PATH)))
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(trace) = trace {
+            post = post.header(TRACEPARENT_HEADER, trace.header_value());
+        }
+        let response = tokio::time::timeout(header_budget, post.body(encoded).send())
+            .await
+            .map_err(|_| WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))?;
         let response = match response {
             Ok(response) => response,
             Err(error) if error.is_connect() => {

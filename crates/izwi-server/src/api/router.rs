@@ -14,7 +14,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
-use crate::api::request_context::attach_enterprise_request_context;
+use crate::api::request_context::{attach_enterprise_request_context, RequestTrace};
 use crate::local_security::{guard_local_request, LocalRequestGuard};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::state::AppState;
@@ -34,6 +34,8 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
     let middleware_state = state.clone();
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request| {
+            // Resolved by the request-context middleware outside this layer.
+            let trace = RequestTrace::of(request).unwrap_or_else(RequestTrace::detached);
             let request_id = request
                 .headers()
                 .get("x-request-id")
@@ -47,6 +49,9 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
                 path = %request.uri().path(),
                 uri = %request.uri(),
                 correlation_id = %request_id,
+                trace_id = %trace.trace_id(),
+                span_id = %trace.span_id(),
+                parent_span_id = %trace.parent_span_id(),
                 status = field::Empty,
                 latency_ms = field::Empty,
                 error = field::Empty

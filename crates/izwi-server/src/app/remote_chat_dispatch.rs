@@ -447,6 +447,7 @@ impl RemoteChatDispatcher {
             &remote,
             invocation.clone(),
             tenant_work,
+            &context.trace,
         )
         .await
         {
@@ -517,6 +518,7 @@ impl RemoteChatDispatcher {
             &alternate_remote,
             alternate_invocation,
             retry_delay.1,
+            &context.trace,
         )
         .await
         {

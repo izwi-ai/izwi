@@ -25,14 +25,25 @@ const WORKER_TLS_KEY_REF_ENV: &str = "IZWI_WORKER_TLS_KEY_REF";
 const WORKER_TLS_CLIENT_CA_REF_ENV: &str = "IZWI_WORKER_TLS_CLIENT_CA_REF";
 const MAX_TLS_PEM_FILE_BYTES: u64 = 256 * 1024;
 
+/// Text logs by default; `IZWI_LOG_FORMAT=json` for one JSON object per line.
+fn init_tracing() -> anyhow::Result<()> {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "izwi_serving_worker=info,izwi_core=info".into());
+    let registry = tracing_subscriber::registry().with(filter);
+    match std::env::var("IZWI_LOG_FORMAT").ok().as_deref() {
+        None | Some("text") => registry.with(tracing_subscriber::fmt::layer()).init(),
+        Some("json") => registry
+            .with(izwi_serving_worker::json_log_layer(std::io::stdout))
+            .init(),
+        Some(other) => anyhow::bail!("IZWI_LOG_FORMAT must be text or json, not {other:?}"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "izwi_serving_worker=info,izwi_core=info".into()),
-        )
-        .init();
+    init_tracing()?;
 
     let process = WorkerProcessConfig::from_env()?;
     let managed_locks = managed_lock_context(&process)?;

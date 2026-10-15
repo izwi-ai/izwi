@@ -29,7 +29,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
 use crate::api::request_context::RequestContext;
-use crate::api::request_context::{attach_gateway_request_context, attach_gateway_request_id};
+use crate::api::request_context::{
+    attach_gateway_request_context, attach_gateway_request_id, RequestTrace,
+};
 use crate::app::chat::{ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver};
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
 use crate::error::ApiError;
@@ -992,6 +994,8 @@ async fn bounded_gateway_admission(
 pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeConfig) -> Router {
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request| {
+            // Resolved by the request-id middleware outside this layer.
+            let trace = RequestTrace::of(request).unwrap_or_else(RequestTrace::detached);
             let request_id = crate::api::request_context::gateway_trace_request_id(request);
             info_span!(
                 "http_request",
@@ -1000,6 +1004,9 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
                 method = %request.method(),
                 path = %request.uri().path(),
                 correlation_id = %request_id,
+                trace_id = %trace.trace_id(),
+                span_id = %trace.span_id(),
+                parent_span_id = %trace.parent_span_id(),
                 status = field::Empty,
                 latency_ms = field::Empty,
                 error = field::Empty

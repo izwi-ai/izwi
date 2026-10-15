@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
-use izwi_serving_client::{InvocationStream, WorkerClient, WorkerClientError};
+use izwi_serving_client::{InvocationStream, TraceContext, WorkerClient, WorkerClientError};
 use izwi_serving_protocol::{
     AttemptId, AttemptIdentity, CallerId, ChatContextPolicy, ChatInput,
     ChatMessage as WorkerChatMessage, ChatParameters as WorkerChatParameters, ChatResponseFormat,
@@ -730,10 +730,11 @@ pub(crate) async fn start_remote_chat_invocation_with_tenant(
     remote: &RemoteChatExecution,
     invocation: InvocationRequest,
     tenant_work: UnboundTenantWorkLease,
+    trace: &TraceContext,
 ) -> Result<StartedTenantInvocation, TenantInvocationStartFailure> {
     let identity = AttemptIdentity::from(&invocation);
     let bound = tenant_work.bind(remote.client.clone(), identity);
-    match remote.client.invoke(invocation).await {
+    match remote.client.invoke_traced(invocation, Some(trace)).await {
         Ok(stream) => Ok(StartedTenantInvocation {
             stream,
             tenant_work: bound,

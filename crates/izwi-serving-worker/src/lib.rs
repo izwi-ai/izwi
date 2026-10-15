@@ -29,6 +29,7 @@ use std::{
 };
 use tokio::sync::{mpsc, watch, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 mod realtime;
 mod runtime;
@@ -1034,6 +1035,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
                 Arc::clone(&self.state),
                 observe_worker_body_limit,
             ))
+            .layer(middleware::from_fn(continue_trace))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -1247,6 +1249,63 @@ async fn metrics<E: InvocationExecutor>(
             .render_prometheus(&state, engine_telemetry.as_ref()),
     )
         .into_response()
+}
+
+/// The worker's JSON log line shape (`IZWI_LOG_FORMAT=json`), matching the
+/// server's: event fields at the top level plus the current span and the
+/// span list, so the W3C trace ids reach every line logged in a request.
+pub fn json_log_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_writer(writer)
+}
+
+/// Continue the caller's W3C trace. Every request runs in a span carrying
+/// the trace id, this worker's span id and the caller's span id, so the
+/// worker's logs join the gateway's under one trace id; a request without a
+/// valid `traceparent` starts a trace.
+async fn continue_trace(mut request: AxumRequest, next: Next) -> Response {
+    let incoming = request
+        .headers()
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let (trace, parent) = TraceContext::continue_from(incoming);
+    let span = tracing::info_span!(
+        "worker_request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        trace_id = %trace.trace_id(),
+        span_id = %trace.span_id(),
+        parent_span_id = tracing::field::Empty,
+    );
+    if let Some(parent) = parent {
+        span.record("parent_span_id", trace::hex(&parent));
+    }
+    // Status polls are frequent; only work-carrying requests log at info.
+    let work =
+        request.method() == axum::http::Method::POST || request.uri().path() == REALTIME_WS_PATH;
+    request.extensions_mut().insert(trace);
+    let started = Instant::now();
+    async move {
+        let response = next.run(request).await;
+        let status = response.status().as_u16();
+        let latency_ms = started.elapsed().as_millis() as u64;
+        if work {
+            tracing::info!(status, latency_ms, "worker request completed");
+        } else {
+            tracing::debug!(status, latency_ms, "worker request completed");
+        }
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 async fn invoke<E: InvocationExecutor>(
@@ -1498,46 +1557,49 @@ async fn invoke<E: InvocationExecutor>(
     let admission_request = request.clone();
     let slot_for_admission = Arc::clone(&admission_slot);
     let ready_for_admission = Arc::clone(&admission_ready);
-    tokio::spawn(async move {
-        let result = admission_state.executor.admit(&admission_request).await;
-        admission_state
-            .metrics
-            .record_queue_wait(received_at.elapsed());
-        if result.is_ok() {
+    tokio::spawn(
+        async move {
+            let result = admission_state.executor.admit(&admission_request).await;
             admission_state
                 .metrics
-                .inner
-                .admitted
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            admission_state
-                .metrics
-                .inner
-                .rejected
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let handoff = AdmissionHandoff {
-            result,
-            permit,
-            admission_guard,
-            execution_started_at: Instant::now(),
-        };
-        let abandoned_handoff = {
-            let mut slot = slot_for_admission
-                .lock()
-                .expect("worker admission slot poisoned");
-            if slot.abandoned {
-                Some(handoff)
+                .record_queue_wait(received_at.elapsed());
+            if result.is_ok() {
+                admission_state
+                    .metrics
+                    .inner
+                    .admitted
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
-                slot.handoff = Some(handoff);
-                None
+                admission_state
+                    .metrics
+                    .inner
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
             }
-        };
-        ready_for_admission.notify_one();
-        if let Some(handoff) = abandoned_handoff {
-            settle_abandoned_admission(admission_state, admission_request, handoff).await;
+            let handoff = AdmissionHandoff {
+                result,
+                permit,
+                admission_guard,
+                execution_started_at: Instant::now(),
+            };
+            let abandoned_handoff = {
+                let mut slot = slot_for_admission
+                    .lock()
+                    .expect("worker admission slot poisoned");
+                if slot.abandoned {
+                    Some(handoff)
+                } else {
+                    slot.handoff = Some(handoff);
+                    None
+                }
+            };
+            ready_for_admission.notify_one();
+            if let Some(handoff) = abandoned_handoff {
+                settle_abandoned_admission(admission_state, admission_request, handoff).await;
+            }
         }
-    });
+        .in_current_span(),
+    );
     let handoff = match tokio::time::timeout(admission_budget, &mut admission_wait).await {
         Ok(()) => admission_slot
             .lock()
@@ -1615,16 +1677,19 @@ async fn invoke<E: InvocationExecutor>(
     let (tx, mut rx) = mpsc::channel::<Bytes>(state.config.event_channel_capacity);
     let remaining_time =
         Duration::from_millis(request.remaining_time_ms).saturating_sub(received_at.elapsed());
-    tokio::spawn(run_invocation(
-        Arc::clone(&state),
-        request,
-        permit,
-        execution,
-        cancel_rx,
-        remaining_time,
-        execution_started_at,
-        tx,
-    ));
+    tokio::spawn(
+        run_invocation(
+            Arc::clone(&state),
+            request,
+            permit,
+            execution,
+            cancel_rx,
+            remaining_time,
+            execution_started_at,
+            tx,
+        )
+        .in_current_span(),
+    );
     drop(admission_guard);
     let output = stream! {
         while let Some(bytes) = rx.recv().await {

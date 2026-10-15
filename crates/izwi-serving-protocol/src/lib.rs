@@ -9,12 +9,14 @@ mod approvals;
 mod identity;
 mod ndjson;
 mod realtime;
+pub mod trace;
 mod types;
 
 pub use approvals::*;
 pub use identity::*;
 pub use ndjson::*;
 pub use realtime::*;
+pub use trace::{TraceContext, TRACEPARENT_HEADER};
 pub use types::*;
 
 /// The only protocol major version implemented by this crate.

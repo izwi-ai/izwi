@@ -12,6 +12,7 @@ use izwi_hooks::{
     HookError, HookMetadata, ObservabilityEvent, ObservabilityEventKind, Principal,
     RequestEnvelope, ResourceDescriptor,
 };
+use izwi_serving_protocol::{trace::hex, TraceContext, TRACEPARENT_HEADER};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -40,6 +41,9 @@ pub struct RequestContext {
     /// How a streamed answer ended in-band; the request audit reads it when
     /// the body ends, since the HTTP status was sent before the stream ran.
     pub(crate) stream_outcome: StreamOutcome,
+    /// This process's span of the request's W3C trace: the parent of every
+    /// worker call made for it.
+    pub(crate) trace: TraceContext,
 }
 
 impl RequestContext {
@@ -49,7 +53,13 @@ impl RequestContext {
             principal,
             received_at: Instant::now(),
             stream_outcome: StreamOutcome::default(),
+            trace: TraceContext::new_root(),
         }
+    }
+
+    pub(crate) fn with_trace(mut self, trace: TraceContext) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Scheduling identity comes exclusively from the authenticated extension.
@@ -77,6 +87,63 @@ impl RequestContext {
 
     pub(crate) fn remaining_budget(&self, total: Duration) -> Option<Duration> {
         total.checked_sub(self.received_at.elapsed())
+    }
+}
+
+/// This process's span for one incoming request, continuing the caller's
+/// `traceparent` when it is valid and starting a trace otherwise.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestTrace {
+    pub(crate) context: TraceContext,
+    parent_span_id: Option<[u8; 8]>,
+}
+
+impl RequestTrace {
+    /// The request's trace, resolved once by the outermost middleware and
+    /// kept in the request extensions for the layers inside it.
+    pub(crate) fn resolve(req: &mut Request) -> Self {
+        if let Some(trace) = req.extensions().get::<Self>() {
+            return *trace;
+        }
+        let incoming = req
+            .headers()
+            .get(TRACEPARENT_HEADER)
+            .and_then(|value| value.to_str().ok());
+        let (context, parent_span_id) = TraceContext::continue_from(incoming);
+        let trace = Self {
+            context,
+            parent_span_id,
+        };
+        req.extensions_mut().insert(trace);
+        trace
+    }
+
+    /// A trace this process starts, for a request no middleware resolved.
+    pub(crate) fn detached() -> Self {
+        Self {
+            context: TraceContext::new_root(),
+            parent_span_id: None,
+        }
+    }
+
+    /// The trace of a request a middleware already resolved, if any.
+    pub(crate) fn of(req: &Request) -> Option<Self> {
+        req.extensions().get::<Self>().copied()
+    }
+
+    pub(crate) fn trace_id(&self) -> String {
+        self.context.trace_id()
+    }
+
+    pub(crate) fn span_id(&self) -> String {
+        self.context.span_id()
+    }
+
+    /// The caller's span id, or `-` for a trace this process started.
+    pub(crate) fn parent_span_id(&self) -> String {
+        self.parent_span_id
+            .map(|span| hex(&span))
+            .unwrap_or_else(|| "-".to_string())
     }
 }
 
@@ -238,7 +305,8 @@ pub async fn attach_gateway_request_context(
         );
     }
 
-    let context = RequestContext::new(correlation_id.clone(), principal.clone());
+    let trace = RequestTrace::resolve(&mut req).context;
+    let context = RequestContext::new(correlation_id.clone(), principal.clone()).with_trace(trace);
     let stream_outcome = context.stream_outcome.clone();
     req.extensions_mut().insert(context);
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
@@ -262,6 +330,7 @@ pub async fn attach_gateway_request_context(
 }
 
 pub async fn attach_gateway_request_id(mut req: Request, next: Next) -> Response {
+    RequestTrace::resolve(&mut req);
     let correlation_id = match resolve_gateway_correlation_id(&mut req) {
         Ok(correlation_id) => correlation_id,
         Err(generated_id) => {
@@ -398,6 +467,7 @@ async fn attach_enterprise_request_context_with_hooks(
     mut req: Request,
     next: Next,
 ) -> Response {
+    let trace = RequestTrace::resolve(&mut req).context;
     let correlation_id = resolve_correlation_id(&mut req);
     let request_envelope = build_request_envelope(&req, &correlation_id);
 
@@ -469,7 +539,7 @@ async fn attach_enterprise_request_context_with_hooks(
         None
     };
 
-    let context = RequestContext::new(correlation_id.clone(), principal.clone());
+    let context = RequestContext::new(correlation_id.clone(), principal.clone()).with_trace(trace);
     let stream_outcome = context.stream_outcome.clone();
     req.extensions_mut().insert(context);
 
