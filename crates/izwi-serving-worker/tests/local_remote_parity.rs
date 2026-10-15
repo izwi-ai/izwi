@@ -214,6 +214,24 @@ async fn complete(app: &Router, body: &Value, api_key: Option<&str>) -> (u16, Va
     (status, body)
 }
 
+/// A GET's status and JSON body.
+async fn get_json(app: &Router, path: &str, api_key: Option<&str>) -> (u16, Value) {
+    let mut request = Request::builder().uri(path);
+    if let Some(api_key) = api_key {
+        request = request.header("authorization", format!("Bearer {api_key}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 /// What a client reads from an SSE chat stream: the concatenated content,
 /// every logprob entry, the finish reason, the usage and any error.
 fn stream_summary(sse: &str) -> Value {
@@ -351,6 +369,21 @@ fn stop_inside(text: &str) -> Option<String> {
 
 async fn assert_paths_agree(paths: &Paths) {
     let hello = json!([user("hello")]);
+
+    // Each path lists the one model it serves, and 404s any other.
+    for (app, api_key) in [
+        (&paths.local, None),
+        (&paths.gateway, Some(GATEWAY_API_KEY)),
+    ] {
+        let (status, list) = get_json(app, "/v1/models", api_key).await;
+        assert_eq!(status, 200, "{list}");
+        assert_eq!(list["data"][0]["id"], VARIANT.dir_name(), "{list}");
+        assert_eq!(list["data"][0]["owned_by"], "izwi");
+        assert_eq!(list["data"].as_array().unwrap().len(), 1, "{list}");
+        let (status, missing) = get_json(app, "/v1/models/gpt-imaginary", api_key).await;
+        assert_eq!(status, 404);
+        assert_eq!(missing["error"]["code"], "model_not_found");
+    }
 
     let greedy = assert_same_answer(
         paths,

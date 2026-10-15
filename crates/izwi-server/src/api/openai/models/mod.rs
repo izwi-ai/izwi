@@ -1,6 +1,6 @@
 //! OpenAI-compatible model resources.
 
-mod handlers;
+pub(crate) mod handlers;
 
 use axum::{routing::get, Router};
 

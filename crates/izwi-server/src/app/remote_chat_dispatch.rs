@@ -256,6 +256,11 @@ impl RemoteChatDispatcher {
         self.config.max_output_tokens
     }
 
+    /// The model this deployment serves under its public name.
+    pub(crate) const fn public_model(&self) -> ModelVariant {
+        self.config.public_model_variant
+    }
+
     /// Readiness is derived from a receiver-clock-fresh registry observation,
     /// never from registration alone. Exhausted workers remain ready because
     /// capacity affects admission, not service health.

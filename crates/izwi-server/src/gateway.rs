@@ -1042,12 +1042,12 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             },
         );
 
-    let mut v1_routes = Router::new().route(
+    let mut inference_routes = Router::new().route(
         "/chat/completions",
         post(crate::api::openai::chat::completions::gateway_completions),
     );
     if state.realtime_relay.is_some() {
-        v1_routes = v1_routes
+        inference_routes = inference_routes
             .route(
                 "/realtime/ws",
                 get(crate::app::realtime_relay::relay_socket),
@@ -1060,13 +1060,25 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
                 get(crate::app::realtime_relay::relay_socket),
             );
     }
-    let v1_routes = v1_routes
-        .fallback(api_not_found)
+    let inference_routes = inference_routes
         .layer(middleware::from_fn_with_state(
             state.clone(),
             bounded_gateway_admission,
         ))
-        .layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()))
+        .layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()));
+    // The model listing is authenticated like inference but takes no
+    // inference capacity.
+    let v1_routes = Router::new()
+        .route(
+            "/models",
+            get(crate::api::openai::models::handlers::gateway_list_models),
+        )
+        .route(
+            "/models/{model}",
+            get(crate::api::openai::models::handlers::gateway_get_model),
+        )
+        .merge(inference_routes)
+        .fallback(api_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             attach_gateway_request_context,
@@ -1576,6 +1588,46 @@ mod tests {
         );
         assert_eq!(error["error"]["type"], "invalid_request_error");
         assert!(body.contains("deterministic test response"));
+    }
+
+    /// EDGE-F10: the standard client bootstrap (`GET /v1/models`) works
+    /// against the gateway, behind the same key as inference.
+    #[tokio::test]
+    async fn gateway_lists_its_public_model_behind_the_api_key() {
+        let model = ModelVariant::Qwen354BGguf;
+        let (state, _worker) = registry_gateway_state(model).await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let response = send(app.clone(), get("/v1/models")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(response).await,
+            json!({
+                "object": "list",
+                "data": [{
+                    "id": model.dir_name(), "object": "model", "created": 0, "owned_by": "izwi"
+                }]
+            })
+        );
+        let response = send(
+            app.clone(),
+            get(&format!("/v1/models/{}", model.dir_name())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["id"], model.dir_name());
+
+        for unknown in ["/v1/models/gpt-imaginary", "/v1/models/Qwen3-8B-GGUF"] {
+            let response = send(app.clone(), get(unknown)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{unknown}");
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "model_not_found"
+            );
+        }
+
+        let unauthenticated = send_raw(app, get("/v1/models")).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2341,7 +2393,6 @@ mod tests {
             StatusCode::OK
         );
         for path in [
-            "/v1/models",
             "/v1/audio/speech",
             "/v1/audio/transcriptions",
             "/v1/responses",
@@ -2415,7 +2466,8 @@ mod tests {
             .as_object()
             .expect("OpenAPI should contain paths");
         assert!(paths.contains_key("/v1/chat/completions"));
-        assert!(!paths.contains_key("/v1/models"));
+        assert!(paths.contains_key("/v1/models"));
+        assert!(!paths.contains_key("/v1/responses"));
     }
 
     #[tokio::test]
@@ -2796,14 +2848,19 @@ mod tests {
             .map(String::as_str)
             .collect();
         paths.sort_unstable();
-        for advertised in ["/livez", "/openapi.json", "/readyz", "/v1/chat/completions"] {
+        for advertised in [
+            "/livez",
+            "/openapi.json",
+            "/readyz",
+            "/v1/chat/completions",
+            "/v1/models",
+        ] {
             assert!(
                 paths.contains(&advertised),
                 "gateway OpenAPI must advertise {advertised}, got {paths:?}"
             );
         }
         for gated in [
-            "/v1/models",
             "/v1/audio/speech",
             "/v1/audio/transcriptions",
             "/v1/responses",
@@ -2828,7 +2885,11 @@ mod tests {
         assert_eq!(unauthorized_body["error"]["type"], "authentication_error");
         assert!(unauthorized_body["error"]["message"].is_string());
 
-        let not_found = send_raw(app.clone(), get_with_bearer("/v1/models", TEST_API_KEY)).await;
+        let not_found = send_raw(
+            app.clone(),
+            get_with_bearer("/v1/audio/speech", TEST_API_KEY),
+        )
+        .await;
         assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
         let not_found_body = error_envelope(not_found).await;
         assert_eq!(not_found_body["error"]["type"], "not_found_error");

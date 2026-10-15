@@ -119,6 +119,8 @@ pub async fn gateway_openapi_json() -> Json<Value> {
                     | "/docs"
                     | "/docs/scalar.js"
                     | "/v1/chat/completions"
+                    | "/v1/models"
+                    | "/v1/models/{model}"
             )
         });
     }
@@ -1689,8 +1691,7 @@ fn list_models() {}
     ),
     responses(
         (status = 200, description = "Retrieve a locally available OpenAI-compatible model", body = OpenAiModel),
-        (status = 400, description = "Invalid model identifier", body = ApiErrorEnvelope),
-        (status = 404, description = "Model not found", body = ApiErrorEnvelope)
+        (status = 404, description = "Unknown or unavailable model (`model_not_found`)", body = ApiErrorEnvelope)
     )
 )]
 fn get_model() {}
@@ -1984,8 +1985,6 @@ pub struct OpenAiModel {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
-    pub root: Option<String>,
-    pub parent: Option<String>,
 }
 
 #[allow(dead_code)]

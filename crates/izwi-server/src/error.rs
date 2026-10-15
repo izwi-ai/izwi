@@ -141,6 +141,18 @@ impl ApiError {
         }
     }
 
+    /// OpenAI `model_not_found`: the requested model is not served here.
+    pub fn model_not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+            detail: Some(ApiErrorDetail {
+                param: Some("model"),
+                code: Some("model_not_found"),
+            }),
+        }
+    }
+
     /// The OpenAI error object: the HTTP error body, and the payload of an
     /// error event once a stream has started.
     pub fn openai_body(&self) -> serde_json::Value {
