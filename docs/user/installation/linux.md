@@ -137,8 +137,10 @@ Native Linux GitHub Release artifacts are CPU-only. For CUDA-capable binaries on
 nvidia-smi
 git clone https://github.com/izwi-ai/izwi.git
 cd izwi
-CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
+IZWI_API_KEY="$(openssl rand -hex 32)" CUDA_COMPUTE_CAP=80 docker compose --profile cuda up
 ```
+
+The container listens on `0.0.0.0`, so the server requires `IZWI_API_KEY` and refuses to start without it. Clients send the key as `Authorization: Bearer <key>`.
 
 Adjust `CUDA_COMPUTE_CAP` for the target GPU architecture if you build on a machine without `nvidia-smi`.
 
@@ -205,6 +207,8 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USERNAME
+# A network bind requires an API key; keep it out of the unit file.
+EnvironmentFile=/etc/izwi/izwi.env
 ExecStart=/usr/bin/izwi serve --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=5
@@ -213,6 +217,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 ```
+
+Create `/etc/izwi/izwi.env` (readable only by the service user) containing
+`IZWI_API_KEY=<a long random key>`, or drop `--host 0.0.0.0` and the
+`EnvironmentFile` line to keep the server on loopback.
 
 Replace `YOUR_USERNAME` with your actual username, then:
 

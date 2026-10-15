@@ -140,7 +140,8 @@ izwi tts --help
 
 | Variable | Description |
 |----------|-------------|
-| `IZWI_HOST` | Server host |
+| `IZWI_HOST` | Server host (default `127.0.0.1`) |
+| `IZWI_API_KEY` | API key the server requires on non-loopback binds; CLI commands send it as a bearer token |
 | `IZWI_PORT` | Server port |
 | `IZWI_MODELS_DIR` | Models directory |
 | `IZWI_BACKEND` | Backend preference (`auto`, `cpu`, `metal`, `cuda`) |

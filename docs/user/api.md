@@ -66,10 +66,11 @@ Common status codes:
 | Status | Meaning |
 |--------|---------|
 | `400` | Invalid request shape, model id, unsupported field, or invalid option, including input the runtime rejects (for example audio over the duration limit). |
-| `403` | Authenticated request or local voice reuse is not permitted by policy metadata. |
+| `401` | The server is bound to a network address and the request lacks a valid API key. |
+| `403` | Authenticated request or local voice reuse is not permitted by policy metadata, or a browser request came from a disallowed `Origin` or `Host`. |
 | `404` | Resource, model, media object, or process-local record was not found. |
 | `413` | Body exceeded an upload limit before the handler could parse it. |
-| `415` | Endpoint expected JSON or multipart content but received another content type. |
+| `415` | Endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
 | `500` | Runtime, model, storage, or server failure. |
 | `503` | Temporarily out of capacity: the requested model cannot be loaded while other resident models are busy, or the runtime is overloaded. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
 
@@ -77,12 +78,22 @@ Enterprise builds can inject authentication and policy hooks. Community builds u
 
 ### Security And CORS
 
-Community builds do not require API keys by default. Treat the server as a local trusted process unless you deliberately expose it.
+The server binds `127.0.0.1:8080` by default, so only this machine can reach it and no API key is needed.
 
-- `izwi serve` defaults to port `8080`.
-- `--host 0.0.0.0` binds beyond loopback. Use it only on trusted networks or behind your own access controls.
-- `--cors` enables wildcard browser CORS responses.
-- Desktop origins such as `tauri://localhost` are allowed for the native app.
+To reach it from other devices, bind a network address and set an API key:
+
+```bash
+export IZWI_API_KEY="$(openssl rand -hex 32)"
+izwi serve --host 0.0.0.0
+```
+
+- With a non-loopback host (`0.0.0.0`, `::`, a LAN IP or hostname) the server refuses to start unless `IZWI_API_KEY` is set (16-4096 printable characters, no spaces). The key is read from the environment only, never from the command line.
+- Clients send the key as `Authorization: Bearer <key>` or `x-api-key: <key>`. `izwi` CLI commands send `IZWI_API_KEY` automatically, and the web UI asks for the key once and keeps it in a same-site cookie.
+- Every route under `/v1` and `/internal` needs the key. The probes (`/livez`, `/readyz`, `/v1/live`, `/v1/ready`, `/internal/live`, `/internal/ready`), the docs and the web UI's static files do not.
+- `--allow-unauthenticated-network` (or `IZWI_ALLOW_UNAUTHENTICATED_NETWORK=1`) starts a network bind without a key. Anyone who can reach the port can then download, load and delete models and read or delete history. Use it only behind your own access controls.
+- Browser protections apply to every bind: a loopback-bound server only answers `localhost`, `*.localhost`, `127.0.0.1` and `[::1]` `Host` names (this blocks DNS rebinding), and writes and WebSocket upgrades from another site's page are rejected by their `Origin`. Allowed origins are the server's own origin, loopback pages, the desktop app (`tauri://localhost`, `http://tauri.localhost`) and any configured CORS origins.
+- `--cors` enables wildcard browser CORS responses, which also lets any web page send requests. Prefer listing origins in `cors_origins`.
+- A reverse proxy in front of a loopback-bound server must forward a loopback `Host` header (nginx does by default with `proxy_pass http://127.0.0.1:8080`).
 
 ### Pagination
 
