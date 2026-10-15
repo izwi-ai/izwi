@@ -2338,22 +2338,15 @@ impl SortformerInferenceModel {
             let pred_rows = if cfg.output_frames_per_encoded_frame == 1 {
                 &prob_rows
             } else {
-                let mut rows = pool_probability_rows(
+                // A trailing encoded frame over a zero-padded mel group keeps
+                // its pooled probability, as in NeMo (which masks by the
+                // encoder length, ceil(T / 8)) and HF (NDZ-6).
+                pooled = pool_probability_rows(
                     &prob_rows,
                     encoded_len,
                     cfg.output_frames_per_encoded_frame,
                     self.num_speakers,
                 )?;
-                // A trailing encoded frame whose stacked mel group was
-                // zero-padded is not a real frame: the reference masks it to
-                // zero probability before the cache sees it.
-                let chunk_mel_frames = plan.feature_end - plan.feature_start;
-                if chunk_mel_frames % cfg.output_frames_per_encoded_frame != 0 {
-                    if let Some(last) = rows.last_mut() {
-                        last.fill(0.0);
-                    }
-                }
-                pooled = rows;
                 &pooled
             };
             let (updated_state, _chunk_preds, output_range) = update_streaming_state(
