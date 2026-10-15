@@ -43,6 +43,8 @@ pub enum WorkerScript {
     TextDeltaThenHang,
     /// `count` deltas of `text_bytes` bytes each, then completion.
     ManyTextDeltas { count: usize, text_bytes: usize },
+    /// Each text as its own delta, then completion.
+    TextDeltas(Vec<String>),
     /// An empty text delta every `output_cadence`: progress without output.
     EmptyDeltaTrickle,
     /// No output, and the runtime cannot confirm teardown: the worker ends
@@ -694,6 +696,12 @@ impl AdmittedExecution for ScriptedExecution {
             }
             (WorkerScript::ManyTextDeltas { count, .. }, step) if step == *count => {
                 self.completed(u64::try_from(*count).unwrap_or(u64::MAX))
+            }
+            (WorkerScript::TextDeltas(texts), step) if step < texts.len() => {
+                self.delta(texts[step].clone())
+            }
+            (WorkerScript::TextDeltas(texts), step) if step == texts.len() => {
+                self.completed(u64::try_from(texts.len()).unwrap_or(u64::MAX))
             }
             (WorkerScript::EmptyDeltaTrickle, step) => {
                 if step > 0 {

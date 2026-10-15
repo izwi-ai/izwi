@@ -1464,6 +1464,78 @@ mod tests {
         assert_eq!(metrics.active_streams, 0);
     }
 
+    /// EDGE-F5 through the gateway: the worker streams the model's tool-call
+    /// markup as text, split mid-tag, and the gateway sends it as
+    /// `delta.tool_calls` with no markup in `delta.content`.
+    #[tokio::test]
+    async fn gateway_streams_worker_tool_markup_as_tool_calls() {
+        let model = ModelVariant::Qwen354BGguf;
+        let deltas = [
+            "Checking.\n<tool",
+            "_call>\n<function=get_",
+            "weather>\n<parameter=city>\nPar",
+            "is\n</parameter>\n</func",
+            "tion>\n</tool_call>",
+        ];
+        let (state, _worker) = registry_gateway_state_with_config(
+            model,
+            TestWorkerConfig {
+                public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+                script: WorkerScript::TextDeltas(deltas.map(str::to_owned).to_vec()),
+                ..TestWorkerConfig::default()
+            },
+        )
+        .await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "weather?"}],
+                    "stream": true,
+                    "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+                })
+                .to_string(),
+            ))
+            .expect("streaming request should build");
+        let response = send(app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("SSE response should be bounded");
+        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
+        let (mut content, mut name, mut arguments, mut finish) =
+            (String::new(), None, String::new(), None);
+        for data in body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+        {
+            let chunk: serde_json::Value = serde_json::from_str(data).expect("chunk JSON");
+            let choice = &chunk["choices"][0];
+            content.push_str(choice["delta"]["content"].as_str().unwrap_or_default());
+            if let Some(call) = choice["delta"]["tool_calls"].get(0) {
+                if let Some(call_name) = call["function"]["name"].as_str() {
+                    name = Some(call_name.to_owned());
+                }
+                arguments.push_str(call["function"]["arguments"].as_str().unwrap_or_default());
+            }
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                finish = Some(reason.to_owned());
+            }
+        }
+        assert_eq!(content, "Checking.", "{body}");
+        assert_eq!(name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).expect("arguments JSON"),
+            json!({"city": "Paris"})
+        );
+        assert_eq!(finish.as_deref(), Some("tool_calls"));
+    }
+
     #[tokio::test]
     async fn gateway_chat_histograms_count_every_dispatched_request() {
         let model = ModelVariant::Qwen354BGguf;

@@ -126,34 +126,9 @@ fn write_python_json(value: &Value, out: &mut String) {
     }
 }
 
-/// Split model output into its text and the calls of every well-formed
-/// marker block. A block that does not parse stays in the text.
-pub(super) fn extract_tool_calls(output: &str) -> (String, Vec<LfmToolCall>) {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    let mut cursor = 0;
-    while let Some(start) = output[cursor..].find(TOOL_CALL_START).map(|at| cursor + at) {
-        text.push_str(&output[cursor..start]);
-        let body_start = start + TOOL_CALL_START.len();
-        let Some(end) = output[body_start..]
-            .find(TOOL_CALL_END)
-            .map(|at| body_start + at)
-        else {
-            text.push_str(&output[start..]);
-            return (text, calls);
-        };
-        let block_end = end + TOOL_CALL_END.len();
-        match parse_call_list(&output[body_start..end]) {
-            Some(parsed) => calls.extend(parsed),
-            None => text.push_str(&output[start..block_end]),
-        }
-        cursor = block_end;
-    }
-    text.push_str(&output[cursor..]);
-    (text, calls)
-}
-
-fn parse_call_list(body: &str) -> Option<Vec<LfmToolCall>> {
+/// Parse the call list between the markers: Pythonic calls, or a JSON
+/// list of `{"name", "arguments"}` objects. `None` when it is neither.
+pub(super) fn parse_call_list(body: &str) -> Option<Vec<LfmToolCall>> {
     if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(body.trim()) {
         return items.iter().map(json_call).collect();
     }
@@ -393,12 +368,12 @@ mod tests {
     }
 
     #[test]
-    fn extracts_pythonic_calls_and_keeps_the_text() {
-        let (text, calls) = extract_tool_calls(
-            "Checking.<|tool_call_start|>[get_weather(city=\"Paris\", days=2), \
-             set(on=True, ratio=-0.5, tags=['a', 'b'], meta={'k': None})]<|tool_call_end|> Done.",
-        );
-        assert_eq!(text, "Checking. Done.");
+    fn parses_pythonic_calls() {
+        let calls = parse_call_list(
+            "[get_weather(city=\"Paris\", days=2), \
+             set(on=True, ratio=-0.5, tags=['a', 'b'], meta={'k': None})]",
+        )
+        .unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(
@@ -412,27 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn extracts_json_calls_and_empty_argument_lists() {
-        let (text, calls) = extract_tool_calls(
-            "<|tool_call_start|>[{\"name\": \"f\", \"arguments\": {\"a\": 1}}]<|tool_call_end|>",
-        );
-        assert_eq!(text, "");
+    fn parses_json_calls_and_empty_argument_lists() {
+        let calls = parse_call_list("[{\"name\": \"f\", \"arguments\": {\"a\": 1}}]").unwrap();
         assert_eq!(calls[0].name, "f");
-        let (_, calls) = extract_tool_calls("<|tool_call_start|>[now()]<|tool_call_end|>");
+        let calls = parse_call_list("[now()]").unwrap();
         assert_eq!(calls[0].name, "now");
         assert!(calls[0].arguments.is_empty());
     }
 
     #[test]
-    fn malformed_or_unterminated_blocks_stay_in_the_text() {
-        for output in [
-            "<|tool_call_start|>[f(a=)]<|tool_call_end|>",
-            "<|tool_call_start|>not a list<|tool_call_end|>",
-            "partial <|tool_call_start|>[f(a=1)]",
-        ] {
-            let (text, calls) = extract_tool_calls(output);
-            assert!(calls.is_empty(), "{output}");
-            assert_eq!(text, output);
+    fn malformed_call_lists_do_not_parse() {
+        for body in ["[f(a=)]", "not a list", "[f(a=1)] trailing"] {
+            assert!(parse_call_list(body).is_none(), "{body}");
         }
     }
 
@@ -440,7 +406,11 @@ mod tests {
     fn rendered_calls_parse_back_to_the_same_arguments() {
         let call = json!({"function": {"name": "f", "arguments": {"s": "a'b\\c\nd", "n": 3, "l": [1, {"k": "v"}]}}});
         let rendered = render_tool_calls(&[call]).unwrap();
-        let (_, calls) = extract_tool_calls(&rendered);
+        let body = rendered
+            .strip_prefix(TOOL_CALL_START)
+            .and_then(|rest| rest.strip_suffix(TOOL_CALL_END))
+            .unwrap();
+        let calls = parse_call_list(body).unwrap();
         assert_eq!(
             Value::Object(calls[0].arguments.clone()),
             json!({"s": "a'b\\c\nd", "n": 3, "l": [1, {"k": "v"}]})

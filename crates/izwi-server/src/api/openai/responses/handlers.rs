@@ -12,6 +12,7 @@ use axum::{
 use crate::api::openai::convert::{
     append_assistant_tool_calls, flatten_content, tool_result_message,
 };
+use crate::api::openai::tool_calls::resolve_tool_policy;
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     chat_top_k, generate_chat, resolve_chat_request_config, spawn_chat_stream,
@@ -68,12 +69,19 @@ pub async fn create_response(
         ));
     }
 
+    // Calls in the answer stay text here: Responses has no `function_call`
+    // output items yet.
+    let tool_policy = resolve_tool_policy(
+        model_variant,
+        req.tools.as_deref(),
+        req.tool_choice.as_ref(),
+    )?;
     let chat_config = resolve_chat_request_config(
         req.enable_thinking,
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        req.tools.clone().unwrap_or_default(),
+        tool_policy.tools,
         media_inputs,
         req.truncation,
     )?;

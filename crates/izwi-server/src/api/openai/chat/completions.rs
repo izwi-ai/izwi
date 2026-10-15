@@ -17,6 +17,10 @@ use crate::api::openai::compat::{
 use crate::api::openai::convert::{
     append_assistant_tool_calls, flatten_content, tool_result_message, InboundContent,
 };
+use crate::api::openai::tool_calls::{
+    parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallDelta, ToolCallFormat,
+    ToolCallParser,
+};
 use crate::api::request_context::{RequestContext, StreamOutcome};
 use crate::app::chat::{
     chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
@@ -139,6 +143,9 @@ pub struct OpenAiInboundMessage {
     pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// On a `tool` message: the id of the call it answers.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,7 +180,7 @@ struct OpenAiAssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAiOutputToolCall>>,
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -271,49 +278,10 @@ struct OpenAiDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAiDeltaToolCall>>,
+    tool_calls: Option<Vec<ToolCallDelta>>,
     /// DS9.3: per-token logprobs for this chunk; absent unless requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<OpenAiChoiceLogprobs>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiDeltaToolCall {
-    index: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    function: Option<OpenAiDeltaToolFunction>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiDeltaToolFunction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiOutputToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    kind: &'static str,
-    function: OpenAiOutputToolFunction,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiOutputToolFunction {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Clone)]
-struct ParsedAssistantToolOutput {
-    content: String,
-    tool_calls: Vec<OpenAiOutputToolCall>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,12 +302,12 @@ fn now_unix_secs() -> u64 {
 fn to_core_messages_with_media(
     variant: ModelVariant,
     messages: Vec<OpenAiInboundMessage>,
-    _enable_thinking: Option<bool>,
-    _tools: Option<Vec<serde_json::Value>>,
-    _tool_choice: Option<serde_json::Value>,
 ) -> Result<(Vec<ChatMessage>, Vec<ChatMediaInput>), ApiError> {
     let mut core = Vec::with_capacity(messages.len());
     let mut media_inputs = Vec::new();
+    // The ids of the latest assistant turn's tool calls, which the tool
+    // results after it answer.
+    let mut call_ids: Vec<String> = Vec::new();
 
     for message in messages {
         let role = parse_role(&message.role)?;
@@ -349,6 +317,25 @@ fn to_core_messages_with_media(
         if role == InboundMessageRole::Assistant {
             let tool_calls = message.tool_calls.as_deref().unwrap_or(&[]);
             append_assistant_tool_calls(variant, &mut content, tool_calls)?;
+            call_ids = tool_calls
+                .iter()
+                .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect();
+        }
+        if role == InboundMessageRole::Tool {
+            // The templates read results in call order and carry no ids, so
+            // an id is checked against the calls it claims to answer.
+            if let Some(id) = &message.tool_call_id {
+                if !call_ids.is_empty() && !call_ids.contains(id) {
+                    return Err(ApiError::invalid_param(
+                        "messages",
+                        format!(
+                            "Tool message `tool_call_id` {id:?} does not match a tool call of the preceding assistant message"
+                        ),
+                    ));
+                }
+            }
         }
 
         match role {
@@ -426,146 +413,6 @@ fn parse_role(raw: &str) -> Result<InboundMessageRole, ApiError> {
     }
 }
 
-fn parse_assistant_tool_output(raw_output: &str) -> ParsedAssistantToolOutput {
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(start_rel) = raw_output[cursor..].find("<tool_call>") {
-        let start = cursor + start_rel;
-        text.push_str(&raw_output[cursor..start]);
-
-        let block_start = start + "<tool_call>".len();
-        let Some(end_rel) = raw_output[block_start..].find("</tool_call>") else {
-            text.push_str(&raw_output[start..]);
-            cursor = raw_output.len();
-            break;
-        };
-        let end = block_start + end_rel;
-        let block = &raw_output[block_start..end];
-        let block_with_tags = &raw_output[start..(end + "</tool_call>".len())];
-
-        if let Some(call) = parse_tool_call_block(block) {
-            tool_calls.push(call);
-        } else {
-            text.push_str(block_with_tags);
-        }
-
-        cursor = end + "</tool_call>".len();
-    }
-
-    if cursor < raw_output.len() {
-        text.push_str(&raw_output[cursor..]);
-    }
-
-    ParsedAssistantToolOutput {
-        content: text.trim().to_string(),
-        tool_calls,
-    }
-}
-
-fn parse_tool_call_block(block: &str) -> Option<OpenAiOutputToolCall> {
-    let fn_start = block.find("<function=")?;
-    let name_start = fn_start + "<function=".len();
-    let name_end_rel = block[name_start..].find('>')?;
-    let name_end = name_start + name_end_rel;
-    let function_name = block[name_start..name_end].trim();
-    if function_name.is_empty() {
-        return None;
-    }
-
-    let fn_body_start = name_end + 1;
-    let fn_close_rel = block[fn_body_start..].find("</function>")?;
-    let fn_body_end = fn_body_start + fn_close_rel;
-    let fn_body = &block[fn_body_start..fn_body_end];
-
-    let mut args = serde_json::Map::new();
-    let mut cursor = 0usize;
-    while let Some(param_rel) = fn_body[cursor..].find("<parameter=") {
-        let param_start = cursor + param_rel + "<parameter=".len();
-        let key_end_rel = fn_body[param_start..].find('>')?;
-        let key_end = param_start + key_end_rel;
-        let key = fn_body[param_start..key_end].trim();
-        if key.is_empty() {
-            return None;
-        }
-
-        let value_start = key_end + 1;
-        let value_end_rel = fn_body[value_start..].find("</parameter>")?;
-        let value_end = value_start + value_end_rel;
-        let raw_value = fn_body[value_start..value_end].trim();
-        let value = serde_json::from_str::<serde_json::Value>(raw_value)
-            .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
-        args.insert(key.to_string(), value);
-        cursor = value_end + "</parameter>".len();
-    }
-
-    Some(OpenAiOutputToolCall {
-        id: new_uuid(),
-        kind: "function",
-        function: OpenAiOutputToolFunction {
-            name: function_name.to_string(),
-            arguments: serde_json::to_string(&serde_json::Value::Object(args)).ok()?,
-        },
-    })
-}
-
-fn build_assistant_response_parts(
-    text: String,
-) -> (
-    Option<String>,
-    Option<Vec<OpenAiOutputToolCall>>,
-    &'static str,
-) {
-    let (lfm_text, lfm_calls) = crate::api::openai::lfm_tools::extract_tool_calls(&text);
-    if !lfm_calls.is_empty() {
-        let tool_calls = lfm_calls
-            .into_iter()
-            .map(|call| OpenAiOutputToolCall {
-                id: new_uuid(),
-                kind: "function",
-                function: OpenAiOutputToolFunction {
-                    name: call.name,
-                    arguments: serde_json::Value::Object(call.arguments).to_string(),
-                },
-            })
-            .collect();
-        let content = lfm_text.trim();
-        return (
-            (!content.is_empty()).then(|| content.to_string()),
-            Some(tool_calls),
-            "tool_calls",
-        );
-    }
-    let parsed = parse_assistant_tool_output(&text);
-    if parsed.tool_calls.is_empty() {
-        (Some(text), None, "stop")
-    } else {
-        let content = if parsed.content.is_empty() {
-            None
-        } else {
-            Some(parsed.content)
-        };
-        (content, Some(parsed.tool_calls), "tool_calls")
-    }
-}
-
-fn stream_tool_call_deltas(tool_calls: &[OpenAiOutputToolCall]) -> Vec<OpenAiDeltaToolCall> {
-    tool_calls
-        .iter()
-        .enumerate()
-        .map(|(idx, call)| OpenAiDeltaToolCall {
-            index: idx,
-            id: Some(call.id.clone()),
-            kind: Some(call.kind),
-            function: Some(OpenAiDeltaToolFunction {
-                name: Some(call.function.name.clone()),
-                arguments: Some(call.function.arguments.clone()),
-            }),
-        })
-        .collect()
-}
-
 fn validate_chat_request_compatibility(
     req: &ChatCompletionRequest,
     profile: OpenAiCompatibilityProfile,
@@ -628,19 +475,6 @@ fn validate_chat_request_compatibility(
         )));
     }
 
-    if profile.is_strict() {
-        if let Some(tool_choice) = &req.tool_choice {
-            if !tool_choice.is_null()
-                && tool_choice.as_str() != Some("auto")
-                && tool_choice.as_str() != Some("none")
-            {
-                return Err(ApiError::bad_request(strict_guardrail_message(
-                    "tool_choice (supported values: \"auto\", \"none\", or null)",
-                )));
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -649,17 +483,13 @@ pub async fn completions(
     Extension(ctx): Extension<RequestContext>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let compat_profile = compatibility_profile();
-    validate_chat_request_compatibility(&req, compat_profile)?;
-    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
-    let reasoning = reasoning_split_mode(&req, &execution_request)?;
+    validate_chat_request_compatibility(&req, compatibility_profile())?;
+    let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
     complete_chat(
         LocalChat(state),
         req,
-        variant,
         execution_request,
-        compat_profile,
-        reasoning,
+        format,
         ctx.stream_outcome.clone(),
     )
     .await
@@ -678,10 +508,8 @@ pub async fn gateway_completions(
             ApiError::bad_request("Gateway chat request body is not valid JSON")
         }
     })?;
-    let compat_profile = compatibility_profile();
-    validate_chat_request_compatibility(&req, compat_profile)?;
-    let (variant, execution_request) = prepare_execution_request(&req, &ctx)?;
-    let reasoning = reasoning_split_mode(&req, &execution_request)?;
+    validate_chat_request_compatibility(&req, compatibility_profile())?;
+    let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
     state
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
@@ -695,13 +523,22 @@ pub async fn gateway_completions(
     complete_chat(
         backend,
         req,
-        variant,
         execution_request,
-        compat_profile,
-        reasoning,
+        format,
         ctx.stream_outcome.clone(),
     )
     .await
+}
+
+/// How a request's answer is rendered: extensions, reasoning split and tool
+/// calls.
+#[derive(Debug, Clone, Copy)]
+struct AnswerFormat {
+    compat_profile: OpenAiCompatibilityProfile,
+    /// See [`reasoning_split_mode`].
+    reasoning: Option<bool>,
+    /// The tool-call format to parse; `None` leaves the answer text.
+    tool_calls: Option<ToolCallFormat>,
 }
 
 /// Runs a validated chat request on `backend` and renders the OpenAI answer:
@@ -709,21 +546,18 @@ pub async fn gateway_completions(
 async fn complete_chat<B: ChatBackend>(
     backend: B,
     req: ChatCompletionRequest,
-    variant: ModelVariant,
     execution_request: ChatExecutionRequest,
-    compat_profile: OpenAiCompatibilityProfile,
-    reasoning: Option<bool>,
+    format: AnswerFormat,
     stream_outcome: StreamOutcome,
 ) -> Result<Response, ApiError> {
+    let variant = execution_request.variant;
     if req.stream.unwrap_or(false) {
-        let model_id = execution_request.variant.dir_name().to_string();
         let (event_rx, observer) = backend.stream(execution_request).await?;
         return Ok(render_chat_stream(
             req,
-            model_id,
+            variant.dir_name().to_string(),
             event_rx,
-            compat_profile,
-            reasoning,
+            format,
             AuditedStream {
                 observer,
                 outcome: stream_outcome,
@@ -732,12 +566,7 @@ async fn complete_chat<B: ChatBackend>(
         .into_response());
     }
     let generation = backend.generate(execution_request).await?;
-    Ok(render_completion_response(
-        variant,
-        generation,
-        compat_profile,
-        reasoning,
-    ))
+    Ok(render_completion_response(variant, generation, format))
 }
 
 /// The most OpenAI `stop` strings a chat request may carry.
@@ -783,22 +612,18 @@ fn ensure_response_format_supported(
     Ok(())
 }
 
+/// The engine request for `req` and how its answer is rendered.
 fn prepare_execution_request(
     req: &ChatCompletionRequest,
     ctx: &RequestContext,
-) -> Result<(ModelVariant, ChatExecutionRequest), ApiError> {
+) -> Result<(ChatExecutionRequest, AnswerFormat), ApiError> {
     let variant = parse_chat_model(&req.model)?;
     let stop_sequences = chat_stop_sequences(req.stop.as_ref())?;
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
     }
-    let (messages, media_inputs) = to_core_messages_with_media(
-        variant,
-        req.messages.clone(),
-        req.enable_thinking,
-        req.tools.clone(),
-        req.tool_choice.clone(),
-    )?;
+    let tool_policy = resolve_tool_policy(variant, req.tools.as_deref(), req.tool_choice.as_ref())?;
+    let (messages, media_inputs) = to_core_messages_with_media(variant, req.messages.clone())?;
     validate_media_inputs_for_variant(variant, &media_inputs).map_err(ApiError::bad_request)?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -810,7 +635,7 @@ fn prepare_execution_request(
         req.reasoning_effort,
         req.preserve_thinking,
         req.chat_template_kwargs.as_ref(),
-        req.tools.clone().unwrap_or_default(),
+        tool_policy.tools,
         media_inputs,
         req.truncation,
     )?;
@@ -837,7 +662,12 @@ fn prepare_execution_request(
         correlation_id: Some(ctx.correlation_id.clone()),
     };
     validate_chat_request_ranges(&execution)?;
-    Ok((variant, execution))
+    let format = AnswerFormat {
+        compat_profile: compatibility_profile(),
+        reasoning: reasoning_split_mode(req, &execution)?,
+        tool_calls: tool_policy.format,
+    };
+    Ok((execution, format))
 }
 
 /// `Some(opened_in_prompt)` when the request asked for `reasoning_format:
@@ -871,34 +701,36 @@ fn reasoning_split_mode(
 fn render_completion_response(
     variant: ModelVariant,
     generation: ChatGeneration,
-    compat_profile: OpenAiCompatibilityProfile,
-    reasoning: Option<bool>,
+    format: AnswerFormat,
 ) -> Response {
-    let completion_id = new_uuid();
-    let created = now_unix_secs();
     let completion_tokens = generation.tokens_generated;
     let prompt_tokens = generation.prompt_tokens;
-    let (reasoning_content, text) = match reasoning {
-        Some(opened_in_prompt) => super::reasoning::split_reasoning(&generation.text, opened_in_prompt),
+    let (reasoning_content, text) = match format.reasoning {
+        Some(opened_in_prompt) => {
+            super::reasoning::split_reasoning(&generation.text, opened_in_prompt)
+        }
         None => (None, generation.text),
     };
-    let (assistant_content, assistant_tool_calls, finish_reason) =
-        build_assistant_response_parts(text);
+    let (content, tool_calls) = match format.tool_calls {
+        Some(tool_format) => parse_answer(tool_format, &text),
+        None => (Some(text), Vec::new()),
+    };
+    let compat_profile = format.compat_profile;
 
     let response = OpenAiChatCompletionResponse {
-        id: completion_id,
+        id: new_uuid(),
         object: "chat.completion",
-        created,
+        created: now_unix_secs(),
         model: variant.dir_name().to_string(),
         choices: vec![OpenAiChoice {
             index: 0,
+            finish_reason: finish_reason(!tool_calls.is_empty(), generation.finish_reason),
             message: OpenAiAssistantMessage {
                 role: "assistant",
                 reasoning_content,
-                content: assistant_content,
-                tool_calls: assistant_tool_calls,
+                content,
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             },
-            finish_reason: measured_finish_reason(finish_reason, generation.finish_reason),
             logprobs: openai_logprobs(&generation.logprobs),
         }],
         usage: OpenAiUsage {
@@ -943,12 +775,92 @@ impl<O: ChatStreamObserver> ChatStreamObserver for AuditedStream<O> {
     }
 }
 
+/// Streamed answer text on its way to the client: reasoning is split off
+/// first, then tool-call markup becomes `tool_calls`.
+struct AnswerStream {
+    splitter: Option<super::reasoning::ReasoningSplitter>,
+    tool_calls: Option<ToolCallParser>,
+}
+
+impl AnswerStream {
+    fn new(format: AnswerFormat) -> Self {
+        Self {
+            splitter: format
+                .reasoning
+                .map(super::reasoning::ReasoningSplitter::new),
+            tool_calls: format.tool_calls.map(ToolCallParser::new),
+        }
+    }
+
+    /// The delta for one piece of model text.
+    fn push(&mut self, text: &str) -> OpenAiDelta {
+        let (reasoning, content) = match self.splitter.as_mut() {
+            Some(splitter) => splitter.push(text),
+            None => (String::new(), text.to_string()),
+        };
+        let parsed = match self.tool_calls.as_mut() {
+            Some(parser) => parser.push(&content),
+            None => ParsedOutput {
+                content,
+                tool_calls: Vec::new(),
+            },
+        };
+        answer_delta(reasoning, parsed)
+    }
+
+    /// The delta for the text held back at the end of the answer.
+    fn finish(&mut self) -> OpenAiDelta {
+        let (reasoning, content) = self
+            .splitter
+            .as_mut()
+            .map(|splitter| splitter.finish())
+            .unwrap_or_default();
+        let parsed = match self.tool_calls.as_mut() {
+            Some(parser) => {
+                let mut parsed = parser.push(&content);
+                parsed.extend(parser.finish());
+                parsed
+            }
+            None => ParsedOutput {
+                content,
+                tool_calls: Vec::new(),
+            },
+        };
+        answer_delta(reasoning, parsed)
+    }
+
+    fn saw_tool_calls(&self) -> bool {
+        self.tool_calls
+            .as_ref()
+            .is_some_and(ToolCallParser::saw_tool_calls)
+    }
+}
+
+fn answer_delta(reasoning: String, parsed: ParsedOutput) -> OpenAiDelta {
+    OpenAiDelta {
+        role: None,
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        content: (!parsed.content.is_empty()).then_some(parsed.content),
+        tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
+        logprobs: None,
+    }
+}
+
+impl OpenAiDelta {
+    fn is_empty(&self) -> bool {
+        self.role.is_none()
+            && self.reasoning_content.is_none()
+            && self.content.is_none()
+            && self.tool_calls.is_none()
+            && self.logprobs.is_none()
+    }
+}
+
 fn render_chat_stream(
     req: ChatCompletionRequest,
     model_id: String,
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
-    compat_profile: OpenAiCompatibilityProfile,
-    reasoning: Option<bool>,
+    format: AnswerFormat,
     observer: impl ChatStreamObserver,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let include_usage = req
@@ -958,152 +870,86 @@ fn render_chat_stream(
         .unwrap_or(false);
     let completion_id = new_uuid();
     let created = now_unix_secs();
+    let chunk = move |delta: OpenAiDelta, finish_reason: Option<&'static str>| OpenAiChatChunk {
+        id: completion_id.clone(),
+        object: "chat.completion.chunk",
+        created,
+        model: model_id.clone(),
+        choices: vec![OpenAiChunkChoice {
+            index: 0,
+            delta,
+            finish_reason,
+        }],
+        usage: None,
+        izwi_generation_time_ms: None,
+        izwi_timing: None,
+    };
 
     let stream = async_stream::stream! {
         let mut observer = observer;
-        let mut splitter = reasoning.map(super::reasoning::ReasoningSplitter::new);
+        let mut answer = AnswerStream::new(format);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
             let (payload, terminal) = match event {
-                ChatStreamEvent::Started => (
-                    serde_json::to_string(&OpenAiChatChunk {
-                        id: completion_id.clone(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: model_id.clone(),
-                        choices: vec![OpenAiChunkChoice {
-                            index: 0,
-                            delta: OpenAiDelta {
-                                role: Some("assistant"),
-                                reasoning_content: None,
-                                content: None,
-                                tool_calls: None,
-                                logprobs: None,
-                            },
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                        izwi_generation_time_ms: None,
-                        izwi_timing: None,
-                    })
-                    .unwrap_or_default(),
-                    false,
-                ),
+                ChatStreamEvent::Started => {
+                    let delta = OpenAiDelta {
+                        role: Some("assistant"),
+                        reasoning_content: None,
+                        content: None,
+                        tool_calls: None,
+                        logprobs: None,
+                    };
+                    (Some(chunk_json(&chunk(delta, None))), false)
+                }
                 ChatStreamEvent::Delta { text, logprobs } => {
                     if !text.is_empty() {
                         observer.record_delta();
                     }
-                    let (reasoning_content, content) = match splitter.as_mut() {
-                        Some(splitter) => {
-                            let (reasoning, content) = splitter.push(&text);
-                            (
-                                (!reasoning.is_empty()).then_some(reasoning),
-                                (!content.is_empty()).then_some(content),
-                            )
-                        }
-                        None => (None, Some(text)),
+                    let delta = OpenAiDelta {
+                        logprobs: openai_logprobs(&logprobs),
+                        ..answer.push(&text)
                     };
-                    (
-                    serde_json::to_string(&OpenAiChatChunk {
-                        id: completion_id.clone(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: model_id.clone(),
-                        choices: vec![OpenAiChunkChoice {
-                            index: 0,
-                            delta: OpenAiDelta {
-                                role: None,
-                                reasoning_content,
-                                content,
-                                tool_calls: None,
-                                logprobs: openai_logprobs(&logprobs),
-                            },
-                            finish_reason: None,
-                        }],
-                        usage: None,
-                        izwi_generation_time_ms: None,
-                        izwi_timing: None,
-                    })
-                    .unwrap_or_default(),
-                    false,
-                    )
+                    ((!delta.is_empty()).then(|| chunk_json(&chunk(delta, None))), false)
                 }
                 ChatStreamEvent::Completed(generation) => {
                     observer.record_completion(&generation);
-                    // Text the splitter still held back is final now.
-                    let (tail_reasoning, tail_content) = splitter
-                        .as_mut()
-                        .map(|splitter| splitter.finish())
-                        .unwrap_or_default();
-                    let answer = match reasoning {
-                        Some(opened_in_prompt) => {
-                            super::reasoning::split_reasoning(&generation.text, opened_in_prompt).1
-                        }
-                        None => generation.text.clone(),
-                    };
-                    let (_, tool_calls, finish_reason) = build_assistant_response_parts(answer);
-                    let delta_tool_calls =
-                        tool_calls.as_ref().map(|calls| stream_tool_call_deltas(calls));
-                    (
-                        serde_json::to_string(&OpenAiChatChunk {
-                            id: completion_id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: model_id.clone(),
-                            choices: vec![OpenAiChunkChoice {
-                                index: 0,
-                                delta: OpenAiDelta {
-                                    role: None,
-                                    reasoning_content: (!tail_reasoning.is_empty())
-                                        .then_some(tail_reasoning),
-                                    content: (!tail_content.is_empty()).then_some(tail_content),
-                                    tool_calls: delta_tool_calls,
-                                    logprobs: None,
-                                },
-                                finish_reason: Some(if tool_calls.is_some() {
-                                    "tool_calls"
-                                } else {
-                                    measured_finish_reason(finish_reason, generation.finish_reason)
-                                }),
-                            }],
-                            usage: include_usage.then_some(OpenAiUsage {
-                                prompt_tokens: generation.prompt_tokens,
-                                completion_tokens: generation.tokens_generated,
-                                total_tokens: generation.prompt_tokens
-                                    + generation.tokens_generated,
-                                prompt_tokens_details: OpenAiPromptTokensDetails {
-                                    cached_tokens: generation
-                                        .cached_prompt_tokens
-                                        .unwrap_or(0),
-                                },
-                            }),
-                            izwi_generation_time_ms: compat_profile
-                                .is_relaxed()
-                                .then_some(generation.generation_time_ms),
-                            izwi_timing: compat_profile.is_relaxed()
-                                .then_some(generation.latency_breakdown).flatten(),
-                        })
-                        .unwrap_or_default(),
-                        true,
-                    )
+                    // Text held back for a tag is final now.
+                    let delta = answer.finish();
+                    let finish = finish_reason(answer.saw_tool_calls(), generation.finish_reason);
+                    let mut last = chunk(delta, Some(finish));
+                    if include_usage {
+                        last.usage = Some(OpenAiUsage {
+                            prompt_tokens: generation.prompt_tokens,
+                            completion_tokens: generation.tokens_generated,
+                            total_tokens: generation.prompt_tokens + generation.tokens_generated,
+                            prompt_tokens_details: OpenAiPromptTokensDetails {
+                                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
+                            },
+                        });
+                    }
+                    if format.compat_profile.is_relaxed() {
+                        last.izwi_generation_time_ms = Some(generation.generation_time_ms);
+                        last.izwi_timing = generation.latency_breakdown;
+                    }
+                    (Some(chunk_json(&last)), true)
                 }
                 ChatStreamEvent::Failed(error) => {
                     observer.record_failure();
-                    (openai_chat_stream_error_payload(error), true)
+                    (Some(openai_chat_stream_error_payload(error)), true)
                 }
                 ChatStreamEvent::ShuttingDown => {
                     observer.record_failure();
                     (
-                        openai_chat_stream_error_payload("Server is shutting down"),
+                        Some(openai_chat_stream_error_payload("Server is shutting down")),
                         true,
                     )
                 }
             };
+            if let Some(payload) = payload {
+                yield Ok(Event::default().data(payload));
+            }
             if terminal {
                 saw_terminal = true;
-            }
-            yield Ok(Event::default().data(payload));
-            if terminal {
                 break;
             }
         }
@@ -1115,6 +961,10 @@ fn render_chat_stream(
     };
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+fn chunk_json(chunk: &OpenAiChatChunk) -> String {
+    serde_json::to_string(chunk).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1142,29 +992,190 @@ mod tests {
         assert!(openai_chat_stream_interruption_payload(true).is_none());
     }
 
-    #[test]
-    fn parses_qwen_tool_call_output_into_openai_shape() {
-        let output = "Checking that now.\n<tool_call>\n<function=get_time>\n<parameter=timezone>\n\"Africa/Harare\"\n</parameter>\n</function>\n</tool_call>";
-        let parsed = parse_assistant_tool_output(output);
+    pub(super) fn generation(text: &str) -> ChatGeneration {
+        ChatGeneration {
+            latency_breakdown: None,
+            finish_reason: None,
+            text: text.to_string(),
+            prompt_tokens: 3,
+            tokens_generated: 5,
+            generation_time_ms: 0.0,
+            cached_prompt_tokens: None,
+            logprobs: Vec::new(),
+        }
+    }
 
-        assert_eq!(parsed.content, "Checking that now.");
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].function.name, "get_time");
-        assert!(parsed.tool_calls[0]
-            .function
-            .arguments
-            .contains("Africa/Harare"));
+    /// The `data:` payloads of the SSE stream that `events` render to for
+    /// the request `body`.
+    pub(super) async fn sse_payloads(
+        body: serde_json::Value,
+        format: AnswerFormat,
+        events: Vec<ChatStreamEvent>,
+    ) -> Vec<String> {
+        let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        drop(tx);
+        let response = render_chat_stream(req, "fixture".into(), rx, format, ()).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The text, assembled tool calls and finish reason a client reads from
+    /// a chat stream.
+    fn read_stream(payloads: &[String]) -> (String, Vec<serde_json::Value>, serde_json::Value) {
+        let mut content = String::new();
+        let mut calls: Vec<serde_json::Value> = Vec::new();
+        let mut finish = serde_json::Value::Null;
+        for payload in payloads.iter().filter(|payload| *payload != "[DONE]") {
+            let chunk: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let Some(choice) = chunk["choices"].get(0) else {
+                continue;
+            };
+            if let Some(text) = choice["delta"]["content"].as_str() {
+                content.push_str(text);
+            }
+            for delta in choice["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let index = delta["index"].as_u64().unwrap() as usize;
+                let arguments = delta["function"]["arguments"].as_str().unwrap_or_default();
+                if index == calls.len() {
+                    calls.push(json!({
+                        "id": delta["id"],
+                        "type": delta["type"],
+                        "name": delta["function"]["name"],
+                        "arguments": arguments,
+                    }));
+                } else {
+                    let call = &mut calls[index]["arguments"];
+                    *call = json!(format!("{}{arguments}", call.as_str().unwrap()));
+                }
+            }
+            if !choice["finish_reason"].is_null() {
+                finish = choice["finish_reason"].clone();
+            }
+        }
+        (content, calls, finish)
+    }
+
+    fn deltas(text: &str, size: usize) -> Vec<ChatStreamEvent> {
+        let chars: Vec<char> = text.chars().collect();
+        std::iter::once(ChatStreamEvent::Started)
+            .chain(chars.chunks(size).map(|piece| ChatStreamEvent::Delta {
+                text: piece.iter().collect(),
+                logprobs: Vec::new(),
+            }))
+            .chain(std::iter::once(ChatStreamEvent::Completed(Box::new(
+                generation(text),
+            ))))
+            .collect()
+    }
+
+    fn tool_format(tool_calls: Option<ToolCallFormat>) -> AnswerFormat {
+        AnswerFormat {
+            compat_profile: OpenAiCompatibilityProfile::Strict,
+            reasoning: None,
+            tool_calls,
+        }
+    }
+
+    /// EDGE-F5: streamed tool calls arrive as `delta.tool_calls`, with no
+    /// markup in `delta.content`, however the deltas split the tags.
+    #[tokio::test]
+    async fn streamed_tool_calls_never_leak_markup_into_content() {
+        let cases = [
+            (
+                ToolCallFormat::QwenXml,
+                "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+            ),
+            (
+                ToolCallFormat::LfmPythonic,
+                "Let me check.<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>",
+            ),
+        ];
+        let body = json!({"model": "m", "messages": [], "stream": true});
+        for (format, text) in cases {
+            for size in [1, 2, 3, 5, 8, 13, text.len()] {
+                let payloads =
+                    sse_payloads(body.clone(), tool_format(Some(format)), deltas(text, size)).await;
+                let (content, calls, finish) = read_stream(&payloads);
+                assert_eq!(content, "Let me check.", "{format:?} split {size}");
+                assert_eq!(calls.len(), 1, "{format:?} split {size}");
+                assert!(calls[0]["id"].as_str().unwrap().starts_with("call_"));
+                assert_eq!(calls[0]["type"], "function");
+                assert_eq!(calls[0]["name"], "get_weather");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(
+                        calls[0]["arguments"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    json!({"city": "Paris"})
+                );
+                assert_eq!(finish, "tool_calls");
+            }
+        }
+    }
+
+    /// Without offered tools the answer is text, markup and all.
+    #[tokio::test]
+    async fn tool_markup_is_text_when_no_tools_were_offered() {
+        let text = "<tool_call>\n<function=f>\n</function>\n</tool_call>";
+        let body = json!({"model": "m", "messages": [], "stream": true});
+        let payloads = sse_payloads(body, tool_format(None), deltas(text, 4)).await;
+        let (content, calls, finish) = read_stream(&payloads);
+        assert_eq!((content.as_str(), calls.len()), (text, 0));
+        assert_eq!(finish, "stop");
+
+        let response = render_completion_response(
+            ModelVariant::Qwen359BGguf,
+            generation(text),
+            tool_format(None),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], text);
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]
-    fn builds_tool_call_finish_reason_when_tool_output_detected() {
-        let (content, tool_calls, finish_reason) = build_assistant_response_parts(
-            "<tool_call>\n<function=ping>\n</function>\n</tool_call>".to_string(),
-        );
-
-        assert!(content.is_none());
-        assert_eq!(finish_reason, "tool_calls");
-        assert_eq!(tool_calls.map(|calls| calls.len()), Some(1));
+    fn tool_results_must_answer_a_call_of_the_preceding_turn() {
+        let message = |role: &str, tool_calls, tool_call_id: Option<&str>| OpenAiInboundMessage {
+            role: role.to_string(),
+            content: Some(InboundContent::Text("x".to_string())),
+            tool_calls,
+            tool_call_id: tool_call_id.map(str::to_owned),
+        };
+        let call = Some(vec![json!({
+            "id": "call_a", "type": "function", "function": {"name": "f", "arguments": "{}"}
+        })]);
+        let conversation = |id| {
+            vec![
+                message("user", None, None),
+                message("assistant", call.clone(), None),
+                message("tool", None, Some(id)),
+            ]
+        };
+        to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_a"))
+            .expect("the result answers the call");
+        let error = to_core_messages_with_media(ModelVariant::Qwen359BGguf, conversation("call_b"))
+            .expect_err("an unknown call id is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("call_b"), "{}", error.message);
     }
 
     #[test]
@@ -1173,6 +1184,7 @@ mod tests {
             role: role.to_string(),
             content: Some(InboundContent::Text(content.to_string())),
             tool_calls: None,
+            tool_call_id: None,
         };
         let messages = vec![
             text("user", "Weather in Paris?"),
@@ -1184,17 +1196,13 @@ mod tests {
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
                 })]),
+                tool_call_id: None,
             },
             text("tool", "{\"temperature_c\": 21}"),
         ];
-        let (lfm, _) = to_core_messages_with_media(
-            ModelVariant::Lfm2512BInstructGguf,
-            messages.clone(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let (lfm, _) =
+            to_core_messages_with_media(ModelVariant::Lfm2512BInstructGguf, messages.clone())
+                .unwrap();
         assert_eq!(
             lfm[1].content,
             "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"
@@ -1203,25 +1211,10 @@ mod tests {
         assert_eq!(lfm[2].content, "{\"temperature_c\": 21}");
 
         // Other families keep the Qwen tool format.
-        let (qwen, _) =
-            to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages, None, None, None)
-                .unwrap();
+        let (qwen, _) = to_core_messages_with_media(ModelVariant::Qwen314BGguf, messages).unwrap();
         assert!(qwen[1].content.contains("<function=get_weather>"));
         assert_eq!(qwen[2].role, ChatRole::User);
         assert!(qwen[2].content.starts_with("<tool_response>"));
-    }
-
-    #[test]
-    fn parses_lfm25_tool_call_output_into_openai_shape() {
-        let (content, tool_calls, finish_reason) = build_assistant_response_parts(
-            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>Checking.".to_string(),
-        );
-        assert_eq!(finish_reason, "tool_calls");
-        assert_eq!(content.as_deref(), Some("Checking."));
-        let calls = tool_calls.expect("tool calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].function.name, "get_weather");
-        assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
     }
 
     #[test]
@@ -1242,10 +1235,8 @@ mod tests {
                     input_video: None,
                 }])),
                 tool_calls: None,
+                tool_call_id: None,
             }],
-            None,
-            None,
-            None,
         )
         .expect("multimodal parts should normalize");
 
@@ -1267,6 +1258,7 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
+                tool_call_id: None,
             }],
             max_tokens: None,
             max_completion_tokens: None,
@@ -1309,6 +1301,7 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
+                tool_call_id: None,
             }],
             max_tokens: None,
             max_completion_tokens: None,
@@ -1375,6 +1368,7 @@ mod tests {
                 role: "user".to_string(),
                 content: Some(InboundContent::Text("hello".to_string())),
                 tool_calls: None,
+                tool_call_id: None,
             }],
             max_tokens: None,
             max_completion_tokens: None,
@@ -1406,50 +1400,20 @@ mod tests {
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
             .expect("relaxed mode should allow passthrough");
     }
-
-    #[test]
-    fn stream_tool_call_deltas_include_index_and_arguments() {
-        let tool_calls = vec![OpenAiOutputToolCall {
-            id: "call_123".to_string(),
-            kind: "function",
-            function: OpenAiOutputToolFunction {
-                name: "get_weather".to_string(),
-                arguments: "{\"city\":\"Harare\"}".to_string(),
-            },
-        }];
-
-        let deltas = stream_tool_call_deltas(&tool_calls);
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].index, 0);
-        assert_eq!(deltas[0].id.as_deref(), Some("call_123"));
-        assert_eq!(deltas[0].kind, Some("function"));
-        assert_eq!(
-            deltas[0]
-                .function
-                .as_ref()
-                .and_then(|function| function.name.as_deref()),
-            Some("get_weather")
-        );
-        assert!(deltas[0]
-            .function
-            .as_ref()
-            .and_then(|function| function.arguments.as_deref())
-            .is_some_and(|args| args.contains("Harare")));
-    }
 }
 
-// Tool calls keep their OpenAI termination contract; ordinary output carries
-// the engine's actual budget termination rather than reporting every run as stop.
-fn measured_finish_reason(
-    parsed: &'static str,
+/// Tool calls keep their OpenAI termination contract; other answers report
+/// the engine's budget termination rather than every run as `stop`.
+fn finish_reason(
+    tool_calls: bool,
     reason: Option<izwi_core::engine::OutputFinishReason>,
 ) -> &'static str {
-    if parsed == "tool_calls" {
-        parsed
+    if tool_calls {
+        "tool_calls"
     } else if reason == Some(izwi_core::engine::OutputFinishReason::MaxTokens) {
         "length"
     } else {
-        parsed
+        "stop"
     }
 }
 
@@ -1463,8 +1427,7 @@ mod timing_contract_tests {
             "reasoning".into(),
             izwi_hooks::Principal::local_anonymous(),
         );
-        let (_, execution) = prepare_execution_request(&req, &ctx).unwrap();
-        reasoning_split_mode(&req, &execution)
+        prepare_execution_request(&req, &ctx).map(|(_, format)| format.reasoning)
     }
 
     #[test]
@@ -1524,24 +1487,28 @@ mod timing_contract_tests {
                 .unwrap();
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
         };
+        let format = |reasoning, tool_calls| AnswerFormat {
+            compat_profile: OpenAiCompatibilityProfile::Strict,
+            reasoning,
+            tool_calls,
+        };
         let text = "<think>check the tool</think>\n\n<|tool_call_start|>[now()]<|tool_call_end|>";
         let parsed = body(render_completion_response(
             ModelVariant::Lfm2512BThinkingGguf,
             generation(text),
-            OpenAiCompatibilityProfile::Strict,
-            Some(false),
+            format(Some(false), Some(ToolCallFormat::LfmPythonic)),
         ))
         .await;
         let message = &parsed["choices"][0]["message"];
         assert_eq!(message["reasoning_content"], "check the tool");
         assert!(message.get("content").is_none());
         assert_eq!(message["tool_calls"][0]["function"]["name"], "now");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "tool_calls");
 
         let raw = body(render_completion_response(
             ModelVariant::Lfm2512BThinkingGguf,
             generation("<think>r</think>A"),
-            OpenAiCompatibilityProfile::Strict,
-            None,
+            format(None, None),
         ))
         .await;
         assert!(raw["choices"][0]["message"].get("reasoning_content").is_none());
@@ -1550,27 +1517,10 @@ mod timing_contract_tests {
 
     #[test]
     fn budget_termination_is_length_without_overriding_tool_calls() {
-        assert_eq!(
-            measured_finish_reason(
-                "stop",
-                Some(izwi_core::engine::OutputFinishReason::MaxTokens)
-            ),
-            "length"
-        );
-        assert_eq!(
-            measured_finish_reason(
-                "stop",
-                Some(izwi_core::engine::OutputFinishReason::StopToken)
-            ),
-            "stop"
-        );
-        assert_eq!(
-            measured_finish_reason(
-                "tool_calls",
-                Some(izwi_core::engine::OutputFinishReason::MaxTokens)
-            ),
-            "tool_calls"
-        );
+        use izwi_core::engine::OutputFinishReason::{MaxTokens, StopToken};
+        assert_eq!(finish_reason(false, Some(MaxTokens)), "length");
+        assert_eq!(finish_reason(false, Some(StopToken)), "stop");
+        assert_eq!(finish_reason(true, Some(MaxTokens)), "tool_calls");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod convert;
 mod lfm_tools;
 pub mod models;
 pub mod responses;
+pub(crate) mod tool_calls;
 
 use axum::Router;
 
