@@ -23,15 +23,15 @@ use crate::diarization_store::{
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
 use crate::error::ApiError;
-use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, resolve_diarization_asr_model_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
     validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole,
-    DiarizationConfig, DiarizationTranscriptResult, GenerationParams, ModelVariant,
-    RuntimeRequestContext, RuntimeService, WorkloadClass,
+    DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
+    JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
+use tracing::{info, warn};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -257,13 +257,24 @@ pub async fn cancel_record(
     let cancelled = state
         .diarization_store
         .update_processing_status(
-            record_id,
+            record_id.clone(),
             DiarizationProcessingStatus::Failed,
             Some("Cancelled by user.".to_string()),
         )
         .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+        .map_err(map_store_error)?;
+    let Some(cancelled) = cancelled else {
+        // It finished since it was read: report that outcome instead.
+        let current = state
+            .diarization_store
+            .get_record(record_id)
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+        return Ok(Json(current));
+    };
+    // The record says why it stopped; now stop the pipeline (PIPE-7).
+    state.diarization_jobs.cancel(&record_id);
 
     Ok(Json(cancelled))
 }
@@ -461,13 +472,20 @@ fn spawn_diarization_processing_task(
     tokio::spawn(async move {
         let runtime = state.runtime.clone();
         let diarization_store = state.diarization_store.clone();
-        let _ = diarization_store
+        // Registered before the record turns processing, so a cancel either
+        // finds this job or has already made the record terminal.
+        let job = state.diarization_jobs.register(&record_id);
+        let started = diarization_store
             .update_processing_status(
                 record_id.clone(),
                 DiarizationProcessingStatus::Processing,
                 None,
             )
             .await;
+        if matches!(started, Ok(None)) {
+            // Cancelled (or deleted) before it started.
+            return;
+        }
 
         let audio_bytes = match diarization_store.get_audio(record_id.clone()).await {
             Ok(Some(audio)) => audio.audio_bytes,
@@ -498,6 +516,7 @@ fn spawn_diarization_processing_task(
             runtime.clone(),
             audio_bytes.as_slice(),
             &parsed,
+            job.cancellation(),
             correlation_id.as_deref(),
         )
         .await
@@ -559,6 +578,10 @@ fn spawn_diarization_processing_task(
                     }
                 }
             }
+            Err(_) if job.cancellation().is_cancelled() => {
+                // The record already says "Cancelled by user.".
+                info!(record_id = %record_id, "diarization pipeline cancelled");
+            }
             Err(err) => {
                 // The record carries the error, but operators debug from the
                 // server log: surface every terminal pipeline failure here.
@@ -585,6 +608,7 @@ async fn generate_diarization_artifacts(
     runtime: Arc<RuntimeService>,
     audio_bytes: &[u8],
     parsed: &ParsedDiarizationCreateRequest,
+    cancellation: &JobCancellation,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
@@ -605,7 +629,10 @@ async fn generate_diarization_artifacts(
                 min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
                 vad_gate: None,
             },
-            parsed.enable_llm_refinement.unwrap_or(false),
+            &DiarizationPipelineOptions {
+                enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+                cancellation: cancellation.clone(),
+            },
         )
         .await?;
 

@@ -633,6 +633,8 @@ impl DiarizationStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
+    /// Move a pending or processing record to `status`. Returns `None` when
+    /// the record is missing or already terminal (ready or failed).
     pub async fn update_processing_status(
         &self,
         record_id: String,
@@ -653,6 +655,12 @@ impl DiarizationStore {
                 Expr::value(processing_error),
             )
             .filter(diarization_records::Column::Id.eq(record_id.clone()))
+            // A terminal record keeps its outcome: a pipeline error arriving
+            // after "Cancelled by user." must not overwrite it (PIPE-7).
+            .filter(
+                diarization_records::Column::ProcessingStatus
+                    .is_in(["pending".to_string(), "processing".to_string()]),
+            )
             .exec(db)
             .await
             .context("Failed updating diarization processing status")?;
@@ -1401,7 +1409,7 @@ pub const fn default_list_limit() -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn build_test_store() -> (DiarizationStore, PathBuf) {
@@ -1414,7 +1422,7 @@ mod tests {
         (store, root)
     }
 
-    fn sample_record() -> NewDiarizationRecord {
+    pub(crate) fn sample_record() -> NewDiarizationRecord {
         NewDiarizationRecord {
             model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
             asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
@@ -1837,6 +1845,58 @@ mod tests {
             completion.is_none(),
             "terminal records should not be overwritten by async completion"
         );
+
+        let current = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(
+            current.processing_status,
+            DiarizationProcessingStatus::Failed
+        );
+        assert_eq!(
+            current.processing_error.as_deref(),
+            Some("Cancelled by user.")
+        );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// PIPE-7: the cancelled pipeline's own error, or a late status write,
+    /// arrives after the cancel and must not replace "Cancelled by user.".
+    #[tokio::test]
+    async fn status_updates_do_not_overwrite_terminal_records() {
+        let (store, root) = build_test_store();
+        let mut pending = sample_record();
+        pending.processing_status = DiarizationProcessingStatus::Pending;
+        let created = store
+            .create_record(pending)
+            .await
+            .expect("pending record should be created");
+        store
+            .update_processing_status(
+                created.id.clone(),
+                DiarizationProcessingStatus::Failed,
+                Some("Cancelled by user.".to_string()),
+            )
+            .await
+            .expect("cancel status update should succeed")
+            .expect("record should exist");
+
+        for (status, error) in [
+            (
+                DiarizationProcessingStatus::Failed,
+                Some("Cancelled: job \"dir\" was cancelled".to_string()),
+            ),
+            (DiarizationProcessingStatus::Processing, None),
+        ] {
+            let late = store
+                .update_processing_status(created.id.clone(), status, error)
+                .await
+                .expect("late status update should execute");
+            assert!(late.is_none(), "{status:?} overwrote a terminal record");
+        }
 
         let current = store
             .get_record(created.id)

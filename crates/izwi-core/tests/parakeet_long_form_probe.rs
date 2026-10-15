@@ -3,7 +3,7 @@
 //! and runs it through the atomic invocation stage; ordinary transcription
 //! uses the retained sequence graph. Both must produce the same text.
 
-use izwi_core::{DiarizationConfig, RuntimeService};
+use izwi_core::{DiarizationConfig, DiarizationPipelineOptions, RuntimeService};
 
 const PARAKEET: &str = "Parakeet-TDT-0.6B-v3";
 
@@ -41,7 +41,7 @@ async fn parakeet_long_form_pipeline_matches_ordinary_transcription() {
             None,
             None,
             &DiarizationConfig::default(),
-            false,
+            &DiarizationPipelineOptions::default(),
         )
         .await
         .expect("diarization pipeline with the default Parakeet ASR");

@@ -26,8 +26,8 @@ use crate::runtime::service::{
     copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
 };
 use crate::runtime::types::{
-    DiarizationConfig, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
-    DiarizationUtterance, DiarizationWord,
+    DiarizationConfig, DiarizationPipelineOptions, DiarizationResult, DiarizationSegment,
+    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
 };
 use crate::runtime::{CoordinatorLane, RuntimeRequestContext};
 use crate::ModelVariant;
@@ -584,7 +584,7 @@ impl RuntimeService {
         aligner_model_id: Option<&str>,
         llm_model_id: Option<&str>,
         config: &DiarizationConfig,
-        enable_llm_refinement: bool,
+        options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
         self.diarize_with_transcript_input(
             DiarizationAudioInput::Base64(audio_base64),
@@ -593,7 +593,7 @@ impl RuntimeService {
             aligner_model_id,
             llm_model_id,
             config,
-            enable_llm_refinement,
+            options,
         )
         .await
     }
@@ -606,7 +606,7 @@ impl RuntimeService {
         aligner_model_id: Option<&str>,
         llm_model_id: Option<&str>,
         config: &DiarizationConfig,
-        enable_llm_refinement: bool,
+        options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
         self.diarize_with_transcript_input(
             DiarizationAudioInput::Bytes(audio_bytes),
@@ -615,7 +615,7 @@ impl RuntimeService {
             aligner_model_id,
             llm_model_id,
             config,
-            enable_llm_refinement,
+            options,
         )
         .await
     }
@@ -628,8 +628,9 @@ impl RuntimeService {
         aligner_model_id: Option<&str>,
         llm_model_id: Option<&str>,
         config: &DiarizationConfig,
-        enable_llm_refinement: bool,
+        options: &DiarizationPipelineOptions,
     ) -> Result<DiarizationTranscriptResult> {
+        let enable_llm_refinement = options.enable_llm_refinement;
         let input_bytes = audio_input.input_bytes();
         if input_bytes == 0 {
             return Err(Error::InvalidInput(
@@ -671,10 +672,12 @@ impl RuntimeService {
         ))?;
         let observed_input_bytes = u64::try_from(input_bytes)
             .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
+        // A cancelled job fails its next stage and drops its leases (PIPE-7).
         let pipeline_job = self
             .coordinator
             .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-            .await?;
+            .await?
+            .with_cancellation(options.cancellation.clone());
         let owned_audio_input = audio_input.into_owned_for_job(&pipeline_job).await?;
         pipeline_job.record_materialized_usage(JobResourceObservation::host(
             u64::try_from(
@@ -740,6 +743,9 @@ impl RuntimeService {
             )
             .await?;
 
+        // Model loads are not stages: do not load the ASR or the aligner for a
+        // job that was cancelled while it diarized.
+        pipeline_job.ensure_not_cancelled()?;
         self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
         let asr_target = self
             .adapter_registry
@@ -772,6 +778,7 @@ impl RuntimeService {
             ),
         };
 
+        pipeline_job.ensure_not_cancelled()?;
         let mut aligner_unavailable = None;
         let aligner_binding = match self
             .load_capability_for_job(
@@ -1010,6 +1017,8 @@ impl RuntimeService {
         let raw_transcript_trimmed = raw_transcript.trim();
         let mut transcript = raw_transcript.clone();
         let mut llm_refined = false;
+        // Refinement runs its own chat job, outside this job's stages.
+        pipeline_job.ensure_not_cancelled()?;
         if runtime_request.enable_llm_refinement && !raw_transcript_trimmed.is_empty() {
             // Refinement is optional polish: an unresolvable refiner model is
             // the same class of failure as a failed completion — return the
@@ -3075,7 +3084,15 @@ mod tests {
             (None, Some("Parakeet-TDT-0.6B-v3"), "not a forced aligner"),
         ] {
             let error = runtime
-                .diarize_with_transcript_bytes(&audio, None, asr, aligner, None, &config, false)
+                .diarize_with_transcript_bytes(
+                    &audio,
+                    None,
+                    asr,
+                    aligner,
+                    None,
+                    &config,
+                    &DiarizationPipelineOptions::default(),
+                )
                 .await
                 .expect_err("an unrunnable pipeline model must be rejected");
             assert!(

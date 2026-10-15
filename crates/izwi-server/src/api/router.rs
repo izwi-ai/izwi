@@ -389,6 +389,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// PIPE-7: cancelling a running diarization stops its pipeline (the
+    /// job's cancellation fires), and the record reports the cancel.
+    #[tokio::test]
+    async fn diarization_cancel_stops_the_running_pipeline() {
+        let (state, _temp_dir) = test_state("diarization_cancel_stops_the_running_pipeline", false);
+        state.lifecycle.mark_ready();
+        let mut pending = crate::diarization_store::tests::sample_record();
+        pending.processing_status =
+            crate::diarization_store::DiarizationProcessingStatus::Processing;
+        let record = state
+            .diarization_store
+            .create_record(pending)
+            .await
+            .expect("record should be created");
+        let job = state.diarization_jobs.register(&record.id);
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &serve_config);
+
+        let response = send_request(
+            app,
+            build_request(
+                Method::POST,
+                &format!("/v1/diarizations/{}/cancel", record.id),
+                None,
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["processing_status"], "failed");
+        assert_eq!(body["processing_error"], "Cancelled by user.");
+        assert!(job.cancellation().is_cancelled());
+    }
+
     #[tokio::test]
     async fn canonical_history_routes_still_resolve() {
         let (app, temp_dir) = test_api_app("canonical_history_routes_still_resolve", true);

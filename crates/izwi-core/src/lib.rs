@@ -139,9 +139,10 @@ pub use runtime::{
 };
 pub use runtime::{
     validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
-    ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult, DiarizationSegment,
-    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
-    GenerationResult, TtsStopReason, TtsStreamingMode, WindowedAlignment,
+    ChatGeneration, ChunkStats, DiarizationConfig, DiarizationPipelineOptions, DiarizationResult,
+    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
+    GenerationRequest, GenerationResult, JobCancellation, TtsStopReason, TtsStreamingMode,
+    WindowedAlignment,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 

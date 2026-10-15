@@ -44,6 +44,27 @@ pub struct JobSpec {
     pub resources: ResourceEstimate,
 }
 
+/// A caller's request to stop an admitted job. Once cancelled, the job's next
+/// stage fails with [`Error::Cancelled`] before it runs, so a long pipeline
+/// stops at its next stage boundary (between ASR chunks and aligner windows)
+/// and releases its leases instead of finishing work nobody will read.
+#[derive(Debug, Clone, Default)]
+pub struct JobCancellation(Arc<AtomicBool>);
+
+impl JobCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparationCancellation {
     state: Arc<AtomicU8>,
@@ -798,7 +819,7 @@ impl InferenceCoordinator {
                     .to_string(),
             ));
         }
-        let JobLease { _inner, spec } = preparation;
+        let JobLease { _inner, spec, .. } = preparation;
         let inner = Arc::try_unwrap(_inner).map_err(|_| {
             Error::InferenceError("preparation admission became shared during handoff".to_string())
         })?;
@@ -921,6 +942,7 @@ impl InferenceCoordinator {
                 },
             }),
             spec: execution,
+            cancellation: None,
         })
     }
 
@@ -980,6 +1002,7 @@ impl InferenceCoordinator {
                 },
             }),
             spec,
+            cancellation: None,
         })
     }
 
@@ -1857,6 +1880,15 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
         G: Send + 'static,
     {
+        // A cancelled job runs no further stage: check before waiting on the
+        // blocking pool and again once the stage holds its permits.
+        job.ensure_not_cancelled()?;
+        let stage_job = job.clone();
+        let operation = move || {
+            stage_job.ensure_not_cancelled()?;
+            drop(stage_job);
+            operation()
+        };
         self.run_blocking_task_with_deadline(job, job.spec.deadline, guard, task_kind, operation)
             .await
     }
@@ -2184,9 +2216,31 @@ fn shared_resource_authority(
 pub struct JobLease {
     _inner: Arc<JobLeaseInner>,
     pub spec: JobSpec,
+    cancellation: Option<JobCancellation>,
 }
 
 impl JobLease {
+    /// Stop this job's stages once `cancellation` fires.
+    pub(crate) fn with_cancellation(mut self, cancellation: JobCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Fails with [`Error::Cancelled`] once the job's caller has cancelled it.
+    pub(crate) fn ensure_not_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(JobCancellation::is_cancelled)
+        {
+            let request_id: String = self.spec.request_id.chars().take(128).collect();
+            return Err(Error::Cancelled(format!(
+                "job {request_id:?} was cancelled"
+            )));
+        }
+        Ok(())
+    }
+
     /// Reconcile observed physical usage against this job's authorization,
     /// which is fixed at admission and can only shrink. Future authorized
     /// growth remains pending. Observations are monotonic; the runtime
@@ -5784,6 +5838,88 @@ Pages free: 10.\n";
         host.await.unwrap().unwrap();
         drop((host_job, device_job));
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    /// PIPE-7: a cancelled job runs no further stage. The stage after the
+    /// cancel never runs, neither does one that was waiting for the device
+    /// when the cancel arrived, and the job's leases are released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_job_runs_no_further_stage() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let cancellation = JobCancellation::new();
+        let pipeline = coordinator
+            .admit(job("cancelled-pipeline"))
+            .await
+            .unwrap()
+            .with_cancellation(cancellation.clone());
+        let stages = Arc::new(AtomicUsize::new(0));
+        let stage = |stages: &Arc<AtomicUsize>| {
+            let stages = stages.clone();
+            move || {
+                stages.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        coordinator
+            .run_host_blocking_stage(&pipeline, stage(&stages))
+            .await
+            .unwrap();
+        coordinator
+            .run_blocking_stage(&pipeline, stage(&stages))
+            .await
+            .unwrap();
+        assert_eq!(stages.load(Ordering::SeqCst), 2);
+
+        // Another job holds the only device permit, so the pipeline's next
+        // chunk waits for it while the cancel arrives.
+        let holder = coordinator.admit(job("device-holder")).await.unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let held = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let holder = holder.clone();
+            async move {
+                coordinator
+                    .run_blocking_stage(&holder, move || {
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*task_release;
+                        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started_rx.await.unwrap();
+        let waiting = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let pipeline = pipeline.clone();
+            let next_chunk = stage(&stages);
+            async move { coordinator.run_blocking_stage(&pipeline, next_chunk).await }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            wake.notify_all();
+        }
+        held.await.unwrap().unwrap();
+        assert!(matches!(waiting.await.unwrap(), Err(Error::Cancelled(_))));
+        let later = coordinator
+            .run_host_blocking_stage(&pipeline, stage(&stages))
+            .await;
+        assert!(matches!(later, Err(Error::Cancelled(_))), "{later:?}");
+        assert_eq!(stages.load(Ordering::SeqCst), 2);
+
+        drop((pipeline, holder));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
     #[test]

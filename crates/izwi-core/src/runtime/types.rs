@@ -181,6 +181,16 @@ pub struct DiarizationConfig {
     pub vad_gate: Option<bool>,
 }
 
+/// Per-job controls of the diarization transcript pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct DiarizationPipelineOptions {
+    /// Polish the speaker transcript with the pipeline LLM.
+    pub enable_llm_refinement: bool,
+    /// Stops the pipeline at its next stage (between ASR chunks and aligner
+    /// windows) once cancelled.
+    pub cancellation: crate::runtime::coordinator::JobCancellation,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatGeneration {
     pub latency_breakdown: Option<crate::engine::LatencyBreakdown>,
