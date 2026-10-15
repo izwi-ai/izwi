@@ -37,6 +37,11 @@ pub struct GenerationParams {
     #[serde(default)]
     pub presence_penalty: f32,
 
+    /// Chat sampling seed. The same seed and parameters on the same backend
+    /// sample the same tokens; `None` derives a seed from the request id.
+    #[serde(default)]
+    pub seed: Option<u64>,
+
     /// Maximum number of tokens to generate
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
@@ -200,6 +205,7 @@ impl Default for GenerationParams {
             top_k: 0,
             repetition_penalty: default_repetition_penalty(),
             presence_penalty: 0.0,
+            seed: None,
             max_tokens: default_max_tokens(),
             speaker: None,
             voice: None,

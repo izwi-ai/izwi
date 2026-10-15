@@ -78,6 +78,9 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// Sampling seed (a signed 64-bit integer, as in OpenAI and vLLM).
+    #[serde(default)]
+    pub seed: Option<i64>,
     /// DS9.3: include per-token logprobs in the response.
     #[serde(default)]
     pub logprobs: Option<bool>,
@@ -1001,6 +1004,8 @@ fn prepare_execution_request(
             top_k: req.top_k,
             repetition_penalty: req.repetition_penalty,
             presence_penalty: req.presence_penalty,
+            // A bit-preserving cast keeps distinct seeds distinct.
+            seed: req.seed.map(|seed| seed as u64),
             logprobs: req.logprobs,
             top_logprobs: req.top_logprobs,
             response_format_json_object: req
@@ -1960,6 +1965,7 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(0.5),
             presence_penalty: None,
+            seed: None,
             logprobs: None,
             top_logprobs: None,
             response_format: None,
@@ -1999,6 +2005,7 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            seed: None,
             logprobs: None,
             top_logprobs: None,
             response_format: None,
@@ -2038,6 +2045,7 @@ mod tests {
             repetition_penalty: None,
             frequency_penalty: Some(1.0),
             presence_penalty: None,
+            seed: None,
             logprobs: None,
             top_logprobs: None,
             response_format: None,
@@ -2285,6 +2293,7 @@ mod timing_contract_tests {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            seed: None,
             logprobs,
             top_logprobs,
             response_format: None,
@@ -2329,6 +2338,7 @@ mod timing_contract_tests {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            seed: None,
             logprobs: None,
             top_logprobs: None,
             response_format: Some(OpenAiResponseFormat { kind: kind.into() }),

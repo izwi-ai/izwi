@@ -12,6 +12,8 @@
 
 mod common;
 
+#[cfg(feature = "metal")]
+use common::metal_leg_device;
 use common::{
     id, write_tiny_lfm_fixture, write_tiny_qwen38_hybrid_fixture, QWEN38_FIXTURE_REVISION,
 };
@@ -170,42 +172,6 @@ async fn cpu_outputs_are_deterministic_across_worker_processes() {
         first.iter().all(|output| !output.is_empty()),
         "parity fixtures must produce non-empty outputs"
     );
-}
-
-/// The strict Metal assignment lane requires the operator-provided device
-/// identity (`metal:<registryID>`). Tests discover it from the host's default
-/// GPU; when that is impossible the leg is recorded as not-run, never passed.
-#[cfg(feature = "metal")]
-fn host_metal_device_id() -> Option<String> {
-    let output = std::process::Command::new("swift")
-        .args(["-e", "import Metal; if let d = MTLCreateSystemDefaultDevice() { print(\"metal:\" + String(d.registryID)) }"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let id = stdout.trim().to_string();
-    (output.status.success() && id.starts_with("metal:")).then_some(id)
-}
-
-/// The host Metal device for one Metal leg, or `None` when the leg is not
-/// run. The skip goes to the real stderr, because libtest hides captured
-/// `println!`/`eprintln!` output of a passing test and a skipped leg would
-/// read as a pass. A lane that requires Metal (`IZWI_REQUIRE_METAL_PARITY=1`)
-/// fails instead.
-#[cfg(feature = "metal")]
-fn metal_leg_device(leg: &str) -> Option<String> {
-    let device_id = host_metal_device_id();
-    if device_id.is_none() {
-        assert!(
-            std::env::var("IZWI_REQUIRE_METAL_PARITY").as_deref() != Ok("1"),
-            "{leg}: IZWI_REQUIRE_METAL_PARITY=1 but the host default GPU registryID is unavailable"
-        );
-        use std::io::Write as _;
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIP {leg}: host default GPU registryID unavailable (not run, not passed)"
-        );
-    }
-    device_id
 }
 
 #[cfg(feature = "metal")]

@@ -4692,7 +4692,10 @@ impl EngineCoreRequest {
             repetition_penalty: self.params.repetition_penalty.max(1.0),
             presence_penalty: self.params.presence_penalty.clamp(-2.0, 2.0),
             stop_token_ids: self.params.stop_token_ids.clone(),
-            seed: Self::chat_request_seed(&self.id),
+            seed: self
+                .params
+                .seed
+                .map_or_else(|| Self::chat_request_seed(&self.id), Self::chat_user_seed),
             request: self.chat_config.clone(),
             logprobs: self.params.logprobs || self.params.top_logprobs > 0,
             top_logprobs: self.params.top_logprobs,
@@ -4710,6 +4713,16 @@ impl EngineCoreRequest {
             hash = hash.wrapping_mul(FNV_PRIME);
         }
         hash
+    }
+
+    /// The sampler seed for a caller's `seed`. The chat samplers seed from
+    /// the clock on 0, so a caller's seed is mixed (SplitMix64's finalizer,
+    /// a bijection) rather than passed through, and a 0 result becomes 1.
+    pub(crate) fn chat_user_seed(seed: u64) -> u64 {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)).max(1)
     }
 
     /// Create a new TTS request.

@@ -2017,6 +2017,7 @@ pub struct ChatCompletionRequest {
     pub top_k: Option<usize>,
     pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    pub seed: Option<i64>,
     pub stop: Option<serde_json::Value>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,

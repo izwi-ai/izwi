@@ -39,6 +39,8 @@ pub struct ChatExecutionRequest {
     pub top_k: Option<usize>,
     pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    /// OpenAI `seed`: the same seed and parameters sample the same tokens.
+    pub seed: Option<u64>,
     /// DS9.3: OpenAI `logprobs` flag and `top_logprobs` count (0-20).
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<u8>,
@@ -73,6 +75,7 @@ impl ChatExecutionRequest {
         let mut params = self
             .resolved_sampling()
             .into_generation_params(self.resolved_max_new_tokens());
+        params.seed = self.seed;
         if self.logprobs.unwrap_or(false) {
             params.logprobs = true;
         }
@@ -1065,6 +1068,7 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
         ("top_k", request.top_k.is_some()),
         ("repetition_penalty", request.repetition_penalty.is_some()),
         ("presence_penalty", request.presence_penalty.is_some()),
+        ("seed", request.seed.is_some()),
         ("logprobs", request.logprobs == Some(true)),
         (
             "top_logprobs",
@@ -1561,6 +1565,7 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: Some(0.25),
+            seed: Some(7),
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,
@@ -1574,6 +1579,19 @@ mod tests {
         assert_eq!(params.top_k, 0);
         assert_eq!(params.presence_penalty, 0.25);
         assert_eq!(params.max_tokens, 32);
+        assert_eq!(params.seed, Some(7));
+    }
+
+    /// The worker protocol cannot carry a seed yet, so the gateway refuses
+    /// one rather than sampling with a different seed.
+    #[test]
+    fn remote_chat_scope_refuses_a_seed() {
+        let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
+        validate_remote_chat_scope(&request).expect("a plain request is in scope");
+        request.seed = Some(7);
+        let error = validate_remote_chat_scope(&request).expect_err("seed is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("`seed`"), "{}", error.message);
     }
 
     fn qwen_request(variant: ModelVariant, enable_thinking: Option<bool>) -> ChatExecutionRequest {
@@ -1590,6 +1608,7 @@ mod tests {
             top_k: None,
             repetition_penalty: None,
             presence_penalty: None,
+            seed: None,
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,

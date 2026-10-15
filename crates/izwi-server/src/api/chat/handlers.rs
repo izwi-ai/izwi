@@ -352,6 +352,7 @@ pub async fn create_thread_message(
         top_k: req.top_k,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
+        seed: None,
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,

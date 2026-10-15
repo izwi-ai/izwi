@@ -1375,6 +1375,30 @@ mod tests {
         assert_eq!(config.request, request.chat_config);
     }
 
+    /// EXE-F9: a caller's seed, not the request id, seeds sampling, so the
+    /// same seed reproduces across requests. Seed 0 must not reach the
+    /// samplers as 0, which they treat as "seed from the clock".
+    #[test]
+    fn chat_generation_config_honours_a_request_seed() {
+        let seeded = |id: &str, seed: Option<u64>| {
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: "hello".to_string(),
+            }]);
+            request.id = id.to_string();
+            request.params.seed = seed;
+            NativeExecutor::chat_generation_config(&request).seed
+        };
+        assert_eq!(seeded("req-a", Some(42)), seeded("req-b", Some(42)));
+        assert_ne!(seeded("req-a", Some(42)), seeded("req-a", Some(43)));
+        assert_ne!(seeded("req-a", Some(0)), 0);
+        assert_ne!(seeded("req-a", Some(0)), seeded("req-a", Some(1)));
+        assert_eq!(
+            seeded("req-a", None),
+            NativeExecutor::chat_request_seed("req-a")
+        );
+    }
+
     #[test]
     fn chat_request_seed_is_stable_for_same_request_id() {
         let first = NativeExecutor::chat_request_seed("req-123");
