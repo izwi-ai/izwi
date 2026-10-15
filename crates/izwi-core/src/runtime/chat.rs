@@ -694,7 +694,7 @@ impl RuntimeService {
             .run_admitted_streaming_request(admitted, |chunk| {
                 let crate::engine::StreamingOutput { text, logprobs, .. } = chunk;
                 if let Some(delta) = text {
-                    if !delta.is_empty() {
+                    if !delta.is_empty() || !logprobs.is_empty() {
                         streamed_text.push_str(&delta);
                         on_delta(delta, logprobs);
                     }

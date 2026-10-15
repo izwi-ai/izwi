@@ -791,7 +791,10 @@ impl NativeExecutor {
 
             let terminal_logprobs = active_state.record_step_logprobs(&step.logprobs, finished);
             if let Some(tx) = stream_tx.as_ref() {
-                if !step.delta.is_empty() {
+                // A step whose text a stop string discarded still publishes
+                // its logprob entries, so the stream carries the terminal
+                // list whole.
+                if !step.delta.is_empty() || !stream_logprobs.is_empty() {
                     Self::stream_chat_text_with_policy(
                         tx,
                         stream_policy,
@@ -1145,7 +1148,7 @@ impl NativeExecutor {
                 let Some(tx) = Self::stream_sender(request) else {
                     return Ok(());
                 };
-                if !step.delta.is_empty() {
+                if !step.delta.is_empty() || !stream_logprobs.is_empty() {
                     Self::stream_chat_text_with_policy(
                         &tx,
                         request.stream_policy,

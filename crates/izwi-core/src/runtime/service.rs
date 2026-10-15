@@ -3247,7 +3247,10 @@ impl RuntimeChatInvocationDriver {
                             if let Err(error) = observed {
                                 return self.fail_and_confirm(error).await;
                             }
-                            if let Some(delta) = chunk.text.filter(|delta| !delta.is_empty()) {
+                            if let Some(delta) = chunk
+                                .text
+                                .filter(|delta| !delta.is_empty() || !chunk.logprobs.is_empty())
+                            {
                                 self.streamed_text.push_str(&delta);
                                 match self.offer_delta(delta, chunk.logprobs) {
                                     DeltaOffer::Accepted => {}

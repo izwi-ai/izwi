@@ -39,6 +39,8 @@ async fn tiny_lfm_runtime(
 /// and its terminal generation.
 struct ChatRun {
     deltas: Vec<String>,
+    /// The tokens of the logprob entries the deltas carried.
+    delta_tokens: Vec<String>,
     generation: ChatGeneration,
 }
 
@@ -109,15 +111,23 @@ async fn run_capped_conversation(
         })
         .await?;
     let mut deltas = Vec::new();
+    let mut delta_tokens = Vec::new();
     loop {
         match tokio::time::timeout(Duration::from_secs(30), invocation.next_event())
             .await
             .expect("chat finishes within 30 s")?
         {
-            Some(RuntimeChatInvocationEvent::TextDelta { text, .. }) => deltas.push(text),
+            Some(RuntimeChatInvocationEvent::TextDelta { text, logprobs }) => {
+                deltas.push(text);
+                delta_tokens.extend(logprobs.into_iter().map(|entry| entry.token));
+            }
             Some(RuntimeChatInvocationEvent::Completed(generation)) => {
                 invocation.wait_for_teardown().await?;
-                return Ok(ChatRun { deltas, generation });
+                return Ok(ChatRun {
+                    deltas,
+                    delta_tokens,
+                    generation,
+                });
             }
             None => panic!("chat ended without a completion"),
         }
@@ -233,6 +243,13 @@ async fn a_stop_string_ends_generation_without_being_returned() {
     };
     let streamed = with_stop(true).await.unwrap();
     assert_eq!(streamed.deltas.concat(), expected);
+    // The stream carries the logprobs of every sampled token, including the
+    // ones whose text the stop string discarded, like the terminal list.
+    assert_eq!(streamed.delta_tokens, streamed.tokens());
+    assert_eq!(
+        streamed.tokens().len(),
+        streamed.generation.tokens_generated
+    );
     assert_eq!(streamed.generation.text, expected);
     assert!(streamed.deltas.iter().all(|delta| !delta.contains(&stop)));
     assert_eq!(
