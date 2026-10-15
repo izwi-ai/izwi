@@ -28,6 +28,6 @@ pub use variant::{
     parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
     resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
-    InferenceBackendHint, ModelFamily, ModelTask, ParseModelVariantError, RemovedModelVariant,
-    REMOVED_MODEL_VARIANTS,
+    validate_diarization_speaker_limits, InferenceBackendHint, ModelFamily, ModelTask,
+    ParseModelVariantError, RemovedModelVariant, REMOVED_MODEL_VARIANTS,
 };

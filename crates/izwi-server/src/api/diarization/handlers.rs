@@ -27,7 +27,8 @@ use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, resolve_diarization_asr_model_variant,
-    resolve_diarization_model_variant_strict, ChatMessage, ChatRequestConfig, ChatRole,
+    resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
+    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole,
     DiarizationConfig, DiarizationTranscriptResult, GenerationParams, ModelVariant,
     RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
@@ -330,7 +331,11 @@ async fn create_pending_record(
     reject_granite_diarization_model(parsed.model_id.as_deref())?;
     validate_diarization_model_id(parsed.model_id.as_deref())?;
     resolve_pipeline_model_ids(parsed)?;
-    validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
+    validate_speaker_bounds(
+        parsed.model_id.as_deref(),
+        parsed.min_speakers,
+        parsed.max_speakers,
+    )?;
 
     state
         .diarization_store
@@ -704,19 +709,20 @@ fn build_rerun_create_request(
     }
 }
 
+/// Speaker limits the diarization model can meet: at most its speaker
+/// channels (4 for the default v2.1, 8 for Nemotron-3), and `min_speakers`
+/// no greater than `max_speakers`. A job that would clamp them silently is
+/// refused when it is created.
 fn validate_speaker_bounds(
+    model_id: Option<&str>,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
 ) -> Result<(), ApiError> {
-    if let (Some(min), Some(max)) = (min_speakers, max_speakers) {
-        if min > max {
-            return Err(ApiError::bad_request(
-                "`min_speakers` cannot be greater than `max_speakers`.",
-            ));
-        }
-    }
-
-    Ok(())
+    let channels = resolve_diarization_model_variant(model_id)
+        .diarization_speaker_channels()
+        .unwrap_or(usize::MAX);
+    validate_diarization_speaker_limits(min_speakers, max_speakers, channels)
+        .map_err(ApiError::bad_request)
 }
 
 fn initial_summary_state(transcript: &str) -> (DiarizationSummaryStatus, Option<String>) {
@@ -1388,12 +1394,41 @@ mod tests {
 
     #[test]
     fn rejects_invalid_speaker_bounds() {
-        let err = validate_speaker_bounds(Some(4), Some(2))
+        let err = validate_speaker_bounds(None, Some(4), Some(2))
             .expect_err("min speakers should not exceed max speakers");
         assert_eq!(
             err.message,
             "`min_speakers` cannot be greater than `max_speakers`."
         );
+    }
+
+    /// PIPE-18: limits above the model's speaker channels are a 400, not a
+    /// silent clamp: 4 for the default v2.1, 8 for Nemotron-3.
+    #[test]
+    fn rejects_speaker_bounds_above_the_model_channels() {
+        for (model_id, min, max, field) in [
+            (None, None, Some(5), "max_speakers"),
+            (None, Some(5), None, "min_speakers"),
+            (
+                Some("diar_streaming_sortformer_4spk-v2.1"),
+                Some(1),
+                Some(6),
+                "max_speakers",
+            ),
+            (
+                Some("Nemotron-3-Diarization"),
+                None,
+                Some(9),
+                "max_speakers",
+            ),
+        ] {
+            let err = validate_speaker_bounds(model_id, min, max)
+                .expect_err("limits above the speaker channels are refused");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(err.message.contains(field), "{}", err.message);
+        }
+        assert!(validate_speaker_bounds(None, Some(1), Some(4)).is_ok());
+        assert!(validate_speaker_bounds(Some("Nemotron-3-Diarization"), Some(2), Some(8)).is_ok());
     }
 
     #[test]

@@ -142,6 +142,25 @@ fn reference_segments(value: &Value) -> Vec<(f32, f32, usize)> {
     segments
 }
 
+/// The references ran NeMo's legacy `ts_vad_post_processing` loop over 10 ms
+/// repeats, which ends a segment still active at the last of `frames` rows
+/// at `frames x frame_secs - 10 ms`. Current NeMo (`binarization_vectorized`),
+/// which izwi follows (SRT-11), ends it at `frames x frame_secs`; nothing
+/// else differs at onset = offset without padding.
+fn as_vectorized(
+    mut segments: Vec<(f32, f32, usize)>,
+    frames: usize,
+    frame_secs: f32,
+) -> Vec<(f32, f32, usize)> {
+    let end = frames as f32 * frame_secs;
+    for segment in &mut segments {
+        if (segment.1 - (end - TS_VAD_FRAME_LENGTH_SECS)).abs() <= SEGMENT_TOLERANCE_SECS {
+            segment.1 = end;
+        }
+    }
+    segments
+}
+
 fn sort_segments(segments: &mut [(f32, f32, usize)]) {
     segments.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
 }
@@ -193,7 +212,7 @@ fn nemo_default_segments(
     };
     let mut segments = (0..num_speakers)
         .flat_map(|speaker| {
-            ts_vad_post_processing(probs, speaker, &params, frame_repeat)
+            predlist_to_timestamps(probs, speaker, &params, frame_repeat)
                 .into_iter()
                 .map(move |(start, end)| (start, end, speaker))
         })
@@ -272,7 +291,7 @@ fn v21_outcome(
     let expected_probs = f32_rows(&run["probs_80ms"]);
     let max_abs = max_abs_diff(&probs, &expected_probs);
     let actual = nemo_default_segments(&probs, model.model.num_speakers, TS_VAD_UNIT_FRAME_COUNT);
-    let expected = reference_segments(&run["segments"]);
+    let expected = as_vectorized(reference_segments(&run["segments"]), probs.len(), 0.08);
     ParityOutcome {
         label: label.to_string(),
         max_abs,
@@ -333,7 +352,11 @@ fn nemotron3_matches_nemo_probabilities_on_the_10s_fixture() {
             let probs = probabilities(&model, &samples, cfg);
             let max_abs = max_abs_diff(&probs, &f32_rows(&run["probs_10ms"]));
             let actual = nemo_default_segments(&probs, model.model.num_speakers, 1);
-            let expected = reference_segments(&run["segments"]);
+            let expected = as_vectorized(
+                reference_segments(&run["segments"]),
+                probs.len(),
+                TS_VAD_FRAME_LENGTH_SECS,
+            );
             ParityOutcome {
                 label: format!("nemotron3 diarization-10s {profile}"),
                 max_abs,
@@ -413,7 +436,11 @@ fn nemotron3_pooled_outcome(
         compared_max_abs = compared_max_abs.max(max_abs_diff(&actual[..rows], &expected[..rows]));
     }
     let actual = nemo_default_segments(&probs, model.model.num_speakers, 1);
-    let expected = reference_segments(&run["segments"]);
+    let expected = as_vectorized(
+        reference_segments(&run["segments"]),
+        probs.len(),
+        TS_VAD_FRAME_LENGTH_SECS,
+    );
     let mut segments_match = segments_equal(&actual, &expected);
     if compared_rows.is_none() {
         let channel_max = (0..model.model.num_speakers)
@@ -470,7 +497,7 @@ fn v21_summary_outcome(
         counts.push(above);
     }
     let actual = nemo_default_segments(&probs, model.model.num_speakers, TS_VAD_UNIT_FRAME_COUNT);
-    let expected = reference_segments(&run["segments"]);
+    let expected = as_vectorized(reference_segments(&run["segments"]), probs.len(), 0.08);
     ParityOutcome {
         label: label.to_string(),
         max_abs,
@@ -617,7 +644,15 @@ fn diarize_without_the_vad_gate_matches_nemo_segments() {
         let actual =
             without_vad_gate(|| diarize_segments(&model, &samples, &DiarizationConfig::default()));
         let duration = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
-        let expected = arrival_labelled(reference_segments(&run["segments"]), duration);
+        // Rows at the reference's frame period (80 ms v2.1, 10 ms Nemotron-3).
+        let frame_secs = reference["frame_secs"].as_f64().expect("frame_secs") as f32;
+        let feature_frames = model.model.preprocessor.feature_frame_count(samples.len());
+        let frames =
+            feature_frames.div_ceil((frame_secs / TS_VAD_FRAME_LENGTH_SECS).round() as usize);
+        let expected = arrival_labelled(
+            as_vectorized(reference_segments(&run["segments"]), frames, frame_secs),
+            duration,
+        );
         println!(
             "diarize {fixture_name} {profile}: {} segments (reference {})",
             actual.len(),

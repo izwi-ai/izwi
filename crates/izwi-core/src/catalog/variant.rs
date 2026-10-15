@@ -490,6 +490,32 @@ pub fn resolve_diarization_model_variant(input: Option<&str>) -> ModelVariant {
     }
 }
 
+/// Refuses diarization speaker limits a model with `channels` speaker
+/// channels cannot meet (PIPE-18): a bound above the channel count, which
+/// used to be clamped silently, or `min_speakers` above `max_speakers`.
+pub fn validate_diarization_speaker_limits(
+    min_speakers: Option<usize>,
+    max_speakers: Option<usize>,
+    channels: usize,
+) -> Result<(), String> {
+    for (field, value) in [
+        ("min_speakers", min_speakers),
+        ("max_speakers", max_speakers),
+    ] {
+        if let Some(value) = value.filter(|value| *value > channels) {
+            return Err(format!(
+                "`{field}` = {value} exceeds the {channels} speaker channels of this diarization model."
+            ));
+        }
+    }
+    if let (Some(min), Some(max)) = (min_speakers, max_speakers) {
+        if min > max {
+            return Err("`min_speakers` cannot be greater than `max_speakers`.".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Strict resolution for an explicitly provided diarization model id: the
 /// caller's pick is the source of truth, so an id that does not parse to a
 /// diarization variant is an error instead of a silent fallback to the
@@ -1496,6 +1522,32 @@ mod tests {
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
         let resolved = resolve_diarization_model_variant(None);
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
+    }
+
+    /// PIPE-18: speaker limits above a diarizer's channels (4 for v2.1, 8
+    /// for Nemotron-3) are refused instead of clamped.
+    #[test]
+    fn diarization_speaker_limits_above_the_channel_count_are_refused() {
+        let v21 = ModelVariant::DiarStreamingSortformer4SpkV21
+            .diarization_speaker_channels()
+            .unwrap();
+        let nemotron = ModelVariant::Nemotron3Diarization
+            .diarization_speaker_channels()
+            .unwrap();
+        assert_eq!((v21, nemotron), (4, 8));
+        assert_eq!(ModelVariant::Qwen306B.diarization_speaker_channels(), None);
+        assert!(validate_diarization_speaker_limits(None, None, v21).is_ok());
+        assert!(validate_diarization_speaker_limits(Some(1), Some(4), v21).is_ok());
+        assert!(validate_diarization_speaker_limits(Some(8), Some(8), nemotron).is_ok());
+        for (min, max, channels, field) in [
+            (Some(5), None, v21, "min_speakers"),
+            (None, Some(5), v21, "max_speakers"),
+            (None, Some(9), nemotron, "max_speakers"),
+            (Some(3), Some(2), v21, "min_speakers"),
+        ] {
+            let err = validate_diarization_speaker_limits(min, max, channels).unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
     }
 
     #[test]

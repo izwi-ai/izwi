@@ -1372,14 +1372,12 @@ const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
 /// Speaker-channel count pinned by each served Sortformer checkpoint.
 /// The checkpoint YAML must agree or the load fails closed.
 fn expected_speaker_count(variant: ModelVariant) -> Result<usize> {
-    match variant {
-        ModelVariant::DiarStreamingSortformer4SpkV21 => Ok(4),
-        ModelVariant::Nemotron3Diarization => Ok(8),
-        _ => Err(Error::ModelLoadError(format!(
+    variant.diarization_speaker_channels().ok_or_else(|| {
+        Error::ModelLoadError(format!(
             "Unsupported Sortformer diarization variant: {}",
             variant.dir_name()
-        ))),
-    }
+        ))
+    })
 }
 
 pub struct SortformerDiarizerModel {
@@ -1604,6 +1602,12 @@ impl SortformerDiarizerModel {
         if sample_rate == 0 {
             return Err(Error::InvalidInput("Invalid sample rate: 0".to_string()));
         }
+        crate::catalog::validate_diarization_speaker_limits(
+            config.min_speakers,
+            config.max_speakers,
+            self.model.num_speakers,
+        )
+        .map_err(Error::InvalidInput)?;
 
         let resampled_samples;
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
@@ -1693,10 +1697,9 @@ impl SortformerDiarizerModel {
 
         let num_speakers = self.model.num_speakers;
 
-        let requested_max = config.max_speakers.unwrap_or(num_speakers);
-        let max_speakers = requested_max.clamp(1, num_speakers);
-        let requested_min = config.min_speakers.unwrap_or(1);
-        let min_speakers = requested_min.clamp(1, max_speakers);
+        // Limits above the channel count were refused up front.
+        let max_speakers = config.max_speakers.unwrap_or(num_speakers).max(1);
+        let min_speakers = config.min_speakers.unwrap_or(1).clamp(1, max_speakers);
         let limit_speaker_channels = should_limit_speaker_channels(config);
 
         let postprocessing_params =
@@ -1705,7 +1708,7 @@ impl SortformerDiarizerModel {
         let mut raw_segments = Vec::<RawSegment>::new();
         let mut speaker_stats = Vec::<SpeakerActivityStats>::new();
         for speaker_idx in 0..num_speakers {
-            let mut speaker_segments = ts_vad_post_processing(
+            let mut speaker_segments = predlist_to_timestamps(
                 &gated_probs,
                 speaker_idx,
                 &postprocessing_params,
@@ -1785,7 +1788,12 @@ impl SortformerDiarizerModel {
         if limit_speaker_channels {
             let selected_speakers =
                 select_speaker_channels(&speaker_stats, min_speakers, max_speakers, num_speakers);
-            raw_segments.retain(|segment| selected_speakers.contains(&segment.speaker_idx));
+            reassign_dropped_speaker_segments(
+                &mut raw_segments,
+                &selected_speakers,
+                &gated_probs,
+                frame_stride_samples,
+            );
         }
 
         raw_segments.sort_by(|a, b| {
@@ -4438,57 +4446,122 @@ fn select_speaker_channels(
         .collect()
 }
 
-fn ts_vad_post_processing(
+/// SRT-12: limiting the speaker count keeps the speech of the channels it
+/// drops. Each of their segments goes to the selected channel with the
+/// highest mean probability over it (ties to the lower channel), whose
+/// probability becomes its confidence; overlapping segments of one speaker
+/// merge afterwards.
+fn reassign_dropped_speaker_segments(
+    segments: &mut [RawSegment],
+    selected: &[usize],
+    probs: &[Vec<f32>],
+    frame_stride_samples: usize,
+) {
+    for segment in segments
+        .iter_mut()
+        .filter(|segment| !selected.contains(&segment.speaker_idx))
+    {
+        let best = selected
+            .iter()
+            .map(|&speaker| {
+                let probability = average_speaker_probability_for_range(
+                    probs,
+                    speaker,
+                    segment.start_secs,
+                    segment.end_secs,
+                    frame_stride_samples,
+                );
+                (speaker, probability)
+            })
+            .max_by(|a, b| {
+                a.1.unwrap_or(0.0)
+                    .total_cmp(&b.1.unwrap_or(0.0))
+                    .then(b.0.cmp(&a.0))
+            });
+        if let Some((speaker, probability)) = best {
+            segment.speaker_idx = speaker;
+            segment.confidence = probability;
+        }
+    }
+}
+
+/// NeMo's current post-processing of one speaker channel
+/// (`predlist_to_timestamps`): binarize the probabilities at their own frame
+/// period (`frame_repeat` x 10 ms: 80 ms for v2.1, 10 ms for Nemotron-3) with
+/// `binarization_vectorized`, then apply `filtering`.
+fn predlist_to_timestamps(
     probs: &[Vec<f32>],
     speaker_idx: usize,
     params: &PostProcessingParams,
     frame_repeat: usize,
 ) -> Vec<(f32, f32)> {
-    let frame_repeat = frame_repeat.max(1);
-    let mut repeated = Vec::with_capacity(probs.len() * frame_repeat);
-    for row in probs {
-        let value = row[speaker_idx].clamp(0.0, 1.0);
-        for _ in 0..frame_repeat {
-            repeated.push(value);
-        }
-    }
-
-    filtering(&binarization(&repeated, params), params)
+    let frame_secs = TS_VAD_FRAME_LENGTH_SECS * frame_repeat.max(1) as f32;
+    let sequence = probs
+        .iter()
+        .map(|row| row[speaker_idx].clamp(0.0, 1.0))
+        .collect::<Vec<_>>();
+    filtering(&binarization(&sequence, frame_secs, params), params)
 }
 
-fn binarization(sequence: &[f32], params: &PostProcessingParams) -> Vec<(f32, f32)> {
-    let mut speech = false;
-    let mut start = 0.0f32;
+/// NeMo's `binarization_vectorized` (SRT-11), a hysteresis over frames of
+/// `frame_secs`. With `onset >= offset` a frame above `onset` turns speech on,
+/// one below `offset` turns it off, and frames between keep the state. With
+/// `onset < offset` (the `dihard3` preset) a frame at or above `offset` sets
+/// speech, one at or below `onset` clears it, and each frame strictly between
+/// toggles it. A segment spans its first speech frame to the first frame
+/// after it without speech, or to the end of the sequence (N frames, where
+/// the legacy loop stopped at frame N - 1), widened by the pads; the start is
+/// clamped at 0. Padded segments that touch or overlap merge.
+fn binarization(
+    sequence: &[f32],
+    frame_secs: f32,
+    params: &PostProcessingParams,
+) -> Vec<(f32, f32)> {
     let mut segments = Vec::new();
-    let mut last_index = 0usize;
-
+    let mut push = |start: usize, end: usize| {
+        let start_secs = (start as f32 * frame_secs - params.pad_onset).max(0.0);
+        let end_secs = end as f32 * frame_secs + params.pad_offset;
+        if end_secs > start_secs {
+            segments.push((start_secs, end_secs));
+        }
+    };
+    let mut speech_start = None::<usize>;
     for (idx, &value) in sequence.iter().enumerate() {
-        last_index = idx;
-        if speech {
-            if value < params.offset {
-                let seg_start = (start - params.pad_onset).max(0.0);
-                let seg_end = idx as f32 * TS_VAD_FRAME_LENGTH_SECS + params.pad_offset;
-                if seg_end > seg_start {
-                    segments.push((seg_start, seg_end));
-                }
-                start = idx as f32 * TS_VAD_FRAME_LENGTH_SECS;
-                speech = false;
+        let speech = speech_start.is_some();
+        let next = if params.onset >= params.offset {
+            if value > params.onset {
+                true
+            } else if value < params.offset {
+                false
+            } else {
+                speech
             }
-        } else if value > params.onset {
-            start = idx as f32 * TS_VAD_FRAME_LENGTH_SECS;
-            speech = true;
+        } else if value >= params.offset {
+            true
+        } else if value <= params.onset {
+            false
+        } else if value > params.onset && value < params.offset {
+            !speech
+        } else {
+            speech
+        };
+        match (speech_start, next) {
+            (None, true) => speech_start = Some(idx),
+            (Some(start), false) => {
+                push(start, idx);
+                speech_start = None;
+            }
+            _ => {}
         }
     }
-
-    if speech {
-        let seg_start = (start - params.pad_onset).max(0.0);
-        let seg_end = last_index as f32 * TS_VAD_FRAME_LENGTH_SECS + params.pad_offset;
-        if seg_end > seg_start {
-            segments.push((seg_start, seg_end));
-        }
+    if let Some(start) = speech_start {
+        push(start, sequence.len());
     }
-
-    merge_overlap_ranges(&segments)
+    if params.pad_onset > 0.0 || params.pad_offset > 0.0 {
+        merge_overlap_ranges(&segments)
+    } else {
+        segments
+    }
 }
 
 fn filtering(segments: &[(f32, f32)], params: &PostProcessingParams) -> Vec<(f32, f32)> {
@@ -5955,27 +6028,159 @@ mod tests {
         };
 
         let sequence = vec![0.1, 0.6, 0.7, 0.2, 0.1];
-        let segments = binarization(&sequence, &params);
+        let segments = binarization(&sequence, TS_VAD_FRAME_LENGTH_SECS, &params);
 
         assert_eq!(segments, vec![(0.01, 0.03)]);
     }
 
-    #[test]
-    fn filtering_merges_short_non_speech_gaps_like_nemo_default_order() {
-        let params = PostProcessingParams {
-            onset: 0.5,
-            offset: 0.5,
-            pad_onset: 0.0,
-            pad_offset: 0.0,
+    fn binarization_params(
+        onset: f32,
+        offset: f32,
+        pad_onset: f32,
+        pad_offset: f32,
+    ) -> PostProcessingParams {
+        PostProcessingParams {
+            onset,
+            offset,
+            pad_onset,
+            pad_offset,
             min_duration_on: 0.0,
-            min_duration_off: 0.15,
+            min_duration_off: 0.0,
             filter_speech_first: true,
+        }
+    }
+
+    fn assert_segments_near(actual: &[(f32, f32)], expected: &[(f32, f32)]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(
+                (a.0 - e.0).abs() < 1e-5 && (a.1 - e.1).abs() < 1e-5,
+                "{actual:?} vs {expected:?}"
+            );
+        }
+    }
+
+    /// SRT-11: NeMo's `binarization_vectorized` at the native 80 ms frame
+    /// ends a segment still active at the last frame at N frames (0.48 s);
+    /// the legacy loop over 10 ms repeats stopped at 8N - 1 (0.47 s).
+    #[test]
+    fn vectorized_binarization_ends_a_trailing_segment_at_the_sequence_end() {
+        let params = binarization_params(0.5, 0.5, 0.0, 0.0);
+        let sequence = [0.2, 0.7, 0.8, 0.3, 0.6, 0.9];
+        assert_segments_near(
+            &binarization(&sequence, 0.08, &params),
+            &[(0.08, 0.24), (0.32, 0.48)],
+        );
+        // The same probabilities as v2.1 rows through the post-processing.
+        let rows = sequence.iter().map(|p| vec![*p]).collect::<Vec<_>>();
+        assert_segments_near(
+            &predlist_to_timestamps(&rows, 0, &params, TS_VAD_UNIT_FRAME_COUNT),
+            &[(0.08, 0.24), (0.32, 0.48)],
+        );
+    }
+
+    /// SRT-11: with onset < offset (the dihard3 preset's 0.56 / 1.0) a frame
+    /// between the thresholds toggles speech instead of holding it; a frame
+    /// at or above offset sets it, one at or below onset clears it, and NaN
+    /// neither sets, clears nor toggles.
+    #[test]
+    fn vectorized_binarization_toggles_between_onset_and_offset() {
+        let params = binarization_params(0.3, 0.7, 0.0, 0.0);
+        let frame = TS_VAD_FRAME_LENGTH_SECS;
+        assert_segments_near(
+            &binarization(&[0.5, 0.5, 0.5], frame, &params),
+            &[(0.0, 0.01), (0.02, 0.03)],
+        );
+        assert_segments_near(
+            &binarization(&[0.5, 0.8, 0.5, 0.5, 0.2, 0.5, 0.9], frame, &params),
+            &[(0.0, 0.02), (0.03, 0.04), (0.05, 0.07)],
+        );
+        assert_segments_near(
+            &binarization(&[0.8, f32::NAN, 0.1], frame, &params),
+            &[(0.0, 0.02)],
+        );
+    }
+
+    /// SRT-11: pads widen each segment (the start clamped at 0, the end not)
+    /// and padded segments that touch or overlap merge.
+    #[test]
+    fn vectorized_binarization_pads_and_merges_like_nemo() {
+        let params = binarization_params(0.5, 0.5, 0.1, 0.05);
+        let sequence = [0.9, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.9];
+        assert_segments_near(
+            &binarization(&sequence, 0.08, &params),
+            &[(0.0, 0.29), (0.46, 0.69)],
+        );
+    }
+
+    /// SRT-12: `max_speakers` below the active count reassigns the dropped
+    /// channel's speech to the kept channel most probable over it instead of
+    /// deleting it, so the attributed speech does not shrink.
+    #[test]
+    fn limiting_speakers_reassigns_dropped_speech_to_the_most_probable_kept_speaker() {
+        // 80 ms rows over 3.2 s: speaker 0 talks 0-1.6 s, speaker 1 1.6-2.4
+        // s (where speaker 2 is the more probable of the kept two), speaker 2
+        // 2.4-3.2 s and 0.8-1.2 s over speaker 0.
+        let stride = TS_VAD_UNIT_FRAME_COUNT * PRODUCTION_HOP_LENGTH;
+        let probs = (0..40)
+            .map(|frame| match frame {
+                0..=9 => vec![0.9, 0.1, 0.1],
+                10..=14 => vec![0.9, 0.1, 0.8],
+                15..=19 => vec![0.9, 0.1, 0.1],
+                20..=29 => vec![0.3, 0.9, 0.6],
+                _ => vec![0.1, 0.1, 0.9],
+            })
+            .collect::<Vec<_>>();
+        let segment = |speaker_idx, start_secs, end_secs| RawSegment {
+            speaker_idx,
+            start_secs,
+            end_secs,
+            confidence: None,
         };
+        let mut segments = vec![
+            segment(0, 0.0, 1.6),
+            segment(2, 0.8, 1.2),
+            segment(1, 1.6, 2.4),
+            segment(2, 2.4, 3.2),
+        ];
+        let speech = |segments: &[RawSegment]| {
+            merge_overlap_ranges(
+                &segments
+                    .iter()
+                    .map(|segment| (segment.start_secs, segment.end_secs))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let before = speech(&segments);
+        let stats = (0..3)
+            .map(|speaker_idx| SpeakerActivityStats {
+                speaker_idx,
+                total_duration_secs: segments
+                    .iter()
+                    .filter(|segment| segment.speaker_idx == speaker_idx)
+                    .map(|segment| segment.end_secs - segment.start_secs)
+                    .sum(),
+                peak_probability: 0.9,
+                segment_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let selected = select_speaker_channels(&stats, 1, 2, 3);
+        assert_eq!(selected, vec![0, 2]);
+        reassign_dropped_speaker_segments(&mut segments, &selected, &probs, stride);
 
-        let segments = vec![(0.0, 0.5), (0.55, 1.0), (1.3, 1.7)];
-        let filtered = filtering(&segments, &params);
-
-        assert_eq!(filtered, vec![(0.0, 1.0), (1.3, 1.7)]);
+        assert!(segments.iter().all(|segment| segment.speaker_idx != 1));
+        let moved = &segments[2];
+        assert_eq!(
+            (moved.speaker_idx, moved.start_secs, moved.end_secs),
+            (2, 1.6, 2.4)
+        );
+        // Its confidence is now speaker 2's probability over it.
+        assert_eq!(
+            moved.confidence,
+            average_speaker_probability_for_range(&probs, 2, 1.6, 2.4, stride)
+        );
+        assert!(moved.confidence.unwrap() < 0.7);
+        assert_eq!(speech(&segments), before);
     }
 
     #[test]

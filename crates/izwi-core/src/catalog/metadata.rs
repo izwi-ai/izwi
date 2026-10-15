@@ -646,6 +646,16 @@ impl ModelVariant {
         )
     }
 
+    /// The speaker channels a diarization checkpoint emits: the most speakers
+    /// it can tell apart, and the bound on `min_speakers`/`max_speakers`.
+    pub fn diarization_speaker_channels(&self) -> Option<usize> {
+        match self {
+            Self::DiarStreamingSortformer4SpkV21 => Some(4),
+            Self::Nemotron3Diarization => Some(8),
+            _ => None,
+        }
+    }
+
     /// Whether this model can produce persisted diarization records.
     pub fn supports_diarization_records(&self) -> bool {
         self.is_diarization()
