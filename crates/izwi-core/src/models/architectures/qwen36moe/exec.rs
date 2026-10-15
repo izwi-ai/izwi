@@ -296,6 +296,16 @@ impl ChatDecodeState {
         self.prefill_progress
     }
 
+    /// The whole reply, which only a terminal step carries: streaming
+    /// consumers read the deltas.
+    fn terminal_text(&self) -> String {
+        if self.finished {
+            self.assembled.clone()
+        } else {
+            String::new()
+        }
+    }
+
     /// Committed output tokens for the session so far.
     pub(crate) fn tokens_generated(&self) -> usize {
         self.tokens_generated
@@ -1696,7 +1706,7 @@ impl Qwen36ChatExec {
         }
         Ok(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,
@@ -1737,7 +1747,7 @@ impl Qwen36ChatExec {
         state.pending_logprobs = logprobs;
         Ok(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,
@@ -1862,7 +1872,7 @@ impl Qwen36ChatExec {
         }
         Ok(Some(ChatDecodeStep {
             delta,
-            text: state.assembled.clone(),
+            text: state.terminal_text(),
             tokens_generated: state.tokens_generated,
             input_tokens_committed: committed,
             finished: state.finished,

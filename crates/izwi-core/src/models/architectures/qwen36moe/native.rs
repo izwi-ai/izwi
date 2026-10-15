@@ -4489,6 +4489,7 @@ mod tests {
                 .unwrap();
             scalar_deltas.push(step.delta);
             assert!(!step.finished);
+            assert!(step.text.is_empty(), "only a terminal step carries text");
         }
         drop(scalar_state);
         std::fs::remove_dir_all(dir_off.path()).ok();
@@ -4506,6 +4507,7 @@ mod tests {
             mtp_deltas.push(step.delta);
             last_tokens_generated = step.tokens_generated;
             assert!(!step.finished);
+            assert!(step.text.is_empty(), "only a terminal step carries text");
         }
         // Evidence the draft/verify path actually ran: at least one
         // speculative round executed, and the MTP cache cursor advanced one
