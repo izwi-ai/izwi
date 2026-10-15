@@ -497,7 +497,30 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                 inbound = control_rx.recv() => {
                     match inbound {
                         Some(ClientControl::Finish) => {
-                            terminal = self.finish_asr(&mut stream).await;
+                            // The reader queues audio before the finish that
+                            // follows it, and this loop prefers control
+                            // frames: transcribe the audio sent first.
+                            let mut pushed = Ok(());
+                            while let (Ok(()), Ok(frame)) = (&pushed, audio_rx.try_recv()) {
+                                pushed = self
+                                    .push_audio(
+                                        runner,
+                                        &mut stream,
+                                        &mut last_audio_sequence,
+                                        &mut session_audio_bytes,
+                                        frame,
+                                        sample_rate,
+                                    )
+                                    .await;
+                            }
+                            match pushed {
+                                Ok(()) => terminal = self.finish_asr(&mut stream).await,
+                                Err(StageTerminal::Disconnected) => {
+                                    cancellation_requested = true;
+                                    self.mark_cancellation();
+                                }
+                                Err(failure) => terminal = Some(failure),
+                            }
                         }
                         Some(ClientControl::Cancel) => {
                             cancellation_requested = true;

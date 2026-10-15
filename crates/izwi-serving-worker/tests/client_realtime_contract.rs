@@ -154,6 +154,46 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
     assert!(session.next_event().await.unwrap().is_none());
 }
 
+/// Audio sent before finish is transcribed even when the finish reaches the
+/// worker while that audio still waits behind a slow runtime push.
+#[tokio::test]
+async fn realtime_finish_transcribes_every_frame_sent_before_it() {
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage {
+        push_cadence: Duration::from_millis(30),
+        ..TestAsrStage::default()
+    }))
+    .await
+    .unwrap();
+    let mut session = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;
+    assert!(session.next_event().await.unwrap().is_some()); // accepted
+
+    for _ in 0..3 {
+        session
+            .send_audio(&[0i16.to_le_bytes(); 16].concat())
+            .await
+            .unwrap();
+    }
+    session.finish().await.unwrap();
+
+    let mut deltas = Vec::new();
+    while let Some(event) = session.next_event().await.unwrap() {
+        match event.event {
+            InvocationEventKind::TextDelta { text, .. } => deltas.push(text),
+            InvocationEventKind::Completed { .. } => break,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(
+        deltas,
+        [
+            "partial ",
+            "partial ",
+            "partial ",
+            "test realtime transcript"
+        ]
+    );
+}
+
 #[tokio::test]
 async fn realtime_stale_incarnation_is_closed_before_admission() {
     let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
