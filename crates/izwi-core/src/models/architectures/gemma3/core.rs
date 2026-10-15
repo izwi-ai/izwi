@@ -767,6 +767,25 @@ impl Gemma3PhysicalModel {
     }
 }
 
+/// The core tests' tiny two-layer Gemma 3 on `device`, with the vocabulary
+/// and position table sized by the caller.
+#[cfg(test)]
+pub(crate) fn tiny_gemma3_model_for_test(
+    device: &Device,
+    vocab_size: usize,
+    max_positions: usize,
+) -> Gemma3PhysicalModel {
+    let mut config = tests::tiny_config();
+    config.vocab_size = vocab_size;
+    config.max_position_embeddings = max_positions;
+    let weights = tests::tiny_weights(&config);
+    Gemma3PhysicalModel::load(
+        config,
+        VarBuilder::from_tensors(weights, DType::F32, device),
+    )
+    .expect("tiny Gemma 3 model")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,7 +796,7 @@ mod tests {
     use crate::engine::ModelInstanceId;
     use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 
-    fn tiny_config() -> Config {
+    pub(super) fn tiny_config() -> Config {
         Config {
             attention_bias: false,
             head_dim: 2,
@@ -891,7 +910,7 @@ mod tests {
         }
     }
 
-    fn tiny_weights(config: &Config) -> HashMap<String, Tensor> {
+    pub(super) fn tiny_weights(config: &Config) -> HashMap<String, Tensor> {
         let device = &Device::Cpu;
         let mut weights = HashMap::new();
         weights.insert(
