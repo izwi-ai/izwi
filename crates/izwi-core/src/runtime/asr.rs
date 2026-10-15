@@ -4042,13 +4042,14 @@ impl RuntimeService {
             })
             .await?;
         let windows = match windows {
-            ForcedAlignmentOwnedText::Whole(text) => vec![SampleWindow {
-                start_sample: 0,
-                end_sample: samples.len(),
+            ForcedAlignmentOwnedText::Whole(text) => vec![SampleWindow::new(
+                0,
+                samples.len(),
                 text,
-            }],
+                language.as_deref(),
+            )],
             ForcedAlignmentOwnedText::Windows(windows) => {
-                sample_windows(windows, sample_rate, samples.len())?
+                sample_windows(windows, sample_rate, samples.len(), language.as_deref())?
             }
         };
         let duration_ms = samples_to_ms(samples.len(), sample_rate);
@@ -4060,7 +4061,6 @@ impl RuntimeService {
                 samples,
                 sample_rate,
                 windows,
-                language,
                 "asr.forced_alignment",
             )
             .await?;
@@ -4075,7 +4075,7 @@ impl RuntimeService {
     /// between windows. A window longer than the aligner's limit is split by
     /// [`LongTextPlanner`] into sub-windows, each its own stage. Shared by the
     /// alignment API and the diarization pipeline; the caller holds the
-    /// aligner's residency lease.
+    /// aligner's residency lease. The windows carry their word units.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn align_sample_windows(
         &self,
@@ -4085,7 +4085,6 @@ impl RuntimeService {
         samples: Arc<[f32]>,
         sample_rate: u32,
         windows: Vec<SampleWindow>,
-        language: Option<String>,
         stage_kind: &str,
     ) -> Result<Vec<AlignedWindow>> {
         let max_window = model
@@ -4105,7 +4104,6 @@ impl RuntimeService {
                         &samples,
                         sample_rate,
                         window,
-                        &language,
                         stage_kind,
                         true,
                     )
@@ -4136,7 +4134,6 @@ impl RuntimeService {
                         &samples,
                         sample_rate,
                         planned.window.clone(),
-                        &language,
                         stage_kind,
                         false,
                     )
@@ -4156,7 +4153,6 @@ impl RuntimeService {
         samples: &Arc<[f32]>,
         sample_rate: u32,
         window: SampleWindow,
-        language: &Option<String>,
         stage_kind: &str,
         check_plausibility: bool,
     ) -> Result<AlignedWindow> {
@@ -4173,7 +4169,6 @@ impl RuntimeService {
             .reserve_stage_workspace(job, stage_kind, workspace)?;
         let model = model.clone();
         let samples = samples.clone();
-        let language = language.clone();
         self.coordinator
             .run_loaded_blocking_stage(
                 job,
@@ -4188,14 +4183,7 @@ impl RuntimeService {
                             sample_rate,
                             &window,
                             check_plausibility,
-                            |audio, text| {
-                                model.force_align_detailed(
-                                    audio,
-                                    sample_rate,
-                                    text,
-                                    language.as_deref(),
-                                )
-                            },
+                            |audio, units| model.force_align_units(audio, sample_rate, units),
                         )
                     })
                 },

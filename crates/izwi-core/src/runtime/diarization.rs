@@ -6,9 +6,6 @@ use crate::catalog::{
 };
 use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
-use crate::models::architectures::qwen3::asr::{
-    forced_alignment_word_ranges, forced_alignment_words,
-};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
@@ -839,7 +836,7 @@ impl RuntimeService {
         // into this block and drops at its end, so the ASR is evictable before
         // the aligner runs and the refinement LLM loads (ADM-8). Dropping only
         // the lease would let eviction count weights the model still pins.
-        let (asr_windows, chunk_texts, detected_language, single_pass_hit_budget) = {
+        let (asr_windows, chunk_texts, single_pass_hit_budget) = {
             let _asr_lease = asr_lease;
             let (asr_model, asr_contract, asr_state) = (asr_model, asr_contract, asr_state);
             if use_single_pass_asr {
@@ -891,12 +888,13 @@ impl RuntimeService {
                         .await?
                 };
                 let hit_budget = asr_hit_token_budget(transcription.diagnostics.as_ref());
-                let window = SampleWindow {
-                    start_sample: 0,
-                    end_sample: audio.samples.len(),
-                    text: transcription.text,
-                };
-                (vec![window], Vec::new(), transcription.language, hit_budget)
+                let window = SampleWindow::new(
+                    0,
+                    audio.samples.len(),
+                    transcription.text,
+                    transcription.language.as_deref(),
+                );
+                (vec![window], Vec::new(), hit_budget)
             } else if invocation_asr {
                 let (_cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
                 let mut transcribed = Vec::with_capacity(chunks.len());
@@ -944,7 +942,7 @@ impl RuntimeService {
                         language: transcription.language,
                     });
                 }
-                (chunk_windows(&transcribed), transcribed, None, false)
+                (chunk_windows(&transcribed), transcribed, false)
             } else {
                 let audio_for_task = audio.clone();
                 let chunks = self
@@ -960,7 +958,7 @@ impl RuntimeService {
                         },
                     )
                     .await?;
-                (chunk_windows(&chunks), chunks, None, false)
+                (chunk_windows(&chunks), chunks, false)
             }
         };
         let mut warnings = asr_token_budget_warnings(
@@ -969,9 +967,7 @@ impl RuntimeService {
         );
         warnings.extend(aligner_unavailable.map(|reason| aligner_unavailable_warning(&reason)));
 
-        let has_words = asr_windows
-            .iter()
-            .any(|window| !forced_alignment_words(&window.text).is_empty());
+        let has_words = asr_windows.iter().any(|window| !window.units.is_empty());
         let timed_windows = if !has_words {
             Vec::new()
         } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
@@ -987,7 +983,6 @@ impl RuntimeService {
                     audio.samples.clone(),
                     audio.sample_rate,
                     asr_windows.clone(),
-                    detected_language.clone(),
                     "diarization.force_align",
                 )
                 .await?;
@@ -1312,20 +1307,24 @@ fn transcribe_audio_chunks(
 }
 
 /// Alignment windows of the transcribed chunks: each chunk's audio with the
-/// text heard in it.
+/// text heard in it, split into word units for the chunk's language.
 fn chunk_windows(chunks: &[TranscribedChunk]) -> Vec<SampleWindow> {
     chunks
         .iter()
-        .map(|chunk| SampleWindow {
-            start_sample: chunk.range.start_sample,
-            end_sample: chunk.range.end_sample,
-            text: chunk.text.clone(),
+        .map(|chunk| {
+            SampleWindow::new(
+                chunk.range.start_sample,
+                chunk.range.end_sample,
+                chunk.text.clone(),
+                chunk.language.as_deref(),
+            )
         })
         .collect()
 }
 
-/// A timed word of one window: the aligner's word, the transcript text it
-/// stands for (the word with its punctuation), and its absolute times.
+/// A timed word of one window: the aligner's word (the source text of one
+/// unit), the transcript text that renders it (the word with the whitespace
+/// before it), and its absolute times.
 #[derive(Debug, Clone, PartialEq)]
 struct WindowWord {
     word: String,
@@ -1361,12 +1360,17 @@ struct StitchedTranscript {
     words: Vec<StitchedWord>,
 }
 
-/// The aligner's words of `text` paired with their transcript text: each word
-/// with the punctuation around it and the whitespace before it, so a run of
-/// tokens concatenates back to the text. A gap between two words splits at its
-/// first whitespace, or before the next word when it has none (CJK).
-fn word_tokens(text: &str) -> Vec<(String, String)> {
-    let ranges = forced_alignment_word_ranges(text);
+/// The aligner's words of `window` paired with their transcript text: each
+/// word with the punctuation around it and the whitespace before it, so a run
+/// of tokens concatenates back to the text. A gap between two words splits at
+/// its first whitespace, or before the next word when it has none (CJK).
+fn word_tokens(window: &SampleWindow) -> Vec<(String, String)> {
+    let text = window.text.as_str();
+    let ranges = window
+        .units
+        .iter()
+        .map(|unit| unit.source.clone())
+        .collect::<Vec<_>>();
     let mut tokens = Vec::with_capacity(ranges.len());
     let mut token_start = 0usize;
     for (idx, range) in ranges.iter().enumerate() {
@@ -1394,10 +1398,7 @@ fn timed_windows_from_alignment(
     sources: &[SampleWindow],
     aligned: Vec<AlignedWindow>,
 ) -> Vec<TimedWindow> {
-    let tokens = sources
-        .iter()
-        .flat_map(|source| word_tokens(&source.text))
-        .collect::<Vec<_>>();
+    let tokens = sources.iter().flat_map(word_tokens).collect::<Vec<_>>();
     let mut cursor = 0usize;
     aligned
         .into_iter()
@@ -1461,7 +1462,7 @@ fn interval_timed_windows(windows: &[SampleWindow], sample_rate: u32) -> Vec<Tim
         .map(|window| {
             let start_ms = samples_to_ms(window.start_sample, sample_rate);
             let end_ms = samples_to_ms(window.end_sample.max(window.start_sample), sample_rate);
-            let tokens = word_tokens(&window.text);
+            let tokens = word_tokens(window);
             let words = tokens
                 .iter()
                 .map(|(word, _)| word.clone())
@@ -3331,21 +3332,24 @@ mod tests {
     #[test]
     fn stitched_text_holds_exactly_the_stitched_words() {
         let sources = [
-            SampleWindow {
-                start_sample: 0,
-                end_sample: 10 * PIPELINE_SAMPLE_RATE as usize,
-                text: "Hello, world! It's \"me\" here.".to_string(),
-            },
-            SampleWindow {
-                start_sample: 9 * PIPELINE_SAMPLE_RATE as usize,
-                end_sample: 20 * PIPELINE_SAMPLE_RATE as usize,
-                text: "你好。Then more".to_string(),
-            },
+            SampleWindow::new(
+                0,
+                10 * PIPELINE_SAMPLE_RATE as usize,
+                "Hello, world! It's \"me\" here.".to_string(),
+                None,
+            ),
+            SampleWindow::new(
+                9 * PIPELINE_SAMPLE_RATE as usize,
+                20 * PIPELINE_SAMPLE_RATE as usize,
+                "你好。Then more".to_string(),
+                None,
+            ),
         ];
         let timed = interval_timed_windows(&sources, PIPELINE_SAMPLE_RATE);
         let stitched = stitch_timed_windows(&timed);
+        let restitched = SampleWindow::new(0, 0, stitched.text.clone(), None);
         assert_eq!(
-            forced_alignment_words(&stitched.text),
+            restitched.words(),
             stitched
                 .words
                 .iter()

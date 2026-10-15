@@ -71,7 +71,7 @@ use crate::models::architectures::nemotron::asr::{
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
-pub(crate) use crate::models::architectures::qwen3::asr::ForcedAlignmentOutput;
+pub(crate) use crate::models::architectures::qwen3::asr::{AlignmentUnit, ForcedAlignmentOutput};
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
@@ -2325,6 +2325,8 @@ impl NativeAsrModel {
         }
     }
 
+    /// Forced alignment of `reference_text`, split into word units for
+    /// `language`: each unit's source text with its start and end in ms.
     pub fn force_align(
         &self,
         audio: &[f32],
@@ -2332,34 +2334,25 @@ impl NativeAsrModel {
         reference_text: &str,
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
-        self.force_align_detailed(audio, sample_rate, reference_text, language)
-            .map(|output| output.words)
+        self.forced_aligner()?
+            .force_align(audio, sample_rate, reference_text, language)
     }
 
-    pub(crate) fn force_align_detailed(
+    /// Forced alignment of word units: one timing per unit.
+    pub(crate) fn force_align_units(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        reference_text: &str,
-        language: Option<&str>,
+        units: &[AlignmentUnit],
     ) -> Result<ForcedAlignmentOutput> {
+        self.forced_aligner()?
+            .force_align_units(audio, sample_rate, units)
+    }
+
+    fn forced_aligner(&self) -> Result<&Qwen3AsrModel> {
         match self {
-            Self::Qwen3(model) => {
-                model.force_align_detailed(audio, sample_rate, reference_text, language)
-            }
-            Self::Parakeet(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::WhisperTurbo(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::VibeVoice(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::GraniteSpeech(_) => Err(Error::InvalidInput(
+            Self::Qwen3(model) => Ok(model),
+            _ => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
         }

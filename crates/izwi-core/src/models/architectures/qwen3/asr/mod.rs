@@ -3,6 +3,7 @@
 mod audio;
 mod config;
 mod tokenizer;
+mod word_units;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,7 @@ pub(crate) use audio::{
 };
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
+pub(crate) use word_units::{alignment_units, AlignmentUnit};
 
 const QWEN3_ASR_PREPARED_INPUT_DOMAIN: StateDomainId = StateDomainId::new(2);
 static NEXT_QWEN3_ASR_AUDIO_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -1523,41 +1525,13 @@ fn qwen3_aligner_max_window_samples(maximum_frames: usize, hop_length: usize) ->
         .saturating_mul(hop_length.max(1))
 }
 
-/// Words of one forced alignment as (word, start_ms, end_ms), and whether
-/// they are interval-based timings that replaced degenerate model output.
+/// The timings of one forced alignment, one `(start_ms, end_ms)` per unit,
+/// and whether they are interval-based timings that replaced degenerate
+/// model output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForcedAlignmentOutput {
-    pub words: Vec<(String, u32, u32)>,
+    pub timings: Vec<(u32, u32)>,
     pub interval_fallback: bool,
-}
-
-/// The words the aligner times in `text`, in order: runs of letters, digits,
-/// `'` and `-`, with each CJK or Hangul character a word of its own.
-/// Re-joining them with spaces yields the same words.
-pub(crate) fn forced_alignment_words(text: &str) -> Vec<String> {
-    extract_alignment_words(text)
-}
-
-/// Byte ranges in `text` of the words [`forced_alignment_words`] returns.
-pub(crate) fn forced_alignment_word_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut current: Option<usize> = None;
-    for (idx, ch) in text.char_indices() {
-        if is_east_asian_char(ch) {
-            if let Some(start) = current.take() {
-                ranges.push(start..idx);
-            }
-            ranges.push(idx..idx + ch.len_utf8());
-        } else if is_alignment_word_char(ch) {
-            current.get_or_insert(idx);
-        } else if let Some(start) = current.take() {
-            ranges.push(start..idx);
-        }
-    }
-    if let Some(start) = current {
-        ranges.push(start..text.len());
-    }
-    ranges
 }
 
 /// Most alignable words one aligner window of `audio_seconds` accepts.
@@ -2789,8 +2763,9 @@ impl Qwen3AsrModel {
             })
     }
 
-    /// Forced alignment: align reference text with audio timestamps.
-    /// Returns a vector of (word, start_time_ms, end_time_ms) tuples.
+    /// Forced alignment of `reference_text`, split into word units for
+    /// `language` ([`alignment_units`]). Returns each unit's source text,
+    /// punctuation included, with its start and end in milliseconds.
     pub fn force_align(
         &self,
         audio: &[f32],
@@ -2798,18 +2773,23 @@ impl Qwen3AsrModel {
         reference_text: &str,
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
-        self.force_align_detailed(audio, sample_rate, reference_text, language)
-            .map(|output| output.words)
+        let units = alignment_units(reference_text, language);
+        let output = self.force_align_units(audio, sample_rate, &units)?;
+        Ok(units
+            .iter()
+            .zip(output.timings)
+            .map(|(unit, (start, end))| (unit.surface(reference_text).to_string(), start, end))
+            .collect())
     }
 
-    /// Forced alignment that also reports whether the model's timings were
-    /// replaced by interval-based ones because they were degenerate.
-    pub fn force_align_detailed(
+    /// Forced alignment of word units: one timing per unit, and whether the
+    /// model's timings were replaced by interval-based ones because they
+    /// were degenerate.
+    pub fn force_align_units(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        reference_text: &str,
-        _language: Option<&str>,
+        units: &[AlignmentUnit],
     ) -> Result<ForcedAlignmentOutput> {
         if !self.is_forced_aligner {
             return Err(Error::InvalidInput(
@@ -2817,14 +2797,14 @@ impl Qwen3AsrModel {
                     .to_string(),
             ));
         }
-        self.force_align_with_nar_head(audio, sample_rate, reference_text)
+        self.force_align_with_nar_head(audio, sample_rate, units)
     }
 
     fn force_align_with_nar_head(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        reference_text: &str,
+        units: &[AlignmentUnit],
     ) -> Result<ForcedAlignmentOutput> {
         let audio = if sample_rate != 16_000 {
             resample(audio, sample_rate, 16_000)?
@@ -2832,12 +2812,15 @@ impl Qwen3AsrModel {
             audio.to_vec()
         };
 
-        let words = extract_alignment_words(reference_text);
-        if words.is_empty() {
+        if units.is_empty() {
             return Err(Error::InvalidInput(
                 "Reference text produced no alignable words".to_string(),
             ));
         }
+        let words = units
+            .iter()
+            .map(|unit| unit.text.clone())
+            .collect::<Vec<_>>();
         let audio_seconds = audio.len() as f64 / f64::from(QWEN3_ASR_SAMPLE_RATE);
         let max_words = qwen3_aligner_max_words(audio_seconds);
         if words.len() > max_words {
@@ -2951,7 +2934,10 @@ impl Qwen3AsrModel {
             normalize_alignment_bounds(&mut alignments, audio_duration_ms);
         }
         Ok(ForcedAlignmentOutput {
-            words: alignments,
+            timings: alignments
+                .into_iter()
+                .map(|(_, start, end)| (start, end))
+                .collect(),
             interval_fallback,
         })
     }
@@ -3315,33 +3301,6 @@ fn batched_decode_argmax(output: &Tensor) -> Result<Vec<u32>> {
         .to_dtype(DType::U32)?
         .to_vec1::<u32>()
         .map_err(Error::from)
-}
-
-fn extract_alignment_words(text: &str) -> Vec<String> {
-    forced_alignment_word_ranges(text)
-        .into_iter()
-        .map(|range| text[range].to_string())
-        .collect()
-}
-
-fn is_alignment_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '\'' || ch == '-'
-}
-
-fn is_east_asian_char(ch: char) -> bool {
-    let code = ch as u32;
-    (0x4E00..=0x9FFF).contains(&code)
-        || (0x3400..=0x4DBF).contains(&code)
-        || (0x20000..=0x2A6DF).contains(&code)
-        || (0x2A700..=0x2B73F).contains(&code)
-        || (0x2B740..=0x2B81F).contains(&code)
-        || (0x2B820..=0x2CEAF).contains(&code)
-        || (0xF900..=0xFAFF).contains(&code)
-        || (0x3040..=0x309F).contains(&code) // Hiragana
-        || (0x30A0..=0x30FF).contains(&code) // Katakana
-        || (0xAC00..=0xD7AF).contains(&code) // Hangul syllables
-        || (0x1100..=0x11FF).contains(&code) // Hangul Jamo
-        || (0x3130..=0x318F).contains(&code) // Hangul Compatibility Jamo
 }
 
 fn distribute_words_over_interval(
@@ -6563,18 +6522,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_alignment_words_strips_markers() {
-        let words = extract_alignment_words("hello,  world! it's me.");
-        assert_eq!(words, vec!["hello", "world", "it's", "me"]);
-    }
-
-    #[test]
-    fn extract_alignment_words_splits_cjk_and_hangul() {
-        let words = extract_alignment_words("你好 world 안녕");
-        assert_eq!(words, vec!["你", "好", "world", "안", "녕"]);
-    }
-
-    #[test]
     fn distribute_words_over_interval_is_monotonic() {
         let words = vec!["one".to_string(), "two".to_string(), "three".to_string()];
         let aligned = distribute_words_over_interval(&words, 100, 160);
@@ -6831,8 +6778,11 @@ mod tests {
         let text = std::fs::read_to_string(data.join("fox.md")).expect("fox.md");
         let text = text.trim();
         let duration_ms = ((audio.len() as f64 / f64::from(sample_rate)) * 1000.0).round() as u32;
-        let mut uniform =
-            distribute_words_over_interval(&extract_alignment_words(text), 0, duration_ms.max(1));
+        let surfaces = alignment_units(text, None)
+            .iter()
+            .map(|unit| unit.surface(text).to_string())
+            .collect::<Vec<_>>();
+        let mut uniform = distribute_words_over_interval(&surfaces, 0, duration_ms.max(1));
         normalize_alignment_bounds(&mut uniform, duration_ms);
 
         for (dir_name, variant) in [

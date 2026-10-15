@@ -19,8 +19,8 @@ use serde::Serialize;
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
-use crate::models::architectures::qwen3::asr::{forced_alignment_words, qwen3_aligner_max_words};
-use crate::models::registry::ForcedAlignmentOutput;
+use crate::models::architectures::qwen3::asr::{alignment_units, qwen3_aligner_max_words};
+use crate::models::registry::{AlignmentUnit, ForcedAlignmentOutput};
 use crate::runtime::coordinator::{JobResourceObservation, StageWorkspaceLease};
 use crate::runtime::diarization::{
     alignment_is_suspicious, fallback_word_timings_from_words, samples_to_ms,
@@ -56,7 +56,8 @@ pub struct AlignedWindow {
     pub start_ms: u32,
     pub end_ms: u32,
     pub source: AlignmentSource,
-    /// `(word, start_ms, end_ms)` in absolute time.
+    /// `(word, start_ms, end_ms)` in absolute time, each word the source
+    /// text of one aligner unit (punctuation included).
     pub words: Vec<(String, u32, u32)>,
     /// Why the window is not [`AlignmentSource::Model`].
     pub detail: Option<String>,
@@ -148,12 +149,40 @@ impl WindowedAlignment {
     }
 }
 
-/// An alignment window in samples of the decoded audio.
+/// An alignment window in samples of the decoded audio, with its text and
+/// the aligner's word units of that text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SampleWindow {
     pub(crate) start_sample: usize,
     pub(crate) end_sample: usize,
     pub(crate) text: String,
+    pub(crate) units: Vec<AlignmentUnit>,
+}
+
+impl SampleWindow {
+    /// A window whose text is split into word units for `language`.
+    pub(crate) fn new(
+        start_sample: usize,
+        end_sample: usize,
+        text: String,
+        language: Option<&str>,
+    ) -> Self {
+        let units = alignment_units(&text, language);
+        Self {
+            start_sample,
+            end_sample,
+            text,
+            units,
+        }
+    }
+
+    /// The source text of each word unit, punctuation included.
+    pub(crate) fn words(&self) -> Vec<String> {
+        self.units
+            .iter()
+            .map(|unit| unit.surface(&self.text).to_string())
+            .collect()
+    }
 }
 
 /// The forward working set one aligner window reserves while it runs
@@ -167,7 +196,7 @@ pub(crate) fn forced_alignment_window_workspace(
 ) -> Result<JobResourceObservation> {
     let samples = window.end_sample.saturating_sub(window.start_sample);
     let secs = samples as f32 / sample_rate.max(1) as f32;
-    let words = forced_alignment_words(&window.text).len();
+    let words = window.units.len();
     Ok(forced_alignment_envelope(variant, secs, words, backend)?
         .map(|envelope| {
             JobResourceObservation::new(envelope.host_bytes, envelope.accelerator_bytes)
@@ -190,11 +219,13 @@ pub(crate) fn align_under_stage_lease<T>(
 }
 
 /// Convert caller windows to sample ranges of `total_samples` audio, clamped
-/// to it. Times must be finite and ordered.
+/// to it, with their text split into word units for `language`. Times must
+/// be finite and ordered.
 pub(crate) fn sample_windows(
     windows: Vec<AlignmentWindow>,
     sample_rate: u32,
     total_samples: usize,
+    language: Option<&str>,
 ) -> Result<Vec<SampleWindow>> {
     let rate = f64::from(sample_rate.max(1));
     windows
@@ -214,17 +245,18 @@ pub(crate) fn sample_windows(
             let end_sample = ((window.end_secs * rate).round() as usize)
                 .min(total_samples)
                 .max(start_sample);
-            Ok(SampleWindow {
+            Ok(SampleWindow::new(
                 start_sample,
                 end_sample,
-                text: window.text,
-            })
+                window.text,
+                language,
+            ))
         })
         .collect()
 }
 
-/// Align one window with `align` (audio slice, text) and rebase the result
-/// by the window start. Degenerate or failed alignments keep interval
+/// Align one window with `align` (audio slice, word units) and rebase the
+/// result by the window start. Degenerate or failed alignments keep interval
 /// timings over the window, flagged by their source. `check_plausibility`
 /// also flags collapsed timings; [`LongTextPlanner`] sub-windows skip it,
 /// since their surplus words are expected to pile up at the window end and
@@ -237,13 +269,13 @@ pub(crate) fn align_window_checked<F>(
     align: F,
 ) -> AlignedWindow
 where
-    F: FnOnce(&[f32], &str) -> Result<ForcedAlignmentOutput>,
+    F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
 {
     let end_sample = window.end_sample.min(samples.len());
     let start_sample = window.start_sample.min(end_sample);
     let start_ms = samples_to_ms(start_sample, sample_rate);
     let end_ms = samples_to_ms(end_sample, sample_rate);
-    let words = forced_alignment_words(&window.text);
+    let words = window.words();
     if words.is_empty() {
         return AlignedWindow {
             start_ms,
@@ -262,19 +294,33 @@ where
             "the forced alignment window holds no audio".to_string(),
         ))
     } else {
-        align(audio, &window.text)
+        align(audio, &window.units).and_then(|output| {
+            if output.timings.len() != words.len() {
+                return Err(Error::InferenceError(format!(
+                    "the aligner timed {} of {} words",
+                    output.timings.len(),
+                    words.len()
+                )));
+            }
+            let timed = words
+                .iter()
+                .cloned()
+                .zip(output.timings)
+                .map(|(word, (start, end))| (word, start, end))
+                .collect::<Vec<_>>();
+            Ok((timed, output.interval_fallback))
+        })
     };
     let (source, relative, detail, error) = match result {
-        Ok(output) if output.interval_fallback => (
+        Ok((timed, true)) => (
             AlignmentSource::Heuristic,
-            output.words,
+            timed,
             Some("the aligner's timings were degenerate".to_string()),
             None,
         ),
-        Ok(output)
-            if output.words.is_empty()
-                || (check_plausibility
-                    && alignment_is_suspicious(&output.words, words.len(), duration_secs)) =>
+        Ok((timed, false))
+            if check_plausibility
+                && alignment_is_suspicious(&timed, words.len(), duration_secs) =>
         {
             (
                 AlignmentSource::Heuristic,
@@ -283,7 +329,7 @@ where
                 None,
             )
         }
-        Ok(output) => (AlignmentSource::Model, output.words, None, None),
+        Ok((timed, false)) => (AlignmentSource::Model, timed, None, None),
         Err(err) => (
             AlignmentSource::Failed,
             fallback_word_timings_from_words(&words, duration_secs),
@@ -348,6 +394,9 @@ pub(crate) struct PlannedWindow {
 /// Plans the sub-windows of one window longer than the aligner's limit and
 /// keeps the words each sub-window aligned inside it (see the module docs).
 pub(crate) struct LongTextPlanner {
+    /// The long window's text, its word units and their source texts.
+    text: String,
+    units: Vec<AlignmentUnit>,
     words: Vec<String>,
     next_word: usize,
     cursor: usize,
@@ -392,7 +441,9 @@ impl LongTextPlanner {
             speech_prefix.push(last + usize::from(value >= threshold));
         }
         Self {
-            words: forced_alignment_words(&window.text),
+            text: window.text.clone(),
+            units: window.units.clone(),
+            words: window.words(),
             next_word: 0,
             cursor: origin,
             end,
@@ -476,11 +527,23 @@ impl LongTextPlanner {
                     .min(qwen3_aligner_max_words(window_secs))
                     .clamp(estimate, remaining_words)
             };
+            // The offered units keep their own text: re-splitting a joined
+            // text could split differently (Korean, Japanese).
+            let units = &self.units[self.next_word..self.next_word + offered];
+            let from = units[0].source.start;
+            let to = units[units.len() - 1].source.end;
             return Some(PlannedWindow {
                 window: SampleWindow {
                     start_sample: self.cursor,
                     end_sample: cut,
-                    text: self.words[self.next_word..self.next_word + offered].join(" "),
+                    text: self.text[from..to].to_string(),
+                    units: units
+                        .iter()
+                        .map(|unit| AlignmentUnit {
+                            text: unit.text.clone(),
+                            source: unit.source.start - from..unit.source.end - from,
+                        })
+                        .collect(),
                 },
                 estimate,
                 last,
@@ -572,28 +635,22 @@ mod tests {
         align: F,
     ) -> AlignedWindow
     where
-        F: FnOnce(&[f32], &str) -> Result<ForcedAlignmentOutput>,
+        F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
     {
         align_window_checked(samples, sample_rate, window, true, align)
     }
 
     fn window(start_sample: usize, end_sample: usize, text: &str) -> SampleWindow {
-        SampleWindow {
-            start_sample,
-            end_sample,
-            text: text.to_string(),
-        }
+        SampleWindow::new(start_sample, end_sample, text.to_string(), None)
     }
 
-    /// Stub aligner: the words of `text` at fixed relative times, 400 ms
-    /// apart with 300 ms spans, regardless of the audio.
-    fn fixed_aligner(audio: &[f32], text: &str) -> Result<ForcedAlignmentOutput> {
+    /// Stub aligner: the units at fixed relative times, 400 ms apart with
+    /// 300 ms spans, regardless of the audio.
+    fn fixed_aligner(audio: &[f32], units: &[AlignmentUnit]) -> Result<ForcedAlignmentOutput> {
         assert!(!audio.is_empty());
         Ok(ForcedAlignmentOutput {
-            words: forced_alignment_words(text)
-                .into_iter()
-                .enumerate()
-                .map(|(idx, word)| (word, idx as u32 * 400, idx as u32 * 400 + 300))
+            timings: (0..units.len() as u32)
+                .map(|idx| (idx * 400, idx * 400 + 300))
                 .collect(),
             interval_fallback: false,
         })
@@ -755,10 +812,10 @@ mod tests {
         );
         assert!(failed.words.iter().all(|(_, _, end)| *end <= 10_000));
 
-        let degenerate = align_window(&samples, rate, &window(ten, 2 * ten, "d e"), |_, text| {
+        let degenerate = align_window(&samples, rate, &window(ten, 2 * ten, "d e"), |_, units| {
             Ok(ForcedAlignmentOutput {
                 interval_fallback: true,
-                ..fixed_aligner(&[0.0], text)?
+                ..fixed_aligner(&[0.0], units)?
             })
         });
         assert_eq!(degenerate.source, AlignmentSource::Heuristic);
@@ -801,12 +858,9 @@ mod tests {
             &samples,
             rate,
             &window(0, samples.len(), &text),
-            |_, text| {
+            |_, units| {
                 Ok(ForcedAlignmentOutput {
-                    words: forced_alignment_words(text)
-                        .into_iter()
-                        .map(|word| (word, 29_900, 29_901))
-                        .collect(),
+                    timings: vec![(29_900, 29_901); units.len()],
                     interval_fallback: false,
                 })
             },
@@ -832,6 +886,7 @@ mod tests {
             ],
             16_000,
             32_000,
+            None,
         )
         .unwrap();
         assert_eq!(windows[0], window(0, 24_000, "a"));
@@ -844,7 +899,8 @@ mod tests {
                     text: "a".into()
                 }],
                 16_000,
-                32_000
+                32_000,
+                None
             )
             .is_err());
         }
@@ -882,10 +938,10 @@ mod tests {
         let model = Qwen3AsrModel::load(&model_dir, ModelVariant::Qwen3ForcedAligner06B, device)
             .expect("load aligner");
         let doubled = format!("{text} {text}");
-        let first_copy_words = forced_alignment_words(text).len();
+        let first_copy_words = alignment_units(text, None).len();
         let align = |window: &SampleWindow, check: bool| {
-            align_window_checked(&samples, rate, window, check, |audio, text| {
-                model.force_align_detailed(audio, rate, text, None)
+            align_window_checked(&samples, rate, window, check, |audio, units| {
+                model.force_align_units(audio, rate, units)
             })
         };
         let report = |label: &str, alignment: &WindowedAlignment| {
@@ -1030,8 +1086,8 @@ mod tests {
             let duration_ms = samples_to_ms(samples.len(), rate);
             let whole = window(0, samples.len(), &text);
             let align = |window: &SampleWindow, check: bool| {
-                align_window_checked(&samples, rate, window, check, |audio, text| {
-                    model.force_align_detailed(audio, rate, text, None)
+                align_window_checked(&samples, rate, window, check, |audio, units| {
+                    model.force_align_units(audio, rate, units)
                 })
             };
             let timed = |label: &str, run: &dyn Fn() -> WindowedAlignment| {
@@ -1113,15 +1169,16 @@ mod tests {
         aligner: F,
     ) -> Vec<AlignedWindow>
     where
-        F: Fn(&SampleWindow, &str) -> Result<ForcedAlignmentOutput>,
+        F: Fn(&SampleWindow, &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
     {
         let mut planner = LongTextPlanner::new(samples, rate, window, max_window);
         let mut out = Vec::new();
         while let Some(planned) = planner.next_window(samples) {
             assert!(planned.window.end_sample - planned.window.start_sample <= max_window);
-            let aligned = align_window_checked(samples, rate, &planned.window, false, |_, text| {
-                aligner(&planned.window, text)
-            });
+            let aligned =
+                align_window_checked(samples, rate, &planned.window, false, |_, units| {
+                    aligner(&planned.window, units)
+                });
             out.push(planner.absorb(&planned, aligned));
             assert!(out.len() < 100, "planner must make progress");
         }
@@ -1132,21 +1189,21 @@ mod tests {
     /// word whose speech is not in the window piles up at the window end.
     fn timeline_aligner(
         rate: u32,
-    ) -> impl Fn(&SampleWindow, &str) -> Result<ForcedAlignmentOutput> {
-        move |window, text| {
+    ) -> impl Fn(&SampleWindow, &[AlignmentUnit]) -> Result<ForcedAlignmentOutput> {
+        move |window, units| {
             let start_ms = samples_to_ms(window.start_sample, rate);
             let length_ms = samples_to_ms(window.end_sample, rate) - start_ms;
             Ok(ForcedAlignmentOutput {
-                words: forced_alignment_words(text)
-                    .into_iter()
-                    .map(|word| {
-                        let k: u32 = word[1..].parse().unwrap();
+                timings: units
+                    .iter()
+                    .map(|unit| {
+                        let k: u32 = unit.text[1..].parse().unwrap();
                         let (true_start, true_end) = (k * 500, k * 500 + 300);
                         if true_end <= start_ms + length_ms {
                             let relative = true_start.saturating_sub(start_ms);
-                            (word, relative, true_end - start_ms)
+                            (relative, true_end - start_ms)
                         } else {
-                            (word, length_ms - 80, length_ms - 80)
+                            (length_ms - 80, length_ms - 80)
                         }
                     })
                     .collect(),
@@ -1244,6 +1301,66 @@ mod tests {
         assert_eq!(aligned_words.len(), 60);
         assert_eq!(aligned_words[20].0, "w100");
         assert_eq!(aligned_words[20].1, 50_000, "{:?}", alignment.windows);
+    }
+
+    /// QFA-3: the aligner gets the language's units and the words keep the
+    /// transcript's punctuation.
+    #[test]
+    fn window_words_are_language_units_with_their_punctuation() {
+        let rate = 16_000u32;
+        let samples = vec![0.1f32; 10 * rate as usize];
+        let text = "We’re here, “AI—autonomous”!".to_string();
+        let window = SampleWindow::new(0, samples.len(), text, Some("English"));
+        let aligned = align_window(&samples, rate, &window, |audio, units| {
+            let texts = units
+                .iter()
+                .map(|unit| unit.text.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(texts, ["Were", "here", "AIautonomous"]);
+            fixed_aligner(audio, units)
+        });
+        assert_eq!(
+            aligned.words,
+            [
+                ("We’re".to_string(), 0, 300),
+                ("here,".to_string(), 400, 700),
+                ("“AI—autonomous”!".to_string(), 800, 1_100),
+            ]
+        );
+
+        let korean =
+            SampleWindow::new(0, samples.len(), "학교에서는 공부합니다".into(), Some("ko"));
+        assert_eq!(korean.words(), ["학교", "에서는", "공부", "합니다"]);
+    }
+
+    /// A sub-window takes its units from the long window instead of
+    /// re-splitting its text: re-splitting the Korean `에서는` alone would
+    /// cut it after the dictionary word `에서`.
+    #[test]
+    fn long_text_sub_windows_keep_the_long_window_units() {
+        let rate = 16_000u32;
+        let samples = vec![0.1f32; 70 * rate as usize];
+        let text = vec!["학교에서는 공부합니다."; 70].join(" ");
+        let long = SampleWindow::new(0, samples.len(), text, Some("Korean"));
+        assert_eq!(long.units.len(), 280);
+        assert_eq!(
+            SampleWindow::new(0, 1, "에서는".into(), Some("Korean")).words(),
+            ["에서", "는"]
+        );
+        let mut planner = LongTextPlanner::new(&samples, rate, &long, 30 * rate as usize);
+        let planned = planner.next_window(&samples).expect("a sub-window");
+        let offered = planned.window.units.len();
+        assert!(offered < long.units.len());
+        let first = long.units[0].source.start;
+        let expected = long.units[..offered]
+            .iter()
+            .map(|unit| AlignmentUnit {
+                text: unit.text.clone(),
+                source: unit.source.start - first..unit.source.end - first,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(planned.window.units, expected);
+        assert_eq!(planned.window.words(), long.words()[..offered]);
     }
 
     #[test]
