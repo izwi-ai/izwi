@@ -1224,7 +1224,17 @@ fn push_timestamp_segment(
     end: f32,
     words: &[String],
 ) {
-    let text = words.join(" ").trim().to_string();
+    // Aligner words are surface spans: Chinese and Japanese words join
+    // without spaces, as the transcript writes them.
+    let text = words
+        .iter()
+        .fold(String::new(), |mut text, word| {
+            text.push_str(izwi_core::spacing_between(&text, word));
+            text.push_str(word);
+            text
+        })
+        .trim()
+        .to_string();
     if text.is_empty() {
         return;
     }
@@ -1720,6 +1730,29 @@ mod tests {
         assert!((segments[0].end - 0.9).abs() < f32::EPSILON);
         assert_eq!(segments[1].id, 1);
         assert_eq!(segments[1].text, "again");
+    }
+
+    /// Chinese and Japanese aligner words make segment text without spaces;
+    /// spaced scripts keep theirs.
+    #[test]
+    fn timestamp_segments_join_cjk_words_without_spaces() {
+        let word = |word: &str, start: f32| TranscriptionTimestampWord {
+            word: word.to_string(),
+            start,
+            end: start + 0.2,
+        };
+        let chinese = build_timestamp_segments(
+            &[word("我们", 0.0), word("明天", 0.2), word("见面。", 0.4)],
+            &[],
+        );
+        assert_eq!(chinese[0].text, "我们明天见面。");
+        let japanese = build_timestamp_segments(&[word("今日は", 0.0), word("晴れ", 0.2)], &[]);
+        assert_eq!(japanese[0].text, "今日は晴れ");
+        let mixed = build_timestamp_segments(
+            &[word("Hello,", 0.0), word("world", 0.2), word("你好", 0.4)],
+            &[],
+        );
+        assert_eq!(mixed[0].text, "Hello, world你好");
     }
 
     #[test]

@@ -101,6 +101,9 @@ pub use config::{
     PhysicalExecutionMode, PhysicalInFlightLimit,
 };
 pub use error::{Error, Result};
+/// The separator between two transcript pieces: none where a script is
+/// written without spaces (CJK, Thai) or punctuation closes, else a space.
+pub use izwi_asr_toolkit::spacing_between;
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use performance::{
     CpuPerformanceConfig, CpuPerformanceConfigOverrides, CpuProjectionBackend,
