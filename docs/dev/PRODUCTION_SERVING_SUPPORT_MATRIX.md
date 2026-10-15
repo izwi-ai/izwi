@@ -131,8 +131,8 @@ in-memory by design (a supervisor restart returns to the declared min set).
 
 A chat request runs on a worker exactly as on the local server. The worker
 builds its engine request with the same izwi-core resolver (family sampling
-profiles, seed, stop, top-k, penalties, logprobs, JSON mode, and the D8 output
-budget and truncation), and the gateway sends each control only to a worker
+profiles, seed, stop, top-k, penalties, logprobs, JSON mode, tools, and the D8
+output budget and truncation), and the gateway sends each control only to a worker
 that advertises its `WorkerFeature`; otherwise it returns a `400`
 (`unsupported_parameter`), never dropping the control.
 
@@ -141,8 +141,8 @@ that advertises its `WorkerFeature`; otherwise it returns a `400`
 | Version negotiation and forward-compatible enums | Supported | Every worker-sent enum decodes a later variant as `Unknown`; the gateway sends `x-izwi-protocol-version` and the worker leaves out what an older gateway cannot decode; invocations carry the negotiated minor. JSON-literal old/new matrix in `crates/izwi-serving-protocol/tests/compatibility_matrix.rs` |
 | Mixed fleets (minor 3 and minor 4 workers) | Supported | Controls route only to workers advertising them; plain requests still run on minor-3 workers at minor 3, which keep automatic truncation (`controls_route_only_to_workers_that_advertise_them`, which also covers a one-worker registry) |
 | Rolling upgrade order | Either order from minor 4 on; minor-3 gateways decode minor-4 workers through the version header filter | Same tests |
-| Local and gateway paths answer alike | Supported on CPU and Metal on the tiny LFM2 fixture; CUDA not run | `crates/izwi-serving-worker/tests/local_remote_parity.rs`: the local role's API and the gateway to a real worker process give identical greedy and seeded answers (content, logprobs, finish reason, token counts), stop strings, unset budgets, auto truncation and the D8 overflow `400`s, streamed and not; JSON mode reaches the engine on both |
-| Known differences | Open | A streamed request that overflows the context is a `200` stream ending in an error locally and a `400` through the gateway; a model failure inside a worker stream is reported as the stream closing, not the model's message |
+| Local and gateway paths answer alike | Supported on CPU and Metal on the tiny LFM2 fixture; CUDA not run | `crates/izwi-serving-worker/tests/local_remote_parity.rs`: the local role's API and the gateway to a real worker process give identical greedy and seeded answers (content, logprobs, finish reason, token counts), stop strings, unset budgets, auto truncation and the D8 overflow `400`s, streamed and not (both admit before the stream starts); JSON mode reaches the engine on both, and a model failure mid-stream ends both streams with the same error event; both list exactly their one model on `/v1/models` |
+| Tool calls through the gateway | Supported where the worker advertises `ChatTools` | The gateway sends `tools` to such workers and parses the model's tool-call markup from the worker's text with the local server's parser (`gateway_streams_worker_tool_markup_as_tool_calls`, scripted worker splitting the markup mid-tag); `local_remote_parity` shows a request with tools renders the same prompt and answer on both paths. The tiny fixture cannot emit a real call |
 
 ## API completeness surface (DS9)
 
@@ -153,7 +153,7 @@ semantics, and older workers tolerate the new fields.
 | Scope | Status | Evidence |
 |---|---|---|
 | `usage.cached_tokens` (DS9.1) | Supported | Scheduler-authoritative managed-prefix cursor through `ChatGeneration` into public `usage.prompt_tokens_details.cached_tokens` (chat) and `input_tokens_details.cached_tokens` (responses); scripted-runtime knob for tests; process test proves 64 cached tokens flow worker→public (`b2fb8415`) |
-| `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming `choices[].logprobs`, streaming `delta.logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
+| `logprobs` / `top_logprobs` (DS9.3) | Supported | Per-token logprobs (raw-logit log_softmax) through all five families, non-streaming and streaming `choices[].logprobs`, and the gateway relay with a 65,536-entry cap; same-tokens property test pins that requesting logprobs never changes the token stream; T40 process evidence worker→public (`0f060c00`/`a3d34d83`/`77a07a1c`) |
 | `response_format: json_object` on shared-sampler families (qwen3, gemma3, lfm2) (DS9.2) | Supported on the grammar-constrained lane | RFC 8259 grammar FSM masks at the ChatSampler seam (stop tokens stay sampleable, logprobs compose on the unmasked row), including continuous-batch rows; property test generates masked JSON across seeds and parses every document (`c1f4b1af`) |
 | `response_format: json_object` on own-sampler families; `json_schema` everywhere | Documented 400, never silently ignored | Rejection is the recorded spike decision pending the schema→FSM follow-up (`c1f4b1af`) |
 | Shared speculative MTP envelopes in continuous batches (DS9.4) | Supported on the CUDA+MTP lane; perf claim hardware-gated | CPU fixture tests prove the two-row envelope commits exactly the solo sequence per row (greedy and sampled) with ragged exits and the opt-in gate both ways (`b6211f24`); the tokens/s-improvement / no-ITL-regression acceptance runs on CUDA via the qwen38 continuous-batching manifest's `IZWI_CUDA_MTP_IN_CONTINUOUS=off` vs default comparison using `summary.itl_ms` — recorded `not run` until hardware evidence exists |

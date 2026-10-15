@@ -149,7 +149,9 @@ HTTP streaming routes use server-sent events (SSE):
 
 `GET /v1/models`
 
-Returns enabled model variants in OpenAI list format.
+Returns the models this server can run now (enabled, and downloaded or
+loaded) in OpenAI list format. `created` is when the model's files arrived on
+this host (`0` when unknown).
 
 ```json
 {
@@ -159,7 +161,7 @@ Returns enabled model variants in OpenAI list format.
       "id": "Qwen3.5-4B",
       "object": "model",
       "created": 1760000000,
-      "owned_by": "agentem"
+      "owned_by": "izwi"
     }
   ]
 }
@@ -167,7 +169,12 @@ Returns enabled model variants in OpenAI list format.
 
 `GET /v1/models/{model}`
 
-Returns one enabled model in the same object shape. Unknown or disabled variants return `404`.
+Returns one of those models in the same object shape. An unknown, disabled or
+not-downloaded model is a `404` with `code: model_not_found` and `param:
+model`.
+
+The gateway serves both routes for the one public model of its deployment
+(with `created: 0`), behind the same API key as chat completions.
 
 Use `/v1/admin/models` when you need download, load, unload, local path, status, or speech-capability details.
 
@@ -197,15 +204,17 @@ Supported request fields:
 | `messages` | Required array. Roles: `system`, `user`, `assistant`, `tool`. |
 | `max_tokens`, `max_completion_tokens` | Optional output budgets (`max_completion_tokens` wins). Unset, the reply may use the rest of the context. An explicit budget that does not fit beside the prompt is a `400` (as in vLLM) unless `truncation` is `auto`. |
 | `truncation` | Izwi extension, as in the Responses API. `disabled` (default): a prompt that does not fit the context is a `400` with `code: context_length_exceeded`, `param: messages` and the token counts. `auto`: the oldest complete turns are dropped (the system message and newest user message are kept) and an explicit budget is shortened to the remaining context. Through the gateway, workers on worker protocol minor 4 apply this exactly as the local server; older workers still truncate automatically. |
-| `stream` | `true` returns SSE chat chunks.
-| `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
+| `stream` | `true` returns SSE chat chunks. The request is admitted before the stream starts, so a request that cannot run (for example `context_length_exceeded`) is a plain HTTP error, not a stream. |
+| `stream_options.include_usage` | Sends the usage in one more chunk after the finish chunk, with `choices: []`; every earlier chunk then carries `usage: null`, as in OpenAI. |
+| `logprobs`, `top_logprobs` | Per-token logprobs (`top_logprobs` 0–20 alternatives). Returned on `choices[].logprobs.content` in the completion and in each stream chunk. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `seed` | Optional signed 64-bit sampling seed. The same seed and parameters sample the same tokens on the same backend; without one, each request samples independently. |
 | `stop` | A string or an array of up to 4 non-empty strings (each at most 1024 bytes). Generation ends before the first match, the stop text is not returned, and `finish_reason` is `stop`. Streams hold back text that could still begin a stop string until it is settled. Requests with `stop` decode one token per scheduler step. |
 | `frequency_penalty` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | Ranges | `temperature` 0–2, `top_p` greater than 0 and at most 1, `top_k` -1 or 0 (disabled) or positive, `presence_penalty` and `frequency_penalty` -2–2, `repetition_penalty` 1–2, `max_tokens` and `max_completion_tokens` at least 1. Anything else is a `400` whose `error.param` names the field and whose `error.code` is `invalid_value`. |
-| `tools`, `tool_choice` | Accepted for tool-call prompting. Strict mode only allows `tool_choice` as `auto`, `none`, or `null`. |
+| `tools` | OpenAI function tools (`{"type": "function", "function": {"name": …}}`), rendered with the model's tool-calling template. Qwen3.5, Qwen3.6, Qwen3.8 and LFM2.5 have one; tools for another chat model are a `400` (`unsupported_parameter`) rather than silently ignored. |
+| `tool_choice` | `auto` (default) offers the tools and parses calls; `none` neither offers them nor parses calls. `required` and named functions need constrained decoding and are a `400` (`unsupported_parameter`); other values are `invalid_value`. |
 | `enable_thinking` | Izwi extension for thinking-capable local models. Qwen3.8 defaults to `true`. |
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
@@ -219,8 +228,10 @@ server: the same sampling profiles, `seed`, `stop`, `top_k`, penalties,
 `truncation`. Each of these controls needs a worker on worker protocol minor
 4 that advertises it; the gateway routes the request only to such workers, and
 when none is ready it returns a `400` with `code: unsupported_parameter` and
-`param` naming the control, never dropping it. `tools` and the reasoning
-controls are not yet supported through the gateway (400).
+`param` naming the control, never dropping it. `tools` need a worker that
+advertises tool support; the gateway parses the calls in the worker's text
+exactly as the local server does. The reasoning controls are not yet
+supported through the gateway (400).
 
 Compatibility profile:
 
@@ -229,24 +240,41 @@ IZWI_OPENAI_COMPAT_PROFILE=strict   # default
 IZWI_OPENAI_COMPAT_PROFILE=relaxed
 ```
 
-Streaming sequence:
+Completion ids are `chatcmpl-<hex>`, and every chunk of a stream shares one
+id. Streaming sequence (with `stream_options.include_usage`):
 
 ```text
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}
-data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"Hel"}}]}
-data: {"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":null}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":0}}}
 data: [DONE]
 ```
 
+If generation fails after the stream started, the last event before
+`[DONE]` is the OpenAI error object, `{"error": {"message", "type", "param",
+"code"}}`, with the type the same failure has as an HTTP error (the OpenAI
+SDKs raise it as `APIError`). There is no finish chunk then.
+
 Tool behavior:
 
-- Assistant messages may include `tool_calls`.
-- Tool responses can be sent with role `tool`.
-- Model-emitted tool calls are returned with `finish_reason: "tool_calls"` when detected.
+- Assistant messages may include `tool_calls`; a `tool` message's
+  `tool_call_id`, when given, must match a call of the preceding assistant
+  message (`400` otherwise). The templates read tool results in order.
+- Calls are parsed only when the request offered tools. They are returned as
+  `message.tool_calls` (ids `call_<hex>`) with `finish_reason: "tool_calls"`,
+  and the call markup never appears in `content`.
+- Streamed, calls arrive as `delta.tool_calls`: the first fragment of each
+  carries its `index`, `id`, `type` and `function.name`, and the
+  `function.arguments` fragments concatenate to the JSON arguments. A Qwen call
+  is sent as soon as its name is known and its arguments one parameter at a
+  time; an LFM2.5 call list is sent when it closes. Text that might open a
+  call is held back until the next delta settles it, and a block that does
+  not parse is sent as text.
 - LFM2.5 models use their own format: tools are listed in the system turn,
   `tool` messages become native tool turns, and calls the model writes as
   `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>` are returned as
-  `tool_calls`. Other chat models use the Qwen XML tool format.
+  `tool_calls`. The Qwen3.5 family uses Qwen's XML tool format.
 - LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
   cards, on every backend.
 
@@ -494,7 +522,7 @@ Request fields:
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice`, `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. |
+| `tools`, `tool_choice`, `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions, except that tool calls stay in the output text (Responses has no `function_call` output items yet). Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
 
