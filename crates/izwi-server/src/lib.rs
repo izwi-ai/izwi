@@ -3062,7 +3062,11 @@ mod tests {
 
     #[test]
     fn local_server_role_remains_the_default() {
-        let args = parse(&["izwi-server"]);
+        // Defaults read the environment, which other tests set under the lock.
+        let args = {
+            let _guard = env_lock();
+            parse(&["izwi-server"])
+        };
         assert_eq!(args.role, ServerRole::Local);
         assert_eq!(args.gateway_topology, GatewayTopology::Standalone);
         validate_role_topology(args.role, args.gateway_topology).expect("local standalone role");
