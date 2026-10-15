@@ -1282,6 +1282,19 @@ pub(crate) fn capacity_shortfall_reason(
     )
 }
 
+/// Whether `error` refuses memory that admitted work holds now and gives
+/// back when it finishes: the live-memory check or the reservation ledger.
+/// A request too large for the machine, a full job queue or a draining
+/// runtime is not such a refusal.
+pub(crate) fn is_held_capacity_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Overloaded(message)
+            if message.starts_with("insufficient live")
+                || message == "requested resources exceed available capacity"
+    )
+}
+
 /// The short reason a client sees when live memory refuses a claim: the
 /// first domain where `need` plus what is already held for admitted work
 /// exceeds `available`, in GB. The full vectors are logged by the caller.

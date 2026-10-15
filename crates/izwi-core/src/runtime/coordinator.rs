@@ -65,6 +65,40 @@ impl JobCancellation {
     }
 }
 
+/// Retry `attempt` while it is refused memory that admitted work holds
+/// (P1V-2, ADM-8): back off from 250 ms to 5 s between attempts until `wait`
+/// has passed, then fail with the last refusal and how long it waited. Any
+/// other outcome returns at once, so a cancel or a request too large for the
+/// machine is not delayed.
+pub(crate) async fn wait_for_held_capacity<T, F, Fut>(wait: Duration, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        let error = match attempt().await {
+            Err(error) if crate::engine::resources::is_held_capacity_refusal(&error) => error,
+            result => return result,
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            let Error::Overloaded(message) = error else {
+                return Err(error);
+            };
+            return Err(Error::Overloaded(format!(
+                "{message}; still refused after waiting {:.0} s for memory to free",
+                wait.as_secs_f64()
+            )));
+        }
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparationCancellation {
     state: Arc<AtomicU8>,
@@ -5838,6 +5872,83 @@ Pages free: 10.\n";
         host.await.unwrap().unwrap();
         drop((host_job, device_job));
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    /// P1V-2: a stage reservation refused memory another job holds waits and
+    /// succeeds once that job gives it back. It fails, saying how long it
+    /// waited, only when the wait runs out, and other errors are not retried.
+    #[tokio::test]
+    async fn held_capacity_refusals_wait_for_memory_to_free() {
+        let provider = cuda_provider(1_000, 1_000);
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Cuda,
+            1,
+            4,
+            authority.clone(),
+        ));
+        let mut spec = job("waits-for-capacity");
+        spec.resources = cuda_resources(100, 0);
+        let job = coordinator.admit(spec).await.unwrap();
+        let held = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "other-job"),
+                cuda_resources(800, 0),
+            )
+            .unwrap();
+        let workspace = JobResourceObservation::host(500);
+        let reserve = || coordinator.reserve_stage_workspace(&job, "stage", workspace);
+        let refusal = reserve().unwrap_err();
+        assert!(
+            crate::engine::resources::is_held_capacity_refusal(&refusal),
+            "{refusal}"
+        );
+
+        let exhausted = wait_for_held_capacity(Duration::ZERO, || async { reserve() }).await;
+        assert!(
+            matches!(&exhausted, Err(Error::Overloaded(message))
+                if message.contains("still refused after waiting")),
+            "{exhausted:?}"
+        );
+        let attempts = AtomicUsize::new(0);
+        let cancelled = wait_for_held_capacity(Duration::from_secs(60), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(Error::Cancelled("cancelled".to_string())) }
+        })
+        .await;
+        assert!(matches!(cancelled, Err(Error::Cancelled(_))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let job = job.clone();
+            let attempts = attempts.clone();
+            async move {
+                wait_for_held_capacity(Duration::from_secs(60), || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let lease = coordinator.reserve_stage_workspace(&job, "stage", workspace);
+                    async move { lease }
+                })
+                .await
+                .map(drop)
+            }
+        });
+        // Free the memory only once the waiter has been refused.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(30), waiter)
+            .await
+            .expect("the waiter succeeds once memory frees")
+            .unwrap()
+            .unwrap();
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
     }
 
     /// PIPE-7: a cancelled job runs no further stage. The stage after the

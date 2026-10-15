@@ -19,7 +19,7 @@ use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
     MAX_AUDIO_SOURCE_BYTES,
 };
-use crate::runtime::coordinator::{JobLease, JobResourceObservation};
+use crate::runtime::coordinator::{wait_for_held_capacity, JobLease, JobResourceObservation};
 use crate::runtime::forced_alignment::{AlignedWindow, AlignmentSource, SampleWindow};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
 use crate::runtime::service::{
@@ -36,6 +36,7 @@ use izwi_asr_toolkit::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::warn;
 
 const UNKNOWN_SPEAKER: &str = "UNKNOWN";
@@ -441,35 +442,51 @@ impl RuntimeService {
             )));
         }
         // The workspace is reserved under the execution permit, when the
-        // stage starts, and released when it returns.
-        let coordinator = self.coordinator.clone();
-        let stage_job = job.clone();
-        self.coordinator
-            .run_loaded_blocking_stage_with_invocation_workspace(
-                job,
-                execution_contract,
-                state_binding,
-                WorkUnit::PipelineStage {
-                    name: "diarization.infer".to_string(),
-                    ordinal: 0,
-                },
-                move |leases| {
-                    let _residency_lease = residency_lease;
-                    let state = leases
-                        .lease_exact_kind_mut(crate::kv::v2::InvocationStateBackingKindV2::Tensor)?
-                        .typed_mut::<crate::engine::InvocationTensorLease>()?;
-                    diarize_under_workspace_lease(&coordinator, &stage_job, workspace, |observer| {
-                        model.diarize_with_workspace_observer_physical(
-                            &audio.samples,
-                            audio.sample_rate,
-                            &config,
-                            state,
-                            observer,
+        // stage starts, and released when it returns. A stage refused memory
+        // other work holds gives its permit back and runs again once that
+        // memory frees, instead of failing the job (P1V-2).
+        let residency_lease = Arc::new(residency_lease);
+        wait_for_held_capacity(pipeline_capacity_wait(), || {
+            let residency_lease = residency_lease.clone();
+            let coordinator = self.coordinator.clone();
+            let stage_job = job.clone();
+            let model = model.clone();
+            let audio = audio.clone();
+            let config = config.clone();
+            self.coordinator
+                .run_loaded_blocking_stage_with_invocation_workspace(
+                    job,
+                    execution_contract.clone(),
+                    state_binding.clone(),
+                    WorkUnit::PipelineStage {
+                        name: "diarization.infer".to_string(),
+                        ordinal: 0,
+                    },
+                    move |leases| {
+                        let _residency_lease = residency_lease;
+                        let state = leases
+                            .lease_exact_kind_mut(
+                                crate::kv::v2::InvocationStateBackingKindV2::Tensor,
+                            )?
+                            .typed_mut::<crate::engine::InvocationTensorLease>()?;
+                        diarize_under_workspace_lease(
+                            &coordinator,
+                            &stage_job,
+                            workspace,
+                            |observer| {
+                                model.diarize_with_workspace_observer_physical(
+                                    &audio.samples,
+                                    audio.sample_rate,
+                                    &config,
+                                    state,
+                                    observer,
+                                )
+                            },
                         )
-                    })
-                },
-            )
-            .await
+                    },
+                )
+        })
+        .await
     }
 
     async fn diarize_input(
@@ -672,12 +689,24 @@ impl RuntimeService {
         ))?;
         let observed_input_bytes = u64::try_from(input_bytes)
             .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
-        // A cancelled job fails its next stage and drops its leases (PIPE-7).
-        let pipeline_job = self
-            .coordinator
-            .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-            .await?
-            .with_cancellation(options.cancellation.clone());
+        // Wait while admitted work holds the memory this job needs (P1V-2),
+        // unless it is cancelled meanwhile. A cancelled job fails its next
+        // stage and drops its leases (PIPE-7).
+        let pipeline_job = wait_for_held_capacity(pipeline_capacity_wait(), || {
+            let spec = spec.clone();
+            async move {
+                if options.cancellation.is_cancelled() {
+                    return Err(Error::Cancelled(
+                        "diarization was cancelled before admission".to_string(),
+                    ));
+                }
+                self.coordinator
+                    .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
+                    .await
+            }
+        })
+        .await?
+        .with_cancellation(options.cancellation.clone());
         let owned_audio_input = audio_input.into_owned_for_job(&pipeline_job).await?;
         pipeline_job.record_materialized_usage(JobResourceObservation::host(
             u64::try_from(
@@ -1136,6 +1165,20 @@ fn pipeline_chunk_config() -> AsrLongFormConfig {
         cfg.overlap_secs = v;
     }
     cfg
+}
+
+/// How long a diarization job waits for memory admitted work holds, at
+/// admission and at its stage workspace, before it fails (P1V-2).
+const DEFAULT_PIPELINE_CAPACITY_WAIT: Duration = Duration::from_secs(120);
+
+/// [`DEFAULT_PIPELINE_CAPACITY_WAIT`], or `IZWI_DIARIZATION_CAPACITY_WAIT_SECS`
+/// (0 fails at once).
+fn pipeline_capacity_wait() -> Duration {
+    std::env::var("IZWI_DIARIZATION_CAPACITY_WAIT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+        .unwrap_or(DEFAULT_PIPELINE_CAPACITY_WAIT)
 }
 
 fn env_positive_f32(key: &str) -> Option<f32> {
