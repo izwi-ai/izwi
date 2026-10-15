@@ -23,9 +23,7 @@ use crate::runtime::audio_io::{
     MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{JobLease, JobResourceObservation};
-use crate::runtime::forced_alignment::{
-    AlignedWindow, AlignmentSource, SampleWindow, WindowedAlignment,
-};
+use crate::runtime::forced_alignment::{AlignedWindow, AlignmentSource, SampleWindow};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
 use crate::runtime::service::{
     copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
@@ -976,83 +974,33 @@ impl RuntimeService {
         {
             // One aligner stage per window: the whole file after a single ASR
             // pass, otherwise each ASR chunk with its own text.
-            let alignment = WindowedAlignment {
-                windows: self
-                    .align_sample_windows(
-                        &pipeline_job,
-                        aligner_contract,
-                        model,
-                        audio.samples.clone(),
-                        audio.sample_rate,
-                        asr_windows.clone(),
-                        detected_language.clone(),
-                        "diarization.force_align",
-                    )
-                    .await?,
-                duration_ms: secs_to_ms(audio.duration_secs),
-            };
+            let aligned = self
+                .align_sample_windows(
+                    &pipeline_job,
+                    aligner_contract,
+                    model,
+                    audio.samples.clone(),
+                    audio.sample_rate,
+                    asr_windows.clone(),
+                    detected_language.clone(),
+                    "diarization.force_align",
+                )
+                .await?;
             drop(aligner_lease);
-            warnings.extend(alignment.warnings());
-            timed_windows_from_alignment(&asr_windows, alignment.windows)
+            timed_windows_from_alignment(&asr_windows, aligned)
         } else {
-            warnings.push("Forced aligner unavailable; word timings are evenly spaced".to_string());
+            warnings.push(
+                "Forced aligner unavailable; word timings are estimated, not aligned".to_string(),
+            );
             interval_timed_windows(&asr_windows, audio.sample_rate)
         };
 
-        // The transcript text and its timed words come from one stitched
-        // word list, so they always hold the same words.
-        let stitched = stitch_timed_windows(&timed_windows);
-        let asr_text = stitched.text;
-        let asr_words = stitched
-            .words
-            .iter()
-            .map(|word| word.word.clone())
-            .collect::<Vec<_>>();
-        let mut model_aligned_words = stitched.words.iter().filter(|word| word.model).count();
-        let mut alignments = stitched
-            .words
-            .into_iter()
-            .map(|word| (word.word, word.start_ms, word.end_ms))
-            .collect::<Vec<_>>();
-
-        if alignment_is_suspicious(&alignments, asr_words.len(), diarization.duration_secs) {
-            warn!(
-                "Forced aligner output looked invalid, using diarization-guided fallback timings"
-            );
-            alignments = fallback_word_timings_with_segments(
-                &asr_words,
-                &diarization.segments,
-                diarization.duration_secs,
-            );
-            model_aligned_words = 0;
-        }
-
-        let (mut words, overlap_assigned_words, mut unattributed_words) =
-            attribute_words_to_speakers(&alignments, &diarization.segments);
-        stabilize_word_speakers(&mut words);
-        normalize_phrase_speakers(&mut words, &diarization.segments);
-
-        if attribution_requires_fallback(words.len(), overlap_assigned_words, unattributed_words) {
-            let attribution_coverage = overlap_assigned_words as f32 / words.len() as f32;
-            let unattributed_ratio = unattributed_words as f32 / words.len() as f32;
-            warn!(
-                "Speaker attribution quality too low ({:.1}% overlap-backed, {:.1}% unattributed), retrying with diarization-guided fallback timings",
-                attribution_coverage * 100.0,
-                unattributed_ratio * 100.0
-            );
-            alignments = fallback_word_timings_with_segments(
-                &asr_words,
-                &diarization.segments,
-                diarization.duration_secs,
-            );
-            let (fallback_words, _fallback_overlap_assigned_words, fallback_unattributed_words) =
-                attribute_words_to_speakers(&alignments, &diarization.segments);
-            words = fallback_words;
-            stabilize_word_speakers(&mut words);
-            normalize_phrase_speakers(&mut words, &diarization.segments);
-            unattributed_words = fallback_unattributed_words;
-            model_aligned_words = 0;
-        }
+        let AttributedTranscript {
+            asr_text,
+            words,
+            model_aligned_words,
+            unattributed_words,
+        } = attribute_transcript(timed_windows, &diarization.segments, &mut warnings);
 
         let utterances = build_utterances(&words);
         let raw_transcript = if utterances.is_empty() {
@@ -1384,6 +1332,8 @@ struct TimedWindow {
     start_ms: u32,
     end_ms: u32,
     source: AlignmentSource,
+    /// Why the aligner did not time the window, when it ran on it.
+    note: Option<String>,
     words: Vec<WindowWord>,
 }
 
@@ -1479,6 +1429,16 @@ fn timed_windows_from_alignment(
                 start_ms: window.start_ms,
                 end_ms: window.end_ms,
                 source: window.source,
+                note: (window.source != AlignmentSource::Model).then(|| {
+                    let kind = match window.source {
+                        AlignmentSource::Failed => "alignment failed",
+                        _ => "alignment was degenerate",
+                    };
+                    match window.detail {
+                        Some(detail) => format!("{kind} ({detail})"),
+                        None => kind.to_string(),
+                    }
+                }),
                 words,
             }
         })
@@ -1513,6 +1473,7 @@ fn interval_timed_windows(windows: &[SampleWindow], sample_rate: u32) -> Vec<Tim
                 start_ms,
                 end_ms,
                 source: AlignmentSource::Heuristic,
+                note: None,
                 words,
             }
         })
@@ -1577,6 +1538,145 @@ fn stitch_timed_windows(windows: &[TimedWindow]) -> StitchedTranscript {
         }
     }
     StitchedTranscript { text, words }
+}
+
+/// A model-timed word longer than [`MAX_REASONABLE_WORD_SPAN_MS`] keeps its
+/// start and ends at most this much later.
+const OUTLIER_WORD_SPAN_MS: u32 = 1_000;
+
+/// The transcript's words timed and attributed to speakers.
+struct AttributedTranscript {
+    asr_text: String,
+    words: Vec<DiarizationWord>,
+    model_aligned_words: usize,
+    unattributed_words: usize,
+}
+
+/// Time the transcript's words from their windows and attribute them to the
+/// speaker turns. Bad timing is repaired where it happened: a window the
+/// aligner did not time, or whose aligned words fall outside the speaker
+/// turns in it, is re-timed over those turns, and a model word stretched over
+/// a pause is clamped to its neighbours. Every other window keeps the model's
+/// timings, whatever happened elsewhere in the file.
+fn attribute_transcript(
+    mut windows: Vec<TimedWindow>,
+    segments: &[DiarizationSegment],
+    warnings: &mut Vec<String>,
+) -> AttributedTranscript {
+    for window in &mut windows {
+        let span = format!(
+            "{:.2}-{:.2} s",
+            ms_to_secs(window.start_ms),
+            ms_to_secs(window.end_ms)
+        );
+        if window.source != AlignmentSource::Model {
+            let retimed = retime_window_over_turns(window, segments);
+            if let Some(note) = &window.note {
+                let timing = if retimed {
+                    "are spread over the speaker turns"
+                } else {
+                    "are evenly spaced"
+                };
+                warnings.push(format!("Words in {span} {timing}: {note}"));
+            }
+            continue;
+        }
+        let overlapping = window
+            .words
+            .iter()
+            .filter(|word| {
+                let start = ms_to_secs(word.start_ms);
+                let end = ms_to_secs(word.end_ms.max(word.start_ms + 1));
+                segments.iter().any(|segment| {
+                    interval_overlap(start, end, segment.start_secs, segment.end_secs) > 0.0
+                })
+            })
+            .count();
+        let outside = window.words.len() - overlapping;
+        if attribution_requires_fallback(window.words.len(), overlapping, outside)
+            && retime_window_over_turns(window, segments)
+        {
+            window.source = AlignmentSource::Heuristic;
+            let warning = format!(
+                "Words in {span} are spread over the speaker turns: {outside} of {} aligned words fell outside them",
+                window.words.len()
+            );
+            warn!("{warning}");
+            warnings.push(warning);
+        }
+    }
+
+    let stitched = stitch_timed_windows(&windows);
+    let mut alignments = stitched
+        .words
+        .iter()
+        .map(|word| (word.word.clone(), word.start_ms, word.end_ms))
+        .collect::<Vec<_>>();
+    clamp_outlier_word_spans(&mut alignments, &stitched.words);
+    let model_aligned_words = stitched.words.iter().filter(|word| word.model).count();
+    let (mut words, _overlap_assigned_words, unattributed_words) =
+        attribute_words_to_speakers(&alignments, segments);
+    stabilize_word_speakers(&mut words);
+    normalize_phrase_speakers(&mut words, segments);
+    AttributedTranscript {
+        asr_text: stitched.text,
+        words,
+        model_aligned_words,
+        unattributed_words,
+    }
+}
+
+/// Re-time `window`'s words over the speaker turns inside it, keeping their
+/// order. Returns false, leaving the words as they are, when no turn
+/// overlaps the window.
+fn retime_window_over_turns(window: &mut TimedWindow, segments: &[DiarizationSegment]) -> bool {
+    let window_start = ms_to_secs(window.start_ms);
+    let window_end = ms_to_secs(window.end_ms);
+    let turns = segments
+        .iter()
+        .filter_map(|segment| {
+            let start_secs = segment.start_secs.max(window_start);
+            let end_secs = segment.end_secs.min(window_end);
+            (end_secs > start_secs).then(|| DiarizationSegment {
+                start_secs,
+                end_secs,
+                ..segment.clone()
+            })
+        })
+        .collect::<Vec<_>>();
+    if turns.is_empty() || window.words.is_empty() {
+        return false;
+    }
+    let words = window
+        .words
+        .iter()
+        .map(|word| word.word.clone())
+        .collect::<Vec<_>>();
+    let timings = fallback_word_timings_with_segments(&words, &turns, window_end);
+    for (word, (_, start_ms, end_ms)) in window.words.iter_mut().zip(timings) {
+        word.start_ms = start_ms;
+        word.end_ms = end_ms;
+    }
+    true
+}
+
+/// Clamp each model-timed word longer than any word lasts (it absorbed a
+/// pause) to [`OUTLIER_WORD_SPAN_MS`] after its start, never past the next
+/// word's start.
+fn clamp_outlier_word_spans(alignments: &mut [(String, u32, u32)], stitched: &[StitchedWord]) {
+    for idx in 0..alignments.len() {
+        let (_, start, end) = alignments[idx];
+        if !stitched[idx].model || end.saturating_sub(start) < MAX_REASONABLE_WORD_SPAN_MS {
+            continue;
+        }
+        let next_start = alignments
+            .get(idx + 1)
+            .map_or(u32::MAX, |(_, next_start, _)| *next_start);
+        alignments[idx].2 = start
+            .saturating_add(OUTLIER_WORD_SPAN_MS)
+            .min(next_start)
+            .max(start.saturating_add(1));
+    }
 }
 
 fn fallback_word_timings(text: &str, duration_secs: f32) -> Vec<(String, u32, u32)> {
@@ -3098,6 +3198,7 @@ mod tests {
             start_ms,
             end_ms,
             source: AlignmentSource::Model,
+            note: None,
             words: words
                 .iter()
                 .enumerate()
@@ -3234,6 +3335,157 @@ mod tests {
             stitched.text,
             "Hello, world! It's \"me\" here.你好。Then more"
         );
+    }
+
+    fn turn(speaker: &str, start_secs: f32, end_secs: f32) -> DiarizationSegment {
+        DiarizationSegment {
+            speaker: speaker.to_string(),
+            start_secs,
+            end_secs,
+            confidence: None,
+        }
+    }
+
+    /// PIPE-5 (suspicious_cascade): 19 well-aligned 30 s chunks and one the
+    /// aligner failed on, whose 6 words are spread 5 s apart. The failed
+    /// window's long spans used to flag the whole file and re-time all 196
+    /// words; now only the failed window is re-timed.
+    #[test]
+    fn one_failed_window_does_not_discard_the_other_windows_alignment() {
+        const FAILED: usize = 7;
+        let windows = (0..20u32)
+            .map(|idx| {
+                let start_ms = idx * 30_000;
+                if idx as usize == FAILED {
+                    let words = (0..6u32)
+                        .map(|k| WindowWord {
+                            word: format!("f{k}"),
+                            text: format!(" f{k}"),
+                            start_ms: start_ms + k * 5_000,
+                            end_ms: start_ms + (k + 1) * 5_000,
+                        })
+                        .collect();
+                    return TimedWindow {
+                        start_ms,
+                        end_ms: start_ms + 30_000,
+                        source: AlignmentSource::Failed,
+                        note: Some("alignment failed (boom)".to_string()),
+                        words,
+                    };
+                }
+                let words = (0..10u32)
+                    .map(|k| {
+                        let word_start = start_ms + 1_000 + k * 2_800;
+                        (format!("w{idx}x{k}"), word_start, word_start + 400)
+                    })
+                    .collect::<Vec<_>>();
+                let words = words
+                    .iter()
+                    .map(|(word, start, end)| (word.as_str(), *start, *end))
+                    .collect::<Vec<_>>();
+                model_window(start_ms, start_ms + 30_000, &words)
+            })
+            .collect::<Vec<_>>();
+        let expected = windows
+            .iter()
+            .filter(|window| window.source == AlignmentSource::Model)
+            .flat_map(|window| window.words.clone())
+            .map(|word| (word.word, word.start_ms, word.end_ms))
+            .collect::<Vec<_>>();
+
+        let mut warnings = Vec::new();
+        let transcript =
+            attribute_transcript(windows, &[turn("SPEAKER_00", 0.0, 600.0)], &mut warnings);
+
+        assert_eq!(transcript.words.len(), 196);
+        assert_eq!(transcript.model_aligned_words, 190);
+        let kept = transcript
+            .words
+            .iter()
+            .filter(|word| word.word.starts_with('w'))
+            .map(|word| {
+                (
+                    word.word.clone(),
+                    secs_to_ms(word.start_secs),
+                    secs_to_ms(word.end_secs),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kept, expected, "model timings must survive");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("210.00-240.00 s"), "{warnings:?}");
+        assert!(warnings[0].contains("boom"), "{warnings:?}");
+    }
+
+    /// A window whose aligned words fall outside the speaker turns in it is
+    /// re-timed over those turns; the window before it keeps its alignment.
+    #[test]
+    fn poorly_attributed_window_is_retimed_over_its_own_turns() {
+        let good = model_window(
+            0,
+            10_000,
+            &[
+                ("a", 1_000, 1_400),
+                ("b", 2_000, 2_400),
+                ("c", 3_000, 3_400),
+            ],
+        );
+        let stray = model_window(
+            10_000,
+            30_000,
+            &[
+                ("d", 11_000, 11_400),
+                ("e", 12_000, 12_400),
+                ("f", 13_000, 13_400),
+            ],
+        );
+        let turns = [
+            turn("SPEAKER_00", 0.0, 10.0),
+            turn("SPEAKER_01", 20.0, 30.0),
+        ];
+        let mut warnings = Vec::new();
+        let transcript = attribute_transcript(vec![good, stray], &turns, &mut warnings);
+
+        let times = transcript
+            .words
+            .iter()
+            .map(|word| (secs_to_ms(word.start_secs), secs_to_ms(word.end_secs)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &times[..3],
+            [(1_000, 1_400), (2_000, 2_400), (3_000, 3_400)]
+        );
+        for (start, end) in &times[3..] {
+            assert!(*start >= 20_000 && *end <= 30_000, "{times:?}");
+        }
+        assert_eq!(transcript.model_aligned_words, 3);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("10.00-30.00 s"), "{warnings:?}");
+    }
+
+    /// A model word stretched over a pause is clamped instead of discarding
+    /// the window.
+    #[test]
+    fn outlier_model_word_is_clamped_to_its_neighbours() {
+        let window = model_window(
+            0,
+            10_000,
+            &[("a", 0, 300), ("b", 400, 4_900), ("c", 5_000, 5_300)],
+        );
+        let mut warnings = Vec::new();
+        let transcript = attribute_transcript(
+            vec![window],
+            &[turn("SPEAKER_00", 0.0, 10.0)],
+            &mut warnings,
+        );
+        let times = transcript
+            .words
+            .iter()
+            .map(|word| (secs_to_ms(word.start_secs), secs_to_ms(word.end_secs)))
+            .collect::<Vec<_>>();
+        assert_eq!(times, [(0, 300), (400, 1_400), (5_000, 5_300)]);
+        assert_eq!(transcript.model_aligned_words, 3);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
