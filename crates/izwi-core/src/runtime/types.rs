@@ -186,6 +186,9 @@ pub struct DiarizationConfig {
 pub struct DiarizationPipelineOptions {
     /// Polish the speaker transcript with the pipeline LLM.
     pub enable_llm_refinement: bool,
+    /// Language hint for the pipeline ASR; `None` lets it detect the
+    /// language of each chunk.
+    pub language: Option<String>,
     /// Stops the pipeline at its next stage (between ASR chunks and aligner
     /// windows) once cancelled.
     pub cancellation: crate::runtime::coordinator::JobCancellation,

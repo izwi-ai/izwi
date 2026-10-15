@@ -877,6 +877,7 @@ impl RuntimeService {
             let (asr_model, asr_contract, asr_state) = (asr_model, asr_contract, asr_state);
             if use_single_pass_asr {
                 let audio_for_task = audio.clone();
+                let language = options.language.clone();
                 // Size the decode budget from the duration, as each chunk's
                 // budget covers its own audio on the chunked path.
                 let options = NativeAsrGenerationOptions {
@@ -896,7 +897,7 @@ impl RuntimeService {
                                 asr_model.transcribe_from_invocation_workspace(
                                     &audio_for_task.samples,
                                     PIPELINE_SAMPLE_RATE,
-                                    None,
+                                    language.as_deref(),
                                     None,
                                     options,
                                     leases,
@@ -916,7 +917,7 @@ impl RuntimeService {
                                 asr_model.transcribe_with_details(
                                     &audio_for_task.samples,
                                     PIPELINE_SAMPLE_RATE,
-                                    None,
+                                    language.as_deref(),
                                     options,
                                 )
                             },
@@ -942,6 +943,7 @@ impl RuntimeService {
                     }
                     let model = asr_model.clone();
                     let chunk_audio = audio.clone();
+                    let language = options.language.clone();
                     let chunk_start = chunk.start_sample;
                     let chunk_end = chunk.end_sample;
                     let options = NativeAsrGenerationOptions {
@@ -963,7 +965,7 @@ impl RuntimeService {
                                 model.transcribe_from_invocation_workspace(
                                     &chunk_audio.samples[chunk_start..chunk_end],
                                     PIPELINE_SAMPLE_RATE,
-                                    None,
+                                    language.as_deref(),
                                     None,
                                     options,
                                     leases,
@@ -981,6 +983,7 @@ impl RuntimeService {
                 (chunk_windows(&transcribed), transcribed, false)
             } else {
                 let audio_for_task = audio.clone();
+                let language = options.language.clone();
                 let chunks = self
                     .coordinator
                     .run_loaded_blocking_stage(
@@ -990,7 +993,12 @@ impl RuntimeService {
                             kind: "diarization.transcribe_chunks".to_string(),
                         },
                         move || {
-                            transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit)
+                            transcribe_audio_chunks(
+                                asr_model,
+                                &audio_for_task,
+                                language.as_deref(),
+                                chunk_limit,
+                            )
                         },
                     )
                     .await?;

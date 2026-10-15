@@ -154,6 +154,10 @@ pub struct DiarizationRecord {
     /// Degraded pipeline steps: an aligner that could not be used, windows
     /// whose word timings are not the aligner's, a truncated ASR decode.
     pub warnings: Vec<String>,
+    /// ASR language hint the job ran with; `None` detects it.
+    pub language: Option<String>,
+    /// Sortformer VAD gate the job asked for; `None` keeps the server default.
+    pub vad_gate: Option<bool>,
     pub summary_status: DiarizationSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -187,6 +191,8 @@ pub struct NewDiarizationRecord {
     pub min_speech_duration_ms: Option<f64>,
     pub min_silence_duration_ms: Option<f64>,
     pub enable_llm_refinement: bool,
+    pub language: Option<String>,
+    pub vad_gate: Option<bool>,
     pub processing_time_ms: f64,
     pub duration_secs: Option<f64>,
     pub rtf: Option<f64>,
@@ -391,6 +397,7 @@ impl DiarizationStore {
         let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
         let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
         let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
+        let language = sanitize_optional_text(record.language.as_deref(), 64);
         let processing_error = sanitize_optional_text(record.processing_error.as_deref(), 1_000);
         let processing_status =
             normalize_processing_status(record.processing_status, processing_error.as_deref());
@@ -501,6 +508,8 @@ impl DiarizationStore {
             raw_transcript: Set(raw_transcript),
             transcript: Set(transcript),
             warnings_json: Set("[]".to_string()),
+            language: Set(language),
+            vad_gate: Set(record.vad_gate.map(i64::from)),
             summary_status: Set(summary_status.as_db_value().to_string()),
             summary_model_id: Set(summary_model_id),
             summary_text: Set(summary_text),
@@ -988,7 +997,9 @@ const DIARIZATION_RECORD_COLUMNS: &str = r#"
     speaker_name_overrides_json,
     audio_mime_type,
     audio_filename,
-    warnings_json
+    warnings_json,
+    language,
+    vad_gate
 "#;
 
 async fn fetch_record_without_audio(
@@ -1136,6 +1147,10 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         audio_mime_type: row.try_get_by_index(32)?,
         audio_filename: row.try_get_by_index(33)?,
         warnings: parse_json_vec(row.try_get_by_index(34)?),
+        language: row.try_get_by_index(35)?,
+        vad_gate: row
+            .try_get_by_index::<Option<i64>>(36)?
+            .map(|value| value != 0),
     })
 }
 
@@ -1476,6 +1491,8 @@ pub(crate) mod tests {
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
             enable_llm_refinement: true,
+            language: None,
+            vad_gate: None,
             processing_time_ms: 500.0,
             duration_secs: Some(12.0),
             rtf: Some(0.4),
@@ -1832,6 +1849,34 @@ pub(crate) mod tests {
         assert_eq!(stored.transcript, long_transcript);
         assert_eq!(stored.warnings, warnings);
 
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// The language hint and VAD gate a job ran with persist, so a rerun can
+    /// repeat them.
+    #[tokio::test]
+    async fn language_and_vad_gate_round_trip() {
+        let (store, root) = build_test_store();
+        for (language, vad_gate) in [
+            (Some("German".to_string()), Some(true)),
+            (None, Some(false)),
+            (None, None),
+        ] {
+            let mut record = sample_record();
+            record.language = language.clone();
+            record.vad_gate = vad_gate;
+            let created = store.create_record(record).await.expect("record");
+            assert_eq!(
+                (created.language.clone(), created.vad_gate),
+                (language.clone(), vad_gate)
+            );
+            let stored = store
+                .get_record(created.id)
+                .await
+                .expect("lookup")
+                .expect("record");
+            assert_eq!((stored.language, stored.vad_gate), (language, vad_gate));
+        }
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
 

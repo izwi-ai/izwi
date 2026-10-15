@@ -97,6 +97,8 @@ POST /v1/speech-to-text/jobs?job_kind=diarization
 | `min_silence_duration_ms` | Number | Optional VAD silence-duration tuning |
 | `enable_llm_refinement` | Boolean/String | Enable optional transcript refinement (in batches of utterance lines) |
 | `generate_summary` | Boolean/String | Summarize the transcript with `llm_model` once it is ready (default `false`) |
+| `language` | String | Optional ASR language hint (default: detected per chunk) |
+| `vad_gate` | Boolean/String | Clip diarizer segments to VAD speech regions (default off; helps on noisy input) |
 
 ### Example (curl)
 

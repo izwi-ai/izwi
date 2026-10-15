@@ -1225,7 +1225,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "language".to_string(),
         json!({
             "type": "string",
-            "description": "Optional transcription language hint."
+            "description": "Optional transcription or diarization ASR language hint."
         }),
     );
     properties.insert(
@@ -1271,6 +1271,13 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         json!({
             "type": "boolean",
             "description": "For diarization jobs, enable optional LLM transcript refinement."
+        }),
+    );
+    properties.insert(
+        "vad_gate".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "For diarization jobs, clip diarizer segments to VAD speech regions (off by default; helps on noisy input)."
         }),
     );
     properties.insert(

@@ -190,6 +190,8 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "raw_transcript",
             "transcript",
             "warnings_json",
+            "language",
+            "vad_gate",
             "summary_status",
             "summary_model_id",
             "summary_text",

@@ -431,6 +431,8 @@ mod tests {
         ("diarization_records", "summary_error"),
         ("diarization_records", "summary_updated_at"),
         ("diarization_records", "warnings_json"),
+        ("diarization_records", "language"),
+        ("diarization_records", "vad_gate"),
         ("studio_project_segments", "model_id"),
         ("studio_project_segments", "voice_mode"),
         ("studio_project_segments", "speaker"),

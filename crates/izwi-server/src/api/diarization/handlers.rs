@@ -74,6 +74,12 @@ pub struct RerunDiarizationRecordRequest {
     /// Defaults to whether the source record asked for a summary.
     #[serde(default)]
     pub generate_summary: Option<bool>,
+    /// Defaults to the source record's language hint.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Defaults to the source record's VAD gate.
+    #[serde(default)]
+    pub vad_gate: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +98,10 @@ struct ParsedDiarizationCreateRequest {
     enable_llm_refinement: Option<bool>,
     /// Summarize the transcript with the pipeline LLM once it is ready (D6).
     generate_summary: bool,
+    /// ASR language hint; `None` detects the language per chunk.
+    language: Option<String>,
+    /// Clip Sortformer segments to VAD speech; `None` keeps the default.
+    vad_gate: Option<bool>,
     stream: bool,
 }
 
@@ -118,6 +128,10 @@ struct JsonCreateRequest {
     enable_llm_refinement: Option<bool>,
     #[serde(default)]
     generate_summary: Option<bool>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    vad_gate: Option<bool>,
     #[serde(default)]
     audio_mime_type: Option<String>,
     #[serde(default)]
@@ -375,6 +389,8 @@ async fn create_pending_record(
             min_speech_duration_ms: parsed.min_speech_duration_ms,
             min_silence_duration_ms: parsed.min_silence_duration_ms,
             enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+            language: parsed.language.clone(),
+            vad_gate: parsed.vad_gate,
             processing_time_ms: 0.0,
             duration_secs: None,
             rtf: None,
@@ -648,10 +664,11 @@ async fn generate_diarization_artifacts(
                 max_speakers: parsed.max_speakers,
                 min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
                 min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
-                vad_gate: None,
+                vad_gate: parsed.vad_gate,
             },
             &DiarizationPipelineOptions {
                 enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+                language: parsed.language.clone(),
                 cancellation: cancellation.clone(),
             },
         )
@@ -761,6 +778,8 @@ fn build_rerun_create_request(
         generate_summary: rerun
             .generate_summary
             .unwrap_or(source_record.summary_status != DiarizationSummaryStatus::NotRequested),
+        language: sanitize_optional(rerun.language).or_else(|| source_record.language.clone()),
+        vad_gate: rerun.vad_gate.or(source_record.vad_gate),
         stream: false,
     }
 }
@@ -1088,6 +1107,8 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             min_silence_duration_ms: payload.min_silence_duration_ms,
             enable_llm_refinement: payload.enable_llm_refinement,
             generate_summary: payload.generate_summary.unwrap_or(false),
+            language: sanitize_optional(payload.language),
+            vad_gate: payload.vad_gate,
             stream: payload.stream.unwrap_or(false),
         });
     }
@@ -1236,6 +1257,22 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     })?;
                     out.generate_summary = parse_truthy(text.as_str());
                 }
+                "language" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'language' field: {err}"
+                        ))
+                    })?;
+                    out.language = sanitize_optional(Some(text));
+                }
+                "vad_gate" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'vad_gate' field: {err}"
+                        ))
+                    })?;
+                    out.vad_gate = Some(parse_truthy(text.as_str()));
+                }
                 "stream" => {
                     let text = field.text().await.map_err(|err| {
                         ApiError::bad_request(format!(
@@ -1363,6 +1400,8 @@ mod tests {
             raw_transcript: "SPEAKER_00: hello there".to_string(),
             transcript: "SPEAKER_00: hello there".to_string(),
             warnings: Vec::new(),
+            language: None,
+            vad_gate: None,
             summary_status: DiarizationSummaryStatus::Ready,
             summary_model_id: Some("Qwen3.5-4B".to_string()),
             summary_text: Some("Speaker 00 greets.".to_string()),
@@ -1461,6 +1500,77 @@ mod tests {
         assert_eq!(parsed.audio_bytes, vec![1_u8, 2_u8, 3_u8]);
     }
 
+    /// PIPE-18, D3: `language` reaches the pipeline ASR and `vad_gate` the
+    /// diarizer from JSON and multipart creates, and a rerun keeps the
+    /// source's values unless it overrides them.
+    #[tokio::test]
+    async fn create_and_rerun_carry_language_and_vad_gate() {
+        let json = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "language": " German ",
+                    "vad_gate": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let parsed = parse_create_request(json).await.unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("German"));
+        assert_eq!(parsed.vad_gate, Some(true));
+
+        let boundary = "izwi-test-boundary";
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap();
+        let mut body = Vec::new();
+        for (name, value) in [("language", "French"), ("vad_gate", "false")] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let multipart = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let parsed = parse_create_request(multipart).await.unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("French"));
+        assert_eq!(parsed.vad_gate, Some(false));
+
+        let mut source = sample_record();
+        source.language = Some("German".to_string());
+        source.vad_gate = Some(true);
+        let kept = build_rerun_create_request(&source, sample_audio(), Default::default());
+        assert_eq!(kept.language.as_deref(), Some("German"));
+        assert_eq!(kept.vad_gate, Some(true));
+        let overridden = build_rerun_create_request(
+            &source,
+            sample_audio(),
+            RerunDiarizationRecordRequest {
+                language: Some("Spanish".to_string()),
+                vad_gate: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(overridden.language.as_deref(), Some("Spanish"));
+        assert_eq!(overridden.vad_gate, Some(false));
+    }
+
     #[test]
     fn rerun_request_applies_requested_overrides() {
         let parsed = build_rerun_create_request(
@@ -1472,7 +1582,7 @@ mod tests {
                 min_speech_duration_ms: Some(180.0),
                 min_silence_duration_ms: Some(140.0),
                 enable_llm_refinement: Some(false),
-                generate_summary: None,
+                ..Default::default()
             },
         );
 
