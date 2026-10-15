@@ -155,6 +155,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "speaker_turns_json",
             "saa_status",
             "saa_warnings_json",
+            "alignment_warnings_json",
             "summary_status",
             "summary_model_id",
             "summary_text",

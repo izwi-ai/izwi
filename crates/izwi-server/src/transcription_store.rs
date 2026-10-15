@@ -188,6 +188,9 @@ pub struct TranscriptionRecord {
     pub speaker_turns: Vec<SpeakerAttributedTurnRecord>,
     pub saa_status: SpeakerAttributedAsrStatus,
     pub saa_warnings: Vec<String>,
+    /// Forced-alignment windows whose word timings are not the model's,
+    /// or why word timestamps are missing.
+    pub alignment_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -257,6 +260,7 @@ pub struct CompleteTranscriptionRecord {
     pub speaker_turns: Vec<SpeakerAttributedTurnRecord>,
     pub saa_status: SpeakerAttributedAsrStatus,
     pub saa_warnings: Vec<String>,
+    pub alignment_warnings: Vec<String>,
     pub summary_status: TranscriptionSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -546,6 +550,7 @@ impl TranscriptionStore {
                 speaker_turns_json: Set(speaker_turns_json),
                 saa_status: Set(saa_status.as_db_value().to_string()),
                 saa_warnings_json: Set(saa_warnings_json),
+                alignment_warnings_json: Set("[]".to_string()),
                 summary_status: Set(summary_status.as_db_value().to_string()),
                 summary_model_id: Set(summary_model_id),
                 summary_text: Set(summary_text),
@@ -841,6 +846,7 @@ impl TranscriptionStore {
             speaker_attributed_text.as_deref(),
             saa_warnings.as_slice(),
         );
+        let alignment_warnings = sanitize_saa_warnings(record.alignment_warnings);
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -857,6 +863,8 @@ impl TranscriptionStore {
             serde_json::to_string(&speaker_turns).context("Failed serializing SAA turns")?;
         let saa_warnings_json =
             serde_json::to_string(&saa_warnings).context("Failed serializing SAA warnings")?;
+        let alignment_warnings_json = serde_json::to_string(&alignment_warnings)
+            .context("Failed serializing alignment warnings")?;
         let mut update = transcription_records::Entity::update_many()
             .col_expr(
                 transcription_records::Column::TranscriptionMode,
@@ -922,6 +930,10 @@ impl TranscriptionStore {
             .col_expr(
                 transcription_records::Column::SaaWarningsJson,
                 Expr::value(saa_warnings_json),
+            )
+            .col_expr(
+                transcription_records::Column::AlignmentWarningsJson,
+                Expr::value(alignment_warnings_json),
             )
             .col_expr(
                 transcription_records::Column::SummaryStatus,
@@ -1129,7 +1141,8 @@ const TRANSCRIPTION_RECORD_COLUMNS: &str = r#"
     summary_model_id,
     summary_text,
     summary_error,
-    summary_updated_at
+    summary_updated_at,
+    alignment_warnings_json
 "#;
 
 async fn fetch_record_without_audio(
@@ -1227,6 +1240,7 @@ fn map_transcription_record(row: &QueryResult) -> anyhow::Result<TranscriptionRe
         summary_text: row.try_get_by_index(23)?,
         summary_error: row.try_get_by_index(24)?,
         summary_updated_at: row.try_get_by_index::<Option<i64>>(25)?.map(i64_to_u64),
+        alignment_warnings: parse_json_vec(row.try_get_by_index(26)?),
     })
 }
 
@@ -1715,6 +1729,7 @@ mod tests {
             speaker_turns: Vec::new(),
             saa_status: SpeakerAttributedAsrStatus::NotRequested,
             saa_warnings: Vec::new(),
+            alignment_warnings: Vec::new(),
             summary_status: TranscriptionSummaryStatus::NotRequested,
             summary_model_id: None,
             summary_text: None,
@@ -2060,6 +2075,7 @@ mod tests {
                     speaker_turns: Vec::new(),
                     saa_status: SpeakerAttributedAsrStatus::NotRequested,
                     saa_warnings: Vec::new(),
+                    alignment_warnings: Vec::new(),
                     summary_status: TranscriptionSummaryStatus::Pending,
                     summary_model_id: Some("Qwen3.5-4B".to_string()),
                     summary_text: None,

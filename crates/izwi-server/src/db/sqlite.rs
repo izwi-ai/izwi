@@ -408,6 +408,7 @@ mod tests {
         ("transcription_records", "speaker_turns_json"),
         ("transcription_records", "saa_status"),
         ("transcription_records", "saa_warnings_json"),
+        ("transcription_records", "alignment_warnings_json"),
         ("transcription_records", "summary_status"),
         ("transcription_records", "summary_model_id"),
         ("transcription_records", "summary_text"),

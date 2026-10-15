@@ -2159,6 +2159,8 @@ pub struct TranscriptionMultipartRequest {
     pub model: Option<String>,
     pub aligner_model: Option<String>,
     pub language: Option<String>,
+    /// One of json, verbose_json, text, srt, vtt; anything else (including
+    /// diarized_json) is rejected with 400 before transcription runs.
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
@@ -2174,6 +2176,8 @@ pub struct TranscriptionJsonRequest {
     pub model: Option<String>,
     pub aligner_model: Option<String>,
     pub language: Option<String>,
+    /// One of json, verbose_json, text, srt, vtt; anything else (including
+    /// diarized_json) is rejected with 400 before transcription runs.
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
@@ -2198,6 +2202,9 @@ pub struct VerboseTranscriptionResponse {
     pub segments: Option<Vec<TranscriptionTimestampSegment>>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
+    /// ASR diagnostics. With word or segment timestamps it also carries
+    /// `alignment_source` (model, heuristic or failed), `alignment_warnings`
+    /// for windows timed by interval fallback, or `alignment_error`.
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
 }
 

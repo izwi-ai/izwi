@@ -193,6 +193,7 @@ pub mod transcription_records {
         pub speaker_turns_json: String,
         pub saa_status: String,
         pub saa_warnings_json: String,
+        pub alignment_warnings_json: String,
         pub summary_status: String,
         pub summary_model_id: Option<String>,
         pub summary_text: Option<String>,

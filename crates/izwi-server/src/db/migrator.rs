@@ -247,6 +247,7 @@ const BASELINE_SCHEMA: &[&str] = &[
         speaker_turns_json TEXT NOT NULL DEFAULT '[]',
         saa_status TEXT NOT NULL DEFAULT 'not_requested',
         saa_warnings_json TEXT NOT NULL DEFAULT '[]',
+        alignment_warnings_json TEXT NOT NULL DEFAULT '[]',
         summary_status TEXT NOT NULL DEFAULT 'not_requested',
         summary_model_id TEXT NULL,
         summary_text TEXT NULL,
@@ -931,6 +932,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "transcription_records",
         column: "saa_warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "alignment_warnings_json",
         definition: "TEXT NOT NULL DEFAULT '[]'",
     },
     CompatibilityColumn {
