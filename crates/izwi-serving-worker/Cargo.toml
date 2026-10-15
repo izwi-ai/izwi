@@ -13,6 +13,8 @@ cuda = ["izwi-core/cuda"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda", "izwi-core/flash-attn"]
 metal = ["izwi-core/metal"]
+# A real worker over a scripted runtime, for contract and gateway tests.
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -39,8 +41,10 @@ candle-core = { workspace = true }
 half = { workspace = true }
 sha2 = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-worker = { path = ".", features = ["test-support"] }
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-server = { path = "../izwi-server" }
+reqwest = { workspace = true }
 safetensors = { workspace = true }
 tempfile = "3.10"
 tokenizers = { workspace = true }

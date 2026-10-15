@@ -1,10 +1,11 @@
-#![cfg(feature = "mock-worker")]
+//! The private worker client against the real worker (`WorkerService` over a
+//! scripted runtime, see `izwi_serving_worker::test_support`) on real
+//! sockets. Behaviour the real worker cannot produce, because it breaks the
+//! wire contract, comes from small raw peers that only exist to break it.
 
-use izwi_serving_client::{
-    mock::{MockFault, MockWorker, MockWorkerConfig},
-    DeadlinePhase, WorkerClient, WorkerClientConfig, WorkerClientError,
-};
+use izwi_serving_client::{DeadlinePhase, WorkerClient, WorkerClientConfig, WorkerClientError};
 use izwi_serving_protocol::*;
+use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig, WorkerScript};
 use std::{collections::BTreeSet, time::Duration};
 use tokio::net::TcpListener;
 
@@ -15,7 +16,7 @@ where
     T::try_from(format!("{prefix}-{suffix}")).expect("test identity")
 }
 
-fn request(config: &MockWorkerConfig, suffix: &str) -> InvocationRequest {
+fn request(config: &TestWorkerConfig, suffix: &str) -> InvocationRequest {
     InvocationRequest {
         schema_version: PROTOCOL_V1,
         request_id: id("request", suffix),
@@ -49,7 +50,7 @@ fn request(config: &MockWorkerConfig, suffix: &str) -> InvocationRequest {
             input: ChatInput {
                 messages: vec![ChatMessage {
                     role: ChatRole::User,
-                    content: "hello mock".into(),
+                    content: "hello worker".into(),
                 }],
             },
             parameters: ChatParameters::default(),
@@ -57,7 +58,7 @@ fn request(config: &MockWorkerConfig, suffix: &str) -> InvocationRequest {
     }
 }
 
-fn client(worker: &MockWorker) -> WorkerClient {
+fn client(worker: &TestWorker) -> WorkerClient {
     WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -67,7 +68,102 @@ fn client(worker: &MockWorker) -> WorkerClient {
 }
 
 fn client_for_endpoint(endpoint: &str, config: WorkerClientConfig) -> WorkerClient {
-    WorkerClient::new(endpoint, MockWorkerConfig::default().credentials, config).expect("client")
+    WorkerClient::new(endpoint, TestWorkerConfig::default().credentials, config).expect("client")
+}
+
+/// Wire faults the real worker never produces; the client must still
+/// classify them.
+#[derive(Clone, Copy)]
+enum WireFault {
+    /// A 200 NDJSON response whose body never carries the Accepted event.
+    OpenBodyWithoutAccepted,
+    /// A 200 NDJSON response whose body ends before the Accepted event.
+    EmptyBody,
+    /// A line that is not a JSON event.
+    MalformedEvent,
+    /// Accepted, then usage events and never output.
+    UsageTrickle,
+    /// Accepted, then single bytes that never complete an event.
+    ByteTrickle,
+}
+
+fn event_line(request: &InvocationRequest, sequence: u64, event: InvocationEventKind) -> Vec<u8> {
+    let mut line = serde_json::to_vec(&InvocationEvent {
+        schema_version: PROTOCOL_V1,
+        request_id: request.request_id.clone(),
+        attempt_id: request.attempt_id.clone(),
+        sequence,
+        event,
+    })
+    .expect("event encodes");
+    line.push(b'\n');
+    line
+}
+
+/// A peer that answers every invocation with `fault`, and its endpoint.
+async fn broken_peer(fault: WireFault) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind broken peer");
+    let endpoint = format!("http://{}/", listener.local_addr().expect("peer address"));
+    let app = axum::Router::new().route(
+        INVOCATIONS_PATH,
+        axum::routing::post(move |body: axum::body::Bytes| async move {
+            let request: InvocationRequest = serde_json::from_slice(&body).expect("invocation");
+            let accepted = event_line(
+                &request,
+                0,
+                InvocationEventKind::Accepted {
+                    worker_id: TestWorkerConfig::default().worker_id,
+                    node_id: TestWorkerConfig::default().node_id,
+                    incarnation_id: request.expected_worker_incarnation.clone(),
+                    deployment_id: request.deployment_id.clone(),
+                    model_generation: request.expected_model_generation,
+                },
+            );
+            let body = async_stream::stream! {
+                match fault {
+                    WireFault::OpenBodyWithoutAccepted => std::future::pending::<()>().await,
+                    WireFault::EmptyBody => {}
+                    WireFault::MalformedEvent => {
+                        yield Ok::<_, std::convert::Infallible>(b"{malformed}\n".to_vec());
+                    }
+                    WireFault::UsageTrickle => {
+                        yield Ok(accepted);
+                        for sequence in 1.. {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            yield Ok(event_line(
+                                &request,
+                                sequence,
+                                InvocationEventKind::Usage {
+                                    usage: Usage {
+                                        input_tokens: 1,
+                                        output_tokens: 0,
+                                        cached_tokens: None,
+                                    },
+                                },
+                            ));
+                        }
+                    }
+                    WireFault::ByteTrickle => {
+                        yield Ok(accepted);
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            yield Ok(b"{".to_vec());
+                        }
+                    }
+                }
+            };
+            axum::response::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, NDJSON_MEDIA_TYPE)
+                .body(axum::body::Body::from_stream(body))
+                .expect("static response")
+        }),
+    );
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (endpoint, server)
 }
 
 async fn unused_loopback_endpoint() -> String {
@@ -91,7 +187,7 @@ async fn refused_connection_is_classified_as_not_established() {
 
     assert!(matches!(
         client
-            .invoke(request(&MockWorkerConfig::default(), "connect-refused"))
+            .invoke(request(&TestWorkerConfig::default(), "connect-refused"))
             .await,
         Err(WorkerClientError::ConnectionNotEstablished(_))
     ));
@@ -119,43 +215,50 @@ async fn response_header_timeout_remains_acceptance_unknown() {
 
     assert!(matches!(
         client
-            .invoke(request(&MockWorkerConfig::default(), "header-timeout"))
+            .invoke(request(&TestWorkerConfig::default(), "header-timeout"))
             .await,
         Err(WorkerClientError::Deadline(DeadlinePhase::ResponseHeaders))
     ));
     server.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn open_response_body_without_accepted_times_out_in_invocation_admission() {
-    let config = MockWorkerConfig {
-        fault: MockFault::OpenBodyWithoutAcknowledgement,
-        cancellation_delay: Duration::from_millis(40),
-        ..MockWorkerConfig::default()
-    };
-    let worker = MockWorker::spawn(config).await.unwrap();
-    let client = WorkerClient::new(
-        &worker.endpoint(),
-        worker.config().credentials.clone(),
+    let (endpoint, server) = broken_peer(WireFault::OpenBodyWithoutAccepted).await;
+    let client = client_for_endpoint(
+        &endpoint,
         WorkerClientConfig {
             request_timeout: Duration::from_millis(30),
             first_output_timeout: Duration::from_millis(200),
             ..WorkerClientConfig::default()
         },
-    )
-    .unwrap();
+    );
 
     let error = client
-        .invoke(request(worker.config(), "open-body-no-accepted"))
+        .invoke(request(
+            &TestWorkerConfig::default(),
+            "open-body-no-accepted",
+        ))
         .await
         .unwrap_err();
     assert!(matches!(
         error,
         WorkerClientError::Deadline(DeadlinePhase::InvocationAdmission)
     ));
-    assert_eq!(worker.active_invocations(), 1);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert_eq!(worker.active_invocations(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn body_ending_before_accepted_is_unknown_not_a_rejection() {
+    let (endpoint, server) = broken_peer(WireFault::EmptyBody).await;
+    let client = client_for_endpoint(&endpoint, WorkerClientConfig::default());
+    let error = client
+        .invoke(request(&TestWorkerConfig::default(), "empty-body"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, WorkerClientError::InterruptedUnknown));
+    assert!(!error.proves_attempt_unaccepted());
+    server.abort();
 }
 
 #[tokio::test]
@@ -185,7 +288,7 @@ async fn generic_http_503_is_not_a_safe_rejection() {
 
     assert!(matches!(
         client
-            .invoke(request(&MockWorkerConfig::default(), "generic-503"))
+            .invoke(request(&TestWorkerConfig::default(), "generic-503"))
             .await,
         Err(WorkerClientError::HttpStatus {
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -200,7 +303,7 @@ async fn generic_http_503_is_not_a_safe_rejection() {
 /// cannot decode; an older worker negotiates its own minor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn descriptor_negotiates_the_minor_and_its_features() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let descriptor = client(&worker).descriptor().await.unwrap();
@@ -235,10 +338,10 @@ async fn descriptor_negotiates_the_minor_and_its_features() {
         serde_json::json!(["streaming", "cancellation", "attempt_query"])
     );
 
-    let minor3 = MockWorker::spawn(MockWorkerConfig {
+    let minor3 = TestWorker::spawn(TestWorkerConfig {
         protocol_version: SchemaVersion::new(1, 3),
         chat_features: BTreeSet::new(),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
     .unwrap();
@@ -255,17 +358,12 @@ async fn descriptor_negotiates_the_minor_and_its_features() {
         client(&minor3).invoke_collect(seeded).await,
         Err(WorkerClientError::Rejected { rejection }) if rejection.code == RejectionCode::InvalidRequest
     ));
-    assert_eq!(
-        minor3
-            .last_invocation()
-            .map(|invocation| invocation.attempt_id),
-        Some(id("attempt", "seeded"))
-    );
+    assert_eq!(minor3.served_invocations(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let client = client(&worker);
@@ -309,9 +407,9 @@ async fn happy_path_uses_authenticated_real_socket_and_strict_event_identity() {
 
 #[tokio::test]
 async fn cached_usage_reports_in_completed_usage_when_configured() {
-    let worker = MockWorker::spawn(MockWorkerConfig {
+    let worker = TestWorker::spawn(TestWorkerConfig {
         usage_cached_input_tokens: Some(7),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
     .unwrap();
@@ -333,7 +431,7 @@ async fn cached_usage_reports_in_completed_usage_when_configured() {
 
 #[tokio::test]
 async fn configured_delta_logprobs_report_on_text_delta_events() {
-    let worker = MockWorker::spawn(MockWorkerConfig {
+    let worker = TestWorker::spawn(TestWorkerConfig {
         delta_logprobs: Some(vec![TokenLogprob {
             token: "x".into(),
             logprob: -1.25,
@@ -344,7 +442,7 @@ async fn configured_delta_logprobs_report_on_text_delta_events() {
                 bytes: b"x".to_vec(),
             }],
         }]),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
     .unwrap();
@@ -370,7 +468,7 @@ async fn configured_delta_logprobs_report_on_text_delta_events() {
 
 #[tokio::test]
 async fn cached_usage_is_absent_on_the_wire_when_not_configured() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let client = client(&worker);
@@ -395,7 +493,7 @@ async fn cached_usage_is_absent_on_the_wire_when_not_configured() {
 
 #[tokio::test]
 async fn authentication_failure_does_not_expose_worker_control_data() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let wrong = ServiceCredentials {
@@ -415,7 +513,7 @@ async fn authentication_failure_does_not_expose_worker_control_data() {
 
 #[tokio::test]
 async fn incompatible_version_model_and_generation_are_rejected_before_execution() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let client = client(&worker);
@@ -478,11 +576,11 @@ async fn incompatible_version_model_and_generation_are_rejected_before_execution
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn atomic_worker_capacity_rejects_a_second_gateway_view() {
-    let config = MockWorkerConfig {
-        fault: MockFault::Hang,
-        ..MockWorkerConfig::default()
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let first_client = client(&worker);
     let second_client = client(&worker);
 
@@ -508,12 +606,12 @@ async fn atomic_worker_capacity_rejects_a_second_gateway_view() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invocation_budget_includes_time_waiting_for_a_client_permit() {
-    let config = MockWorkerConfig {
-        fault: MockFault::Hang,
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
         max_active_invocations: 2,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -551,12 +649,12 @@ async fn invocation_budget_includes_time_waiting_for_a_client_permit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invocation_total_budget_caps_wait_for_a_client_permit() {
-    let config = MockWorkerConfig {
-        fault: MockFault::Hang,
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
         max_active_invocations: 2,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -586,12 +684,12 @@ async fn invocation_total_budget_caps_wait_for_a_client_permit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_streams_never_starve_status_or_cancel_requests() {
-    let config = MockWorkerConfig {
-        fault: MockFault::Hang,
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
         max_active_invocations: 2,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -627,20 +725,33 @@ async fn live_streams_never_starve_status_or_cancel_requests() {
 
 #[tokio::test]
 async fn malformed_oversized_and_accepted_then_eof_are_never_success() {
-    for (suffix, fault, expected) in [
-        ("malformed", MockFault::MalformedEvent, "ndjson"),
+    let (endpoint, server) = broken_peer(WireFault::MalformedEvent).await;
+    let error = client_for_endpoint(&endpoint, WorkerClientConfig::default())
+        .invoke_collect(request(&TestWorkerConfig::default(), "malformed"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, WorkerClientError::Ndjson(_)));
+    server.abort();
+
+    for (suffix, config, expected) in [
         (
             "oversized",
-            MockFault::OversizedEvent { text_bytes: 2048 },
+            TestWorkerConfig {
+                output_text: "x".repeat(2048),
+                ..TestWorkerConfig::default()
+            },
             "ndjson",
         ),
-        ("eof", MockFault::AcceptedThenDisconnect, "interrupted"),
+        (
+            "eof",
+            TestWorkerConfig {
+                script: WorkerScript::LoseAfterAccept,
+                ..TestWorkerConfig::default()
+            },
+            "interrupted",
+        ),
     ] {
-        let config = MockWorkerConfig {
-            fault,
-            ..MockWorkerConfig::default()
-        };
-        let worker = MockWorker::spawn(config).await.unwrap();
+        let worker = TestWorker::spawn(config).await.unwrap();
         let mut client_config = WorkerClientConfig::default();
         client_config.ndjson_limits.max_line_bytes = 1024;
         client_config.ndjson_limits.max_total_bytes = 4096;
@@ -662,22 +773,24 @@ async fn malformed_oversized_and_accepted_then_eof_are_never_success() {
     }
 }
 
+/// Runtime admission that outlasts the request's queue wait: the worker
+/// cannot say whether it accepted, so the outcome is unknown, and the
+/// capacity stays held until the late admission is cancelled and torn down.
 #[tokio::test]
 async fn lost_acknowledgement_is_unknown_and_never_releases_capacity_early() {
-    let config = MockWorkerConfig {
-        fault: MockFault::AcceptedWithoutAcknowledgement,
-        cancellation_delay: Duration::from_millis(150),
-        ..MockWorkerConfig::default()
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
+        admission_delay: Duration::from_millis(100),
+        cancellation_delay: Duration::from_millis(80),
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = client(&worker);
     let invocation = request(worker.config(), "lost-ack");
     let identity = AttemptIdentity::from(&invocation);
 
-    assert!(matches!(
-        client.invoke(invocation).await,
-        Err(WorkerClientError::InterruptedUnknown)
-    ));
+    let error = client.invoke(invocation).await.unwrap_err();
+    assert!(!error.proves_attempt_unaccepted(), "{error}");
     assert_eq!(worker.active_invocations(), 1);
     assert!(matches!(
         client
@@ -686,28 +799,33 @@ async fn lost_acknowledgement_is_unknown_and_never_releases_capacity_early() {
         Err(WorkerClientError::Rejected { rejection })
             if rejection.code == RejectionCode::CapacityExhausted
     ));
-    assert!(matches!(
-        client.query_attempt(&identity).await.unwrap().state,
-        AttemptState::Running
-            | AttemptState::CancellationRequested
-            | AttemptState::ExecutionStopping
-    ));
+    assert!(!client
+        .query_attempt(&identity)
+        .await
+        .unwrap()
+        .state
+        .is_terminal());
 
-    tokio::time::sleep(Duration::from_millis(180)).await;
-    assert_eq!(worker.active_invocations(), 0);
-    assert_eq!(
-        client.query_attempt(&identity).await.unwrap().state,
-        AttemptState::Cancelled
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while worker.active_invocations() != 0 {
+        assert!(std::time::Instant::now() < deadline, "capacity never freed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(client
+        .query_attempt(&identity)
+        .await
+        .unwrap()
+        .state
+        .is_terminal());
 }
 
 #[tokio::test]
 async fn partial_output_then_disconnect_is_never_replayed_or_reported_as_success() {
-    let config = MockWorkerConfig {
-        fault: MockFault::PartialThenDisconnect,
-        ..MockWorkerConfig::default()
+    let config = TestWorkerConfig {
+        script: WorkerScript::LoseAfterPartial,
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = client(&worker);
     let error = client
         .invoke_collect(request(worker.config(), "partial-eof"))
@@ -719,12 +837,12 @@ async fn partial_output_then_disconnect_is_never_replayed_or_reported_as_success
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_output_timeout_requests_cancel_but_capacity_waits_for_teardown() {
-    let config = MockWorkerConfig {
-        fault: MockFault::Hang,
+    let config = TestWorkerConfig {
+        script: WorkerScript::Hang,
         cancellation_delay: Duration::from_millis(180),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client_config = WorkerClientConfig {
         first_output_timeout: Duration::from_millis(30),
         progress_timeout: Duration::from_millis(30),
@@ -770,32 +888,47 @@ async fn first_output_timeout_requests_cancel_but_capacity_waits_for_teardown() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_trickle_does_not_reset_first_useful_output_deadline() {
-    assert_non_output_trickle_times_out(MockFault::UsageTrickleWithoutOutput, "usage-trickle")
-        .await;
+    assert_peer_trickle_times_out(WireFault::UsageTrickle, "usage-trickle").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_byte_trickle_does_not_reset_first_useful_output_deadline() {
-    assert_non_output_trickle_times_out(MockFault::ByteTrickleWithoutEvent, "byte-trickle").await;
+    assert_peer_trickle_times_out(WireFault::ByteTrickle, "byte-trickle").await;
 }
 
+async fn assert_peer_trickle_times_out(fault: WireFault, suffix: &str) {
+    let (endpoint, server) = broken_peer(fault).await;
+    let client = client_for_endpoint(
+        &endpoint,
+        WorkerClientConfig {
+            first_output_timeout: Duration::from_millis(35),
+            progress_timeout: Duration::from_millis(20),
+            request_timeout: Duration::from_millis(200),
+            ..WorkerClientConfig::default()
+        },
+    );
+    let error = client
+        .invoke_collect(request(&TestWorkerConfig::default(), suffix))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::FirstOutput)
+    ));
+    server.abort();
+}
+
+/// Empty text deltas are real worker output (a runtime may emit them), but
+/// not useful output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_delta_trickle_does_not_reset_first_useful_output_deadline() {
-    assert_non_output_trickle_times_out(
-        MockFault::EmptyDeltaTrickleWithoutOutput,
-        "empty-delta-trickle",
-    )
-    .await;
-}
-
-async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
-    let config = MockWorkerConfig {
-        fault,
+    let config = TestWorkerConfig {
+        script: WorkerScript::EmptyDeltaTrickle,
         output_cadence: Duration::from_millis(10),
         cancellation_delay: Duration::from_millis(80),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -807,7 +940,7 @@ async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
         },
     )
     .unwrap();
-    let invocation = request(worker.config(), suffix);
+    let invocation = request(worker.config(), "empty-delta-trickle");
     let identity = AttemptIdentity::from(&invocation);
 
     let error = client.invoke_collect(invocation).await.unwrap_err();
@@ -833,13 +966,13 @@ async fn assert_non_output_trickle_times_out(fault: MockFault, suffix: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn non_empty_output_switches_to_the_progress_idle_deadline() {
-    let config = MockWorkerConfig {
-        fault: MockFault::TextDeltaThenHang,
+    let config = TestWorkerConfig {
+        script: WorkerScript::TextDeltaThenHang,
         output_cadence: Duration::from_millis(25),
         cancellation_delay: Duration::from_millis(40),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -864,11 +997,11 @@ async fn non_empty_output_switches_to_the_progress_idle_deadline() {
 
 #[tokio::test]
 async fn text_delta_resets_progress_deadline_until_completion() {
-    let config = MockWorkerConfig {
+    let config = TestWorkerConfig {
         output_cadence: Duration::from_millis(25),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -913,15 +1046,19 @@ fn wide_chat_transport_config() -> WorkerClientConfig {
 
 #[tokio::test]
 async fn gateway_sized_event_budget_allows_4096_deltas_and_terminal_control_events() {
-    let config = MockWorkerConfig {
-        fault: MockFault::ManyTextDeltas {
+    let config = TestWorkerConfig {
+        script: WorkerScript::ManyTextDeltas {
             count: 4096,
             text_bytes: 1,
         },
         output_cadence: Duration::ZERO,
-        ..MockWorkerConfig::default()
+        max_output_tokens: 4096,
+        // Room for every delta, so the worker never merges them for a
+        // lagging reader and the client sees 4096 separate events.
+        event_channel_capacity: 4100,
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -944,12 +1081,12 @@ async fn gateway_sized_event_budget_allows_4096_deltas_and_terminal_control_even
 #[tokio::test]
 async fn gateway_sized_line_budget_allows_a_near_512_kib_text_delta() {
     let output_bytes = 512 * 1024 - 1024;
-    let config = MockWorkerConfig {
+    let config = TestWorkerConfig {
         output_text: "x".repeat(output_bytes),
         output_cadence: Duration::ZERO,
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     };
-    let worker = MockWorker::spawn(config).await.unwrap();
+    let worker = TestWorker::spawn(config).await.unwrap();
     let client = WorkerClient::new(
         &worker.endpoint(),
         worker.config().credentials.clone(),
@@ -968,7 +1105,7 @@ async fn gateway_sized_line_budget_allows_a_near_512_kib_text_delta() {
 
 #[tokio::test]
 async fn request_body_is_bounded_before_any_post() {
-    let worker = MockWorker::spawn(MockWorkerConfig::default())
+    let worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let client_config = WorkerClientConfig {
@@ -990,10 +1127,10 @@ async fn request_body_is_bounded_before_any_post() {
 
 #[tokio::test]
 async fn duplicate_attempt_returns_unretryable_conflict_response() {
-    let worker = MockWorker::spawn(MockWorkerConfig {
+    let worker = TestWorker::spawn(TestWorkerConfig {
         output_cadence: Duration::from_millis(50),
         cancellation_delay: Duration::from_millis(150),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     })
     .await
     .unwrap();

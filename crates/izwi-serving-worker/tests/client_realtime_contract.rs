@@ -1,16 +1,16 @@
-#![cfg(feature = "mock-worker")]
 //! Realtime session contract tests (T32/T33): the bounded
-//! `izwi-realtime-v1` client against the deterministic mock worker over real
+//! `izwi-realtime-v1` client against the real worker (`WorkerService` over a
+//! scripted realtime stage, see `izwi_serving_worker::test_support`) over real
 //! sockets. Ordering, bounds, one-terminal-outcome, owner-loss interruption,
 //! stale-identity fencing, and HTTP/WS cancellation parity.
 
 use futures::StreamExt;
 use izwi_serving_client::realtime::{connect, RealtimeClientConfig, RealtimeClientError};
-use izwi_serving_client::{
-    mock::{MockRealtimeKnobs, MockTtsRealtimeKnobs, MockWorker, MockWorkerConfig},
-    WorkerClient, WorkerClientConfig,
-};
+use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_serving_worker::test_support::{
+    tts_chunk_bytes, TestAsrStage, TestTtsStage, TestWorker, TestWorkerConfig,
+};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -24,26 +24,26 @@ where
 
 fn credentials() -> ServiceCredentials {
     ServiceCredentials {
-        credential_id: id("mock-credential-1"),
-        bearer_token: ServiceBearerToken::new("mock-secret-token").unwrap(),
+        credential_id: id("test-credential-1"),
+        bearer_token: ServiceBearerToken::new("test-secret-token").unwrap(),
     }
 }
 
-fn realtime_config(knobs: MockRealtimeKnobs) -> MockWorkerConfig {
-    MockWorkerConfig {
-        deployment_id: id("mock-asr-v1"),
-        public_model: id("mock-asr"),
+fn realtime_config(knobs: TestAsrStage) -> TestWorkerConfig {
+    TestWorkerConfig {
+        deployment_id: id("test-asr-v1"),
+        public_model: id("test-asr"),
         realtime: Some(knobs),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     }
 }
 
-fn tts_config(knobs: MockTtsRealtimeKnobs) -> MockWorkerConfig {
-    MockWorkerConfig {
-        deployment_id: id("mock-tts-v1"),
-        public_model: id("mock-tts"),
+fn tts_config(knobs: TestTtsStage) -> TestWorkerConfig {
+    TestWorkerConfig {
+        deployment_id: id("test-tts-v1"),
+        public_model: id("test-tts"),
         realtime_tts: Some(knobs),
-        ..MockWorkerConfig::default()
+        ..TestWorkerConfig::default()
     }
 }
 
@@ -53,8 +53,8 @@ fn admission(session: &'static str, attempt: &'static str) -> RealtimeSessionAdm
         session_id: id(session),
         request_id: id("request-1"),
         attempt_id: id(attempt),
-        expected_worker_incarnation: id("mock-incarnation-1"),
-        deployment_id: id("mock-asr-v1"),
+        expected_worker_incarnation: id("test-incarnation-1"),
+        deployment_id: id("test-asr-v1"),
         expected_model_generation: ModelGeneration::new(1).unwrap(),
         caller: GatewayAttestedCallerContext {
             tenant_id: id("tenant-1"),
@@ -94,7 +94,7 @@ async fn established(
     .expect("session established")
 }
 
-async fn http_client(worker: &MockWorker) -> WorkerClient {
+async fn http_client(worker: &TestWorker) -> WorkerClient {
     WorkerClient::new(
         &worker.endpoint(),
         credentials(),
@@ -105,7 +105,7 @@ async fn http_client(worker: &MockWorker) -> WorkerClient {
 
 #[tokio::test]
 async fn realtime_session_orders_events_and_ends_with_one_terminal() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     let mut session = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;
@@ -113,7 +113,7 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
     let admission = session.admission().clone();
     assert_eq!(admission.session_id, "session-1");
     assert_eq!(admission.attempt_id, "attempt-1");
-    assert_eq!(admission.worker_id, "mock-worker-1");
+    assert_eq!(admission.worker_id, "test-worker-1");
     assert_eq!(
         admission.bounds.max_frame_bytes,
         MAX_REALTIME_AUDIO_FRAME_BYTES
@@ -141,7 +141,7 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
     let InvocationEventKind::TextDelta { text, .. } = final_delta.event else {
         panic!("expected final transcript delta");
     };
-    assert_eq!(text, "mock realtime transcript");
+    assert_eq!(text, "test realtime transcript");
     let completed = session.next_event().await.unwrap().expect("completed");
     assert!(matches!(
         completed.event,
@@ -156,11 +156,11 @@ async fn realtime_session_orders_events_and_ends_with_one_terminal() {
 
 #[tokio::test]
 async fn realtime_stale_incarnation_is_closed_before_admission() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     let admit = RealtimeSessionAdmit {
-        expected_worker_incarnation: id("mock-incarnation-stale"),
+        expected_worker_incarnation: id("test-incarnation-stale"),
         ..admission("session-1", "attempt-1")
     };
     let error = connect(
@@ -180,7 +180,7 @@ async fn realtime_stale_incarnation_is_closed_before_admission() {
 
 #[tokio::test]
 async fn realtime_frames_above_the_negotiated_bound_never_leave_the_client() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     let mut session = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;
@@ -197,9 +197,9 @@ async fn realtime_frames_above_the_negotiated_bound_never_leave_the_client() {
 
 #[tokio::test]
 async fn realtime_owner_loss_interrupts_without_any_terminal_event() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs {
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage {
         disconnect_after_frames: Some(2),
-        ..MockRealtimeKnobs::default()
+        ..TestAsrStage::default()
     }))
     .await
     .unwrap();
@@ -229,8 +229,8 @@ async fn realtime_owner_loss_interrupts_without_any_terminal_event() {
             attempt_id: id("attempt-1"),
             tenant_id: id("tenant-1"),
             caller_id: id("caller-1"),
-            incarnation_id: id("mock-incarnation-1"),
-            deployment_id: id("mock-asr-v1"),
+            incarnation_id: id("test-incarnation-1"),
+            deployment_id: id("test-asr-v1"),
             model_generation: ModelGeneration::new(1).unwrap(),
         })
         .await
@@ -240,9 +240,9 @@ async fn realtime_owner_loss_interrupts_without_any_terminal_event() {
 
 #[tokio::test]
 async fn realtime_in_session_cancel_ends_with_one_cancelled_terminal() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs {
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage {
         push_cadence: Duration::from_millis(1),
-        ..MockRealtimeKnobs::default()
+        ..TestAsrStage::default()
     }))
     .await
     .unwrap();
@@ -263,9 +263,9 @@ async fn realtime_in_session_cancel_ends_with_one_cancelled_terminal() {
 
 #[tokio::test]
 async fn realtime_http_cancel_reaches_the_ws_session_through_the_shared_table() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs {
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage {
         push_cadence: Duration::from_millis(1),
-        ..MockRealtimeKnobs::default()
+        ..TestAsrStage::default()
     }))
     .await
     .unwrap();
@@ -279,8 +279,8 @@ async fn realtime_http_cancel_reaches_the_ws_session_through_the_shared_table() 
             attempt_id: id("attempt-1"),
             tenant_id: id("tenant-1"),
             caller_id: id("caller-1"),
-            incarnation_id: id("mock-incarnation-1"),
-            deployment_id: id("mock-asr-v1"),
+            incarnation_id: id("test-incarnation-1"),
+            deployment_id: id("test-asr-v1"),
             model_generation: ModelGeneration::new(1).unwrap(),
         })
         .await
@@ -298,7 +298,7 @@ async fn realtime_http_cancel_reaches_the_ws_session_through_the_shared_table() 
 
 #[tokio::test]
 async fn realtime_attempt_id_reuse_is_closed_as_duplicate() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     let mut first = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;
@@ -323,7 +323,7 @@ async fn realtime_attempt_id_reuse_is_closed_as_duplicate() {
 
 #[tokio::test]
 async fn realtime_endpoint_rejects_missing_subprotocol_and_denies_policy() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
 
@@ -338,11 +338,11 @@ async fn realtime_endpoint_rejects_missing_subprotocol_and_denies_policy() {
     let headers = request.headers_mut();
     headers.insert(
         SERVICE_AUTHORIZATION_HEADER,
-        HeaderValue::from_static("Bearer mock-secret-token"),
+        HeaderValue::from_static("Bearer test-secret-token"),
     );
     headers.insert(
         SERVICE_CREDENTIAL_ID_HEADER,
-        HeaderValue::from_static("mock-credential-1"),
+        HeaderValue::from_static("test-credential-1"),
     );
     let error = tokio_tungstenite::connect_async(request).await.unwrap_err();
     assert!(
@@ -373,7 +373,7 @@ async fn realtime_endpoint_rejects_missing_subprotocol_and_denies_policy() {
     ));
 
     // Chat workers built without realtime knobs never expose the route.
-    let chat_worker = MockWorker::spawn(MockWorkerConfig::default())
+    let chat_worker = TestWorker::spawn(TestWorkerConfig::default())
         .await
         .unwrap();
     let error = connect(
@@ -400,8 +400,8 @@ fn tts_admission(session: &'static str, attempt: &'static str) -> RealtimeSessio
         session_id: id(session),
         request_id: id("request-1"),
         attempt_id: id(attempt),
-        expected_worker_incarnation: id("mock-incarnation-1"),
-        deployment_id: id("mock-tts-v1"),
+        expected_worker_incarnation: id("test-incarnation-1"),
+        deployment_id: id("test-tts-v1"),
         expected_model_generation: ModelGeneration::new(1).unwrap(),
         caller: GatewayAttestedCallerContext {
             tenant_id: id("tenant-1"),
@@ -419,10 +419,10 @@ fn tts_admission(session: &'static str, attempt: &'static str) -> RealtimeSessio
 
 #[tokio::test]
 async fn tts_session_streams_audio_frames_and_ends_with_one_terminal() {
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+    let worker = TestWorker::spawn(tts_config(TestTtsStage {
         chunk_bytes: 16,
         chunk_count: 3,
-        ..MockTtsRealtimeKnobs::default()
+        ..TestTtsStage::default()
     }))
     .await
     .unwrap();
@@ -464,10 +464,11 @@ async fn tts_session_streams_audio_frames_and_ends_with_one_terminal() {
     assert!(payloads[3].1.is_empty());
     for (index, (sequence, payload)) in payloads.iter().take(3).enumerate() {
         assert_eq!(*sequence, u32::try_from(index + 1).unwrap());
-        let expected: Vec<u8> = (0..16)
-            .map(|position| ((index * 31 + position * 7) % 251 + 1) as u8)
-            .collect();
-        assert_eq!(*payload, expected, "payload frame {index} content");
+        assert_eq!(
+            *payload,
+            tts_chunk_bytes(index, 16),
+            "payload frame {index} content"
+        );
     }
 
     let completed = session.next_event().await.unwrap().expect("completed");
@@ -482,7 +483,7 @@ async fn tts_session_streams_audio_frames_and_ends_with_one_terminal() {
 
 #[tokio::test]
 async fn tts_session_client_rejects_text_bound_violations_locally() {
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(tts_config(TestTtsStage::default()))
         .await
         .unwrap();
     let mut session =
@@ -502,7 +503,7 @@ async fn tts_session_client_rejects_text_bound_violations_locally() {
 
 #[tokio::test]
 async fn tts_session_in_session_cancel_ends_with_one_cancelled_terminal() {
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(tts_config(TestTtsStage::default()))
         .await
         .unwrap();
     let mut session =
@@ -531,9 +532,9 @@ async fn tts_session_in_session_cancel_ends_with_one_cancelled_terminal() {
 
 #[tokio::test]
 async fn tts_owner_loss_interrupts_without_any_terminal_event() {
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+    let worker = TestWorker::spawn(tts_config(TestTtsStage {
         disconnect_after_frames: Some(2),
-        ..MockTtsRealtimeKnobs::default()
+        ..TestTtsStage::default()
     }))
     .await
     .unwrap();
@@ -568,8 +569,8 @@ async fn tts_owner_loss_interrupts_without_any_terminal_event() {
             attempt_id: id("attempt-1"),
             tenant_id: id("tenant-1"),
             caller_id: id("caller-1"),
-            incarnation_id: id("mock-incarnation-1"),
-            deployment_id: id("mock-tts-v1"),
+            incarnation_id: id("test-incarnation-1"),
+            deployment_id: id("test-tts-v1"),
             model_generation: ModelGeneration::new(1).unwrap(),
         })
         .await
@@ -579,13 +580,13 @@ async fn tts_owner_loss_interrupts_without_any_terminal_event() {
 
 #[tokio::test]
 async fn tts_admit_on_an_asr_worker_is_incompatible() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     // The admit targets the ASR worker's deployment with the TTS task, so the
     // fencing ladder reaches the task check and answers IncompatibleTask.
     let admit = RealtimeSessionAdmit {
-        deployment_id: id("mock-asr-v1"),
+        deployment_id: id("test-asr-v1"),
         ..tts_admission("session-1", "attempt-1")
     };
     let error = connect(
@@ -605,10 +606,10 @@ async fn tts_admit_on_an_asr_worker_is_incompatible() {
 #[tokio::test]
 async fn tts_http_cancel_reaches_the_ws_session_through_the_shared_table() {
     // A long emission window guarantees the HTTP cancel lands mid-stream.
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs {
+    let worker = TestWorker::spawn(tts_config(TestTtsStage {
         chunk_count: 10,
         push_cadence: Duration::from_millis(20),
-        ..MockTtsRealtimeKnobs::default()
+        ..TestTtsStage::default()
     }))
     .await
     .unwrap();
@@ -625,8 +626,8 @@ async fn tts_http_cancel_reaches_the_ws_session_through_the_shared_table() {
             attempt_id: id("attempt-1"),
             tenant_id: id("tenant-1"),
             caller_id: id("caller-1"),
-            incarnation_id: id("mock-incarnation-1"),
-            deployment_id: id("mock-tts-v1"),
+            incarnation_id: id("test-incarnation-1"),
+            deployment_id: id("test-tts-v1"),
             model_generation: ModelGeneration::new(1).unwrap(),
         })
         .await
@@ -651,7 +652,7 @@ async fn tts_http_cancel_reaches_the_ws_session_through_the_shared_table() {
 
 #[tokio::test]
 async fn tts_session_empty_finish_completes_without_audio() {
-    let worker = MockWorker::spawn(tts_config(MockTtsRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(tts_config(TestTtsStage::default()))
         .await
         .unwrap();
     let mut session =
@@ -669,7 +670,7 @@ async fn tts_session_empty_finish_completes_without_audio() {
 
 #[tokio::test]
 async fn text_input_is_rejected_on_audio_stream_sessions_before_writing() {
-    let worker = MockWorker::spawn(realtime_config(MockRealtimeKnobs::default()))
+    let worker = TestWorker::spawn(realtime_config(TestAsrStage::default()))
         .await
         .unwrap();
     let mut session = established(&worker.endpoint(), admission("session-1", "attempt-1")).await;

@@ -3901,6 +3901,8 @@ dependencies = [
  "izwi-serving-client",
  "izwi-serving-protocol",
  "izwi-serving-supervisor",
+ "izwi-serving-worker",
+ "reqwest 0.11.27",
  "rustls-pemfile",
  "safetensors 0.4.5",
  "serde_json",

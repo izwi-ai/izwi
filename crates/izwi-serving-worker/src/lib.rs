@@ -32,6 +32,8 @@ use tokio::time::Instant;
 
 mod realtime;
 mod runtime;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use realtime::{RuntimeRealtimeSessionLimits, REALTIME_SESSION_DEFAULT_LIMITS};
 pub use runtime::{
