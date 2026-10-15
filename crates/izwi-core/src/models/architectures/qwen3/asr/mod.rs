@@ -1616,18 +1616,8 @@ impl Qwen3AsrModel {
         };
         let timestamp_token_id = config.timestamp_token_id;
         let timestamp_segment_time_ms = config.timestamp_segment_time.map(|v| v as u32);
-        let is_forced_aligner = config
-            .thinker_config
-            .model_type
-            .as_deref()
-            .map(|name| name.to_ascii_lowercase().contains("forced_aligner"))
-            .unwrap_or(false)
-            || config.thinker_config.classify_num.is_some();
-        let model_family = if is_forced_aligner {
-            ModelFamily::Qwen3ForcedAligner
-        } else {
-            ModelFamily::Qwen3Asr
-        };
+        let model_family = config.model_family();
+        let is_forced_aligner = model_family == ModelFamily::Qwen3ForcedAligner;
 
         let mut text_cfg = config.thinker_config.text_config.clone();
         let inferred_lm_head_size = if let Some(gguf_path) = gguf_path.as_ref() {
@@ -1687,8 +1677,7 @@ impl Qwen3AsrModel {
         // stricter around f32 boundaries, so select audio/text dtypes separately.
         let is_gguf = gguf_loader.is_some();
         let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
-        let is_quantized =
-            is_gguf || config.quantization.is_some() || config.quantization_config.is_some();
+        let is_quantized = is_gguf || config.is_mlx_quantized();
         if !is_gguf && is_quantized {
             validate_quantization_config(&config)?;
         }
@@ -3745,6 +3734,54 @@ fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![weights_path])
 }
 
+/// How [`Qwen3AsrModel::load`] reads a safetensors checkpoint: the shards,
+/// the text and audio-tower dtypes it resolves on the device, and the bit width
+/// of MLX-packed weights. Load admission prices the checkpoint with it
+/// (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Qwen3AsrSafetensorsLoad {
+    pub(crate) shards: Vec<PathBuf>,
+    pub(crate) text_dtype: DType,
+    pub(crate) audio_dtype: DType,
+    /// Bits per packed element of an MLX-quantized checkpoint, as its config
+    /// names them.
+    pub(crate) mlx_bits: Option<u64>,
+}
+
+/// [`Qwen3AsrSafetensorsLoad`] for the checkpoint in `model_dir` on `device`,
+/// or `None` when the loader would read a GGUF checkpoint instead or the
+/// config or weights are missing (the loader reports those).
+pub(crate) fn qwen3_asr_safetensors_load(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: &DeviceProfile,
+) -> Result<Option<Qwen3AsrSafetensorsLoad>> {
+    let config_path = model_dir.join("config.json");
+    if resolve_qwen_asr_gguf_path(model_dir, variant).is_some() || !config_path.is_file() {
+        return Ok(None);
+    }
+    let config: Qwen3AsrConfig = serde_json::from_str(&fs::read_to_string(config_path)?)?;
+    let shards = match resolve_safetensors_shards(model_dir) {
+        Ok(shards) => shards,
+        Err(Error::ModelNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let quantized = config.is_mlx_quantized();
+    let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+        device,
+        config.model_family(),
+        false,
+        quantized,
+        config.thinker_config.dtype.as_deref(),
+    )?;
+    Ok(Some(Qwen3AsrSafetensorsLoad {
+        shards,
+        text_dtype,
+        audio_dtype,
+        mlx_bits: if quantized { config.mlx_bits() } else { None },
+    }))
+}
+
 /// The text and audio-tower weight dtypes the Qwen3-ASR loader selects on
 /// `device`, honouring `IZWI_QWEN_ASR_TEXT_DTYPE` (or `IZWI_QWEN_DTYPE`) and
 /// `IZWI_QWEN_ASR_AUDIO_DTYPE`. `checkpoint_dtype` is the thinker config's dtype
@@ -4206,11 +4243,7 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
 }
 
 fn validate_quantization_config(config: &Qwen3AsrConfig) -> Result<()> {
-    let quant = config
-        .quantization_config
-        .as_ref()
-        .or(config.quantization.as_ref());
-    let Some(quant) = quant else {
+    let Some(quant) = config.mlx_quantization() else {
         return Ok(());
     };
 
