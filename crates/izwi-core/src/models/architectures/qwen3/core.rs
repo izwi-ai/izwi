@@ -404,6 +404,9 @@ static QWEN3_SEQUENTIAL_ROPE_HOST_TABLES: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static QWEN3_MROPE_POSITION_READBACKS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    static QWEN3_ROPE_TABLE_BUILDS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    static QWEN3_HEAD_ROWS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn record_mrope_position_readback() {
@@ -425,6 +428,16 @@ pub fn qwen3_sequential_rope_host_tables() -> u64 {
 #[cfg(test)]
 fn thread_mrope_position_readbacks() -> u64 {
     QWEN3_MROPE_POSITION_READBACKS_THREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn thread_rope_table_builds() -> u64 {
+    QWEN3_ROPE_TABLE_BUILDS_THREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn thread_head_rows() -> u64 {
+    QWEN3_HEAD_ROWS_THREAD.with(std::cell::Cell::get)
 }
 
 pub fn qwen3_runtime_profiling_enabled() -> bool {
@@ -1337,6 +1350,21 @@ impl Qwen3Attention {
         start_pos: usize,
         position_ids: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
+        self.apply_rope_pair_cached(q, k, start_pos, position_ids, &mut None)
+    }
+
+    /// [`Self::apply_rope_pair`] with the cos/sin tables kept in `tables`
+    /// across calls: a stateless forward builds them once for every layer
+    /// (the layers share one RoPE geometry) instead of once per layer
+    /// (QFA-9). The tables stay host-built and uploaded.
+    fn apply_rope_pair_cached(
+        &self,
+        q: Tensor,
+        k: Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        tables: &mut Option<(Tensor, Tensor)>,
+    ) -> Result<(Tensor, Tensor)> {
         let seq_len = q.dim(1)?;
         if k.dim(1)? != seq_len {
             return Err(Error::InferenceError(format!(
@@ -1347,8 +1375,46 @@ impl Qwen3Attention {
         }
         let q = q.contiguous()?;
         let k = k.contiguous()?;
+        let reusable = tables
+            .as_ref()
+            .is_some_and(|(cos, _)| cos.dtype() == q.dtype() && cos.dim(0).ok() == Some(seq_len));
+        if !reusable {
+            *tables = Some(self.rope_tables(seq_len, start_pos, position_ids, &q)?);
+        }
+        let Some((cos_half, sin_half)) = tables.as_ref() else {
+            return Err(Error::InferenceError("Qwen3 RoPE tables missing".into()));
+        };
 
-        let (cos_half, sin_half) = if let Some(position_ids) = position_ids {
+        if self.should_try_rope_kernel(q.dtype()) {
+            let cos = cos_half.unsqueeze(0)?.contiguous()?;
+            let sin = sin_half.unsqueeze(0)?.contiguous()?;
+            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(&q, &k, &cos, &sin)? {
+                record_rope_kernel();
+                record_rope_kernel();
+                return Ok((q_out, k_out));
+            }
+        }
+        record_rope_manual();
+        record_rope_manual();
+
+        Ok((
+            apply_rotary_emb(&q, cos_half, sin_half)?,
+            apply_rotary_emb(&k, cos_half, sin_half)?,
+        ))
+    }
+
+    /// The `[seq, head_dim / 2]` cos/sin tables for `q`'s positions, in its
+    /// dtype and on its device.
+    fn rope_tables(
+        &self,
+        seq_len: usize,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        q: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        #[cfg(test)]
+        QWEN3_ROPE_TABLE_BUILDS_THREAD.with(|count| count.set(count.get() + 1));
+        if let Some(position_ids) = position_ids {
             if self.use_mrope {
                 build_mrope_cache_with_inv_freqs(
                     seq_len,
@@ -1358,7 +1424,7 @@ impl Qwen3Attention {
                     position_ids,
                     self.mrope_section.as_deref().unwrap_or(&[]),
                     &self.rope_inv_freqs,
-                )?
+                )
             } else {
                 build_rope_cache_with_inv_freqs(
                     seq_len,
@@ -1366,7 +1432,7 @@ impl Qwen3Attention {
                     q.device(),
                     q.dtype(),
                     &self.rope_inv_freqs,
-                )?
+                )
             }
         } else if self.sequential_mrope_uses_host_tables() {
             // Equal sequential positions on all three axes are plain 1-D RoPE:
@@ -1378,7 +1444,7 @@ impl Qwen3Attention {
                 q.device(),
                 q.dtype(),
                 &self.rope_inv_freqs,
-            )?
+            )
         } else if self.use_mrope {
             let mut data = Vec::with_capacity(3 * seq_len);
             let base = start_pos as i64;
@@ -1396,7 +1462,7 @@ impl Qwen3Attention {
                 &position_ids,
                 self.mrope_section.as_deref().unwrap_or(&[]),
                 &self.rope_inv_freqs,
-            )?
+            )
         } else {
             build_rope_cache_with_inv_freqs(
                 seq_len,
@@ -1404,25 +1470,8 @@ impl Qwen3Attention {
                 q.device(),
                 q.dtype(),
                 &self.rope_inv_freqs,
-            )?
-        };
-
-        if self.should_try_rope_kernel(q.dtype()) {
-            let cos = cos_half.unsqueeze(0)?.contiguous()?;
-            let sin = sin_half.unsqueeze(0)?.contiguous()?;
-            if let Some((q_out, k_out)) = try_apply_rope_pair_thd(&q, &k, &cos, &sin)? {
-                record_rope_kernel();
-                record_rope_kernel();
-                return Ok((q_out, k_out));
-            }
+            )
         }
-        record_rope_manual();
-        record_rope_manual();
-
-        Ok((
-            apply_rotary_emb(&q, &cos_half, &sin_half)?,
-            apply_rotary_emb(&k, &cos_half, &sin_half)?,
-        ))
     }
 
     fn should_try_rope_kernel(&self, dtype: DType) -> bool {
@@ -1440,6 +1489,7 @@ impl Qwen3Attention {
         x: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
+        rope_tables: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let batch = x.dim(0)?;
         let sequence = x.dim(1)?;
@@ -1448,7 +1498,8 @@ impl Qwen3Attention {
         let key = key.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
         let value = value.reshape((batch, sequence, self.num_kv_heads, self.head_dim))?;
         let (query, key) = self.apply_qk_norm_pair(query, key, sequence)?;
-        let (query, key) = self.apply_rope_pair(query, key, start_pos, position_ids)?;
+        let (query, key) =
+            self.apply_rope_pair_cached(query, key, start_pos, position_ids, rope_tables)?;
 
         let query = query.transpose(1, 2)?;
         let key_heads = key.transpose(1, 2)?;
@@ -1985,11 +2036,13 @@ impl Qwen3Layer {
         input: &Tensor,
         start_pos: usize,
         position_ids: Option<&Tensor>,
+        rope_tables: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let attention = self.self_attn.forward_stateless(
             &self.input_layernorm.forward(input)?,
             start_pos,
             position_ids,
+            rope_tables,
         )?;
         let hidden = input.broadcast_add(&attention)?;
         let mlp = self
@@ -2597,16 +2650,67 @@ impl Qwen3Model {
         start_pos: usize,
         position_ids: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let hidden = self.stateless_normed_hidden(embeds, start_pos, position_ids)?;
+        self.logits_from_hidden(&hidden)
+    }
+
+    /// A stateless forward that scores only the prompt `rows`: the normed
+    /// hidden state is gathered at those positions before the head, so the
+    /// logits are `[1, rows.len(), vocab]` instead of one row per prompt
+    /// position (QFA-9: the forced aligner reads only its timestamp rows).
+    pub fn forward_stateless_rows_with_embeds(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+        rows: &[usize],
+    ) -> Result<Tensor> {
+        let (batch, sequence, _) = embeds.dims3()?;
+        if batch != 1 {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3 row-scored forward takes one sequence, got {batch}"
+            )));
+        }
+        if let Some(row) = rows.iter().find(|row| **row >= sequence) {
+            return Err(Error::InferenceError(format!(
+                "Qwen3 scored row {row} is out of range for sequence length {sequence}"
+            )));
+        }
+        let rows = rows
+            .iter()
+            .map(|row| u32::try_from(*row).map_err(|_| Error::InvalidInput("row index".into())))
+            .collect::<Result<Vec<_>>>()?;
+        let index = Tensor::from_vec(rows.clone(), rows.len(), embeds.device())?;
+        let hidden = self.stateless_normed_hidden(embeds, start_pos, position_ids)?;
+        self.logits_from_hidden(&hidden.index_select(&index, 1)?)
+    }
+
+    /// The final-normed hidden state of a stateless forward over `embeds`.
+    /// The RoPE tables are built once and shared by every layer.
+    fn stateless_normed_hidden(
+        &self,
+        embeds: &Tensor,
+        start_pos: usize,
+        position_ids: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let position_ids =
             self.elide_sequential_mrope_positions(start_pos, embeds.dim(1)?, position_ids)?;
+        let mut rope_tables = None;
         let mut hidden = embeds.clone();
         for layer in &self.layers {
-            hidden = layer.forward_stateless(&hidden, start_pos, position_ids)?;
+            hidden = layer.forward_stateless(&hidden, start_pos, position_ids, &mut rope_tables)?;
         }
-        self.logits_from_hidden(&self.norm.forward(&hidden)?)
+        self.norm.forward(&hidden).map_err(Error::from)
     }
 
     pub fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor> {
+        #[cfg(test)]
+        QWEN3_HEAD_ROWS_THREAD.with(|count| {
+            let rows = hidden.dims()[..hidden.rank().saturating_sub(1)]
+                .iter()
+                .product::<usize>();
+            count.set(count.get() + rows as u64)
+        });
         if !qwen3_runtime_profiling_enabled() {
             return self.lm_head.forward(hidden).map_err(Error::from);
         }
@@ -3301,7 +3405,7 @@ mod tests {
         let mut hidden = embeds.clone();
         for layer in &model.layers {
             hidden = layer
-                .forward_stateless(&hidden, start_pos, Some(ids))
+                .forward_stateless(&hidden, start_pos, Some(ids), &mut None)
                 .unwrap();
         }
         model
@@ -3345,8 +3449,94 @@ mod tests {
         let actual = model
             .forward_stateless_with_embeds(&embeds, 0, Some(&ids))
             .unwrap();
-        assert_eq!(thread_mrope_position_readbacks() - before, 3);
+        // The sequential check, then one table build shared by both layers.
+        assert_eq!(thread_mrope_position_readbacks() - before, 2);
         assert_eq!(bitwise(&expected), bitwise(&actual));
+    }
+
+    /// QFA-9: a stateless forward builds its RoPE tables once for all
+    /// layers, and the result equals building them in every layer.
+    #[test]
+    fn stateless_forward_builds_rope_tables_once() {
+        let device = Device::Cpu;
+        let model = tiny_mrope_qwen3_model(&device);
+        let embeds = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(23 * 4, 3, 1.0),
+            (1, 23, 4),
+            &device,
+        )
+        .unwrap();
+        let mixed_axes = (0..69).map(|v| v % 7).collect::<Vec<i64>>();
+        for ids in [
+            None,
+            Some(equal_axis_positions(23, 0, &device)),
+            Some(Tensor::from_vec(mixed_axes, (3, 23), &device).unwrap()),
+        ] {
+            let reference_ids = ids
+                .clone()
+                .unwrap_or_else(|| equal_axis_positions(23, 0, &device));
+            let before = thread_rope_table_builds();
+            let expected = per_layer_mrope_logits(&model, &embeds, 0, &reference_ids);
+            assert_eq!(thread_rope_table_builds() - before, 2);
+            let before = thread_rope_table_builds();
+            let actual = model
+                .forward_stateless_with_embeds(&embeds, 0, ids.as_ref())
+                .unwrap();
+            assert_eq!(thread_rope_table_builds() - before, 1);
+            assert_eq!(bitwise(&expected), bitwise(&actual));
+        }
+    }
+
+    /// QFA-9: scoring only the requested rows runs the head over those rows
+    /// alone and gives their logits and classes; a row past the sequence is
+    /// rejected.
+    #[test]
+    fn row_scored_forward_matches_the_full_logits_at_those_rows() {
+        let device = Device::Cpu;
+        let model = tiny_mrope_qwen3_model(&device);
+        let embeds = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(31 * 4, 11, 1.0),
+            (1, 31, 4),
+            &device,
+        )
+        .unwrap();
+        let rows = [30usize, 2, 17, 17, 0, 9];
+        let full = model
+            .forward_stateless_with_embeds(&embeds, 0, None)
+            .unwrap();
+        let index =
+            Tensor::from_vec(rows.map(|row| row as u32).to_vec(), rows.len(), &device).unwrap();
+        let expected = full.index_select(&index, 1).unwrap();
+        let (tables, head_rows) = (thread_rope_table_builds(), thread_head_rows());
+        let scored = model
+            .forward_stateless_rows_with_embeds(&embeds, 0, None, &rows)
+            .unwrap();
+        assert_eq!(thread_rope_table_builds() - tables, 1);
+        assert_eq!(thread_head_rows() - head_rows, rows.len() as u64);
+        assert_eq!(scored.dims(), [1, rows.len(), 8]);
+        let classes = |logits: &Tensor| {
+            logits
+                .argmax(candle_core::D::Minus1)
+                .unwrap()
+                .to_vec2::<u32>()
+                .unwrap()
+        };
+        assert_eq!(classes(&expected), classes(&scored));
+        let delta = (expected - &scored)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(delta <= 1e-6, "row logits moved by {delta}");
+        let error = model
+            .forward_stateless_rows_with_embeds(&embeds, 0, None, &[31])
+            .unwrap_err();
+        assert!(error.to_string().contains("out of range"), "{error}");
     }
 
     /// Cache-free reference: logits for every position of `ids`, computed by

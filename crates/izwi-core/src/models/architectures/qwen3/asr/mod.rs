@@ -2895,15 +2895,16 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let logits = self.forward_with_audio(
+        let logits = self.timestamp_logits(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
+            &timestamp_positions,
         )?;
 
         let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
-        let timestamp_ms = batched_timestamp_argmax(&logits, &timestamp_positions)?
+        let timestamp_ms = timestamp_argmax(&logits, &timestamp_positions)?
             .into_iter()
             .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
             .collect::<Vec<_>>();
@@ -2992,12 +2993,15 @@ impl Qwen3AsrModel {
         decode_raw_asr_output(&self.tokenizer, &self.specials, tokens)
     }
 
-    fn forward_with_audio(
+    /// The aligner's classifier logits at the prompt's timestamp rows only,
+    /// `[1, timestamp_positions.len(), classes]` (QFA-9).
+    fn timestamp_logits(
         &self,
         input_ids: &Tensor,
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
+        timestamp_positions: &[usize],
     ) -> Result<Tensor> {
         let (embeds, position_ids) = self.prepare_audio_prompt_embeddings(
             input_ids,
@@ -3005,8 +3009,12 @@ impl Qwen3AsrModel {
             audio_pad_start,
             audio_pad_len,
         )?;
-        self.text_model
-            .forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())
+        self.text_model.forward_stateless_rows_with_embeds(
+            &embeds,
+            0,
+            position_ids.as_ref(),
+            timestamp_positions,
+        )
     }
 
     fn prepare_audio_prompt_embeddings(
@@ -4973,29 +4981,20 @@ fn collect_stop_token_ids(specials: &SpecialTokenIds) -> Vec<u32> {
     stop_ids
 }
 
-fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<u32>> {
+/// The class of each timestamp row. `logits` holds one row per entry of
+/// `positions` (the prompt positions they were scored at, for errors).
+fn timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<u32>> {
     if positions.is_empty() {
         return Ok(Vec::new());
     }
     let dims = logits.dims();
-    if dims.len() != 3 || dims[0] != 1 {
+    if dims.len() != 3 || dims[0] != 1 || dims[1] != positions.len() {
         return Err(Error::InferenceError(format!(
-            "Forced aligner timestamp argmax expects logits shape [1, seq, classes], got {dims:?}"
+            "Forced aligner timestamp argmax expects logits shape [1, {}, classes], got {dims:?}",
+            positions.len()
         )));
     }
-    let seq_len = dims[1];
-    let mut position_ids = Vec::with_capacity(positions.len());
-    for &position in positions {
-        if position >= seq_len {
-            return Err(Error::InferenceError(format!(
-                "Forced aligner timestamp position {position} is out of range for sequence length {seq_len}"
-            )));
-        }
-        position_ids.push(position as i64);
-    }
-
-    let position_index = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
-    let token_logits = logits.i(0)?.index_select(&position_index, 0)?;
+    let token_logits = logits.i(0)?;
     // A NaN row argmaxes to class 0, which would read as a fabricated 0 ms
     // timestamp; a device fault must surface as an error instead.
     let rows = token_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
@@ -6713,37 +6712,36 @@ mod tests {
     }
 
     #[test]
-    fn batched_timestamp_argmax_selects_requested_positions() {
+    fn timestamp_argmax_reads_one_class_per_scored_row() {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(
             vec![
-                0.1f32, 0.2, 0.9, 0.0, //
-                0.8, 0.1, 0.0, 0.2, //
-                0.3, 1.4, 0.2, 0.0, //
+                0.3f32, 1.4, 0.2, 0.0, //
+                0.1, 0.2, 0.9, 0.0, //
                 0.0, 0.2, 0.1, 2.0,
             ],
-            (1, 4, 4),
+            (1, 3, 4),
             &device,
         )
         .expect("logits");
 
-        let indices = batched_timestamp_argmax(&logits, &[2, 0, 3]).expect("argmax");
+        let indices = timestamp_argmax(&logits, &[20, 7, 31]).expect("argmax");
 
         assert_eq!(indices, vec![1, 2, 3]);
     }
 
     #[test]
-    fn batched_timestamp_argmax_rejects_out_of_range_position() {
+    fn timestamp_argmax_rejects_a_row_count_mismatch() {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(vec![0.1f32; 8], (1, 2, 4), &device).expect("logits");
-        let err = batched_timestamp_argmax(&logits, &[2])
-            .expect_err("timestamp position should be out of range");
+        let err = timestamp_argmax(&logits, &[2])
+            .expect_err("one position cannot describe two scored rows");
 
-        assert!(format!("{err}").contains("out of range"));
+        assert!(format!("{err}").contains("[1, 1, classes]"), "{err}");
     }
 
     #[test]
-    fn batched_timestamp_argmax_rejects_non_finite_logits() {
+    fn timestamp_argmax_rejects_non_finite_logits() {
         let device = candle_core::Device::Cpu;
         for poison in [f32::NAN, f32::INFINITY] {
             let mut values = vec![0.1f32; 12];
@@ -6751,14 +6749,10 @@ mod tests {
             values[5] = poison;
             let logits = Tensor::from_vec(values, (1, 3, 4), &device).expect("logits");
 
-            let err = batched_timestamp_argmax(&logits, &[0, 1, 2])
+            let err = timestamp_argmax(&logits, &[4, 5, 6])
                 .expect_err("a non-finite timestamp row must not become class 0");
             assert!(format!("{err}").contains("non-finite"), "{err}");
-            // Rows that are not timestamp positions are not inspected.
-            assert_eq!(
-                batched_timestamp_argmax(&logits, &[0, 2]).expect("finite rows"),
-                vec![2, 0]
-            );
+            assert!(format!("{err}").contains("prompt position 5"), "{err}");
         }
     }
 
