@@ -2144,10 +2144,12 @@ impl Qwen38ChatModel {
         drop(text_states);
         drop(caches);
 
+        // The device argmax has no logprobs, so a logprob row keeps the
+        // batch on the per-row sampler.
         let batch_greedy = self.device_sampling_enabled()
-            && states
-                .iter()
-                .all(|state| state.config.temperature <= 1e-5 && !state.track_history);
+            && states.iter().all(|state| {
+                state.config.temperature <= 1e-5 && !state.track_history && !state.config.logprobs
+            });
         let mut sampled = if batch_greedy {
             device_sampling::greedy(&target.logits.squeeze(1)?, self.tokenizer.vocab_size)?
         } else {
