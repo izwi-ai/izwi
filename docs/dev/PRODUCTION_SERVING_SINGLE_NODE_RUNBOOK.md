@@ -406,12 +406,22 @@ bounded `env:VARIABLE` secret. That secret must differ from the public inference
 key. With it configured, authenticate separately and scrape either
 `GET /internal/metrics` or `GET /internal/metrics/prometheus`.
 
-The response is capped at 4 KiB and contains only a fixed set of unlabeled
-counters/gauges for active admitted requests and streams, auth/quota/body
-rejections, routing or dispatch failures, dispatch calls and accumulated
-latency, and HTTP status classes. It intentionally contains no request IDs,
-tenant IDs, model names, prompts, or worker-controlled labels. A dropped SSE
-body counts as a stream failure unless a terminal completion was observed.
+The response is capped at 256 KiB. Every label comes from a closed vocabulary:
+the parsed model name (a known `ModelVariant`, never request text), the
+gateway's own route paths, HTTP status codes and a fixed outcome set. A labelled
+family keeps at most 16 series; further label sets share an `other` series.
+There are no request IDs, tenant IDs, prompts or worker-controlled labels.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `izwi_gateway_chat_request_duration_seconds` | histogram | `model`, `stream`, `outcome` (`ok`/`error`) | Gateway ingress to the last byte of the answer. `_count` is requests. A stream dropped before its terminal event is an `error`. |
+| `izwi_gateway_chat_ttft_seconds` | histogram | `model` | Streaming: ingress to the first answer text sent. |
+| `izwi_gateway_chat_inter_token_latency_seconds` | histogram | `model` | Gap between successive text deltas of one stream (a worker may coalesce several tokens into one delta). |
+| `izwi_gateway_chat_prompt_tokens_total`, `izwi_gateway_chat_completion_tokens_total` | counter | `model` | Usage of completed requests. |
+| `izwi_gateway_worker_dispatch_seconds` | histogram | `outcome` (`accepted` or the HTTP status answered) | Worker call latency; streams stop at acceptance. |
+| `izwi_gateway_http_request_duration_seconds` | histogram | `route`, `status` | Time to response headers. Unknown paths share `route="other"`. |
+| `izwi_gateway_active_requests`, `izwi_gateway_active_streams`, `izwi_gateway_active_tenant_work` | gauge | none | Admitted work in flight. |
+| `izwi_gateway_*_rejections_total`, `izwi_gateway_routing_dispatch_failures_total`, `izwi_gateway_dispatch_calls_total`, `izwi_gateway_dispatch_latency_microseconds_total`, `izwi_gateway_http_responses_{2xx,3xx,4xx,5xx,other}_total` | counter | none | Unchanged unlabelled counters. |
 
 The same private service credential used for descriptor, status, invocation,
 query, and cancellation authorizes a worker scrape at
@@ -427,6 +437,40 @@ supervisor lifecycle totals plus configured worker identity, state, process,
 incarnation, assignment, deployment, and generation. Repeated signals are
 coalesced through a one-entry channel. This local signal surface is for service
 manager diagnostics; it does not create an unauthenticated network listener.
+
+Set `IZWI_SUPERVISOR_METRICS_TEXTFILE=/path/supervisor.prom` to have the
+supervisor keep a Prometheus textfile for a node exporter's textfile collector.
+It is replaced atomically whenever it changes and holds the gauges
+`izwi_supervisor_workers`, `_workers_running`, `_workers_quarantined` and
+`_workers_restart_pending`, and the counters
+`izwi_supervisor_{launch_attempts,readiness_failures,restarts_scheduled,quarantines,unexpected_exits,stop_failures,autoscale_ups,autoscale_downs,rollouts_committed,rollouts_aborted,rollouts_degraded}_total`.
+A rollout runs before the supervision loop, so rollout counters appear once it
+has finished.
+
+### 5. Logs and traces
+
+- The gateway and the local server log text by default; `--log-format json`
+  (or `IZWI_LOG_FORMAT=json`) writes one JSON object per line with the event
+  fields at the top level, plus `span` and `spans` carrying `correlation_id`,
+  `trace_id`, `span_id` and `parent_span_id`. The worker and the supervisor
+  read the same `IZWI_LOG_FORMAT` variable.
+- Trace context: a valid W3C `traceparent` from the caller is continued; any
+  other request starts a trace. The gateway sends its own span as the parent on
+  every worker invocation (`traceparent` header) and realtime dial (WebSocket
+  upgrade header), and the worker continues it, so one `trace_id` finds the
+  request in the gateway's and the worker's logs.
+- The supervisor relays each worker's stdout and stderr line by line: JSON
+  lines gain a leading `"worker_id"` field, other lines a `<worker_id> | `
+  prefix.
+- Span export is off by default. Set `IZWI_OTLP_TRACES_ENDPOINT` (for an
+  OpenTelemetry Collector, `http://collector:4318/v1/traces`) on the gateway,
+  server or worker to export request spans (`http_request`, `worker_request`)
+  as OTLP/HTTP JSON. Spans queue in a bounded buffer and are dropped, never
+  waited on, when the collector falls behind.
+- Request audit and observability hooks run after the response body ends, on
+  their own task. A streamed answer is audited with how it ended: a 200 SSE
+  stream that reported an error in-band is a `Failure`, and the audit metadata
+  `body` is `completed`, `failed` or `interrupted` (client disconnect).
 
 ## Admission, retry, timeout, and cancellation semantics
 

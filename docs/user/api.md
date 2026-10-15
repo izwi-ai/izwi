@@ -912,6 +912,39 @@ Batch runtime metrics include `queued_stages`, `jobs_by_status`,
 `izwi_batch_runtime_queued_stages`, `izwi_batch_runtime_jobs`,
 `izwi_batch_runtime_stages`, and `izwi_batch_runtime_worker_running`.
 
+Latencies are Prometheus histograms (cumulative `_bucket{le=...}`, `_sum`,
+`_count`) in seconds, so they aggregate across replicas and `histogram_quantile`
+works on them. The JSON snapshot keeps its windowed averages and percentiles
+for the UI. Labels are bounded: model names come from the model catalog,
+families keep at most 64 series (the rest share `other`), and no request or
+tenant IDs are used.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `izwi_request_duration_seconds` | `model`, `backend`, `task`, `outcome` | Server admission to the terminal output. |
+| `izwi_request_ttft_seconds` | `model`, `backend`, `task` | Server admission to the first user-visible output. |
+| `izwi_request_queue_wait_seconds` | `model`, `backend`, `task` | Server admission until the engine first schedules the request, including the runtime coordinator, input preparation and model residency. |
+| `izwi_request_prefill_seconds` | `model`, `backend`, `task` | Engine prefill time of one request. |
+| `izwi_request_prompt_tokens_total`, `izwi_request_generation_tokens_total` | `model`, `task` | Counters for completed requests (generation counts audio frames for speech models). |
+| `izwi_engine_inter_token_latency_seconds` | `model`, `task` | Gap between successive committed tokens of one request; a commit of k tokens after a gap g counts k gaps of g/k. |
+| `izwi_engine_step_host_seconds` | `phase` (`prepare`, `commit`, `deliver`) | Host time of engine step phases under the step gate. |
+| `izwi_engine_batch_rows`, `izwi_engine_batch_tokens` | none | Rows and work units (tokens, or frames for speech) per dispatched physical batch. |
+| `izwi_runtime_stage_duration_seconds` | `stage`, `workload_class` | Duration of runtime pipeline stages. |
+| `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
+| `izwi_voice_endpointing_latency_seconds`, `izwi_voice_asr_first_partial_seconds`, `izwi_voice_asr_final_seconds`, `izwi_voice_llm_first_token_seconds`, `izwi_voice_tts_first_audio_seconds`, `izwi_voice_barge_in_latency_seconds`, `izwi_voice_session_duration_seconds` | none | Realtime voice stage latencies; `izwi_voice_metric_contract_info` lists each with its description. |
+| `izwi_voice_audio_egress_underruns_total`, `izwi_voice_audio_ingress_dropped_frames_total` | none | Assistant audio sent after playback had drained; input frames missing from the client's sequence. |
+
+The windowed `quantile="avg"|"p50"|"p95"` gauges (`izwi_latency_*`,
+`izwi_runtime_stage_duration_ms`, `izwi_runtime_workload_*`) were removed in
+favour of these histograms. The latency breakdown a request returns also
+reports `pre_engine_ms`, the time between runtime admission and engine
+insertion.
+
+Requests may carry a W3C `traceparent`; the server continues that trace and
+logs `trace_id`, `span_id` and `parent_span_id` on the request. See the
+production serving runbook for JSON logs and the optional OTLP span export
+(`IZWI_OTLP_TRACES_ENDPOINT`).
+
 ### Admin Model Management
 
 Preview local admin routes. Use these routes as the OSS model lifecycle and discovery surface for voice apps: each model record includes local status, broad modalities, speech-generation capabilities when present, and route-level capability booleans.
