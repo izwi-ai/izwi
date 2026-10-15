@@ -268,6 +268,12 @@ pub struct StoredResponseInputItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredResponseRecord {
     pub id: String,
+    /// Owning tenant ([`RequestContext::tenant_scope`]); lookups from any
+    /// other tenant see the record as missing.
+    ///
+    /// [`RequestContext::tenant_scope`]: crate::api::request_context::RequestContext::tenant_scope
+    #[serde(default)]
+    pub tenant_scope: String,
     pub created_at: u64,
     pub status: String,
     pub model: String,
@@ -803,6 +809,7 @@ mod tests {
             "resp-old".to_string(),
             StoredResponseRecord {
                 id: "resp-old".to_string(),
+                tenant_scope: String::new(),
                 created_at: 10,
                 status: "completed".to_string(),
                 model: "test".to_string(),
@@ -822,6 +829,7 @@ mod tests {
             "resp-new".to_string(),
             StoredResponseRecord {
                 id: "resp-new".to_string(),
+                tenant_scope: String::new(),
                 created_at: 20,
                 status: "completed".to_string(),
                 model: "test".to_string(),
@@ -1083,6 +1091,7 @@ mod tests {
     fn response_record(id: &str, created_at: u64) -> StoredResponseRecord {
         StoredResponseRecord {
             id: id.to_string(),
+            tenant_scope: String::new(),
             created_at,
             status: "completed".to_string(),
             model: "test".to_string(),

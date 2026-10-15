@@ -96,7 +96,14 @@ pub async fn create_response(
     };
 
     if req.stream.unwrap_or(false) {
-        return create_streaming_response(state, req, execution_request, input_items).await;
+        return create_streaming_response(
+            state,
+            req,
+            execution_request,
+            input_items,
+            ctx.tenant_scope(),
+        )
+        .await;
     }
 
     let output = generate_chat(&state, execution_request).await?;
@@ -129,6 +136,7 @@ pub async fn create_response(
         &state,
         StoredResponseRecord {
             id: response_id,
+            tenant_scope: ctx.tenant_scope(),
             created_at,
             status: "completed".to_string(),
             model: model_variant.dir_name().to_string(),
@@ -153,27 +161,44 @@ pub async fn create_response(
         .unwrap())
 }
 
+/// Whether the caller's tenant owns a stored response. Another tenant's
+/// record is reported as missing, so ids do not leak across tenants.
+fn owned_by(record: &StoredResponseRecord, ctx: &RequestContext) -> bool {
+    record.tenant_scope == ctx.tenant_scope()
+}
+
+fn response_not_found() -> ApiError {
+    ApiError::not_found("Response not found")
+}
+
 pub async fn get_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseObject>, ApiError> {
     let store = state.response_store.read().await;
     let record = store
         .get(&response_id)
+        .filter(|record| owned_by(record, &ctx))
         .cloned()
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .ok_or_else(response_not_found)?;
 
     Ok(Json(record_to_response(record)))
 }
 
 pub async fn delete_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseDeletedObject>, ApiError> {
     let mut store = state.response_store.write().await;
-    if store.remove(&response_id).is_none() {
-        return Err(ApiError::not_found("Response not found"));
+    if !store
+        .get(&response_id)
+        .is_some_and(|record| owned_by(record, &ctx))
+    {
+        return Err(response_not_found());
     }
+    store.remove(&response_id);
 
     Ok(Json(ResponseDeletedObject {
         id: response_id,
@@ -184,12 +209,14 @@ pub async fn delete_response(
 
 pub async fn cancel_response(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseObject>, ApiError> {
     let mut store = state.response_store.write().await;
     let record = store
         .get_mut(&response_id)
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .filter(|record| owned_by(record, &ctx))
+        .ok_or_else(response_not_found)?;
 
     if record.status != "completed" {
         record.status = "cancelled".to_string();
@@ -201,13 +228,15 @@ pub async fn cancel_response(
 
 pub async fn list_response_input_items(
     State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
     Path(response_id): Path<String>,
 ) -> Result<Json<ResponseInputItemsList>, ApiError> {
     let store = state.response_store.read().await;
     let record = store
         .get(&response_id)
+        .filter(|record| owned_by(record, &ctx))
         .cloned()
-        .ok_or_else(|| ApiError::not_found("Response not found"))?;
+        .ok_or_else(response_not_found)?;
 
     let data = record
         .input_items
@@ -235,6 +264,7 @@ async fn create_streaming_response(
     req: ResponsesCreateRequest,
     execution_request: ChatExecutionRequest,
     input_items: Vec<StoredResponseInputItem>,
+    tenant_scope: String,
 ) -> Result<Response<Body>, ApiError> {
     let response_id = new_uuid();
     let created_at = now_unix_secs();
@@ -364,6 +394,7 @@ async fn create_streaming_response(
                         &store_state,
                         StoredResponseRecord {
                             id: response_id_for_task.clone(),
+                            tenant_scope: tenant_scope.clone(),
                             created_at,
                             status: "completed".to_string(),
                             model: model_name.clone(),
@@ -442,6 +473,7 @@ async fn create_streaming_response(
                         &store_state,
                         StoredResponseRecord {
                             id: response_id_for_task.clone(),
+                            tenant_scope: tenant_scope.clone(),
                             created_at,
                             status: "failed".to_string(),
                             model: model_name.clone(),
@@ -467,6 +499,7 @@ async fn create_streaming_response(
                         &store_state,
                         StoredResponseRecord {
                             id: response_id_for_task.clone(),
+                            tenant_scope: tenant_scope.clone(),
                             created_at,
                             status: "failed".to_string(),
                             model: model_name.clone(),
@@ -504,6 +537,7 @@ async fn create_streaming_response(
                 &store_state,
                 StoredResponseRecord {
                     id: response_id_for_task.clone(),
+                    tenant_scope: tenant_scope.clone(),
                     created_at,
                     status: "failed".to_string(),
                     model: model_name.clone(),
@@ -918,6 +952,7 @@ mod tests {
     fn stored_record_usage_reports_openai_shaped_cached_tokens() {
         let record = StoredResponseRecord {
             id: "resp_cached".to_string(),
+            tenant_scope: String::new(),
             created_at: 0,
             status: "completed".to_string(),
             model: "test".to_string(),
@@ -1163,9 +1198,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stored_responses_are_visible_only_to_the_owning_tenant() {
+        let _guard = env_lock();
+        let (state, _temp_dir) = test_app_state("responses_tenant_scope");
+        let context = |tenant: &str| {
+            let mut principal = izwi_hooks::Principal::local_anonymous();
+            principal.id = format!("user-{tenant}");
+            principal.tenant_id = Some(tenant.to_string());
+            Extension(RequestContext::new("test".to_string(), principal))
+        };
+        let (owner, other) = (context("tenant-a"), context("tenant-b"));
+        let mut record = response_record("resp-a");
+        record.status = "in_progress".to_string();
+        record.tenant_scope = owner.0.tenant_scope();
+        state.store_response_record(record).await;
+        let id = || Path("resp-a".to_string());
+        let status = |err: ApiError| err.status;
+
+        let get = get_response(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(get.err().map(status), Some(StatusCode::NOT_FOUND));
+        let items = list_response_input_items(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(items.err().map(status), Some(StatusCode::NOT_FOUND));
+        let cancel = cancel_response(State(state.clone()), other.clone(), id()).await;
+        assert_eq!(cancel.err().map(status), Some(StatusCode::NOT_FOUND));
+        let delete = delete_response(State(state.clone()), other, id()).await;
+        assert_eq!(delete.err().map(status), Some(StatusCode::NOT_FOUND));
+        assert_eq!(
+            state.response_store.read().await["resp-a"].status,
+            "in_progress",
+            "another tenant must not cancel or delete the record"
+        );
+
+        assert!(get_response(State(state.clone()), owner.clone(), id())
+            .await
+            .is_ok());
+        assert!(delete_response(State(state.clone()), owner.clone(), id())
+            .await
+            .is_ok());
+        assert!(state.response_store.read().await.is_empty());
+    }
+
     fn response_record(id: &str) -> StoredResponseRecord {
         StoredResponseRecord {
             id: id.to_string(),
+            tenant_scope: String::new(),
             created_at: now_unix_secs(),
             status: "completed".to_string(),
             model: "test".to_string(),
