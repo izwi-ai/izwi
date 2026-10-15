@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -46,7 +46,8 @@ use crate::runtime::pipeline::{
 use crate::runtime::telemetry::histogram::{buckets, CounterFamily, HistogramFamily};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
-    VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
+    VoiceLatency, VoiceMetricDescriptor, VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
+    VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
     VOICE_SESSION_INTERRUPTED_TOTAL, VOICE_SESSION_STARTED_TOTAL, VOICE_STREAM_BACKPRESSURE_TOTAL,
 };
 use crate::runtime::CoordinatorSnapshot;
@@ -194,6 +195,52 @@ impl RequestHistograms {
     }
 }
 
+/// One histogram per voice latency, named by the voice metric catalog.
+#[derive(Debug)]
+struct VoiceLatencyHistograms([HistogramFamily; VoiceLatency::ALL.len()]);
+
+impl VoiceLatencyHistograms {
+    fn new() -> Self {
+        Self(VoiceLatency::ALL.map(|latency| {
+            HistogramFamily::new(
+                // The catalog's Prometheus names are static strings below.
+                voice_latency_prometheus_name(latency),
+                voice_latency_help(latency),
+                &[],
+                buckets::VOICE_SECONDS,
+            )
+        }))
+    }
+
+    fn family(&self, latency: VoiceLatency) -> &HistogramFamily {
+        let index = VoiceLatency::ALL
+            .iter()
+            .position(|candidate| *candidate == latency)
+            .expect("every latency is in ALL");
+        &self.0[index]
+    }
+}
+
+const fn voice_latency_prometheus_name(latency: VoiceLatency) -> &'static str {
+    match latency {
+        VoiceLatency::SessionDuration => "izwi_voice_session_duration_seconds",
+        VoiceLatency::Endpointing => "izwi_voice_endpointing_latency_seconds",
+        VoiceLatency::AsrFirstPartial => "izwi_voice_asr_first_partial_seconds",
+        VoiceLatency::AsrFinal => "izwi_voice_asr_final_seconds",
+        VoiceLatency::LlmFirstToken => "izwi_voice_llm_first_token_seconds",
+        VoiceLatency::TtsFirstAudio => "izwi_voice_tts_first_audio_seconds",
+        VoiceLatency::TurnFirstAudio => "izwi_voice_turn_first_audio_seconds",
+        VoiceLatency::BargeIn => "izwi_voice_barge_in_latency_seconds",
+    }
+}
+
+fn voice_latency_help(latency: VoiceLatency) -> &'static str {
+    voice_metric_catalog()
+        .iter()
+        .find(|metric| metric.name == latency.metric_name())
+        .map_or("Voice latency.", |metric| metric.description)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceRuntimeTelemetrySnapshot {
     pub sessions_started: u64,
@@ -201,6 +248,8 @@ pub struct VoiceRuntimeTelemetrySnapshot {
     pub interruptions: u64,
     pub barge_ins: u64,
     pub stream_backpressure_total: u64,
+    pub egress_underruns_total: u64,
+    pub ingress_dropped_frames_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +559,9 @@ pub(crate) struct RuntimeTelemetryCollector {
     voice_interruptions: AtomicU64,
     voice_barge_ins: AtomicU64,
     voice_stream_backpressure: AtomicU64,
+    voice_egress_underruns: AtomicU64,
+    voice_ingress_dropped_frames: AtomicU64,
+    voice_latencies: VoiceLatencyHistograms,
     transcription_stream_backpressure: AtomicU64,
     broker_shadow_requests: AtomicU64,
     broker_execution_requests: AtomicU64,
@@ -551,6 +603,9 @@ impl RuntimeTelemetryCollector {
             voice_interruptions: AtomicU64::new(0),
             voice_barge_ins: AtomicU64::new(0),
             voice_stream_backpressure: AtomicU64::new(0),
+            voice_egress_underruns: AtomicU64::new(0),
+            voice_ingress_dropped_frames: AtomicU64::new(0),
+            voice_latencies: VoiceLatencyHistograms::new(),
             transcription_stream_backpressure: AtomicU64::new(0),
             broker_shadow_requests: AtomicU64::new(0),
             broker_execution_requests: AtomicU64::new(0),
@@ -696,6 +751,21 @@ impl RuntimeTelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_voice_latency(&self, latency: VoiceLatency, elapsed: Duration) {
+        self.voice_latencies
+            .family(latency)
+            .observe_duration(&[], elapsed);
+    }
+
+    pub(crate) fn record_voice_egress_underrun(&self) {
+        self.voice_egress_underruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_voice_ingress_dropped_frames(&self, frames: u64) {
+        self.voice_ingress_dropped_frames
+            .fetch_add(frames, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_transcription_stream_backpressure(&self) {
         self.transcription_stream_backpressure
             .fetch_add(1, Ordering::Relaxed);
@@ -823,6 +893,10 @@ impl RuntimeTelemetryCollector {
                 interruptions: self.voice_interruptions.load(Ordering::Relaxed),
                 barge_ins: self.voice_barge_ins.load(Ordering::Relaxed),
                 stream_backpressure_total: self.voice_stream_backpressure.load(Ordering::Relaxed),
+                egress_underruns_total: self.voice_egress_underruns.load(Ordering::Relaxed),
+                ingress_dropped_frames_total: self
+                    .voice_ingress_dropped_frames
+                    .load(Ordering::Relaxed),
             },
             realtime: RealtimeRuntimeTelemetrySnapshot {
                 transcription_stream_backpressure_total: self
@@ -911,6 +985,21 @@ impl RuntimeTelemetryCollector {
             "Runtime stream backpressure events.",
             snapshot.voice.stream_backpressure_total,
         );
+        push_voice_counter(
+            &mut payload,
+            VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL,
+            "Assistant audio chunks sent after the audio already sent had finished playing.",
+            snapshot.voice.egress_underruns_total,
+        );
+        push_voice_counter(
+            &mut payload,
+            VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
+            "Input audio frames missing from the client's frame sequence.",
+            snapshot.voice.ingress_dropped_frames_total,
+        );
+        for family in &self.voice_latencies.0 {
+            family.render(&mut payload);
+        }
         payload.push_str(&format!(
             "# HELP izwi_realtime_transcription_stream_backpressure_total Realtime transcription websocket backpressure events.\n\
 # TYPE izwi_realtime_transcription_stream_backpressure_total counter\n\
@@ -1454,6 +1543,40 @@ mod tests {
         assert!(payload.contains("izwi_voice_session_interruptions_total 1"));
         assert!(payload.contains("izwi_voice_barge_in_events_total 1"));
         assert!(payload.contains("izwi_voice_metric_contract_info"));
+    }
+
+    #[tokio::test]
+    async fn voice_latencies_export_as_catalog_named_histograms() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_voice_latency(VoiceLatency::TurnFirstAudio, Duration::from_millis(420));
+        telemetry.record_voice_latency(VoiceLatency::TurnFirstAudio, Duration::from_millis(900));
+        telemetry.record_voice_latency(VoiceLatency::BargeIn, Duration::from_millis(250));
+        telemetry.record_voice_egress_underrun();
+        telemetry.record_voice_ingress_dropped_frames(3);
+
+        let payload = telemetry.prometheus().await;
+        let counts = check_histograms(&payload).expect("valid histograms");
+        assert_eq!(counts["izwi_voice_turn_first_audio_seconds"], 2);
+        assert_eq!(counts["izwi_voice_barge_in_latency_seconds"], 1);
+        assert_eq!(counts["izwi_voice_asr_final_seconds"], 0);
+        assert!(payload.contains("izwi_voice_turn_first_audio_seconds_bucket{le=\"0.5\"} 1"));
+        assert!(payload.contains("izwi_voice_audio_egress_underruns_total 1"));
+        assert!(payload.contains("izwi_voice_audio_ingress_dropped_frames_total 3"));
+        // Every catalog entry is exported under its catalog name and type.
+        for metric in voice_metric_catalog() {
+            let name = prometheus_voice_metric_name(metric.name);
+            let kind = crate::runtime::voice_metrics::prometheus_voice_metric_type(metric.name);
+            assert!(
+                payload.contains(&format!("# TYPE {name} {kind}\n")),
+                "{name} is declared but not exported as a {kind}"
+            );
+        }
+        for latency in VoiceLatency::ALL {
+            assert_eq!(
+                voice_latency_prometheus_name(latency),
+                prometheus_voice_metric_name(latency.metric_name())
+            );
+        }
     }
 
     #[tokio::test]

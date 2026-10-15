@@ -8316,6 +8316,22 @@ izwi_inference_coordinator_poisoned {}\n",
         self.record_voice_stage_observation("voice.barge_in");
     }
 
+    pub fn record_voice_latency(
+        &self,
+        latency: crate::runtime::VoiceLatency,
+        elapsed: std::time::Duration,
+    ) {
+        self.telemetry.record_voice_latency(latency, elapsed);
+    }
+
+    pub fn record_voice_egress_underrun(&self) {
+        self.telemetry.record_voice_egress_underrun();
+    }
+
+    pub fn record_voice_ingress_dropped_frames(&self, frames: u64) {
+        self.telemetry.record_voice_ingress_dropped_frames(frames);
+    }
+
     pub fn record_voice_stream_backpressure(&self) {
         self.telemetry.record_voice_stream_backpressure();
         self.record_voice_stage_observation("voice.stream_backpressure");
