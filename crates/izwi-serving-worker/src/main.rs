@@ -267,10 +267,8 @@ async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
         "worker ready"
     );
     if let Some(tls) = &process.tls {
-        let tls_listener = TlsListener {
-            inner: listener,
-            acceptor: tls.acceptor.clone(),
-        };
+        let tls_listener = TlsListener::new(listener, tls.acceptor.clone(), TLS_HANDSHAKE_TIMEOUT)
+            .context("start private TLS worker listener")?;
         axum::serve(tls_listener, worker.router())
             .with_graceful_shutdown(shutdown)
             .await
@@ -794,9 +792,68 @@ fn load_pem_file(reference: &str, label: &str) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// How long a connecting client may take to complete its TLS handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TLS listener for `axum::serve`, which accepts connections serially.
+/// Handshakes run in their own tasks, each bounded by a timeout, and only
+/// completed ones reach the serve loop, so a client that connects and never
+/// finishes its handshake cannot block other connections (status polls
+/// included).
 struct TlsListener {
-    inner: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    local_addr: SocketAddr,
+    handshaken: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        SocketAddr,
+    )>,
+    acceptor_task: tokio::task::JoinHandle<()>,
+}
+
+impl TlsListener {
+    fn new(
+        inner: tokio::net::TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+        handshake_timeout: Duration,
+    ) -> std::io::Result<Self> {
+        let local_addr = inner.local_addr()?;
+        let (handshaken_tx, handshaken) = tokio::sync::mpsc::channel(64);
+        let acceptor_task = tokio::spawn(async move {
+            loop {
+                let (stream, addr) = match inner.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::warn!(%error, "worker TCP accept failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let handshaken_tx = handshaken_tx.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            let _ = handshaken_tx.send((tls_stream, addr)).await;
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "worker TLS handshake failed");
+                        }
+                        Err(_) => tracing::warn!(%addr, "worker TLS handshake timed out"),
+                    }
+                });
+            }
+        });
+        Ok(Self {
+            local_addr,
+            handshaken,
+            acceptor_task,
+        })
+    }
+}
+
+impl Drop for TlsListener {
+    fn drop(&mut self) {
+        self.acceptor_task.abort();
+    }
 }
 
 impl axum::serve::Listener for TlsListener {
@@ -804,24 +861,15 @@ impl axum::serve::Listener for TlsListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.inner.accept().await {
-                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
-                    Ok(tls_stream) => return (tls_stream, addr),
-                    Err(error) => {
-                        tracing::warn!(%error, "worker TLS handshake failed");
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "worker TCP accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
+        match self.handshaken.recv().await {
+            Some(connection) => connection,
+            // The acceptor task owns a sender until it is aborted on drop.
+            None => std::future::pending().await,
         }
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
+        Ok(self.local_addr)
     }
 }
 
@@ -1461,6 +1509,103 @@ max_input_bytes = 4096
         process.declared.max_output_tokens = Some(1024);
         let deployment = loaded_deployment(&process, Some(32_768)).unwrap();
         assert_eq!(deployment.capability.max_output_tokens, Some(1024));
+    }
+
+    // A test CA and a 127.0.0.1/localhost server certificate it signed,
+    // both valid until 2126.
+    const TEST_TLS_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBojCCAUmgAwIBAgIUdBX0RhdufHDBNF8a5FM9v08YGpkwCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTaXp3aS13b3JrZXItdGVzdC1jYTAgFw0yNjEwMTUwMDQ2NDVa
+GA8yMTI2MDkyMTAwNDY0NVowHjEcMBoGA1UEAwwTaXp3aS13b3JrZXItdGVzdC1j
+YTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABH6nOtgS54Cm3yRQLlEuAyOjJ3EF
+FbehOd+roB/cz5zV22Vca4829Tjt78IKqMjYMgAM83vfGO0BjYH1P98Y4GujYzBh
+MB0GA1UdDgQWBBSHCmIoNmcszJw5SuI+kD2tGf63NDAfBgNVHSMEGDAWgBSHCmIo
+NmcszJw5SuI+kD2tGf63NDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIC
+BDAKBggqhkjOPQQDAgNHADBEAiBsSEjXq630d3WuZ1A2SfNeTgVAGjY/UiI1ihwt
+ncCWmAIgF/OmCK7S2tW5gSC0RruJ+HTbQceCUW2RJWDR3UCVzMg=
+-----END CERTIFICATE-----\n";
+    const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIByjCCAW+gAwIBAgIUHdiP51T8U6u0cmd1WdbO0gq5ZCowCgYIKoZIzj0EAwIw
+HjEcMBoGA1UEAwwTaXp3aS13b3JrZXItdGVzdC1jYTAgFw0yNjEwMTUwMDQ2NDVa
+GA8yMTI2MDkyMTAwNDY0NVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZI
+zj0CAQYIKoZIzj0DAQcDQgAEawKV8g783ImEAkgeHXTmlt5bAUsCTdhZb8PBRWvA
+U24lyrzBrR/Vz5uIg4TeK0q7ipxtc/yjMkpeeZdx1+5/CaOBkjCBjzAaBgNVHREE
+EzARhwR/AAABgglsb2NhbGhvc3QwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
+B4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFF/nl2HJSUkKIf++pjqo
+OxYwfaHTMB8GA1UdIwQYMBaAFIcKYig2ZyzMnDlK4j6QPa0Z/rc0MAoGCCqGSM49
+BAMCA0kAMEYCIQCDcIS9dgHuzrVJZ7h8voeSmzHbnAPDP5NkkMw3bEhReQIhALcZ
++gix6hpATwk3SOgWPxw/u6+6bzgIQevkjzg2Z/zd
+-----END CERTIFICATE-----\n";
+    const TEST_TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg5EWocTLY0FLh8QHA
+n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
+2Flvw8FFa8BTbiXKvMGtH9XPm4iDhN4rSruKnG1z/KMySl55l3HX7n8J
+-----END PRIVATE KEY-----\n";
+
+    #[tokio::test]
+    async fn stalled_tls_handshake_does_not_block_other_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls;
+
+        let files = tempfile::tempdir().unwrap();
+        let (cert, key) = (files.path().join("cert.pem"), files.path().join("key.pem"));
+        std::fs::write(&cert, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key, TEST_TLS_KEY_PEM).unwrap();
+        let tls = {
+            let _lock = ENV_LOCK.lock().unwrap();
+            std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
+            std::env::set_var(WORKER_TLS_CERT_REF_ENV, format!("file:{}", cert.display()));
+            std::env::set_var(WORKER_TLS_KEY_REF_ENV, format!("file:{}", key.display()));
+            let tls = WorkerTlsConfig::from_env();
+            std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+            std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+            tls.unwrap().unwrap()
+        };
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let handshake_timeout = Duration::from_secs(1);
+        let listener = TlsListener::new(tcp, tls.acceptor, handshake_timeout).unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // A client that connects and never sends its ClientHello.
+        let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        for der in rustls_pemfile::certs(&mut TEST_TLS_CA_PEM.as_bytes()).unwrap() {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(der))
+                .unwrap();
+        }
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let response = tokio::time::timeout(handshake_timeout / 2, async {
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let mut stream = connector.connect(server_name, stream).await.unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .expect("a stalled handshake must not delay other connections");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
+
+        // The stalled client is disconnected once its handshake times out.
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(handshake_timeout * 3, silent.read(&mut byte))
+            .await
+            .expect("the server closes a stalled handshake");
+        assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+        server.abort();
     }
 
     #[test]
