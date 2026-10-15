@@ -68,6 +68,9 @@ const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
 const DEFAULT_STREAM_SILENCE_MS: u32 = DEFAULT_SILENCE_MS;
 const DEFAULT_STREAM_MAX_UTTERANCE_MS: u32 = DEFAULT_MAX_UTTERANCE_MS;
 const DEFAULT_STREAM_PRE_ROLL_MS: u32 = DEFAULT_PRE_ROLL_MS;
+/// Voiced speech that confirms a barge-in. A speech start alone does not
+/// interrupt the assistant: a cough, a door or speaker echo also starts one.
+const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
@@ -598,6 +601,8 @@ enum ClientEvent {
         #[serde(default)]
         pre_roll_ms: Option<u32>,
         #[serde(default)]
+        barge_in_min_speech_ms: Option<u32>,
+        #[serde(default)]
         input_sample_rate: Option<u32>,
     },
     InputStreamStop,
@@ -760,6 +765,7 @@ struct StreamingInputConfig {
     silence_duration_ms: u32,
     max_utterance_ms: u32,
     pre_roll_ms: u32,
+    barge_in_min_speech_ms: u32,
     input_sample_rate_hint: Option<u32>,
 }
 
@@ -784,6 +790,7 @@ struct StreamingActiveUtterance {
     total_ms: f32,
     silence_ms: f32,
     started_at: Instant,
+    barge_in_confirmed: bool,
 }
 
 struct StreamingInputState {
@@ -962,6 +969,8 @@ struct SpeechStartEvent {
 struct StreamingFrameResult {
     sequence_gap: Option<(u32, u32)>,
     speech_start: Option<SpeechStartEvent>,
+    /// The active utterance has just confirmed a barge-in.
+    barge_in: bool,
     speech_rejected: Option<SpeechStartEvent>,
     finalized_utterance: Option<(PendingAudioCommit, Vec<u8>, UtteranceEndReason)>,
 }
@@ -1008,6 +1017,7 @@ impl StreamingInputState {
             return Ok(StreamingFrameResult {
                 sequence_gap,
                 speech_start: None,
+                barge_in: false,
                 speech_rejected: None,
                 finalized_utterance: None,
             });
@@ -1031,6 +1041,7 @@ impl StreamingInputState {
             return Ok(StreamingFrameResult {
                 sequence_gap,
                 speech_start: None,
+                barge_in: false,
                 speech_rejected: None,
                 finalized_utterance: None,
             });
@@ -1065,6 +1076,7 @@ impl StreamingInputState {
         let mut result = StreamingFrameResult {
             sequence_gap,
             speech_start: None,
+            barge_in: false,
             speech_rejected: None,
             finalized_utterance: None,
         };
@@ -1082,6 +1094,7 @@ impl StreamingInputState {
                 total_ms: 0.0,
                 silence_ms: 0.0,
                 started_at: Instant::now(),
+                barge_in_confirmed: false,
             };
             if !self.pre_roll.is_empty() {
                 capture.samples_i16.extend(self.pre_roll.iter().copied());
@@ -1115,6 +1128,16 @@ impl StreamingInputState {
                 active.silence_ms = 0.0;
             } else {
                 active.silence_ms += frame_ms;
+            }
+            // An utterance that ends or is rejected in this frame never
+            // barges in; finalizing one preempts the turn on its own.
+            if !active.barge_in_confirmed
+                && end_reason.is_none()
+                && !noise_rejected
+                && active.voiced_ms >= self.config.barge_in_min_speech_ms as f32
+            {
+                active.barge_in_confirmed = true;
+                result.barge_in = true;
             }
         }
 
@@ -1610,6 +1633,7 @@ async fn handle_text_message(
             silence_duration_ms,
             max_utterance_ms,
             pre_roll_ms,
+            barge_in_min_speech_ms,
             input_sample_rate,
         } => {
             if !conn.started {
@@ -1733,6 +1757,9 @@ async fn handle_text_message(
                 pre_roll_ms: pre_roll_ms
                     .unwrap_or(DEFAULT_STREAM_PRE_ROLL_MS)
                     .clamp(0, 2_000),
+                barge_in_min_speech_ms: barge_in_min_speech_ms
+                    .unwrap_or(DEFAULT_BARGE_IN_MIN_SPEECH_MS)
+                    .min(5_000),
                 input_sample_rate_hint: input_sample_rate
                     .filter(|sr| *sr >= 8_000 && *sr <= 192_000),
             }));
@@ -1749,6 +1776,7 @@ async fn handle_text_message(
                         "score_frame_ms": VAD_FRAME_MS,
                         "min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.min_speech_ms),
                         "silence_duration_ms": conn.streaming_input.as_ref().map(|s| s.config.silence_duration_ms),
+                        "barge_in_min_speech_ms": conn.streaming_input.as_ref().map(|s| s.config.barge_in_min_speech_ms),
                     }
                 }),
             );
@@ -1848,12 +1876,10 @@ async fn handle_binary_message(
                 );
             }
 
+            // Clients may duck playback on `user_speech_start` and resume it
+            // on `user_speech_rejected`; the turn is cancelled only once the
+            // speech is sustained.
             if let Some(evt) = frame_result.speech_start {
-                if interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await {
-                    state.runtime.record_voice_interruption();
-                    state.runtime.record_voice_barge_in();
-                    conn.voice_session.interrupt("barge_in");
-                }
                 send_json(
                     out_tx,
                     json!({
@@ -1862,6 +1888,14 @@ async fn handle_binary_message(
                         "utterance_seq": evt.utterance_seq,
                     }),
                 );
+            }
+
+            if frame_result.barge_in
+                && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await
+            {
+                state.runtime.record_voice_interruption();
+                state.runtime.record_voice_barge_in();
+                conn.voice_session.interrupt("barge_in");
             }
 
             if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
@@ -3514,6 +3548,7 @@ mod tests {
             silence_duration_ms: 200,
             max_utterance_ms: 10_000,
             pre_roll_ms: 100,
+            barge_in_min_speech_ms: DEFAULT_BARGE_IN_MIN_SPEECH_MS,
             input_sample_rate_hint: Some(16_000),
         })
     }
@@ -3828,6 +3863,83 @@ mod tests {
             .handle_pcm16_frame(3, 16_000, &silence)
             .expect_err("duplicate frame must fail")
             .contains("Stale or duplicate"));
+    }
+
+    fn pcm16_frame(samples: &[i16]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    /// SPK-F3: a speech start alone does not barge in. Sustained speech
+    /// confirms exactly one barge-in once it reaches the configured voiced
+    /// duration.
+    #[test]
+    fn barge_in_waits_for_sustained_speech() {
+        let mut input = test_streaming_input();
+        // Every Earshot score clears the minimum threshold, so each frame is
+        // voiced and the utterance is pure sustained speech.
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+
+        let mut barge_ins = Vec::new();
+        let mut voiced_before = 0.0_f32;
+        for frame_seq in 1..=40_u32 {
+            let result = input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+            if frame_seq == 1 {
+                assert!(result.speech_start.is_some());
+            }
+            let voiced = input.active.as_ref().expect("active utterance").voiced_ms;
+            if result.barge_in {
+                barge_ins.push(frame_seq);
+                assert!(voiced >= DEFAULT_BARGE_IN_MIN_SPEECH_MS as f32);
+                assert!(voiced_before < DEFAULT_BARGE_IN_MIN_SPEECH_MS as f32);
+            }
+            voiced_before = voiced;
+        }
+        assert_eq!(barge_ins.len(), 1, "one barge-in per utterance");
+        assert!(barge_ins[0] > 1, "the first speech frame must not barge in");
+    }
+
+    /// SPK-F3: a short noise burst (a cough or a door) starts speech and is
+    /// rejected, but never barges in.
+    #[test]
+    fn short_noise_burst_never_barges_in() {
+        let mut input = StreamingInputState::new(StreamingInputConfig {
+            vad_threshold: 0.3,
+            min_speech_ms: DEFAULT_STREAM_MIN_SPEECH_MS,
+            ..test_streaming_input().config
+        });
+        let mut seed = 0x1234_5678_9abc_def0_u64;
+        let burst: Vec<i16> = (0..8_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 20_000.0) as i16
+            })
+            .collect();
+        let silence = vec![0_i16; 320];
+        let frames = std::iter::repeat_n(&silence[..], 15)
+            .chain(burst.chunks(320))
+            .chain(std::iter::repeat_n(&silence[..], 30));
+
+        let (mut starts, mut rejections) = (0, 0);
+        for (index, frame) in frames.enumerate() {
+            let result = input
+                .handle_pcm16_frame(index as u32 + 1, 16_000, &pcm16_frame(frame))
+                .expect("frame");
+            starts += usize::from(result.speech_start.is_some());
+            rejections += usize::from(result.speech_rejected.is_some());
+            assert!(!result.barge_in, "a short burst must not barge in");
+            assert!(result.finalized_utterance.is_none());
+        }
+        assert!(starts >= 1, "the burst must start speech");
+        assert_eq!(rejections, starts, "every start is rejected as noise");
     }
 
     #[test]

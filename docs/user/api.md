@@ -1110,6 +1110,7 @@ Client JSON messages:
 | `silence_duration_ms` | Silence before utterance end. |
 | `max_utterance_ms` | Hard utterance duration cap. |
 | `pre_roll_ms` | Audio retained before speech start. |
+| `barge_in_min_speech_ms` | Voiced speech, default `300`, that interrupts a speaking assistant. A shorter sound (a cough, a door, speaker echo) does not interrupt it. `0` interrupts on the first speech frame. |
 | `input_sample_rate` | Expected input sample rate. |
 
 Client binary frame:
@@ -1145,8 +1146,8 @@ Server events:
 | `session_ready` | Voice session initialized. |
 | `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration. |
 | `input_stream_stopped` | Input stream stopped. |
-| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. |
-| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. |
+| `user_speech_start`, `user_speech_end` | VAD utterance boundaries. A client may duck assistant playback on `user_speech_start`; the server cancels the turn only after `barge_in_min_speech_ms` of speech. |
+| `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. Ducked playback can resume. |
 | `turn_processing` | Turn started. |
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
 | `assistant_text_start`, `assistant_text_delta`, `assistant_text_final` | Assistant text events. |
