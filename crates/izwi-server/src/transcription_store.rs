@@ -654,6 +654,40 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
+    /// Fail the records a previous server process left pending or processing
+    /// with no durable runtime job to finish them (P1V-1): a streamed
+    /// transcription runs as a task of the process that accepted it, so after
+    /// a restart nothing would ever complete it. Records backed by an active
+    /// runtime job are left to the runtime's own lease recovery. Returns the
+    /// number of records failed.
+    pub async fn fail_interrupted_records(&self) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let result = db
+            .execute_raw(raw::statement(
+                db,
+                r#"
+                UPDATE transcription_records
+                SET
+                    processing_status = 'failed',
+                    processing_error = ?1,
+                    runtime_stage_id = NULL,
+                    runtime_attempt_token = NULL
+                WHERE processing_status IN ('pending', 'processing')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM runtime_jobs j
+                      WHERE j.job_kind = 'asr_transcription'
+                        AND j.route_record_id = transcription_records.id
+                        AND j.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  )
+                "#,
+                vec![crate::diarization_store::INTERRUPTED_BY_SHUTDOWN_ERROR.into()],
+            )?)
+            .await
+            .context("Failed to fail interrupted transcription records")?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn update_processing_status(
         &self,
         record_id: String,
@@ -2185,6 +2219,68 @@ mod tests {
             TranscriptionProcessingStatus::Failed
         );
         assert_eq!(summaries[0].transcription_preview, "Runtime unavailable");
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1: a streamed transcription left processing by a previous process
+    /// fails at startup; a record a queued runtime job will still run is left
+    /// to the runtime.
+    #[tokio::test]
+    async fn startup_fails_only_records_without_an_active_runtime_job() {
+        let (store, root) = build_test_store();
+        let pending = |status| {
+            let mut record = sample_record();
+            record.processing_status = status;
+            record.transcription = String::new();
+            record.segments.clear();
+            record.words.clear();
+            record
+        };
+        let streamed = store
+            .create_record(pending(TranscriptionProcessingStatus::Processing))
+            .await
+            .expect("streamed record");
+        let queued = store
+            .create_record(pending(TranscriptionProcessingStatus::Pending))
+            .await
+            .expect("queued record");
+        let (_runtime, _attempt) = claim_projection_attempt(
+            &store,
+            TranscriptionRecordMode::Transcription.as_db_value(),
+            &queued.id,
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .fail_interrupted_records()
+                .await
+                .expect("startup recovery"),
+            1
+        );
+        let streamed = store
+            .get_record(streamed.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(
+            streamed.processing_status,
+            TranscriptionProcessingStatus::Failed
+        );
+        assert_eq!(
+            streamed.processing_error.as_deref(),
+            Some(crate::diarization_store::INTERRUPTED_BY_SHUTDOWN_ERROR)
+        );
+        let queued = store
+            .get_record(queued.id)
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(
+            queued.processing_status,
+            TranscriptionProcessingStatus::Pending
+        );
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

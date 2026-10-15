@@ -497,6 +497,26 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "Failed to reconcile speech history records during startup: {err}"
         )),
     }
+    // Diarization jobs and streamed transcriptions run as tasks of the process
+    // that accepted them; fail the ones a previous process left running.
+    match state.diarization_store.fail_interrupted_records().await {
+        Ok(failed) if failed > 0 => {
+            info!(failed, "Failed diarization jobs interrupted by a shutdown");
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted diarization jobs during startup: {err}"
+        )),
+    }
+    match state.transcription_store.fail_interrupted_records().await {
+        Ok(failed) if failed > 0 => {
+            info!(failed, "Failed transcriptions interrupted by a shutdown");
+        }
+        Ok(_) => {}
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted transcriptions during startup: {err}"
+        )),
+    }
     match state
         .artifact_store
         .cleanup_due(DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT)

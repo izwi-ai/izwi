@@ -21,6 +21,9 @@ use crate::{
 };
 
 const DEFAULT_LIST_LIMIT: usize = 200;
+/// The error of a record whose in-process job died with the server (P1V-1).
+pub const INTERRUPTED_BY_SHUTDOWN_ERROR: &str =
+    "Interrupted by a server shutdown before it finished; rerun the job.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -631,6 +634,44 @@ impl DiarizationStore {
         }
 
         fetch_record_without_audio(db, &record_id).await
+    }
+
+    /// Fail the jobs a previous server process left pending or processing
+    /// (P1V-1). Diarization jobs and their summaries run as tasks of the
+    /// process that accepted them, so at startup none of them can still be
+    /// running; left alone they would stay "processing" forever. A failed
+    /// record keeps its audio and can be rerun. Returns the number of
+    /// records failed.
+    pub async fn fail_interrupted_records(&self) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let active = ["pending".to_string(), "processing".to_string()];
+        let jobs = diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::ProcessingStatus,
+                Expr::value(DiarizationProcessingStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingError,
+                Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
+            )
+            .filter(diarization_records::Column::ProcessingStatus.is_in(active))
+            .exec(db)
+            .await
+            .context("Failed to fail interrupted diarization records")?;
+        diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::SummaryStatus,
+                Expr::value(DiarizationSummaryStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryError,
+                Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
+            )
+            .filter(diarization_records::Column::SummaryStatus.eq("pending"))
+            .exec(db)
+            .await
+            .context("Failed to fail interrupted diarization summaries")?;
+        Ok(jobs.rows_affected)
     }
 
     /// Move a pending or processing record to `status`. Returns `None` when
@@ -1859,6 +1900,69 @@ pub(crate) mod tests {
             current.processing_error.as_deref(),
             Some("Cancelled by user.")
         );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1: a job left pending or processing by a previous process fails
+    /// at startup with a clear error (and a pending summary with it), while
+    /// finished records are untouched.
+    #[tokio::test]
+    async fn startup_fails_records_left_running_by_a_previous_process() {
+        let (store, root) = build_test_store();
+        let mut ids = Vec::new();
+        for status in [
+            DiarizationProcessingStatus::Pending,
+            DiarizationProcessingStatus::Processing,
+            DiarizationProcessingStatus::Ready,
+        ] {
+            let mut record = sample_record();
+            record.processing_status = status;
+            record.summary_status = DiarizationSummaryStatus::NotRequested;
+            if status == DiarizationProcessingStatus::Ready {
+                record.summary_status = DiarizationSummaryStatus::Pending;
+                record.summary_text = None;
+            }
+            let created = store.create_record(record).await.expect("record");
+            ids.push(created.id);
+        }
+
+        assert_eq!(
+            store
+                .fail_interrupted_records()
+                .await
+                .expect("startup recovery"),
+            2
+        );
+
+        for id in &ids[..2] {
+            let record = store
+                .get_record(id.clone())
+                .await
+                .expect("record lookup")
+                .expect("record");
+            assert_eq!(
+                record.processing_status,
+                DiarizationProcessingStatus::Failed
+            );
+            assert_eq!(
+                record.processing_error.as_deref(),
+                Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
+            );
+        }
+        let ready = store
+            .get_record(ids[2].clone())
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_eq!(ready.processing_status, DiarizationProcessingStatus::Ready);
+        assert!(ready.processing_error.is_none());
+        assert_eq!(ready.summary_status, DiarizationSummaryStatus::Failed);
+        assert_eq!(
+            ready.summary_error.as_deref(),
+            Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
+        );
+        assert_eq!(store.fail_interrupted_records().await.expect("rerun"), 0);
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
