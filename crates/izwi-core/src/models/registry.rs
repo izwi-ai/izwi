@@ -96,8 +96,8 @@ use crate::models::architectures::qwen38::chat::{
     Qwen38SharedStepCheckpoint,
 };
 use crate::models::architectures::sortformer::diarization::{
-    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerWorkspaceEstimate,
-    SortformerWorkspaceEvent,
+    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerStream,
+    SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
@@ -3748,10 +3748,37 @@ impl NativeDiarizationModel {
         }
     }
 
-    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+    /// Start a diarization that runs in steps of about `step_audio_secs`
+    /// of audio each (PIPE-8).
+    pub(crate) fn begin_stream(
         &self,
         audio: &[f32],
-        sample_rate: u32,
+        config: &DiarizationConfig,
+        step_audio_secs: f32,
+    ) -> Result<SortformerStream> {
+        match self {
+            Self::Sortformer(model) => model.begin_stream(audio, config, step_audio_secs),
+        }
+    }
+
+    pub(crate) fn advance_stream<F>(
+        &self,
+        stream: &mut SortformerStream,
+        audio: &[f32],
+        observer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        match self {
+            Self::Sortformer(model) => model.advance_stream(stream, audio, observer),
+        }
+    }
+
+    pub(crate) fn finish_stream_physical<F>(
+        &self,
+        stream: SortformerStream,
+        audio: &[f32],
         config: &DiarizationConfig,
         state: &mut InvocationTensorLease,
         observer: F,
@@ -3760,13 +3787,9 @@ impl NativeDiarizationModel {
         F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
     {
         match self {
-            Self::Sortformer(model) => model.diarize_with_workspace_observer_physical(
-                audio,
-                sample_rate,
-                config,
-                state,
-                observer,
-            ),
+            Self::Sortformer(model) => {
+                model.finish_stream_physical(stream, audio, config, state, observer)
+            }
         }
     }
 }

@@ -7,7 +7,8 @@ use crate::catalog::{
 use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
 use crate::error::{Error, Result};
 use crate::models::architectures::sortformer::diarization::{
-    production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
+    production_workspace_authorization, sortformer_uses_selected_model_device, SortformerStream,
+    SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
 use crate::models::architectures::voxtral::realtime::VOXTRAL_REALTIME_OFFLINE_AUDIO_SECONDS_HINT;
 use crate::models::registry::{
@@ -19,7 +20,9 @@ use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
     MAX_AUDIO_SOURCE_BYTES,
 };
-use crate::runtime::coordinator::{wait_for_held_capacity, JobLease, JobResourceObservation};
+use crate::runtime::coordinator::{
+    wait_for_held_capacity, InferenceCoordinator, JobLease, JobResourceObservation,
+};
 use crate::runtime::forced_alignment::{AlignedWindow, AlignmentSource, SampleWindow};
 use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
 use crate::runtime::service::{
@@ -35,7 +38,7 @@ use izwi_asr_toolkit::{
     chunk_seam_secs, plan_audio_chunks, spacing_between, AsrLongFormConfig, AudioChunk, TimedWord,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
 
@@ -64,6 +67,10 @@ const MAX_FRAGMENT_DURATION_SECS: f32 = 1.25;
 const FRAGMENT_CONFIDENCE_MARGIN: f32 = 0.08;
 const PHRASE_CAPITALIZED_GAP_SECS: f32 = 0.35;
 const PHRASE_HARD_GAP_SECS: f32 = 0.75;
+/// Audio one Sortformer stage covers (PIPE-8): a 1 h file runs in about 40
+/// stages, each a few seconds of compute, so work waiting on the same permit
+/// or lane gets in between them.
+const SORTFORMER_STAGE_AUDIO_SECS: f32 = 90.0;
 
 #[derive(Debug, Clone)]
 struct PipelineAudio {
@@ -198,6 +205,55 @@ fn diarize_under_workspace_lease<T>(
         }
     };
     body(&mut observer)
+}
+
+fn lock_stream(
+    stream: &Mutex<Option<SortformerStream>>,
+) -> Result<std::sync::MutexGuard<'_, Option<SortformerStream>>> {
+    stream
+        .lock()
+        .map_err(|_| Error::InferenceError("Sortformer stream lock poisoned".into()))
+}
+
+/// Run `step` as one loaded stage at a time until it reports the work
+/// finished (PIPE-8). Between stages the job holds no permit, so other work
+/// gets the device in between. A `host_model` (weights and compute in host
+/// memory) takes the coordinator's host-model lane instead of the device
+/// permit on an accelerator. A stage refused memory other work holds is
+/// retried as in [`wait_for_held_capacity`]; `step` must leave its work
+/// unchanged when it fails before running.
+async fn run_bounded_stages<F>(
+    coordinator: &Arc<InferenceCoordinator>,
+    job: &JobLease,
+    contract: &crate::runtime::adapters::LoadedExecutionContract,
+    work: WorkUnit,
+    host_model: bool,
+    step: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<bool> + Clone + Send + 'static,
+{
+    loop {
+        let finished = wait_for_held_capacity(pipeline_capacity_wait(), || {
+            let step = step.clone();
+            let (contract, work) = (contract.clone(), work.clone());
+            async move {
+                if host_model {
+                    coordinator
+                        .run_loaded_host_model_stage(job, contract, work, step)
+                        .await
+                } else {
+                    coordinator
+                        .run_loaded_blocking_stage(job, contract, work, step)
+                        .await
+                }
+            }
+        })
+        .await?;
+        if finished {
+            return Ok(());
+        }
+    }
 }
 
 fn runtime_audio_bytes(audio: &RuntimeAudioInput) -> usize {
@@ -441,11 +497,53 @@ impl RuntimeService {
                 limit as f64 / 1e9
             )));
         }
-        // The workspace is reserved under the execution permit, when the
-        // stage starts, and released when it returns. A stage refused memory
+        // The file runs as bounded stages, each reserving the workspace when
+        // it starts and releasing it when it returns. A stage refused memory
         // other work holds gives its permit back and runs again once that
-        // memory frees, instead of failing the job (P1V-2).
+        // memory frees, instead of failing the job (P1V-2). On Metal the model
+        // runs on the CPU: its steps take the host-model lane, not the device
+        // permit, so chat, TTS and ASR on the GPU are not queued behind the
+        // file (PIPE-8, D4). Only the final commit to the invocation state
+        // touches the device.
+        let host_model =
+            !sortformer_uses_selected_model_device(self.backend_context().backend_kind);
+        let stream = model.begin_stream(&audio.samples, &config, SORTFORMER_STAGE_AUDIO_SECS)?;
+        let finished = stream.is_finished();
+        let stream = Arc::new(Mutex::new(Some(stream)));
         let residency_lease = Arc::new(residency_lease);
+        let step = {
+            let coordinator = self.coordinator.clone();
+            let job = job.clone();
+            let model = model.clone();
+            let audio = audio.clone();
+            let stream = stream.clone();
+            let residency_lease = residency_lease.clone();
+            move || {
+                let _residency_lease = &residency_lease;
+                diarize_under_workspace_lease(&coordinator, &job, workspace, |observer| {
+                    let mut stream = lock_stream(&stream)?;
+                    let stream = stream.as_mut().ok_or_else(|| {
+                        Error::InferenceError("Sortformer stream already finished".into())
+                    })?;
+                    model.advance_stream(stream, &audio.samples, observer)?;
+                    Ok(stream.is_finished())
+                })
+            }
+        };
+        if !finished {
+            run_bounded_stages(
+                &self.coordinator,
+                job,
+                &execution_contract,
+                WorkUnit::PipelineStage {
+                    name: "diarization.infer".to_string(),
+                    ordinal: 0,
+                },
+                host_model,
+                step,
+            )
+            .await?;
+        }
         wait_for_held_capacity(pipeline_capacity_wait(), || {
             let residency_lease = residency_lease.clone();
             let coordinator = self.coordinator.clone();
@@ -453,6 +551,7 @@ impl RuntimeService {
             let model = model.clone();
             let audio = audio.clone();
             let config = config.clone();
+            let stream = stream.clone();
             self.coordinator
                 .run_loaded_blocking_stage_with_invocation_workspace(
                     job,
@@ -474,9 +573,14 @@ impl RuntimeService {
                             &stage_job,
                             workspace,
                             |observer| {
-                                model.diarize_with_workspace_observer_physical(
+                                let stream = lock_stream(&stream)?.take().ok_or_else(|| {
+                                    Error::InferenceError(
+                                        "Sortformer stream already finished".into(),
+                                    )
+                                })?;
+                                model.finish_stream_physical(
+                                    stream,
                                     &audio.samples,
-                                    audio.sample_rate,
                                     &config,
                                     state,
                                     observer,
@@ -3012,6 +3116,123 @@ mod tests {
                      {workspace_bytes} B"
                 );
             }
+        }
+    }
+
+    /// PIPE-8, D4: an interactive job submitted while a long diarization
+    /// runs gets the Metal permit before the diarization finishes. With the
+    /// CPU Sortformer on the host-model lane it runs at once, mid-stage; on
+    /// the device permit (CUDA, CPU) it runs between two bounded stages.
+    #[tokio::test]
+    async fn interactive_work_gets_the_device_before_diarization_finishes() {
+        use crate::engine::{ModelInstanceId, Priority, WorkloadClass};
+        use crate::runtime::adapters::{LoadedModelBundle, RuntimeAdapterRegistry};
+        use crate::runtime::coordinator::JobSpec;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const STAGES: usize = 3;
+        let spec = |id: &str, workload_class| {
+            let mut resources = ResourceVector::zero();
+            resources.unified_bytes = ResourceAmount::Known(64 * 1024 * 1024);
+            JobSpec {
+                request_id: id.to_string(),
+                lane: CoordinatorLane::Pipeline,
+                priority: Priority::Normal,
+                workload_class,
+                deadline: None,
+                resources,
+            }
+        };
+        for host_model in [true, false] {
+            let coordinator = Arc::new(InferenceCoordinator::new(
+                crate::backends::BackendKind::Metal,
+                1,
+                8,
+            ));
+            let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
+            // Any scalar loaded stage will do: the stages under test are stubs.
+            let contract = LoadedModelBundle::bind(
+                &adapters,
+                coordinator.execution_group_id(),
+                ModelInstanceId::new(7),
+                ModelVariant::Kokoro82M,
+                crate::backends::BackendKind::Metal,
+            )
+            .unwrap()
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+            let diarization_job = coordinator
+                .admit(spec("diarization", WorkloadClass::Background))
+                .await
+                .unwrap();
+            // Each stage blocks until the test releases it.
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let released = Arc::new(Mutex::new(released));
+            let (started, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let step = {
+                let (started, done) = (started.clone(), done.clone());
+                move || {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    released.lock().unwrap().recv().unwrap();
+                    Ok(done.fetch_add(1, Ordering::AcqRel) + 1 == STAGES)
+                }
+            };
+            let diarization = tokio::spawn({
+                let coordinator = coordinator.clone();
+                async move {
+                    run_bounded_stages(
+                        &coordinator,
+                        &diarization_job,
+                        &contract,
+                        WorkUnit::AtomicJob {
+                            kind: "tts".to_string(),
+                        },
+                        host_model,
+                        step,
+                    )
+                    .await
+                }
+            });
+            while started.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let interactive = tokio::spawn({
+                let coordinator = coordinator.clone();
+                async move {
+                    let job = coordinator
+                        .admit(spec("chat", WorkloadClass::Interactive))
+                        .await?;
+                    coordinator.run_stage(&job, async { Ok(()) }).await
+                }
+            });
+            if host_model {
+                // The first stage still blocks: the permit was never taken.
+                tokio::time::timeout(Duration::from_secs(10), interactive)
+                    .await
+                    .expect("interactive work waited on a host-model stage")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(done.load(Ordering::Acquire), 0);
+                assert_eq!(coordinator.snapshot().host_model_stages_total, 1);
+            } else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!interactive.is_finished(), "the stage holds the permit");
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), interactive)
+                    .await
+                    .expect("interactive work waited for the whole diarization")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(done.load(Ordering::Acquire), 1);
+                assert_eq!(coordinator.snapshot().host_model_stages_total, 0);
+            }
+            assert!(!diarization.is_finished());
+            for _ in done.load(Ordering::Acquire)..STAGES {
+                release.send(()).unwrap();
+            }
+            diarization.await.unwrap().unwrap();
+            assert_eq!(started.load(Ordering::Acquire), STAGES);
         }
     }
 

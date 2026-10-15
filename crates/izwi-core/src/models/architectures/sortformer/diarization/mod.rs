@@ -1141,8 +1141,43 @@ impl SortformerStreamingState {
 #[derive(Debug, Default)]
 struct SortformerStreamingCounters {
     chunks: AtomicU64,
+    /// Bounded steps the streaming passes ran in (PIPE-8): one per pass when
+    /// it runs whole, one per runtime stage when it is staged.
+    steps: AtomicU64,
     host_reads: AtomicU64,
     physical_state_commits: AtomicU64,
+}
+
+/// A streaming pass that runs in bounded steps (PIPE-8): its chunk plan, the
+/// streaming state, and the probabilities so far. A step may run as its own
+/// runtime stage, so a long file does not hold an execution permit for its
+/// whole pass.
+#[derive(Debug)]
+pub(crate) struct SortformerStream {
+    cfg: SortformerStreamingConfig,
+    sample_count: usize,
+    feature_frames: usize,
+    plans: Vec<SortformerStreamingChunkPlan>,
+    next_plan: usize,
+    chunks_per_step: usize,
+    /// `None` only while a step runs.
+    state: Option<SortformerStreamingState>,
+    track_silence_mean: bool,
+    total_preds: Vec<Vec<f32>>,
+    chunks: u64,
+    host_reads: u64,
+}
+
+impl SortformerStream {
+    /// Every chunk has run; the stream can finish.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.next_plan >= self.plans.len()
+    }
+
+    /// Steps left before the stream can finish.
+    pub(crate) fn steps_remaining(&self) -> usize {
+        (self.plans.len() - self.next_plan).div_ceil(self.chunks_per_step)
+    }
 }
 
 fn commit_sortformer_streaming_state(
@@ -1563,26 +1598,7 @@ impl SortformerDiarizerModel {
     where
         F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
     {
-        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, None, observer)
-    }
-
-    pub(crate) fn diarize_with_workspace_observer_physical<F>(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        config: &DiarizationConfig,
-        state: &mut InvocationTensorLease,
-        observer: F,
-    ) -> Result<DiarizationResult>
-    where
-        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
-    {
-        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
-            return Err(Error::InferenceError(
-                "Sortformer received a foreign physical streaming domain".into(),
-            ));
-        }
-        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, Some(state), observer)
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, observer)
     }
 
     fn diarize_with_workspace_observer_impl<F>(
@@ -1590,7 +1606,6 @@ impl SortformerDiarizerModel {
         audio: &[f32],
         sample_rate: u32,
         config: &DiarizationConfig,
-        physical_state: Option<&mut InvocationTensorLease>,
         mut observer: F,
     ) -> Result<DiarizationResult>
     where
@@ -1602,12 +1617,7 @@ impl SortformerDiarizerModel {
         if sample_rate == 0 {
             return Err(Error::InvalidInput("Invalid sample rate: 0".to_string()));
         }
-        crate::catalog::validate_diarization_speaker_limits(
-            config.min_speakers,
-            config.max_speakers,
-            self.model.num_speakers,
-        )
-        .map_err(Error::InvalidInput)?;
+        self.validate_speaker_limits(config)?;
 
         let resampled_samples;
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
@@ -1628,24 +1638,126 @@ impl SortformerDiarizerModel {
         let workspace_estimate = self.model.workspace_estimate(samples.len())?;
         let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
 
-        let (speaker_probs, frame_stride_samples) = match physical_state {
-            Some(state) => self
-                .model
-                .infer_speaker_probabilities_physical(samples, state)?,
-            None => self.model.infer_speaker_probabilities(samples)?,
+        let (speaker_probs, frame_stride_samples) =
+            self.model.infer_speaker_probabilities(samples)?;
+        let result =
+            self.segments_from_probabilities(samples, speaker_probs, frame_stride_samples, config);
+        workspace.release()?;
+        Ok(result)
+    }
+
+    fn validate_speaker_limits(&self, config: &DiarizationConfig) -> Result<()> {
+        crate::catalog::validate_diarization_speaker_limits(
+            config.min_speakers,
+            config.max_speakers,
+            self.model.num_speakers,
+        )
+        .map_err(Error::InvalidInput)
+    }
+
+    /// Start a diarization of 16 kHz `audio` that runs in steps of about
+    /// `step_audio_secs` each (PIPE-8). Run [`Self::advance_stream`] until the
+    /// stream is finished, then [`Self::finish_stream_physical`]; the result
+    /// is the one [`Self::diarize`] gives, bit for bit.
+    pub(crate) fn begin_stream(
+        &self,
+        audio: &[f32],
+        config: &DiarizationConfig,
+        step_audio_secs: f32,
+    ) -> Result<SortformerStream> {
+        if audio.is_empty() {
+            return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+        self.validate_speaker_limits(config)?;
+        let cfg = self.model.streaming.ok_or_else(|| {
+            Error::InferenceError("staged Sortformer requires the bounded streaming path".into())
+        })?;
+        let feature_frames = self.model.preprocessor.feature_frame_count(audio.len());
+        Ok(self.model.begin_stream(
+            audio.len(),
+            feature_frames,
+            cfg,
+            chunks_per_stream_step(cfg, self.model.preprocessor.hop_length, step_audio_secs),
+        ))
+    }
+
+    /// Run the stream's next step under the per-stage workspace observer.
+    pub(crate) fn advance_stream<F>(
+        &self,
+        stream: &mut SortformerStream,
+        audio: &[f32],
+        mut observer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        let workspace_estimate = self.model.workspace_estimate(audio.len())?;
+        let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
+        self.model.advance_stream(stream, audio)?;
+        workspace.release()
+    }
+
+    /// Commit a finished stream's final cache to the invocation state and
+    /// turn its probabilities into speaker segments.
+    pub(crate) fn finish_stream_physical<F>(
+        &self,
+        stream: SortformerStream,
+        audio: &[f32],
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        mut observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Sortformer received a foreign physical streaming domain".into(),
+            ));
+        }
+        if stream.sample_count != audio.len() {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream over {} samples finished with {}",
+                stream.sample_count,
+                audio.len()
+            )));
+        }
+        let workspace_estimate = self.model.workspace_estimate(audio.len())?;
+        let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
+        let speaker_probs = if stream.feature_frames == 0 {
+            Vec::new()
+        } else {
+            self.model.finish_stream(stream, Some(state))?
         };
+        let result = self.segments_from_probabilities(
+            audio,
+            speaker_probs,
+            self.model.probs_frame_stride_samples()?,
+            config,
+        );
+        workspace.release()?;
+        Ok(result)
+    }
+
+    /// Speaker segments from the probability rows of 16 kHz `samples`.
+    fn segments_from_probabilities(
+        &self,
+        samples: &[f32],
+        speaker_probs: Vec<Vec<f32>>,
+        frame_stride_samples: usize,
+        config: &DiarizationConfig,
+    ) -> DiarizationResult {
+        let duration_secs = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
         // Probability rows expand to the 10 ms timeline either because the
         // head runs at the encoded rate (v2.1, repeated in post-processing)
         // or because the upsampler already emitted 10 ms rows (Nemotron-3).
         let frame_repeat = (frame_stride_samples / self.model.preprocessor.hop_length).max(1);
         if speaker_probs.is_empty() {
-            let result = DiarizationResult {
+            return DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
             };
-            workspace.release()?;
-            return Ok(result);
         }
 
         let explicit_min_speech_ms = config
@@ -1773,16 +1885,11 @@ impl SortformerDiarizerModel {
         }
 
         if raw_segments.is_empty() {
-            let result = DiarizationResult {
+            return DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
             };
-            drop(speaker_stats);
-            drop(vad_regions);
-            drop(gated_probs);
-            workspace.release()?;
-            return Ok(result);
         }
 
         if limit_speaker_channels {
@@ -1858,19 +1965,11 @@ impl SortformerDiarizerModel {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
 
-        drop(speaker_labels);
-        drop(speaker_remap);
-        drop(ordered);
-        drop(speaker_stats);
-        drop(vad_regions);
-        drop(gated_probs);
-        let result = DiarizationResult {
+        DiarizationResult {
             segments,
             duration_secs,
             speaker_count,
-        };
-        workspace.release()?;
-        Ok(result)
+        }
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -2246,34 +2345,6 @@ impl SortformerInferenceModel {
         Ok((out, self.probs_frame_stride_samples()?))
     }
 
-    fn infer_speaker_probabilities_physical(
-        &self,
-        samples: &[f32],
-        state: &mut InvocationTensorLease,
-    ) -> Result<(Vec<Vec<f32>>, usize)> {
-        let feature_frames = self.preprocessor.feature_frame_count(samples.len());
-        if feature_frames == 0 {
-            return Ok((Vec::new(), self.probs_frame_stride_samples()?));
-        }
-        let streaming_cfg = self.streaming.ok_or_else(|| {
-            Error::InferenceError(
-                "Sortformer physical state requires the bounded streaming path".into(),
-            )
-        })?;
-        if state.arena()?.absolute_cursor() != 0 {
-            return Err(Error::InferenceError(
-                "Sortformer invocation state was not reset before inference".into(),
-            ));
-        }
-        let out = self.infer_speaker_probabilities_streaming(
-            samples,
-            feature_frames,
-            streaming_cfg,
-            Some(state),
-        )?;
-        Ok((out, self.probs_frame_stride_samples()?))
-    }
-
     fn infer_speaker_probabilities_offline(
         &self,
         features: &Tensor,
@@ -2294,18 +2365,63 @@ impl SortformerInferenceModel {
         cfg: SortformerStreamingConfig,
         physical_state: Option<&mut InvocationTensorLease>,
     ) -> Result<Vec<Vec<f32>>> {
+        let mut stream = self.begin_stream(samples.len(), feature_frames, cfg, usize::MAX);
+        self.advance_stream(&mut stream, samples)?;
+        self.finish_stream(stream, physical_state)
+    }
+
+    /// Start a streaming pass over `sample_count` samples whose steps each
+    /// run at most `chunks_per_step` chunks.
+    fn begin_stream(
+        &self,
+        sample_count: usize,
+        feature_frames: usize,
+        cfg: SortformerStreamingConfig,
+        chunks_per_step: usize,
+    ) -> SortformerStream {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         if let Some(silence) = &self.silence_embedding {
             state.mean_sil_emb = silence.clone();
         }
-        let track_silence_mean = self.silence_embedding.is_none();
-        let mut total_preds = Vec::new();
+        SortformerStream {
+            cfg,
+            sample_count,
+            feature_frames,
+            plans: plan_streaming_feature_chunks(feature_frames, cfg),
+            next_plan: 0,
+            chunks_per_step: chunks_per_step.max(1),
+            state: Some(state),
+            track_silence_mean: self.silence_embedding.is_none(),
+            total_preds: Vec::new(),
+            chunks: 0,
+            host_reads: 0,
+        }
+    }
+
+    /// Run the stream's next step: up to `chunks_per_step` chunks. The state
+    /// carries over unchanged between steps, so any split of the chunks into
+    /// steps gives the probabilities of one uninterrupted pass, bit for bit.
+    fn advance_stream(&self, stream: &mut SortformerStream, samples: &[f32]) -> Result<()> {
+        if samples.len() != stream.sample_count {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream over {} samples resumed with {}",
+                stream.sample_count,
+                samples.len()
+            )));
+        }
+        let cfg = stream.cfg;
+        let mut state = stream
+            .state
+            .take()
+            .ok_or_else(|| Error::InferenceError("Sortformer stream state was lost".into()))?;
+        let end = stream
+            .next_plan
+            .saturating_add(stream.chunks_per_step)
+            .min(stream.plans.len());
         // The cache, FIFO and chunk embeddings stay on the model device; the
         // only per-chunk host reads are the probabilities (once) and, for the
         // running silence mean, the silent rows popped from the FIFO.
-        let mut chunks = 0u64;
-        let mut host_reads = 0u64;
-        for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
+        for plan in &stream.plans[stream.next_plan..end] {
             let chunk = self
                 .preprocessor
                 .compute_feature_range(samples, plan.feature_start, plan.feature_end)?
@@ -2324,7 +2440,7 @@ impl SortformerInferenceModel {
             let Some(composite) = composite.tensor() else {
                 continue;
             };
-            chunks += 1;
+            stream.chunks += 1;
 
             let composite_len = composite.dim(0)?;
             let (encoded, encoded_len) = self
@@ -2333,7 +2449,7 @@ impl SortformerInferenceModel {
             let probs = self.forward_probabilities(&encoded, encoded_len)?;
             let output_rows = encoded_len * cfg.output_frames_per_encoded_frame;
             let prob_rows = tensor_to_probability_rows(&probs, output_rows, self.num_speakers)?;
-            host_reads += 1;
+            stream.host_reads += 1;
             let pooled;
             let pred_rows = if cfg.output_frames_per_encoded_frame == 1 {
                 &prob_rows
@@ -2355,17 +2471,51 @@ impl SortformerInferenceModel {
                 pred_rows,
                 pre_encoded_left_offset(plan.left_offset, cfg.subsampling_factor),
                 pre_encoded_right_offset(plan.right_offset, cfg.subsampling_factor),
-                track_silence_mean,
+                stream.track_silence_mean,
                 cfg,
             )?;
             state = updated_state;
-            total_preds.extend_from_slice(&prob_rows[output_range]);
+            stream
+                .total_preds
+                .extend_from_slice(&prob_rows[output_range]);
         }
-        host_reads += state.host_reads;
+        stream.state = Some(state);
+        stream.next_plan = end;
+        self.streaming_counters
+            .steps
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The probabilities of a stream that has run every chunk. With
+    /// `physical_state` the final cache is committed to the invocation state.
+    fn finish_stream(
+        &self,
+        mut stream: SortformerStream,
+        physical_state: Option<&mut InvocationTensorLease>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if !stream.is_finished() {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream finished after {} of {} chunks",
+                stream.next_plan,
+                stream.plans.len()
+            )));
+        }
+        let cfg = stream.cfg;
+        let state = stream
+            .state
+            .take()
+            .ok_or_else(|| Error::InferenceError("Sortformer stream state was lost".into()))?;
+        let host_reads = stream.host_reads + state.host_reads;
         // Nothing reads the invocation state back while the stream runs, so
         // it is committed once, with the final cache, instead of being staged
         // on the arena device after every chunk.
         if let Some(lease) = physical_state {
+            if lease.arena()?.absolute_cursor() != 0 {
+                return Err(Error::InferenceError(
+                    "Sortformer invocation state was not reset before inference".into(),
+                ));
+            }
             commit_sortformer_streaming_state(lease, cfg, &state)?;
             self.streaming_counters
                 .physical_state_commits
@@ -2373,14 +2523,15 @@ impl SortformerInferenceModel {
         }
         self.streaming_counters
             .chunks
-            .fetch_add(chunks, Ordering::Relaxed);
+            .fetch_add(stream.chunks, Ordering::Relaxed);
         self.streaming_counters
             .host_reads
             .fetch_add(host_reads, Ordering::Relaxed);
+        let mut total_preds = stream.total_preds;
         if cfg.output_frames_per_encoded_frame > 1 {
             // The upsampler pads the final stacked group; trim the trailing
             // rows back to the mel frame count.
-            total_preds.truncate(feature_frames);
+            total_preds.truncate(stream.feature_frames);
         }
 
         Ok(total_preds)
@@ -2390,6 +2541,7 @@ impl SortformerInferenceModel {
         let counters = &self.streaming_counters;
         serde_json::json!({
             "chunks": counters.chunks.load(Ordering::Relaxed),
+            "steps": counters.steps.load(Ordering::Relaxed),
             "host_reads": counters.host_reads.load(Ordering::Relaxed),
             "physical_state_commits": counters.physical_state_commits.load(Ordering::Relaxed),
         })
@@ -2491,6 +2643,18 @@ fn resolve_streaming_profile() -> SortformerStreamingProfile {
             SortformerStreamingProfile::DEFAULT
         }
     }
+}
+
+/// Whole chunks in a step of about `step_audio_secs` of 16 kHz audio, at
+/// least one.
+fn chunks_per_stream_step(
+    cfg: SortformerStreamingConfig,
+    hop_length: usize,
+    step_audio_secs: f32,
+) -> usize {
+    let chunk_samples = cfg.chunk_len * cfg.subsampling_factor * hop_length;
+    let step_samples = (step_audio_secs.max(0.0) * TARGET_SAMPLE_RATE as f32) as usize;
+    (step_samples / chunk_samples.max(1)).max(1)
 }
 
 fn plan_streaming_feature_chunks(
@@ -7653,5 +7817,91 @@ mod tests {
         for (a, b) in physical.iter().flatten().zip(plain.iter().flatten()) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    /// PIPE-8: a stream run in bounded steps carries its state between
+    /// steps unchanged, so every split gives the one-pass probabilities and
+    /// the same committed state, bit for bit, and counts one step per stage.
+    #[test]
+    fn staged_stream_matches_one_pass_bit_for_bit() {
+        let model = synthetic_streaming_model(2);
+        let cfg = model.streaming.unwrap();
+        let samples = random_values(16_000 * 6, 0x57A6E, 0.3, 0.0);
+        let feature_frames = model.preprocessor.feature_frame_count(samples.len());
+        let planned = plan_streaming_feature_chunks(feature_frames, cfg).len();
+        assert!(planned >= 8, "{planned} chunks");
+        let mut one_pass_lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+        let one_pass = model
+            .infer_speaker_probabilities_streaming(
+                &samples,
+                feature_frames,
+                cfg,
+                Some(&mut one_pass_lease),
+            )
+            .unwrap();
+        let committed = |lease: &InvocationTensorLease| {
+            lease
+                .read_snapshot()
+                .unwrap()
+                .components
+                .into_iter()
+                .map(|slice| {
+                    let values = slice
+                        .tensor
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    values.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for chunks_per_step in [1, 2, 3, planned] {
+            let steps_before = model.streaming_path_diagnostics()["steps"]
+                .as_u64()
+                .unwrap();
+            let mut stream =
+                model.begin_stream(samples.len(), feature_frames, cfg, chunks_per_step);
+            let expected_steps = planned.div_ceil(chunks_per_step);
+            assert_eq!(stream.steps_remaining(), expected_steps);
+            while !stream.is_finished() {
+                model.advance_stream(&mut stream, &samples).unwrap();
+            }
+            assert_eq!(
+                model.streaming_path_diagnostics()["steps"]
+                    .as_u64()
+                    .unwrap()
+                    - steps_before,
+                expected_steps as u64
+            );
+            let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+            let staged = model.finish_stream(stream, Some(&mut lease)).unwrap();
+            assert_eq!(
+                staged.len(),
+                one_pass.len(),
+                "{chunks_per_step} chunks/step"
+            );
+            for (a, b) in staged.iter().flatten().zip(one_pass.iter().flatten()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{chunks_per_step} chunks/step");
+            }
+            assert_eq!(committed(&lease), committed(&one_pass_lease));
+        }
+
+        // A stream cannot finish early or resume over other audio.
+        let mut stream = model.begin_stream(samples.len(), feature_frames, cfg, 1);
+        assert!(model.advance_stream(&mut stream, &samples[1..]).is_err());
+        model.advance_stream(&mut stream, &samples).unwrap();
+        assert!(model.finish_stream(stream, None).is_err());
+    }
+
+    /// A step covers about 90 s of 16 kHz audio in whole chunks: three
+    /// 27.2 s chunks of the v2.1 card profile, never zero.
+    #[test]
+    fn stream_steps_cover_bounded_audio() {
+        let cfg = production_workspace_streaming_config();
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 90.0), 3);
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 1.0), 1);
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 0.0), 1);
     }
 }

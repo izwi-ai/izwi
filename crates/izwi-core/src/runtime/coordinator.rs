@@ -216,6 +216,9 @@ pub struct CoordinatorSnapshot {
     pub admitted_total: u64,
     pub rejected_total: u64,
     pub expired_total: u64,
+    /// Stages of host-resident models an accelerator coordinator ran on its
+    /// host-model lane instead of the device permit (D4: Sortformer on Metal).
+    pub host_model_stages_total: u64,
     pub draining: bool,
     pub poisoned: bool,
 }
@@ -625,6 +628,11 @@ pub struct InferenceCoordinator {
     backend: BackendKind,
     jobs: Arc<Semaphore>,
     host_work: Arc<Semaphore>,
+    /// One stage at a time of a model whose weights and compute live in host
+    /// memory while this coordinator owns an accelerator. Separate from
+    /// `host_work`, so a long model stage does not queue request preparation.
+    host_models: Arc<Semaphore>,
+    host_model_stages_total: AtomicU64,
     execution: PhysicalExecutionAdmission,
     resources: Arc<ResourceAuthority>,
     admission_gate: Mutex<()>,
@@ -701,6 +709,8 @@ impl InferenceCoordinator {
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             host_work: Arc::new(Semaphore::new(capacity)),
+            host_models: Arc::new(Semaphore::new(1)),
+            host_model_stages_total: AtomicU64::new(0),
             execution: PhysicalExecutionAdmission::with_idle(
                 Some(execution_group_id),
                 capacity,
@@ -787,6 +797,7 @@ impl InferenceCoordinator {
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
+            host_model_stages_total: self.host_model_stages_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
             // The shared resource authority poisons alongside the execution
             // guard on backend-fatal errors (Metal command-buffer OOM at a
@@ -1306,6 +1317,61 @@ impl InferenceCoordinator {
         };
         self.run_blocking_task(job, permit, "host preparation", operation)
             .await
+    }
+
+    /// Execute one scalar stage of a loaded model whose weights and compute
+    /// live in host memory (D4: Sortformer runs on CPU on Metal). On an
+    /// accelerator coordinator the stage issues no device work, so it takes
+    /// the host-model lane instead of the device execution permit, and
+    /// interactive device work is not queued behind it. On a CPU coordinator
+    /// the host is the device: the stage takes the execution permit as any
+    /// loaded stage does. Cancellation, the deadline and the job lease apply
+    /// either way.
+    pub(crate) async fn run_loaded_host_model_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if self.backend == BackendKind::Cpu {
+            return self
+                .run_loaded_blocking_stage(job, contract, work, operation)
+                .await;
+        }
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "a host-model stage must be a scalar execution-group stage".to_string(),
+            ));
+        }
+        let acquire = self.host_models.clone().acquire_owned();
+        let permit = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
+                .await
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout(job.spec.request_id.clone())
+                })?
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+        };
+        self.host_model_stages_total.fetch_add(1, Ordering::Relaxed);
+        self.run_blocking_task(job, permit, "host model", move || {
+            let _contract = contract;
+            let _work = work;
+            operation()
+        })
+        .await
     }
 
     /// Execute one independently scheduled scalar row through an exact loaded
