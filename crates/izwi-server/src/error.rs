@@ -94,6 +94,19 @@ impl ApiError {
         }
     }
 
+    /// A `400` about one request parameter, rendered with OpenAI's
+    /// `param` and the `invalid_value` code.
+    pub fn invalid_param(param: &'static str, msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+            detail: Some(ApiErrorDetail {
+                param: Some(param),
+                code: Some("invalid_value"),
+            }),
+        }
+    }
+
     /// OpenAI `context_length_exceeded`: the messages, or the messages plus
     /// the requested output, do not fit the model's context.
     pub fn context_length_exceeded(msg: impl Into<String>) -> Self {

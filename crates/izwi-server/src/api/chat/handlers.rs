@@ -13,7 +13,7 @@ use tokio::sync::OwnedMutexGuard;
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
     generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream_with_keepalive,
-    ChatExecutionRequest, ChatStreamEvent,
+    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -368,6 +368,7 @@ pub async fn create_thread_message(
         chat_config,
         correlation_id: Some(ctx.correlation_id),
     };
+    validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
         return create_streaming_thread_message(

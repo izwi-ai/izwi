@@ -468,6 +468,72 @@ async fn send_chat_terminal_with_timeout(
     let _ = tokio::time::timeout(timeout, event_tx.send(event)).await;
 }
 
+/// EDGE-F19: the OpenAI and vLLM ranges of the chat sampling controls,
+/// enforced at the edge so every role and model family rejects the same
+/// values with the same `400` instead of clamping them or failing inside a
+/// family's sampler.
+pub(crate) fn validate_chat_request_ranges(request: &ChatExecutionRequest) -> Result<(), ApiError> {
+    let within = |value: Option<f32>, min: f32, max: f32| {
+        value.is_none_or(|value| value.is_finite() && (min..=max).contains(&value))
+    };
+    if !within(request.temperature, 0.0, 2.0) {
+        return Err(ApiError::invalid_param(
+            "temperature",
+            "`temperature` must be between 0 and 2",
+        ));
+    }
+    if request
+        .top_p
+        .is_some_and(|top_p| !(top_p > 0.0 && top_p <= 1.0))
+    {
+        return Err(ApiError::invalid_param(
+            "top_p",
+            "`top_p` must be greater than 0 and at most 1",
+        ));
+    }
+    // The samplers penalize repetition only; a value below 1 cannot be
+    // honoured, so it is refused rather than silently raised to 1.
+    if !within(request.repetition_penalty, 1.0, 2.0) {
+        return Err(ApiError::invalid_param(
+            "repetition_penalty",
+            "`repetition_penalty` must be between 1 and 2",
+        ));
+    }
+    if !within(request.presence_penalty, -2.0, 2.0) {
+        return Err(ApiError::invalid_param(
+            "presence_penalty",
+            "`presence_penalty` must be between -2 and 2",
+        ));
+    }
+    for (param, value) in [
+        ("max_tokens", request.max_tokens),
+        ("max_completion_tokens", request.max_completion_tokens),
+    ] {
+        if value == Some(0) {
+            return Err(ApiError::invalid_param(
+                param,
+                format!("`{param}` must be at least 1"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// OpenAI-compatible `top_k`: `-1` (vLLM) and `0` disable top-k sampling;
+/// any other negative value is refused.
+pub(crate) fn chat_top_k(top_k: Option<i64>) -> Result<Option<usize>, ApiError> {
+    match top_k {
+        None => Ok(None),
+        Some(-1) => Ok(Some(0)),
+        Some(top_k) => usize::try_from(top_k).map(Some).map_err(|_| {
+            ApiError::invalid_param(
+                "top_k",
+                "`top_k` must be -1 or 0 (disabled) or a positive integer",
+            )
+        }),
+    }
+}
+
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
     parse_chat_model_variant(Some(model_id)).map_err(|err| ApiError::bad_request(err.to_string()))
 }
@@ -1717,6 +1783,70 @@ mod tests {
             chat_models > profiled.len(),
             "unprofiled chat models are covered"
         );
+    }
+
+    /// EDGE-F19: boundary values are accepted and values just outside them
+    /// are refused with the parameter named.
+    #[test]
+    fn sampling_ranges_accept_their_bounds_and_name_what_they_refuse() {
+        let request = |apply: fn(&mut ChatExecutionRequest)| {
+            let mut request = qwen_request(ModelVariant::Gemma34BIt, None);
+            apply(&mut request);
+            validate_chat_request_ranges(&request).map_err(|error| error.detail)
+        };
+        let refused = |param| {
+            Err(Some(crate::error::ApiErrorDetail {
+                param: Some(param),
+                code: Some("invalid_value"),
+            }))
+        };
+        for apply in [
+            (|r: &mut ChatExecutionRequest| r.temperature = Some(0.0)) as fn(&mut _),
+            |r| r.temperature = Some(2.0),
+            |r| r.top_p = Some(1.0),
+            |r| r.top_p = Some(f32::MIN_POSITIVE),
+            |r| r.repetition_penalty = Some(1.0),
+            |r| r.repetition_penalty = Some(2.0),
+            |r| r.presence_penalty = Some(-2.0),
+            |r| r.presence_penalty = Some(2.0),
+            |r| r.max_tokens = Some(1),
+            |r| r.max_completion_tokens = Some(1),
+        ] {
+            assert_eq!(request(apply), Ok(()));
+        }
+        assert_eq!(
+            request(|r| r.temperature = Some(2.01)),
+            refused("temperature")
+        );
+        assert_eq!(
+            request(|r| r.temperature = Some(f32::NAN)),
+            refused("temperature")
+        );
+        assert_eq!(request(|r| r.top_p = Some(0.0)), refused("top_p"));
+        assert_eq!(request(|r| r.top_p = Some(f32::NAN)), refused("top_p"));
+        assert_eq!(
+            request(|r| r.repetition_penalty = Some(0.99)),
+            refused("repetition_penalty")
+        );
+        assert_eq!(
+            request(|r| r.presence_penalty = Some(-2.01)),
+            refused("presence_penalty")
+        );
+        assert_eq!(request(|r| r.max_tokens = Some(0)), refused("max_tokens"));
+        assert_eq!(
+            request(|r| r.max_completion_tokens = Some(0)),
+            refused("max_completion_tokens")
+        );
+    }
+
+    #[test]
+    fn top_k_accepts_the_vllm_disabled_value() {
+        assert_eq!(chat_top_k(None).unwrap(), None);
+        assert_eq!(chat_top_k(Some(-1)).unwrap(), Some(0));
+        assert_eq!(chat_top_k(Some(0)).unwrap(), Some(0));
+        assert_eq!(chat_top_k(Some(40)).unwrap(), Some(40));
+        let error = chat_top_k(Some(-2)).unwrap_err();
+        assert_eq!(error.detail.and_then(|detail| detail.param), Some("top_k"));
     }
 
     #[test]

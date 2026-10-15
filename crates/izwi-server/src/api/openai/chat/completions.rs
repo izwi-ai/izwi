@@ -16,10 +16,11 @@ use crate::api::openai::compat::{
 };
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, generate_remote_chat, generate_remote_chat_with_execution_and_tenant,
-    parse_chat_model, resolve_chat_request_config, spawn_chat_stream,
-    spawn_remote_chat_stream_with_execution, spawn_remote_chat_stream_with_tenant,
-    ChatExecutionRequest, ChatStreamEvent,
+    chat_top_k, generate_chat, generate_remote_chat,
+    generate_remote_chat_with_execution_and_tenant, parse_chat_model, resolve_chat_request_config,
+    spawn_chat_stream, spawn_remote_chat_stream_with_execution,
+    spawn_remote_chat_stream_with_tenant, validate_chat_request_ranges, ChatExecutionRequest,
+    ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -71,8 +72,9 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// `-1` (vLLM) or `0` disables top-k sampling.
     #[serde(default)]
-    pub top_k: Option<usize>,
+    pub top_k: Option<i64>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
@@ -733,22 +735,35 @@ fn validate_chat_request_compatibility(
     profile: OpenAiCompatibilityProfile,
 ) -> Result<(), ApiError> {
     if req.n.unwrap_or(1) != 1 {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::invalid_param(
+            "n",
             "This server currently supports only `n=1` for chat completions",
         ));
     }
 
     if let Some(top_logprobs) = req.top_logprobs {
         if top_logprobs > 20 {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::invalid_param(
+                "top_logprobs",
                 "`top_logprobs` must be between 0 and 20",
             ));
         }
         if !req.logprobs.unwrap_or(false) {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::invalid_param(
+                "top_logprobs",
                 "`top_logprobs` requires `logprobs` to be true",
             ));
         }
+    }
+
+    if req
+        .frequency_penalty
+        .is_some_and(|value| !(value.is_finite() && (-2.0..=2.0).contains(&value)))
+    {
+        return Err(ApiError::invalid_param(
+            "frequency_penalty",
+            "`frequency_penalty` must be between -2 and 2",
+        ));
     }
 
     if let Some(response_format) = &req.response_format {
@@ -1025,31 +1040,30 @@ fn prepare_execution_request(
         media_inputs,
         req.truncation,
     )?;
-    Ok((
+    let execution = ChatExecutionRequest {
         variant,
-        ChatExecutionRequest {
-            variant,
-            messages,
-            max_completion_tokens: req.max_completion_tokens,
-            max_tokens: req.max_tokens,
-            temperature: req.temperature,
-            top_p: req.top_p,
-            top_k: req.top_k,
-            repetition_penalty: req.repetition_penalty,
-            presence_penalty: req.presence_penalty,
-            // A bit-preserving cast keeps distinct seeds distinct.
-            seed: req.seed.map(|seed| seed as u64),
-            stop: stop_sequences,
-            logprobs: req.logprobs,
-            top_logprobs: req.top_logprobs,
-            response_format_json_object: req
-                .response_format
-                .as_ref()
-                .is_some_and(|format| format.kind == "json_object"),
-            chat_config,
-            correlation_id: Some(ctx.correlation_id.clone()),
-        },
-    ))
+        messages,
+        max_completion_tokens: req.max_completion_tokens,
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: chat_top_k(req.top_k)?,
+        repetition_penalty: req.repetition_penalty,
+        presence_penalty: req.presence_penalty,
+        // A bit-preserving cast keeps distinct seeds distinct.
+        seed: req.seed.map(|seed| seed as u64),
+        stop: stop_sequences,
+        logprobs: req.logprobs,
+        top_logprobs: req.top_logprobs,
+        response_format_json_object: req
+            .response_format
+            .as_ref()
+            .is_some_and(|format| format.kind == "json_object"),
+        chat_config,
+        correlation_id: Some(ctx.correlation_id.clone()),
+    };
+    validate_chat_request_ranges(&execution)?;
+    Ok((variant, execution))
 }
 
 /// `Some(opened_in_prompt)` when the request asked for `reasoning_format:
@@ -1602,6 +1616,59 @@ mod tests {
         assert!(body["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("incompatible with remote deployment")));
+    }
+
+    /// EDGE-F19: out-of-range sampling values are OpenAI-shaped 400s that
+    /// name the parameter, and never reach a worker.
+    #[tokio::test]
+    async fn out_of_range_sampling_values_are_rejected_at_the_edge() {
+        let worker_config = MockWorkerConfig::default();
+        let credentials = valid_client_credentials(&worker_config);
+        let (mut app, worker, _temp) = remote_chat_app(
+            "ranges",
+            worker_config,
+            credentials,
+            WorkerClientConfig::default(),
+            None,
+        )
+        .await;
+
+        for (field, value) in [
+            ("temperature", json!(2.5)),
+            ("temperature", json!(-0.1)),
+            ("top_p", json!(0.0)),
+            ("top_p", json!(1.5)),
+            ("top_k", json!(-2)),
+            ("presence_penalty", json!(2.5)),
+            ("frequency_penalty", json!(-3.0)),
+            ("repetition_penalty", json!(0.5)),
+            ("max_tokens", json!(0)),
+            ("max_completion_tokens", json!(0)),
+            ("n", json!(2)),
+        ] {
+            let mut body = json!({
+                "model": ModelVariant::Qwen354BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            body[field] = value.clone();
+            let mut request = public_chat_request();
+            *request.body_mut() = Body::from(body.to_string());
+            let response = app
+                .as_service::<Body>()
+                .call(request)
+                .await
+                .expect("router request should succeed");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={value}"
+            );
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{field}");
+            assert_eq!(body["error"]["param"], field, "{field}={value}");
+            assert_eq!(body["error"]["code"], "invalid_value", "{field}");
+        }
+        assert_eq!(worker.served_invocations(), 0);
     }
 
     #[tokio::test]

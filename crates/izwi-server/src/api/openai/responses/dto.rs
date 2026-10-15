@@ -21,8 +21,9 @@ pub struct ResponsesCreateRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// `-1` (vLLM) or `0` disables top-k sampling.
     #[serde(default)]
-    pub top_k: Option<usize>,
+    pub top_k: Option<i64>,
     #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]

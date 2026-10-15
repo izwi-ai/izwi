@@ -2014,7 +2014,7 @@ pub struct ChatCompletionRequest {
     pub stream_options: Option<ChatCompletionStreamOptions>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
-    pub top_k: Option<usize>,
+    pub top_k: Option<i64>,
     pub repetition_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub seed: Option<i64>,

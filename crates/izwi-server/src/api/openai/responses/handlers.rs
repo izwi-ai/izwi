@@ -11,8 +11,8 @@ use axum::{
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, resolve_chat_request_config, spawn_chat_stream, ChatExecutionRequest,
-    ChatStreamEvent,
+    chat_top_k, generate_chat, resolve_chat_request_config, spawn_chat_stream,
+    validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
     flatten_content_parts, validate_media_inputs_for_variant, FlattenedMultimodalContent,
@@ -79,6 +79,12 @@ pub async fn create_response(
         media_inputs,
         req.truncation,
     )?;
+    if req.max_output_tokens == Some(0) {
+        return Err(ApiError::invalid_param(
+            "max_output_tokens",
+            "`max_output_tokens` must be at least 1",
+        ));
+    }
     let execution_request = ChatExecutionRequest {
         variant: model_variant,
         messages,
@@ -86,7 +92,7 @@ pub async fn create_response(
         max_tokens: None,
         temperature: req.temperature,
         top_p: req.top_p,
-        top_k: req.top_k,
+        top_k: chat_top_k(req.top_k)?,
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
         seed: None,
@@ -97,6 +103,7 @@ pub async fn create_response(
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };
+    validate_chat_request_ranges(&execution_request)?;
 
     if req.stream.unwrap_or(false) {
         return create_streaming_response(
