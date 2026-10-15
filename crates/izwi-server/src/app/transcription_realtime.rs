@@ -928,11 +928,16 @@ async fn handle_worker_command(
                         );
                     }
                 }
-                Err(err) => send_session_error_with_code(
+                Err(failure) if failure.terminal => {
+                    session.native_asr_stream = None;
+                    send_session_fatal_error(out_tx, session, failure.message);
+                    return true;
+                }
+                Err(failure) => send_session_error_with_code(
                     out_tx,
                     session,
                     RealtimeErrorCode::InferenceFailed,
-                    err,
+                    failure.message,
                 ),
             }
             false
@@ -1023,6 +1028,45 @@ fn send_session_error_with_code(
             }
         }
     }
+}
+
+/// Ends the session after a failure the stream cannot recover from: one
+/// fatal error and a close frame, instead of an error for every later frame.
+fn send_session_fatal_error(
+    out_tx: &OutboundTx,
+    session: &mut RealtimeSessionState,
+    message: String,
+) {
+    const REASON: &str = "realtime_stream_failed";
+    match session.wire_protocol {
+        TranscriptionWireProtocol::LegacyV2 => {
+            send_json(
+                out_tx,
+                json!({ "type": "error", "code": REASON, "message": message, "fatal": true }),
+            );
+        }
+        TranscriptionWireProtocol::TypedV3 => {
+            if let Some(typed) = session.typed_session.as_mut() {
+                typed.send(
+                    out_tx,
+                    RealtimeServerEvent::FatalError {
+                        code: RealtimeErrorCode::InferenceFailed,
+                        message,
+                        close: RealtimeClose {
+                            code: RealtimeCloseCode::InternalError,
+                            reason: RealtimeCloseReason::InternalError,
+                            message: "transcription realtime stream failed".to_string(),
+                            retryable: false,
+                        },
+                    },
+                );
+            }
+        }
+    }
+    let _ = out_tx.send(Message::Close(Some(CloseFrame {
+        code: RealtimeCloseCode::InternalError.websocket_code(),
+        reason: REASON.into(),
+    })));
 }
 
 fn send_session_pong(
@@ -1315,13 +1359,29 @@ fn ingest_audio_frame(
     Ok(samples)
 }
 
+/// A native realtime stream failure. A `terminal` failure closed the runtime
+/// stream, so every later push would fail the same way.
+struct NativeStreamFailure {
+    message: String,
+    terminal: bool,
+}
+
+impl NativeStreamFailure {
+    fn recoverable(error: impl ToString) -> Self {
+        Self {
+            message: error.to_string(),
+            terminal: false,
+        }
+    }
+}
+
 async fn maybe_process_native_stream_frame(
     state: &AppState,
     out_tx: &OutboundTx,
     session: &mut RealtimeSessionState,
     frame_samples: &[i16],
     sample_rate: u32,
-) -> Result<bool, String> {
+) -> Result<bool, NativeStreamFailure> {
     if frame_samples.is_empty() {
         return Ok(session.native_asr_stream.is_some());
     }
@@ -1337,7 +1397,7 @@ async fn maybe_process_native_stream_frame(
                 None,
             )
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(NativeStreamFailure::recoverable)?;
     }
 
     let Some(stream) = session.native_asr_stream.as_mut() else {
@@ -1351,7 +1411,10 @@ async fn maybe_process_native_stream_frame(
         .runtime
         .push_asr_realtime_samples(stream, &samples, sample_rate)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| NativeStreamFailure {
+            message: err.to_string(),
+            terminal: stream.is_closed(),
+        })?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     emit_native_stream_events(out_tx, session, events, sample_rate, processing_time_ms);
     session.pending_recompute = false;
@@ -2112,9 +2175,9 @@ mod tests {
 
     use super::{
         collapse_unstable_repetition, ingest_audio_frame, merge_online_transcript,
-        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_finished,
-        strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput, OutboundTx,
-        RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
+        negotiate_transcription_protocol, pcm16_i16_to_f32, send_session_fatal_error,
+        send_session_finished, strip_suffix_prefix_overlap_with_lookahead_by_words, MailboxOutput,
+        OutboundTx, RealtimeInferenceDiagnostics, RealtimeSessionState, TranscriptionWireProtocol,
         TypedTranscriptionSession,
     };
     use crate::app::realtime_protocol::{
@@ -2225,6 +2288,56 @@ mod tests {
             events[2].event.finality(),
             RealtimeEventFinality::SessionFinal
         );
+    }
+
+    /// SPK-F1: a closed native stream ends the session with one fatal error
+    /// and a close frame, for both wire protocols.
+    #[tokio::test]
+    async fn terminal_native_stream_failure_sends_one_fatal_error_then_closes() {
+        let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
+        for wire_protocol in [
+            TranscriptionWireProtocol::TypedV3,
+            TranscriptionWireProtocol::LegacyV2,
+        ] {
+            let outbound = OutboundTx::with_capacity(runtime.clone(), "transcription test", 8);
+            let mut session = RealtimeSessionState {
+                started: true,
+                wire_protocol,
+                typed_session: (wire_protocol == TranscriptionWireProtocol::TypedV3).then(|| {
+                    TypedTranscriptionSession::with_identity(
+                        "session-1".to_string(),
+                        "process-42".to_string(),
+                    )
+                }),
+                ..RealtimeSessionState::default()
+            };
+
+            send_session_fatal_error(&outbound, &mut session, "stream expired".to_string());
+
+            let Some(MailboxOutput::Message(Message::Text(text))) = outbound.next().await else {
+                panic!("expected the fatal error event");
+            };
+            if wire_protocol == TranscriptionWireProtocol::TypedV3 {
+                let envelope = serde_json::from_str::<RealtimeServerEnvelope>(text.as_str())
+                    .expect("typed event envelope");
+                let RealtimeServerEvent::FatalError { message, close, .. } = &envelope.event else {
+                    panic!("expected a typed fatal error, got {:?}", envelope.event);
+                };
+                assert_eq!(message, "stream expired");
+                assert!(!close.retryable);
+                assert!(envelope.event.requires_connection_close());
+            } else {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("legacy error");
+                assert_eq!(value["type"], "error");
+                assert_eq!(value["fatal"], true);
+            }
+            let Some(MailboxOutput::Message(Message::Close(Some(frame)))) = outbound.next().await
+            else {
+                panic!("expected a close frame after the fatal error");
+            };
+            assert_eq!(frame.code, 1011);
+        }
     }
 
     #[tokio::test]

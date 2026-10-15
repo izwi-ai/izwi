@@ -927,35 +927,8 @@ fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) 
         let guard = RealtimeAsrCleanupGuard::new(cleanup, engine_session);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let cleanup_receipt = match guard
-                    .engine_session()
-                    .engine
-                    .cleanup_realtime_asr_session(&guard.engine_session().handle)
-                    .await
-                {
-                    Ok(receipt) => receipt,
-                    Err(error) => {
-                        tracing::error!(
-                            request_id = %guard.engine_session().handle.request_id(),
-                            error = %error,
-                            "Engine realtime ASR cleanup receipt could not be created; retaining authorities"
-                        );
-                        return;
-                    }
-                };
-                if let Err(error) = cleanup_receipt.confirmed().await {
-                    tracing::error!(
-                        request_id = %guard.engine_session().handle.request_id(),
-                        error = %error,
-                        "Engine realtime ASR cleanup was not confirmed; retaining authorities"
-                    );
-                    return;
-                }
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn_blocking(move || guard.release_confirmed());
-                } else {
-                    guard.release_confirmed();
-                }
+                // Failures are logged and retain the authorities.
+                let _ = confirm_realtime_asr_engine_cleanup(guard).await;
             });
             return;
         }
@@ -970,6 +943,62 @@ fn schedule_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) 
         handle.spawn_blocking(move || cleanup.release());
     } else {
         cleanup.release();
+    }
+}
+
+/// Releases a detached Engine session's authorities only after the Engine
+/// confirms its cleanup. Any failure, or dropping this future, retains them.
+async fn confirm_realtime_asr_engine_cleanup(guard: RealtimeAsrCleanupGuard) -> Result<()> {
+    let cleanup_receipt = match guard
+        .engine_session()
+        .engine
+        .cleanup_realtime_asr_session(&guard.engine_session().handle)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            tracing::error!(
+                request_id = %guard.engine_session().handle.request_id(),
+                error = %error,
+                "Engine realtime ASR cleanup receipt could not be created; retaining authorities"
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = cleanup_receipt.confirmed().await {
+        tracing::error!(
+            request_id = %guard.engine_session().handle.request_id(),
+            error = %error,
+            "Engine realtime ASR cleanup was not confirmed; retaining authorities"
+        );
+        return Err(error);
+    }
+    tokio::task::spawn_blocking(move || guard.release_confirmed())
+        .await
+        .map_err(|error| {
+            Error::InferenceError(format!("realtime ASR cleanup release failed: {error}"))
+        })
+}
+
+/// Like [`schedule_realtime_asr_cleanup`], but completes before returning,
+/// so a rollover never holds two segments' physical state at once.
+async fn release_realtime_asr_cleanup(cleanup: Option<RealtimeAsrDetachedResources>) -> Result<()> {
+    let Some(mut cleanup) = cleanup else {
+        return Ok(());
+    };
+    match cleanup.engine_session.take() {
+        Some(engine_session) => {
+            confirm_realtime_asr_engine_cleanup(RealtimeAsrCleanupGuard::new(
+                cleanup,
+                engine_session,
+            ))
+            .await
+        }
+        None => tokio::task::spawn_blocking(move || cleanup.release())
+            .await
+            .map_err(|error| {
+                Error::InferenceError(format!("realtime ASR cleanup release failed: {error}"))
+            }),
     }
 }
 
@@ -1130,11 +1159,135 @@ pub struct RuntimeAsrRealtimeStream {
     engine_sample_rate: Option<u32>,
     engine_text: String,
     engine_chunk_index: usize,
+    segment: RealtimeEngineSegment,
+}
+
+/// An Engine realtime session prepares at most `max_samples` of source
+/// audio (Voxtral re-encodes its whole prefix on every push), so a longer
+/// stream continues in a fresh session. A segment looks for a pause in its
+/// final fifth so the boundary falls between words; it rolls over at the
+/// hard ceiling only when the speaker never pauses.
+const REALTIME_SEGMENT_SOFT_ROLLOVER_DIVISOR: usize = 5;
+/// Sustained quiet audio that counts as a pause between words.
+const REALTIME_SEGMENT_PAUSE_MS: u64 = 200;
+/// Chunk RMS below which pushed audio counts as quiet (about -40 dBFS).
+const REALTIME_SEGMENT_QUIET_RMS: f64 = 0.01;
+
+/// What an Engine realtime stream carries from one session to the next.
+#[derive(Debug, Default)]
+struct RealtimeEngineSegment {
+    language: Option<String>,
+    prompt: Option<String>,
+    trailing_quiet_samples: usize,
+    separator_pending: bool,
+}
+
+impl RealtimeEngineSegment {
+    fn new(language: Option<&str>, prompt: Option<&str>) -> Self {
+        Self {
+            language: language.map(str::to_string),
+            prompt: prompt.map(str::to_string),
+            ..Self::default()
+        }
+    }
+}
+
+fn realtime_chunk_is_quiet(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let energy: f64 = samples
+        .iter()
+        .map(|sample| f64::from(*sample) * f64::from(*sample))
+        .sum();
+    (energy / samples.len() as f64).sqrt() < REALTIME_SEGMENT_QUIET_RMS
+}
+
+fn realtime_trailing_quiet_samples(previous: usize, chunk: &[f32]) -> usize {
+    if realtime_chunk_is_quiet(chunk) {
+        previous.saturating_add(chunk.len())
+    } else {
+        0
+    }
+}
+
+/// Whether an Engine realtime stream must start a new session before it
+/// accepts `incoming` more samples.
+fn realtime_segment_rollover_due(
+    committed_samples: usize,
+    incoming_samples: usize,
+    trailing_quiet_samples: usize,
+    max_samples: usize,
+    sample_rate: u32,
+) -> bool {
+    if committed_samples == 0 {
+        return false;
+    }
+    if committed_samples.saturating_add(incoming_samples) > max_samples {
+        return true;
+    }
+    let soft_start = max_samples - max_samples / REALTIME_SEGMENT_SOFT_ROLLOVER_DIVISOR;
+    let pause_samples = usize::try_from(u64::from(sample_rate) * REALTIME_SEGMENT_PAUSE_MS / 1_000)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    committed_samples >= soft_start && trailing_quiet_samples >= pause_samples
 }
 
 impl RuntimeAsrRealtimeStream {
     fn execution_path(&self) -> RealtimeAsrExecutionPath {
         realtime_asr_execution_path(self.variant)
+    }
+
+    /// Whether the stream has ended: finished, failed, or expired. A closed
+    /// stream rejects every later operation, so callers must stop feeding it.
+    pub fn is_closed(&self) -> bool {
+        self.resources
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .closed
+    }
+
+    /// The session-wide authorities a rollover hands to the next segment:
+    /// the session quota slot, the absolute lifetime and the idle timeout.
+    fn segment_authorities(&self) -> Result<(Arc<RealtimeAsrSessionLease>, Instant, Duration)> {
+        let resources = self.resources.lock().map_err(|_| {
+            Error::InferenceError("realtime ASR resource mutex poisoned".to_string())
+        })?;
+        if resources.closed {
+            return Err(resources.closed_error());
+        }
+        let session_lease = resources.session_lease.as_ref().cloned().ok_or_else(|| {
+            Error::InferenceError("realtime ASR session lease is unavailable".into())
+        })?;
+        Ok((
+            session_lease,
+            resources.absolute_deadline,
+            resources.idle_timeout,
+        ))
+    }
+
+    fn detach(&self) -> Option<RealtimeAsrDetachedResources> {
+        let cleanup = self
+            .resources
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .detach();
+        self.activity.notify_one();
+        cleanup
+    }
+
+    /// Continues this stream on `next`'s fresh Engine session. The
+    /// transcript, chunk numbering and language carry over; the segment
+    /// clock restarts. `next` is left holding this stream's closed session.
+    fn continue_on(&mut self, next: &mut RuntimeAsrRealtimeStream) {
+        std::mem::swap(&mut self.resources, &mut next.resources);
+        std::mem::swap(&mut self.activity, &mut next.activity);
+        std::mem::swap(&mut self.operation_gate, &mut next.operation_gate);
+        self.max_samples = next.max_samples;
+        self.committed_samples = 0;
+        self.engine_sample_rate = None;
+        self.segment.trailing_quiet_samples = 0;
+        self.segment.separator_pending = true;
     }
 
     fn begin_engine_operation(
@@ -1192,7 +1345,18 @@ impl RuntimeAsrRealtimeStream {
         outputs
             .into_iter()
             .map(|output| {
-                let delta = output.text.unwrap_or_default();
+                let mut delta = output.text.unwrap_or_default();
+                if self.segment.separator_pending && !delta.is_empty() {
+                    // A new segment's decoder starts without the previous
+                    // word, so it may not emit the space between them.
+                    self.segment.separator_pending = false;
+                    if !self.engine_text.is_empty()
+                        && !self.engine_text.ends_with(char::is_whitespace)
+                        && !delta.starts_with(char::is_whitespace)
+                    {
+                        delta.insert(0, ' ');
+                    }
+                }
                 self.engine_text.push_str(&delta);
                 let chunk_index = self.engine_chunk_index;
                 self.engine_chunk_index = self.engine_chunk_index.saturating_add(1);
@@ -1283,13 +1447,7 @@ impl RuntimeAsrRealtimeStream {
     }
 
     fn close(&self) {
-        let cleanup = self
-            .resources
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .detach();
-        schedule_realtime_asr_cleanup(cleanup);
-        self.activity.notify_one();
+        schedule_realtime_asr_cleanup(self.detach());
     }
 
     fn close_due_to_timeout(&self) {
@@ -1795,6 +1953,7 @@ impl RuntimeService {
             engine_sample_rate: None,
             engine_text: String::new(),
             engine_chunk_index: 0,
+            segment: RealtimeEngineSegment::new(language, prompt),
         })
     }
 
@@ -1957,6 +2116,7 @@ impl RuntimeService {
             engine_sample_rate: None,
             engine_text: String::new(),
             engine_chunk_index: 0,
+            segment: RealtimeEngineSegment::default(),
         }))
     }
 
@@ -1974,6 +2134,28 @@ impl RuntimeService {
             return Ok(Vec::new());
         }
         if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
+            let mut events = Vec::new();
+            if realtime_segment_rollover_due(
+                stream.committed_samples,
+                samples.len(),
+                stream.segment.trailing_quiet_samples,
+                stream.max_samples,
+                sample_rate,
+            ) {
+                // A failed rollover has already finished or detached the
+                // current session, so the stream ends instead of rejecting
+                // every later push.
+                events = match self
+                    .roll_over_engine_realtime_segment(stream, sample_rate)
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        stream.close();
+                        return Err(error);
+                    }
+                };
+            }
             let total_samples = stream
                 .committed_samples
                 .checked_add(samples.len())
@@ -2087,7 +2269,10 @@ impl RuntimeService {
             }
             stream.committed_samples = total_samples;
             stream.engine_sample_rate = Some(sample_rate);
-            return Ok(stream.map_engine_outputs(outputs));
+            stream.segment.trailing_quiet_samples =
+                realtime_trailing_quiet_samples(stream.segment.trailing_quiet_samples, samples);
+            events.extend(stream.map_engine_outputs(outputs));
+            return Ok(events);
         }
         let handles = stream.begin_operation(true)?;
         let operation_lease = self
@@ -2161,103 +2346,167 @@ impl RuntimeService {
         Ok(map_native_realtime_events(events))
     }
 
+    /// Flushes the current Engine session's audio and returns its final
+    /// outputs. Success leaves the stream open so the caller decides between
+    /// ending it and rolling over into a fresh session.
+    async fn finish_engine_realtime_segment(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+    ) -> Result<Vec<StreamingOutput>> {
+        let handles = stream.begin_engine_operation(false)?;
+        let operation_lease = self
+            .model_lifecycle
+            .try_acquire_ready_lease(stream.variant)
+            .ok_or_else(|| {
+                Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
+            });
+        let operation_lease = match operation_lease {
+            Ok(lease) => lease,
+            Err(error) => {
+                stream.close();
+                return Err(error);
+            }
+        };
+        let RealtimeAsrEngineOperationHandles {
+            session,
+            job,
+            session_lease,
+            _guard: operation_guard,
+        } = handles;
+        let sample_rate = stream.engine_sample_rate.ok_or_else(|| {
+            Error::InvalidInput("realtime ASR finish requires committed audio".into())
+        })?;
+        let preparation_cost = session.model.preparation_cost(
+            0,
+            stream.committed_samples,
+            sample_rate,
+            VoxtralRealtimePreparationMode::Finish,
+        )?;
+        let committed_observation = match &session.model {
+            RuntimeRealtimeEngineModel::Voxtral(model) => {
+                let geometry = model.realtime_preparation_geometry_for_source_samples(
+                    stream.committed_samples,
+                    sample_rate,
+                    VoxtralRealtimePreparationMode::Finish,
+                )?;
+                voxtral_realtime_committed_observation(
+                    session.retained_metadata_bytes,
+                    model.realtime_prepared_resource_usage(geometry)?,
+                )?
+            }
+            RuntimeRealtimeEngineModel::Nemotron { .. } => session
+                .model
+                .committed_observation(session.retained_metadata_bytes)?,
+        };
+        let ordering = match self
+            .coordinator
+            .acquire_job_ordering(&job, stream.operation_gate.clone())
+            .await
+        {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                drop((operation_lease, session_lease, operation_guard));
+                if matches!(error, Error::Timeout(_)) {
+                    stream.close_due_to_timeout();
+                } else {
+                    stream.close();
+                }
+                return Err(error);
+            }
+        };
+        let operation = session
+            .engine
+            .finish_realtime_asr_session_with_outputs_and_cost(
+                &session.handle,
+                session.max_output_steps,
+                session.max_cache_append,
+                preparation_cost,
+            );
+        let result = match job.spec.deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::Timeout("realtime ASR Engine finish".into())),
+            },
+            None => operation.await,
+        };
+        drop((ordering, operation_lease, session_lease, operation_guard));
+        let (_ack, outputs) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if matches!(error, Error::Timeout(_)) {
+                    stream.close_due_to_timeout();
+                } else {
+                    stream.close();
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = job.record_materialized_usage(committed_observation) {
+            stream.close();
+            return Err(error);
+        }
+        Ok(outputs)
+    }
+
+    /// Ends the current Engine session at a segment boundary and continues
+    /// the stream in a fresh one. The flushed text is returned as ordinary
+    /// (non-final) events; the stream's transcript stays continuous.
+    async fn roll_over_engine_realtime_segment(
+        &self,
+        stream: &mut RuntimeAsrRealtimeStream,
+        sample_rate: u32,
+    ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
+        if stream
+            .engine_sample_rate
+            .is_some_and(|established| established != sample_rate)
+        {
+            return Err(Error::InvalidInput(
+                "realtime ASR sample rate changed within one stream".into(),
+            ));
+        }
+        let (session_lease, absolute_deadline, idle_timeout) = stream.segment_authorities()?;
+        let outputs = self.finish_engine_realtime_segment(stream).await?;
+        let mut events = stream.map_engine_outputs(outputs);
+        for event in &mut events {
+            event.is_final = false;
+        }
+        // The session quota slot travels with `session_lease`; the finished
+        // session's memory and residency are released before the next one
+        // is admitted.
+        tokio::time::timeout_at(
+            absolute_deadline.into(),
+            release_realtime_asr_cleanup(stream.detach()),
+        )
+        .await
+        .map_err(|_| Error::Timeout("realtime ASR segment cleanup".into()))??;
+        let language = stream.segment.language.clone();
+        let prompt = stream.segment.prompt.clone();
+        let metadata_bytes = language.as_deref().map(str::len).unwrap_or_default()
+            + prompt.as_deref().map(str::len).unwrap_or_default();
+        let context = RuntimeRequestContext::new(crate::engine::WorkloadClass::Realtime)
+            .with_deadline(absolute_deadline);
+        let mut next = self
+            .start_engine_realtime_stream(
+                stream.variant,
+                language.as_deref(),
+                prompt.as_deref(),
+                context,
+                metadata_bytes,
+                session_lease,
+                absolute_deadline,
+                idle_timeout,
+            )
+            .await?;
+        stream.continue_on(&mut next);
+        Ok(events)
+    }
+
     pub async fn finish_asr_realtime_stream(
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
         if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
-            let handles = stream.begin_engine_operation(false)?;
-            let operation_lease = self
-                .model_lifecycle
-                .try_acquire_ready_lease(stream.variant)
-                .ok_or_else(|| {
-                    Error::ModelNotFound(format!("ASR model {} is not resident", stream.variant))
-                });
-            let operation_lease = match operation_lease {
-                Ok(lease) => lease,
-                Err(error) => {
-                    stream.close();
-                    return Err(error);
-                }
-            };
-            let RealtimeAsrEngineOperationHandles {
-                session,
-                job,
-                session_lease,
-                _guard: operation_guard,
-            } = handles;
-            let sample_rate = stream.engine_sample_rate.ok_or_else(|| {
-                Error::InvalidInput("realtime ASR finish requires committed audio".into())
-            })?;
-            let preparation_cost = session.model.preparation_cost(
-                0,
-                stream.committed_samples,
-                sample_rate,
-                VoxtralRealtimePreparationMode::Finish,
-            )?;
-            let committed_observation = match &session.model {
-                RuntimeRealtimeEngineModel::Voxtral(model) => {
-                    let geometry = model.realtime_preparation_geometry_for_source_samples(
-                        stream.committed_samples,
-                        sample_rate,
-                        VoxtralRealtimePreparationMode::Finish,
-                    )?;
-                    voxtral_realtime_committed_observation(
-                        session.retained_metadata_bytes,
-                        model.realtime_prepared_resource_usage(geometry)?,
-                    )?
-                }
-                RuntimeRealtimeEngineModel::Nemotron { .. } => session
-                    .model
-                    .committed_observation(session.retained_metadata_bytes)?,
-            };
-            let ordering = match self
-                .coordinator
-                .acquire_job_ordering(&job, stream.operation_gate.clone())
-                .await
-            {
-                Ok(ordering) => ordering,
-                Err(error) => {
-                    drop((operation_lease, session_lease, operation_guard));
-                    if matches!(error, Error::Timeout(_)) {
-                        stream.close_due_to_timeout();
-                    } else {
-                        stream.close();
-                    }
-                    return Err(error);
-                }
-            };
-            let operation = session
-                .engine
-                .finish_realtime_asr_session_with_outputs_and_cost(
-                    &session.handle,
-                    session.max_output_steps,
-                    session.max_cache_append,
-                    preparation_cost,
-                );
-            let result = match job.spec.deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline.into(), operation).await {
-                    Ok(result) => result,
-                    Err(_) => Err(Error::Timeout("realtime ASR Engine finish".into())),
-                },
-                None => operation.await,
-            };
-            drop((ordering, operation_lease, session_lease, operation_guard));
-            let (_ack, outputs) = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    if matches!(error, Error::Timeout(_)) {
-                        stream.close_due_to_timeout();
-                    } else {
-                        stream.close();
-                    }
-                    return Err(error);
-                }
-            };
-            if let Err(error) = job.record_materialized_usage(committed_observation) {
-                stream.close();
-                return Err(error);
-            }
+            let outputs = self.finish_engine_realtime_segment(stream).await?;
             stream.close();
             return Ok(stream.map_engine_outputs(outputs));
         }
@@ -5193,6 +5442,7 @@ mod tests {
             engine_sample_rate: None,
             engine_text: String::new(),
             engine_chunk_index: 0,
+            segment: RealtimeEngineSegment::default(),
         };
 
         // Nemotron routes to the direct native streaming path: the fixture
@@ -5214,6 +5464,217 @@ mod tests {
             .to_string()
             .contains("realtime ASR stream model is unavailable"));
         assert!(!finish.to_string().contains("Engine realtime ASR session"));
+    }
+
+    fn fixture_realtime_stream(
+        max_samples: usize,
+        session_lease: Option<Arc<RealtimeAsrSessionLease>>,
+    ) -> RuntimeAsrRealtimeStream {
+        let now = Instant::now();
+        let resources = Arc::new(StdMutex::new(RuntimeAsrRealtimeResources {
+            model: None,
+            state: None,
+            execution_contract: None,
+            residency_lease: None,
+            job: None,
+            session_lease,
+            engine_session: None,
+            voxtral_model: None,
+            absolute_deadline: now + Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+            last_activity: now,
+            active_operations: 0,
+            closed: false,
+            timeout_reason: None,
+        }));
+        RuntimeAsrRealtimeStream {
+            variant: ModelVariant::VoxtralMini4BRealtime2602,
+            resources,
+            activity: Arc::new(Notify::new()),
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
+            max_samples,
+            committed_samples: 0,
+            engine_sample_rate: None,
+            engine_text: String::new(),
+            engine_chunk_index: 0,
+            segment: RealtimeEngineSegment::new(Some("en"), None),
+        }
+    }
+
+    fn text_output(text: &str, is_final: bool) -> StreamingOutput {
+        let mut output = StreamingOutput::new("rollover".to_string(), 0, Vec::new(), 16_000);
+        output.text = Some(text.to_string());
+        output.is_final = is_final;
+        output
+    }
+
+    /// SPK-F1: Voxtral prepares at most 30 s per session. Drive 70 s of
+    /// synthetic speech with pauses, then 70 s without any, through the
+    /// segment clock: no segment may exceed the ceiling, a segment ends in a
+    /// pause when the speaker leaves one near the ceiling, and continuous
+    /// speech still rolls over exactly at the ceiling.
+    #[test]
+    fn realtime_segment_clock_rolls_over_at_a_pause_or_the_ceiling() {
+        const RATE: u32 = 16_000;
+        const MAX: usize = 480_000;
+        const FRAME: usize = 320;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut speech = move || {
+            (0..FRAME)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.6
+                })
+                .collect::<Vec<f32>>()
+        };
+        let silence = vec![0.0_f32; FRAME];
+        let pause_samples = (RATE as usize) * REALTIME_SEGMENT_PAUSE_MS as usize / 1_000;
+        let soft_start = MAX - MAX / REALTIME_SEGMENT_SOFT_ROLLOVER_DIVISOR;
+
+        let run = |pattern: &mut dyn FnMut(usize) -> Vec<f32>| {
+            let (mut committed, mut quiet, mut boundaries) = (0_usize, 0_usize, Vec::new());
+            for frame_index in 0..(70 * RATE as usize / FRAME) {
+                let frame = pattern(frame_index);
+                if realtime_segment_rollover_due(committed, frame.len(), quiet, MAX, RATE) {
+                    boundaries.push((committed, quiet));
+                    committed = 0;
+                    quiet = 0;
+                }
+                committed += frame.len();
+                assert!(committed <= MAX, "a segment exceeded the session ceiling");
+                quiet = realtime_trailing_quiet_samples(quiet, &frame);
+            }
+            boundaries
+        };
+
+        // 1.6 s of speech, then 0.4 s of silence, repeated.
+        let paused = run(&mut |index| {
+            if index % 100 < 80 {
+                speech()
+            } else {
+                silence.clone()
+            }
+        });
+        assert_eq!(paused.len(), 2, "70 s of audio spans three segments");
+        for (committed, quiet) in paused {
+            assert!(committed >= soft_start && committed < MAX);
+            assert!(quiet >= pause_samples, "the boundary must fall in a pause");
+        }
+
+        let continuous = run(&mut |_| speech());
+        assert_eq!(continuous, vec![(MAX, 0), (MAX, 0)]);
+    }
+
+    #[test]
+    fn realtime_segment_clock_never_rolls_over_an_empty_segment() {
+        let due = |committed, incoming, quiet| {
+            realtime_segment_rollover_due(committed, incoming, quiet, 480_000, 16_000)
+        };
+        assert!(!due(0, 480_000, 0));
+        assert!(!due(0, 320, 1_000_000));
+        // Quiet audio before the soft window is not a boundary.
+        assert!(!due(100_000, 320, 16_000));
+        assert!(due(479_900, 320, 0));
+    }
+
+    /// A rollover keeps one continuous transcript: chunk numbering carries
+    /// over, the segment flush is not reported as the stream's final event,
+    /// and a missing word separator is restored at the boundary.
+    #[tokio::test]
+    async fn engine_segment_continuation_keeps_one_transcript_and_quota_slot() {
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+        })
+        .expect("session policy");
+        let lease = policy.try_acquire().expect("session slot");
+        let mut stream = fixture_realtime_stream(480_000, Some(lease));
+        stream.committed_samples = 480_000;
+        stream.engine_sample_rate = Some(16_000);
+        stream.segment.trailing_quiet_samples = 3_200;
+
+        let first = stream.map_engine_outputs(vec![
+            text_output("Hello", false),
+            text_output(" world", false),
+        ]);
+        assert_eq!(first[1].text, "Hello world");
+
+        let (session_lease, _, _) = stream.segment_authorities().expect("open stream");
+        release_realtime_asr_cleanup(stream.detach())
+            .await
+            .expect("release the finished segment");
+        assert!(stream.is_closed());
+        assert_eq!(
+            policy.permits.available_permits(),
+            0,
+            "the session keeps its quota slot across the rollover"
+        );
+
+        let mut next = fixture_realtime_stream(240_000, Some(session_lease));
+        stream.continue_on(&mut next);
+        drop(next);
+        assert!(!stream.is_closed());
+        assert_eq!(stream.max_samples, 240_000);
+        assert_eq!(stream.committed_samples, 0);
+        assert_eq!(stream.engine_sample_rate, None);
+        assert_eq!(stream.segment.trailing_quiet_samples, 0);
+        assert_eq!(stream.segment.language.as_deref(), Some("en"));
+        assert_eq!(policy.permits.available_permits(), 0);
+
+        let second = stream.map_engine_outputs(vec![
+            text_output("", false),
+            text_output("again", false),
+            text_output(" today", true),
+        ]);
+        assert_eq!(second[1].delta, " again");
+        assert_eq!(second[2].text, "Hello world again today");
+        assert_eq!(second[2].chunk_index, 4);
+        assert!(second[2].is_final);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while policy.permits.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the stream releases its one slot");
+    }
+
+    /// SPK-F1 regression: a push past the Engine session ceiling used to be
+    /// rejected while the stream stayed open, so every later frame failed
+    /// the same way. It must now roll over, or end the stream if the
+    /// rollover cannot run (this fixture has no Engine session to finish).
+    #[tokio::test]
+    async fn push_past_the_engine_ceiling_never_leaves_a_stream_that_rejects_every_frame() {
+        let runtime = RuntimeService::new(EngineConfig {
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let policy = RealtimeAsrSessionPolicy::new(RealtimeAsrSessionLimits {
+            max_sessions: 1,
+            max_lifetime: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+        })
+        .expect("session policy");
+        let mut stream =
+            fixture_realtime_stream(16, Some(policy.try_acquire().expect("session slot")));
+        stream.committed_samples = 16;
+        stream.engine_sample_rate = Some(16_000);
+
+        let error = runtime
+            .push_asr_realtime_samples(&mut stream, &[0.25; 4], 16_000)
+            .await
+            .expect_err("the fixture cannot open a new segment");
+        assert!(
+            !error.to_string().contains("exceeds the stream reservation"),
+            "the ceiling must trigger a rollover, not a per-frame rejection: {error}"
+        );
+        assert!(stream.is_closed(), "a failed rollover must end the stream");
     }
 
     #[test]
@@ -5427,6 +5888,7 @@ mod tests {
             engine_sample_rate: None,
             engine_text: String::new(),
             engine_chunk_index: 0,
+            segment: RealtimeEngineSegment::default(),
         };
 
         drop(stream);
