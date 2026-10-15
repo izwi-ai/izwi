@@ -1241,7 +1241,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         json!({
             "type": "boolean",
             "default": false,
-            "description": "For transcription jobs, generate an AI summary after the transcript is ready. Defaults to false."
+            "description": "For transcription and diarization jobs, generate an AI summary after the transcript is ready (diarization uses llm_model). Defaults to false."
         }),
     );
     properties.insert(
@@ -1263,7 +1263,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "llm_model".to_string(),
         json!({
             "type": "string",
-            "description": "Optional diarization transcript-refinement model."
+            "description": "Optional diarization chat model for transcript refinement and the summary."
         }),
     );
     properties.insert(

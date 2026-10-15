@@ -25,7 +25,7 @@ use crate::diarization_store::{
 use crate::error::ApiError;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, resolve_diarization_asr_model_variant,
+    parse_model_variant, resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
     validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole,
     DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
@@ -71,6 +71,9 @@ pub struct RerunDiarizationRecordRequest {
     pub min_silence_duration_ms: Option<f64>,
     #[serde(default)]
     pub enable_llm_refinement: Option<bool>,
+    /// Defaults to whether the source record asked for a summary.
+    #[serde(default)]
+    pub generate_summary: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +90,8 @@ struct ParsedDiarizationCreateRequest {
     min_speech_duration_ms: Option<f64>,
     min_silence_duration_ms: Option<f64>,
     enable_llm_refinement: Option<bool>,
+    /// Summarize the transcript with the pipeline LLM once it is ready (D6).
+    generate_summary: bool,
     stream: bool,
 }
 
@@ -111,6 +116,8 @@ struct JsonCreateRequest {
     min_silence_duration_ms: Option<f64>,
     #[serde(default)]
     enable_llm_refinement: Option<bool>,
+    #[serde(default)]
+    generate_summary: Option<bool>,
     #[serde(default)]
     audio_mime_type: Option<String>,
     #[serde(default)]
@@ -309,13 +316,19 @@ pub async fn regenerate_summary(
     Extension(ctx): Extension<RequestContext>,
     Path(record_id): Path<String>,
 ) -> Result<Json<DiarizationRecord>, ApiError> {
+    let existing = state
+        .diarization_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
     let record = state
         .diarization_store
         .update_summary(
             record_id,
             UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Pending,
-                model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+                model_id: Some(summary_model_id(existing.llm_model_id.as_deref())),
                 text: None,
                 error: None,
                 updated_at: None,
@@ -438,6 +451,14 @@ fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Re
                 ApiError::bad_request(format!("Model '{raw}' is not a forced aligner model."))
             })?;
         parsed.aligner_model_id = Some(variant.dir_name().to_string());
+    }
+    if let Some(raw) = parsed.llm_model_id.as_deref() {
+        let variant = resolve_diarization_llm_variant(Some(raw)).map_err(|_| {
+            ApiError::bad_request(format!(
+                "Model '{raw}' is not a chat model for diarization refinement or summaries."
+            ))
+        })?;
+        parsed.llm_model_id = Some(variant.dir_name().to_string());
     }
     Ok(())
 }
@@ -639,6 +660,9 @@ async fn generate_diarization_artifacts(
     Ok(diarization_artifacts(
         output,
         started.elapsed().as_secs_f64() * 1000.0,
+        parsed
+            .generate_summary
+            .then(|| summary_model_id(parsed.llm_model_id.as_deref())),
     ))
 }
 
@@ -647,13 +671,15 @@ async fn generate_diarization_artifacts(
 fn diarization_artifacts(
     output: DiarizationTranscriptResult,
     processing_time_ms: f64,
+    summary_model: Option<String>,
 ) -> GeneratedDiarizationArtifacts {
     let rtf = if output.duration_secs > 0.0 {
         Some((processing_time_ms / 1000.0) / output.duration_secs as f64)
     } else {
         None
     };
-    let (summary_status, summary_model_id) = initial_summary_state(output.transcript.as_str());
+    let (summary_status, summary_model_id) =
+        initial_summary_state(output.transcript.as_str(), summary_model);
 
     GeneratedDiarizationArtifacts {
         duration_secs: output.duration_secs as f64,
@@ -732,6 +758,9 @@ fn build_rerun_create_request(
                 .enable_llm_refinement
                 .unwrap_or(source_record.enable_llm_refinement),
         ),
+        generate_summary: rerun
+            .generate_summary
+            .unwrap_or(source_record.summary_status != DiarizationSummaryStatus::NotRequested),
         stream: false,
     }
 }
@@ -752,14 +781,24 @@ fn validate_speaker_bounds(
         .map_err(ApiError::bad_request)
 }
 
-fn initial_summary_state(transcript: &str) -> (DiarizationSummaryStatus, Option<String>) {
-    if transcript.trim().is_empty() {
-        (DiarizationSummaryStatus::NotRequested, None)
-    } else {
-        (
-            DiarizationSummaryStatus::Pending,
-            Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
-        )
+/// The model that summarizes a record: its pipeline LLM, else the default.
+fn summary_model_id(llm_model_id: Option<&str>) -> String {
+    llm_model_id
+        .unwrap_or(DEFAULT_DIARIZATION_SUMMARY_MODEL)
+        .to_string()
+}
+
+/// A summary is generated only when the job asked for one (`summary_model`)
+/// and there is a transcript to summarize (D6): it loads a chat model.
+fn initial_summary_state(
+    transcript: &str,
+    summary_model: Option<String>,
+) -> (DiarizationSummaryStatus, Option<String>) {
+    match summary_model {
+        Some(model) if !transcript.trim().is_empty() => {
+            (DiarizationSummaryStatus::Pending, Some(model))
+        }
+        _ => (DiarizationSummaryStatus::NotRequested, None),
     }
 }
 
@@ -778,6 +817,10 @@ fn maybe_spawn_summary_generation(
         summary_timeout_secs,
         record.id.clone(),
         record.transcript.clone(),
+        record
+            .summary_model_id
+            .clone()
+            .unwrap_or_else(|| summary_model_id(record.llm_model_id.as_deref())),
         correlation_id,
     );
 }
@@ -787,6 +830,7 @@ fn spawn_summary_generation_task(
     summary_timeout_secs: u64,
     record_id: String,
     transcript: String,
+    model_id: String,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
@@ -801,7 +845,10 @@ fn spawn_summary_generation_task(
                 persist_summary_update(
                     &diarization_store,
                     record_id.as_str(),
-                    summary_failure_update("Summary generation unavailable: request queue closed."),
+                    summary_failure_update(
+                        "Summary generation unavailable: request queue closed.",
+                        &model_id,
+                    ),
                 )
                 .await;
                 return;
@@ -813,6 +860,7 @@ fn spawn_summary_generation_task(
         } else {
             generate_diarization_summary_with_timeout(
                 runtime,
+                &model_id,
                 transcript.as_str(),
                 correlation_id.as_deref(),
                 summary_timeout_secs,
@@ -826,12 +874,12 @@ fn spawn_summary_generation_task(
         let summary_update = match summary_result {
             Ok(summary_text) => UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Ready,
-                model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+                model_id: Some(model_id),
                 text: Some(summary_text),
                 error: None,
                 updated_at: None,
             },
-            Err(err) => summary_failure_update(err.as_str()),
+            Err(err) => summary_failure_update(err.as_str(), &model_id),
         };
 
         persist_summary_update(&diarization_store, record_id.as_str(), summary_update).await;
@@ -840,6 +888,7 @@ fn spawn_summary_generation_task(
 
 async fn generate_diarization_summary_with_timeout(
     runtime: Arc<RuntimeService>,
+    model_id: &str,
     transcript: &str,
     correlation_id: Option<&str>,
     timeout_secs: u64,
@@ -847,7 +896,13 @@ async fn generate_diarization_summary_with_timeout(
 ) -> Result<String, String> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(runtime, transcript, correlation_id, runtime_context),
+        generate_diarization_summary(
+            runtime,
+            model_id,
+            transcript,
+            correlation_id,
+            runtime_context,
+        ),
     )
     .await
     .map_err(|_| summary_timeout_error(timeout_secs))?
@@ -855,14 +910,13 @@ async fn generate_diarization_summary_with_timeout(
 
 async fn generate_diarization_summary(
     runtime: Arc<RuntimeService>,
+    model_id: &str,
     transcript: &str,
     correlation_id: Option<&str>,
     runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
-    let variant =
-        parse_chat_model_variant(Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)).map_err(|err| {
-            format!("Invalid summary model '{DEFAULT_DIARIZATION_SUMMARY_MODEL}': {err}")
-        })?;
+    let variant = resolve_diarization_llm_variant(Some(model_id))
+        .map_err(|err| format!("Invalid summary model '{model_id}': {err}"))?;
     let params = GenerationParams {
         max_tokens: DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS,
         temperature: 0.2,
@@ -898,10 +952,10 @@ async fn generate_diarization_summary(
         .ok_or_else(|| "Summary generation returned empty text".to_string())
 }
 
-fn summary_failure_update(error: &str) -> UpdateDiarizationSummary {
+fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSummary {
     UpdateDiarizationSummary {
         status: DiarizationSummaryStatus::Failed,
-        model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+        model_id: Some(model_id.to_string()),
         text: None,
         error: Some(truncate_summary_error(error)),
         updated_at: None,
@@ -1033,6 +1087,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             min_speech_duration_ms: payload.min_speech_duration_ms,
             min_silence_duration_ms: payload.min_silence_duration_ms,
             enable_llm_refinement: payload.enable_llm_refinement,
+            generate_summary: payload.generate_summary.unwrap_or(false),
             stream: payload.stream.unwrap_or(false),
         });
     }
@@ -1172,6 +1227,14 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                         ))
                     })?;
                     out.enable_llm_refinement = Some(parse_truthy(text.as_str()));
+                }
+                "generate_summary" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'generate_summary' field: {err}"
+                        ))
+                    })?;
+                    out.generate_summary = parse_truthy(text.as_str());
                 }
                 "stream" => {
                     let text = field.text().await.map_err(|err| {
@@ -1334,7 +1397,7 @@ mod tests {
             llm_refined: false,
             warnings: vec![warning.to_string()],
         };
-        let artifacts = diarization_artifacts(output, 1_500.0);
+        let artifacts = diarization_artifacts(output, 1_500.0, None);
         assert_eq!(artifacts.warnings, [warning]);
         assert_eq!(artifacts.alignment_coverage, Some(0.0));
     }
@@ -1409,6 +1472,7 @@ mod tests {
                 min_speech_duration_ms: Some(180.0),
                 min_silence_duration_ms: Some(140.0),
                 enable_llm_refinement: Some(false),
+                generate_summary: None,
             },
         );
 
@@ -1469,15 +1533,65 @@ mod tests {
         assert!(err.message.contains("64 MiB"));
     }
 
+    /// D6, LIVE-10: a summary loads a chat model, so a job gets one only
+    /// when it asks, and it uses the job's pipeline LLM.
     #[test]
-    fn defaults_summary_state_to_pending_for_non_empty_transcripts() {
-        let (status, model_id) = initial_summary_state("SPEAKER_00: hello");
-        assert_eq!(status, DiarizationSummaryStatus::Pending);
-        assert_eq!(model_id.as_deref(), Some("Qwen3.5-4B"));
-
-        let (status, model_id) = initial_summary_state("   ");
+    fn summary_is_generated_only_on_request_with_the_pipeline_llm() {
+        let (status, model_id) = initial_summary_state("SPEAKER_00: hello", None);
         assert_eq!(status, DiarizationSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
+
+        let requested = Some(summary_model_id(Some("Qwen3-8B")));
+        let (status, model_id) = initial_summary_state("SPEAKER_00: hello", requested.clone());
+        assert_eq!(status, DiarizationSummaryStatus::Pending);
+        assert_eq!(model_id.as_deref(), Some("Qwen3-8B"));
+
+        let (status, model_id) = initial_summary_state("   ", requested);
+        assert_eq!(status, DiarizationSummaryStatus::NotRequested);
+        assert_eq!(model_id, None);
+        assert_eq!(summary_model_id(None), DEFAULT_DIARIZATION_SUMMARY_MODEL);
+    }
+
+    #[tokio::test]
+    async fn create_requests_a_summary_only_when_asked() {
+        let request = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "audio_base64": wav_data_url("audio/wav") });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let plain = parse_create_request(request(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(!plain.generate_summary);
+        let asked = parse_create_request(request(serde_json::json!({ "generate_summary": true })))
+            .await
+            .unwrap();
+        assert!(asked.generate_summary);
+
+        // A rerun keeps the source's choice unless it overrides it.
+        let mut source = sample_record();
+        source.summary_status = DiarizationSummaryStatus::NotRequested;
+        let rerun = |source: &DiarizationRecord, generate_summary| {
+            build_rerun_create_request(
+                source,
+                sample_audio(),
+                RerunDiarizationRecordRequest {
+                    generate_summary,
+                    ..Default::default()
+                },
+            )
+            .generate_summary
+        };
+        assert!(!rerun(&source, None));
+        assert!(rerun(&source, Some(true)));
+        source.summary_status = DiarizationSummaryStatus::Ready;
+        assert!(rerun(&source, None));
+        assert!(!rerun(&source, Some(false)));
     }
 
     #[test]
@@ -1503,12 +1617,9 @@ mod tests {
 
     #[test]
     fn summary_failure_update_sets_failed_status_and_truncates_error() {
-        let update = summary_failure_update("x".repeat(500).as_str());
+        let update = summary_failure_update("x".repeat(500).as_str(), "Qwen3-8B");
         assert_eq!(update.status, DiarizationSummaryStatus::Failed);
-        assert_eq!(
-            update.model_id.as_deref(),
-            Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)
-        );
+        assert_eq!(update.model_id.as_deref(), Some("Qwen3-8B"));
         assert!(update.text.is_none());
         let error = update.error.expect("error should be populated");
         assert_eq!(error.len(), 320);

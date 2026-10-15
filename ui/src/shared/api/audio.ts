@@ -939,6 +939,8 @@ export interface DiarizationRecordCreateRequest {
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
   enable_llm_refinement?: boolean;
+  /** Summarize the transcript with the pipeline LLM once it is ready. */
+  generate_summary?: boolean;
 }
 
 export interface DiarizationRecordUpdateRequest {
@@ -951,6 +953,7 @@ export interface DiarizationRecordRerunRequest {
   min_speech_duration_ms?: number;
   min_silence_duration_ms?: number;
   enable_llm_refinement?: boolean;
+  generate_summary?: boolean;
 }
 
 export type ASRStreamEvent =
@@ -3234,6 +3237,9 @@ export class AudioApiClient {
         "enable_llm_refinement",
         enableLlmRefinement ? "true" : "false",
       );
+      if (request.generate_summary) {
+        form.append("generate_summary", "true");
+      }
       if (typeof request.min_speakers === "number") {
         form.append("min_speakers", String(request.min_speakers));
       }
@@ -3275,6 +3281,7 @@ export class AudioApiClient {
         aligner_model: request.aligner_model_id,
         llm_model: request.llm_model_id,
         enable_llm_refinement: enableLlmRefinement,
+        generate_summary: Boolean(request.generate_summary),
         min_speakers: request.min_speakers,
         max_speakers: request.max_speakers,
         min_speech_duration_ms: request.min_speech_duration_ms,

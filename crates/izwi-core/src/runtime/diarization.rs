@@ -1054,19 +1054,18 @@ impl RuntimeService {
             // raw speaker transcript instead of discarding the whole run.
             match resolve_chat_variant(runtime_request.llm_model_id.as_deref()) {
                 Ok(llm_variant) => {
-                    match self
-                        .polish_diarized_transcript(llm_variant, &raw_transcript)
-                        .await
-                    {
-                        Ok(polished) if !polished.trim().is_empty() => {
-                            let polished_trimmed = polished.trim();
-                            transcript = polished_trimmed.to_string();
-                            llm_refined = polished_trimmed != raw_transcript_trimmed;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            warn!("Transcript refinement failed, returning raw speaker transcript: {err}");
-                        }
+                    let polished = self
+                        .polish_diarized_transcript(
+                            &pipeline_job,
+                            llm_variant,
+                            &raw_transcript,
+                            &mut warnings,
+                        )
+                        .await?;
+                    let polished_trimmed = polished.trim();
+                    if !polished_trimmed.is_empty() {
+                        transcript = polished_trimmed.to_string();
+                        llm_refined = polished_trimmed != raw_transcript_trimmed;
                     }
                 }
                 Err(err) => {
@@ -1100,7 +1099,48 @@ impl RuntimeService {
         })
     }
 
+    /// Refine the speaker transcript in batches of whole utterance lines, each
+    /// with an output budget sized from its own length (PIPE-12): one prompt
+    /// over a long transcript ran out of budget and was always discarded.
+    /// A batch the model cannot refine faithfully keeps its raw lines; a
+    /// failed generation keeps the rest raw and adds a warning. Only a
+    /// cancel is an error.
     async fn polish_diarized_transcript(
+        &self,
+        job: &JobLease,
+        llm_variant: ModelVariant,
+        raw_transcript: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<String> {
+        let batches = refinement_batches(raw_transcript);
+        let mut polished = Vec::with_capacity(batches.len());
+        let mut failure = None;
+        for batch in &batches {
+            job.ensure_not_cancelled()?;
+            if failure.is_some() {
+                polished.push(batch.to_string());
+                continue;
+            }
+            match self.polish_transcript_batch(llm_variant, batch).await {
+                Ok(text) => polished.push(text),
+                Err(err) => {
+                    warn!(
+                        "Transcript refinement failed, keeping the raw speaker transcript: {err}"
+                    );
+                    failure = Some(err);
+                    polished.push(batch.to_string());
+                }
+            }
+        }
+        if let Some(err) = failure {
+            warnings.push(format!(
+                "LLM refinement failed ({err}); the rest of the transcript is unrefined"
+            ));
+        }
+        Ok(polished.join("\n"))
+    }
+
+    async fn polish_transcript_batch(
         &self,
         llm_variant: ModelVariant,
         raw_transcript: &str,
@@ -1120,7 +1160,13 @@ impl RuntimeService {
             },
         ];
 
-        let generation = self.chat_generate(llm_variant, messages, 1024).await?;
+        let generation = self
+            .chat_generate(
+                llm_variant,
+                messages,
+                refinement_max_new_tokens(raw_transcript),
+            )
+            .await?;
         Ok(sanitize_refined_transcript(
             &generation.text,
             raw_transcript,
@@ -2556,6 +2602,37 @@ fn format_utterance_transcript(utterances: &[DiarizationUtterance]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Input bytes of one refinement batch: about 500-700 tokens of English, so
+/// the rewrite fits a modest output budget.
+const REFINEMENT_BATCH_BYTES: usize = 2_000;
+
+/// The transcript as batches of whole lines of at most
+/// [`REFINEMENT_BATCH_BYTES`] (a longer line is a batch of its own).
+fn refinement_batches(transcript: &str) -> Vec<String> {
+    let mut batches = Vec::new();
+    let mut batch = String::new();
+    for line in transcript.lines().filter(|line| !line.trim().is_empty()) {
+        if !batch.is_empty() && batch.len() + 1 + line.len() > REFINEMENT_BATCH_BYTES {
+            batches.push(std::mem::take(&mut batch));
+        }
+        if !batch.is_empty() {
+            batch.push('\n');
+        }
+        batch.push_str(line);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// Output budget for rewriting `batch`: byte-level BPE spends at most about
+/// one token per 2 bytes of text in any script, plus room for the line
+/// headers and a short preamble the sanitizer strips.
+fn refinement_max_new_tokens(batch: &str) -> usize {
+    (batch.len() / 2 + 128).max(256)
 }
 
 fn sanitize_refined_transcript(candidate: &str, fallback: &str) -> String {
@@ -4308,6 +4385,41 @@ mod tests {
             speaker_confidence: Some(speaker_confidence),
             overlaps_segment: true,
         }
+    }
+
+    /// PIPE-12: a transcript well past 3 minutes is refined in batches of
+    /// whole lines whose budget covers their own rewrite, instead of one
+    /// 1024-token generation that always ran out and was discarded.
+    #[test]
+    fn long_transcripts_are_refined_in_batches_their_budget_covers() {
+        let lines = (0..240)
+            .map(|index| {
+                format!(
+                    "SPEAKER_0{} [{}.00s - {}.50s]: and then we talked about the plan for line {index}",
+                    index % 2,
+                    index,
+                    index
+                )
+            })
+            .collect::<Vec<_>>();
+        let transcript = lines.join("\n");
+        assert!(transcript.len() > 5 * REFINEMENT_BATCH_BYTES);
+
+        let batches = refinement_batches(&transcript);
+        assert!(batches.len() > 1);
+        assert_eq!(batches.join("\n"), transcript, "every line once, in order");
+        for batch in &batches {
+            assert!(batch.len() <= REFINEMENT_BATCH_BYTES);
+            // The rewrite of a batch is about as long as the batch.
+            assert!(refinement_max_new_tokens(batch) >= batch.len() / 2);
+        }
+        // About one token per CJK character.
+        let cjk = format!(
+            "SPEAKER_00 [0.00s - 90.00s]: {}",
+            "我们明天下午三点在北京见面。".repeat(40)
+        );
+        assert!(refinement_max_new_tokens(&cjk) >= cjk.chars().count());
+        assert!(refinement_batches(" \n\n").is_empty());
     }
 
     #[test]
