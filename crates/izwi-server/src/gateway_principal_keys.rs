@@ -19,7 +19,7 @@ use crate::gateway_security::{
 };
 use hmac::{Hmac, Mac};
 use izwi_hooks::Principal;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, TransactionTrait};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::fmt;
@@ -326,7 +326,7 @@ impl StoredPrincipalKey {
 }
 
 async fn upsert_principal_key(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     record: &StoredPrincipalKey,
 ) -> anyhow::Result<()> {
     let now = current_timestamp_millis();
@@ -375,6 +375,31 @@ async fn upsert_principal_key(
     )?)
     .await?;
     Ok(())
+}
+
+/// Delete every stored principal the manifest no longer lists, so removing a
+/// principal from the manifest revokes its key on the next boot.
+async fn revoke_unlisted_principal_keys(
+    db: &impl ConnectionTrait,
+    provisioned: &[ProvisionedPrincipal],
+) -> anyhow::Result<u64> {
+    let placeholders = (1..=provisioned.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = db
+        .execute_raw(crate::db::raw::statement(
+            db,
+            format!(
+                "DELETE FROM gateway_principal_keys WHERE principal_id NOT IN ({placeholders})"
+            ),
+            provisioned
+                .iter()
+                .map(|principal| principal.principal_id.clone().into())
+                .collect(),
+        )?)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 async fn load_principal_keys(
@@ -439,9 +464,10 @@ impl GatewayPrincipalDirectory {
         self.entries.len()
     }
 
-    /// Provision manifest principals into the durable store, then load the
-    /// full directory from the store. The store is the system of record; the
-    /// manifest only bootstraps entries at boot.
+    /// Make the durable store match the manifest in one transaction (upsert
+    /// listed principals, delete unlisted ones), then load the directory from
+    /// the store. The manifest is authoritative: removing a principal from it
+    /// revokes that principal's key on the next boot.
     pub async fn bootstrap(
         store: &StoreDatabase,
         manifest_path: &Path,
@@ -450,8 +476,17 @@ impl GatewayPrincipalDirectory {
         let manifest = load_manifest(manifest_path)?;
         let provisioned = resolve_principals(&manifest, perimeter)?;
         let db = store.connection().await?;
+        let transaction = db.begin().await?;
         for principal in &provisioned {
-            upsert_principal_key(db, &StoredPrincipalKey::provision(principal)).await?;
+            upsert_principal_key(&transaction, &StoredPrincipalKey::provision(principal)).await?;
+        }
+        let revoked = revoke_unlisted_principal_keys(&transaction, &provisioned).await?;
+        transaction.commit().await?;
+        if revoked > 0 {
+            tracing::info!(
+                revoked,
+                "Revoked gateway scoped principal keys absent from the manifest"
+            );
         }
         let stored = load_principal_keys(db).await?;
         let entries: Vec<ScopedEntry> = stored
@@ -862,39 +897,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_survives_restart_from_store_without_reprovoked_material() {
+    async fn bootstrap_revokes_principals_removed_from_the_manifest() {
         let _guard = crate::test_support::env_lock();
         let dir = tempfile::tempdir().expect("temp dir");
         std::env::set_var("IZWI_TEST_SCOPED_KEY", SCOPED_KEY);
-        let manifest = write_manifest(dir.path(), &manifest_body("env:IZWI_TEST_SCOPED_KEY"));
+        std::env::set_var("IZWI_TEST_SCOPED_KEY_2", OTHER_SCOPED_KEY);
+        let both = write_manifest(
+            dir.path(),
+            r#"{"version":1,"principals":[
+                {"principal_id":"svc-alpha","roles":["inference"],"tenant_id":"tenant-alpha","key_ref":"env:IZWI_TEST_SCOPED_KEY"},
+                {"principal_id":"ops","roles":["metrics"],"key_ref":"env:IZWI_TEST_SCOPED_KEY_2"}]}"#,
+        );
         let store = StoreDatabase::new(dir.path().join("store.sqlite3"));
-        let directory = GatewayPrincipalDirectory::bootstrap(&store, &manifest, &test_perimeter())
+        let directory = GatewayPrincipalDirectory::bootstrap(&store, &both, &test_perimeter())
             .await
             .expect("bootstrap");
+        assert_eq!(directory.len(), 2);
 
-        // Restart against the same store with a *new* manifest that provisions
-        // a second principal: the first entry must keep authenticating and the
-        // second must be added.
-        std::env::set_var("IZWI_TEST_SCOPED_KEY_2", OTHER_SCOPED_KEY);
-        let second_manifest = write_manifest(
-            dir.path(),
-            r#"{"version":1,"principals":[{"principal_id":"ops","roles":["metrics"],"key_ref":"env:IZWI_TEST_SCOPED_KEY_2"}]}"#,
-        );
+        // Restart against the same store with a manifest that no longer lists
+        // `ops`: its stored row must be deleted, not kept authenticating.
+        let alpha_only = write_manifest(dir.path(), &manifest_body("env:IZWI_TEST_SCOPED_KEY"));
         let restarted =
-            GatewayPrincipalDirectory::bootstrap(&store, &second_manifest, &test_perimeter())
+            GatewayPrincipalDirectory::bootstrap(&store, &alpha_only, &test_perimeter())
                 .await
                 .expect("restart bootstrap");
         std::env::remove_var("IZWI_TEST_SCOPED_KEY");
         std::env::remove_var("IZWI_TEST_SCOPED_KEY_2");
 
-        assert_eq!(restarted.len(), 2);
+        assert_eq!(restarted.len(), 1);
         assert!(restarted
             .authenticate(&bearer(&HeaderMap::new(), SCOPED_KEY))
             .is_some_and(|principal| principal.id == "svc-alpha"));
-        assert!(restarted
-            .authenticate(&bearer(&HeaderMap::new(), OTHER_SCOPED_KEY))
-            .is_some_and(|principal| principal.id == "ops"));
-        let _ = directory;
+        assert!(
+            restarted
+                .authenticate(&bearer(&HeaderMap::new(), OTHER_SCOPED_KEY))
+                .is_none(),
+            "a principal removed from the manifest must not authenticate"
+        );
+        let db = store.connection().await.expect("store connection");
+        let stored = load_principal_keys(db).await.expect("load");
+        assert_eq!(
+            stored
+                .iter()
+                .map(|record| record.principal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["svc-alpha"]
+        );
     }
 
     #[test]
