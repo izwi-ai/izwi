@@ -577,7 +577,10 @@ fn resolve_by_heuristic(normalized: &str) -> Option<ModelVariant> {
         return Some(granite_speech);
     }
 
-    if normalized.contains("sortformer") && normalized.contains("diar") {
+    // `sortformer4spk` covers the short id older CLIs sent (PIPE-3).
+    if normalized.contains("sortformer")
+        && (normalized.contains("diar") || normalized == "sortformer4spk")
+    {
         return Some(DiarStreamingSortformer4SpkV21);
     }
 
@@ -1560,6 +1563,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, ModelVariant::DiarStreamingSortformer4SpkV21);
+    }
+
+    /// PIPE-3: the short Sortformer ids older CLIs sent resolve to v2.1.
+    #[test]
+    fn resolve_diarization_strict_accepts_short_sortformer_aliases() {
+        for raw in ["sortformer-4spk", "sortformer4spk", "Sortformer_4spk"] {
+            assert_eq!(
+                resolve_diarization_model_variant_strict(raw),
+                Ok(ModelVariant::DiarStreamingSortformer4SpkV21),
+                "input: {raw}"
+            );
+        }
+        assert!(resolve_diarization_model_variant_strict("nvidia/sortformer").is_err());
     }
 
     #[test]
