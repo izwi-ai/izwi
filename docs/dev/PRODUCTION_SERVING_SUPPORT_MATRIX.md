@@ -15,8 +15,18 @@ is never promoted to real hardware or performance evidence.
 | One machine, multiple devices | One gateway | Multiple independent mock workers | Deterministic chat replicas prove compatible routing, independent request identity, worker-authoritative capacity, retry fencing, and failure isolation | Mock transport evidence only; no physical multi-device claim |
 | One machine, Apple silicon | One gateway | Metal worker (metal-feature build, device identity `metal:<registryID>` verified at startup) | **Real Metal inference executed**: 120 gateway-routed generations through a metal worker (debug build, tiny synthetic fixture, `benchmarks/manifests/ds07-metal-baseline.json`); `backend_parity.rs` proves greedy Metal outputs equal CPU outputs on the fixture, including the DS1.5 committed-prefix attach leg (`benchmarks/manifests/ds15-metal-summary.json`); supervisor launch + exact device identity process-evidenced (`multi_lane_launch.rs`) | Development Metal lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
 | One machine, NVIDIA | One gateway | CUDA-capable worker binary via `--cuda-worker-binary` | The supervisor accepts, validates, and launches CUDA assignments with exact declared UUID and device-visibility environment (process test `multi_lane_launch.rs`); no CUDA toolchain or NVIDIA device was available in this work session | Supervision code-complete; CUDA execution not run — no CUDA or multi-GPU support claim |
-| Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the bundled worker remains loopback-only and no proxy enforcement, separate-machine handshake, or artifact path was exercised | Not supported as an operational profile |
-| Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals + monotonic observation registry), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); capacity claims steer selection while the worker remains the atomic admission arbiter (ADR 0005) | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL coordination SQL remains written but unvalidated; circuit state and accepted-work ownership stay per-gateway |
+| Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the worker terminates TLS/mTLS from bounded file references (supervised workers stay loopback-only), but no separate-machine handshake or artifact path was exercised | Not supported as an operational profile |
+| Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals + monotonic observation registry), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); a hung coordination store is unit-tested: status polls and dispatch proceed and admission falls back to the worker. Capacity claims cover only the transit to worker acceptance and steer selection while the worker remains the atomic admission arbiter | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL coordination SQL remains written but unvalidated; circuit state and accepted-work ownership stay per-gateway |
+
+## Worker contract, health, and stream backpressure
+
+These apply to every cell above.
+
+| Behaviour | Status | Evidence |
+|---|---|---|
+| Worker capability | Derived from the loaded model: precision and execution representation from the served variant, a chat context from the runtime's fitted context, and an output limit up to it. A supervisor passes its declared profile and limits (`IZWI_WORKER_PRECISION`, `_EXECUTION_REPRESENTATION`, `_MAX_CONTEXT_TOKENS`, `_MAX_OUTPUT_TOKENS`); the worker advertises exactly those once the model proves them and fails startup otherwise | Worker unit tests against a supervisor-rendered node config; CPU only |
+| Runtime health | A panic after native entry or a latched fatal device fault (CUDA sticky errors, Metal command-buffer errors; out-of-memory stays recoverable) marks the runtime Failed. Worker status then reports `Failed`, the gateway and supervisor stop routing to it, and the worker exits with status 70 (`IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE`, default on) so the supervisor restarts it. A drain-recoverable fault keeps the worker running but not Ready. The local server's `/livez` fails only on Failed, and `/readyz` no longer fails on saturation | CPU fault injection through the runtime's own classifier; the CUDA and Metal fault-text classification is unit-tested only and has not met a real device fault |
+| Stream backpressure | The runtime, the worker's NDJSON relay, the local SSE path and the gateway relay merge text deltas for a lagging reader instead of cancelling. A stream fails only when the reader accepts nothing for the slow-consumer timeout (`IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS`, default 30 s; the gateway relay's `IZWI_GATEWAY_SLOW_CONSUMER_TIMEOUT_MS`, default 5 s) or the merged text exceeds its bound. Terminal events never overtake text | Paused-reader tests at each hop, including a gateway reader paused while a worker bursts through both relay hops |
 
 ## Committed prefix reuse by model family and backend (DS1.6)
 
@@ -78,8 +88,11 @@ approves both generations for the soak window, a structurally
 never-two-eligible / never-zero-eligible gateway cutover (DINV-07), then
 drain of the old generation. Automatic aborts (canary/replacement readiness
 failure, replacement exit during the window, SIGUSR2, shutdown) restore the
-pre-rollout approvals byte-identically and leave the old generation serving
-(ADR 0006). Design and evidence:
+pre-rollout approvals byte-identically and leave the old generation serving.
+The commit is still a timer: the plan declares the gateways' approvals
+refresh interval, the window must cover two refreshes and a commit grace of
+at least one refresh separates the commit view from the old generation's
+drain. Design and evidence:
 runbook section "Coordinated blue-green rollout".
 
 | Scope | Status | Evidence |
@@ -95,7 +108,7 @@ generation. Not a production soak or hardware-capacity certificate.
 
 The supervisor can scale one deployment's worker count within explicit
 declared bounds: out on sustained queue depth, in after a stabilized idle
-window with drain (ADR 0007). It is supervisor-managed — no Kubernetes, no
+window with drain. It is supervisor-managed — no Kubernetes, no
 external scaler — and fleet-profile only: the supervisor owns the v1 pinned
 approval lines of its autoscaled deployments in the gateway's shared
 approvals file, and the gateway adopts the add/remove at runtime with no
@@ -136,10 +149,11 @@ The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent.
 
-## Single-gateway failure semantics
+## Gateway failure semantics
 
-The current topology has one public gateway and makes no availability claim for
-gateway loss.
+One gateway makes no availability claim for gateway loss. With several fleet
+gateways, losing one loses its in-flight streams and, when quotas are
+partitioned, its quota slice until it restarts; the others keep serving.
 
 - New requests cannot be admitted while the gateway is unavailable. A
   replacement gateway rebuilds its bounded registry from explicit approvals and
@@ -159,8 +173,10 @@ gateway loss.
   itself stays worker-authoritative and accepted-work ownership stays
   gateway-local. The T25 supervisor generation fence is process-evidenced
   (`tests/generation_fence_collision.rs`).
-- Gateway mode intentionally owns no SQLite database, model runtime, accelerator,
-  process-local session, or durable artifact provider. Durable/local workflows do
+- Gateway mode intentionally owns no model runtime, accelerator,
+  process-local session, or durable artifact provider, and no database unless
+  scoped principal keys are configured (their store follows `IZWI_DB_PATH` /
+  `IZWI_DATABASE_URL`) or the fleet profile's coordination database is set. Durable/local workflows do
   not fail over through a replacement gateway because they are not advertised by
   this profile.
 - Already-running workers remain independently owned by the supervisor. Worker

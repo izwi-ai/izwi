@@ -4,7 +4,7 @@
 //! metadata, 2 routed experts) exercises the real RuntimeService loader,
 //! sparse dispatch, scheduler, managed memory, and decode path through an
 //! actual worker process over HTTP — including the public gateway surface.
-//! DS10 groundwork: no MoE artifact is downloaded (ADR 0008).
+//! DS10 groundwork: no MoE artifact is downloaded.
 
 mod common;
 

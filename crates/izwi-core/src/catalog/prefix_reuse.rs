@@ -162,7 +162,7 @@ impl ModelFamily {
                     "no CUDA lane evidence for dense prefix reuse",
                 ),
             },
-            // DS10 groundwork (ADR 0008): the sparse-MoE family shares the
+            // DS10 groundwork: the sparse-MoE family shares the
             // dense qwen3 committed-pages machinery, but per-family evidence
             // is not collected yet — the cell stays fail-closed until the MoE
             // fixture correctness suite runs.

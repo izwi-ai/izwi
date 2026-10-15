@@ -173,7 +173,7 @@ pub enum ModelVariant {
     Qwen314BGguf,
     /// Qwen3 MoE 30B-A3B text model (GGUF; sparse experts, ~3B active params).
     /// Catalog-disabled until real-checkpoint activation evidence exists
-    /// (DS10 groundwork posture, ADR 0008).
+    /// (DS10 groundwork posture).
     #[serde(
         rename = "Qwen3-30B-A3B-GGUF",
         alias = "Qwen3-30B-A3B",
@@ -1016,7 +1016,7 @@ impl ModelVariant {
             | Self::Qwen317B
             | Self::Qwen317B4Bit
             | Self::Qwen314BGguf
-            // DS10 groundwork posture (ADR 0008): catalog-disabled until a
+            // DS10 groundwork posture: catalog-disabled until a
             // real MoE checkpoint is validated on every buildable lane.
             | Self::Qwen3Moe30bA3bGguf => false,
             Self::Qwen3Asr06BGguf

@@ -2290,7 +2290,7 @@ impl Qwen3Model {
 
     /// Per-layer expert-activation counters of the sparse layers (empty when
     /// the model is dense). Engine-side telemetry only: protocol exposure is
-    /// deferred to expert-parallel activation (DS10 A6, ADR 0008).
+    /// deferred to expert-parallel activation (DS10 A6).
     pub fn expert_activation_counters(&self) -> Vec<Arc<ExpertActivationCounters>> {
         self.layers
             .iter()

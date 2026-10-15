@@ -163,6 +163,7 @@ izwi serve --mode web --no-ui
 | `IZWI_UI_DIR` | Config-only UI build directory |
 | `RUST_LOG` | `--log-level` |
 | `IZWI_LOG_FORMAT` | `--log-format` |
+| `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | Environment only: how long a streamed chat answer waits for a client that stopped reading before it fails (default `30000`). While the client lags, text is merged rather than dropped |
 | `IZWI_SERVE_MODE` | `--mode` |
 
 Legacy aliases still resolve for one release cycle:

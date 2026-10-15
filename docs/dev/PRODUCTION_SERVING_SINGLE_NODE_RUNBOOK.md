@@ -5,11 +5,11 @@ certificate
 
 This runbook describes only the production-serving behavior currently present
 in this checkout. It covers a single trusted node with a separately started
-public gateway, CPU-only supervisor executable, and one or more private CPU
-workers. The contracts are designed for CPU, Apple Metal, and NVIDIA CUDA, but
-the currently packaged supervisor command rejects Metal and CUDA assignments.
-See the [evidence matrix](#evidence-and-support-matrix) before choosing a
-profile.
+public gateway, the supervisor executable, and one or more private workers.
+The supervisor launches CPU, Apple Metal, and NVIDIA CUDA worker lanes from an
+operator-declared device inventory; the evidence differs per lane (CUDA
+execution has not been run). See the
+[evidence matrix](#evidence-and-support-matrix) before choosing a profile.
 
 Use the [exact-profile support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md)
 for profile approval. Node configuration
@@ -56,9 +56,13 @@ izwi-serving-supervisor          validates, starts, fences, restarts, drains
   made a gateway dependency.
 
 The `izwi-serving-supervisor` executable supervises CPU, Metal, and CUDA
-worker lanes (ADR 0003), requiring an operator-declared device inventory and
-allocatable host-memory ceiling. Never change an explicit Metal or CUDA
-assignment to CPU merely to make validation pass.
+worker lanes, requiring an operator-declared device inventory and
+allocatable host-memory ceiling: `--cpu-worker-binary` with `--cpu-ids`,
+`--metal-worker-binary` with `--metal-devices device_id@index[,...]`, and
+`--cuda-worker-binary` with `--cuda-devices uuid@host_index@total_memory_bytes[,...]`.
+The supervisor never probes or initializes an accelerator; each worker
+verifies its assigned device identity at startup. Never change an explicit
+Metal or CUDA assignment to CPU merely to make validation pass.
 
 ## Security boundary
 
@@ -74,6 +78,9 @@ key through an environment reference:
 | `IZWI_GATEWAY_API_PRINCIPAL_ID` | Server-authored principal | `gateway-api-key` |
 | `IZWI_GATEWAY_TENANT_ID` | Server-authored tenant | `default` |
 | `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` | Accepted or acceptance-uncertain work owned per server-authored tenant | min(8, `--gateway-max-in-flight`) |
+| `IZWI_GATEWAY_TENANT_REQUESTS_PER_MINUTE` | Per-tenant request starts per minute (token-bucket refill), 1–1,000,000 | `600` |
+| `IZWI_GATEWAY_TENANT_BURST_REQUESTS` | Per-tenant burst bucket size, 1–100,000 | `64` |
+| `IZWI_GATEWAY_MAX_TRACKED_TENANTS` | Bound on tenants with live rate state, 1–65,536 | `16384` |
 
 The server assigns the `inference` role/scope. Public `x-principal-id`,
 `x-tenant-id`, `x-scopes`, and `x-roles` headers are not authority. The
@@ -152,9 +159,10 @@ worker links made by a gateway.
   loopback HTTP worker endpoints. `--gateway-topology fleet-one-gateway`
   requires `--role gateway`, HTTPS, a configured client certificate/private
   key, and versioned worker approvals that pin both node and worker identity.
-- The bundled worker rejects every non-loopback bind. Plaintext worker client
-  URLs must use a numeric loopback host such as `127.0.0.1` or `::1`; `localhost`
-  is deliberately not accepted.
+- Supervised workers bind numeric loopback only: node config validation
+  rejects any other bind. Plaintext worker client URLs must use a numeric
+  loopback host such as `127.0.0.1` or `::1`; `localhost` is deliberately not
+  accepted.
 - The worker client accepts certificate-verified HTTPS endpoints, augments the
   platform trust store with up to 16 private CA PEM files, and can present one
   client certificate/key identity. Configure bounded absolute `file:`
@@ -163,10 +171,16 @@ worker links made by a gateway.
   `IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF`. Certificate and key references must
   be supplied together. Each PEM file is limited to 256 KiB and all private CA
   files together to 1 MiB. TLS material on a plaintext endpoint is rejected.
-- The bundled worker does not terminate TLS. A remote HTTPS topology therefore
-  still needs a separately managed trusted TLS/mTLS ingress or sidecar proxying
-  to the worker's loopback listener. This is not a native multi-machine profile
-  until that deployment has separate-machine transport evidence.
+- A worker started outside the supervisor terminates TLS itself when
+  `IZWI_WORKER_TLS_CERT_REF` and `IZWI_WORKER_TLS_KEY_REF` name bounded
+  absolute `file:` PEM paths (256 KiB each), and requires client certificates
+  (mTLS) when `IZWI_WORKER_TLS_CLIENT_CA_REF` is also set. Without TLS it
+  refuses a non-loopback bind unless `IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1`
+  acknowledges a private network such as a container bridge; the gateway's
+  `standalone` topology still reaches workers only over numeric-loopback HTTP,
+  and `fleet-one-gateway` only over HTTPS. This is not a supported
+  multi-machine profile until a deployment has separate-machine transport
+  evidence.
 - The gateway itself does not terminate TLS. Bind it to loopback behind a TLS
   ingress. A non-loopback gateway bind is rejected unless
   `IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1` explicitly acknowledges that trusted
@@ -195,16 +209,46 @@ Before validation:
 4. Keep each worker on a distinct numeric-loopback port. The schema permits at
    most 64 workers per node and rejects duplicate endpoints or exclusive
    devices and aggregate CPU/host-memory overcommit.
-5. Keep the current worker deployment contract unchanged unless the worker code
-   supports the replacement. The real worker currently supports only
-   `LFM2.5-1.2B-Instruct-GGUF`, task `chat`, GGUF `q4_k_m`, native LFM2 execution,
-   chat-message input, text output, and cooperative cancellation.
+5. Keep each worker deployment contract within what the worker serves. Chat
+   workers serve `LFM2.5-1.2B-Instruct-GGUF`, `Qwen3.8-27B-FP8`,
+   `Qwen3-30B-A3B-GGUF`, and `Qwen3.6-35B-A3B-FP8`; `speech_to_text` workers
+   serve the Nemotron ASR and Voxtral realtime families; `text_to_speech`
+   workers serve the streaming TTS families. A chat deployment must declare
+   `max_context_tokens` and `max_output_tokens` (output within context). The
+   supervisor passes the declared precision, execution representation and
+   token limits to the worker (`IZWI_WORKER_PRECISION`,
+   `IZWI_WORKER_EXECUTION_REPRESENTATION`, `IZWI_WORKER_MAX_CONTEXT_TOKENS`,
+   `IZWI_WORKER_MAX_OUTPUT_TOKENS`); the worker advertises exactly those once
+   the loaded model proves them and refuses to start otherwise, so its status
+   equals the approval.
 6. Set every `bearer_token_env` in the supervisor's environment. Use the same
    private credential ID and secret for all workers routed by one gateway.
 
 The worker verifies its artifact manifest before constructing the runtime. It
 then initializes the exact assigned backend without fallback, loads and warms
 the model, and only then binds its private listener.
+
+### Worker process environment
+
+The supervisor sets each worker's identity, assignment and deployment
+variables itself, including the declared `IZWI_WORKER_PRECISION`,
+`IZWI_WORKER_EXECUTION_REPRESENTATION`, `IZWI_WORKER_MAX_CONTEXT_TOKENS` and
+`IZWI_WORKER_MAX_OUTPUT_TOKENS`. It clears everything else except a short
+allowlist (`PATH`, `RUST_LOG`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, temp
+directories), so the variables below take their defaults on supervised
+workers; set them only on a worker you start yourself.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `IZWI_WORKER_PRECISION`, `IZWI_WORKER_EXECUTION_REPRESENTATION` | Declared execution profile; the worker refuses to start if the loaded model does not match. Unset: derived from the served model | derived |
+| `IZWI_WORKER_MAX_CONTEXT_TOKENS`, `IZWI_WORKER_MAX_OUTPUT_TOKENS` | Declared chat token limits; a context above the runtime's fitted context fails startup. Unset: the fitted context, and output up to it | derived |
+| `IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE` | Exit with status 70 once the runtime fails permanently (a panic after native entry or a latched fatal device fault), so a supervisor restarts it | `true` |
+| `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | How long streamed text may wait on a stalled reader before the invocation fails; while the reader lags, deltas are merged rather than dropped. Also read by the local server | `30000` |
+
+A worker's `/internal/v1/status` reflects runtime health: a permanent failure
+reports `process_state` and readiness `Failed`, and a drain-recoverable fault
+keeps the process `Running` with readiness `Failed`. The gateway and the
+supervisor's readiness wait only route to `Running` and `Ready`.
 
 ## Validate without starting workers
 
@@ -226,9 +270,11 @@ validation used before launch. Successful output is redacted and capped at 16
 KiB. It exits before inheriting the allowlisted environment, opening lock files,
 launching a child, loading a model, or initializing an accelerator.
 
-Validation is currently CPU-only. A Metal or CUDA node file is expected to fail
-at the executable's device-lane boundary; this is fail-closed behavior, not a
-request to edit the backend to CPU.
+Metal and CUDA nodes validate the same way with their worker binary and
+device declarations (`--metal-worker-binary` plus `--metal-devices`,
+`--cuda-worker-binary` plus `--cuda-devices`). A device that is not declared,
+or a worker binary that does not support the lane, fails validation; that is
+fail-closed behavior, not a request to edit the backend to CPU.
 
 ## Start and verify
 
@@ -300,8 +346,10 @@ Fleet mode rejects the pinned `--worker-endpoint` form, legacy repeated
 `--gateway-worker-endpoint` values, five-field approvals, plaintext endpoints,
 and missing client identity before descriptor/status network I/O. Bearer
 service authentication remains required in addition to mTLS. This policy does
-not make the bundled loopback-only worker a supported remote deployment: use a
-reviewed TLS/mTLS proxy and retain real separate-machine handshake evidence.
+not by itself make a remote worker a supported deployment: the worker
+terminates TLS/mTLS itself (see "Binds and TLS"), but no separate-machine
+handshake has been exercised, so retain real separate-machine handshake
+evidence before relying on it.
 Configurations that previously used remote HTTPS under the implicit local
 policy must migrate explicitly to `fleet-one-gateway`, v1 approvals, and client
 certificate/key references; there is no legacy remote-HTTPS compatibility mode.
@@ -387,6 +435,12 @@ manager diagnostics; it does not create an unauthenticated network listener.
   tenant is derived from authenticated server state, not caller identity
   headers. A tenant-limit rejection is 429; exhausted or unavailable global
   ownership state is 503.
+- Tenant request starts are also rate-limited per gateway process: a token
+  bucket of `IZWI_GATEWAY_TENANT_BURST_REQUESTS` (default 64) refilled at
+  `IZWI_GATEWAY_TENANT_REQUESTS_PER_MINUTE` (default 600), with rate state
+  for at most `IZWI_GATEWAY_MAX_TRACKED_TENANTS` (default 16,384) tenants. An
+  over-rate request is 429. The limits are per process: with several
+  gateways, use the fleet partition (below) or the totals multiply.
 - Once an exact worker attempt is bound, tenant ownership survives a response
   timeout, dropped JSON response, or SSE disconnect. It is released only by an
   authenticated terminal worker event, a cancellation disposition that proves
@@ -604,19 +658,19 @@ not under pressure. Kill switch: `IZWI_KV_HOST_OFFLOAD=0`. Tuning knobs:
 0.85/0.70 of arena capacity), `IZWI_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES` (8),
 `IZWI_KV_OFFLOAD_MAX_PROMOTION_PAGES` (64).
 
-Operationally: pages move only between tiers of the same worker process
-(ADR 0004); demotion runs synchronously at manager safe points, so a
-referenced page is never a victim and active work keeps resolving through
-the existing preemption ladder; a promotion that cannot restore truncates
-and the scheduler re-plans cold, so reuse degrades before correctness does.
-On CUDA the pool is additional capacity across PCIe; on Metal and CPU it is
-charged to the shared host/unified ledger (DINV-05) and the win is prefix
-retention plus admission headroom, never extra memory. Watch
-`izwi_engine_kv_cache_host_pages` (gauge, must stay inside the budget),
+Operationally: pages move only between tiers of the same worker process;
+demotion runs synchronously at manager safe points, so a referenced page is
+never a victim and active work keeps resolving through the existing preemption
+ladder; a promotion that cannot restore truncates and the scheduler re-plans
+cold, so reuse degrades before correctness does. On CUDA the pool is
+additional capacity across PCIe; on Metal and CPU it is charged to the shared
+host/unified ledger (DINV-05) and the win is prefix retention plus admission
+headroom, never extra memory. Watch `izwi_engine_kv_cache_host_pages` (gauge,
+must stay inside the budget),
 `izwi_engine_kv_cache_demotions_total`/`izwi_engine_kv_cache_promotions_total`
 (counters; on a healthy shared-prefix workload both advance and the gauge
-returns toward zero after promotion), and the per-deployment additive
-status fields of the same names. Evidence rig:
+returns toward zero after promotion), and the per-deployment additive status
+fields of the same names. Evidence rig:
 `scripts/bench/run-ds4-offload-benchmark.sh` (off/on legs; hard gates on
 completion, demotion, promotion, and budget containment).
 
@@ -675,10 +729,10 @@ express (node identity, capacity, non-rolling workers).
 
 ### Coordinated blue-green rollout (DS6)
 
-One supervisor invocation performs the cutover with automatic abort
-(ADR 0006). Write a rollout plan that names the already-validated target node
-config (new nonzero generations), the gateway's shared approvals file, the
-canary replacement, and the soak/abort windows:
+One supervisor invocation performs the cutover with automatic abort. Write a
+rollout plan that names the already-validated target node config (new nonzero
+generations), the gateway's shared approvals file, the canary replacement, and
+the soak/abort windows:
 
 ```toml
 schema_version = 1
@@ -755,10 +809,10 @@ file to the rollout command.
 ### Signal-driven worker autoscaling (DS7)
 
 The supervisor can act as a capacity manager for one deployment on its node:
-scale out on sustained queue depth, scale in after a stabilized idle window
-(ADR 0007). It is supervisor-managed — no Kubernetes, no external scaler —
-and fleet-profile only: the supervisor owns the v1 pinned approval lines of
-its autoscaled deployments in the gateway's shared approvals file.
+scale out on sustained queue depth, scale in after a stabilized idle window.
+It is supervisor-managed — no Kubernetes, no external scaler — and
+fleet-profile only: the supervisor owns the v1 pinned approval lines of its
+autoscaled deployments in the gateway's shared approvals file.
 
 Autoscaling is off unless the node config carries an `[autoscaling]` block.
 All workers of an autoscaled deployment are declared in the node config as
@@ -844,7 +898,7 @@ Operate it like the rest of the supervisor:
 | Public route returns 403 or 503 from policy | Enterprise inference policy result or hook health | Repair policy service/rules; do not bypass the hook |
 | Request returns 400/413 | Request ID/header/body/model/multimodal bounds | Fix the request or explicitly configured bounded limit |
 | Request returns overload/unavailable | Gateway semaphore, fresh eligible workers, worker authoritative capacity, drain state, circuit logs | Shed load or add an independently budgeted worker; do not create an unbounded proxy queue |
-| Same tenant receives 429 | `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` and exact attempts still awaiting terminal teardown | Wait for confirmed completion/teardown or raise the limit only with measured capacity; do not release on client disconnect |
+| Same tenant receives 429 | Concurrency: `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` and exact attempts still awaiting terminal teardown. Rate: `IZWI_GATEWAY_TENANT_REQUESTS_PER_MINUTE` / `IZWI_GATEWAY_TENANT_BURST_REQUESTS` | Wait for confirmed completion/teardown or raise the limits only with measured capacity; do not release on client disconnect |
 | Stream stops without terminal output | Timeout, proxy disconnect, slow consumer, worker/protocol error | Treat result as unknown; inspect the exact attempt and never replay automatically |
 | Worker repeatedly restarts or is quarantined | First failure, resource limits, manifest/model load, lock ownership, stable-uptime threshold | Drain the gateway, fix root cause, validate, then restart supervisor |
 | New worker incarnation is ignored | Logical worker/node, capacity, artifact/generation/profile/capability drift | Make node config and gateway approval agree; do not accept status-advertised drift |
@@ -863,7 +917,7 @@ server-backed fleet (see the coordination database section below). The
 authority contract is unchanged from single-node operation: the worker
 remains the atomic admission arbiter, capacity claims only steer selection,
 and an unreachable coordination store degrades to worker-authoritative
-admission — dispatches keep succeeding, nothing panics (ADR 0005). Remote
+admission — dispatches keep succeeding, nothing panics. Remote
 TLS termination and separate-machine handshakes remain explicit release
 gates.
 
@@ -871,11 +925,12 @@ gates.
 `IZWI_GATEWAY_FLEET_PARTITION=i` (0-based, `i < N`) on each gateway. Every
 gateway owns a strict 1/N slice (floored to 1) of the configured tenant
 request-rate and concurrency budgets, so the fleet total cannot exceed the
-configured limits and a crashed gateway releases its partition with no effect
-on its peers. No shared atomic counter or coordination service is required.
-Partitioning is the explicitly-chosen quota fallback; without it, each
-gateway's tenant budget is enforced worker-authoritatively. Every gateway
-logs its effective posture at startup (`selection_mode`, `quota_mode`).
+configured limits; a crashed gateway's slice simply goes unused until it
+restarts, and its peers neither absorb it nor are affected by it. No shared
+atomic counter or coordination service is required. Partitioning is the
+explicitly-chosen quota fallback; without it, each gateway's tenant budget is
+enforced worker-authoritatively. Every gateway logs its effective posture at
+startup (`selection_mode`, `quota_mode`).
 
 **Shared approvals.** Point every gateway at the same bounded approvals file
 with `IZWI_GATEWAY_SHARED_APPROVALS_PATH=/absolute/path/approvals.txt`
@@ -883,9 +938,10 @@ with `IZWI_GATEWAY_SHARED_APPROVALS_PATH=/absolute/path/approvals.txt`
 line, `#` comments and blank lines skipped). CLI approvals remain explicit;
 shared entries augment them and duplicate endpoints fail closed at startup.
 Each gateway refreshes its cached view every
-`IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS` (1s–1h, default 30s) and logs drift;
-newly approved workers are adopted on rolling gateway restart, never
-mid-stream.
+`IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS` (1s–1h, default 30s) and adopts a
+changed view at runtime: workers the view adds are adopted (and retried until
+they answer), pollers for removed workers stop, and generation changes apply
+through the rollout cutover rule. In-flight streams are never moved.
 
 **Fleet coordination database (optional).** Point every gateway at the same
 coordination database — a SQLite file with
@@ -956,9 +1012,10 @@ adds the dual-generation approval window, automatic abort, and resume.
 `IZWI_WORKER_TLS_CERT_REF` and `IZWI_WORKER_TLS_KEY_REF` name bounded
 absolute `file:` PEM paths (256 KiB each), optionally requiring client
 certificates via `IZWI_WORKER_TLS_CLIENT_CA_REF` (mTLS). Non-loopback binds
-are rejected without TLS. The bundled supervisor still launches CPU workers
-only; remote deployment needs an operator-managed ingress plus
-separate-machine handshake evidence before any support claim.
+are rejected without TLS unless `IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1`
+acknowledges a private network. Supervised workers bind loopback only.
+Remote deployment needs separate-machine handshake evidence before any
+support claim.
 
 ## Evidence and support matrix
 
@@ -969,13 +1026,12 @@ to unrelated local-engine tests elsewhere in the repository.
 |---|---|---|
 | Deterministic mock worker | Real-loopback HTTP contract and public gateway tests cover auth/version/bounds, success, incompatible model/deployment, authoritative capacity rejection, timeout, lost acknowledgement, partial stream, cancellation, two replicas, circuit fencing, and the bounded one-alternate policy. The focused alternate-dispatch suite passed 7/7 in this work session, including bounded backoff/jitter. | Implementation/test evidence only; not production readiness |
 | Real CPU execution | A subprocess worker loaded/warmed a generated tiny supported LFM2 GGUF and completed public JSON and SSE chat through the gateway | Proven development-path process separation; not a production model/resource/performance certificate |
-| Metal compilation | No serving-specific Metal build was run in this work session | Not established |
-| Real Metal execution | No separated gateway/supervisor/worker inference was run on Metal | Not established; supervisor executable rejects Metal configs |
-| CUDA compilation | No CUDA toolchain was available and no serving-specific CUDA build was run | Not established |
-| Real CUDA execution | No NVIDIA device was available | Not established; supervisor executable rejects CUDA configs |
+| Metal compilation and execution | A metal-feature worker served 120 gateway-routed generations on the tiny fixture; `backend_parity.rs` proves greedy Metal outputs equal CPU outputs; supervisor launch with exact device identity is process-evidenced (`multi_lane_launch.rs`) | Development lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
+| CUDA compilation | Compile-checked by the `cargo-cuda-compile` lane; no serving-specific CUDA execution was run | Compilation only |
+| Real CUDA execution | The supervisor accepts, validates and launches CUDA assignments with the exact declared UUID (`multi_lane_launch.rs`); no NVIDIA device was available to execute on | Not established |
 | Physical multi-GPU | Parser/topology and mock-replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
-| Multi-gateway | Conservatively partitioned quotas (1/N slices, unit-tested), shared approvals file with TTL-cached views (unit-tested), shared SQLite coordination for observations and atomic capacity claims (tested, incl. multi-connection same-file atomicity and concurrent idempotency keys never double-acquiring), backend-conditional fleet SQL for PostgreSQL/MySQL written best-effort but unvalidated, registry circuit/replacement-incarnation fencing (unit-tested). Single-host equivalents proven: worker kill fails over to a replacement incarnation, gateway crash cannot duplicate execution, crashing workers are quarantined, reconnects re-approve same-generation workers and fail closed on generation drift. No multi-machine/store-outage tests | Not supported as an operational profile |
+| Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals with monotonic observations, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). MySQL coordination SQL is written but unvalidated. Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,
