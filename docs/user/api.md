@@ -48,31 +48,41 @@ curl -H "x-request-id: demo-123" http://localhost:8080/readyz
 
 ### Errors
 
-JSON errors use this envelope:
+JSON errors use OpenAI's envelope:
 
 ```json
 {
   "error": {
-    "message": "Unsupported transcription model: Example",
-    "type": "invalid_request_error",
-    "param": null,
-    "code": "400"
+    "message": "Model not found: Example",
+    "type": "not_found_error",
+    "param": "model",
+    "code": "model_not_found"
   }
 }
 ```
 
-Common status codes:
+`code` names what went wrong; it is never the HTTP status. `param` names the request field the error is about, when there is one. The local server and the gateway answer the same failure with the same status, type and code.
 
-| Status | Meaning |
-|--------|---------|
-| `400` | Invalid request shape, model id, unsupported field, or invalid option, including input the runtime rejects (for example audio over the duration limit). |
-| `401` | The server is bound to a network address and the request lacks a valid API key. |
-| `403` | Authenticated request or local voice reuse is not permitted by policy metadata, or a browser request came from a disallowed `Origin` or `Host`. |
-| `404` | Resource, model, media object, or process-local record was not found. |
-| `413` | Body exceeded an upload limit before the handler could parse it. |
-| `415` | Endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
-| `500` | Runtime, model, storage, or server failure. |
-| `503` | Temporarily out of capacity: the requested model cannot be loaded while other resident models are busy, or the runtime is overloaded. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
+| Status | `type` | `code` | Meaning |
+|--------|--------|--------|---------|
+| `400` | `invalid_request_error` | `invalid_value` | Invalid request shape, field, option or model input (for example audio over the duration limit). A body that is not valid JSON, or JSON of the wrong shape, is this error too. |
+| `400` | `invalid_request_error` | `unsupported_parameter` | A valid parameter this deployment cannot honour. |
+| `400` | `invalid_request_error` | `context_length_exceeded` | The prompt, or the prompt plus the requested output, does not fit the model's context. |
+| `401` | `authentication_error` | `invalid_api_key` | The server is bound to a network address (or is the gateway) and the request lacks a valid API key. |
+| `403` | `permission_denied_error` | `permission_denied` | The request is not permitted by policy, or a browser request came from a disallowed `Origin` or `Host`. |
+| `404` | `not_found_error` | `model_not_found` | The requested model is not served here (`param` is `model`). |
+| `404` | `not_found_error` | `not_found` | Another resource, media object or record was not found. |
+| `408` | `server_error` | `timeout` | The request's deadline passed. |
+| `409` | `invalid_request_error` | `conflict` | The resource is in use, for example unloading a model that is serving requests. |
+| `413` | `invalid_request_error` | `payload_too_large` | The body or an input exceeded a size limit. |
+| `415` | `invalid_request_error` | `unsupported_media_type` | The endpoint expected JSON or multipart content but received another content type (writes with `text/plain` or form-encoded bodies are always rejected). |
+| `429` | `rate_limit_error` | `rate_limit_exceeded` | A rate, quota or admission limit was reached. |
+| `499` | `server_error` | `cancelled` | The request was cancelled. |
+| `500` | `server_error` | `server_error` | Runtime, model, storage or server failure. |
+| `502` | `server_error` | `bad_gateway` | Gateway only: a worker's answer could not be used. |
+| `503` | `service_unavailable_error` | `service_unavailable` | Temporarily out of capacity or not ready: the requested model cannot be loaded while other resident models are busy, the runtime is overloaded, a worker is draining, or a runtime dependency is missing. These responses carry a `Retry-After` header. Also returned by the readiness endpoint when the server is alive but not ready. |
+
+The message of a `500` or `502` can name file paths, devices and internal state, so the server logs it with the request ID and, unless it is a loopback-bound local server, returns only a generic message that includes the request ID (also in the `x-request-id` response header). A loopback-bound local server (the default, and the desktop app) returns the full message, since its only client is this machine.
 
 Enterprise builds can inject authentication and policy hooks. Community builds use local anonymous defaults. If an enterprise hook rejects a request, the response can be `401`, `403`, or `500` before the route handler runs.
 
