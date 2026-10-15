@@ -117,6 +117,9 @@ COPY config.docker.toml /app/config.toml
 ENV IZWI_CONFIG_PATH=/app/config.toml
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
+# The container must listen on all interfaces; the server then refuses to
+# start unless IZWI_API_KEY is provided at runtime (docker run -e IZWI_API_KEY).
+ENV IZWI_HOST=0.0.0.0
 
 # Create directories for models and data
 RUN mkdir -p /app/models /app/data && \
@@ -179,6 +182,9 @@ COPY config.docker.toml /app/config.toml
 ENV IZWI_CONFIG_PATH=/app/config.toml
 ENV IZWI_UI_DIR=/app/ui/dist
 ENV IZWI_MODELS_DIR=/app/models
+# The container must listen on all interfaces; the server then refuses to
+# start unless IZWI_API_KEY is provided at runtime (docker run -e IZWI_API_KEY).
+ENV IZWI_HOST=0.0.0.0
 ENV IZWI_BACKEND=cuda
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility

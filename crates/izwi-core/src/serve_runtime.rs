@@ -375,8 +375,11 @@ impl ServeRuntimeConfigOverrides {
     }
 }
 
+/// Loopback by default: the local role exposes model management and history,
+/// so network exposure is an explicit choice (the server then requires an API
+/// key).
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_port() -> u16 {

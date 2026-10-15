@@ -43,6 +43,9 @@ services:
       - CARGO_HOME=/root/.cargo
       - CARGO_TARGET_DIR=/app/target
       - HF_HOME=/app/models/huggingface
+      # The published port needs a 0.0.0.0 bind, which requires an API key.
+      - IZWI_HOST=0.0.0.0
+      - IZWI_API_KEY=${IZWI_API_KEY:-}
       - TRANSFORMERS_CACHE=/app/models/huggingface
       # Vite needs to know the host for HMR
       - VITE_HOST=0.0.0.0
@@ -87,6 +90,9 @@ services:
       - CARGO_HOME=/root/.cargo
       - CARGO_TARGET_DIR=/app/target
       - HF_HOME=/app/models/huggingface
+      # The published port needs a 0.0.0.0 bind, which requires an API key.
+      - IZWI_HOST=0.0.0.0
+      - IZWI_API_KEY=${IZWI_API_KEY:-}
     working_dir: /app
     command: cargo watch -x run
 

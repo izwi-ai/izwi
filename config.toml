@@ -31,8 +31,9 @@ backend = "auto"
 num_threads = 8
 
 [server]
-# Server host address
-host = "0.0.0.0"
+# Server host address. Loopback by default; binding any other address (for
+# example "0.0.0.0") requires IZWI_API_KEY in the server's environment.
+host = "127.0.0.1"
 
 # Server port
 port = 8080

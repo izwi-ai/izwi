@@ -46,6 +46,7 @@ mod gateway_shared_approvals;
 mod gateway_tenant_concurrency;
 mod gateway_worker_tls;
 mod ids;
+mod local_security;
 mod logging;
 pub mod media_ingest;
 mod onboarding_store;
@@ -126,9 +127,15 @@ struct ServerArgs {
     #[arg(long = "performance", value_name = "KEY=VALUE", value_parser = parse_performance_override)]
     performance: Vec<izwi_core::PerformanceConfigOverrides>,
 
-    /// Host to bind to
+    /// Host to bind to (default 127.0.0.1). A non-loopback bind on the local
+    /// role requires IZWI_API_KEY unless --allow-unauthenticated-network.
     #[arg(short = 'H', long)]
     host: Option<String>,
+
+    /// Serve a non-loopback local-role bind without an API key. Anyone who
+    /// can reach the port can then manage models and read history.
+    #[arg(long, env = "IZWI_ALLOW_UNAUTHENTICATED_NETWORK")]
+    allow_unauthenticated_network: bool,
 
     /// Port to listen on
     #[arg(short, long)]
@@ -407,6 +414,24 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
         log_format = args.log_format.as_str(),
         "Starting Izwi TTS Server"
     );
+
+    let api_key = local_security::LocalApiKey::from_env()?;
+    local_security::validate_local_bind(
+        &serve_config.host,
+        api_key.as_ref(),
+        args.allow_unauthenticated_network,
+    )?;
+    if api_key.is_some() {
+        info!("Local API key required on /v1 and /internal routes");
+    } else if !gateway_security::is_loopback_host(&serve_config.host) {
+        warn!(
+            host = %serve_config.host,
+            "SECURITY WARNING: serving a non-loopback address WITHOUT authentication \
+             (--allow-unauthenticated-network). Anyone who can reach this port can download, \
+             load and delete models and read or delete history. Set IZWI_API_KEY instead."
+        );
+    }
+    let enterprise_hooks = local_security::with_api_key(enterprise_hooks, api_key);
 
     let effective_runtime_config = serde_json::to_string(&serve_config)
         .context("failed to serialize effective server runtime configuration")?;
@@ -3603,7 +3628,7 @@ mod tests {
 
         let resolved = resolve_serve_runtime_config(&parse(&["izwi-server"])).unwrap();
 
-        assert_eq!(resolved.host, "0.0.0.0");
+        assert_eq!(resolved.host, "127.0.0.1");
         assert_eq!(resolved.port, 8080);
         assert_eq!(
             resolved.max_batch_size,

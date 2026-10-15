@@ -1,6 +1,13 @@
+import {
+  apiKeyVersion,
+  resolveUnauthorized,
+  stopApiKeyPrompts,
+} from "@/shared/api/apiKey";
 import { API_BASE_URL } from "@/shared/config/runtime";
 
 export const API_BASE = API_BASE_URL;
+
+export class UnauthorizedError extends Error {}
 
 export class ApiHttpClient {
   readonly baseUrl: string;
@@ -16,6 +23,29 @@ export class ApiHttpClient {
   }
 
   async request<T>(path: string, options?: RequestInit): Promise<T> {
+    const keyVersion = apiKeyVersion();
+    try {
+      return await this.send<T>(path, options);
+    } catch (err) {
+      const retry =
+        err instanceof UnauthorizedError && resolveUnauthorized(keyVersion);
+      if (!retry) {
+        throw err;
+      }
+    }
+    try {
+      return await this.send<T>(path, options);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        // The key just stored was rejected too (wrong key, or a cross-origin
+        // page whose cookie is not sent): stop asking until the page reloads.
+        stopApiKeyPrompts();
+      }
+      throw err;
+    }
+  }
+
+  private async send<T>(path: string, options?: RequestInit): Promise<T> {
     // Requests to the local model service must never hang the UI indefinitely:
     // a slow first /admin/models call otherwise leaves the catalog spinner up
     // forever. A caller-supplied signal wins; otherwise we bound the wait.
@@ -47,6 +77,9 @@ export class ApiHttpClient {
       }
     }
 
+    if (response.status === 401) {
+      throw new UnauthorizedError("This Izwi server requires an API key.");
+    }
     if (!response.ok) {
       throw await this.createError(response, "Request failed");
     }

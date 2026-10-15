@@ -28,7 +28,8 @@ use_metal = false
 num_threads = 4
 
 [server]
-# Server host address (bind to all interfaces for Docker)
+# Server host address (bind to all interfaces for Docker). The image sets
+# IZWI_HOST=0.0.0.0, so the server requires IZWI_API_KEY at startup.
 host = "0.0.0.0"
 
 # Server port

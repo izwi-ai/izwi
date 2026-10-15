@@ -201,9 +201,15 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "server", env = "IZWI_SERVE_MODE")]
         mode: ServeMode,
 
-        /// Host to bind to
+        /// Host to bind to (default 127.0.0.1). Binding any other address
+        /// requires IZWI_API_KEY unless --allow-unauthenticated-network.
         #[arg(short = 'H', long)]
         host: Option<String>,
+
+        /// Serve a non-loopback address without an API key. Anyone who can
+        /// reach the port can then manage models and read history.
+        #[arg(long, env = "IZWI_ALLOW_UNAUTHENTICATED_NETWORK")]
+        allow_unauthenticated_network: bool,
 
         /// Port to listen on
         #[arg(short, long)]

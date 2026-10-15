@@ -466,7 +466,7 @@ fn bool_from_env(name: &str) -> Result<bool, GatewayPerimeterConfigError> {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -658,6 +658,7 @@ mod tests {
         );
 
         let explicit_cors = ServeRuntimeConfig {
+            host: "0.0.0.0".to_string(),
             cors_enabled: true,
             cors_origins: vec!["https://api.example.test".to_string()],
             ..defaults
