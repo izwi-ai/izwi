@@ -252,7 +252,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         summary_model_id TEXT NULL,
         summary_text TEXT NULL,
         summary_error TEXT NULL,
-        summary_updated_at INTEGER NULL
+        summary_updated_at INTEGER NULL,
+        owner_node_id TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_transcription_records_created_at ON transcription_records(created_at DESC);",
@@ -295,7 +296,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         speaker_name_overrides_json TEXT NOT NULL DEFAULT '{}',
         audio_mime_type TEXT NOT NULL,
         audio_filename TEXT NULL,
-        audio_storage_path TEXT NOT NULL
+        audio_storage_path TEXT NOT NULL,
+        owner_node_id TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_diarization_records_created_at ON diarization_records(created_at DESC);",
@@ -325,7 +327,8 @@ const BASELINE_SCHEMA: &[&str] = &[
         audio_storage_path TEXT NOT NULL,
         audio_media_asset_id TEXT NULL,
         audio_artifact_tenant TEXT NULL,
-        stop_reason TEXT NULL
+        stop_reason TEXT NULL,
+        owner_node_id TEXT NULL
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_speech_history_route_created_at ON speech_history_records(route_kind, created_at DESC);",
@@ -968,6 +971,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         definition: "INTEGER NULL",
     },
     CompatibilityColumn {
+        table: "transcription_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
         table: "speech_history_records",
         column: "saved_voice_id",
         definition: "TEXT NULL",
@@ -1010,6 +1018,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
         table: "speech_history_records",
         column: "stop_reason",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "owner_node_id",
         definition: "TEXT NULL",
     },
     CompatibilityColumn {
@@ -1091,6 +1104,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         table: "diarization_records",
         column: "vad_gate",
         definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
     },
     CompatibilityColumn {
         table: "studio_project_segments",

@@ -16,6 +16,7 @@ use crate::{
     db::{raw, StoreDatabase},
     entity::{transcription_records, RuntimeProjectionAttempt},
     ids::new_uuid,
+    node_identity::{NodeIdentity, RecoveryScope},
     persistence::{
         delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
     },
@@ -272,6 +273,8 @@ pub struct CompleteTranscriptionRecord {
 pub struct TranscriptionStore {
     db: StoreDatabase,
     media_storage: Arc<dyn MediaStorageProvider>,
+    /// The node whose tasks stream the records this store creates.
+    node: NodeIdentity,
 }
 
 impl TranscriptionStore {
@@ -289,6 +292,7 @@ impl TranscriptionStore {
         Ok(Self {
             db: StoreDatabase::new(db_path),
             media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
+            node: NodeIdentity::local(),
         })
     }
 
@@ -296,7 +300,17 @@ impl TranscriptionStore {
         db: StoreDatabase,
         media_storage: Arc<dyn MediaStorageProvider>,
     ) -> Self {
-        Self { db, media_storage }
+        Self {
+            db,
+            media_storage,
+            node: NodeIdentity::local(),
+        }
+    }
+
+    /// Records this store creates are owned by `node` (P1V-1).
+    pub fn with_node_identity(mut self, node: NodeIdentity) -> Self {
+        self.node = node;
+        self
     }
 
     pub async fn list_records_page(
@@ -556,6 +570,7 @@ impl TranscriptionStore {
                 summary_text: Set(summary_text),
                 summary_error: Set(summary_error),
                 summary_updated_at: Set(summary_updated_at),
+                owner_node_id: Set(Some(self.node.id().to_string())),
             })
             .exec(db)
             .await
@@ -654,18 +669,36 @@ impl TranscriptionStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
-    /// Fail the records a previous server process left pending or processing
-    /// with no durable runtime job to finish them (P1V-1): a streamed
-    /// transcription runs as a task of the process that accepted it, so after
-    /// a restart nothing would ever complete it. Records backed by an active
-    /// runtime job are left to the runtime's own lease recovery. Returns the
-    /// number of records failed.
-    pub async fn fail_interrupted_records(&self) -> anyhow::Result<u64> {
+    /// Fail the records a previous run of this node left pending or
+    /// processing with no durable runtime job to finish them (P1V-1): a
+    /// streamed transcription runs as a task of the node that accepted it, so
+    /// after a restart nothing would ever complete it. Records backed by an
+    /// active runtime job are left to the runtime's own lease recovery, and
+    /// streamed records other nodes own on a shared database to those nodes.
+    /// Returns the number of records failed, or `None` when this node cannot
+    /// tell its records from another node's.
+    pub async fn fail_interrupted_records(&self) -> anyhow::Result<Option<u64>> {
         let db = self.db.connection().await?;
+        let Some(scope) = self.node.recovery_scope(db.get_database_backend()) else {
+            return Ok(None);
+        };
+        self.fail_interrupted_records_in(&scope).await.map(Some)
+    }
+
+    async fn fail_interrupted_records_in(&self, scope: &RecoveryScope) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let unowned = if scope.include_unowned {
+            "OR owner_node_id IS NULL"
+        } else {
+            ""
+        };
+        // A record a runtime job ran has no node-local task: once no job is
+        // active, nothing will finish it, whichever node starts.
         let result = db
             .execute_raw(raw::statement(
                 db,
-                r#"
+                format!(
+                    r#"
                 UPDATE transcription_records
                 SET
                     processing_status = 'failed',
@@ -680,8 +713,22 @@ impl TranscriptionStore {
                         AND j.route_record_id = transcription_records.id
                         AND j.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
                   )
-                "#,
-                vec![crate::diarization_store::INTERRUPTED_BY_SHUTDOWN_ERROR.into()],
+                  AND (
+                      owner_node_id = ?2
+                      {unowned}
+                      OR EXISTS (
+                          SELECT 1
+                          FROM runtime_jobs j
+                          WHERE j.job_kind = 'asr_transcription'
+                            AND j.route_record_id = transcription_records.id
+                      )
+                  )
+                "#
+                ),
+                vec![
+                    crate::diarization_store::INTERRUPTED_BY_SHUTDOWN_ERROR.into(),
+                    scope.owner.clone().into(),
+                ],
             )?)
             .await
             .context("Failed to fail interrupted transcription records")?;
@@ -2257,7 +2304,7 @@ mod tests {
                 .fail_interrupted_records()
                 .await
                 .expect("startup recovery"),
-            1
+            Some(1)
         );
         let streamed = store
             .get_record(streamed.id)
@@ -2281,6 +2328,98 @@ mod tests {
             queued.processing_status,
             TranscriptionProcessingStatus::Pending
         );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1 on a database several nodes share: node A's startup fails the
+    /// streams A left running, leaves node B's, and fails a record whose
+    /// runtime job ended (no node runs it). Unowned rows are recovered only
+    /// where the database belongs to one node.
+    #[tokio::test]
+    async fn startup_recovery_leaves_other_nodes_streams_running() {
+        let (store, root) = build_test_store();
+        let node = |id| {
+            store
+                .clone()
+                .with_node_identity(NodeIdentity::configured(id).expect("node id"))
+        };
+        let (node_a, node_b) = (node("node-a"), node("node-b"));
+        let streaming = || {
+            let mut record = sample_record();
+            record.processing_status = TranscriptionProcessingStatus::Processing;
+            record.transcription = String::new();
+            record.segments.clear();
+            record.words.clear();
+            record
+        };
+        let a_stream = node_a.create_record(streaming()).await.expect("A");
+        let b_stream = node_b.create_record(streaming()).await.expect("B");
+        let b_durable = node_b.create_record(streaming()).await.expect("B job");
+        let legacy = node_a.create_record(streaming()).await.expect("legacy");
+        let (_runtime, _attempt) = claim_projection_attempt(
+            &store,
+            TranscriptionRecordMode::Transcription.as_db_value(),
+            &b_durable.id,
+        )
+        .await;
+        let db = store.db.connection().await.expect("db");
+        for (sql, id) in [
+            (
+                "UPDATE runtime_jobs SET status = 'failed' WHERE route_record_id = ?1",
+                &b_durable.id,
+            ),
+            (
+                "UPDATE transcription_records SET owner_node_id = NULL WHERE id = ?1",
+                &legacy.id,
+            ),
+        ] {
+            db.execute_raw(raw::statement(db, sql, vec![id.clone().into()]).expect("sql"))
+                .await
+                .expect("fixture update");
+        }
+        let status = |id: &String| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .get_record(id)
+                    .await
+                    .expect("lookup")
+                    .expect("record")
+                    .processing_status
+            }
+        };
+        use TranscriptionProcessingStatus::{Failed, Processing};
+
+        let shared = RecoveryScope {
+            owner: "node-a".to_string(),
+            include_unowned: false,
+        };
+        assert_eq!(
+            node_a
+                .fail_interrupted_records_in(&shared)
+                .await
+                .expect("A recovery"),
+            2
+        );
+        assert_eq!(status(&a_stream.id).await, Failed);
+        assert_eq!(status(&b_durable.id).await, Failed);
+        assert_eq!(status(&b_stream.id).await, Processing);
+        assert_eq!(status(&legacy.id).await, Processing);
+
+        assert_eq!(
+            node_a.fail_interrupted_records().await.expect("A recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&legacy.id).await, Failed);
+        assert_eq!(status(&b_stream.id).await, Processing);
+
+        assert_eq!(
+            node_b.fail_interrupted_records().await.expect("B recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&b_stream.id).await, Failed);
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

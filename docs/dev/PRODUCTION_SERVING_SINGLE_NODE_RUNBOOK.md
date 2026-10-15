@@ -889,6 +889,16 @@ startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
 immediately instead of waiting out the TTL. Unset means single-gateway
 operation with purely process-local state.
 
+**Servers sharing one records database.** Diarization jobs, streamed
+transcriptions and streamed speech run as tasks of the server that accepted
+them, and at startup a server fails the ones it left pending or processing.
+Records carry the node that runs them, and a server recovers only its own. Set
+`IZWI_NODE_ID` (1–128 ASCII letters, digits, `-`, `_`) to an id unique to each
+server and stable across its restarts. On SQLite the default node `local` also
+recovers rows written before owners were recorded. On any other database a
+server with no `IZWI_NODE_ID` skips this recovery and logs a warning, because
+it cannot tell its records from another server's.
+
 PostgreSQL is the validated server-backed store: the migrator promotes the
 shared DDL per backend and the fleet store execution suite runs against real
 PostgreSQL in CI (`scripts/ci/check-backend-truth.sh cargo-fleet-stores`).

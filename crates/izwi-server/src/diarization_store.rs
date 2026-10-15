@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,6 +16,7 @@ use crate::{
     db::{raw, StoreDatabase},
     entity::diarization_records,
     ids::new_uuid,
+    node_identity::{NodeIdentity, RecoveryScope},
     persistence::{
         delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
     },
@@ -262,6 +265,8 @@ pub struct CompleteDiarizationRecord {
 pub struct DiarizationStore {
     db: StoreDatabase,
     media_storage: Arc<dyn MediaStorageProvider>,
+    /// The node whose tasks run the jobs and summaries this store starts.
+    node: NodeIdentity,
 }
 
 impl DiarizationStore {
@@ -279,6 +284,7 @@ impl DiarizationStore {
         Ok(Self {
             db: StoreDatabase::new(db_path),
             media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
+            node: NodeIdentity::local(),
         })
     }
 
@@ -286,7 +292,17 @@ impl DiarizationStore {
         db: StoreDatabase,
         media_storage: Arc<dyn MediaStorageProvider>,
     ) -> Self {
-        Self { db, media_storage }
+        Self {
+            db,
+            media_storage,
+            node: NodeIdentity::local(),
+        }
+    }
+
+    /// Records this store starts are owned by `node` (P1V-1).
+    pub fn with_node_identity(mut self, node: NodeIdentity) -> Self {
+        self.node = node;
+        self
     }
 
     pub async fn list_records_page(
@@ -522,6 +538,7 @@ impl DiarizationStore {
             audio_mime_type: Set(audio_mime_type),
             audio_filename: Set(audio_filename),
             audio_storage_path: Set(audio_storage_path.clone()),
+            owner_node_id: Set(Some(self.node.id().to_string())),
         })
         .exec(db)
         .await
@@ -612,7 +629,22 @@ impl DiarizationStore {
                 }
             });
 
-        let result = diarization_records::Entity::update_many()
+        let mut update_query = diarization_records::Entity::update_many();
+        if summary_status == DiarizationSummaryStatus::Pending {
+            // This node's task generates the summary. A record still being
+            // diarized keeps the owner that runs its pipeline.
+            update_query = update_query.col_expr(
+                diarization_records::Column::OwnerNodeId,
+                Expr::case(
+                    diarization_records::Column::ProcessingStatus
+                        .is_in(["pending".to_string(), "processing".to_string()]),
+                    Expr::col(diarization_records::Column::OwnerNodeId),
+                )
+                .finally(Expr::value(self.node.id()))
+                .into(),
+            );
+        }
+        let result = update_query
             .col_expr(
                 diarization_records::Column::SummaryStatus,
                 Expr::value(summary_status.as_db_value()),
@@ -645,14 +677,32 @@ impl DiarizationStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
-    /// Fail the jobs a previous server process left pending or processing
+    /// Fail the jobs a previous run of this node left pending or processing
     /// (P1V-1). Diarization jobs and their summaries run as tasks of the
-    /// process that accepted them, so at startup none of them can still be
-    /// running; left alone they would stay "processing" forever. A failed
+    /// node that accepted them, so at startup none of its own can still be
+    /// running; left alone they would stay "processing" forever. Records
+    /// other nodes own on a shared database are theirs to recover. A failed
     /// record keeps its audio and can be rerun. Returns the number of
-    /// records failed.
-    pub async fn fail_interrupted_records(&self) -> anyhow::Result<u64> {
+    /// records failed, or `None` when this node cannot tell its records from
+    /// another node's (see [`NodeIdentity::recovery_scope`]).
+    pub async fn fail_interrupted_records(&self) -> anyhow::Result<Option<u64>> {
         let db = self.db.connection().await?;
+        let Some(scope) = self.node.recovery_scope(db.get_database_backend()) else {
+            return Ok(None);
+        };
+        self.fail_interrupted_records_in(&scope).await.map(Some)
+    }
+
+    async fn fail_interrupted_records_in(&self, scope: &RecoveryScope) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let owned = || {
+            let owner = diarization_records::Column::OwnerNodeId;
+            let mut owned = Condition::any().add(owner.eq(scope.owner.as_str()));
+            if scope.include_unowned {
+                owned = owned.add(owner.is_null());
+            }
+            owned
+        };
         let active = ["pending".to_string(), "processing".to_string()];
         let jobs = diarization_records::Entity::update_many()
             .col_expr(
@@ -664,6 +714,7 @@ impl DiarizationStore {
                 Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
             )
             .filter(diarization_records::Column::ProcessingStatus.is_in(active))
+            .filter(owned())
             .exec(db)
             .await
             .context("Failed to fail interrupted diarization records")?;
@@ -677,6 +728,7 @@ impl DiarizationStore {
                 Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
             )
             .filter(diarization_records::Column::SummaryStatus.eq("pending"))
+            .filter(owned())
             .exec(db)
             .await
             .context("Failed to fail interrupted diarization summaries")?;
@@ -1977,7 +2029,7 @@ pub(crate) mod tests {
                 .fail_interrupted_records()
                 .await
                 .expect("startup recovery"),
-            2
+            Some(2)
         );
 
         for id in &ids[..2] {
@@ -2007,7 +2059,114 @@ pub(crate) mod tests {
             ready.summary_error.as_deref(),
             Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
         );
-        assert_eq!(store.fail_interrupted_records().await.expect("rerun"), 0);
+        assert_eq!(
+            store.fail_interrupted_records().await.expect("rerun"),
+            Some(0)
+        );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1 on a database several nodes share: node A's startup fails the
+    /// jobs and summaries A left running and leaves node B's running. Rows
+    /// written before owners were recorded are recovered only where the
+    /// database belongs to one node.
+    #[tokio::test]
+    async fn startup_recovery_leaves_other_nodes_jobs_running() {
+        let (store, root) = build_test_store();
+        let node = |id| {
+            store
+                .clone()
+                .with_node_identity(NodeIdentity::configured(id).expect("node id"))
+        };
+        let (node_a, node_b) = (node("node-a"), node("node-b"));
+        let processing = || {
+            let mut record = sample_record();
+            record.processing_status = DiarizationProcessingStatus::Processing;
+            record.summary_status = DiarizationSummaryStatus::NotRequested;
+            record.summary_text = None;
+            record
+        };
+        let a_job = node_a.create_record(processing()).await.expect("A job");
+        let b_job = node_b.create_record(processing()).await.expect("B job");
+        let legacy = node_a.create_record(processing()).await.expect("legacy");
+        let db = store.db.connection().await.expect("db");
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE diarization_records SET owner_node_id = NULL WHERE id = ?1",
+                vec![legacy.id.clone().into()],
+            )
+            .expect("statement"),
+        )
+        .await
+        .expect("unown legacy row");
+        // B regenerates the summary of a finished record of A's: B runs it.
+        let mut finished = sample_record();
+        finished.summary_status = DiarizationSummaryStatus::NotRequested;
+        finished.summary_text = None;
+        let b_summary = node_a.create_record(finished).await.expect("finished");
+        // B asks for a summary of A's running job: A still runs the job.
+        for id in [&b_summary.id, &a_job.id] {
+            node_b
+                .update_summary(
+                    id.clone(),
+                    UpdateDiarizationSummary {
+                        status: DiarizationSummaryStatus::Pending,
+                        model_id: Some("Qwen3.5-4B".to_string()),
+                        text: None,
+                        error: None,
+                        updated_at: None,
+                    },
+                )
+                .await
+                .expect("summary update")
+                .expect("record");
+        }
+        let status = |id: &String| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let record = store.get_record(id).await.expect("lookup").expect("record");
+                (record.processing_status, record.summary_status)
+            }
+        };
+        use DiarizationProcessingStatus::{Failed, Processing, Ready};
+        use DiarizationSummaryStatus::{Failed as SummaryFailed, NotRequested, Pending};
+
+        // A shared database: A recovers only what it owns.
+        let shared = RecoveryScope {
+            owner: "node-a".to_string(),
+            include_unowned: false,
+        };
+        assert_eq!(
+            node_a
+                .fail_interrupted_records_in(&shared)
+                .await
+                .expect("A recovery"),
+            1
+        );
+        assert_eq!(status(&a_job.id).await, (Failed, SummaryFailed));
+        assert_eq!(status(&b_job.id).await, (Processing, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, Pending));
+        assert_eq!(status(&legacy.id).await, (Processing, NotRequested));
+
+        // SQLite belongs to one node: A also recovers the unowned row.
+        assert_eq!(
+            node_a.fail_interrupted_records().await.expect("A recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&legacy.id).await, (Failed, NotRequested));
+        assert_eq!(status(&b_job.id).await, (Processing, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, Pending));
+
+        // B's own restart recovers B's job and the summary it was running.
+        assert_eq!(
+            node_b.fail_interrupted_records().await.expect("B recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&b_job.id).await, (Failed, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, SummaryFailed));
 
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }

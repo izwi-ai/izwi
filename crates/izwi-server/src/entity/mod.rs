@@ -199,6 +199,7 @@ pub mod transcription_records {
         pub summary_text: Option<String>,
         pub summary_error: Option<String>,
         pub summary_updated_at: Option<i64>,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }
@@ -247,6 +248,7 @@ pub mod diarization_records {
         pub audio_mime_type: String,
         pub audio_filename: Option<String>,
         pub audio_storage_path: String,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }
@@ -282,6 +284,7 @@ pub mod speech_history_records {
         pub audio_media_asset_id: Option<String>,
         pub audio_artifact_tenant: Option<String>,
         pub stop_reason: Option<String>,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }

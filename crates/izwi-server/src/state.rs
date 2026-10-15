@@ -7,6 +7,7 @@ use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
 use crate::media_ingest::MediaIngestService;
+use crate::node_identity::NodeIdentity;
 use crate::onboarding_store::OnboardingStore;
 use crate::persistence::{LocalMediaStorageProvider, PersistenceContext};
 use crate::saved_voice_store::SavedVoiceStore;
@@ -603,16 +604,24 @@ impl AppState {
         let realtime_session_capacity = realtime_session_limit_from_env();
         let store_database = StoreDatabase::from_connection(persistence.database.connection());
         let media_storage = persistence.media_storage();
+        // The node that owns the in-process jobs these stores start (P1V-1).
+        let node = NodeIdentity::from_env();
 
         let chat_store = Arc::new(ChatStore::initialize_with_database(store_database.clone()));
-        let transcription_store = Arc::new(TranscriptionStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
-        let diarization_store = Arc::new(DiarizationStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
+        let transcription_store = Arc::new(
+            TranscriptionStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+            )
+            .with_node_identity(node.clone()),
+        );
+        let diarization_store = Arc::new(
+            DiarizationStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+            )
+            .with_node_identity(node.clone()),
+        );
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
             media_storage.clone(),
@@ -635,11 +644,14 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-            artifact_store.clone(),
-        ));
+        let speech_history_store = Arc::new(
+            SpeechHistoryStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+                artifact_store.clone(),
+            )
+            .with_node_identity(node),
+        );
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),

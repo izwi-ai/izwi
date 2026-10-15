@@ -161,6 +161,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "summary_text",
             "summary_error",
             "summary_updated_at",
+            "owner_node_id",
         ],
     },
     RequiredSchemaTable {
@@ -204,6 +205,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_mime_type",
             "audio_filename",
             "audio_storage_path",
+            "owner_node_id",
         ],
     },
     RequiredSchemaTable {
@@ -234,6 +236,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "audio_media_asset_id",
             "audio_artifact_tenant",
             "stop_reason",
+            "owner_node_id",
         ],
     },
     RequiredSchemaTable {
