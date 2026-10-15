@@ -110,27 +110,32 @@ pub fn create_router(state: AppState, serve_config: &ServeRuntimeConfig) -> Rout
         .nest("/internal", crate::api::internal::router())
         .with_state(state);
 
-    apply_runtime_contract(app, serve_config)
+    let app = apply_ui_fallback(app, serve_config)
         .layer(trace_layer)
         .layer(middleware::from_fn_with_state(
             middleware_state,
             attach_enterprise_request_context,
-        ))
+        ));
+    // CORS is the outermost layer so browser preflights are answered before
+    // authentication, which would otherwise reject them for lacking a key.
+    apply_cors(app, serve_config)
 }
 
-pub(crate) fn apply_runtime_contract(mut app: Router, serve_config: &ServeRuntimeConfig) -> Router {
-    if serve_config.ui_enabled {
-        let index_path = serve_config.ui_dir.join("index.html");
-        app = app.fallback_service(
-            ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
-        );
+fn apply_ui_fallback(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+    if !serve_config.ui_enabled {
+        return app;
     }
+    let index_path = serve_config.ui_dir.join("index.html");
+    app.fallback_service(
+        ServeDir::new(serve_config.ui_dir.clone()).fallback(ServeFile::new(index_path)),
+    )
+}
 
-    if let Some(cors_layer) = build_cors_layer(serve_config) {
-        app = app.layer(cors_layer);
+fn apply_cors(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+    match build_cors_layer(serve_config) {
+        Some(cors_layer) => app.layer(cors_layer),
+        None => app,
     }
-
-    app
 }
 
 fn build_cors_layer(serve_config: &ServeRuntimeConfig) -> Option<CorsLayer> {
@@ -195,7 +200,8 @@ mod tests {
         RuntimeService,
     };
     use izwi_hooks::{
-        AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookResult, PolicyEngine,
+        AuthProvider, AuthorizationDecision, AuthorizationRequest, EnterpriseHooks, HookError,
+        HookResult, PolicyEngine, Principal, RequestEnvelope,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -204,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_wildcard_cors_adds_allow_origin_header() {
-        let app = apply_runtime_contract(
+        let app = apply_cors(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 cors_enabled: true,
@@ -232,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_cors_emits_no_allow_origin_header_for_browser_origin() {
-        let app = apply_runtime_contract(
+        let app = apply_cors(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 cors_enabled: false,
@@ -259,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_cors_still_allows_desktop_origin() {
-        let app = apply_runtime_contract(
+        let app = apply_cors(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 cors_enabled: false,
@@ -286,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn enabled_custom_cors_keeps_desktop_allowlist() {
-        let app = apply_runtime_contract(
+        let app = apply_cors(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 cors_enabled: true,
@@ -339,7 +345,7 @@ mod tests {
         std::fs::write(ui_dir.join("index.html"), "<html>ui</html>")
             .expect("index should be written");
 
-        let app = apply_runtime_contract(
+        let app = apply_ui_fallback(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 ui_enabled: true,
@@ -369,7 +375,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_ui_returns_not_found_for_unknown_routes() {
-        let app = apply_runtime_contract(
+        let app = apply_ui_fallback(
             Router::new().route("/hello", get(|| async { "ok" })),
             &ServeRuntimeConfig {
                 ui_enabled: false,
@@ -2833,6 +2839,59 @@ mod tests {
         drop(temp_dir);
     }
 
+    #[tokio::test]
+    async fn cors_preflight_is_answered_before_authentication() {
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.auth = Arc::new(DenyAllAuth);
+
+        let (state, temp_dir) = test_state_with_hooks("cors_preflight_before_auth", false, hooks);
+        state.lifecycle.mark_ready();
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &serve_config);
+
+        let preflight = send_request(
+            app.clone(),
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/chat/completions")
+                .header(header::ORIGIN, "tauri://localhost")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
+
+        // The actual request still goes through authentication, and its
+        // rejection carries CORS headers the browser can read.
+        let rejected = send_request(
+            app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/admin/models")
+                .header(header::ORIGIN, "tauri://localhost")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            rejected.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("tauri://localhost"))
+        );
+
+        drop(temp_dir);
+    }
+
     async fn send_request(mut app: Router, request: Request<Body>) -> Response {
         app.as_service::<Body>()
             .call(request)
@@ -3001,6 +3060,15 @@ mod tests {
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct DenyAllAuth;
+
+    #[async_trait]
+    impl AuthProvider for DenyAllAuth {
+        async fn authenticate(&self, _request: &RequestEnvelope) -> HookResult<Principal> {
+            Err(HookError::Denied("test credential required".to_string()))
         }
     }
 
