@@ -2839,7 +2839,7 @@ mod tests {
                 ModelVariant::Nemotron3Diarization,
             ] {
                 let workspace =
-                    crate::models::architectures::sortformer::diarization::checkpoint_profile_workspace_estimate(
+                    crate::models::architectures::sortformer::diarization::default_profile_workspace_estimate(
                         variant,
                         three_seconds,
                         backend == BackendKind::Cuda,
@@ -3013,7 +3013,7 @@ mod tests {
                 .unwrap();
             settle_decoded_job(&job, backend, peak, steady, Some(String::new())).unwrap();
             let workspace =
-                crate::models::architectures::sortformer::diarization::checkpoint_profile_workspace_estimate(
+                crate::models::architectures::sortformer::diarization::default_profile_workspace_estimate(
                     ModelVariant::DiarStreamingSortformer4SpkV21,
                     samples,
                     backend == BackendKind::Cuda,

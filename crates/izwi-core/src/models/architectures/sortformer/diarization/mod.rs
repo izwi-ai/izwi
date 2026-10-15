@@ -65,8 +65,10 @@ const NEMOTRON3_ROPE_FF_DIM: usize = 2048;
 const NEMOTRON3_ROPE_HEADS: usize = 8;
 const NEMOTRON3_ROPE_THETA: f32 = 10_000.0;
 const NEMOTRON3_ROPE_MAX_POSITIONS: usize = 5_000;
-const NEMOTRON3_MAX_CHUNK_LEN: usize = 264;
+const NEMOTRON3_MAX_CHUNK_LEN: usize = 340;
+const NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT: usize = 40;
 const NEMOTRON3_MAX_SPKCACHE_LEN: usize = 264;
+const NEMOTRON3_MAX_FIFO_LEN: usize = 264;
 const NEMOTRON3_HEAD_D_MODEL: usize = 192;
 // The formulas below explicitly count the largest live tensors in each
 // model stage. A 1.5x factor covers what they cannot see: allocator retention
@@ -218,11 +220,72 @@ struct SortformerModulesConfig {
     min_pos_scores_rate: Option<f32>,
 }
 
+/// Streaming geometry a loaded checkpoint runs, chosen once per process
+/// with `IZWI_SORTFORMER_STREAMING_PROFILE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortformerStreamingProfile {
+    /// The checkpoint yaml's `sortformer_modules` values (NeMo's
+    /// `from_pretrained` default; Nemotron-3's training geometry).
     Model,
+    /// The model card's low-latency profile.
     LowLatency,
-    HighLatency,
+    /// The model card's very-high-latency (offline) profile: the
+    /// configuration NVIDIA benchmarks, and the default for file
+    /// diarization, which never streams output to the client.
+    VeryHighLatency,
+}
+
+impl SortformerStreamingProfile {
+    const DEFAULT: Self = Self::VeryHighLatency;
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::LowLatency => "low_latency",
+            Self::VeryHighLatency => "very_high_latency",
+        }
+    }
+
+    /// The model card geometry this profile sets for `encoder_kind`, in
+    /// 80 ms frames; `None` keeps the checkpoint yaml's values.
+    fn card_geometry(self, encoder_kind: SortformerEncoderKind) -> Option<SortformerCardGeometry> {
+        let geometry = |chunk_len, chunk_right_context, fifo_len, update_period, spkcache_len| {
+            Some(SortformerCardGeometry {
+                chunk_len,
+                chunk_right_context,
+                fifo_len,
+                spkcache_update_period: update_period,
+                spkcache_len,
+            })
+        };
+        match (encoder_kind, self) {
+            (_, Self::Model) => None,
+            // diar_streaming_sortformer_4spk-v2.1 card: 6/7/188/144/188 and
+            // 340/40/40/300/188 (chunk / right context / FIFO / update /
+            // cache); the left context stays the yaml's 1.
+            (SortformerEncoderKind::Conformer, Self::LowLatency) => geometry(6, 7, 188, 144, 188),
+            (SortformerEncoderKind::Conformer, Self::VeryHighLatency) => {
+                geometry(340, 40, 40, 300, 188)
+            }
+            // Nemotron-3-Diarization card and HF config.json: low 9/4/264/
+            // 222/264 and offline 340/40/40/300/264, left context 0.
+            (SortformerEncoderKind::FeatureStackingRope, Self::LowLatency) => {
+                geometry(9, 4, 264, 222, 264)
+            }
+            (SortformerEncoderKind::FeatureStackingRope, Self::VeryHighLatency) => {
+                geometry(340, 40, 40, 300, 264)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortformerCardGeometry {
+    chunk_len: usize,
+    chunk_right_context: usize,
+    fifo_len: usize,
+    spkcache_update_period: usize,
+    spkcache_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -419,9 +482,9 @@ const NEMOTRON3_PRODUCTION_PROFILE: SortformerProductionProfile = SortformerProd
     topology: SortformerWorkspaceTopology::nemotron3_production(),
     max_chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
     max_chunk_left_context: 0,
-    max_chunk_right_context: 0,
+    max_chunk_right_context: NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT,
     max_spkcache_len: NEMOTRON3_MAX_SPKCACHE_LEN,
-    max_fifo_len: 0,
+    max_fifo_len: NEMOTRON3_MAX_FIFO_LEN,
 };
 
 const PRODUCTION_PROFILES: [SortformerProductionProfile; 2] =
@@ -449,9 +512,20 @@ fn production_workspace_streaming_config() -> SortformerStreamingConfig {
     }
 }
 
-/// Largest streaming profile the Nemotron-3 checkpoint may claim, pinned to
-/// its trained sortformer_modules values.
+/// Largest streaming envelope the Nemotron-3 checkpoint may claim: the card
+/// offline chunk and right context with the card low-latency FIFO.
 fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
+    SortformerStreamingConfig {
+        chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
+        chunk_right_context: NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT,
+        fifo_len: NEMOTRON3_MAX_FIFO_LEN,
+        spkcache_update_period: 300,
+        ..nemotron3_checkpoint_streaming_config()
+    }
+}
+
+/// The Nemotron-3 checkpoint yaml's trained sortformer_modules values.
+fn nemotron3_checkpoint_streaming_config() -> SortformerStreamingConfig {
     SortformerStreamingConfig {
         fc_d_model: NEMOTRON3_ROPE_D_MODEL,
         num_speakers: 8,
@@ -459,8 +533,8 @@ fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
         output_frames_per_encoded_frame: TS_VAD_UNIT_FRAME_COUNT,
         spkcache_len: NEMOTRON3_MAX_SPKCACHE_LEN,
         fifo_len: 0,
-        chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
-        spkcache_update_period: NEMOTRON3_MAX_CHUNK_LEN,
+        chunk_len: 264,
+        spkcache_update_period: 264,
         chunk_left_context: 0,
         chunk_right_context: 0,
         spkcache_sil_frames_per_spk: 1,
@@ -500,17 +574,17 @@ pub fn production_workspace_authorization(
     })
 }
 
-/// The workspace `variant` estimates once loaded under its checkpoint's own
-/// streaming profile (no latency override), so tests can price a request
-/// without the checkpoint. v2.1's `model_config.yaml` pins chunk 188, left
-/// and right context 1, FIFO 0 and update period 188.
+/// The workspace `variant` estimates once loaded under the default
+/// streaming profile, so tests can price a request without the checkpoint.
+/// v2.1's `model_config.yaml` pins chunk 188, left and right context 1,
+/// FIFO 0 and update period 188 before the profile applies.
 #[cfg(test)]
-pub(crate) fn checkpoint_profile_workspace_estimate(
+pub(crate) fn default_profile_workspace_estimate(
     variant: ModelVariant,
     target_sample_count: usize,
     separate_device_memory: bool,
 ) -> Result<SortformerWorkspaceEstimate> {
-    let (topology, cfg) = match variant {
+    let (topology, checkpoint, encoder_kind) = match variant {
         ModelVariant::DiarStreamingSortformer4SpkV21 => (
             SortformerWorkspaceTopology::v21_production(),
             SortformerStreamingConfig {
@@ -521,10 +595,12 @@ pub(crate) fn checkpoint_profile_workspace_estimate(
                 spkcache_update_period: 188,
                 ..production_workspace_streaming_config()
             },
+            SortformerEncoderKind::Conformer,
         ),
         ModelVariant::Nemotron3Diarization => (
             SortformerWorkspaceTopology::nemotron3_production(),
-            nemotron3_workspace_streaming_config(),
+            nemotron3_checkpoint_streaming_config(),
+            SortformerEncoderKind::FeatureStackingRope,
         ),
         other => {
             return Err(Error::InvalidInput(format!(
@@ -532,6 +608,11 @@ pub(crate) fn checkpoint_profile_workspace_estimate(
             )))
         }
     };
+    let cfg = apply_streaming_profile(
+        checkpoint,
+        encoder_kind,
+        SortformerStreamingProfile::DEFAULT,
+    );
     workspace_estimate_for(topology, cfg, target_sample_count, separate_device_memory)
 }
 
@@ -1042,7 +1123,7 @@ impl SortformerDiarizerModel {
         let model = SortformerInferenceModel::load(
             &vb,
             preprocessor_cfg,
-            variant,
+            resolve_streaming_profile(),
             num_spks,
             streaming_mode,
             config.encoder.clone(),
@@ -1051,11 +1132,37 @@ impl SortformerDiarizerModel {
             device_profile.kind.is_cuda(),
         )?;
 
-        Ok(Self {
+        let model = Self {
             variant,
             _artifacts: artifacts,
             _checkpoint_tensor_count: tensor_info.len(),
             model,
+        };
+        tracing::info!(
+            "{} streams with the {} profile: {}",
+            variant.dir_name(),
+            model.model.streaming_profile.name(),
+            model.family_diagnostics()
+        );
+        Ok(model)
+    }
+
+    /// The active streaming profile and geometry, for loaded-model
+    /// diagnostics.
+    pub fn family_diagnostics(&self) -> serde_json::Value {
+        let streaming = self.model.streaming.map(|cfg| {
+            serde_json::json!({
+                "chunk_len": cfg.chunk_len,
+                "chunk_left_context": cfg.chunk_left_context,
+                "chunk_right_context": cfg.chunk_right_context,
+                "fifo_len": cfg.fifo_len,
+                "spkcache_update_period": cfg.spkcache_update_period,
+                "spkcache_len": cfg.spkcache_len,
+            })
+        });
+        serde_json::json!({
+            "streaming_profile": self.model.streaming_profile.name(),
+            "streaming": streaming,
         })
     }
 
@@ -1439,6 +1546,7 @@ struct SortformerInferenceModel {
     head: SortformerSpeakerHead,
     num_speakers: usize,
     streaming: Option<SortformerStreamingConfig>,
+    streaming_profile: SortformerStreamingProfile,
     /// Nemotron-3's learned silence embedding used for cache silence slots;
     /// v2.1 keeps None and tracks a running silence mean instead.
     silence_embedding: Option<Vec<f32>>,
@@ -1448,7 +1556,7 @@ impl SortformerInferenceModel {
     fn load(
         vb: &VarBuilder,
         preprocessor_cfg: SortformerPreprocessorConfig,
-        variant: ModelVariant,
+        profile: SortformerStreamingProfile,
         num_spks: usize,
         streaming_mode: bool,
         encoder_cfg: Option<SortformerEncoderConfig>,
@@ -1512,7 +1620,7 @@ impl SortformerInferenceModel {
             }
         };
         let streaming = resolve_streaming_config(
-            variant,
+            profile,
             &modules_cfg,
             encoder.d_model(),
             num_spks,
@@ -1529,6 +1637,7 @@ impl SortformerInferenceModel {
             head,
             num_speakers: num_spks,
             streaming: Some(streaming),
+            streaming_profile: profile,
             silence_embedding,
         };
         model.validate_production_topology(proj_in, proj_out)?;
@@ -1891,13 +2000,13 @@ impl SortformerInferenceModel {
 }
 
 fn resolve_streaming_config(
-    variant: ModelVariant,
+    profile: SortformerStreamingProfile,
     modules_cfg: &SortformerModulesConfig,
     encoder_d_model: usize,
     num_spks: usize,
     encoder_kind: SortformerEncoderKind,
 ) -> Result<SortformerStreamingConfig> {
-    let mut cfg = SortformerStreamingConfig {
+    let cfg = SortformerStreamingConfig {
         fc_d_model: modules_cfg.fc_d_model.unwrap_or(encoder_d_model),
         num_speakers: num_spks,
         subsampling_factor: modules_cfg
@@ -1928,50 +2037,45 @@ fn resolve_streaming_config(
             .clamp(0.0, 1.0),
     };
 
-    match resolve_streaming_profile(variant) {
-        SortformerStreamingProfile::Model => {}
-        SortformerStreamingProfile::LowLatency | SortformerStreamingProfile::HighLatency
-            if encoder_kind == SortformerEncoderKind::FeatureStackingRope =>
-        {
-            return Err(Error::ModelLoadError(
-                "Nemotron-3-Diarization only supports its checkpoint streaming profile; \
-                 latency overrides are not published for this checkpoint"
-                    .to_string(),
-            ));
-        }
-        SortformerStreamingProfile::LowLatency => {
-            cfg.chunk_len = 6;
-            cfg.chunk_right_context = 7;
-            cfg.fifo_len = 188;
-            cfg.spkcache_update_period = 144;
-            cfg.spkcache_len = 188;
-        }
-        SortformerStreamingProfile::HighLatency => {
-            cfg.chunk_len = 340;
-            cfg.chunk_right_context = 40;
-            cfg.fifo_len = 40;
-            cfg.spkcache_update_period = 300;
-            cfg.spkcache_len = 188;
-        }
-    }
-
-    cfg.validate()
+    apply_streaming_profile(cfg, encoder_kind, profile).validate()
 }
 
-fn resolve_streaming_profile(variant: ModelVariant) -> SortformerStreamingProfile {
-    if let Ok(value) = std::env::var("IZWI_SORTFORMER_STREAMING_PROFILE") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "model" => return SortformerStreamingProfile::Model,
-            "low_latency" | "low-latency" | "low" => return SortformerStreamingProfile::LowLatency,
-            "high_latency" | "high-latency" | "high" => {
-                return SortformerStreamingProfile::HighLatency
-            }
-            _ => {}
+fn apply_streaming_profile(
+    mut cfg: SortformerStreamingConfig,
+    encoder_kind: SortformerEncoderKind,
+    profile: SortformerStreamingProfile,
+) -> SortformerStreamingConfig {
+    if let Some(geometry) = profile.card_geometry(encoder_kind) {
+        cfg.chunk_len = geometry.chunk_len;
+        cfg.chunk_right_context = geometry.chunk_right_context;
+        cfg.fifo_len = geometry.fifo_len;
+        cfg.spkcache_update_period = geometry.spkcache_update_period;
+        cfg.spkcache_len = geometry.spkcache_len;
+    }
+    cfg
+}
+
+/// Reads `IZWI_SORTFORMER_STREAMING_PROFILE`. Every profile is published
+/// for both checkpoints; an unknown value logs and keeps the default rather
+/// than failing the load.
+fn resolve_streaming_profile() -> SortformerStreamingProfile {
+    let Ok(value) = std::env::var("IZWI_SORTFORMER_STREAMING_PROFILE") else {
+        return SortformerStreamingProfile::DEFAULT;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => SortformerStreamingProfile::DEFAULT,
+        "model" => SortformerStreamingProfile::Model,
+        "low_latency" | "low-latency" | "low" => SortformerStreamingProfile::LowLatency,
+        "very_high_latency" | "very-high-latency" | "high_latency" | "high-latency" | "high"
+        | "offline" => SortformerStreamingProfile::VeryHighLatency,
+        other => {
+            tracing::warn!(
+                "unknown IZWI_SORTFORMER_STREAMING_PROFILE {other:?}; using the {} profile",
+                SortformerStreamingProfile::DEFAULT.name()
+            );
+            SortformerStreamingProfile::DEFAULT
         }
     }
-
-    let _ = variant;
-    SortformerStreamingProfile::Model
 }
 
 fn plan_streaming_feature_chunks(
@@ -4432,16 +4536,12 @@ mod tests {
 
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_arena_device() {
-        // resolve_streaming_config reads the profile env var on every call;
-        // hold the lock so a concurrent profile test cannot flip this
-        // default-profile resolution into an override-rejection error.
-        let _env = env_lock().lock().unwrap();
         let cases = [
             ("v2.1", streaming_cfg_for_test()),
             (
                 "nemotron",
                 resolve_streaming_config(
-                    ModelVariant::Nemotron3Diarization,
+                    SortformerStreamingProfile::Model,
                     &SortformerModulesConfig {
                         // The checkpoint publishes an 8-channel-divisible
                         // cache; the 188 default is 4-channel only.
@@ -4472,14 +4572,13 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_metal_arena_device() {
-        let _env = env_lock().lock().unwrap();
         let Some(device) = crate::backends::metal_device_if_available(0) else {
             // No Metal device on this host: the CPU test above still covers
             // the device-routing contract.
             return;
         };
         let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
+            SortformerStreamingProfile::Model,
             &SortformerModulesConfig {
                 spkcache_len: Some(192),
                 ..SortformerModulesConfig::default()
@@ -4505,10 +4604,9 @@ mod tests {
     #[ignore = "requires CUDA hardware"]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_cuda_arena_device() {
-        let _env = env_lock().lock().unwrap();
         let device = Device::new_cuda(0).unwrap();
         let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
+            SortformerStreamingProfile::Model,
             &SortformerModulesConfig {
                 spkcache_len: Some(192),
                 ..SortformerModulesConfig::default()
@@ -4773,59 +4871,87 @@ mod tests {
         assert_eq!(clamped, vec![0, 1, 2, 3]);
     }
 
-    #[test]
-    fn resolve_streaming_config_uses_model_profile_by_default() {
-        let _env = env_lock().lock().unwrap();
-        let cfg = resolve_streaming_config(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            &SortformerModulesConfig::default(),
-            512,
-            4,
-            SortformerEncoderKind::Conformer,
-        )
-        .unwrap();
-
-        assert_eq!(cfg.chunk_len, 188);
-        assert_eq!(cfg.chunk_right_context, 1);
-        assert_eq!(cfg.fifo_len, 0);
-        assert_eq!(cfg.spkcache_update_period, 188);
-        assert_eq!(cfg.spkcache_len, 188);
+    fn streaming_geometry(cfg: &SortformerStreamingConfig) -> [usize; 6] {
+        [
+            cfg.chunk_len,
+            cfg.chunk_left_context,
+            cfg.chunk_right_context,
+            cfg.fifo_len,
+            cfg.spkcache_update_period,
+            cfg.spkcache_len,
+        ]
     }
 
-    #[test]
-    fn resolve_streaming_config_honors_high_latency_override() {
+    fn with_profile_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _env = env_lock().lock().unwrap();
         let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
         let previous = std::env::var(key).ok();
-        std::env::set_var(key, "high");
-
-        let cfg = resolve_streaming_config(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            &SortformerModulesConfig::default(),
-            512,
-            4,
-            SortformerEncoderKind::Conformer,
-        )
-        .unwrap();
-
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
         match previous {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
+        result
+    }
 
-        assert_eq!(cfg.chunk_len, 340);
-        assert_eq!(cfg.chunk_right_context, 40);
-        assert_eq!(cfg.fifo_len, 40);
-        assert_eq!(cfg.spkcache_update_period, 300);
-        assert_eq!(cfg.spkcache_len, 188);
+    /// D2: file diarization defaults to the card very-high-latency profile
+    /// (SRT-3), and the knob still selects the yaml and low profiles. An
+    /// unknown value keeps the default instead of failing the load.
+    #[test]
+    fn resolve_streaming_profile_defaults_to_card_very_high_latency() {
+        for (value, expected) in [
+            (None, SortformerStreamingProfile::VeryHighLatency),
+            (Some(""), SortformerStreamingProfile::VeryHighLatency),
+            (Some("high"), SortformerStreamingProfile::VeryHighLatency),
+            (Some("offline"), SortformerStreamingProfile::VeryHighLatency),
+            (Some("model"), SortformerStreamingProfile::Model),
+            (Some("Low-Latency"), SortformerStreamingProfile::LowLatency),
+            (Some("bogus"), SortformerStreamingProfile::VeryHighLatency),
+        ] {
+            assert_eq!(
+                with_profile_env(value, resolve_streaming_profile),
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
-    fn resolve_streaming_config_nemotron3_uses_checkpoint_values_and_rejects_overrides() {
-        // Both resolutions read the profile env var; one lock must span
-        // them so a concurrent profile test cannot flip the default-profile
-        // case into the override-rejection error.
-        let _env = env_lock().lock().unwrap();
+    fn resolve_streaming_config_applies_the_v21_card_profiles() {
+        let resolve = |profile| {
+            resolve_streaming_config(
+                profile,
+                &SortformerModulesConfig::default(),
+                512,
+                4,
+                SortformerEncoderKind::Conformer,
+            )
+            .unwrap()
+        };
+        // chunk / left / right / FIFO / update period / cache
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::DEFAULT)),
+            [340, 1, 40, 40, 300, 188]
+        );
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::Model)),
+            [188, 1, 1, 0, 188, 188]
+        );
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::LowLatency)),
+            [6, 1, 7, 188, 144, 188]
+        );
+    }
+
+    /// NDZ-1/NDZ-3: Nemotron-3 defaults to its card offline profile and
+    /// accepts every published profile, including under the knob a v2.1
+    /// operator sets.
+    #[test]
+    fn resolve_streaming_config_nemotron3_defaults_to_card_offline_profile() {
         let modules_cfg = SortformerModulesConfig {
             fc_d_model: Some(512),
             subsampling_factor: Some(8),
@@ -4833,40 +4959,107 @@ mod tests {
             fifo_len: Some(0),
             chunk_len: Some(264),
             spkcache_update_period: Some(264),
+            chunk_left_context: Some(0),
+            chunk_right_context: Some(0),
+            spkcache_sil_frames_per_spk: Some(1),
             ..SortformerModulesConfig::default()
         };
-        let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
-            &modules_cfg,
-            512,
-            8,
-            SortformerEncoderKind::FeatureStackingRope,
-        )
-        .unwrap();
-
-        assert_eq!(cfg.fc_d_model, 512);
-        assert_eq!(cfg.num_speakers, 8);
-        assert_eq!(cfg.output_frames_per_encoded_frame, 8);
-        assert_eq!(cfg.chunk_len, 264);
-        assert_eq!(cfg.spkcache_len, 264);
-        assert_eq!(cfg.spkcache_update_period, 264);
-        assert_eq!(cfg.fifo_len, 0);
-
-        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
-        let previous = std::env::var(key).ok();
-        std::env::set_var(key, "high");
-        let overridden = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
-            &modules_cfg,
-            512,
-            8,
-            SortformerEncoderKind::FeatureStackingRope,
+        let resolve = |profile| {
+            resolve_streaming_config(
+                profile,
+                &modules_cfg,
+                512,
+                8,
+                SortformerEncoderKind::FeatureStackingRope,
+            )
+            .unwrap()
+        };
+        let default = resolve(SortformerStreamingProfile::DEFAULT);
+        assert_eq!(default.fc_d_model, 512);
+        assert_eq!(default.num_speakers, 8);
+        assert_eq!(default.output_frames_per_encoded_frame, 8);
+        assert_eq!(streaming_geometry(&default), [340, 0, 40, 40, 300, 264]);
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::Model)),
+            [264, 0, 0, 0, 264, 264]
         );
-        match previous {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::LowLatency)),
+            [9, 0, 4, 264, 222, 264]
+        );
+        let under_high_knob = with_profile_env(Some("high"), || {
+            resolve_streaming_config(
+                resolve_streaming_profile(),
+                &modules_cfg,
+                512,
+                8,
+                SortformerEncoderKind::FeatureStackingRope,
+            )
+        });
+        assert_eq!(
+            streaming_geometry(&under_high_knob.unwrap()),
+            [340, 0, 40, 40, 300, 264]
+        );
+    }
+
+    /// Every published profile of both checkpoints fits its production
+    /// envelope and the request authorization, and its physical state
+    /// carries the FIFO components exactly when the profile has a FIFO.
+    #[test]
+    fn every_published_profile_fits_the_production_authorization() {
+        // The pipeline's one-hour limit at 16 kHz.
+        let one_hour = 60 * 60 * TARGET_SAMPLE_RATE as usize;
+        let authorization = production_workspace_authorization(one_hour, false).unwrap();
+        let cases = [
+            (
+                SortformerWorkspaceTopology::v21_production(),
+                SortformerStreamingConfig {
+                    chunk_len: 188,
+                    chunk_left_context: 1,
+                    chunk_right_context: 1,
+                    fifo_len: 0,
+                    spkcache_update_period: 188,
+                    ..production_workspace_streaming_config()
+                },
+                SortformerEncoderKind::Conformer,
+            ),
+            (
+                SortformerWorkspaceTopology::nemotron3_production(),
+                nemotron3_checkpoint_streaming_config(),
+                SortformerEncoderKind::FeatureStackingRope,
+            ),
+        ];
+        for (topology, checkpoint, kind) in cases {
+            for profile in [
+                SortformerStreamingProfile::Model,
+                SortformerStreamingProfile::LowLatency,
+                SortformerStreamingProfile::VeryHighLatency,
+            ] {
+                let cfg = apply_streaming_profile(checkpoint, kind, profile)
+                    .validate()
+                    .unwrap();
+                topology.validate_production(cfg).unwrap();
+                let estimate = workspace_estimate_for(topology, cfg, one_hour, false).unwrap();
+                assert!(
+                    estimate.host_bytes <= authorization.host_bytes,
+                    "{kind:?} {profile:?}"
+                );
+                assert!(
+                    estimate.accelerator_bytes <= authorization.accelerator_bytes,
+                    "{kind:?} {profile:?}"
+                );
+                let contract = physical::sortformer_invocation_contract(cfg).unwrap();
+                let crate::kv::v2::StateDomainSpec::Tensor(state) = &contract.domains[0] else {
+                    panic!("Sortformer state must be a tensor domain");
+                };
+                let expected_components = if cfg.fifo_len > 0 { 6 } else { 4 };
+                assert_eq!(
+                    state.components.len(),
+                    expected_components,
+                    "{kind:?} {profile:?}"
+                );
+            }
         }
-        assert!(overridden.is_err());
     }
 
     #[test]
@@ -5627,18 +5820,22 @@ mod tests {
     /// uses: the speaker cache and FIFO filled, then three full chunks.
     #[test]
     fn sortformer_workspace_estimate_bounds_the_measured_peak() {
-        let _env = env_lock().lock().unwrap();
-        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
-        let previous = std::env::var(key).ok();
         let v21 = SortformerWorkspaceTopology::v21_production();
         for (profile, samples, measured) in [
-            ("model", 970_240_usize, 384_631_072_u64),
-            ("high_latency", 1_754_880, 750_699_096),
-            ("low_latency", 535_040, 234_455_304),
+            (
+                SortformerStreamingProfile::Model,
+                970_240_usize,
+                384_631_072_u64,
+            ),
+            (
+                SortformerStreamingProfile::VeryHighLatency,
+                1_754_880,
+                750_699_096,
+            ),
+            (SortformerStreamingProfile::LowLatency, 535_040, 234_455_304),
         ] {
-            std::env::set_var(key, profile);
             let cfg = resolve_streaming_config(
-                ModelVariant::DiarStreamingSortformer4SpkV21,
+                profile,
                 &SortformerModulesConfig::default(),
                 PRODUCTION_CONFORMER_D_MODEL,
                 4,
@@ -5649,16 +5846,12 @@ mod tests {
             let total = estimate.host_bytes + estimate.accelerator_bytes;
             assert!(
                 total >= measured,
-                "v2.1 {profile}: {total} B < measured {measured} B"
+                "v2.1 {profile:?}: {total} B < measured {measured} B"
             );
             assert!(
                 total <= measured * 3 / 2,
-                "v2.1 {profile}: {total} B is over 1.5x the measured {measured} B"
+                "v2.1 {profile:?}: {total} B is over 1.5x the measured {measured} B"
             );
-        }
-        match previous {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
         }
 
         // Nemotron-3's peak was 51 MiB: the estimate bounds it with room to
@@ -5671,6 +5864,21 @@ mod tests {
         )
         .unwrap();
         assert!(nemotron3.host_bytes + nemotron3.accelerator_bytes >= 53_624_904);
+        // Its default card offline profile peaked at 108.6 MiB (115.5 s,
+        // composite 684 frames; 2026-10-15).
+        let card_offline = apply_streaming_profile(
+            nemotron3_checkpoint_streaming_config(),
+            SortformerEncoderKind::FeatureStackingRope,
+            SortformerStreamingProfile::VeryHighLatency,
+        );
+        let estimate = workspace_estimate_for(
+            SortformerWorkspaceTopology::nemotron3_production(),
+            card_offline,
+            1_848_320,
+            false,
+        )
+        .unwrap();
+        assert!(estimate.host_bytes + estimate.accelerator_bytes >= 113_901_664);
     }
 
     /// Live process memory for the measurement below: the physical
@@ -5747,6 +5955,8 @@ mod tests {
             (ModelVariant::DiarStreamingSortformer4SpkV21, "high_latency"),
             (ModelVariant::DiarStreamingSortformer4SpkV21, "low_latency"),
             (ModelVariant::Nemotron3Diarization, "model"),
+            (ModelVariant::Nemotron3Diarization, "high_latency"),
+            (ModelVariant::Nemotron3Diarization, "low_latency"),
         ] {
             let model_dir = models_root.join(variant.dir_name());
             if !model_dir.exists() {

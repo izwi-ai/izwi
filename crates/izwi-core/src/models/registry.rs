@@ -3703,6 +3703,12 @@ impl NativeAudioChatModel {
 }
 
 impl NativeDiarizationModel {
+    pub fn family_diagnostics(&self) -> Value {
+        match self {
+            Self::Sortformer(model) => model.family_diagnostics(),
+        }
+    }
+
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -6351,7 +6357,7 @@ impl ModelRegistry {
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
-                    None,
+                    Some(model.family_diagnostics()),
                 ));
             }
         }
