@@ -1291,37 +1291,36 @@ impl SortformerDiarizerModel {
                     5000.0,
                 )
             });
-        let min_speech_ms = explicit_min_speech_ms
-            .unwrap_or(DEFAULT_MIN_SPEECH_MS)
-            .clamp(
-                frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
-                5000.0,
+        // D3: NeMo has no external VAD gate; Sortformer is itself the speech
+        // detector. The opt-in gate keeps whole probabilities and clips the
+        // post-processed segments to padded VAD speech regions instead.
+        let vad_regions = if resolve_vad_gate(config) {
+            let min_speech_ms = explicit_min_speech_ms
+                .unwrap_or(DEFAULT_MIN_SPEECH_MS)
+                .clamp(
+                    frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
+                    5000.0,
+                );
+            let min_silence_ms = explicit_min_silence_ms
+                .unwrap_or(DEFAULT_MIN_SILENCE_MS)
+                .clamp(
+                    frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
+                    5000.0,
+                );
+            let vad_mask = sortformer_vad_frame_mask(
+                samples,
+                speaker_probs.len(),
+                frame_stride_samples,
+                min_speech_ms,
+                min_silence_ms,
             );
-        let min_silence_ms = explicit_min_silence_ms
-            .unwrap_or(DEFAULT_MIN_SILENCE_MS)
-            .clamp(
-                frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
-                5000.0,
-            );
-
-        let mut gated_probs = speaker_probs;
-        let frame_count = gated_probs.len();
-        let vad_mask = sortformer_vad_frame_mask(
-            samples,
-            frame_count,
-            frame_stride_samples,
-            min_speech_ms,
-            min_silence_ms,
-        );
+            Some(padded_vad_regions(&vad_mask, frame_stride_samples))
+        } else {
+            None
+        };
+        let gated_probs = speaker_probs;
 
         let num_speakers = self.model.num_speakers;
-        for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
-            if !active {
-                for spk in 0..num_speakers {
-                    gated_probs[frame_idx][spk] = 0.0;
-                }
-            }
-        }
 
         let requested_max = config.max_speakers.unwrap_or(num_speakers);
         let max_speakers = requested_max.clamp(1, num_speakers);
@@ -1335,12 +1334,15 @@ impl SortformerDiarizerModel {
         let mut raw_segments = Vec::<RawSegment>::new();
         let mut speaker_stats = Vec::<SpeakerActivityStats>::new();
         for speaker_idx in 0..num_speakers {
-            let speaker_segments = ts_vad_post_processing(
+            let mut speaker_segments = ts_vad_post_processing(
                 &gated_probs,
                 speaker_idx,
                 &postprocessing_params,
                 frame_repeat,
             );
+            if let Some(regions) = &vad_regions {
+                speaker_segments = gate_segments(&speaker_segments, regions);
+            }
             if speaker_segments.is_empty() {
                 if limit_speaker_channels {
                     speaker_stats.push(SpeakerActivityStats {
@@ -1403,7 +1405,7 @@ impl SortformerDiarizerModel {
                 speaker_count: 0,
             };
             drop(speaker_stats);
-            drop(vad_mask);
+            drop(vad_regions);
             drop(gated_probs);
             workspace.release()?;
             return Ok(result);
@@ -1481,7 +1483,7 @@ impl SortformerDiarizerModel {
         drop(speaker_remap);
         drop(ordered);
         drop(speaker_stats);
-        drop(vad_mask);
+        drop(vad_regions);
         drop(gated_probs);
         let result = DiarizationResult {
             segments,
@@ -4116,6 +4118,52 @@ fn sortformer_vad_frame_mask(
     .unwrap_or_else(|_| vec![true; frame_count])
 }
 
+/// The opt-in VAD gate: the request's `vad_gate`, else
+/// `IZWI_SORTFORMER_VAD_GATE`, else off.
+fn resolve_vad_gate(config: &DiarizationConfig) -> bool {
+    config
+        .vad_gate
+        .or_else(|| env_flag("IZWI_SORTFORMER_VAD_GATE"))
+        .unwrap_or(false)
+}
+
+/// Speech regions of a frame mask in seconds, each widened by one encoded
+/// Sortformer frame (80 ms) on both sides so the gate never clips an onset
+/// or offset the model placed inside that frame.
+fn padded_vad_regions(mask: &[bool], frame_stride_samples: usize) -> Vec<(f32, f32)> {
+    let frame_secs = frame_stride_samples as f32 / TARGET_SAMPLE_RATE as f32;
+    let encoded_frame_secs =
+        (TS_VAD_UNIT_FRAME_COUNT * PRODUCTION_HOP_LENGTH) as f32 / TARGET_SAMPLE_RATE as f32;
+    let pad_secs = encoded_frame_secs.max(frame_secs);
+    let regions = collect_active_regions(mask)
+        .into_iter()
+        .map(|(start, end)| {
+            (
+                (start as f32 * frame_secs - pad_secs).max(0.0),
+                (end + 1) as f32 * frame_secs + pad_secs,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_overlap_ranges(&regions)
+}
+
+/// Gates whole post-processed segments: one that meets no speech region is
+/// dropped, and one that does is trimmed to the first and last regions it
+/// meets. Pauses the VAD finds inside a turn never split it.
+fn gate_segments(segments: &[(f32, f32)], regions: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    segments
+        .iter()
+        .filter_map(|&(start, end)| {
+            let mut met = regions
+                .iter()
+                .filter(|&&(region_start, region_end)| region_start < end && region_end > start);
+            let first = met.next()?;
+            let last = met.next_back().unwrap_or(first);
+            Some((start.max(first.0), end.min(last.1)))
+        })
+        .collect()
+}
+
 fn ms_f32_to_u32(ms: f32) -> u32 {
     ms.round().max(1.0) as u32
 }
@@ -4737,6 +4785,61 @@ mod tests {
         assert!(mask.iter().all(|active| !active));
     }
 
+    /// D3: the VAD gate is opt-in. A request value wins over the
+    /// environment, which wins over the off default.
+    #[test]
+    fn vad_gate_is_off_unless_requested() {
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_VAD_GATE";
+        let previous = std::env::var(key).ok();
+        let requested = |vad_gate| DiarizationConfig {
+            vad_gate,
+            ..DiarizationConfig::default()
+        };
+        std::env::remove_var(key);
+        let unset = resolve_vad_gate(&DiarizationConfig::default());
+        let request_on = resolve_vad_gate(&requested(Some(true)));
+        std::env::set_var(key, "1");
+        let env_on = resolve_vad_gate(&DiarizationConfig::default());
+        let request_off = resolve_vad_gate(&requested(Some(false)));
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        assert!(!unset);
+        assert!(request_on);
+        assert!(env_on);
+        assert!(!request_off);
+    }
+
+    /// SRT-4: when on, the gate widens each VAD speech region by one
+    /// encoded Sortformer frame (80 ms) and trims whole segments to the
+    /// regions; it never touches probabilities.
+    #[test]
+    fn vad_gate_pads_regions_by_one_encoded_frame_and_clips_segments() {
+        let mask = [false, false, true, true, false, false, false, true, false];
+        // v2.1 rows are 80 ms: frames 2-3 and 7, each widened by one frame.
+        let v21 = padded_vad_regions(&mask, 1280);
+        let expected = [(0.08, 0.40), (0.48, 0.72)];
+        assert_eq!(v21.len(), expected.len());
+        for (actual, expected) in v21.iter().zip(expected) {
+            assert!((actual.0 - expected.0).abs() < 1e-6, "{v21:?}");
+            assert!((actual.1 - expected.1).abs() < 1e-6, "{v21:?}");
+        }
+        // Nemotron-3 rows are 10 ms: the pad is still 80 ms (8 rows).
+        let nemotron = padded_vad_regions(&mask, 160);
+        assert_eq!(nemotron.len(), 1);
+        assert!((nemotron[0].0 - 0.0).abs() < 1e-6);
+        assert!((nemotron[0].1 - 0.16).abs() < 1e-6);
+
+        // A segment is trimmed to the regions it meets, not split at the
+        // pause between them; one outside every region is dropped.
+        let gated = gate_segments(&[(0.0, 0.6), (0.9, 1.2), (0.2, 0.3)], &v21);
+        assert_eq!(gated.len(), 2, "{gated:?}");
+        assert!((gated[0].0 - 0.08).abs() < 1e-6 && (gated[0].1 - 0.6).abs() < 1e-6);
+        assert!((gated[1].0 - 0.2).abs() < 1e-6 && (gated[1].1 - 0.3).abs() < 1e-6);
+    }
+
     #[test]
     fn select_speaker_channels_prefers_active_speakers_by_duration() {
         let stats = vec![
@@ -5350,130 +5453,6 @@ mod tests {
         assert!((segments[0].start_secs - 0.0).abs() < 1e-6);
         assert!((segments[0].end_secs - 2.0).abs() < 1e-6);
         assert_eq!(segments[1].speaker, "SPEAKER_01");
-    }
-
-    /// Expected segments come from NeMo's card very-high-latency profile
-    /// (340/40/40/300) on 44.1 kHz input through the model-internal linear
-    /// resampler, so the test pins both instead of inheriting the default
-    /// profile. Probability parity on canonical 16 kHz input lives in
-    /// `parity_tests`.
-    #[test]
-    #[ignore = "requires local Sortformer checkpoint"]
-    fn sortformer_local_checkpoint_matches_diarization_2_reference_segments() {
-        let models_root = std::env::var("IZWI_MODELS_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("izwi")
-                    .join("models")
-            });
-        let model_dir = models_root.join(ModelVariant::DiarStreamingSortformer4SpkV21.dir_name());
-        if !model_dir
-            .join("diar_streaming_sortformer_4spk-v2.1.nemo")
-            .exists()
-        {
-            eprintln!(
-                "Skipping Sortformer checkpoint test, model not found at {}",
-                model_dir.display()
-            );
-            return;
-        }
-
-        let audio_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/diarization-2.mp3");
-        let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
-        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
-
-        assert_eq!(
-            sample_rate, 44_100,
-            "the expected segments encode 44.1 kHz input"
-        );
-
-        let model = {
-            let _env = env_lock().lock().unwrap();
-            let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, "high");
-            let model = SortformerDiarizerModel::load(
-                &model_dir,
-                ModelVariant::DiarStreamingSortformer4SpkV21,
-                DeviceProfile::cpu(),
-            );
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            model.expect("sortformer checkpoint should load")
-        };
-        let streaming = model.model.streaming.expect("bounded streaming profile");
-        assert_eq!(
-            (
-                streaming.chunk_len,
-                streaming.chunk_right_context,
-                streaming.fifo_len,
-                streaming.spkcache_update_period,
-                streaming.spkcache_len,
-            ),
-            (340, 40, 40, 300, 188)
-        );
-        let diarization = model
-            .diarize(&samples, sample_rate, &DiarizationConfig::default())
-            .expect("sortformer diarization should run");
-
-        let expected = vec![
-            (0.40, 2.72, 0usize),
-            (3.20, 4.96, 0),
-            (5.44, 10.08, 0),
-            (10.72, 15.52, 0),
-            (15.60, 18.32, 0),
-            (19.60, 20.08, 0),
-            (20.88, 22.88, 0),
-            (23.28, 27.84, 0),
-            (28.40, 29.84, 0),
-            (30.16, 36.96, 0),
-            (38.40, 42.64, 0),
-            (42.80, 62.16, 1),
-            (62.40, 68.80, 2),
-            (69.44, 92.80, 2),
-            (92.88, 97.60, 3),
-            (97.92, 104.00, 0),
-            (104.16, 116.55, 0),
-        ];
-
-        assert_eq!(
-            diarization.segments.len(),
-            expected.len(),
-            "unexpected segment count: {:#?}",
-            diarization.segments
-        );
-
-        for (segment, (expected_start, expected_end, expected_speaker)) in
-            diarization.segments.iter().zip(expected.iter())
-        {
-            let actual_speaker = parse_test_speaker_id(&segment.speaker);
-            assert!(
-                (segment.start_secs - expected_start).abs() <= 0.02,
-                "segment start mismatch for {:?}: expected {}, got {}",
-                segment,
-                expected_start,
-                segment.start_secs
-            );
-            assert!(
-                (segment.end_secs - expected_end).abs() <= 0.02,
-                "segment end mismatch for {:?}: expected {}, got {}",
-                segment,
-                expected_end,
-                segment.end_secs
-            );
-            assert_eq!(
-                actual_speaker, *expected_speaker,
-                "speaker mismatch for {:?}",
-                segment
-            );
-        }
     }
 
     #[test]

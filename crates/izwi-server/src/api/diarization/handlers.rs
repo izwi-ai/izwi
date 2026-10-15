@@ -598,6 +598,7 @@ async fn generate_diarization_artifacts(
                 max_speakers: parsed.max_speakers,
                 min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
                 min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
+                vad_gate: None,
             },
             parsed.enable_llm_refinement.unwrap_or(false),
         )

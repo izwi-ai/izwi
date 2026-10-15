@@ -527,3 +527,171 @@ fn sortformer_v21_matches_nemo_low_latency_fifo_pops_on_diarization_2() {
         &reference["runs"]["card_low"],
     )]);
 }
+
+/// `diarize` segments as `(start, end, label index)`, sorted.
+fn diarize_segments(
+    model: &SortformerDiarizerModel,
+    samples: &[f32],
+    config: &DiarizationConfig,
+) -> Vec<(f32, f32, usize)> {
+    let result = model
+        .diarize(samples, TARGET_SAMPLE_RATE, config)
+        .expect("diarize should run");
+    let mut segments = result
+        .segments
+        .iter()
+        .map(|segment| {
+            let label = segment
+                .speaker
+                .strip_prefix("SPEAKER_")
+                .and_then(|id| id.parse::<usize>().ok())
+                .expect("SPEAKER_nn label");
+            (segment.start_secs, segment.end_secs, label)
+        })
+        .collect::<Vec<_>>();
+    sort_segments(&mut segments);
+    segments
+}
+
+/// NeMo's raw channels relabelled in first-appearance order, as `diarize`
+/// labels speakers, with ends clamped to the audio duration.
+fn arrival_labelled(mut segments: Vec<(f32, f32, usize)>, duration: f32) -> Vec<(f32, f32, usize)> {
+    let mut order = Vec::<usize>::new();
+    for segment in &segments {
+        if !order.contains(&segment.2) {
+            order.push(segment.2);
+        }
+    }
+    for segment in &mut segments {
+        segment.1 = segment.1.min(duration);
+        segment.2 = order
+            .iter()
+            .position(|channel| *channel == segment.2)
+            .unwrap();
+    }
+    segments
+}
+
+fn without_vad_gate<T>(f: impl FnOnce() -> T) -> T {
+    let _env = crate::env_test_lock().lock().unwrap();
+    let key = "IZWI_SORTFORMER_VAD_GATE";
+    let previous = std::env::var(key).ok();
+    std::env::remove_var(key);
+    let result = f();
+    if let Some(value) = previous {
+        std::env::set_var(key, value);
+    }
+    result
+}
+
+/// D3/SRT-4: with the VAD gate off (the default), the served `diarize`
+/// path reproduces NeMo's segments under each card offline profile. The
+/// gate used to fragment Nemotron-3 on diarization-2 into ~30 segments
+/// against the reference's 13.
+#[test]
+#[ignore = "requires the local Sortformer checkpoints and prepared parity audio"]
+fn diarize_without_the_vad_gate_matches_nemo_segments() {
+    let mut outcomes = Vec::new();
+    for (fixture_name, profile, load) in [
+        (
+            "v21-diarization.json",
+            "card_high",
+            load_v21 as fn() -> Option<SortformerDiarizerModel>,
+        ),
+        ("v21-diarization-2.json", "card_high", load_v21),
+        (
+            "nemotron3-diarization-2.json",
+            "card_offline",
+            load_nemotron3,
+        ),
+    ] {
+        let reference = fixture(fixture_name);
+        let Some(samples) = parity_audio(reference["audio"].as_str().expect("audio")) else {
+            return;
+        };
+        let Some(mut model) = load() else {
+            continue;
+        };
+        let run = &reference["runs"][profile];
+        model.model.streaming = Some(fixture_streaming_config(&model, &run["streaming"]));
+        let actual =
+            without_vad_gate(|| diarize_segments(&model, &samples, &DiarizationConfig::default()));
+        let duration = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
+        let expected = arrival_labelled(reference_segments(&run["segments"]), duration);
+        println!(
+            "diarize {fixture_name} {profile}: {} segments (reference {})",
+            actual.len(),
+            expected.len()
+        );
+        outcomes.push(ParityOutcome {
+            label: format!("diarize {fixture_name} {profile} without the VAD gate"),
+            max_abs: 0.0,
+            segments_equal: segments_equal(&actual, &expected),
+            detail: format!("izwi {actual:?}\nnemo {expected:?}"),
+        });
+    }
+    ParityOutcome::report(&outcomes);
+}
+
+/// SRT-4: on quiet speech (diarization.wav at -35 dBFS peak) the opt-in
+/// gate keeps every gate-off segment to within one encoded frame at each
+/// end: it may only trim a padded edge, never drop speech.
+#[test]
+#[ignore = "requires the local Sortformer v2.1 checkpoint and prepared parity audio"]
+fn opt_in_vad_gate_keeps_quiet_speech_within_one_frame() {
+    let reference = fixture("v21-diarization.json");
+    let Some(samples) = parity_audio(reference["audio"].as_str().expect("audio")) else {
+        return;
+    };
+    let Some(mut model) = load_v21() else {
+        return;
+    };
+    model.model.streaming = Some(fixture_streaming_config(
+        &model,
+        &reference["runs"]["card_high"]["streaming"],
+    ));
+    let peak = samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
+    let gain = 10f32.powf(-35.0 / 20.0) / peak;
+    let quiet = samples.iter().map(|s| s * gain).collect::<Vec<_>>();
+    let config = |vad_gate| DiarizationConfig {
+        vad_gate: Some(vad_gate),
+        ..DiarizationConfig::default()
+    };
+    let ungated = diarize_segments(&model, &quiet, &config(false));
+    let gated = diarize_segments(&model, &quiet, &config(true));
+    println!(
+        "quiet speech: {} segments ungated, {} gated",
+        ungated.len(),
+        gated.len()
+    );
+
+    let frame = 0.08 + SEGMENT_TOLERANCE_SECS;
+    let uncovered = ungated
+        .iter()
+        .filter(|(start, end, speaker)| {
+            // The gated pieces of this speaker inside the segment must span
+            // it, less at most one frame at each end and no inner gap.
+            let mut pieces = gated
+                .iter()
+                .filter(|piece| piece.2 == *speaker && piece.1 > *start && piece.0 < *end)
+                .map(|piece| (piece.0.max(*start), piece.1.min(*end)))
+                .collect::<Vec<_>>();
+            pieces.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let Some(first) = pieces.first() else {
+                return true;
+            };
+            let mut covered_to = first.1;
+            for piece in &pieces[1..] {
+                if piece.0 > covered_to + SEGMENT_TOLERANCE_SECS {
+                    return true;
+                }
+                covered_to = covered_to.max(piece.1);
+            }
+            first.0 > start + frame || covered_to < end - frame
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        uncovered.is_empty(),
+        "the gate dropped quiet speech: {uncovered:?}\nungated {ungated:?}\ngated {gated:?}"
+    );
+}
