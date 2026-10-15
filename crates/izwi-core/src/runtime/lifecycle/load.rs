@@ -555,10 +555,10 @@ fn admit_asr_request_floor(
 }
 
 /// Whether a load of `variant` is reconciled against the device observer:
-/// the families whose admission is a residency plan (ASR and TTS), so an
-/// observed excess means the plan under-prices the loader.
+/// the families whose admission is a residency plan (ASR, the forced aligner
+/// and TTS), so an observed excess means the plan under-prices the loader.
 fn reconciles_device_usage(variant: ModelVariant) -> bool {
-    asr_memory::is_asr_variant(variant) || tts_memory::has_plan(variant)
+    asr_memory::has_plan(variant) || tts_memory::has_plan(variant)
 }
 
 /// A request envelope in `backend`'s ledger domains: host and accelerator
@@ -1986,8 +1986,8 @@ impl ModelLifecycleController {
     }
 
     /// One reconciliation checkpoint for a load priced by a residency plan
-    /// (ASR and TTS), or `None` for other families and backends without a
-    /// device observer (CPU).
+    /// (ASR, the forced aligner and TTS), or `None` for other families and
+    /// backends without a device observer (CPU).
     fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
         if !reconciles_device_usage(variant) {
             return None;

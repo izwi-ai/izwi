@@ -165,6 +165,13 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
     ) || variant.family() == ModelFamily::GraniteSpeechAsr
 }
 
+/// Whether this module prices `variant`: the ASR variants and the forced
+/// aligner, which is not one of them (stateless, with no request floor or
+/// state fit).
+pub(super) fn has_plan(variant: ModelVariant) -> bool {
+    is_asr_variant(variant) || variant.family() == ModelFamily::Qwen3ForcedAligner
+}
+
 pub(super) fn residency_plan(
     variant: ModelVariant,
     model_path: &Path,
@@ -3191,6 +3198,73 @@ pub(super) mod tests {
                 metal > catalog + (2 << 30),
                 "{variant}: {metal} vs {catalog}"
             );
+        }
+    }
+
+    /// ADM-7: aligner loads are reconciled against the device observer now
+    /// that a plan prices them. After the fence a Metal weight load grows the
+    /// device by its resident weights (dense: 4.19 GiB, the audit's 4.49 GB):
+    /// inside the plan's authorized peak, but past the checkpoint-bytes
+    /// estimate the generic path authorized (2.77 GB) and its tolerance, so
+    /// reconciling without the plan would fail every load.
+    #[test]
+    fn aligner_loads_reconcile_within_the_plan_not_the_generic_estimate() {
+        let _env = env_lock();
+        let sample = |observed| super::super::DeviceUsageSample {
+            observed,
+            reserved: 0,
+        };
+        for (variant, files, generic_peak) in [
+            (
+                ModelVariant::Qwen3ForcedAligner06B,
+                census!("qwen3_forced_aligner_0_6b.json"),
+                2_769_739_008,
+            ),
+            (
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+                census!("qwen3_forced_aligner_0_6b_4bit.json"),
+                1_126_895_360,
+            ),
+        ] {
+            assert!(super::super::reconciles_device_usage(variant));
+            let plan = aligner(&files, BackendKind::Metal);
+            let observed = plan.resident_bytes;
+            let reconcile = |authorized| {
+                super::super::reconcile_observed_growth(
+                    variant,
+                    "weight load",
+                    sample(0),
+                    sample(observed),
+                    authorized,
+                )
+            };
+            assert_eq!(reconcile(plan.load_peak_bytes).unwrap(), observed);
+            let census = super::super::CheckpointCensus {
+                files,
+                container_fallback_bytes: 0,
+            };
+            let generic = super::super::estimate_from_tensor_inventory(
+                super::super::model_memory_estimate(variant),
+                census.inventory(),
+            )
+            .unwrap();
+            assert_eq!(generic.load_peak_bytes, generic_peak, "{variant}");
+            assert!(reconcile(generic.load_peak_bytes).is_err(), "{variant}");
+        }
+        // The ASR and TTS families keep their reconciliation; families
+        // without a plan are not reconciled.
+        for variant in [
+            ModelVariant::Qwen3Asr06BGguf,
+            ModelVariant::ParakeetTdt06BV3,
+            ModelVariant::Qwen3Tts12Hz06BCustomVoice,
+        ] {
+            assert!(super::super::reconciles_device_usage(variant), "{variant}");
+        }
+        for variant in [
+            ModelVariant::Qwen306B,
+            ModelVariant::DiarStreamingSortformer4SpkV21,
+        ] {
+            assert!(!super::super::reconciles_device_usage(variant), "{variant}");
         }
     }
 
