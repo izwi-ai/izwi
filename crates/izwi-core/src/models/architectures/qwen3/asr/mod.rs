@@ -6699,6 +6699,106 @@ mod tests {
             })
     }
 
+    /// The aligner against qwen-asr 0.0.6 on fox.wav and test.wav: the same
+    /// word units, and word boundaries within 40 ms on average of the
+    /// reference's windowed-encoder run (the form izwi implements).
+    /// `IZWI_ALIGNER_REFERENCE_DIR` holds the audit's
+    /// `01-aligner-reference-{fox,test}.json`; `IZWI_ALIGNER_DEVICE` picks
+    /// cpu (default) or metal; `IZWI_ALIGNER_DUMP` names a file for the
+    /// timings.
+    ///
+    /// With the production decode, the canonical resampler differs from the
+    /// reference's soxr_hq near 8 kHz and moves test.wav's `AIautonomous` end
+    /// by 800 ms (measured 2026-10-15: mean 15.5 ms over 134 boundaries).
+    /// Given the reference's own 16 kHz audio (`IZWI_ALIGNER_AUDIO_DIR`), every
+    /// boundary must also be within 160 ms (measured: all equal, CPU and
+    /// Metal).
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and IZWI_ALIGNER_REFERENCE_DIR"]
+    fn forced_aligner_matches_the_reference_timings() {
+        let reference_dir = PathBuf::from(
+            std::env::var("IZWI_ALIGNER_REFERENCE_DIR").expect("IZWI_ALIGNER_REFERENCE_DIR"),
+        );
+        let device_name = std::env::var("IZWI_ALIGNER_DEVICE").unwrap_or_else(|_| "cpu".into());
+        let device = DeviceSelector::detect_with_preference(Some(&device_name)).expect("device");
+        let model = Qwen3AsrModel::load(
+            &local_models_root().join("Qwen3-ForcedAligner-0.6B"),
+            ModelVariant::Qwen3ForcedAligner06B,
+            device,
+        )
+        .expect("load aligner");
+        let reference_audio = std::env::var("IZWI_ALIGNER_AUDIO_DIR").ok();
+        let data = reference_audio
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"));
+        let reference_audio = reference_audio.is_some();
+        let mut dump = serde_json::Map::new();
+        let mut off_target = Vec::new();
+        for name in ["fox", "test"] {
+            let path = reference_dir.join(format!("01-aligner-reference-{name}.json"));
+            let reference: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).expect("reference")).unwrap();
+            let text = reference["input"]["transcript"].as_str().unwrap();
+            let language = reference["input"]["language"].as_str();
+            let bytes = fs::read(data.join(format!("{name}.wav"))).expect("audio");
+            // The production decode, which resamples to 16 kHz itself.
+            let (audio, rate) =
+                crate::runtime::audio_io::decode_audio_bytes_canonical(&bytes).expect("decode");
+            let units = alignment_units(text, language);
+            let timings = model
+                .force_align_units(&audio, rate, &units)
+                .expect("align");
+            dump.insert(name.into(), json!(timings));
+            for variant in ["windowed", "official"] {
+                let words = reference["variants"][variant]["words"].as_array().unwrap();
+                let texts = words
+                    .iter()
+                    .map(|word| word["text"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    units
+                        .iter()
+                        .map(|unit| unit.text.as_str())
+                        .collect::<Vec<_>>(),
+                    texts,
+                    "{name}: word units"
+                );
+                let ms = |value: &serde_json::Value| (value.as_f64().unwrap() * 1000.0).round();
+                let deltas = words
+                    .iter()
+                    .zip(&timings)
+                    .flat_map(|(word, (start, end))| {
+                        [
+                            (ms(&word["start"]) - f64::from(*start)).abs(),
+                            (ms(&word["end"]) - f64::from(*end)).abs(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                let max = deltas.iter().copied().fold(0.0, f64::max);
+                eprintln!(
+                    "{device_name} {name} vs {variant}: mean |d| {mean:.1} ms, max {max} ms, \
+                     {} of {} boundaries differ",
+                    deltas.iter().filter(|delta| **delta > 0.0).count(),
+                    deltas.len()
+                );
+                let max_bound = if reference_audio {
+                    160.0
+                } else {
+                    f64::INFINITY
+                };
+                if variant == "windowed" && (mean > 40.0 || max > max_bound) {
+                    off_target.push(format!("{name}: mean {mean:.1} ms, max {max} ms"));
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("IZWI_ALIGNER_DUMP") {
+            fs::write(path, serde_json::Value::Object(dump).to_string()).expect("dump");
+        }
+        assert!(off_target.is_empty(), "{off_target:?}");
+    }
+
     #[test]
     #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
     fn forced_aligner_local_checkpoint_loads_and_aligns() {
