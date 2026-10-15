@@ -3905,6 +3905,27 @@ impl RuntimeService {
     }
 }
 
+/// Residency leases a long-lived session (a realtime voice connection) holds
+/// on the models it uses. Each model loads like an inference auto-load and
+/// is never pinned: it stays out of eviction only while this set, or a clone
+/// of it, is alive, and becomes evictable again when the session ends.
+#[derive(Debug, Clone, Default)]
+pub struct SessionModelLeases {
+    leases: Arc<std::sync::Mutex<HashMap<ModelVariant, crate::model::ModelResidencyLease>>>,
+}
+
+impl SessionModelLeases {
+    /// Loads `variant` if needed and keeps a lease on it for the session.
+    pub async fn hold(&self, runtime: &RuntimeService, variant: ModelVariant) -> Result<()> {
+        let lease = runtime.load_model_for_inference(variant).await?;
+        self.leases
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(variant, lease);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6487,6 +6508,77 @@ mod tests {
                 .await,
             Err(Error::Overloaded(_))
         ));
+        assert!(runtime.model_manager.resident_variants().await.is_empty());
+
+        std::fs::remove_dir_all(models_dir).unwrap();
+    }
+
+    /// SPK-F7: a realtime voice session holds its models through
+    /// `SessionModelLeases`. The models are never pinned, a held model is not
+    /// evicted to make room for another, and it becomes evictable once the
+    /// session drops its leases.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_model_leases_protect_without_pinning() {
+        // Serialize the load transaction's residency reservation on the
+        // process-global authority.
+        let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let models_dir = std::env::temp_dir().join(format!(
+            "izwi-runtime-session-lease-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            max_loaded_models: Some(1),
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let variant = ModelVariant::Kokoro82M;
+        let (_authority, resource_lease) = isolated_resource_lease("session-lease");
+        runtime
+            .model_lifecycle
+            .install_loading_slot(variant, resource_lease)
+            .expect("loading slot");
+        runtime
+            .model_lifecycle
+            .finalize_slot_materialization(variant, one_byte_host_reservation())
+            .expect("materialized slot");
+        runtime.model_manager.mark_loaded(variant).await;
+        runtime
+            .model_lifecycle
+            .mark_slot_ready(variant)
+            .expect("ready slot");
+
+        let leases = super::SessionModelLeases::default();
+        leases.hold(&runtime, variant).await.expect("first turn");
+        leases
+            .clone()
+            .hold(&runtime, variant)
+            .await
+            .expect("next turn");
+        assert!(!runtime.pinned_model_variants().await.contains(&variant));
+        assert_eq!(runtime.model_manager.active_residency_leases(variant), 1);
+
+        let error = runtime
+            .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
+            .await
+            .expect_err("a model held by a session is not evicted");
+        assert!(error.to_string().contains("no resident model is idle"));
+        assert_eq!(
+            runtime.model_manager.resident_variants().await,
+            vec![variant]
+        );
+
+        drop(leases);
+        assert_eq!(runtime.model_manager.active_residency_leases(variant), 0);
+        runtime
+            .ensure_model_budget_before_load(ModelVariant::WhisperLargeV3Turbo)
+            .await
+            .expect("an unpinned model is evictable after the session");
         assert!(runtime.model_manager.resident_variants().await.is_empty());
 
         std::fs::remove_dir_all(models_dir).unwrap();

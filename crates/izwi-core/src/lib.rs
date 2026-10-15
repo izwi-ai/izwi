@@ -132,11 +132,12 @@ pub use runtime::{
     RuntimeObservationContext, RuntimeReplayRecord, RuntimeRequestContext, RuntimeService,
     RuntimeStageObservation, RuntimeStageOutcome, RuntimeStageOutputCounters, RuntimeStageTiming,
     RuntimeTelemetrySnapshot, RuntimeTraceContract, RuntimeTracePhase,
-    RuntimeWorkloadClassTelemetrySnapshot, SpeechToSpeechGeneration, VoiceRuntimeTelemetrySnapshot,
-    VoiceSession, VoiceSessionPhase, DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT,
-    RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS, TRACE_CAPABILITY, TRACE_CORRELATION_ID,
-    TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET, TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND,
-    TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
+    RuntimeWorkloadClassTelemetrySnapshot, SessionModelLeases, SpeechToSpeechGeneration,
+    VoiceRuntimeTelemetrySnapshot, VoiceSession, VoiceSessionPhase,
+    DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT, RUNTIME_REPLAY_REDACTION, RUNTIME_TRACE_CONTRACTS,
+    TRACE_CAPABILITY, TRACE_CORRELATION_ID, TRACE_ERROR_KIND, TRACE_EXECUTION_TARGET,
+    TRACE_MODEL_VARIANT, TRACE_PIPELINE_KIND, TRACE_PIPELINE_STAGE, TRACE_REQUEST_ID,
+    TRACE_STREAMING_MODE,
 };
 pub use runtime::{
     validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,

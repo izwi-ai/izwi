@@ -7,3 +7,5 @@ mod load;
 mod phases;
 mod publish;
 mod unload;
+
+pub use load::SessionModelLeases;

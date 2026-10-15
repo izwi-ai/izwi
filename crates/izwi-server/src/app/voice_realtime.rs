@@ -26,9 +26,10 @@ use izwi_agent::{
 };
 use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
-    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant, ChatMessage, ChatRole,
-    GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
-    VoiceSession, WorkloadClass,
+    parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
+    resolve_asr_model_variant, ChatMessage, ChatRole, GenerationConfig, GenerationParams,
+    GenerationRequest, RuntimeRequestContext, RuntimeService, SessionModelLeases, VoiceSession,
+    WorkloadClass,
 };
 use izwi_vad::{
     sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
@@ -894,6 +895,9 @@ struct ConnectionState {
     agent_session_id: Option<String>,
     agent_session_system_prompt: Option<String>,
     streaming_input: Option<StreamingInputState>,
+    /// Keeps the input stream's models resident between turns without
+    /// pinning them; turns in flight hold their own clone.
+    model_leases: SessionModelLeases,
     active_turn: Option<ActiveTurn>,
     voice_session: VoiceSession,
     started: bool,
@@ -911,6 +915,7 @@ impl Default for ConnectionState {
             agent_session_id: None,
             agent_session_system_prompt: None,
             streaming_input: None,
+            model_leases: SessionModelLeases::default(),
             active_turn: None,
             voice_session: VoiceSession::default(),
             started: false,
@@ -1319,6 +1324,7 @@ async fn finalize_stream_vad_utterance(
         turn_record_id.clone(),
         control.clone(),
         output_generation,
+        conn.model_leases.clone(),
     );
 
     conn.active_turn = Some(ActiveTurn {
@@ -1745,6 +1751,7 @@ async fn handle_text_message(
                 state.runtime.record_voice_session_started();
             }
 
+            conn.model_leases = SessionModelLeases::default();
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
                 turn_config,
                 vad_threshold: normalize_stream_vad_threshold(vad_threshold),
@@ -1809,6 +1816,7 @@ async fn handle_text_message(
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
+            conn.model_leases = SessionModelLeases::default();
             if let Some(session_id) = conn.close_voice_session_if_idle() {
                 state
                     .voice_store
@@ -1952,6 +1960,7 @@ fn spawn_turn_task(
     turn_record_id: String,
     control: TurnControl,
     output_generation: u64,
+    model_leases: SessionModelLeases,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout_secs = state.request_timeout_secs.max(1);
@@ -1986,6 +1995,13 @@ fn spawn_turn_task(
                         }),
                     );
 
+                    model_leases
+                        .hold(
+                            &state.runtime,
+                            resolve_asr_model_variant(Some(&config.asr_model_id)),
+                        )
+                        .await
+                        .map_err(|err| format!("Failed to load ASR model: {err}"))?;
                     let transcript = {
                         let tx = out_tx.clone();
                         let utt_id = commit.utterance_id.clone();
@@ -2081,6 +2097,12 @@ fn spawn_turn_task(
                     let Some(agent_session_id) = agent_session_id.as_deref() else {
                         return Err("Missing agent session for modular voice turn".to_string());
                     };
+                    let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
+                        .map_err(|err| format!("Invalid chat model: {err}"))?;
+                    model_leases
+                        .hold(&state.runtime, text_variant)
+                        .await
+                        .map_err(|err| format!("Failed to load chat model: {err}"))?;
                     let assistant_raw = run_agent_turn(
                         &state,
                         agent_session_id,
@@ -2146,6 +2168,7 @@ fn spawn_turn_task(
                         runtime_context,
                         &control,
                         output_generation,
+                        &model_leases,
                     )
                     .await?;
                     state
@@ -2214,6 +2237,7 @@ fn spawn_turn_task(
                         runtime_context,
                         &control,
                         output_generation,
+                        &model_leases,
                     )
                     .await?;
 
@@ -2416,15 +2440,15 @@ async fn stream_tts_to_socket(
     runtime_context: RuntimeRequestContext,
     control: &TurnControl,
     output_generation: u64,
+    model_leases: &SessionModelLeases,
 ) -> Result<(), String> {
     if control.is_cancelled() {
         return Err("Turn cancelled".to_string());
     }
     let tts_variant = parse_tts_model_variant(tts_model_id)
         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
-    state
-        .runtime
-        .load_model(tts_variant)
+    model_leases
+        .hold(&state.runtime, tts_variant)
         .await
         .map_err(|err| format!("Failed to load TTS model: {err}"))?;
 
@@ -2675,6 +2699,7 @@ async fn stream_unified_s2s_to_socket(
     runtime_context: RuntimeRequestContext,
     control: &TurnControl,
     output_generation: u64,
+    model_leases: &SessionModelLeases,
 ) -> Result<izwi_core::SpeechToSpeechGeneration, String> {
     if control.is_cancelled() {
         return Err("Turn cancelled".to_string());
@@ -2687,9 +2712,8 @@ async fn stream_unified_s2s_to_socket(
         ));
     }
 
-    state
-        .runtime
-        .load_model(variant)
+    model_leases
+        .hold(&state.runtime, variant)
         .await
         .map_err(|err| format!("Failed to load unified audio model: {err}"))?;
 

@@ -49,6 +49,7 @@ pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
 pub use health::RuntimeHealth;
 pub(crate) use health::{fatal_device_fault, fatal_device_fault_message};
+pub use lifecycle::SessionModelLeases;
 pub use service::{
     stream_slow_consumer_timeout, RuntimeChatInvocation, RuntimeChatInvocationEvent,
     RuntimeChatInvocationRequest, RuntimeChatTeardown, RuntimeChatTeardownDisposition,
