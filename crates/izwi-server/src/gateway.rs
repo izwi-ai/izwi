@@ -2622,8 +2622,8 @@ mod tests {
         assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
         assert_eq!(body.matches("# TYPE ").count(), 22);
         // Labels are the gateway's own fixed vocabulary, never caller text.
-        let samples = izwi_core::runtime::prometheus::parse_exposition(&body)
-            .expect("valid exposition");
+        let samples =
+            izwi_core::runtime::prometheus::parse_exposition(&body).expect("valid exposition");
         for sample in &samples {
             for label in sample.labels.keys() {
                 assert!(

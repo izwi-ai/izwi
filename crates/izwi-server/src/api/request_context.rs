@@ -6,12 +6,12 @@ use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use http_body::Body as _;
 use izwi_hooks::{
     AuditCategory, AuditEvent, AuditOutcome, AuthorizationRequest, EnterpriseAction, HeaderPair,
     HookError, HookMetadata, ObservabilityEvent, ObservabilityEventKind, Principal,
     RequestEnvelope, ResourceDescriptor,
 };
-use http_body::Body as _;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -961,11 +961,16 @@ mod tests {
         let started = Instant::now();
         let response = tokio::time::timeout(
             Duration::from_secs(5),
-            send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()),
+            send_request(
+                app,
+                Request::builder().uri("/").body(Body::empty()).unwrap(),
+            ),
         )
         .await
         .expect("a slow audit hook never delays the response");
-        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         assert_eq!(body, "ok");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(audits.try_recv().is_err(), "the hook is still running");
@@ -985,14 +990,20 @@ mod tests {
     #[tokio::test]
     async fn streamed_answers_are_audited_when_the_body_ends_with_the_in_band_outcome() {
         let (app, mut audits) = audited_app(Duration::ZERO, get(failing_stream));
-        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        let response = send_request(
+            app,
+            Request::builder().uri("/").body(Body::empty()).unwrap(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             audits.try_recv().is_err(),
             "nothing is audited while the stream runs"
         );
-        let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let _ = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let event = loop {
             let event = tokio::time::timeout(Duration::from_secs(5), audits.recv())
                 .await
@@ -1010,7 +1021,11 @@ mod tests {
     #[tokio::test]
     async fn a_body_dropped_mid_stream_is_audited_as_interrupted() {
         let (app, mut audits) = audited_app(Duration::ZERO, get(failing_stream));
-        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        let response = send_request(
+            app,
+            Request::builder().uri("/").body(Body::empty()).unwrap(),
+        )
+        .await;
         let mut body = response.into_body().into_data_stream();
         let _first = futures::StreamExt::next(&mut body).await;
         drop(body);
@@ -1030,13 +1045,19 @@ mod tests {
     #[tokio::test]
     async fn sized_responses_are_audited_as_completed_and_keep_their_length() {
         let (app, mut audits) = audited_app(Duration::ZERO, get(|| async { "sized" }));
-        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        let response = send_request(
+            app,
+            Request::builder().uri("/").body(Body::empty()).unwrap(),
+        )
+        .await;
         assert_eq!(
             http_body::Body::size_hint(response.body()).exact(),
             Some(5),
             "the audit wrapper keeps the body's exact length"
         );
-        let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let _ = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
         let event = loop {
             let event = tokio::time::timeout(Duration::from_secs(5), audits.recv())
                 .await
