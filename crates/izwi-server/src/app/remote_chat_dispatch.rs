@@ -743,9 +743,10 @@ mod tests {
     use izwi_serving_protocol::{
         ArtifactRevision, BackendKind, Capability, CapacitySnapshot, CredentialId,
         DeviceAssignment, FinishReason, IncarnationId, InvocationEvent, InvocationEventKind,
-        InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration, ModelReadiness,
-        NodeId, ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor, WorkerFeature,
-        WorkerId, WorkerProcessState, WorkerStatus, INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
+        InvocationInput, InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration,
+        ModelReadiness, NodeId, ServiceBearerToken, ServiceCredentials, Usage, WorkerDescriptor,
+        WorkerFeature, WorkerId, WorkerProcessState, WorkerStatus, INVOCATIONS_PATH,
+        NDJSON_MEDIA_TYPE,
     };
 
     use crate::batch_runtime::store::BatchRuntimeStore;
@@ -1198,6 +1199,76 @@ mod tests {
             Duration::from_millis(RETRY_BACKOFF_MAX_MS),
             "untrusted worker advice must be clamped"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_receives_the_resolved_sampling_profile() {
+        let worker =
+            ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+
+        // Qwen3.5-4B thinks by default; its published profile is T 1.0 and
+        // top-p 0.95, never the worker's greedy default.
+        dispatcher(registry)
+            .generate(2, &context, request(), tenant_work())
+            .await
+            .unwrap();
+        let requests = worker.requests();
+        let InvocationInput::Chat { parameters, .. } = &requests[0].input;
+        assert_eq!(parameters.temperature, Some(1.0));
+        assert_eq!(parameters.top_p, Some(0.95));
+    }
+
+    #[tokio::test]
+    async fn parameters_the_worker_cannot_honour_are_rejected_before_dispatch() {
+        let worker =
+            ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let dispatcher = dispatcher(registry);
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+
+        let cases: [(&str, fn(&mut ChatExecutionRequest)); 3] = [
+            ("logprobs", |request| request.logprobs = Some(true)),
+            ("top_logprobs", |request| request.top_logprobs = Some(2)),
+            ("response_format", |request| {
+                request.response_format_json_object = true
+            }),
+        ];
+        for (parameter, apply) in cases {
+            let mut unsupported = request();
+            apply(&mut unsupported);
+            let error = dispatcher
+                .generate(2, &context, unsupported, tenant_work())
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{parameter}");
+            assert!(error.message.contains(parameter), "{}", error.message);
+        }
+        assert!(worker.requests().is_empty());
+
+        // An explicit `logprobs: false` asks for nothing the worker lacks.
+        let mut disabled = request();
+        disabled.logprobs = Some(false);
+        dispatcher
+            .generate(2, &context, disabled, tenant_work())
+            .await
+            .unwrap();
+        assert_eq!(worker.requests().len(), 1);
     }
 
     #[tokio::test]

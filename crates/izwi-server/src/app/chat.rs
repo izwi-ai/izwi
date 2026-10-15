@@ -1036,17 +1036,36 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
             "Remote chat execution currently supports text-only requests",
         ));
     }
-    if !request.chat_config.tools.is_empty()
-        || request.chat_config.enable_thinking.is_some()
-        || request.chat_config.reasoning_effort.is_some()
-        || request.chat_config.preserve_thinking.is_some()
-        || request.top_k.is_some()
-        || request.repetition_penalty.is_some()
-        || request.presence_penalty.is_some()
-    {
-        return Err(ApiError::bad_request(
-            "Remote chat execution does not yet support tools or advanced generation controls",
-        ));
+    // The worker protocol carries only messages, temperature, top_p and the
+    // output limits; any other control is refused, never silently dropped.
+    let unsupported = [
+        ("tools", !request.chat_config.tools.is_empty()),
+        (
+            "enable_thinking",
+            request.chat_config.enable_thinking.is_some(),
+        ),
+        (
+            "reasoning_effort",
+            request.chat_config.reasoning_effort.is_some(),
+        ),
+        (
+            "preserve_thinking",
+            request.chat_config.preserve_thinking.is_some(),
+        ),
+        ("top_k", request.top_k.is_some()),
+        ("repetition_penalty", request.repetition_penalty.is_some()),
+        ("presence_penalty", request.presence_penalty.is_some()),
+        ("logprobs", request.logprobs == Some(true)),
+        (
+            "top_logprobs",
+            request.top_logprobs.is_some_and(|count| count > 0),
+        ),
+        ("response_format", request.response_format_json_object),
+    ];
+    if let Some((parameter, _)) = unsupported.iter().find(|(_, requested)| *requested) {
+        return Err(ApiError::bad_request(format!(
+            "Remote chat execution does not support `{parameter}`"
+        )));
     }
     Ok(())
 }
@@ -1062,6 +1081,11 @@ fn build_remote_chat_invocation(
         .unwrap_or(u32::MAX)
         .min(remote.config.max_output_tokens)
         .max(1);
+    // Send the temperature and top-p the local path would sample with,
+    // including the model family's published profile, so a worker never
+    // falls back to greedy decoding for a request that did not set them.
+    // The profile's top-k and penalties have no protocol field yet.
+    let sampling = request.resolved_generation_params();
     let input = InvocationInput::Chat {
         input: ChatInput {
             messages: request
@@ -1079,8 +1103,8 @@ fn build_remote_chat_invocation(
                 .collect(),
         },
         parameters: WorkerChatParameters {
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: Some(sampling.temperature),
+            top_p: Some(sampling.top_p),
             seed: None,
             stop: Vec::new(),
         },
