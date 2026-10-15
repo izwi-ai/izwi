@@ -862,6 +862,7 @@ mod tests {
     fn engine_tts_stop_reason_reads_frames_and_the_end_of_speech_step() {
         let breakdown = |steps: u32, frames: usize| {
             Some(crate::engine::LatencyBreakdown {
+                pre_engine_ms: None,
                 queue_wait_ms: 0.0,
                 media_decode_ms: None,
                 normalization_ms: None,

@@ -18,6 +18,7 @@ use super::{
     BatchDispatch, BatchDispatchKind, DeadlinePhase, DispatchState, FailureOrigin, NativeBatchMode,
     OutcomeProvenance, PhysicalBatch, ResourceAmount,
 };
+use crate::runtime::prometheus::{buckets, HistogramFamily};
 
 /// Stable metric names for scheduler and KV-cache observability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1208,6 +1209,75 @@ pub(crate) fn record_engine_incremental_prefill_commit(tokens: usize, became_mul
     }
 }
 
+static ENGINE_INTER_TOKEN_LATENCY: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_inter_token_latency_seconds",
+    "Gap between successive committed tokens (audio frames for speech models) of one request; a commit of k tokens after a gap g counts k gaps of g/k.",
+    &["model", "task"],
+    buckets::INTER_TOKEN_SECONDS,
+);
+static ENGINE_STEP_HOST_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_step_host_seconds",
+    "Host time of one engine step phase under the step gate: prepare (scheduling and batch planning), commit (state commit of one physical batch) and deliver (stream delivery and terminal routing).",
+    &["phase"],
+    buckets::STEP_SECONDS,
+);
+static ENGINE_BATCH_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_batch_rows",
+    "Rows in one dispatched physical batch.",
+    &[],
+    buckets::BATCH_ROWS,
+);
+static ENGINE_BATCH_TOKENS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_batch_tokens",
+    "Work units in one dispatched physical batch: tokens for text models, frames or samples for speech models.",
+    &[],
+    buckets::BATCH_TOKENS,
+);
+
+/// Host phases of one engine step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EngineStepPhase {
+    Prepare,
+    Commit,
+    Deliver,
+}
+
+impl EngineStepPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Deliver => "deliver",
+        }
+    }
+}
+
+pub(crate) fn record_engine_step_phase(phase: EngineStepPhase, elapsed: Duration) {
+    ENGINE_STEP_HOST_SECONDS.observe_duration(&[phase.as_str()], elapsed);
+}
+
+/// Record `tokens` tokens committed `gap` after the request's previous
+/// commit. Tokens of one commit arrive together, so the gap is spread evenly
+/// over them.
+pub(crate) fn record_engine_inter_token_gap(model: &str, task: &str, gap: Duration, tokens: usize) {
+    if tokens == 0 {
+        return;
+    }
+    let series = ENGINE_INTER_TOKEN_LATENCY.series(&[model, task]);
+    let per_token = gap.as_secs_f64() / tokens as f64;
+    for _ in 0..tokens {
+        series.observe(per_token);
+    }
+}
+
+/// Append the engine histograms in the Prometheus text format.
+pub fn push_engine_histograms(payload: &mut String) {
+    ENGINE_INTER_TOKEN_LATENCY.render(payload);
+    ENGINE_STEP_HOST_SECONDS.render(payload);
+    ENGINE_BATCH_ROWS.render(payload);
+    ENGINE_BATCH_TOKENS.render(payload);
+}
+
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
     ENGINE_METRIC_CATALOG
 }
@@ -1342,6 +1412,11 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     let useful_elements = batch.rows.iter().fold(0u64, |total, row| {
         total.saturating_add(row.cost.tensor_elements)
     });
+    let work_units = batch.rows.iter().fold(0u64, |total, row| {
+        total.saturating_add(row.cost.logical_units)
+    });
+    ENGINE_BATCH_ROWS.observe(&[], batch.rows.len() as f64);
+    ENGINE_BATCH_TOKENS.observe(&[], work_units as f64);
     saturating_atomic_add(&ENGINE_PHYSICAL_BATCHES, 1);
     ENGINE_PHYSICAL_BATCH_MAX_WIDTH.fetch_max(batch.rows.len() as u64, Ordering::Relaxed);
     saturating_atomic_add(&ENGINE_PHYSICAL_BATCH_ROWS, batch.rows.len() as u64);

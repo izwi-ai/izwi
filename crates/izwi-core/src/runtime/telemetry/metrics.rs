@@ -43,6 +43,7 @@ use crate::models::shared::telemetry::{
 use crate::runtime::pipeline::{
     PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind,
 };
+use crate::runtime::telemetry::histogram::{buckets, CounterFamily, HistogramFamily};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
     VoiceMetricDescriptor, VOICE_BARGE_IN_TOTAL, VOICE_SESSION_CLOSED_TOTAL,
@@ -51,6 +52,147 @@ use crate::runtime::voice_metrics::{
 use crate::runtime::CoordinatorSnapshot;
 use crate::runtime_models::LoadedModelDiagnostics;
 use crate::KernelPathTelemetrySnapshot;
+
+/// Pipeline stage of a whole engine request (non-streaming).
+pub(crate) const ENGINE_REQUEST_STAGE: &str = "engine.request";
+/// Pipeline stage of a whole streaming engine request.
+pub(crate) const ENGINE_STREAMING_REQUEST_STAGE: &str = "engine.streaming_request";
+
+/// Stages whose observations describe one whole request, so they feed the
+/// request histograms. Every other stage is part of a request.
+fn is_request_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        ENGINE_REQUEST_STAGE
+            | ENGINE_STREAMING_REQUEST_STAGE
+            | "tts.direct.request"
+            | "tts.direct.streaming"
+    )
+}
+
+const REQUEST_LABELS: &[&str] = &["model", "backend", "task"];
+const REQUEST_OUTCOME_LABELS: &[&str] = &["model", "backend", "task", "outcome"];
+const TOKEN_LABELS: &[&str] = &["model", "task"];
+
+/// Aggregatable request histograms for the Prometheus exposition. Times run
+/// from server admission (the workload permit wait) through runtime
+/// admission, so queue wait and TTFT include coordinator and model-residency
+/// time, not only the engine scheduler's queue.
+#[derive(Debug)]
+struct RequestHistograms {
+    duration: HistogramFamily,
+    ttft: HistogramFamily,
+    queue_wait: HistogramFamily,
+    prefill: HistogramFamily,
+    prompt_tokens: CounterFamily,
+    generation_tokens: CounterFamily,
+    stage_duration: HistogramFamily,
+}
+
+impl RequestHistograms {
+    const fn new() -> Self {
+        Self {
+            duration: HistogramFamily::new(
+                "izwi_request_duration_seconds",
+                "Request latency from server admission to the terminal output.",
+                REQUEST_OUTCOME_LABELS,
+                buckets::REQUEST_SECONDS,
+            ),
+            ttft: HistogramFamily::new(
+                "izwi_request_ttft_seconds",
+                "Time from server admission to the first user-visible output.",
+                REQUEST_LABELS,
+                buckets::FIRST_OUTPUT_SECONDS,
+            ),
+            queue_wait: HistogramFamily::new(
+                "izwi_request_queue_wait_seconds",
+                "Time from server admission until the engine first schedules the request, including the coordinator, input preparation and model residency.",
+                REQUEST_LABELS,
+                buckets::QUEUE_SECONDS,
+            ),
+            prefill: HistogramFamily::new(
+                "izwi_request_prefill_seconds",
+                "Engine prefill time attributed to one request.",
+                REQUEST_LABELS,
+                buckets::FIRST_OUTPUT_SECONDS,
+            ),
+            prompt_tokens: CounterFamily::new(
+                "izwi_request_prompt_tokens_total",
+                "Prompt tokens of completed requests.",
+                TOKEN_LABELS,
+            ),
+            generation_tokens: CounterFamily::new(
+                "izwi_request_generation_tokens_total",
+                "Generated tokens (or audio frames) of completed requests.",
+                TOKEN_LABELS,
+            ),
+            stage_duration: HistogramFamily::new(
+                "izwi_runtime_stage_duration_seconds",
+                "Duration of runtime pipeline stages.",
+                &["stage", "workload_class"],
+                buckets::REQUEST_SECONDS,
+            ),
+        }
+    }
+
+    fn record(&self, observation: &RuntimeStageObservation) {
+        let context = &observation.context;
+        let stage = context.pipeline_stage.as_deref().unwrap_or("unknown");
+        let timing = &observation.timing;
+        if let Some(total_ms) = timing.total_ms {
+            let workload_class = context.workload_class.as_deref().unwrap_or("unknown");
+            self.stage_duration
+                .observe(&[stage, workload_class], total_ms / 1000.0);
+        }
+        if !is_request_stage(stage) {
+            return;
+        }
+        let model = context.model_variant.as_deref().unwrap_or("unknown");
+        let backend = context.backend_kind.as_deref().unwrap_or("unknown");
+        let task = context.capability.as_deref().unwrap_or("unknown");
+        let labels = [model, backend, task];
+        // Server admission precedes every runtime-relative timing.
+        let admission_ms = timing.admission_ms.unwrap_or(0.0);
+        let seconds = |ms: f64| (admission_ms + ms) / 1000.0;
+        if let Some(total_ms) = timing.total_ms {
+            let outcome = match observation.outcome {
+                RuntimeStageOutcome::Failed => "failed",
+                RuntimeStageOutcome::Cancelled => "cancelled",
+                _ => "completed",
+            };
+            self.duration
+                .observe(&[model, backend, task, outcome], seconds(total_ms));
+        }
+        if let Some(ttft_ms) = timing.ttft_ms {
+            self.ttft.observe(&labels, seconds(ttft_ms));
+        }
+        if let Some(queue_wait_ms) = timing.queue_wait_ms {
+            self.queue_wait.observe(&labels, seconds(queue_wait_ms));
+        }
+        if let Some(prefill_ms) = timing.prefill_ms {
+            self.prefill.observe(&labels, prefill_ms / 1000.0);
+        }
+        if observation.outcome.is_failure() {
+            return;
+        }
+        if let Some(tokens) = observation.outputs.prompt_tokens {
+            self.prompt_tokens.add(&[model, task], tokens);
+        }
+        if let Some(tokens) = observation.outputs.generated_tokens {
+            self.generation_tokens.add(&[model, task], tokens);
+        }
+    }
+
+    fn render(&self, payload: &mut String) {
+        self.duration.render(payload);
+        self.ttft.render(payload);
+        self.queue_wait.render(payload);
+        self.prefill.render(payload);
+        self.prompt_tokens.render(payload);
+        self.generation_tokens.render(payload);
+        self.stage_duration.render(payload);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VoiceRuntimeTelemetrySnapshot {
@@ -349,18 +491,6 @@ pub struct RuntimeTelemetrySnapshot {
     pub observability: RuntimeObservabilityTelemetrySnapshot,
     pub engine_metrics: &'static [EngineMetricDescriptor],
     pub voice_metrics: &'static [VoiceMetricDescriptor],
-    #[serde(skip_serializing)]
-    latency_sample_counts: RuntimeLatencySampleCounts,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct RuntimeLatencySampleCounts {
-    queue_wait: usize,
-    prefill: usize,
-    decode: usize,
-    ttft: usize,
-    end_to_end: usize,
-    stage_duration: usize,
 }
 
 #[derive(Debug)]
@@ -400,6 +530,7 @@ pub(crate) struct RuntimeTelemetryCollector {
     decode_ms_samples: Mutex<VecDeque<f64>>,
     ttft_ms_samples: Mutex<VecDeque<f64>>,
     end_to_end_ms_samples: Mutex<VecDeque<f64>>,
+    request_histograms: RequestHistograms,
 }
 
 impl RuntimeTelemetryCollector {
@@ -440,6 +571,7 @@ impl RuntimeTelemetryCollector {
             decode_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             ttft_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
             end_to_end_ms_samples: Mutex::new(VecDeque::with_capacity(max_samples.max(64))),
+            request_histograms: RequestHistograms::new(),
         }
     }
 
@@ -462,10 +594,11 @@ impl RuntimeTelemetryCollector {
         }
 
         if let Some(latency) = output.latency_breakdown.as_ref() {
+            let pre_engine_ms = latency.pre_engine_ms.unwrap_or(0.0);
             Self::push_sample(
                 &self.queue_wait_ms_samples,
                 self.max_samples,
-                latency.queue_wait_ms,
+                pre_engine_ms + latency.queue_wait_ms,
             )
             .await;
             Self::push_sample(
@@ -476,12 +609,17 @@ impl RuntimeTelemetryCollector {
             .await;
             Self::push_sample(&self.decode_ms_samples, self.max_samples, latency.decode_ms).await;
             if let Some(ttft_ms) = latency.ttft_ms {
-                Self::push_sample(&self.ttft_ms_samples, self.max_samples, ttft_ms).await;
+                Self::push_sample(
+                    &self.ttft_ms_samples,
+                    self.max_samples,
+                    pre_engine_ms + ttft_ms,
+                )
+                .await;
             }
             Self::push_sample(
                 &self.end_to_end_ms_samples,
                 self.max_samples,
-                latency.total_ms,
+                pre_engine_ms + latency.total_ms,
             )
             .await;
         } else {
@@ -619,6 +757,7 @@ impl RuntimeTelemetryCollector {
         if observation.outcome.is_failure() {
             self.stage_failures_total.fetch_add(1, Ordering::Relaxed);
         }
+        self.request_histograms.record(&observation);
 
         if let Some(total_ms) = observation.timing.total_ms {
             Self::push_sample_sync(&self.stage_duration_ms_samples, self.max_samples, total_ms);
@@ -719,14 +858,6 @@ impl RuntimeTelemetryCollector {
             },
             engine_metrics: engine_metric_catalog(),
             voice_metrics: voice_metric_catalog(),
-            latency_sample_counts: RuntimeLatencySampleCounts {
-                queue_wait: queue.len(),
-                prefill: prefill.len(),
-                decode: decode.len(),
-                ttft: ttft.len(),
-                end_to_end: end_to_end.len(),
-                stage_duration: stage_duration.len(),
-            },
         }
     }
 
@@ -748,46 +879,7 @@ impl RuntimeTelemetryCollector {
             snapshot.worker_restarts,
             snapshot.worker_panics,
         );
-        push_latency_gauges(
-            &mut payload,
-            "izwi_latency_queue_wait_ms",
-            snapshot.latency_sample_counts.queue_wait,
-            snapshot.queue_wait_ms_avg,
-            snapshot.queue_wait_ms_p50,
-            snapshot.queue_wait_ms_p95,
-        );
-        push_latency_gauges(
-            &mut payload,
-            "izwi_latency_prefill_ms",
-            snapshot.latency_sample_counts.prefill,
-            snapshot.prefill_ms_avg,
-            snapshot.prefill_ms_p50,
-            snapshot.prefill_ms_p95,
-        );
-        push_latency_gauges(
-            &mut payload,
-            "izwi_latency_decode_ms",
-            snapshot.latency_sample_counts.decode,
-            snapshot.decode_ms_avg,
-            snapshot.decode_ms_p50,
-            snapshot.decode_ms_p95,
-        );
-        push_latency_gauges(
-            &mut payload,
-            "izwi_latency_ttft_ms",
-            snapshot.latency_sample_counts.ttft,
-            snapshot.ttft_ms_avg,
-            snapshot.ttft_ms_p50,
-            snapshot.ttft_ms_p95,
-        );
-        push_latency_gauges(
-            &mut payload,
-            "izwi_latency_end_to_end_ms",
-            snapshot.latency_sample_counts.end_to_end,
-            snapshot.end_to_end_ms_avg,
-            snapshot.end_to_end_ms_p50,
-            snapshot.end_to_end_ms_p95,
-        );
+        self.request_histograms.render(&mut payload);
         payload.push_str(&kernel_path_prometheus());
         push_voice_counter(
             &mut payload,
@@ -855,15 +947,6 @@ izwi_realtime_transcription_stream_backpressure_total {}\n",
             snapshot.observability.stage_observations_total,
             snapshot.observability.stage_failures_total,
         ));
-        push_latency_gauges(
-            &mut payload,
-            "izwi_runtime_stage_duration_ms",
-            snapshot.latency_sample_counts.stage_duration,
-            snapshot.observability.stage_duration_ms_avg,
-            snapshot.observability.stage_duration_ms_p50,
-            snapshot.observability.stage_duration_ms_p95,
-        );
-        push_workload_class_prometheus(&mut payload, &snapshot.observability.workload_classes);
         payload.push_str(&voice_metric_prometheus_contract());
         payload
     }
@@ -966,121 +1049,6 @@ fn workload_class_latency_snapshots(
 fn push_optional_sample(samples: &mut Vec<f64>, value: Option<f64>) {
     if let Some(value) = value {
         samples.push(value.max(0.0));
-    }
-}
-
-fn push_workload_class_prometheus(
-    payload: &mut String,
-    classes: &[RuntimeWorkloadClassTelemetrySnapshot],
-) {
-    if classes.is_empty() {
-        return;
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_stage_observations gauge\n");
-    for class in classes {
-        let label = prometheus_label_value(&class.workload_class);
-        payload.push_str(&format!(
-            "izwi_runtime_workload_stage_observations{{workload_class=\"{label}\"}} {}\n",
-            class.observations
-        ));
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_stage_failures gauge\n");
-    for class in classes {
-        let label = prometheus_label_value(&class.workload_class);
-        payload.push_str(&format!(
-            "izwi_runtime_workload_stage_failures{{workload_class=\"{label}\"}} {}\n",
-            class.failures
-        ));
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_queue_wait_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_queue_wait_ms",
-            class,
-            &class.queue_wait_ms,
-        );
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_admission_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_admission_ms",
-            class,
-            &class.admission_ms,
-        );
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_prefill_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_prefill_ms",
-            class,
-            &class.prefill_ms,
-        );
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_decode_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_decode_ms",
-            class,
-            &class.decode_ms,
-        );
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_ttft_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_ttft_ms",
-            class,
-            &class.ttft_ms,
-        );
-    }
-    payload.push_str("# TYPE izwi_runtime_workload_stage_duration_ms gauge\n");
-    for class in classes {
-        push_workload_class_stats(
-            payload,
-            "izwi_runtime_workload_stage_duration_ms",
-            class,
-            &class.stage_duration_ms,
-        );
-    }
-}
-
-fn push_workload_class_stats(
-    payload: &mut String,
-    metric_name: &str,
-    class: &RuntimeWorkloadClassTelemetrySnapshot,
-    stats: &RuntimeLatencyStats,
-) {
-    if stats.count == 0 {
-        return;
-    }
-    let workload_class = prometheus_label_value(&class.workload_class);
-    for (quantile, value) in [("avg", stats.avg), ("p50", stats.p50), ("p95", stats.p95)] {
-        payload.push_str(&format!(
-            "{metric_name}{{workload_class=\"{workload_class}\",quantile=\"{quantile}\"}} {value:.6}\n"
-        ));
-    }
-}
-
-fn push_latency_gauges(
-    payload: &mut String,
-    metric_name: &str,
-    count: usize,
-    avg: f64,
-    p50: f64,
-    p95: f64,
-) {
-    if count == 0 {
-        return;
-    }
-    payload.push_str(&format!("# TYPE {metric_name} gauge\n"));
-    for (quantile, value) in [("avg", avg), ("p50", p50), ("p95", p95)] {
-        payload.push_str(&format!(
-            "{metric_name}{{quantile=\"{quantile}\"}} {value:.6}\n"
-        ));
     }
 }
 
@@ -1368,13 +1336,6 @@ fn percentile_slice(values: &[f64], q: f64) -> f64 {
     sorted[idx]
 }
 
-fn prometheus_label_value(value: &str) -> String {
-    value
-        .replace('\\', r"\\")
-        .replace('"', r#"\""#)
-        .replace('\n', r"\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1343,7 @@ mod tests {
         ExecutorOutput, OutputProcessor, ENGINE_EXECUTOR_DISPATCH_STATE_ROWS_TOTAL,
         ENGINE_SCHEDULER_QUEUE_DEPTH,
     };
+    use crate::runtime::telemetry::histogram::check_histograms;
     use std::time::Duration;
 
     fn terminal_output(request_id: &str, error: Option<&str>) -> EngineOutput {
@@ -1611,20 +1573,18 @@ mod tests {
         let payload = telemetry.prometheus().await;
         assert!(payload.contains("izwi_runtime_stage_observations_total 2"));
         assert!(payload.contains("izwi_runtime_stage_failures_total 1"));
-        assert!(payload.contains("izwi_runtime_stage_duration_ms{quantile=\"avg\"} 71.000000"));
-        assert!(payload.contains(
-            "izwi_runtime_workload_stage_observations{workload_class=\"interactive\"} 1"
-        ));
-        assert!(payload.contains(
-            "izwi_runtime_workload_queue_wait_ms{workload_class=\"interactive\",quantile=\"avg\"} 5.000000"
-        ));
-        assert!(payload.contains(
-            "izwi_runtime_workload_admission_ms{workload_class=\"interactive\",quantile=\"avg\"} 3.000000"
-        ));
-        assert!(!payload.contains("izwi_runtime_workload_queue_wait_ms{workload_class=\"batch\""));
-        assert!(
-            payload.contains("izwi_runtime_workload_stage_failures{workload_class=\"batch\"} 1")
+        let counts = check_histograms(&payload).expect("valid histograms");
+        assert_eq!(
+            counts["izwi_runtime_stage_duration_seconds{stage=\"tts_synthesize\",workload_class=\"interactive\"}"],
+            1
         );
+        assert_eq!(
+            counts["izwi_runtime_stage_duration_seconds{stage=\"tts_synthesize\",workload_class=\"batch\"}"],
+            1
+        );
+        // Not a whole-request stage, so no request histogram series.
+        assert!(!payload.contains("izwi_request_duration_seconds_count"));
+        assert!(!payload.contains("quantile="));
         assert!(!payload.contains("req-1"));
         assert!(!payload.contains("job-1"));
     }
@@ -1813,17 +1773,102 @@ mod tests {
         );
     }
 
+    fn engine_request_observation(
+        model: &str,
+        outcome: RuntimeStageOutcome,
+        timing: RuntimeStageTiming,
+    ) -> RuntimeStageObservation {
+        let mut observation = RuntimeStageObservation::new(
+            RuntimeObservationContext {
+                capability: Some("chat".to_string()),
+                model_variant: Some(model.to_string()),
+                backend_kind: Some("cpu".to_string()),
+                pipeline_stage: Some(ENGINE_STREAMING_REQUEST_STAGE.to_string()),
+                workload_class: Some("interactive".to_string()),
+                request_id: Some(format!("req-{model}")),
+                ..RuntimeObservationContext::default()
+            },
+            outcome,
+        );
+        observation.timing = timing;
+        observation.outputs.prompt_tokens = Some(10);
+        observation.outputs.generated_tokens = Some(4);
+        observation
+    }
+
     #[tokio::test]
-    async fn prometheus_omits_latency_gauges_without_samples() {
+    async fn prometheus_exports_request_histograms_not_windowed_quantiles() {
         let telemetry = RuntimeTelemetryCollector::new(64);
+        for total_ms in [5.0, 80.0, 400.0, 2_500.0, 90_000.0] {
+            telemetry.record_stage_observation(engine_request_observation(
+                "Qwen3-0.6B",
+                RuntimeStageOutcome::Completed,
+                RuntimeStageTiming {
+                    admission_ms: Some(20.0),
+                    queue_wait_ms: Some(3.0),
+                    prefill_ms: Some(30.0),
+                    ttft_ms: Some(40.0),
+                    total_ms: Some(total_ms),
+                    ..RuntimeStageTiming::default()
+                },
+            ));
+        }
+        telemetry.record_stage_observation(engine_request_observation(
+            "Qwen3-0.6B",
+            RuntimeStageOutcome::Failed,
+            RuntimeStageTiming {
+                total_ms: Some(1.0),
+                ..RuntimeStageTiming::default()
+            },
+        ));
 
         let payload = telemetry.prometheus().await;
+        assert!(!payload.contains("quantile="));
+        assert!(!payload.contains("izwi_latency_"));
+        let counts = check_histograms(&payload).expect("valid histogram exposition");
+        let labels = "backend=\"cpu\",model=\"Qwen3-0.6B\",task=\"chat\"";
+        let duration = |outcome: &str| {
+            format!(
+                "izwi_request_duration_seconds{{backend=\"cpu\",model=\"Qwen3-0.6B\",outcome=\"{outcome}\",task=\"chat\"}}"
+            )
+        };
+        assert_eq!(counts[&duration("completed")], 5);
+        assert_eq!(counts[&duration("failed")], 1);
+        assert_eq!(counts[&format!("izwi_request_ttft_seconds{{{labels}}}")], 5);
+        assert_eq!(
+            counts[&format!("izwi_request_queue_wait_seconds{{{labels}}}")],
+            5
+        );
+        assert_eq!(
+            counts[&format!("izwi_request_prefill_seconds{{{labels}}}")],
+            5
+        );
+        // Admission (20 ms) precedes the runtime timings: 25 ms <= 50 ms bucket.
+        assert!(payload.contains(&format!(
+            "izwi_request_duration_seconds_bucket{{model=\"Qwen3-0.6B\",backend=\"cpu\",task=\"chat\",outcome=\"completed\",le=\"0.05\"}} 1"
+        )));
+        // Failed requests count toward duration but not toward token totals.
+        assert!(payload
+            .contains("izwi_request_prompt_tokens_total{model=\"Qwen3-0.6B\",task=\"chat\"} 50"));
+        assert!(payload.contains(
+            "izwi_request_generation_tokens_total{model=\"Qwen3-0.6B\",task=\"chat\"} 20"
+        ));
+        assert!(!payload.contains("req-Qwen3"));
+    }
 
-        assert!(!payload.contains("izwi_latency_queue_wait_ms"));
-        assert!(!payload.contains("izwi_latency_prefill_ms"));
-        assert!(!payload.contains("izwi_latency_decode_ms"));
-        assert!(!payload.contains("izwi_latency_ttft_ms"));
-        assert!(!payload.contains("izwi_latency_end_to_end_ms"));
-        assert!(!payload.contains("izwi_runtime_stage_duration_ms"));
+    #[tokio::test]
+    async fn json_snapshot_keeps_windowed_latency_stats() {
+        let telemetry = RuntimeTelemetryCollector::new(64);
+        telemetry.record_stage_observation(engine_request_observation(
+            "m",
+            RuntimeStageOutcome::Completed,
+            RuntimeStageTiming {
+                total_ms: Some(42.0),
+                ..RuntimeStageTiming::default()
+            },
+        ));
+        let snapshot = telemetry.snapshot().await;
+        assert_eq!(snapshot.observability.stage_duration_ms_avg, 42.0);
+        assert_eq!(snapshot.observability.stage_duration_ms_p95, 42.0);
     }
 }

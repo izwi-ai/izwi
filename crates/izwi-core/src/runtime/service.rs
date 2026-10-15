@@ -111,7 +111,7 @@ use crate::runtime::telemetry::{
     push_engine_physical_execution_metrics, EngineRuntimeTelemetrySnapshot,
     RuntimeObservationContext, RuntimeStageObservation, RuntimeStageOutcome,
     RuntimeStageOutputCounters, RuntimeStageTiming, RuntimeTelemetryCollector,
-    RuntimeTelemetrySnapshot,
+    RuntimeTelemetrySnapshot, ENGINE_REQUEST_STAGE, ENGINE_STREAMING_REQUEST_STAGE,
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
@@ -3321,16 +3321,20 @@ fn engine_output_observation(
         ..RuntimeStageTiming::default()
     };
     if let Some(latency) = output.latency_breakdown.as_ref() {
-        timing.queue_wait_ms = Some(latency.queue_wait_ms);
+        // Queue, first output and total run from runtime admission, so
+        // they include the coordinator and model-residency time before the
+        // engine saw the request.
+        let pre_engine_ms = latency.pre_engine_ms.unwrap_or(0.0);
+        timing.queue_wait_ms = Some(pre_engine_ms + latency.queue_wait_ms);
         timing.media_decode_ms = latency.media_decode_ms;
         timing.normalization_ms = latency.normalization_ms;
         timing.prefill_ms = Some(latency.prefill_ms);
         timing.decode_ms = Some(latency.decode_ms);
-        timing.ttft_ms = latency.ttft_ms;
+        timing.ttft_ms = latency.ttft_ms.map(|ttft_ms| pre_engine_ms + ttft_ms);
         timing.sampling_ms = latency.sampling_ms;
         timing.codec_ms = latency.codec_ms;
         timing.postprocess_ms = latency.postprocess_ms;
-        timing.total_ms = Some(latency.total_ms);
+        timing.total_ms = Some(pre_engine_ms + latency.total_ms);
     }
 
     let outcome = if output.error.is_some() {
@@ -4115,7 +4119,7 @@ impl RuntimeService {
     ) -> RuntimeObservationContext {
         RuntimeObservationContext {
             route_source: Some(format!("{:?}", RouteSource::InternalEngine)),
-            capability: Some(capability_name_for_task(request.task_type).to_string()),
+            capability: Some(request.task_type.as_str().to_string()),
             model_variant: request
                 .model_variant
                 .map(|variant| variant.dir_name().to_string()),
@@ -4126,11 +4130,14 @@ impl RuntimeService {
                     .as_str()
                     .to_string(),
             ),
-            pipeline_stage: Some(if streaming {
-                "engine.streaming_request".to_string()
-            } else {
-                "engine.request".to_string()
-            }),
+            pipeline_stage: Some(
+                if streaming {
+                    ENGINE_STREAMING_REQUEST_STAGE
+                } else {
+                    ENGINE_REQUEST_STAGE
+                }
+                .to_string(),
+            ),
             workload_class: Some(request.workload_class.as_str().to_string()),
             request_id: Some(request.id.clone()),
             correlation_id: request.correlation_id.clone(),
@@ -4678,6 +4685,7 @@ impl RuntimeService {
                 "chat invocation does not match its coordinator admission".to_string(),
             ));
         }
+        request.runtime_admitted_at = Some(job.admitted_at());
 
         let observation_context = self.engine_observation_context(&request, streaming);
         let admission_ms = request.admission_ms;
@@ -7301,6 +7309,7 @@ impl RuntimeService {
                 "engine request does not match its coordinator admission".to_string(),
             ));
         }
+        request.runtime_admitted_at = Some(job.admitted_at());
         let observation_request = request.clone();
         self.ensure_step_driver_started().await;
 
@@ -7596,6 +7605,7 @@ impl RuntimeService {
                 "streaming engine request does not match its coordinator admission".to_string(),
             ));
         }
+        request.runtime_admitted_at = Some(job.admitted_at());
         if request.model_variant == Some(ModelVariant::FishAudioS2Pro)
             && (request.collect_audio_samples
                 || request.audio_stream_engine_queue_capacity.is_none())
@@ -7898,6 +7908,7 @@ impl RuntimeService {
 
     async fn push_engine_prometheus_metrics(&self, payload: &mut String) {
         let snapshot = self.engine_telemetry_snapshot().await;
+        crate::engine::push_engine_histograms(payload);
         push_engine_metric(
             payload,
             ENGINE_SCHEDULER_QUEUE_DEPTH,
@@ -8367,15 +8378,6 @@ izwi_inference_coordinator_poisoned {}\n",
                 },
                 RuntimeStageOutcome::Observed,
             ));
-    }
-}
-
-fn capability_name_for_task(task_type: TaskType) -> &'static str {
-    match task_type {
-        TaskType::TTS => "tts",
-        TaskType::ASR => "asr",
-        TaskType::Chat => "chat",
-        TaskType::SpeechToSpeech => "speech_to_speech",
     }
 }
 
@@ -10406,6 +10408,32 @@ mod tests {
 
         let payload = runtime.telemetry_prometheus().await;
 
+        // Every histogram in the whole exposition is well formed, and the
+        // engine's step, batch and inter-token families are present.
+        crate::runtime::prometheus::check_histograms(&payload).expect("valid histograms");
+        for family in [
+            "izwi_engine_inter_token_latency_seconds",
+            "izwi_engine_step_host_seconds",
+            "izwi_engine_batch_rows",
+            "izwi_engine_batch_tokens",
+            "izwi_request_duration_seconds",
+            "izwi_request_ttft_seconds",
+            "izwi_request_queue_wait_seconds",
+        ] {
+            assert!(
+                payload.contains(&format!("# TYPE {family} histogram")),
+                "{family}"
+            );
+        }
+        // Every TYPE line names a family once.
+        let mut types = payload
+            .lines()
+            .filter(|line| line.starts_with("# TYPE "))
+            .collect::<Vec<_>>();
+        let total = types.len();
+        types.sort_unstable();
+        types.dedup();
+        assert_eq!(types.len(), total, "duplicate metric families");
         assert!(payload.contains("izwi_engine_scheduler_queue_depth"));
         assert!(payload.contains("izwi_engine_scheduler_running_requests"));
         assert!(payload

@@ -400,7 +400,13 @@ pub struct TokenLogprob {
 /// Request latency phases captured by the scheduler/engine loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyBreakdown {
-    /// Time spent waiting in queue before first scheduling.
+    /// Time between runtime coordinator admission and engine insertion:
+    /// input preparation, model residency and lane waits. Every other phase
+    /// is measured from engine insertion, so a request's time since runtime
+    /// admission is this plus that phase. Absent for direct engine callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_engine_ms: Option<f64>,
+    /// Time spent waiting in the engine scheduler queue before first scheduling.
     pub queue_wait_ms: f64,
     /// Time spent decoding input media before model execution, when measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -536,6 +542,18 @@ pub enum TaskType {
     Chat,
     /// Speech-to-speech generation.
     SpeechToSpeech,
+}
+
+impl TaskType {
+    /// Stable lowercase name for telemetry labels.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TTS => "tts",
+            Self::ASR => "asr",
+            Self::Chat => "chat",
+            Self::SpeechToSpeech => "speech_to_speech",
+        }
+    }
 }
 
 #[cfg(test)]

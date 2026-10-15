@@ -68,6 +68,7 @@ use crate::model::ModelVariant;
 
 #[derive(Debug, Clone, Default)]
 struct RequestPhaseTiming {
+    pre_engine_ms: Option<f64>,
     first_scheduled_at: Option<Instant>,
     queue_wait_ms: f64,
     media_decode_ms: Option<f64>,
@@ -88,16 +89,39 @@ struct RequestPhaseTiming {
 }
 
 impl RequestPhaseTiming {
-    fn record_token_commit(&mut self, decode: bool, tokens: usize, at: Instant) {
-        if tokens == 0 {
-            return;
+    fn admitted(request: &EngineCoreRequest, inserted_at: Instant) -> Self {
+        Self {
+            pre_engine_ms: request.runtime_admitted_at.map(|admitted| {
+                inserted_at
+                    .saturating_duration_since(admitted)
+                    .as_secs_f64()
+                    * 1000.0
+            }),
+            ..Self::default()
         }
+    }
+
+    /// Record `tokens` committed at `at`; returns the gap since the previous
+    /// token commit, when there was one.
+    fn record_token_commit(
+        &mut self,
+        decode: bool,
+        tokens: usize,
+        at: Instant,
+    ) -> Option<Duration> {
+        if tokens == 0 {
+            return None;
+        }
+        let gap = self
+            .last_token_commit_at
+            .map(|previous| at.saturating_duration_since(previous));
         self.first_token_commit_at.get_or_insert(at);
         self.last_token_commit_at = Some(at);
         if decode {
             self.decode_tokens = self.decode_tokens.saturating_add(tokens);
             self.last_decode_commit_at = Some(at);
         }
+        gap
     }
 
     fn decode_wall_ms(&self) -> Option<f64> {
@@ -3561,11 +3585,14 @@ impl EngineCore {
         }
 
         // Track request
+        let inserted_at = Instant::now();
+        self.request_phase_timings.insert(
+            request_id.clone(),
+            RequestPhaseTiming::admitted(&request, inserted_at),
+        );
         self.requests.insert(request_id.clone(), Arc::new(request));
         self.request_start_times
-            .insert(request_id.clone(), Instant::now());
-        self.request_phase_timings
-            .insert(request_id.clone(), RequestPhaseTiming::default());
+            .insert(request_id.clone(), inserted_at);
 
         debug!(
             request_id = %request_id,
@@ -3659,11 +3686,13 @@ impl EngineCore {
                 "realtime request {request_id} lost its scheduler session"
             ))
         })?;
+        let inserted_at = Instant::now();
+        self.request_phase_timings.insert(
+            request_id.clone(),
+            RequestPhaseTiming::admitted(&request, inserted_at),
+        );
         self.requests.insert(request_id.clone(), Arc::new(request));
-        self.request_start_times
-            .insert(request_id.clone(), Instant::now());
-        self.request_phase_timings
-            .insert(request_id, RequestPhaseTiming::default());
+        self.request_start_times.insert(request_id, inserted_at);
         Ok(session)
     }
 
@@ -5046,14 +5075,27 @@ impl EngineCore {
                             || committed.output.tokens_generated > 0)
                             && progressed
                         {
-                            if let Some(timing) = self
-                                .request_phase_timings
-                                .get_mut(&committed.session.request_id)
+                            let request_id = &committed.session.request_id;
+                            let tokens = committed.output.tokens_generated;
+                            let gap =
+                                self.request_phase_timings
+                                    .get_mut(request_id)
+                                    .and_then(|timing| {
+                                        timing.record_token_commit(
+                                            decode_transaction,
+                                            tokens,
+                                            Instant::now(),
+                                        )
+                                    });
+                            if let (Some(gap), Some(request)) = (gap, self.requests.get(request_id))
                             {
-                                timing.record_token_commit(
-                                    decode_transaction,
-                                    committed.output.tokens_generated,
-                                    Instant::now(),
+                                super::metrics::record_engine_inter_token_gap(
+                                    request
+                                        .model_variant
+                                        .map_or("unknown", |variant| variant.dir_name()),
+                                    request.task_type.as_str(),
+                                    gap,
+                                    tokens,
                                 );
                             }
                             committed_service_requests.push(committed.session.request_id.clone());
@@ -5206,6 +5248,7 @@ impl EngineCore {
                             / phase.decode_ms) as f32;
                 }
                 engine_output.latency_breakdown = Some(LatencyBreakdown {
+                    pre_engine_ms: phase.pre_engine_ms,
                     queue_wait_ms: phase.queue_wait_ms,
                     media_decode_ms: phase.media_decode_ms,
                     normalization_ms: phase.normalization_ms,
@@ -11530,6 +11573,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latency_breakdown_reports_time_between_runtime_admission_and_insertion() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        let mut request = EngineCoreRequest::tts("pre-engine timing");
+        request.id = "pre-engine".into();
+        request.prompt_tokens = vec![1];
+        request.runtime_admitted_at = Some(Instant::now() - Duration::from_millis(250));
+        core.add_request(request).unwrap();
+        core.step().await.unwrap();
+        let prepared = core.prepare_step().await.unwrap().unwrap();
+        let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+        let committed = core.commit_step(executed).await.unwrap();
+        let timing = committed.outputs[0].latency_breakdown.as_ref().unwrap();
+        let pre_engine_ms = timing.pre_engine_ms.expect("runtime admission was stamped");
+        // Measured at insertion, so it cannot include the engine's own time.
+        assert!(pre_engine_ms >= 250.0, "{pre_engine_ms}");
+        assert!(pre_engine_ms < 250.0 + 5_000.0, "{pre_engine_ms}");
+    }
+
+    #[tokio::test]
     async fn decode_timing_commits_once_and_ignores_duplicate_completion() {
         let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
             Mutex::new(Vec::new()),
@@ -11555,6 +11627,14 @@ mod tests {
         assert_eq!(timing.decode_tokens, Some(1));
         assert!(timing.decode_wall_ms.unwrap() > 0.0);
         assert!(timing.decode_wall_ms.unwrap() <= timing.total_ms);
+        // Token stats carry the measured prefill, not a placeholder.
+        assert!(timing.prefill_ms > 0.0);
+        assert_eq!(
+            committed.outputs[0].token_stats.prefill_time_ms,
+            timing.prefill_ms as f32
+        );
+        // A direct engine caller has no runtime admission before insertion.
+        assert_eq!(timing.pre_engine_ms, None);
         assert!(core
             .commit_step(duplicate)
             .await
@@ -11653,6 +11733,26 @@ mod decode_timing_tests {
         assert_eq!(timing.decode_wall_ms(), Some(90.0));
         assert_eq!(timing.post_first_token_ms(), Some(100.0));
         assert!(timing.decode_wall_ms().unwrap() > timing.decode_ms);
+    }
+
+    #[test]
+    fn token_commits_report_the_gap_since_the_previous_commit() {
+        let start = Instant::now();
+        let mut timing = RequestPhaseTiming::default();
+        assert_eq!(timing.record_token_commit(false, 1, start), None);
+        assert_eq!(
+            timing.record_token_commit(true, 4, start + Duration::from_millis(40)),
+            Some(Duration::from_millis(40))
+        );
+        // An empty commit is not a token and leaves the reference point.
+        assert_eq!(
+            timing.record_token_commit(true, 0, start + Duration::from_millis(60)),
+            None
+        );
+        assert_eq!(
+            timing.record_token_commit(true, 1, start + Duration::from_millis(70)),
+            Some(Duration::from_millis(30))
+        );
     }
 
     #[test]

@@ -247,7 +247,9 @@ impl OutputProcessor {
         let token_stats = TokenStats {
             prompt_tokens: executor_output.tokens_processed,
             generated_tokens: num_tokens,
-            prefill_time_ms: 0.0, // Not tracked at this level
+            // Stamped by the engine core from the request's phase timing; an
+            // output that never reached scheduling has no prefill.
+            prefill_time_ms: 0.0,
             decode_time_ms: generation_time.as_secs_f32() * 1000.0,
             tokens_per_second: if generation_time.as_secs_f32() > 0.0 {
                 num_tokens as f32 / generation_time.as_secs_f32()

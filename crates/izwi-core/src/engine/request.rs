@@ -1301,6 +1301,11 @@ pub struct EngineCoreRequest {
     pub admission_ms: Option<f64>,
     /// Arrival timestamp
     pub arrival_time: Instant,
+    /// When the runtime coordinator admitted this request. Input
+    /// preparation, model residency and lane waits run between it and engine
+    /// insertion; `None` for direct engine callers, whose queue starts at
+    /// insertion.
+    pub runtime_admitted_at: Option<Instant>,
     /// Optional absolute end-to-end deadline supplied by the ingress layer.
     pub deadline: Option<Instant>,
     /// Prompt token IDs (set by processor)
@@ -4780,6 +4785,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
@@ -4846,6 +4852,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
@@ -4912,6 +4919,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
@@ -4975,6 +4983,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
@@ -5039,6 +5048,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,
@@ -5103,6 +5113,7 @@ impl EngineCoreRequest {
             workload_class: WorkloadClass::Online,
             admission_ms: None,
             arrival_time: Instant::now(),
+            runtime_admitted_at: None,
             deadline: None,
             prompt_tokens: Vec::new(),
             chat_execution_ready: None,

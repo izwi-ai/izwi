@@ -60,6 +60,7 @@ pub use service::{
     RuntimeChatInvocationRequest, RuntimeChatTeardown, RuntimeChatTeardownDisposition,
     RuntimeService, DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT,
 };
+pub use telemetry::histogram as prometheus;
 pub use telemetry::{
     runtime_trace_contracts, sanitized_replay_record, trace_contract_for_phase,
     EngineRuntimeTelemetrySnapshot, InferenceBrokerRuntimeTelemetrySnapshot,

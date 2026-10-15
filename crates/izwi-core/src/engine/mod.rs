@@ -115,7 +115,8 @@ pub use metrics::{
     engine_physical_execution_metrics_snapshot, engine_request_parallel_batches_total,
     engine_stream_backpressure_total, engine_stream_metrics_snapshot,
     engine_tensor_batch_max_width, engine_tensor_batches_total, prometheus_engine_metric_name,
-    prometheus_engine_metric_type, BenchmarkResult, EngineBatchMetricsSnapshot,
+    prometheus_engine_metric_type, push_engine_histograms, BenchmarkResult,
+    EngineBatchMetricsSnapshot,
     EngineDeadlinePhaseMetricsSnapshot, EngineDispatchStateMetricsSnapshot,
     EngineDurationMetricsSnapshot, EngineFailureOriginMetricsSnapshot, EngineMetricDescriptor,
     EnginePhysicalDeferMetricsSnapshot, EnginePhysicalDeferReason,
@@ -738,7 +739,10 @@ impl OwnedStepContext {
         executed.apply_stream_delivery_failures(&dispatch_failures);
         let committed = {
             let mut core = self.core.write().await;
-            core.commit_step(executed).await?
+            let started = Instant::now();
+            let committed = core.commit_step(executed).await?;
+            metrics::record_engine_step_phase(metrics::EngineStepPhase::Commit, started.elapsed());
+            committed
         };
         self.deliver_and_route_committed(committed, defer_unregistered_terminal_ack)
             .await
@@ -885,6 +889,19 @@ impl OwnedStepContext {
         committed: core::CommittedEngineStep,
         defer_unregistered_terminal_ack: bool,
     ) -> Result<Vec<EngineOutput>> {
+        let started = Instant::now();
+        let routed = self
+            .route_committed(committed, defer_unregistered_terminal_ack)
+            .await;
+        metrics::record_engine_step_phase(metrics::EngineStepPhase::Deliver, started.elapsed());
+        routed
+    }
+
+    async fn route_committed(
+        &self,
+        committed: core::CommittedEngineStep,
+        defer_unregistered_terminal_ack: bool,
+    ) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
         let mut synchronous = Vec::new();
         for delivery in committed.stream_deliveries {
@@ -979,7 +996,10 @@ impl OwnedStepContext {
         let _step = self.step_gate.lock().await;
         let prepared = {
             let mut core = self.core.write().await;
-            core.prepare_step().await?
+            let started = Instant::now();
+            let prepared = core.prepare_step().await?;
+            metrics::record_engine_step_phase(metrics::EngineStepPhase::Prepare, started.elapsed());
+            prepared
         };
         let outputs = match prepared {
             Some(prepared) => {

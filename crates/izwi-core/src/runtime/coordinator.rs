@@ -803,6 +803,7 @@ impl InferenceCoordinator {
         })?;
         let JobLeaseInner {
             coordinator,
+            admitted_at,
             _permit,
             reservation,
             active,
@@ -818,6 +819,7 @@ impl InferenceCoordinator {
         drop(active);
         Ok(PreparationAdmissionBridge {
             coordinator,
+            admitted_at,
             preparation_spec: spec,
             reservation: Some(reservation),
         })
@@ -909,6 +911,7 @@ impl InferenceCoordinator {
         Ok(JobLease {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
+                admitted_at: bridge.admitted_at,
                 _permit: permit,
                 reservation,
                 active: ActiveJobGuard {
@@ -968,6 +971,7 @@ impl InferenceCoordinator {
         Ok(JobLease {
             _inner: Arc::new(JobLeaseInner {
                 coordinator: self.clone(),
+                admitted_at: Instant::now(),
                 _permit: permit,
                 reservation,
                 active: ActiveJobGuard {
@@ -2166,6 +2170,11 @@ pub struct JobLease {
 }
 
 impl JobLease {
+    /// When the coordinator admitted this request.
+    pub fn admitted_at(&self) -> Instant {
+        self._inner.admitted_at
+    }
+
     /// Reconcile observed physical usage against this job's immutable
     /// authorization. Future authorized growth remains pending. Observations
     /// are monotonic; the runtime restores pending claims before dropping or
@@ -2225,6 +2234,9 @@ impl Drop for ModelLoadLease {
 #[derive(Debug)]
 struct JobLeaseInner {
     coordinator: Arc<InferenceCoordinator>,
+    /// When the coordinator first admitted this request; a preparation
+    /// handoff keeps the original admission.
+    admitted_at: Instant,
     _permit: OwnedSemaphorePermit,
     reservation: ResourceLease,
     active: ActiveJobGuard,
@@ -2246,6 +2258,7 @@ impl Drop for ActiveJobGuard {
 #[derive(Debug)]
 pub(crate) struct PreparationAdmissionBridge {
     coordinator: Arc<InferenceCoordinator>,
+    admitted_at: Instant,
     preparation_spec: JobSpec,
     reservation: Option<ResourceLease>,
 }
