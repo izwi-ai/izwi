@@ -2718,9 +2718,18 @@ mod tests {
             .expect("cancel")
             .expect("cancelled job");
         assert_eq!(cancellation.status, RuntimeJobStatus::Running);
-        assert_eq!(
-            cancellation.cancellation_state,
-            Some(RuntimeCancellationState::Requested)
+        // cancel_job reads the job back after committing, so the worker's
+        // 10 ms poll may already have advanced it to ExecutionStopping.
+        assert!(
+            matches!(
+                cancellation.cancellation_state,
+                Some(
+                    RuntimeCancellationState::Requested
+                        | RuntimeCancellationState::ExecutionStopping
+                )
+            ),
+            "{:?}",
+            cancellation.cancellation_state
         );
 
         let requested = store
