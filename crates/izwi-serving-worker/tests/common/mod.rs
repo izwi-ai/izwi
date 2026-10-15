@@ -18,6 +18,11 @@ where
 }
 
 pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
+    write_tiny_lfm_fixture_with_context(models_dir, 32)
+}
+
+/// The tiny LFM2 fixture with a chosen native context length.
+pub fn write_tiny_lfm_fixture_with_context(models_dir: &Path, context_tokens: u32) -> PathBuf {
     let model_dir = models_dir.join("LFM2.5-1.2B-Instruct-GGUF");
     std::fs::create_dir_all(&model_dir).unwrap();
     let tokenizer = tokenizers::Tokenizer::new(
@@ -60,7 +65,7 @@ pub fn write_tiny_lfm_fixture(models_dir: &Path) -> PathBuf {
     let metadata = [
         ("general.architecture", Value::String("lfm2".into())),
         ("lfm2.block_count", Value::U32(2)),
-        ("lfm2.context_length", Value::U32(32)),
+        ("lfm2.context_length", Value::U32(context_tokens)),
         ("lfm2.embedding_length", Value::U32(4)),
         ("lfm2.attention.head_count", Value::U32(1)),
         (

@@ -491,6 +491,18 @@ impl DeploymentConfig {
                 worker: worker.worker_id.clone(),
             });
         }
+        // A chat worker advertises exactly these limits once its loaded model
+        // proves the context, so a chat deployment must state both.
+        if self.task == TaskKind::Chat
+            && !matches!(
+                (self.capability.max_context_tokens, self.capability.max_output_tokens),
+                (Some(context), Some(output)) if output <= context
+            )
+        {
+            return Err(ConfigError::ChatCapabilityTokenLimits {
+                worker: worker.worker_id.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -990,6 +1002,11 @@ pub enum ConfigError {
     CapabilityStreamingMismatch { worker: WorkerId },
     #[error("worker {worker} capability token limits must be non-zero when specified")]
     ZeroCapabilityTokenLimit { worker: WorkerId },
+    #[error(
+        "worker {worker} chat deployment must set max_context_tokens and a max_output_tokens \
+         within it"
+    )]
+    ChatCapabilityTokenLimits { worker: WorkerId },
     #[error("worker {worker} retained attempt capacity is below active invocation capacity")]
     AttemptRetentionBelowCapacity { worker: WorkerId },
     #[error("worker {worker} attempt retention must be between one second and one day")]
@@ -1715,6 +1732,18 @@ max_output_tokens = 32
             streaming.validate(&inventory(), &binaries),
             Err(ConfigError::CapabilityStreamingMismatch { .. })
         ));
+
+        // A chat worker advertises exactly the approved limits, so both must
+        // be stated and the output must fit the context.
+        for (context, output) in [(None, Some(32)), (Some(32), None), (Some(32), Some(64))] {
+            let mut limits = cpu_config(directory.path());
+            limits.workers[0].deployment.capability.max_context_tokens = context;
+            limits.workers[0].deployment.capability.max_output_tokens = output;
+            assert!(matches!(
+                limits.validate(&inventory(), &binaries),
+                Err(ConfigError::ChatCapabilityTokenLimits { .. })
+            ));
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use crate::{ConfigError, ValidatedNodeConfig};
-use izwi_serving_protocol::{DeviceAssignment, IncarnationId, ServiceBearerToken, WorkerId};
+use izwi_serving_protocol::{
+    DeviceAssignment, IncarnationId, ServiceBearerToken, TaskKind, WorkerId,
+};
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
@@ -26,6 +28,14 @@ pub const WORKER_OWNERSHIP_LOCK_ENV: &str = "IZWI_WORKER_OWNERSHIP_LOCK";
 pub const WORKER_GENERATION_FENCE_ENV: &str = "IZWI_WORKER_GENERATION_FENCE_LOCK";
 pub const WORKER_MODEL_LOAD_LOCK_ENV: &str = "IZWI_WORKER_MODEL_LOAD_LOCK";
 pub const WORKER_MODEL_LOAD_SLOTS_ENV: &str = "IZWI_WORKER_MODEL_LOAD_SLOTS";
+pub const WORKER_TASK_ENV: &str = "IZWI_WORKER_TASK";
+/// The deployment's declared execution profile and token limits. The worker
+/// advertises exactly these once its loaded model proves them and refuses to
+/// start otherwise, so its status equals the approved deployment.
+pub const WORKER_PRECISION_ENV: &str = "IZWI_WORKER_PRECISION";
+pub const WORKER_EXECUTION_REPRESENTATION_ENV: &str = "IZWI_WORKER_EXECUTION_REPRESENTATION";
+pub const WORKER_MAX_CONTEXT_TOKENS_ENV: &str = "IZWI_WORKER_MAX_CONTEXT_TOKENS";
+pub const WORKER_MAX_OUTPUT_TOKENS_ENV: &str = "IZWI_WORKER_MAX_OUTPUT_TOKENS";
 pub const MAX_INHERITED_ENV_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_INHERITED_ENV_TOTAL_BYTES: usize = 256 * 1024;
 
@@ -260,6 +270,29 @@ pub fn build_child_launch_spec(
         "IZWI_WORKER_MODEL",
         worker.deployment.public_model.as_str().into(),
     );
+    set(
+        WORKER_TASK_ENV,
+        match worker.deployment.task {
+            TaskKind::Chat => "chat",
+            TaskKind::SpeechToText => "speech_to_text",
+            TaskKind::TextToSpeech => "text_to_speech",
+        }
+        .into(),
+    );
+    set(
+        WORKER_PRECISION_ENV,
+        worker.deployment.precision.as_str().into(),
+    );
+    set(
+        WORKER_EXECUTION_REPRESENTATION_ENV,
+        worker.deployment.execution_representation.as_str().into(),
+    );
+    if let Some(tokens) = worker.deployment.capability.max_context_tokens {
+        set(WORKER_MAX_CONTEXT_TOKENS_ENV, tokens.to_string().into());
+    }
+    if let Some(tokens) = worker.deployment.capability.max_output_tokens {
+        set(WORKER_MAX_OUTPUT_TOKENS_ENV, tokens.to_string().into());
+    }
     set(
         "IZWI_WORKER_ARTIFACT_REVISION",
         worker.deployment.artifact_revision.as_str().into(),

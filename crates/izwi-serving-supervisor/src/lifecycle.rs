@@ -2,8 +2,8 @@ use crate::{ChildLaunchSpec, ReadinessPolicy, RestartPolicy, ShutdownPolicy, Val
 use izwi_serving_client::{WorkerClient, WorkerClientConfig, WorkerClientError};
 use izwi_serving_protocol::{
     ArtifactRevision, BackendKind, Capability, DeploymentId, DeviceAssignment, IncarnationId,
-    ModelAlias, ModelGeneration, ModelReadiness, NodeId, ServiceCredentials, TaskKind,
-    WorkerDescriptor, WorkerId, WorkerProcessState, WorkerStatus,
+    LoadedDeployment, ModelAlias, ModelGeneration, ModelReadiness, NodeId, ServiceCredentials,
+    TaskKind, WorkerDescriptor, WorkerId, WorkerProcessState, WorkerStatus,
 };
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, io, process::ExitStatus, time::Duration};
@@ -93,6 +93,24 @@ impl ExpectedWorkerIdentity {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// Checks the task, execution profile, and capability a worker reports for
+    /// the assigned deployment. Readiness is observed state and not compared.
+    pub fn verify_deployment(&self, deployment: &LoadedDeployment) -> Result<(), IdentityMismatch> {
+        if deployment.task != self.task {
+            return Err(IdentityMismatch::DeploymentTask);
+        }
+        if deployment.precision != self.precision
+            || deployment.execution_representation != self.execution_representation
+            || deployment.tokenizer_revision != self.tokenizer_revision
+        {
+            return Err(IdentityMismatch::ExecutionProfile);
+        }
+        if deployment.capability != self.capability {
+            return Err(IdentityMismatch::CapabilityProfile);
+        }
+        Ok(())
+    }
 }
 
 /// Stateful verifier that rejects stale, replaced, or misassigned worker observations.
@@ -177,18 +195,7 @@ impl ReadinessTracker {
         if matching.next().is_some() {
             return Err(IdentityMismatch::DuplicateDeployment);
         }
-        if deployment.task != self.expected.task {
-            return Err(IdentityMismatch::DeploymentTask);
-        }
-        if deployment.precision != self.expected.precision
-            || deployment.execution_representation != self.expected.execution_representation
-            || deployment.tokenizer_revision != self.expected.tokenizer_revision
-        {
-            return Err(IdentityMismatch::ExecutionProfile);
-        }
-        if deployment.capability != self.expected.capability {
-            return Err(IdentityMismatch::CapabilityProfile);
-        }
+        self.expected.verify_deployment(deployment)?;
         if deployment.readiness == ModelReadiness::Failed {
             return Err(IdentityMismatch::DeploymentFailed);
         }

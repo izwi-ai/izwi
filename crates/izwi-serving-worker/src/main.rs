@@ -5,8 +5,9 @@ use izwi_core::{
 use izwi_serving_protocol::*;
 use izwi_serving_supervisor::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
-    WORKER_GENERATION_FENCE_ENV, WORKER_MODEL_LOAD_LOCK_ENV, WORKER_MODEL_LOAD_SLOTS_ENV,
-    WORKER_OWNERSHIP_LOCK_ENV,
+    WORKER_EXECUTION_REPRESENTATION_ENV, WORKER_GENERATION_FENCE_ENV,
+    WORKER_MAX_CONTEXT_TOKENS_ENV, WORKER_MAX_OUTPUT_TOKENS_ENV, WORKER_MODEL_LOAD_LOCK_ENV,
+    WORKER_MODEL_LOAD_SLOTS_ENV, WORKER_OWNERSHIP_LOCK_ENV, WORKER_PRECISION_ENV, WORKER_TASK_ENV,
 };
 use izwi_serving_worker::{
     warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
@@ -193,116 +194,13 @@ async fn main() -> anyhow::Result<()> {
         assignment: process.assignment.clone(),
         features,
     };
-    let deployment = match process.task {
-        TaskKind::Chat => LoadedDeployment {
-            deployment_id: process.deployment_id.clone(),
-            public_model: process.public_model.clone(),
-            artifact_revision: process.artifact_revision.clone(),
-            model_generation: process.model_generation,
-            task: TaskKind::Chat,
-            backend: process.assignment.backend(),
-            precision: "gguf-q4_k_m".into(),
-            execution_representation: "native-lfm2".into(),
-            tokenizer_revision: None,
-            readiness: ModelReadiness::Ready,
-            capability: Capability {
-                task: TaskKind::Chat,
-                streaming: process.streaming,
-                realtime: false,
-                cancellation: CancellationBehavior::Cooperative,
-                accepted_input_formats: BTreeSet::from([InputFormat::ChatMessages]),
-                output_formats: BTreeSet::from([OutputFormat::Text]),
-                max_input_bytes: process.max_request_bytes as u64,
-                max_context_tokens: Some(32),
-                max_output_tokens: Some(32),
-            },
-            // Routing signals are per-status observations populated from engine
-            // telemetry at status time, never static startup metadata.
-            kv_cache_usage_pct: None,
-            prefix_hits_total: None,
-            prefix_queries_total: None,
-            prefix_evictions_total: None,
-            kv_host_pages: None,
-            kv_demotions_total: None,
-            kv_promotions_total: None,
-            kv_promotion_latency_avg_seconds: None,
-            tokens_out_per_s_ema: None,
-            observation_cost_units: None,
-        },
-        TaskKind::SpeechToText => LoadedDeployment {
-            deployment_id: process.deployment_id.clone(),
-            public_model: process.public_model.clone(),
-            artifact_revision: process.artifact_revision.clone(),
-            model_generation: process.model_generation,
-            task: TaskKind::SpeechToText,
-            backend: process.assignment.backend(),
-            precision: "fp16".into(),
-            execution_representation: match variant_family_name(&process.variant) {
-                "nemotron_asr" => "native-nemotron-realtime".into(),
-                _ => "native-voxtral-realtime".into(),
-            },
-            tokenizer_revision: None,
-            readiness: ModelReadiness::Ready,
-            capability: Capability {
-                task: TaskKind::SpeechToText,
-                streaming: true,
-                realtime: true,
-                cancellation: CancellationBehavior::Cooperative,
-                accepted_input_formats: BTreeSet::from([InputFormat::PcmAudio]),
-                output_formats: BTreeSet::from([OutputFormat::Text]),
-                max_input_bytes: process.max_request_bytes as u64,
-                // Realtime sessions carry audio, not chat context; the
-                // session-level byte budget in the subprotocol bounds input.
-                max_context_tokens: None,
-                max_output_tokens: None,
-            },
-            kv_cache_usage_pct: None,
-            prefix_hits_total: None,
-            prefix_queries_total: None,
-            prefix_evictions_total: None,
-            kv_host_pages: None,
-            kv_demotions_total: None,
-            kv_promotions_total: None,
-            kv_promotion_latency_avg_seconds: None,
-            tokens_out_per_s_ema: None,
-            observation_cost_units: None,
-        },
-        TaskKind::TextToSpeech => LoadedDeployment {
-            deployment_id: process.deployment_id.clone(),
-            public_model: process.public_model.clone(),
-            artifact_revision: process.artifact_revision.clone(),
-            model_generation: process.model_generation,
-            task: TaskKind::TextToSpeech,
-            backend: process.assignment.backend(),
-            precision: "fp32".into(),
-            execution_representation: "native-tts-realtime".into(),
-            tokenizer_revision: None,
-            readiness: ModelReadiness::Ready,
-            capability: Capability {
-                task: TaskKind::TextToSpeech,
-                streaming: true,
-                realtime: true,
-                cancellation: CancellationBehavior::Cooperative,
-                accepted_input_formats: BTreeSet::from([InputFormat::Text]),
-                output_formats: BTreeSet::from([OutputFormat::PcmAudio]),
-                max_input_bytes: process.max_request_bytes as u64,
-                // Realtime sessions carry bounded text, not chat context; the
-                // session-level byte budget in the subprotocol bounds input.
-                max_context_tokens: None,
-                max_output_tokens: None,
-            },
-            kv_cache_usage_pct: None,
-            prefix_hits_total: None,
-            prefix_queries_total: None,
-            prefix_evictions_total: None,
-            kv_host_pages: None,
-            kv_demotions_total: None,
-            kv_promotions_total: None,
-            kv_promotion_latency_avg_seconds: None,
-            tokens_out_per_s_ema: None,
-            observation_cost_units: None,
-        },
-    };
+    let fitted_context_tokens = runtime
+        .loaded_model_diagnostics()
+        .await
+        .into_iter()
+        .find(|loaded| loaded.variant_id == process.variant.dir_name())
+        .and_then(|loaded| loaded.effective_context_tokens);
+    let deployment = loaded_deployment(&process, fitted_context_tokens)?;
     let worker_config = WorkerConfig {
         descriptor,
         deployment,
@@ -584,6 +482,36 @@ struct WorkerProcessConfig {
     /// latched fatal device fault) so the supervisor restarts the worker
     /// with its bounded backoff instead of leaving a Failed process up.
     exit_on_runtime_failure: bool,
+    declared: DeclaredDeployment,
+}
+
+/// The execution profile and token limits a supervisor approved for this
+/// worker. Unset values are derived from the loaded model.
+struct DeclaredDeployment {
+    precision: Option<String>,
+    execution_representation: Option<String>,
+    max_context_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+impl DeclaredDeployment {
+    fn from_env() -> anyhow::Result<Self> {
+        let label = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let limit = |name: &str| {
+            parse_optional_env::<std::num::NonZeroU32>(name)
+                .map(|limit| limit.map(std::num::NonZeroU32::get))
+        };
+        Ok(Self {
+            precision: label(WORKER_PRECISION_ENV),
+            execution_representation: label(WORKER_EXECUTION_REPRESENTATION_ENV),
+            max_context_tokens: limit(WORKER_MAX_CONTEXT_TOKENS_ENV)?,
+            max_output_tokens: limit(WORKER_MAX_OUTPUT_TOKENS_ENV)?,
+        })
+    }
 }
 
 impl WorkerProcessConfig {
@@ -719,6 +647,7 @@ impl WorkerProcessConfig {
                 10_000,
             )?),
             exit_on_runtime_failure: parse_env("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
+            declared: DeclaredDeployment::from_env()?,
         })
     }
 
@@ -1089,13 +1018,125 @@ fn verify_artifact_manifest(process: &WorkerProcessConfig) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Stable family label for the deployment's execution representation.
-fn variant_family_name(variant: &ModelVariant) -> &'static str {
-    match variant.family() {
-        izwi_core::catalog::ModelFamily::NemotronAsr => "nemotron_asr",
-        izwi_core::catalog::ModelFamily::Voxtral => "voxtral",
-        _ => "other",
+/// How this worker serves `variant`: (weight precision, execution
+/// representation).
+fn execution_profile(
+    task: TaskKind,
+    variant: ModelVariant,
+) -> anyhow::Result<(&'static str, &'static str)> {
+    Ok(match task {
+        TaskKind::Chat => match variant {
+            ModelVariant::Lfm2512BInstructGguf => ("gguf-q4_k_m", "native-lfm2"),
+            ModelVariant::Qwen3Moe30bA3bGguf => ("gguf-q4_k_m", "native-qwen3-moe"),
+            ModelVariant::Qwen3827BFp8 => ("fp8-block", "native-qwen38"),
+            ModelVariant::Qwen36Moe35BA3BFp8 => ("fp8-block", "native-qwen35-moe"),
+            other => bail!("no serving execution profile for chat model {other}"),
+        },
+        TaskKind::SpeechToText => (
+            "fp16",
+            match variant.family() {
+                izwi_core::catalog::ModelFamily::NemotronAsr => "native-nemotron-realtime",
+                _ => "native-voxtral-realtime",
+            },
+        ),
+        TaskKind::TextToSpeech => ("fp32", "native-tts-realtime"),
+    })
+}
+
+/// The deployment this worker advertises: identity from the process
+/// configuration, execution profile and token limits from the loaded model.
+/// A supervisor-declared profile or limit is advertised exactly once the
+/// loaded model proves it; one the model cannot honour stops startup, so the
+/// worker never reports a capability it does not have and its status equals
+/// the approved deployment.
+fn loaded_deployment(
+    process: &WorkerProcessConfig,
+    fitted_context_tokens: Option<usize>,
+) -> anyhow::Result<LoadedDeployment> {
+    let (precision, execution_representation) = execution_profile(process.task, process.variant)?;
+    let declared = &process.declared;
+    for (name, declared, served) in [
+        (WORKER_PRECISION_ENV, &declared.precision, precision),
+        (
+            WORKER_EXECUTION_REPRESENTATION_ENV,
+            &declared.execution_representation,
+            execution_representation,
+        ),
+    ] {
+        if let Some(declared) = declared.as_deref().filter(|declared| *declared != served) {
+            bail!(
+                "{name}={declared} does not match {}, which this worker serves as {served}",
+                process.public_model
+            );
+        }
     }
+    let (input_format, output_format, realtime) = match process.task {
+        TaskKind::Chat => (InputFormat::ChatMessages, OutputFormat::Text, false),
+        TaskKind::SpeechToText => (InputFormat::PcmAudio, OutputFormat::Text, true),
+        TaskKind::TextToSpeech => (InputFormat::Text, OutputFormat::PcmAudio, true),
+    };
+    let (max_context_tokens, max_output_tokens) = if realtime {
+        // Realtime sessions carry audio or bounded text, not chat context;
+        // the session-level byte budget in the subprotocol bounds input.
+        if declared.max_context_tokens.is_some() || declared.max_output_tokens.is_some() {
+            bail!("realtime speech deployments do not advertise token limits");
+        }
+        (None, None)
+    } else {
+        let fitted = fitted_context_tokens
+            .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
+            .context("the loaded chat model reports no fitted context")?;
+        let context = declared.max_context_tokens.unwrap_or(fitted);
+        if context > fitted {
+            bail!(
+                "{WORKER_MAX_CONTEXT_TOKENS_ENV}={context} exceeds the loaded model's fitted \
+                 context of {fitted} tokens"
+            );
+        }
+        let output = declared.max_output_tokens.unwrap_or(context);
+        if output > context {
+            bail!(
+                "{WORKER_MAX_OUTPUT_TOKENS_ENV}={output} exceeds the advertised context of \
+                 {context} tokens"
+            );
+        }
+        (Some(context), Some(output))
+    };
+    Ok(LoadedDeployment {
+        deployment_id: process.deployment_id.clone(),
+        public_model: process.public_model.clone(),
+        artifact_revision: process.artifact_revision.clone(),
+        model_generation: process.model_generation,
+        task: process.task,
+        backend: process.assignment.backend(),
+        precision: precision.into(),
+        execution_representation: execution_representation.into(),
+        tokenizer_revision: None,
+        readiness: ModelReadiness::Ready,
+        capability: Capability {
+            task: process.task,
+            streaming: realtime || process.streaming,
+            realtime,
+            cancellation: CancellationBehavior::Cooperative,
+            accepted_input_formats: BTreeSet::from([input_format]),
+            output_formats: BTreeSet::from([output_format]),
+            max_input_bytes: process.max_request_bytes as u64,
+            max_context_tokens,
+            max_output_tokens,
+        },
+        // Routing signals are per-status observations populated from engine
+        // telemetry at status time, never static startup metadata.
+        kv_cache_usage_pct: None,
+        prefix_hits_total: None,
+        prefix_queries_total: None,
+        prefix_evictions_total: None,
+        kv_host_pages: None,
+        kv_demotions_total: None,
+        kv_promotions_total: None,
+        kv_promotion_latency_avg_seconds: None,
+        tokens_out_per_s_ema: None,
+        observation_cost_units: None,
+    })
 }
 
 fn env_or(name: &str, fallback: &str) -> String {
@@ -1105,7 +1146,7 @@ fn env_or(name: &str, fallback: &str) -> String {
 /// Parses `IZWI_WORKER_TASK`. Chat remains the default so existing
 /// deployments are byte-identical.
 fn parse_worker_task() -> anyhow::Result<TaskKind> {
-    match env_or("IZWI_WORKER_TASK", "chat")
+    match env_or(WORKER_TASK_ENV, "chat")
         .trim()
         .to_ascii_lowercase()
         .as_str()
@@ -1239,6 +1280,187 @@ mod tests {
                 expected_device_uuid: "GPU-0123".into(),
             }
         );
+    }
+
+    /// Parses the worker configuration a supervisor would launch for one
+    /// deployment, and returns it with the supervisor's approval.
+    fn supervised_worker(
+        deployment: &str,
+    ) -> (
+        WorkerProcessConfig,
+        izwi_serving_supervisor::ExpectedWorkerIdentity,
+    ) {
+        use izwi_serving_supervisor::{
+            build_child_launch_spec, BinaryCatalog, BinaryRecord, ExpectedWorkerIdentity,
+            HostInventory, NodeConfig, ResolvedWorkerSecret, WorkerBinaryFlavor,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("worker");
+        std::fs::write(&binary, b"worker").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = format!(
+            r#"
+schema_version = 2
+node_id = "node-a"
+working_directory = "{root}"
+runtime_directory = "{root}/run"
+host_memory_budget_bytes = 4096
+
+[[workers]]
+worker_id = "worker-a"
+bind = "127.0.0.1:9470"
+binary = "cpu"
+credential_id = "credential-a"
+bearer_token_env = "WORKER_A_TOKEN"
+max_active_invocations = 1
+max_request_bytes = 4096
+streaming = true
+
+[workers.assignment]
+backend = "cpu"
+thread_budget = 1
+affinity = [0]
+host_memory_limit_bytes = 4096
+
+[workers.deployment]
+deployment_id = "deployment-a"
+artifact_revision = "revision-a"
+model_generation = 3
+backend = "cpu"
+models_directory = "{root}"
+{deployment}
+"#,
+            root = root.path().display()
+        );
+        let node = NodeConfig::parse_bounded(config.as_bytes())
+            .unwrap()
+            .validate(
+                &HostInventory {
+                    effective_cpu_ids: vec![0],
+                    allocatable_host_memory_bytes: 8192,
+                    metal_devices: Vec::new(),
+                    cuda_devices: Vec::new(),
+                },
+                &BinaryCatalog::new([(
+                    WorkerBinaryFlavor::Cpu,
+                    BinaryRecord {
+                        path: binary,
+                        supported_backends: vec![BackendKind::Cpu],
+                    },
+                )]),
+            )
+            .unwrap();
+        let worker_id = WorkerId::new("worker-a").unwrap();
+        let incarnation = IncarnationId::new("incarnation-a").unwrap();
+        let namespace = LockNamespace::open(root.path().join("locks")).unwrap();
+        let assignment = node.worker(&worker_id).unwrap().assignment.clone();
+        let spec = build_child_launch_spec(
+            &node,
+            &worker_id,
+            &incarnation,
+            "WORKER_A_TOKEN",
+            &ResolvedWorkerSecret {
+                bearer_token: ServiceBearerToken::new("worker-a-secret").unwrap(),
+            },
+            &Default::default(),
+            &WorkerLockPaths::for_worker(&namespace, &worker_id, &assignment),
+        )
+        .unwrap();
+
+        let process = {
+            let _lock = ENV_LOCK.lock().unwrap();
+            for (name, value) in spec.environment() {
+                std::env::set_var(name, value);
+            }
+            let process = WorkerProcessConfig::from_env();
+            for name in spec.environment().keys() {
+                std::env::remove_var(name);
+            }
+            process.unwrap()
+        };
+        let expected = ExpectedWorkerIdentity::from_config(&node, &worker_id, incarnation).unwrap();
+        (process, expected)
+    }
+
+    const SUPERVISED_CHAT: &str = r#"
+public_model = "LFM2.5-1.2B-Instruct-GGUF"
+task = "chat"
+precision = "gguf-q4_k_m"
+execution_representation = "native-lfm2"
+
+[workers.deployment.capability]
+streaming = true
+realtime = false
+cancellation = "cooperative"
+accepted_input_formats = ["chat_messages"]
+output_formats = ["text"]
+max_input_bytes = 4096
+max_context_tokens = 8192
+max_output_tokens = 4096
+"#;
+
+    #[test]
+    fn worker_deployment_equals_the_supervisor_approval() {
+        let (process, expected) = supervised_worker(SUPERVISED_CHAT);
+        let deployment = loaded_deployment(&process, Some(32_768)).unwrap();
+        assert_eq!(expected.verify_deployment(&deployment), Ok(()));
+        assert_eq!(deployment.capability.max_context_tokens, Some(8192));
+        assert_eq!(deployment.capability.max_output_tokens, Some(4096));
+
+        let (process, expected) = supervised_worker(
+            r#"
+public_model = "Nemotron-3.5-ASR-Streaming-0.6B"
+task = "speech_to_text"
+precision = "fp16"
+execution_representation = "native-nemotron-realtime"
+
+[workers.deployment.capability]
+streaming = true
+realtime = true
+cancellation = "cooperative"
+accepted_input_formats = ["pcm_audio"]
+output_formats = ["text"]
+max_input_bytes = 4096
+"#,
+        );
+        assert_eq!(process.task, TaskKind::SpeechToText);
+        let deployment = loaded_deployment(&process, None).unwrap();
+        assert_eq!(expected.verify_deployment(&deployment), Ok(()));
+    }
+
+    #[test]
+    fn worker_refuses_a_declaration_its_loaded_model_cannot_honour() {
+        let (process, _) = supervised_worker(SUPERVISED_CHAT);
+        let error = loaded_deployment(&process, Some(4096)).unwrap_err();
+        assert!(error.to_string().contains("fitted context"), "{error}");
+        assert!(loaded_deployment(&process, None).is_err());
+
+        let (process, _) =
+            supervised_worker(&SUPERVISED_CHAT.replace("native-lfm2", "native-qwen38"));
+        let error = loaded_deployment(&process, Some(32_768)).unwrap_err();
+        assert!(error.to_string().contains("native-lfm2"), "{error}");
+    }
+
+    #[test]
+    fn standalone_chat_worker_advertises_its_fitted_context() {
+        let (mut process, _) = supervised_worker(SUPERVISED_CHAT);
+        process.declared = DeclaredDeployment {
+            precision: None,
+            execution_representation: None,
+            max_context_tokens: None,
+            max_output_tokens: None,
+        };
+        let deployment = loaded_deployment(&process, Some(32_768)).unwrap();
+        assert_eq!(deployment.precision, "gguf-q4_k_m");
+        assert_eq!(deployment.execution_representation, "native-lfm2");
+        assert_eq!(deployment.capability.max_context_tokens, Some(32_768));
+        assert_eq!(deployment.capability.max_output_tokens, Some(32_768));
+
+        process.declared.max_output_tokens = Some(1024);
+        let deployment = loaded_deployment(&process, Some(32_768)).unwrap();
+        assert_eq!(deployment.capability.max_output_tokens, Some(1024));
     }
 
     #[test]

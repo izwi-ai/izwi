@@ -6,7 +6,7 @@
 mod common;
 
 use axum::{body::Body, http::Request};
-use common::{id, write_tiny_lfm_fixture};
+use common::{id, write_tiny_lfm_fixture, write_tiny_lfm_fixture_with_context};
 use izwi_core::ModelVariant;
 use izwi_hooks::EnterpriseHooks;
 use izwi_server::{
@@ -26,18 +26,17 @@ impl Drop for ChildGuard {
     }
 }
 
-#[tokio::test]
-async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
-    let models = tempfile::tempdir().unwrap();
-    let model_dir = write_tiny_lfm_fixture(models.path());
-    assert!(model_dir.join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf").exists());
-
+/// Starts the worker binary on the tiny fixture in `models` and waits until
+/// it has loaded, warmed, and bound.
+async fn spawn_tiny_worker(
+    models: &std::path::Path,
+) -> (ChildGuard, WorkerClient, WorkerDescriptor) {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
         .env("IZWI_WORKER_BIND", address.to_string())
-        .env("IZWI_MODELS_DIR", models.path())
+        .env("IZWI_MODELS_DIR", models)
         .env("IZWI_WORKER_CREDENTIAL_ID", "real-cpu-credential")
         .env("IZWI_WORKER_BEARER_TOKEN", "real-cpu-secret")
         .env("IZWI_WORKER_ARTIFACT_REVISION", "tiny-lfm-fixture-v1")
@@ -49,7 +48,7 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let mut child = ChildGuard(child);
+    let child = ChildGuard(child);
 
     let credentials = ServiceCredentials {
         credential_id: id("real-cpu-credential"),
@@ -76,49 +75,102 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
     })
     .await
     .expect("worker loads and warms the tiny model before its startup deadline");
+    (child, client, descriptor)
+}
+
+fn chat_request(
+    descriptor: &WorkerDescriptor,
+    attempt: &'static str,
+    max_tokens: u32,
+) -> InvocationRequest {
+    InvocationRequest {
+        schema_version: PROTOCOL_V1,
+        request_id: id("real-request-1"),
+        attempt_id: id(attempt),
+        expected_worker_incarnation: descriptor.incarnation_id.clone(),
+        deployment_id: id("lfm25-cpu-v1"),
+        expected_model_generation: ModelGeneration::new(1).unwrap(),
+        caller: GatewayAttestedCallerContext {
+            tenant_id: id("local-test"),
+            caller_id: id("real-process-test"),
+            policy_revision: id("test-policy-v1"),
+            permitted_actions: BTreeSet::from([PermittedAction::Invoke]),
+            allowed_data_regions: vec!["local".into()],
+        },
+        task: TaskKind::Chat,
+        service_class: ServiceClass::Interactive,
+        remaining_time_ms: 10_000,
+        max_queue_wait_ms: 2_000,
+        output_limits: OutputLimits {
+            max_tokens,
+            max_bytes: 1024,
+        },
+        requested_output_format: OutputFormat::Text,
+        session_id: None,
+        request_digest: id("sha256:real-cpu-fixture"),
+        input: InvocationInput::Chat {
+            input: ChatInput {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: "hello".into(),
+                }],
+            },
+            parameters: ChatParameters {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                stop: Vec::new(),
+            },
+        },
+    }
+}
+
+/// The worker advertises the loaded model's fitted context and its real
+/// execution profile, and serves outputs beyond the old fixed 32 tokens.
+#[tokio::test]
+async fn worker_capability_follows_the_loaded_model() {
+    let models = tempfile::tempdir().unwrap();
+    write_tiny_lfm_fixture_with_context(models.path(), 256);
+    let (mut child, client, descriptor) = spawn_tiny_worker(models.path()).await;
+
+    let status = client.status().await.unwrap();
+    let deployment = &status.deployments[0];
+    assert_eq!(deployment.precision, "gguf-q4_k_m");
+    assert_eq!(deployment.execution_representation, "native-lfm2");
+    let context = deployment
+        .capability
+        .max_context_tokens
+        .expect("a chat worker advertises its fitted context");
+    assert!(context > 64, "fitted context {context}");
+    assert_eq!(deployment.capability.max_output_tokens, Some(context));
+
+    let events = client
+        .invoke_collect(chat_request(&descriptor, "long-output-attempt", 64))
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.first().map(|event| &event.event),
+        Some(InvocationEventKind::Accepted { .. })
+    ));
+    assert!(matches!(
+        events.last().map(|event| &event.event),
+        Some(InvocationEventKind::Completed { .. })
+    ));
+
+    child.0.start_kill().unwrap();
+    let _ = child.0.wait().await;
+}
+
+#[tokio::test]
+async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
+    let models = tempfile::tempdir().unwrap();
+    let model_dir = write_tiny_lfm_fixture(models.path());
+    assert!(model_dir.join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf").exists());
+    let (mut child, client, descriptor) = spawn_tiny_worker(models.path()).await;
     assert_eq!(descriptor.assignment.backend(), BackendKind::Cpu);
 
     let events = client
-        .invoke_collect(InvocationRequest {
-            schema_version: PROTOCOL_V1,
-            request_id: id("real-request-1"),
-            attempt_id: id("real-attempt-1"),
-            expected_worker_incarnation: descriptor.incarnation_id.clone(),
-            deployment_id: id("lfm25-cpu-v1"),
-            expected_model_generation: ModelGeneration::new(1).unwrap(),
-            caller: GatewayAttestedCallerContext {
-                tenant_id: id("local-test"),
-                caller_id: id("real-process-test"),
-                policy_revision: id("test-policy-v1"),
-                permitted_actions: BTreeSet::from([PermittedAction::Invoke]),
-                allowed_data_regions: vec!["local".into()],
-            },
-            task: TaskKind::Chat,
-            service_class: ServiceClass::Interactive,
-            remaining_time_ms: 10_000,
-            max_queue_wait_ms: 2_000,
-            output_limits: OutputLimits {
-                max_tokens: 1,
-                max_bytes: 1024,
-            },
-            requested_output_format: OutputFormat::Text,
-            session_id: None,
-            request_digest: id("sha256:real-cpu-fixture"),
-            input: InvocationInput::Chat {
-                input: ChatInput {
-                    messages: vec![ChatMessage {
-                        role: ChatRole::User,
-                        content: "hello".into(),
-                    }],
-                },
-                parameters: ChatParameters {
-                    temperature: Some(0.0),
-                    top_p: Some(1.0),
-                    seed: Some(0),
-                    stop: Vec::new(),
-                },
-            },
-        })
+        .invoke_collect(chat_request(&descriptor, "real-attempt-1", 1))
         .await
         .unwrap();
     assert!(matches!(
