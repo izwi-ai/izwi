@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::openai::compat::{
     compatibility_profile, strict_guardrail_message, OpenAiCompatibilityProfile,
 };
-use crate::api::request_context::RequestContext;
+use crate::api::request_context::{RequestContext, StreamOutcome};
 use crate::app::chat::{
     chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
     ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver, LocalChat,
@@ -819,6 +819,7 @@ pub async fn completions(
         execution_request,
         compat_profile,
         reasoning,
+        ctx.stream_outcome.clone(),
     )
     .await
 }
@@ -857,6 +858,7 @@ pub async fn gateway_completions(
         execution_request,
         compat_profile,
         reasoning,
+        ctx.stream_outcome.clone(),
     )
     .await
 }
@@ -870,6 +872,7 @@ async fn complete_chat<B: ChatBackend>(
     execution_request: ChatExecutionRequest,
     compat_profile: OpenAiCompatibilityProfile,
     reasoning: Option<bool>,
+    stream_outcome: StreamOutcome,
 ) -> Result<Response, ApiError> {
     if req.stream.unwrap_or(false) {
         let model_id = execution_request.variant.dir_name().to_string();
@@ -880,7 +883,10 @@ async fn complete_chat<B: ChatBackend>(
             event_rx,
             compat_profile,
             reasoning,
-            observer,
+            AuditedStream {
+                observer,
+                outcome: stream_outcome,
+            },
         )
         .into_response());
     }
@@ -1072,6 +1078,28 @@ fn render_completion_response(
     };
 
     Json(response).into_response()
+}
+
+/// Tells the request audit how a stream ended in-band.
+struct AuditedStream<O> {
+    observer: O,
+    outcome: StreamOutcome,
+}
+
+impl<O: ChatStreamObserver> ChatStreamObserver for AuditedStream<O> {
+    fn record_delta(&mut self) {
+        self.observer.record_delta();
+    }
+
+    fn record_completion(&mut self, generation: &ChatGeneration) {
+        self.outcome.record_success();
+        self.observer.record_completion(generation);
+    }
+
+    fn record_failure(&mut self) {
+        self.outcome.record_failure();
+        self.observer.record_failure();
+    }
 }
 
 fn render_chat_stream(

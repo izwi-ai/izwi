@@ -11,6 +11,11 @@ use izwi_hooks::{
     HookError, HookMetadata, ObservabilityEvent, ObservabilityEventKind, Principal,
     RequestEnvelope, ResourceDescriptor,
 };
+use http_body::Body as _;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
@@ -32,6 +37,9 @@ pub struct RequestContext {
     /// Receiver-local ingress time used to preserve the original end-to-end
     /// request budget when work crosses another process boundary.
     received_at: Instant,
+    /// How a streamed answer ended in-band; the request audit reads it when
+    /// the body ends, since the HTTP status was sent before the stream ran.
+    pub(crate) stream_outcome: StreamOutcome,
 }
 
 impl RequestContext {
@@ -40,6 +48,7 @@ impl RequestContext {
             correlation_id,
             principal,
             received_at: Instant::now(),
+            stream_outcome: StreamOutcome::default(),
         }
     }
 
@@ -68,6 +77,32 @@ impl RequestContext {
 
     pub(crate) fn remaining_budget(&self, total: Duration) -> Option<Duration> {
         total.checked_sub(self.received_at.elapsed())
+    }
+}
+
+/// The in-band end of a streamed answer (an SSE stream answers 200 before it
+/// runs, and reports a failure inside the body).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamOutcome(Arc<AtomicU8>);
+
+impl StreamOutcome {
+    const SUCCEEDED: u8 = 1;
+    const FAILED: u8 = 2;
+
+    pub(crate) fn record_success(&self) {
+        let _ = self
+            .0
+            .compare_exchange(0, Self::SUCCEEDED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub(crate) fn record_failure(&self) {
+        let _ = self
+            .0
+            .compare_exchange(0, Self::FAILED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn failed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::FAILED
     }
 }
 
@@ -203,28 +238,27 @@ pub async fn attach_gateway_request_context(
         );
     }
 
-    req.extensions_mut().insert(RequestContext::new(
-        correlation_id.clone(),
-        principal.clone(),
-    ));
+    let context = RequestContext::new(correlation_id.clone(), principal.clone());
+    let stream_outcome = context.stream_outcome.clone();
+    req.extensions_mut().insert(context);
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
     let mut response = next.run(req).await;
-    let status = response.status();
-    record_request_outcome(
-        &state.enterprise_hooks,
-        &principal,
-        &resource,
-        &correlation_id,
-        &request_envelope,
-        status,
-    )
-    .await;
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
-    response
+    audit_at_body_end(
+        response,
+        PendingRequestAudit {
+            hooks: state.enterprise_hooks.clone(),
+            principal,
+            resource,
+            correlation_id,
+            request: request_envelope,
+            stream_outcome,
+        },
+    )
 }
 
 pub async fn attach_gateway_request_id(mut req: Request, next: Next) -> Response {
@@ -435,27 +469,15 @@ async fn attach_enterprise_request_context_with_hooks(
         None
     };
 
-    req.extensions_mut().insert(RequestContext::new(
-        correlation_id.clone(),
-        principal.clone(),
-    ));
+    let context = RequestContext::new(correlation_id.clone(), principal.clone());
+    let stream_outcome = context.stream_outcome.clone();
+    req.extensions_mut().insert(context);
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
 
     let mut response = next.run(req).await;
-    let status = response.status();
-
-    record_request_outcome(
-        hooks,
-        &principal,
-        &resource,
-        &correlation_id,
-        &request_envelope,
-        status,
-    )
-    .await;
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
@@ -465,7 +487,146 @@ async fn attach_enterprise_request_context_with_hooks(
         response = speech_admission::guard_response(response, permit);
     }
 
-    response
+    audit_at_body_end(
+        response,
+        PendingRequestAudit {
+            hooks: hooks.clone(),
+            principal,
+            resource,
+            correlation_id,
+            request: request_envelope,
+            stream_outcome,
+        },
+    )
+}
+
+/// The request audit, recorded once the response body has ended so a
+/// streamed answer is audited with how it actually ended. The hooks run on
+/// their own task: they never delay the response.
+struct PendingRequestAudit {
+    hooks: izwi_hooks::EnterpriseHooks,
+    principal: Principal,
+    resource: ResourceDescriptor,
+    correlation_id: String,
+    request: RequestEnvelope,
+    stream_outcome: StreamOutcome,
+}
+
+impl PendingRequestAudit {
+    fn finish(self, status: StatusCode, body: BodyEnd) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!("No runtime to record the request audit on");
+            return;
+        };
+        let outcome = if body != BodyEnd::Completed || self.stream_outcome.failed() {
+            AuditOutcome::Failure
+        } else if status.is_success() || status.is_redirection() {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Failure
+        };
+        runtime.spawn(async move {
+            record_request_outcome(
+                &self.hooks,
+                &self.principal,
+                &self.resource,
+                &self.correlation_id,
+                &self.request,
+                status,
+                outcome,
+                body,
+            )
+            .await;
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyEnd {
+    Completed,
+    Failed,
+    /// Dropped before its end, e.g. the client disconnected mid-stream.
+    Interrupted,
+}
+
+impl BodyEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+fn audit_at_body_end(response: Response, audit: PendingRequestAudit) -> Response {
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        axum::body::Body::new(AuditedBody {
+            inner: body,
+            status,
+            audit: Some(audit),
+        }),
+    )
+}
+
+/// Forwards a response body unchanged (size hint included) and records the
+/// request audit when it ends.
+struct AuditedBody {
+    inner: axum::body::Body,
+    status: StatusCode,
+    audit: Option<PendingRequestAudit>,
+}
+
+impl AuditedBody {
+    fn finish(&mut self, end: BodyEnd) {
+        if let Some(audit) = self.audit.take() {
+            audit.finish(self.status, end);
+        }
+    }
+}
+
+impl http_body::Body for AuditedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(None) => self.finish(BodyEnd::Completed),
+            Poll::Ready(Some(Err(_))) => self.finish(BodyEnd::Failed),
+            // A sized body may never be polled past its last frame.
+            Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => {
+                self.finish(BodyEnd::Completed)
+            }
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for AuditedBody {
+    fn drop(&mut self) {
+        let end = if self.inner.is_end_stream() {
+            BodyEnd::Completed
+        } else {
+            BodyEnd::Interrupted
+        };
+        self.finish(end);
+    }
 }
 
 /// Use the caller's x-request-id only when it passes the gateway's bounded
@@ -524,6 +685,7 @@ async fn record_denied_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_request_outcome(
     hooks: &izwi_hooks::EnterpriseHooks,
     principal: &Principal,
@@ -531,17 +693,14 @@ async fn record_request_outcome(
     correlation_id: &str,
     request: &RequestEnvelope,
     status: StatusCode,
+    outcome: AuditOutcome,
+    body: BodyEnd,
 ) {
     let mut metadata = HookMetadata::new();
     metadata.insert("method".to_string(), request.method.clone());
     metadata.insert("path".to_string(), request.path.clone());
     metadata.insert("status".to_string(), status.as_u16().to_string());
-
-    let outcome = if status.is_success() || status.is_redirection() {
-        AuditOutcome::Success
-    } else {
-        AuditOutcome::Failure
-    };
+    metadata.insert("body".to_string(), body.as_str().to_string());
 
     let audit_event = AuditEvent {
         category: AuditCategory::Request,
@@ -757,6 +916,138 @@ mod tests {
             Uuid::parse_str(&returned).expect("invalid ids are replaced with a UUID");
             assert_eq!(body, format!("{returned}|{returned}"));
         }
+    }
+
+    /// Request audits, delivered after `delay`.
+    struct SlowAudit {
+        delay: Duration,
+        events: tokio::sync::mpsc::UnboundedSender<AuditEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl izwi_hooks::AuditSink for SlowAudit {
+        async fn record(&self, event: AuditEvent) -> izwi_hooks::HookResult<()> {
+            tokio::time::sleep(self.delay).await;
+            let _ = self.events.send(event);
+            Ok(())
+        }
+    }
+
+    fn audited_app(
+        delay: Duration,
+        route: axum::routing::MethodRouter,
+    ) -> (Router, tokio::sync::mpsc::UnboundedReceiver<AuditEvent>) {
+        let (events, received) = tokio::sync::mpsc::unbounded_channel();
+        let mut hooks = izwi_hooks::EnterpriseHooks::noop();
+        hooks.audit = std::sync::Arc::new(SlowAudit { delay, events });
+        let app = Router::new()
+            .route("/", route)
+            .layer(middleware::from_fn(move |req, next| {
+                let hooks = hooks.clone();
+                async move {
+                    attach_enterprise_request_context_with_hooks(&hooks, None, req, next).await
+                }
+            }));
+        (app, received)
+    }
+
+    fn request_audit(event: AuditEvent) -> Option<AuditEvent> {
+        (event.category == izwi_hooks::AuditCategory::Request).then_some(event)
+    }
+
+    #[tokio::test]
+    async fn request_audit_runs_off_the_response_path() {
+        let (app, mut audits) = audited_app(Duration::from_secs(30), get(|| async { "ok" }));
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("a slow audit hook never delays the response");
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body, "ok");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(audits.try_recv().is_err(), "the hook is still running");
+    }
+
+    /// A stream that reports a failure in-band while answering 200.
+    async fn failing_stream(Extension(context): Extension<RequestContext>) -> Response {
+        let body = async_stream::stream! {
+            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from("data: part\n\n"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            context.stream_outcome.record_failure();
+            yield Ok(axum::body::Bytes::from("data: {\"error\":\"boom\"}\n\n"));
+        };
+        Response::new(Body::from_stream(body))
+    }
+
+    #[tokio::test]
+    async fn streamed_answers_are_audited_when_the_body_ends_with_the_in_band_outcome() {
+        let (app, mut audits) = audited_app(Duration::ZERO, get(failing_stream));
+        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            audits.try_recv().is_err(),
+            "nothing is audited while the stream runs"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let event = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), audits.recv())
+                .await
+                .expect("audited at body end")
+                .expect("audit sink open");
+            if let Some(event) = request_audit(event) {
+                break event;
+            }
+        };
+        assert_eq!(event.outcome, AuditOutcome::Failure);
+        assert_eq!(event.metadata["status"], "200");
+        assert_eq!(event.metadata["body"], "completed");
+    }
+
+    #[tokio::test]
+    async fn a_body_dropped_mid_stream_is_audited_as_interrupted() {
+        let (app, mut audits) = audited_app(Duration::ZERO, get(failing_stream));
+        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        let mut body = response.into_body().into_data_stream();
+        let _first = futures::StreamExt::next(&mut body).await;
+        drop(body);
+        let event = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), audits.recv())
+                .await
+                .expect("audited when the body is dropped")
+                .expect("audit sink open");
+            if let Some(event) = request_audit(event) {
+                break event;
+            }
+        };
+        assert_eq!(event.outcome, AuditOutcome::Failure);
+        assert_eq!(event.metadata["body"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn sized_responses_are_audited_as_completed_and_keep_their_length() {
+        let (app, mut audits) = audited_app(Duration::ZERO, get(|| async { "sized" }));
+        let response = send_request(app, Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            http_body::Body::size_hint(response.body()).exact(),
+            Some(5),
+            "the audit wrapper keeps the body's exact length"
+        );
+        let _ = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let event = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), audits.recv())
+                .await
+                .expect("audited")
+                .expect("audit sink open");
+            if let Some(event) = request_audit(event) {
+                break event;
+            }
+        };
+        assert_eq!(event.outcome, AuditOutcome::Success);
+        assert_eq!(event.metadata["body"], "completed");
     }
 
     async fn send_request(mut app: Router, request: Request<Body>) -> Response {
