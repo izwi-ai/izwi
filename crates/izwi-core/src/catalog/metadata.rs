@@ -303,6 +303,13 @@ impl ModelVariant {
     pub const FISH_S2_PRO_ARTIFACT_REVISION: &'static str =
         "1de9996b6be38b745688de084d87a5633f714e4e";
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    /// The `.nemo` revisions izwi's Sortformer loader was verified against
+    /// (sha256 `8abd3283…2ef8` and `867c53f5…e96d`); a re-published archive
+    /// changes graph config and weights together (NDZ-5).
+    pub const SORTFORMER_4SPK_V21_ARTIFACT_REVISION: &'static str =
+        "cd03eee90fbec18297ac31b8c21546e596b7f71c";
+    pub const NEMOTRON3_DIARIZATION_ARTIFACT_REVISION: &'static str =
+        "f667ed73aee57d40cc39428eb768b4fd87a0a29e";
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
@@ -331,6 +338,10 @@ impl ModelVariant {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
+            Self::DiarStreamingSortformer4SpkV21 => {
+                Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
+            }
+            Self::Nemotron3Diarization => Some(Self::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION),
             _ => None,
         }
     }

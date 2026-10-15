@@ -2751,6 +2751,34 @@ mod tests {
         std::fs::remove_dir_all(temp_dir).ok();
     }
 
+    /// NDZ-5: the diarizers download the `.nemo` revision their loader was
+    /// verified against, not mutable `main`.
+    #[test]
+    fn sortformer_diarizers_download_their_pinned_revision() {
+        let (downloader, temp_dir) = test_downloader();
+        for (variant, revision) in [
+            (
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                ModelVariant::SORTFORMER_4SPK_V21_ARTIFACT_REVISION,
+            ),
+            (
+                ModelVariant::Nemotron3Diarization,
+                ModelVariant::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION,
+            ),
+        ] {
+            let specs = downloader.get_model_file_specs(variant);
+            assert!(!specs.is_empty(), "{variant}");
+            for spec in specs {
+                assert_eq!(
+                    spec.source_revision, revision,
+                    "{variant} {}",
+                    spec.source_file
+                );
+            }
+        }
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
     #[test]
     fn nemotron3_diarization_is_downloaded_when_nemo_checkpoint_exists() {
         let (downloader, temp_dir) = test_downloader();

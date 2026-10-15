@@ -1,8 +1,10 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::error::{Error, Result};
@@ -51,7 +53,12 @@ pub fn ensure_sortformer_artifacts(
 
     let model_config_path = extracted_dir.join("model_config.yaml");
     let checkpoint_path = extracted_dir.join("model_weights.ckpt");
-    if !model_config_path.exists() || !checkpoint_path.exists() {
+    let stamp_path = extracted_dir.join(EXTRACTION_STAMP_FILE);
+    let extracted = model_config_path.exists() && checkpoint_path.exists();
+    if !extracted || !extraction_matches_archive(&nemo_path, &stamp_path)? {
+        // A load interrupted mid-extraction finds no stamp and starts over.
+        remove_stamp(&stamp_path)?;
+        let stamp = ExtractionStamp::of(&nemo_path, Some(sha256_file(&nemo_path)?))?;
         extract_required_entries(
             &nemo_path,
             &[
@@ -59,6 +66,7 @@ pub fn ensure_sortformer_artifacts(
                 ("model_weights.ckpt", &checkpoint_path),
             ],
         )?;
+        stamp.write(&stamp_path)?;
     }
 
     Ok(SortformerArtifacts {
@@ -67,6 +75,120 @@ pub fn ensure_sortformer_artifacts(
         model_config_path,
         checkpoint_path,
     })
+}
+
+/// Records which `.nemo` the files in `sortformer-native/` came from (NDZ-5),
+/// so a re-published archive is extracted again instead of serving the
+/// stale config and weights.
+const EXTRACTION_STAMP_FILE: &str = "source.nemo.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ExtractionStamp {
+    size: u64,
+    modified_secs: u64,
+    modified_nanos: u32,
+    sha256: Option<String>,
+}
+
+impl ExtractionStamp {
+    /// The archive's size and modification time, and its digest when known.
+    fn of(nemo_path: &Path, sha256: Option<String>) -> Result<Self> {
+        let metadata = fs::metadata(nemo_path).map_err(|e| {
+            Error::ModelLoadError(format!(
+                "Failed reading .nemo archive metadata {}: {}",
+                nemo_path.display(),
+                e
+            ))
+        })?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        Ok(Self {
+            size: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+            sha256,
+        })
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let tmp_path = path.with_extension("tmp");
+        let bytes = serde_json::to_vec_pretty(self)?;
+        fs::write(&tmp_path, bytes)
+            .and_then(|()| fs::rename(&tmp_path, path))
+            .map_err(|e| {
+                Error::ModelLoadError(format!(
+                    "Failed writing Sortformer extraction stamp {}: {}",
+                    path.display(),
+                    e
+                ))
+            })
+    }
+
+    fn same_file_metadata(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.modified_secs == other.modified_secs
+            && self.modified_nanos == other.modified_nanos
+    }
+}
+
+/// Whether the extraction came from the archive now at `nemo_path`. The
+/// metadata check costs nothing per load; a changed modification time with an
+/// unchanged size (a copy or touch) is settled by the digest recorded at
+/// extraction, and a missing stamp (an extraction from before stamps) counts
+/// as stale.
+fn extraction_matches_archive(nemo_path: &Path, stamp_path: &Path) -> Result<bool> {
+    let Some(stamp) = ExtractionStamp::read(stamp_path) else {
+        return Ok(false);
+    };
+    let current = ExtractionStamp::of(nemo_path, None)?;
+    if stamp.same_file_metadata(&current) {
+        return Ok(true);
+    }
+    let Some(recorded) = stamp.sha256.as_deref() else {
+        return Ok(false);
+    };
+    if stamp.size != current.size {
+        return Ok(false);
+    }
+    let digest = sha256_file(nemo_path)?;
+    if digest != recorded {
+        return Ok(false);
+    }
+    ExtractionStamp {
+        sha256: Some(digest),
+        ..current
+    }
+    .write(stamp_path)?;
+    Ok(true)
+}
+
+fn remove_stamp(stamp_path: &Path) -> Result<()> {
+    match fs::remove_file(stamp_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::ModelLoadError(format!(
+            "Failed removing Sortformer extraction stamp {}: {}",
+            stamp_path.display(),
+            e
+        ))),
+    }
+}
+
+/// The archive's sha256, as Hugging Face publishes it for the LFS file.
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)
+        .map_err(|e| Error::ModelLoadError(format!("Failed opening {}: {}", path.display(), e)))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .map_err(|e| Error::ModelLoadError(format!("Failed hashing {}: {}", path.display(), e)))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn extract_required_entries(nemo_path: &Path, entries: &[(&str, &Path)]) -> Result<()> {
@@ -225,6 +347,75 @@ mod tests {
             "sample_rate: 16000\nmax_num_of_spks: 4\n"
         );
         assert_eq!(fs::read(artifacts.checkpoint_path).unwrap(), b"checkpoint");
+
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    /// A plain-tar `.nemo` holding `config` and `checkpoint`, modified at
+    /// `modified_secs` past the epoch.
+    fn write_nemo(path: &Path, config: &[u8], checkpoint: &[u8], modified_secs: u64) {
+        let mut builder = Builder::new(File::create(path).unwrap());
+        add_archive_file(&mut builder, "./model_config.yaml", config);
+        add_archive_file(&mut builder, "./model_weights.ckpt", checkpoint);
+        builder.into_inner().unwrap().sync_all().unwrap();
+        set_modified(path, modified_secs);
+    }
+
+    fn set_modified(path: &Path, modified_secs: u64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(modified_secs))
+            .unwrap();
+    }
+
+    /// NDZ-5: the extraction is tied to the archive it came from. A
+    /// re-published archive (new size, or same size and new bytes) is
+    /// extracted again; an unchanged or merely touched one is not.
+    #[test]
+    fn a_changed_nemo_archive_refreshes_the_extraction() {
+        let temp_dir = std::env::temp_dir().join(format!("sortformer-nemo-{}", Uuid::new_v4()));
+        let variant = ModelVariant::Nemotron3Diarization;
+        let model_dir = temp_dir.join(variant.dir_name());
+        fs::create_dir_all(&model_dir).unwrap();
+        let nemo_path = model_dir.join("Nemotron-3-Diarization.nemo");
+        let config = |artifacts: &SortformerArtifacts| {
+            fs::read_to_string(&artifacts.model_config_path).unwrap()
+        };
+
+        write_nemo(&nemo_path, b"revision: 1\n", b"weights-1", 1_000);
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "revision: 1\n");
+
+        // Unchanged: the extracted files are served as they are.
+        fs::write(&artifacts.model_config_path, "kept\n").unwrap();
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "kept\n");
+
+        // Touched (same bytes, new time): the recorded digest still matches.
+        set_modified(&nemo_path, 2_000);
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "kept\n");
+
+        // Re-published with the same size and new bytes.
+        write_nemo(&nemo_path, b"revision: 2\n", b"weights-2", 3_000);
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "revision: 2\n");
+        assert_eq!(fs::read(&artifacts.checkpoint_path).unwrap(), b"weights-2");
+
+        // Re-published with a new size (the same time stamp).
+        let larger = vec![3u8; 64 * 1024];
+        write_nemo(&nemo_path, b"revision: 3\n", &larger, 3_000);
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "revision: 3\n");
+        assert_eq!(fs::read(&artifacts.checkpoint_path).unwrap(), larger);
+
+        // An extraction from before stamps is refreshed once.
+        fs::remove_file(artifacts.extracted_dir.join(EXTRACTION_STAMP_FILE)).unwrap();
+        fs::write(&artifacts.model_config_path, "stale\n").unwrap();
+        let artifacts = ensure_sortformer_artifacts(&model_dir, variant).unwrap();
+        assert_eq!(config(&artifacts), "revision: 3\n");
 
         fs::remove_dir_all(temp_dir).unwrap();
     }
