@@ -517,8 +517,13 @@ fn replacement_exit_during_window_aborts_and_restores() {
 fn resume_after_crash_commits_and_fresh_start_fails_closed() {
     let rig = Rig::build(4, 1);
     let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    // The coordinator writes the window view first and persists
+    // `window_open` after it; a crash between the two resumes from
+    // `launching_replacement`. Crash only once both have landed, so the test
+    // exercises the window-open resume it names.
     let window_open = wait_until(Duration::from_secs(30), || {
         read_file(&rig.approvals).contains("chat-prod|2")
+            && read_file(&rig.state_file()).contains("window_open")
     });
     assert!(window_open, "the window must open before the crash");
 
