@@ -23,7 +23,8 @@ use crate::backends::{DeviceKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{
-    batch_norm_affine, depthwise_conv1d, fold_channel_affine, DepthwiseConv1dSpec,
+    batch_norm_affine, depthwise_conv1d, depthwise_conv2d, fold_channel_affine,
+    DepthwiseConv1dSpec, DepthwiseConv2dSpec,
 };
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
@@ -2755,11 +2756,16 @@ impl SortformerPreprocessor {
 #[derive(Debug, Default)]
 struct SortformerPathCounters {
     conformer_depthwise_conv1d: AtomicU64,
+    subsampling_depthwise_conv2d: AtomicU64,
 }
 
 impl SortformerPathCounters {
     fn conformer_depthwise_conv1d(&self) -> u64 {
         self.conformer_depthwise_conv1d.load(Ordering::Relaxed)
+    }
+
+    fn subsampling_depthwise_conv2d(&self) -> u64 {
+        self.subsampling_depthwise_conv2d.load(Ordering::Relaxed)
     }
 }
 
@@ -2775,7 +2781,7 @@ struct SortformerConformerEncoder {
 impl SortformerConformerEncoder {
     fn load(vb: VarBuilder, xscaling: bool) -> Result<Self> {
         let counters = Arc::new(SortformerPathCounters::default());
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"))?;
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), &counters)?;
 
         let mut layers = Vec::new();
         let mut idx = 0usize;
@@ -2853,10 +2859,11 @@ struct ConvSubsamplingDw {
     conv6: Conv2d,
     out: Linear,
     out_channels: usize,
+    counters: Arc<SortformerPathCounters>,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, counters: &Arc<SortformerPathCounters>) -> Result<Self> {
         let conv0_w = vb.pp("conv.0").get_unchecked_dtype("weight", DType::F32)?;
         let (out_channels, _, _, _) = conv0_w.dims4()?;
 
@@ -2892,7 +2899,24 @@ impl ConvSubsamplingDw {
             conv6,
             out,
             out_channels,
+            counters: Arc::clone(counters),
         })
+    }
+
+    /// conv.2 / conv.5: the stride-2 depthwise convs, run by the shared
+    /// strided-tap op (about 22 ops) instead of Candle's grouped conv2d, which
+    /// runs one convolution per channel (SRT-5).
+    fn depthwise(&self, conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+        let cfg = conv.config();
+        let spec = DepthwiseConv2dSpec {
+            padding: cfg.padding,
+            stride: cfg.stride,
+        };
+        let y = depthwise_conv2d(x, conv.weight(), conv.bias(), spec)?;
+        self.counters
+            .subsampling_depthwise_conv2d
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(y)
     }
 
     fn forward(&self, features_t: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
@@ -2901,11 +2925,11 @@ impl ConvSubsamplingDw {
         x = self.conv0.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv2.forward(&x)?;
+        x = self.depthwise(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv5.forward(&x)?;
+        x = self.depthwise(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
@@ -3499,7 +3523,11 @@ impl SortformerAcousticEncoder {
             Self::Conformer(encoder) => serde_json::json!({
                 "conformer_depthwise_conv1d": "shift_accumulate_folded_batch_norm",
                 "conformer_depthwise_conv1d_calls": encoder.counters.conformer_depthwise_conv1d(),
+                "subsampling_depthwise_conv2d": "strided_taps",
+                "subsampling_depthwise_conv2d_calls": encoder.counters.subsampling_depthwise_conv2d(),
                 "shared_depthwise_conv1d_calls_total": shared_total,
+                "shared_depthwise_conv2d_calls_total":
+                    crate::kernels::depthwise_conv::depthwise_conv2d_calls(),
             }),
             // Feature stacking and RoPE attention: no depthwise convolution.
             Self::FeatureStackingRope(_) => serde_json::json!({
@@ -6323,6 +6351,10 @@ mod tests {
                 encoder.counters.conformer_depthwise_conv1d(),
                 ((chunk + 1) * layers) as u64
             );
+            assert_eq!(
+                encoder.counters.subsampling_depthwise_conv2d(),
+                2 * (chunk + 1) as u64
+            );
         }
         // Other tests may run concurrently; the shared counter only grows.
         assert!(
@@ -6334,6 +6366,41 @@ mod tests {
             diagnostics["conformer_depthwise_conv1d_calls"],
             serde_json::json!(chunks * layers)
         );
+        assert_eq!(
+            diagnostics["subsampling_depthwise_conv2d_calls"],
+            serde_json::json!(2 * chunks)
+        );
+    }
+
+    /// SRT-5: the dw_striding subsampling (strided-tap depthwise conv2d)
+    /// matches the same graph through Candle's per-channel grouped conv2d,
+    /// on odd chunk lengths.
+    #[test]
+    fn subsampling_depthwise_conv2d_matches_grouped_conv2d() {
+        let encoder = conformer_encoder_fixture(1);
+        let sub = &encoder.pre_encode;
+        for (mel_frames, seed) in [(40, 21), (37, 22), (9, 23), (1, 24)] {
+            let features_t =
+                random_tensor(&[1, mel_frames, SYNTHETIC_FEATURE_BINS], seed, 1.0, 0.0);
+            let mut x = features_t.unsqueeze(1).unwrap();
+            x = sub.conv0.forward(&x).unwrap().relu().unwrap();
+            x = sub.conv2.forward(&x).unwrap();
+            x = sub.conv3.forward(&x).unwrap().relu().unwrap();
+            x = sub.conv5.forward(&x).unwrap();
+            x = sub.conv6.forward(&x).unwrap().relu().unwrap();
+            let (b, c, t, f) = x.dims4().unwrap();
+            let expected = x
+                .transpose(1, 2)
+                .unwrap()
+                .reshape((b, t, c * f))
+                .unwrap()
+                .apply(&sub.out)
+                .unwrap();
+            let (actual, len) = encoder.pre_encode(&features_t, mel_frames).unwrap();
+            assert_eq!(len, subsampled_len_3x(mel_frames));
+            let diff = tensor_max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "{mel_frames} frames: max |diff| {diff}");
+        }
     }
 
     #[test]

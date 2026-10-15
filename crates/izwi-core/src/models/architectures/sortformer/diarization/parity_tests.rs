@@ -757,6 +757,10 @@ fn sortformer_streaming_timings_on_diarization_2() {
                 "{run} depthwise calls"
             );
         }
+        if let Some(calls) = kernels.get("subsampling_depthwise_conv2d_calls") {
+            let expected = 2 * chunks * 2;
+            assert_eq!(calls.as_u64(), Some(expected as u64), "{run} conv2d calls");
+        }
         let flat = probs.iter().flatten().copied().collect::<Vec<f32>>();
         if let Some(tag) = &dump_tag {
             std::fs::create_dir_all(&dump_dir).expect("create bench dump dir");
