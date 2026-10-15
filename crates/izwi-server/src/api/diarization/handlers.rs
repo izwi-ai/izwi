@@ -31,7 +31,7 @@ use izwi_core::{
     DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
     JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
-use tracing::{info, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -506,7 +506,9 @@ fn spawn_diarization_processing_task(
     parsed: ParsedDiarizationCreateRequest,
     correlation_id: Option<String>,
 ) {
-    tokio::spawn(async move {
+    // The job outlives its request's span: carry the ids into its own logs.
+    let span = diarization_job_span(&record_id, correlation_id.as_deref());
+    let task = async move {
         let runtime = state.runtime.clone();
         let diarization_store = state.diarization_store.clone();
         // Registered before the record turns processing, so a cancel either
@@ -637,7 +639,18 @@ fn spawn_diarization_processing_task(
                     .await;
             }
         }
-    });
+    };
+    tokio::spawn(task.instrument(span));
+}
+
+/// The span of one diarization job's processing, so its pipeline logs carry
+/// the record and the request's correlation id (PIPE-18).
+fn diarization_job_span(record_id: &str, correlation_id: Option<&str>) -> tracing::Span {
+    info_span!(
+        "diarization_job",
+        record_id = %record_id,
+        correlation_id = correlation_id.unwrap_or("-")
+    )
 }
 
 async fn generate_diarization_artifacts(
@@ -1569,6 +1582,43 @@ mod tests {
         );
         assert_eq!(overridden.language.as_deref(), Some("Spanish"));
         assert_eq!(overridden.vad_gate, Some(false));
+    }
+
+    /// PIPE-18: a job's pipeline logs carry its record id and the request's
+    /// correlation id, though the job outlives the request.
+    #[test]
+    fn diarization_job_logs_carry_the_correlation_id() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                async { warn!("diarization pipeline failed") }
+                    .instrument(diarization_job_span("dir_42", Some("corr-7"))),
+            );
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(logged.trim()).unwrap();
+        assert_eq!(line["span"]["correlation_id"], "corr-7", "{logged}");
+        assert_eq!(line["span"]["record_id"], "dir_42", "{logged}");
     }
 
     #[test]
