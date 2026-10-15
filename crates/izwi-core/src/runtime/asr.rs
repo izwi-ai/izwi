@@ -41,8 +41,9 @@ use crate::runtime::audio_io::{
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
 use crate::runtime::diarization::samples_to_ms;
 use crate::runtime::forced_alignment::{
-    align_window_checked, sample_windows, AlignedWindow, AlignmentWindow, LongTextPlanner,
-    SampleWindow, WindowedAlignment,
+    align_under_stage_lease, align_window_checked, forced_alignment_window_workspace,
+    sample_windows, AlignedWindow, AlignmentWindow, LongTextPlanner, SampleWindow,
+    WindowedAlignment,
 };
 use crate::runtime::request::AsrRuntimeRequest;
 #[cfg(test)]
@@ -4159,6 +4160,16 @@ impl RuntimeService {
         stage_kind: &str,
         check_plausibility: bool,
     ) -> Result<AlignedWindow> {
+        // The aligner adapter is stateless, so the window's forward working
+        // set is reserved here, for this stage only (ADM-5).
+        let workspace = forced_alignment_window_workspace(
+            contract.metadata.model_variant,
+            &window,
+            sample_rate,
+        )?;
+        let lease = self
+            .coordinator
+            .reserve_stage_workspace(job, stage_kind, workspace)?;
         let model = model.clone();
         let samples = samples.clone();
         let language = language.clone();
@@ -4170,20 +4181,22 @@ impl RuntimeService {
                     kind: stage_kind.to_string(),
                 },
                 move || {
-                    Ok(align_window_checked(
-                        &samples,
-                        sample_rate,
-                        &window,
-                        check_plausibility,
-                        |audio, text| {
-                            model.force_align_detailed(
-                                audio,
-                                sample_rate,
-                                text,
-                                language.as_deref(),
-                            )
-                        },
-                    ))
+                    align_under_stage_lease(&lease, workspace, || {
+                        align_window_checked(
+                            &samples,
+                            sample_rate,
+                            &window,
+                            check_plausibility,
+                            |audio, text| {
+                                model.force_align_detailed(
+                                    audio,
+                                    sample_rate,
+                                    text,
+                                    language.as_deref(),
+                                )
+                            },
+                        )
+                    })
                 },
             )
             .await

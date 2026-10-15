@@ -17,11 +17,14 @@
 use serde::Serialize;
 
 use crate::error::{Error, Result};
+use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::asr::{forced_alignment_words, qwen3_aligner_max_words};
 use crate::models::registry::ForcedAlignmentOutput;
+use crate::runtime::coordinator::{JobResourceObservation, StageWorkspaceLease};
 use crate::runtime::diarization::{
     alignment_is_suspicious, fallback_word_timings_from_words, samples_to_ms,
 };
+use crate::runtime::lifecycle::asr_envelope::forced_alignment_envelope;
 use izwi_asr_toolkit::{plan_audio_chunks, AsrLongFormConfig};
 
 /// The text spoken in `[start_secs, end_secs)` of the audio.
@@ -150,6 +153,38 @@ pub(crate) struct SampleWindow {
     pub(crate) start_sample: usize,
     pub(crate) end_sample: usize,
     pub(crate) text: String,
+}
+
+/// The forward working set one aligner window reserves while it runs
+/// (ADM-5): the forced-alignment envelope over the window's audio and its
+/// words. Zero for a variant without one.
+pub(crate) fn forced_alignment_window_workspace(
+    variant: ModelVariant,
+    window: &SampleWindow,
+    sample_rate: u32,
+) -> Result<JobResourceObservation> {
+    let samples = window.end_sample.saturating_sub(window.start_sample);
+    let secs = samples as f32 / sample_rate.max(1) as f32;
+    let words = forced_alignment_words(&window.text).len();
+    Ok(forced_alignment_envelope(variant, secs, words)?
+        .map(|envelope| {
+            JobResourceObservation::new(envelope.host_bytes, envelope.accelerator_bytes)
+        })
+        .unwrap_or_default())
+}
+
+/// Run one aligner forward under its stage lease: the working set counts
+/// as allocated while `body` runs and as pending again before it is freed,
+/// and the claim ends when the lease drops with the stage.
+pub(crate) fn align_under_stage_lease<T>(
+    lease: &StageWorkspaceLease,
+    workspace: JobResourceObservation,
+    body: impl FnOnce() -> T,
+) -> Result<T> {
+    lease.record_materialized_usage(workspace)?;
+    let output = body();
+    lease.prepare_materialized_release(JobResourceObservation::default())?;
+    Ok(output)
 }
 
 /// Convert caller windows to sample ranges of `total_samples` audio, clamped
@@ -560,6 +595,90 @@ mod tests {
                 .collect(),
             interval_fallback: false,
         })
+    }
+
+    /// ADM-5: an aligner window stage reserves its forward working set,
+    /// which grows with the window's seconds and words, holds it as
+    /// allocated while the forward runs, and releases it with the stage.
+    #[tokio::test]
+    async fn aligner_window_stage_reserves_its_forward_working_set() {
+        use crate::backends::BackendKind;
+        use crate::engine::ResourceAmount;
+        use crate::runtime::coordinator::{InferenceCoordinator, JobSpec};
+        use crate::runtime::types::RuntimeRequestContext;
+        use crate::runtime::CoordinatorLane;
+        use std::sync::Arc;
+
+        let rate = 16_000u32;
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let workspace = |secs: usize, text: &str| {
+            let window = window(0, secs * rate as usize, text);
+            let workspace = forced_alignment_window_workspace(variant, &window, rate).unwrap();
+            workspace.host_bytes + workspace.accelerator_bytes
+        };
+        let words = |count: usize| vec!["word"; count].join(" ");
+        let short = workspace(5, &words(12));
+        assert!(short > 0);
+        assert!(workspace(30, &words(75)) > short);
+        assert!(workspace(180, &words(450)) > workspace(30, &words(75)));
+        assert!(workspace(30, &words(300)) > workspace(30, &words(75)));
+        assert_eq!(
+            forced_alignment_window_workspace(
+                ModelVariant::Qwen3Asr06BGguf,
+                &window(0, 30 * rate as usize, "a b"),
+                rate
+            )
+            .unwrap(),
+            JobResourceObservation::default()
+        );
+
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Metal, 1, 4));
+        let context = RuntimeRequestContext::default();
+        let job = coordinator
+            .admit(JobSpec {
+                request_id: "aligner-stage-lease".to_string(),
+                lane: CoordinatorLane::Atomic,
+                priority: context.priority,
+                workload_class: context.workload_class,
+                deadline: None,
+                resources: crate::runtime::service::transient_resources(BackendKind::Metal, 0),
+            })
+            .await
+            .unwrap();
+        let observation = forced_alignment_window_workspace(
+            variant,
+            &window(0, 180 * rate as usize, &words(450)),
+            rate,
+        )
+        .unwrap();
+        let bytes = observation.host_bytes + observation.accelerator_bytes;
+        let authority = coordinator.resource_authority();
+        let before = authority.snapshot();
+        let plus = |amount: ResourceAmount| match amount {
+            ResourceAmount::Known(value) => ResourceAmount::Known(value + bytes),
+            ResourceAmount::Unknown => panic!("unknown authority amount"),
+        };
+        let lease = coordinator
+            .reserve_stage_workspace(&job, "asr.forced_alignment", observation)
+            .unwrap();
+        assert_eq!(
+            authority.snapshot().pending.unified_bytes,
+            plus(before.pending.unified_bytes)
+        );
+        align_under_stage_lease(&lease, observation, || {
+            let running = authority.snapshot();
+            assert_eq!(
+                running.materialized.unified_bytes,
+                plus(before.materialized.unified_bytes)
+            );
+            assert_eq!(running.pending.unified_bytes, before.pending.unified_bytes);
+        })
+        .unwrap();
+        drop(lease);
+        let after = authority.snapshot();
+        assert_eq!(after.reserved, before.reserved);
+        assert_eq!(after.pending, before.pending);
+        assert_eq!(after.reservations, before.reservations);
     }
 
     #[test]

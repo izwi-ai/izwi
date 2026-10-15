@@ -62,8 +62,10 @@ use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
 use crate::runtime::asr_automatic_context as qwen3_asr_automatic_context;
 
-pub(crate) use audio::QWEN3_ASR_AUDIO_POSITIONS;
 use audio::AudioTower;
+pub(crate) use audio::{
+    qwen3_audio_cnn_chunk_bytes, qwen3_audio_cnn_slice_chunks, QWEN3_ASR_AUDIO_POSITIONS,
+};
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
 
@@ -1339,7 +1341,7 @@ impl Qwen3AsrDiagnostics {
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
 const QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS: usize = 1_200;
-const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
+pub(crate) const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
 /// Alignable words (or CJK characters) one aligner window accepts per second
 /// of audio. Fast speech runs about 5 per second; the bound keeps the prompt
 /// (about 3.5 tokens per word) proportional to the encoded window.
