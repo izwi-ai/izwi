@@ -141,6 +141,8 @@ that advertises its `WorkerFeature`; otherwise it returns a `400`
 | Version negotiation and forward-compatible enums | Supported | Every worker-sent enum decodes a later variant as `Unknown`; the gateway sends `x-izwi-protocol-version` and the worker leaves out what an older gateway cannot decode; invocations carry the negotiated minor. JSON-literal old/new matrix in `crates/izwi-serving-protocol/tests/compatibility_matrix.rs` |
 | Mixed fleets (minor 3 and minor 4 workers) | Supported | Controls route only to workers advertising them; plain requests still run on minor-3 workers at minor 3, which keep automatic truncation (`controls_route_only_to_workers_that_advertise_them`, `a_pinned_worker_gets_only_the_controls_it_advertises`) |
 | Rolling upgrade order | Either order from minor 4 on; minor-3 gateways decode minor-4 workers through the version header filter | Same tests |
+| Local and gateway paths answer alike | Supported on CPU and Metal on the tiny LFM2 fixture; CUDA not run | `crates/izwi-serving-worker/tests/local_remote_parity.rs`: the local role's API and the gateway to a real worker process give identical greedy and seeded answers (content, logprobs, finish reason, token counts), stop strings, unset budgets, auto truncation and the D8 overflow `400`s, streamed and not; JSON mode reaches the engine on both |
+| Known differences | Open | A streamed request that overflows the context is a `200` stream ending in an error locally and a `400` through the gateway; a model failure inside a worker stream is reported as the stream closing, not the model's message |
 
 ## API completeness surface (DS9)
 

@@ -99,6 +99,19 @@ pub use gateway_tenant_concurrency::{
     GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError,
 };
 
+/// The local role's HTTP API over an already started runtime, without the
+/// listener, preload and persistence lifecycle of `izwi serve`. Integration
+/// tests in other crates use it to run a request through the local server
+/// and through a gateway and compare the answers.
+#[doc(hidden)]
+pub fn create_local_router(
+    runtime: RuntimeService,
+    serve_config: &ServeRuntimeConfig,
+) -> anyhow::Result<axum::Router> {
+    let state = AppState::new(runtime, serve_config)?;
+    Ok(api::create_router(state, serve_config))
+}
+
 const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
 const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_GATEWAY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
