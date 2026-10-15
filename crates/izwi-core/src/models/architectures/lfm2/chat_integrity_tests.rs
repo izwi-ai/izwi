@@ -261,16 +261,57 @@ fn lfm2_never_selects_a_control_token_greedy_or_sampled() {
 #[test]
 fn lfm2_json_constrained_rows_never_take_the_batched_argmax() {
     let model = tiny_lfm_model();
-    let plain = new_state(&model, ChatGenerationConfig::default());
-    assert!(plain.greedy);
-    let json = new_state(
+    let mut plain = new_state(&model, ChatGenerationConfig::default());
+    let mut json = new_state(
         &model,
         ChatGenerationConfig {
             constrain_json_object: true,
             ..Default::default()
         },
     );
-    assert!(!json.greedy);
+    // "b" (4) is the argmax, but no JSON value starts with it: the grammar
+    // leaves the JSON row only its end-of-turn token, <|im_end|> (2).
+    let row = [-1000f32, -1000., 1., 1., 2., -1000., -1000.];
+    let logits = Tensor::new(&[row, row], &Device::Cpu).unwrap();
+    let picked = model
+        .select_batch_tokens(&mut [&mut plain, &mut json], &logits)
+        .unwrap();
+    assert_eq!((picked[0].0, picked[1].0), (4, 2));
+}
+
+#[test]
+fn lfm2_batch_selection_reads_back_once_for_mixed_rows() {
+    let model = tiny_lfm_model();
+    let mut greedy = new_state(&model, ChatGenerationConfig::default());
+    let mut sampled = new_state(
+        &model,
+        ChatGenerationConfig {
+            temperature: 1.0,
+            top_k: 3,
+            seed: 7,
+            ..Default::default()
+        },
+    );
+    let mut logprobs = new_state(
+        &model,
+        ChatGenerationConfig {
+            logprobs: true,
+            top_logprobs: 2,
+            ..Default::default()
+        },
+    );
+    let row = [-1000f32, -1000., 1., 1., 2., 0.5, -1000.];
+    let logits = Tensor::new(&[row, row, row], &Device::Cpu).unwrap();
+    let before = crate::models::shared::telemetry::thread_host_reads();
+    let picked = model
+        .select_batch_tokens(&mut [&mut greedy, &mut sampled, &mut logprobs], &logits)
+        .unwrap();
+    assert_eq!(
+        crate::models::shared::telemetry::thread_host_reads() - before,
+        1
+    );
+    assert_eq!(picked[0], (4, None));
+    assert!(picked[2].1.is_some());
 }
 
 #[test]

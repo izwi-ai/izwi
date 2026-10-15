@@ -7,6 +7,7 @@
 use super::reference_tests::{models_dir_for_bench, Sessions};
 use super::*;
 use crate::backends::DeviceProfile;
+use candle_core::DType;
 use std::time::Instant;
 
 fn steps() -> usize {
@@ -132,7 +133,10 @@ fn bench(profile: DeviceProfile) {
             .unwrap()
             .unwrap();
         let finite = diagnostics::finite_flag(&logits).unwrap();
-        let _ = packed_greedy_selection(&logits, &finite).unwrap();
+        let mut sampler = ChatSampler::new(config.clone(), &prompt);
+        let vocab = logits.dim(D::Minus1).unwrap();
+        let _ =
+            sample_chat_rows_guarded(&mut [&mut sampler], &logits, vocab, Some(&finite)).unwrap();
     }
     let readback_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
 
@@ -446,7 +450,14 @@ fn one_sync_vs_three(profile: DeviceProfile) {
             .unwrap();
         let finite = diagnostics::finite_flag(&logits).unwrap();
         let masked = model.mask_non_generatable(&logits).unwrap();
-        let _ = packed_greedy_selection(&masked, &finite).unwrap();
+        let mut sampler = ChatSampler::new(config.clone(), &prompt);
+        let _ = sample_chat_rows_guarded(
+            &mut [&mut sampler],
+            &masked,
+            model.tokenizer.vocab_size,
+            Some(&finite),
+        )
+        .unwrap();
         pending
             .commit(&mut [&mut new.shortconv], &mut [&mut new.physical_kv])
             .unwrap();

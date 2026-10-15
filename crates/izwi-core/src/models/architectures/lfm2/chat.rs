@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use candle_core::{DType, IndexOp, Tensor, D};
+use candle_core::{Tensor, D};
 use serde::Deserialize;
 use tracing::info;
 
@@ -20,7 +20,7 @@ use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
-use crate::models::shared::sampling::ChatSampler;
+use crate::models::shared::sampling::{sample_chat_rows_guarded, ChatSampler};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
 use crate::models::shared::weights::gguf::GgufLoader;
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -37,7 +37,6 @@ pub struct ChatDecodeState {
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    greedy: bool,
     decoder: IncrementalDecoder,
     stop_reason: Option<&'static str>,
     assembled: String,
@@ -57,7 +56,6 @@ pub(crate) struct Lfm2ChatDecodeCheckpoint {
     pending_token: Option<u32>,
     generated_ids: Vec<u32>,
     sampler: ChatSampler,
-    greedy: bool,
     decoder: IncrementalDecoder,
     stop_reason: Option<&'static str>,
     assembled: String,
@@ -102,7 +100,6 @@ impl ChatDecodeState {
             pending_token: self.pending_token,
             generated_ids: self.generated_ids.clone(),
             sampler: self.sampler.clone(),
-            greedy: self.greedy,
             decoder: self.decoder.clone(),
             stop_reason: self.stop_reason,
             assembled: self.assembled.clone(),
@@ -134,7 +131,6 @@ impl ChatDecodeState {
         self.pending_token = checkpoint.pending_token;
         self.generated_ids = checkpoint.generated_ids;
         self.sampler = checkpoint.sampler;
-        self.greedy = checkpoint.greedy;
         self.decoder = checkpoint.decoder;
         self.stop_reason = checkpoint.stop_reason;
         self.assembled = checkpoint.assembled;
@@ -518,7 +514,6 @@ impl Lfm2ChatModel {
             ),
             // A JSON-constrained row must sample through the grammar, so it
             // never takes the batched argmax shortcut.
-            greedy: is_plain_greedy(config) && !config.constrain_json_object,
             decoder: IncrementalDecoder::new(true),
             stop_reason: None,
             assembled: String::new(),
@@ -801,11 +796,10 @@ impl Lfm2ChatModel {
         Ok(steps)
     }
 
-    /// Next token per row from finite, width-checked logits. Plain greedy
-    /// rows read their argmax and the finite flag back in one transfer;
-    /// sampled rows sample first and then read the flag from an idle device,
-    /// so either way the step synchronizes once. No token is accepted from
-    /// non-finite logits.
+    /// Next token per row from finite, width-checked logits. Every row
+    /// samples from one readback that also carries the finite flag, so the
+    /// step synchronizes once, and no token is accepted (and no sampler
+    /// advances) from non-finite logits.
     fn select_batch_tokens(
         &self,
         states: &mut [&mut ChatDecodeState],
@@ -814,28 +808,36 @@ impl Lfm2ChatModel {
         self.tokenizer.validate_logits_width(logits)?;
         let finite = diagnostics::finite_flag(logits)?;
         let masked = self.mask_non_generatable(logits)?;
-        // DS9.3: rows collecting logprobs must sample through the resolving
-        // path, which forfeits the batched argmax for the whole envelope.
-        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
-        if states.iter().all(|state| state.greedy) && !wants_logprobs {
-            let (ids, all_finite) = packed_greedy_selection(
-                &masked.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?,
-                &finite,
-            )?;
-            if !all_finite {
-                return Err(diagnostics::non_finite_error(logits, logits_stage()));
-            }
-            return Ok(ids.into_iter().map(|id| (id, None)).collect());
-        }
-        let mut sampled = Vec::with_capacity(states.len());
-        for (row, state) in states.iter_mut().enumerate() {
-            let row_logits = masked.i(row)?;
-            sampled.push(self.sample_token(state, &row_logits)?);
-        }
-        if finite.to_vec1::<f32>()?[0] == 0.0 {
+        let mut samplers = states
+            .iter_mut()
+            .map(|state| {
+                state.pending_logprobs.clear();
+                &mut state.sampler
+            })
+            .collect::<Vec<_>>();
+        let Some(sampled) = sample_chat_rows_guarded(
+            &mut samplers,
+            &masked,
+            self.tokenizer.vocab_size,
+            Some(&finite),
+        )?
+        else {
             return Err(diagnostics::non_finite_error(logits, logits_stage()));
-        }
-        Ok(sampled)
+        };
+        sampled
+            .into_iter()
+            .map(|(token, raw)| {
+                let entry = raw
+                    .map(|raw| {
+                        crate::models::shared::sampling::resolve_token_logprob(
+                            &self.tokenizer.inner,
+                            &raw,
+                        )
+                    })
+                    .transpose()?;
+                Ok((token, entry))
+            })
+            .collect()
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
@@ -976,14 +978,6 @@ fn validate_generation_config(config: &ChatGenerationConfig) -> Result<()> {
     Ok(())
 }
 
-fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
-    config.temperature <= 1e-5
-        && config.top_k == 0
-        && config.top_p >= 1.0
-        && (config.repetition_penalty - 1.0).abs() <= f32::EPSILON
-        && config.presence_penalty.abs() <= f32::EPSILON
-}
-
 /// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
 /// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
 /// kept. Object keys follow `serde_json`'s map order.
@@ -1099,21 +1093,6 @@ fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<
 /// Per-row argmax of `[B, V]` logits read back with a device-side `[1]`
 /// finite flag in one transfer: `(tokens, all_finite)`. Ties pick the first
 /// maximum. Token ids are below 2^24, so the F32 round trip is exact.
-fn packed_greedy_selection(logits: &Tensor, finite: &Tensor) -> Result<(Vec<u32>, bool)> {
-    let (rows, _) = logits.dims2()?;
-    let ids = logits.argmax(D::Minus1)?.to_dtype(DType::F32)?;
-    let packed = Tensor::cat(&[&ids, finite], 0)?.to_vec1::<f32>()?;
-    if packed.len() != rows + 1 {
-        return Err(Error::InferenceError(
-            "LFM2 packed greedy readback has the wrong length".into(),
-        ));
-    }
-    Ok((
-        packed[..rows].iter().map(|id| *id as u32).collect(),
-        packed[rows] != 0.0,
-    ))
-}
-
 /// The template's `content.split("</think>")[-1] | trim` for past assistant
 /// turns; content without `</think>` is kept verbatim.
 fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
@@ -1155,29 +1134,6 @@ mod tests {
     use super::{
         has_token_repetition_loop, should_check_repetition_loop, strip_past_assistant_thinking,
     };
-
-    #[test]
-    fn lfm2_packed_greedy_tokens_pick_the_first_maximum_per_row() {
-        use candle_core::{Device, Tensor};
-        let logits = Tensor::from_vec(
-            vec![1f32, 4., 2., 4., -3., -2., -1., -4., 9., 2., 1., 0.],
-            (3, 4),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let finite = super::diagnostics::finite_flag(&logits).unwrap();
-        assert_eq!(
-            super::packed_greedy_selection(&logits, &finite).unwrap(),
-            (vec![1, 2, 0], true)
-        );
-        assert_eq!(
-            super::packed_greedy_selection(&logits.narrow(0, 1, 1).unwrap(), &finite).unwrap(),
-            (vec![2], true)
-        );
-        let bad = Tensor::from_vec(vec![1f32, f32::NAN], (1, 2), &Device::Cpu).unwrap();
-        let bad_finite = super::diagnostics::finite_flag(&bad).unwrap();
-        assert!(!super::packed_greedy_selection(&bad, &bad_finite).unwrap().1);
-    }
 
     #[test]
     fn tool_json_uses_python_json_dumps_spacing() {

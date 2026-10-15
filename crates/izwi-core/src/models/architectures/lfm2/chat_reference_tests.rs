@@ -20,6 +20,7 @@ use crate::backends::DeviceProfile;
 use crate::engine::ModelInstanceId;
 use crate::kv::{CacheBlockRef, KvArenaId, KvGroupId, KvLayerBinding};
 use crate::models::architectures::lfm2::physical::Lfm2StateLayout;
+use candle_core::{DType, IndexOp};
 use std::path::PathBuf;
 use std::sync::Arc;
 
