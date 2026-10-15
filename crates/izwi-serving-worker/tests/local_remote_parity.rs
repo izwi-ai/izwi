@@ -234,7 +234,7 @@ fn stream_summary(sse: &str) -> Value {
             if let Some(text) = choice["delta"]["content"].as_str() {
                 content.push_str(text);
             }
-            if let Some(entries) = choice["delta"]["logprobs"]["content"].as_array() {
+            if let Some(entries) = choice["logprobs"]["content"].as_array() {
                 logprobs.extend(entries.iter().cloned());
             }
             if !choice["finish_reason"].is_null() {

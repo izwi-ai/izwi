@@ -20,7 +20,7 @@ use crate::app::chat::{
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::ApiError;
-use crate::ids::new_uuid;
+use crate::ids::new_prefixed_id;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
 use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole, ModelVariant};
 
@@ -124,7 +124,7 @@ pub async fn create_response(
 
     let output = generate_chat(&state, execution_request).await?;
 
-    let response_id = new_uuid();
+    let response_id = new_prefixed_id("resp_");
     let created_at = now_unix_secs();
 
     let usage = ResponseUsage {
@@ -282,11 +282,11 @@ async fn create_streaming_response(
     input_items: Vec<StoredResponseInputItem>,
     tenant_scope: String,
 ) -> Result<Response<Body>, ApiError> {
-    let response_id = new_uuid();
+    let response_id = new_prefixed_id("resp_");
     let created_at = now_unix_secs();
     let metadata = req.metadata.clone();
     let response_id_for_task = response_id.clone();
-    let message_id = new_uuid();
+    let message_id = new_prefixed_id("msg_");
     let model_name = execution_request.variant.dir_name().to_string();
     let store_state = state.clone();
     let mut event_rx = spawn_chat_stream(state.clone(), execution_request);
@@ -748,7 +748,7 @@ fn parse_input_role(raw: &str) -> Result<ResponseInboundRole, ApiError> {
 }
 
 fn assistant_output_item(text: String) -> ResponseOutputItem {
-    assistant_output_item_with_id(new_uuid(), text)
+    assistant_output_item_with_id(new_prefixed_id("msg_"), text)
 }
 
 fn assistant_output_item_with_id(id: String, text: String) -> ResponseOutputItem {

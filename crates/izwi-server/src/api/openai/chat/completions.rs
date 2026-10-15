@@ -29,7 +29,7 @@ use crate::app::chat::{
 use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::ApiError;
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState};
-use crate::ids::new_uuid;
+use crate::ids::new_prefixed_id;
 use crate::state::AppState;
 use izwi_core::{
     chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort,
@@ -254,8 +254,10 @@ struct OpenAiChatChunk {
     created: u64,
     model: String,
     choices: Vec<OpenAiChunkChoice>,
+    /// With `stream_options.include_usage`: `null` on every chunk but the
+    /// last, which carries the usage and no choices.
     #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<OpenAiUsage>,
+    usage: Option<Option<OpenAiUsage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     izwi_generation_time_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +268,9 @@ struct OpenAiChatChunk {
 struct OpenAiChunkChoice {
     index: usize,
     delta: OpenAiDelta,
+    /// DS9.3: the logprobs of this chunk's tokens; absent unless requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<OpenAiChoiceLogprobs>,
     finish_reason: Option<&'static str>,
 }
 
@@ -279,9 +284,6 @@ struct OpenAiDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallDelta>>,
-    /// DS9.3: per-token logprobs for this chunk; absent unless requested.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,7 +720,7 @@ fn render_completion_response(
     let compat_profile = format.compat_profile;
 
     let response = OpenAiChatCompletionResponse {
-        id: new_uuid(),
+        id: new_prefixed_id("chatcmpl-"),
         object: "chat.completion",
         created: now_unix_secs(),
         model: variant.dir_name().to_string(),
@@ -842,7 +844,6 @@ fn answer_delta(reasoning: String, parsed: ParsedOutput) -> OpenAiDelta {
         reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
         content: (!parsed.content.is_empty()).then_some(parsed.content),
         tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
-        logprobs: None,
     }
 }
 
@@ -852,7 +853,6 @@ impl OpenAiDelta {
             && self.reasoning_content.is_none()
             && self.content.is_none()
             && self.tool_calls.is_none()
-            && self.logprobs.is_none()
     }
 }
 
@@ -868,21 +868,25 @@ fn render_chat_stream(
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let completion_id = new_uuid();
+    let completion_id = new_prefixed_id("chatcmpl-");
     let created = now_unix_secs();
-    let chunk = move |delta: OpenAiDelta, finish_reason: Option<&'static str>| OpenAiChatChunk {
+    let chunk = move |choices: Vec<OpenAiChunkChoice>| OpenAiChatChunk {
         id: completion_id.clone(),
         object: "chat.completion.chunk",
         created,
         model: model_id.clone(),
-        choices: vec![OpenAiChunkChoice {
-            index: 0,
-            delta,
-            finish_reason,
-        }],
-        usage: None,
+        choices,
+        usage: include_usage.then_some(None),
         izwi_generation_time_ms: None,
         izwi_timing: None,
+    };
+    let choice = |delta, logprobs, finish_reason| {
+        vec![OpenAiChunkChoice {
+            index: 0,
+            delta,
+            logprobs,
+            finish_reason,
+        }]
     };
 
     let stream = async_stream::stream! {
@@ -890,62 +894,66 @@ fn render_chat_stream(
         let mut answer = AnswerStream::new(format);
         let mut saw_terminal = false;
         while let Some(event) = event_rx.recv().await {
-            let (payload, terminal) = match event {
+            let (payloads, terminal) = match event {
                 ChatStreamEvent::Started => {
                     let delta = OpenAiDelta {
                         role: Some("assistant"),
                         reasoning_content: None,
                         content: None,
                         tool_calls: None,
-                        logprobs: None,
                     };
-                    (Some(chunk_json(&chunk(delta, None))), false)
+                    (vec![chunk_json(&chunk(choice(delta, None, None)))], false)
                 }
                 ChatStreamEvent::Delta { text, logprobs } => {
                     if !text.is_empty() {
                         observer.record_delta();
                     }
-                    let delta = OpenAiDelta {
-                        logprobs: openai_logprobs(&logprobs),
-                        ..answer.push(&text)
-                    };
-                    ((!delta.is_empty()).then(|| chunk_json(&chunk(delta, None))), false)
+                    let delta = answer.push(&text);
+                    let logprobs = openai_logprobs(&logprobs);
+                    if delta.is_empty() && logprobs.is_none() {
+                        (Vec::new(), false)
+                    } else {
+                        (vec![chunk_json(&chunk(choice(delta, logprobs, None)))], false)
+                    }
                 }
                 ChatStreamEvent::Completed(generation) => {
                     observer.record_completion(&generation);
                     // Text held back for a tag is final now.
                     let delta = answer.finish();
                     let finish = finish_reason(answer.saw_tool_calls(), generation.finish_reason);
-                    let mut last = chunk(delta, Some(finish));
+                    let mut last = chunk(choice(delta, None, Some(finish)));
+                    if format.compat_profile.is_relaxed() {
+                        last.izwi_generation_time_ms = Some(generation.generation_time_ms);
+                        last.izwi_timing = generation.latency_breakdown;
+                    }
+                    let mut payloads = vec![chunk_json(&last)];
                     if include_usage {
-                        last.usage = Some(OpenAiUsage {
+                        let mut usage = chunk(Vec::new());
+                        usage.usage = Some(Some(OpenAiUsage {
                             prompt_tokens: generation.prompt_tokens,
                             completion_tokens: generation.tokens_generated,
                             total_tokens: generation.prompt_tokens + generation.tokens_generated,
                             prompt_tokens_details: OpenAiPromptTokensDetails {
                                 cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
                             },
-                        });
+                        }));
+                        payloads.push(chunk_json(&usage));
                     }
-                    if format.compat_profile.is_relaxed() {
-                        last.izwi_generation_time_ms = Some(generation.generation_time_ms);
-                        last.izwi_timing = generation.latency_breakdown;
-                    }
-                    (Some(chunk_json(&last)), true)
+                    (payloads, true)
                 }
                 ChatStreamEvent::Failed(error) => {
                     observer.record_failure();
-                    (Some(openai_chat_stream_error_payload(error)), true)
+                    (vec![openai_chat_stream_error_payload(error)], true)
                 }
                 ChatStreamEvent::ShuttingDown => {
                     observer.record_failure();
                     (
-                        Some(openai_chat_stream_error_payload("Server is shutting down")),
+                        vec![openai_chat_stream_error_payload("Server is shutting down")],
                         true,
                     )
                 }
             };
-            if let Some(payload) = payload {
+            for payload in payloads {
                 yield Ok(Event::default().data(payload));
             }
             if terminal {
@@ -1126,6 +1134,63 @@ mod tests {
                 assert_eq!(finish, "tool_calls");
             }
         }
+    }
+
+    /// EDGE-F18: stream logprobs sit on the choice, usage comes in its own
+    /// final chunk with no choices (`null` before it), and ids are
+    /// `chatcmpl-` ids shared by every chunk.
+    #[tokio::test]
+    async fn stream_chunks_have_the_openai_wire_shape() {
+        let entry = izwi_core::engine::TokenLogprob {
+            token: "Hi".to_string(),
+            logprob: -0.5,
+            bytes: b"Hi".to_vec(),
+            top_logprobs: Vec::new(),
+        };
+        let events = vec![
+            ChatStreamEvent::Started,
+            ChatStreamEvent::Delta {
+                text: "Hi".into(),
+                logprobs: vec![entry],
+            },
+            ChatStreamEvent::Completed(Box::new(generation("Hi"))),
+        ];
+        let body = json!({
+            "model": "m", "messages": [], "stream": true, "logprobs": true,
+            "stream_options": {"include_usage": true}
+        });
+        let payloads = sse_payloads(body, tool_format(None), events).await;
+        assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+        let chunks: Vec<serde_json::Value> = payloads[..payloads.len() - 1]
+            .iter()
+            .map(|payload| serde_json::from_str(payload).unwrap())
+            .collect();
+        assert_eq!(chunks.len(), 4, "role, text, finish, usage: {chunks:?}");
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("chatcmpl-"), "{id}");
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id));
+
+        let text = &chunks[1]["choices"][0];
+        assert_eq!(text["delta"]["content"], "Hi");
+        assert!(text["delta"].get("logprobs").is_none());
+        assert_eq!(text["logprobs"]["content"][0]["token"], "Hi");
+
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "stop");
+        for chunk in &chunks[..3] {
+            assert!(chunk["usage"].is_null() && chunk.get("usage").is_some());
+        }
+        assert_eq!(chunks[3]["choices"], json!([]));
+        assert_eq!(chunks[3]["usage"]["prompt_tokens"], 3);
+        assert_eq!(chunks[3]["usage"]["completion_tokens"], 5);
+        assert_eq!(chunks[3]["usage"]["total_tokens"], 8);
+
+        // Without `include_usage` there is no usage field at all.
+        let body = json!({"model": "m", "messages": [], "stream": true});
+        let payloads = sse_payloads(body, tool_format(None), deltas("Hi", 1)).await;
+        assert!(payloads
+            .iter()
+            .filter(|payload| *payload != "[DONE]")
+            .all(|payload| !payload.contains("\"usage\"")));
     }
 
     /// Without offered tools the answer is text, markup and all.
