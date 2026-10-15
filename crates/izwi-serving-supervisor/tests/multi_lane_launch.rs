@@ -23,9 +23,14 @@ fn supervisor_launches_metal_and_cuda_lane_workers_with_exact_assignments() {
 
     // One fake worker binary per lane. It records the exact environment the
     // supervisor handed it, then sleeps until the supervisor's graceful stop.
+    // The snapshot is written to a temporary file and renamed into place, so
+    // the marker never exists half-written while the test polls for it.
     let marker = root.path().join("worker-env.txt");
     let fake_worker = root.path().join("fake-lane-worker");
-    let script = format!("#!/bin/sh\nenv > {}\nsleep 30\n", marker.display());
+    let script = format!(
+        "#!/bin/sh\nenv > {marker}.tmp\nmv {marker}.tmp {marker}\nsleep 30\n",
+        marker = marker.display()
+    );
     std::fs::write(&fake_worker, script).unwrap();
     std::fs::set_permissions(&fake_worker, std::fs::Permissions::from_mode(0o755)).unwrap();
 
