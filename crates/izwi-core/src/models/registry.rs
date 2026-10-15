@@ -71,7 +71,7 @@ use crate::models::architectures::nemotron::asr::{
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
-pub(crate) use crate::models::architectures::qwen3::asr::{AlignmentUnit, ForcedAlignmentOutput};
+pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
@@ -2338,13 +2338,13 @@ impl NativeAsrModel {
             .force_align(audio, sample_rate, reference_text, language)
     }
 
-    /// Forced alignment of word units: one timing per unit.
+    /// Forced alignment of word units: one `(start_ms, end_ms)` per unit.
     pub(crate) fn force_align_units(
         &self,
         audio: &[f32],
         sample_rate: u32,
         units: &[AlignmentUnit],
-    ) -> Result<ForcedAlignmentOutput> {
+    ) -> Result<Vec<(u32, u32)>> {
         self.forced_aligner()?
             .force_align_units(audio, sample_rate, units)
     }

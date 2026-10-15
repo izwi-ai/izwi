@@ -3,8 +3,10 @@
 //! The aligner times at most one window of audio per forward (its
 //! `max_audio_seconds_hint`). Longer audio is aligned as windows, each with
 //! the text spoken in it, and every window's timings are rebased by the
-//! window start. A window the aligner rejects or times degenerately keeps
-//! interval timings and says so in its [`AlignmentSource`].
+//! window start. The aligner's timings are the reference's, unchanged. A
+//! window the aligner rejects, or whose timings fail the plausibility check
+//! a caller asks for, keeps interval timings and says so in its
+//! [`AlignmentSource`].
 //!
 //! A window longer than the aligner's limit with one text (a bare
 //! `/v1/audio/align` request, or a transcript without chunk texts) is aligned
@@ -20,7 +22,7 @@ use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::asr::{alignment_units, qwen3_aligner_max_words};
-use crate::models::registry::{AlignmentUnit, ForcedAlignmentOutput};
+use crate::models::registry::AlignmentUnit;
 use crate::runtime::coordinator::{JobResourceObservation, StageWorkspaceLease};
 use crate::runtime::diarization::{
     alignment_is_suspicious, fallback_word_timings_from_words, samples_to_ms,
@@ -42,8 +44,8 @@ pub struct AlignmentWindow {
 pub enum AlignmentSource {
     /// The aligner's own timings.
     Model,
-    /// The aligner ran but its timings were degenerate; the words are spread
-    /// evenly over the window.
+    /// The aligner ran but its timings failed the plausibility check the
+    /// caller asked for; the words are spread evenly over the window.
     Heuristic,
     /// The aligner could not align the window; the words are spread evenly
     /// over the window.
@@ -255,12 +257,14 @@ pub(crate) fn sample_windows(
         .collect()
 }
 
-/// Align one window with `align` (audio slice, word units) and rebase the
-/// result by the window start. Degenerate or failed alignments keep interval
-/// timings over the window, flagged by their source. `check_plausibility`
-/// also flags collapsed timings; [`LongTextPlanner`] sub-windows skip it,
-/// since their surplus words are expected to pile up at the window end and
-/// the planner trims them itself.
+/// Align one window with `align` (audio slice, word units, giving one
+/// `(start_ms, end_ms)` per unit) and rebase the result by the window start.
+/// A failed alignment keeps interval timings over the window, flagged
+/// [`AlignmentSource::Failed`]. With `check_plausibility`, collapsed timings
+/// are replaced the same way and flagged [`AlignmentSource::Heuristic`];
+/// otherwise the aligner's timings are kept as they are. [`LongTextPlanner`]
+/// sub-windows skip the check, since their surplus words are expected to
+/// pile up at the window end and the planner trims them itself.
 pub(crate) fn align_window_checked<F>(
     samples: &[f32],
     sample_rate: u32,
@@ -269,7 +273,7 @@ pub(crate) fn align_window_checked<F>(
     align: F,
 ) -> AlignedWindow
 where
-    F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
+    F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<Vec<(u32, u32)>>,
 {
     let end_sample = window.end_sample.min(samples.len());
     let start_sample = window.start_sample.min(end_sample);
@@ -294,31 +298,24 @@ where
             "the forced alignment window holds no audio".to_string(),
         ))
     } else {
-        align(audio, &window.units).and_then(|output| {
-            if output.timings.len() != words.len() {
+        align(audio, &window.units).and_then(|timings| {
+            if timings.len() != words.len() {
                 return Err(Error::InferenceError(format!(
                     "the aligner timed {} of {} words",
-                    output.timings.len(),
+                    timings.len(),
                     words.len()
                 )));
             }
-            let timed = words
+            Ok(words
                 .iter()
                 .cloned()
-                .zip(output.timings)
+                .zip(timings)
                 .map(|(word, (start, end))| (word, start, end))
-                .collect::<Vec<_>>();
-            Ok((timed, output.interval_fallback))
+                .collect::<Vec<_>>())
         })
     };
     let (source, relative, detail, error) = match result {
-        Ok((timed, true)) => (
-            AlignmentSource::Heuristic,
-            timed,
-            Some("the aligner's timings were degenerate".to_string()),
-            None,
-        ),
-        Ok((timed, false))
+        Ok(timed)
             if check_plausibility
                 && alignment_is_suspicious(&timed, words.len(), duration_secs) =>
         {
@@ -329,7 +326,7 @@ where
                 None,
             )
         }
-        Ok((timed, false)) => (AlignmentSource::Model, timed, None, None),
+        Ok(timed) => (AlignmentSource::Model, timed, None, None),
         Err(err) => (
             AlignmentSource::Failed,
             fallback_word_timings_from_words(&words, duration_secs),
@@ -635,7 +632,7 @@ mod tests {
         align: F,
     ) -> AlignedWindow
     where
-        F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
+        F: FnOnce(&[f32], &[AlignmentUnit]) -> Result<Vec<(u32, u32)>>,
     {
         align_window_checked(samples, sample_rate, window, true, align)
     }
@@ -646,14 +643,11 @@ mod tests {
 
     /// Stub aligner: the units at fixed relative times, 400 ms apart with
     /// 300 ms spans, regardless of the audio.
-    fn fixed_aligner(audio: &[f32], units: &[AlignmentUnit]) -> Result<ForcedAlignmentOutput> {
+    fn fixed_aligner(audio: &[f32], units: &[AlignmentUnit]) -> Result<Vec<(u32, u32)>> {
         assert!(!audio.is_empty());
-        Ok(ForcedAlignmentOutput {
-            timings: (0..units.len() as u32)
-                .map(|idx| (idx * 400, idx * 400 + 300))
-                .collect(),
-            interval_fallback: false,
-        })
+        Ok((0..units.len() as u32)
+            .map(|idx| (idx * 400, idx * 400 + 300))
+            .collect())
     }
 
     /// ADM-5: an aligner window stage reserves its forward working set,
@@ -812,12 +806,12 @@ mod tests {
         );
         assert!(failed.words.iter().all(|(_, _, end)| *end <= 10_000));
 
-        let degenerate = align_window(&samples, rate, &window(ten, 2 * ten, "d e"), |_, units| {
-            Ok(ForcedAlignmentOutput {
-                interval_fallback: true,
-                ..fixed_aligner(&[0.0], units)?
-            })
-        });
+        let degenerate = align_window(
+            &samples,
+            rate,
+            &window(ten, 2 * ten, "d e f g h i j k"),
+            |_, units| Ok(vec![(9_900, 9_900); units.len()]),
+        );
         assert_eq!(degenerate.source, AlignmentSource::Heuristic);
         assert_eq!(degenerate.words[0].1, 10_000);
 
@@ -858,15 +852,34 @@ mod tests {
             &samples,
             rate,
             &window(0, samples.len(), &text),
-            |_, units| {
-                Ok(ForcedAlignmentOutput {
-                    timings: vec![(29_900, 29_901); units.len()],
-                    interval_fallback: false,
-                })
-            },
+            |_, units| Ok(vec![(29_900, 29_901); units.len()]),
         );
         assert_eq!(collapsed.source, AlignmentSource::Heuristic);
         assert!(collapsed.words[0].1 < 2_000, "{:?}", collapsed.words[0]);
+    }
+
+    /// QFA-5: without the plausibility check the aligner's timings are kept
+    /// exactly, zero-length words included; nothing is substituted silently.
+    #[test]
+    fn unchecked_windows_keep_the_aligner_timings() {
+        let rate = 16_000u32;
+        let samples = vec![0.1f32; 30 * rate as usize];
+        let text = (0..20)
+            .map(|idx| format!("w{idx}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let unchecked = align_window_checked(
+            &samples,
+            rate,
+            &window(rate as usize, samples.len(), &text),
+            false,
+            |_, units| Ok(vec![(28_900, 28_900); units.len()]),
+        );
+        assert_eq!(unchecked.source, AlignmentSource::Model);
+        assert!(unchecked
+            .words
+            .iter()
+            .all(|(_, start, end)| (*start, *end) == (29_900, 29_900)));
     }
 
     #[test]
@@ -1169,7 +1182,7 @@ mod tests {
         aligner: F,
     ) -> Vec<AlignedWindow>
     where
-        F: Fn(&SampleWindow, &[AlignmentUnit]) -> Result<ForcedAlignmentOutput>,
+        F: Fn(&SampleWindow, &[AlignmentUnit]) -> Result<Vec<(u32, u32)>>,
     {
         let mut planner = LongTextPlanner::new(samples, rate, window, max_window);
         let mut out = Vec::new();
@@ -1189,26 +1202,23 @@ mod tests {
     /// word whose speech is not in the window piles up at the window end.
     fn timeline_aligner(
         rate: u32,
-    ) -> impl Fn(&SampleWindow, &[AlignmentUnit]) -> Result<ForcedAlignmentOutput> {
+    ) -> impl Fn(&SampleWindow, &[AlignmentUnit]) -> Result<Vec<(u32, u32)>> {
         move |window, units| {
             let start_ms = samples_to_ms(window.start_sample, rate);
             let length_ms = samples_to_ms(window.end_sample, rate) - start_ms;
-            Ok(ForcedAlignmentOutput {
-                timings: units
-                    .iter()
-                    .map(|unit| {
-                        let k: u32 = unit.text[1..].parse().unwrap();
-                        let (true_start, true_end) = (k * 500, k * 500 + 300);
-                        if true_end <= start_ms + length_ms {
-                            let relative = true_start.saturating_sub(start_ms);
-                            (relative, true_end - start_ms)
-                        } else {
-                            (length_ms - 80, length_ms - 80)
-                        }
-                    })
-                    .collect(),
-                interval_fallback: false,
-            })
+            Ok(units
+                .iter()
+                .map(|unit| {
+                    let k: u32 = unit.text[1..].parse().unwrap();
+                    let (true_start, true_end) = (k * 500, k * 500 + 300);
+                    if true_end <= start_ms + length_ms {
+                        let relative = true_start.saturating_sub(start_ms);
+                        (relative, true_end - start_ms)
+                    } else {
+                        (length_ms - 80, length_ms - 80)
+                    }
+                })
+                .collect())
         }
     }
 

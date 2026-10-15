@@ -1525,15 +1525,6 @@ fn qwen3_aligner_max_window_samples(maximum_frames: usize, hop_length: usize) ->
         .saturating_mul(hop_length.max(1))
 }
 
-/// The timings of one forced alignment, one `(start_ms, end_ms)` per unit,
-/// and whether they are interval-based timings that replaced degenerate
-/// model output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForcedAlignmentOutput {
-    pub timings: Vec<(u32, u32)>,
-    pub interval_fallback: bool,
-}
-
 /// Most alignable words one aligner window of `audio_seconds` accepts.
 pub(crate) fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
     let proportional = if audio_seconds.is_finite() && audio_seconds > 0.0 {
@@ -1598,10 +1589,13 @@ impl Qwen3AsrModel {
             let config_str = fs::read_to_string(config_path)?;
             serde_json::from_str(&config_str)?
         };
-        let timestamp_token_id = config.timestamp_token_id;
-        let timestamp_segment_time_ms = config.timestamp_segment_time.map(|v| v as u32);
         let model_family = config.model_family();
         let is_forced_aligner = model_family == ModelFamily::Qwen3ForcedAligner;
+        let (timestamp_token_id, timestamp_segment_time_ms) = forced_aligner_timestamp_config(
+            is_forced_aligner,
+            config.timestamp_token_id,
+            config.timestamp_segment_time,
+        )?;
 
         let mut text_cfg = config.thinker_config.text_config.clone();
         let inferred_lm_head_size = if let Some(gguf_path) = gguf_path.as_ref() {
@@ -2774,23 +2768,24 @@ impl Qwen3AsrModel {
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
         let units = alignment_units(reference_text, language);
-        let output = self.force_align_units(audio, sample_rate, &units)?;
+        let timings = self.force_align_units(audio, sample_rate, &units)?;
         Ok(units
             .iter()
-            .zip(output.timings)
+            .zip(timings)
             .map(|(unit, (start, end))| (unit.surface(reference_text).to_string(), start, end))
             .collect())
     }
 
-    /// Forced alignment of word units: one timing per unit, and whether the
-    /// model's timings were replaced by interval-based ones because they
-    /// were degenerate.
+    /// Forced alignment of word units: one `(start_ms, end_ms)` per unit,
+    /// the reference's values (`parse_timestamp`). Words may have
+    /// `start == end`, and nothing replaces implausible timings: callers that
+    /// want a fallback check the timings themselves and say so.
     pub fn force_align_units(
         &self,
         audio: &[f32],
         sample_rate: u32,
         units: &[AlignmentUnit],
-    ) -> Result<ForcedAlignmentOutput> {
+    ) -> Result<Vec<(u32, u32)>> {
         if !self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Forced alignment requires a Qwen3-ForcedAligner model; Qwen3 ASR does not expose an autoregressive alignment capability"
@@ -2805,7 +2800,7 @@ impl Qwen3AsrModel {
         audio: &[f32],
         sample_rate: u32,
         units: &[AlignmentUnit],
-    ) -> Result<ForcedAlignmentOutput> {
+    ) -> Result<Vec<(u32, u32)>> {
         let audio = if sample_rate != 16_000 {
             resample(audio, sample_rate, 16_000)?
         } else {
@@ -2891,55 +2886,18 @@ impl Qwen3AsrModel {
             &timestamp_positions,
         )?;
 
-        let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
-        let timestamp_ms = timestamp_argmax(&logits, &timestamp_positions)?
-            .into_iter()
-            .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
-            .collect::<Vec<_>>();
-
-        let mut fixed = fix_timestamp_sequence(&timestamp_ms);
-        let required = words.len().saturating_mul(2);
-        if fixed.len() < required {
-            let fill = fixed.last().copied().unwrap_or(0);
-            fixed.resize(required, fill);
+        let segment_time_ms = self.timestamp_segment_time_ms.ok_or_else(|| {
+            Error::InvalidInput("Forced aligner model has no timestamp_segment_time".to_string())
+        })?;
+        let classes = timestamp_argmax(&logits, &timestamp_positions)?;
+        if classes.len() != words.len() * 2 {
+            return Err(Error::InferenceError(format!(
+                "Forced aligner prompt has {} timestamp markers for {} words",
+                classes.len(),
+                words.len()
+            )));
         }
-
-        let mut alignments = Vec::with_capacity(words.len());
-        for (idx, word) in words.iter().enumerate() {
-            let start = fixed.get(idx * 2).copied().unwrap_or(0);
-            let mut end = fixed
-                .get(idx * 2 + 1)
-                .copied()
-                .unwrap_or_else(|| start.saturating_add(segment_time_ms));
-            if end <= start {
-                end = start.saturating_add(1);
-            }
-            alignments.push((word.clone(), start, end));
-        }
-
-        // Bound timings by the audio the mel frames encode.
-        let encoded_samples = frames
-            .saturating_mul(self.mel.config().hop_length.max(1))
-            .min(audio.len());
-        let audio_duration_ms =
-            ((encoded_samples as f64 * 1000.0) / f64::from(QWEN3_ASR_SAMPLE_RATE)).round() as u32;
-        normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        let interval_fallback =
-            alignment_distribution_is_degenerate(&alignments, audio_duration_ms);
-        if interval_fallback {
-            warn!(
-                "Forced aligner produced degenerate timestamp distribution; falling back to interval-based alignment"
-            );
-            alignments = distribute_words_over_interval(&words, 0, audio_duration_ms.max(1));
-            normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        }
-        Ok(ForcedAlignmentOutput {
-            timings: alignments
-                .into_iter()
-                .map(|(_, start, end)| (start, end))
-                .collect(),
-            interval_fallback,
-        })
+        Ok(reference_word_timings(&classes, segment_time_ms))
     }
 
     fn build_forced_aligner_prompt(
@@ -3301,109 +3259,6 @@ fn batched_decode_argmax(output: &Tensor) -> Result<Vec<u32>> {
         .to_dtype(DType::U32)?
         .to_vec1::<u32>()
         .map_err(Error::from)
-}
-
-fn distribute_words_over_interval(
-    words: &[String],
-    start_ms: u32,
-    end_ms: u32,
-) -> Vec<(String, u32, u32)> {
-    if words.is_empty() {
-        return Vec::new();
-    }
-
-    let start = start_ms.min(end_ms);
-    let mut end = end_ms.max(start.saturating_add(1));
-    let min_span = words.len() as u32;
-    if end.saturating_sub(start) < min_span {
-        end = start.saturating_add(min_span);
-    }
-
-    let span = end.saturating_sub(start).max(1);
-    let step = span as f32 / words.len() as f32;
-
-    words
-        .iter()
-        .enumerate()
-        .map(|(idx, word)| {
-            let ws = start.saturating_add((idx as f32 * step).floor() as u32);
-            let mut we = if idx + 1 == words.len() {
-                end
-            } else {
-                start.saturating_add(((idx + 1) as f32 * step).floor() as u32)
-            };
-            if we <= ws {
-                we = ws.saturating_add(1);
-            }
-            (word.clone(), ws, we)
-        })
-        .collect()
-}
-
-fn normalize_alignment_bounds(alignments: &mut [(String, u32, u32)], audio_duration_ms: u32) {
-    if alignments.is_empty() {
-        return;
-    }
-
-    let max_end = audio_duration_ms.max(1);
-    let mut cursor = 0u32;
-
-    for (_, start, end) in alignments.iter_mut() {
-        let mut s = (*start).min(max_end.saturating_sub(1));
-        let mut e = (*end).min(max_end);
-
-        if s < cursor {
-            s = cursor;
-        }
-        if e <= s {
-            e = s.saturating_add(1).min(max_end);
-        }
-        if e <= s {
-            // audio may be fully exhausted; preserve monotonic order with best effort.
-            s = max_end.saturating_sub(1);
-            e = max_end;
-        }
-
-        *start = s;
-        *end = e;
-        cursor = e;
-    }
-}
-
-fn alignment_distribution_is_degenerate(
-    alignments: &[(String, u32, u32)],
-    audio_duration_ms: u32,
-) -> bool {
-    if alignments.is_empty() {
-        return true;
-    }
-    if alignments.len() < 8 {
-        return false;
-    }
-
-    let audio_duration_ms = audio_duration_ms.max(1);
-    let tail_start = audio_duration_ms.saturating_sub(250);
-    let mut min_start = u32::MAX;
-    let mut max_end = 0u32;
-    let mut tiny_spans = 0usize;
-    let mut tail_heavy = 0usize;
-
-    for (_, start, end) in alignments {
-        min_start = min_start.min((*start).min(audio_duration_ms));
-        max_end = max_end.max((*end).min(audio_duration_ms));
-        if *end <= start.saturating_add(1) {
-            tiny_spans += 1;
-        }
-        if *start >= tail_start {
-            tail_heavy += 1;
-        }
-    }
-
-    let span = max_end.saturating_sub(min_start);
-    let len = alignments.len();
-    tiny_spans * 10 >= len * 8
-        || tail_heavy * 10 >= len * 8
-        || span <= (audio_duration_ms / 20).max(1)
 }
 
 /// The thinker dtype hint a GGUF checkpoint implies: the published GGUFs are
@@ -4134,7 +3989,52 @@ fn tensor_shape_from_safetensors_header(
     Ok(Some(dims))
 }
 
-fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
+/// The forced aligner's timestamp token and the milliseconds one timestamp
+/// class stands for. The reference reads both from the config
+/// (`Qwen3ForcedAligner.__init__`), so an aligner checkpoint without them is
+/// refused instead of timed with a guessed class length. `(None, None)` for
+/// Qwen3-ASR.
+fn forced_aligner_timestamp_config(
+    is_forced_aligner: bool,
+    timestamp_token_id: Option<u32>,
+    timestamp_segment_time: Option<usize>,
+) -> Result<(Option<u32>, Option<u32>)> {
+    if !is_forced_aligner {
+        return Ok((None, None));
+    }
+    let token = timestamp_token_id.ok_or_else(|| {
+        Error::ModelLoadError("Forced aligner config has no timestamp_token_id".to_string())
+    })?;
+    let segment_ms = timestamp_segment_time
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| u32::try_from(ms).ok())
+        .ok_or_else(|| {
+            Error::ModelLoadError(
+                "Forced aligner config has no positive timestamp_segment_time".to_string(),
+            )
+        })?;
+    Ok((Some(token), Some(segment_ms)))
+}
+
+/// The reference `parse_timestamp`: each timestamp class times the segment
+/// time, repaired by `fix_timestamp`, as one `(start_ms, end_ms)` per word
+/// (two classes per word). The values are returned as they are: a word may
+/// have `start == end`.
+fn reference_word_timings(classes: &[u32], segment_time_ms: u32) -> Vec<(u32, u32)> {
+    let timestamps = classes
+        .iter()
+        .map(|class| f64::from(*class) * f64::from(segment_time_ms))
+        .collect::<Vec<_>>();
+    fix_timestamp_sequence(&timestamps)
+        .chunks_exact(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
+/// The reference `fix_timestamp`: keep the longest non-decreasing
+/// subsequence and repair the rest from its neighbours, in Python float
+/// arithmetic, truncating like `int()`.
+fn fix_timestamp_sequence(data: &[f64]) -> Vec<u32> {
     let n = data.len();
     if n == 0 {
         return Vec::new();
@@ -4171,7 +4071,7 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
         is_normal[idx] = true;
     }
 
-    let mut result: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+    let mut result = data.to_vec();
     let mut i = 0usize;
     while i < n {
         if is_normal[i] {
@@ -4212,9 +4112,9 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
 
             match (left_val, right_val) {
                 (Some(left), Some(right)) => {
-                    let step = (right - left) / (anomaly_count as f32 + 1.0);
+                    let step = (right - left) / (anomaly_count as f64 + 1.0);
                     for (offset, value) in result[i..j].iter_mut().enumerate() {
-                        *value = left + step * (offset as f32 + 1.0);
+                        *value = left + step * (offset as f64 + 1.0);
                     }
                 }
                 (Some(left), None) => {
@@ -6522,55 +6422,107 @@ mod tests {
     }
 
     #[test]
-    fn distribute_words_over_interval_is_monotonic() {
-        let words = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-        let aligned = distribute_words_over_interval(&words, 100, 160);
-        assert_eq!(aligned.len(), 3);
-        assert!(aligned[0].1 < aligned[0].2);
-        assert!(aligned[1].1 >= aligned[0].2);
-        assert!(aligned[2].2 >= aligned[1].2);
-    }
-
-    #[test]
-    fn normalize_alignment_bounds_clamps_to_duration() {
-        let mut alignments = vec![
-            ("one".to_string(), 0, 20),
-            ("two".to_string(), 10, 12),
-            ("three".to_string(), 100, 140),
-        ];
-        normalize_alignment_bounds(&mut alignments, 60);
-        assert_eq!(alignments[0].0, "one");
-        assert!(alignments[0].1 < alignments[0].2);
-        assert!(alignments[1].1 >= alignments[0].2);
-        assert!(alignments[2].2 <= 60);
-    }
-
-    #[test]
-    fn alignment_distribution_is_degenerate_detects_tail_collapse() {
-        let alignments = (0..20)
-            .map(|idx| (format!("w{idx}"), 27_302u32, 27_303u32))
-            .collect::<Vec<_>>();
-        assert!(alignment_distribution_is_degenerate(&alignments, 27_303));
-    }
-
-    #[test]
-    fn alignment_distribution_is_degenerate_accepts_spread_alignment() {
-        let alignments = (0..20)
-            .map(|idx| {
-                let start = idx * 120;
-                let end = start + 80;
-                (format!("w{idx}"), start, end)
-            })
-            .collect::<Vec<_>>();
-        assert!(!alignment_distribution_is_degenerate(&alignments, 3_000));
-    }
-
-    #[test]
     fn fix_timestamp_sequence_recovers_monotonicity() {
-        let repaired = fix_timestamp_sequence(&[100, 80, 120, 60, 140]);
+        let repaired = fix_timestamp_sequence(&[100.0, 80.0, 120.0, 60.0, 140.0]);
         assert_eq!(repaired.len(), 5);
         for pair in repaired.windows(2) {
             assert!(pair[0] <= pair[1]);
+        }
+        // Three or more anomalies are interpolated and truncated like int()
+        // (the reference `fix_timestamp` gives the same).
+        assert_eq!(
+            fix_timestamp_sequence(&[0.0, 90.0, 80.0, 70.0, 60.0, 100.0]),
+            [0, 90, 92, 95, 97, 100]
+        );
+    }
+
+    /// QFA-5: izwi's post-processing of the reference's raw timestamp
+    /// classes gives exactly the reference's word timings, zero-length words
+    /// and LIS repairs included. Classes and `fixed_ms` from qwen-asr 0.0.6
+    /// on test.wav (windowed and official encoder) and fox.wav (windowed),
+    /// `01-aligner-reference-{test,fox}.json` of the 2026-10-14 audit.
+    #[test]
+    fn post_processing_returns_the_reference_timings() {
+        const TEST_WINDOWED: [u32; 134] = [
+            2, 4, 4, 7, 7, 11, 11, 15, 15, 20, 21, 22, 22, 30, 32, 33, 33, 42, 42, 44, 44, 46, 53,
+            55, 55, 68, 69, 71, 72, 76, 76, 78, 78, 83, 83, 92, 92, 94, 94, 98, 106, 109, 109, 113,
+            113, 115, 115, 120, 120, 123, 124, 134, 135, 142, 151, 160, 160, 163, 163, 167, 167,
+            170, 170, 174, 174, 183, 185, 187, 187, 195, 195, 204, 204, 210, 212, 214, 214, 221,
+            221, 224, 224, 231, 234, 235, 235, 241, 241, 249, 251, 258, 257, 259, 259, 266, 266,
+            268, 268, 276, 276, 285, 286, 287, 287, 290, 290, 296, 299, 301, 301, 304, 304, 308,
+            308, 316, 316, 321, 321, 329, 331, 333, 333, 337, 338, 348, 347, 350, 350, 350, 350,
+            357, 357, 359, 359, 369,
+        ];
+        const TEST_WINDOWED_FIXED_MS: [u32; 134] = [
+            160, 320, 320, 560, 560, 880, 880, 1200, 1200, 1600, 1680, 1760, 1760, 2400, 2560,
+            2640, 2640, 3360, 3360, 3520, 3520, 3680, 4240, 4400, 4400, 5440, 5520, 5680, 5760,
+            6080, 6080, 6240, 6240, 6640, 6640, 7360, 7360, 7520, 7520, 7840, 8480, 8720, 8720,
+            9040, 9040, 9200, 9200, 9600, 9600, 9840, 9920, 10720, 10800, 11360, 12080, 12800,
+            12800, 13040, 13040, 13360, 13360, 13600, 13600, 13920, 13920, 14640, 14800, 14960,
+            14960, 15600, 15600, 16320, 16320, 16800, 16960, 17120, 17120, 17680, 17680, 17920,
+            17920, 18480, 18720, 18800, 18800, 19280, 19280, 19920, 20080, 20640, 20640, 20720,
+            20720, 21280, 21280, 21440, 21440, 22080, 22080, 22800, 22880, 22960, 22960, 23200,
+            23200, 23680, 23920, 24080, 24080, 24320, 24320, 24640, 24640, 25280, 25280, 25680,
+            25680, 26320, 26480, 26640, 26640, 26960, 27040, 27840, 27840, 28000, 28000, 28000,
+            28000, 28560, 28560, 28720, 28720, 29520,
+        ];
+        // The official (whole-clip encoder) classes differ in five places.
+        let mut test_official = TEST_WINDOWED;
+        let mut test_official_fixed_ms = TEST_WINDOWED_FIXED_MS;
+        for (idx, class, fixed) in [
+            (9, 21, 1680),
+            (26, 68, 5440),
+            (111, 307, 24560),
+            (123, 347, 27760),
+            (124, 347, 27760),
+        ] {
+            test_official[idx] = class;
+            test_official_fixed_ms[idx] = fixed;
+        }
+        let fox_windowed = [
+            3, 4, 4, 7, 7, 13, 13, 19, 20, 25, 25, 28, 28, 29, 29, 35, 35, 41,
+        ];
+        let fox_windowed_fixed_ms = [
+            240, 320, 320, 560, 560, 1040, 1040, 1520, 1600, 2000, 2000, 2240, 2240, 2320, 2320,
+            2800, 2800, 3280,
+        ];
+        for (classes, fixed_ms) in [
+            (&TEST_WINDOWED[..], &TEST_WINDOWED_FIXED_MS[..]),
+            (&test_official[..], &test_official_fixed_ms[..]),
+            (&fox_windowed[..], &fox_windowed_fixed_ms[..]),
+        ] {
+            let expected = fixed_ms
+                .chunks_exact(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect::<Vec<_>>();
+            assert_eq!(reference_word_timings(classes, 80), expected);
+        }
+        // test.wav's word 63 is zero-length in the reference.
+        assert_eq!(
+            reference_word_timings(&TEST_WINDOWED, 80)[63],
+            (28_000, 28_000)
+        );
+    }
+
+    #[test]
+    fn aligner_checkpoints_must_declare_their_timestamp_config() {
+        assert_eq!(
+            forced_aligner_timestamp_config(true, Some(151_705), Some(80)).unwrap(),
+            (Some(151_705), Some(80))
+        );
+        assert_eq!(
+            forced_aligner_timestamp_config(false, None, None).unwrap(),
+            (None, None)
+        );
+        for (token, segment) in [
+            (None, Some(80)),
+            (Some(151_705), None),
+            (Some(151_705), Some(0)),
+        ] {
+            assert!(matches!(
+                forced_aligner_timestamp_config(true, token, segment),
+                Err(Error::ModelLoadError(_))
+            ));
         }
     }
 
@@ -6765,7 +6717,7 @@ mod tests {
     /// fox.wav gives a 77-token prompt (77 % 32 = 13), which hit Candle's
     /// causal Metal SDPA over-read in the dense text model; the 4-bit audio
     /// tower's OHWI conv kernels hit the strided-kernel conv bug. Metal must
-    /// match CPU per word boundary and must not fall back to uniform spacing.
+    /// match CPU per word boundary.
     #[cfg(feature = "metal")]
     #[test]
     #[ignore = "requires local Qwen3-ForcedAligner checkpoints and a Metal device (~5 GB)"]
@@ -6777,13 +6729,6 @@ mod tests {
             crate::audio::decode_audio_bytes_to_mono(&bytes).expect("decode fox.wav");
         let text = std::fs::read_to_string(data.join("fox.md")).expect("fox.md");
         let text = text.trim();
-        let duration_ms = ((audio.len() as f64 / f64::from(sample_rate)) * 1000.0).round() as u32;
-        let surfaces = alignment_units(text, None)
-            .iter()
-            .map(|unit| unit.surface(text).to_string())
-            .collect::<Vec<_>>();
-        let mut uniform = distribute_words_over_interval(&surfaces, 0, duration_ms.max(1));
-        normalize_alignment_bounds(&mut uniform, duration_ms);
 
         for (dir_name, variant) in [
             (
@@ -6812,11 +6757,6 @@ mod tests {
             let metal = align_on("metal");
             eprintln!("{dir_name} cpu:   {cpu:?}\n{dir_name} metal: {metal:?}");
 
-            assert_ne!(cpu, uniform, "{dir_name}: CPU fell back to uniform spacing");
-            assert_ne!(
-                metal, uniform,
-                "{dir_name}: Metal fell back to uniform spacing"
-            );
             assert_eq!(cpu.len(), metal.len(), "{dir_name}: word count");
             for (c, m) in cpu.iter().zip(&metal) {
                 assert_eq!(c.0, m.0, "{dir_name}: word order");
