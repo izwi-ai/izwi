@@ -2318,7 +2318,8 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B => 1_520_000_000,
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
-                    ModelVariant::Qwen3ForcedAligner06B4Bit => 703_000_000,
+                    ModelVariant::Qwen3ForcedAligner06B => 1_835_544_544,
+                    ModelVariant::Qwen3ForcedAligner06B4Bit => 971_305_827,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Qwen3508BGguf => 685_000_000,
                     ModelVariant::Qwen352BGguf => 1_850_000_000,
@@ -2339,8 +2340,8 @@ impl ModelDownloader {
             match variant {
                 ModelVariant::ParakeetTdt06BV3 => 2_509_332_480,
                 ModelVariant::Nemotron35AsrStreaming06B => 2_368_284_501,
-                ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
-                ModelVariant::Nemotron3Diarization => 200_000_000,
+                ModelVariant::DiarStreamingSortformer4SpkV21 => 471_367_680,
+                ModelVariant::Nemotron3Diarization => 198_676_480,
                 _ => 4_000_000_000,
             }
         } else if file.contains("tokenizer") && file.contains("safetensors") {

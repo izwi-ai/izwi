@@ -374,11 +374,12 @@ impl ModelVariant {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::Lfm25Audio
-            | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::Voxtral => Provider::IzwiCudaEligible,
+            // The forced aligner runs one cacheless forward per request.
             ModelFamily::KokoroTts
             | ModelFamily::ParakeetAsr
             | ModelFamily::SortformerDiarization
+            | ModelFamily::Qwen3ForcedAligner
             | ModelFamily::Tokenizer => Provider::NotApplicable,
         };
         let rope_provider = match family {
@@ -788,6 +789,30 @@ mod tests {
         assert_eq!(convolution.provider, CudaProviderClass::IzwiCudaEligible);
         assert!(convolution.reason.contains("Qwen3.8"));
         assert!(convolution.reason.contains("not inherited"));
+    }
+
+    /// ADM-9: the forced aligner and the diarizers keep no paged cache.
+    #[test]
+    fn cacheless_audio_models_report_no_paged_or_state_provider() {
+        for variant in [
+            ModelVariant::Qwen3ForcedAligner06B,
+            ModelVariant::Qwen3ForcedAligner06B4Bit,
+            ModelVariant::DiarStreamingSortformer4SpkV21,
+        ] {
+            for capability in variant.cuda_operator_capabilities() {
+                if matches!(
+                    capability.operator,
+                    CudaOperatorKind::PagedAttention | CudaOperatorKind::State
+                ) {
+                    assert_eq!(
+                        capability.provider,
+                        CudaProviderClass::NotApplicable,
+                        "{variant} {:?}",
+                        capability.operator
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -2735,6 +2735,67 @@ pub(super) mod tests {
         }
     }
 
+    /// ADM-9, QFA-12: the catalog figures for the aligner and the diarizers
+    /// follow their checkpoints. The memory figure covers the largest plan
+    /// resident on any backend, with under 0.1 GiB to spare, and the size is
+    /// within 1% of the census payload (the files add headers, tokenizer and
+    /// config bytes).
+    #[test]
+    fn aligner_and_diarizer_catalog_figures_follow_the_checkpoints() {
+        let _env = env_lock();
+        type Plan<'a> = Box<dyn Fn(BackendKind) -> AsrResidencyPlan + 'a>;
+        let aligner_dense = census!("qwen3_forced_aligner_0_6b.json");
+        let aligner_4bit = census!("qwen3_forced_aligner_0_6b_4bit.json");
+        let sortformer_v21 = census!("diar_streaming_sortformer_4spk_v2_1.json");
+        let nemotron_diarization = census!("nemotron_3_diarization.json");
+        let rows: [(ModelVariant, &[CensusFile], Plan); 4] = [
+            (
+                ModelVariant::Qwen3ForcedAligner06B,
+                &aligner_dense,
+                Box::new(|b| aligner(&aligner_dense, b)),
+            ),
+            (
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+                &aligner_4bit,
+                Box::new(|b| aligner(&aligner_4bit, b)),
+            ),
+            (
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                &sortformer_v21,
+                Box::new(|b| sortformer(&sortformer_v21, b)),
+            ),
+            (
+                ModelVariant::Nemotron3Diarization,
+                &nemotron_diarization,
+                Box::new(|b| sortformer(&nemotron_diarization, b)),
+            ),
+        ];
+        for (variant, files, plan) in rows {
+            let resident = BACKENDS
+                .map(|backend| plan(backend).resident_bytes)
+                .into_iter()
+                .max()
+                .unwrap();
+            let catalog = super::super::model_memory_estimate(variant).resident_bytes;
+            assert!(
+                catalog >= resident && catalog - resident < (1 << 30) / 10,
+                "{variant}: catalog {:.3} GiB, plan {:.3} GiB",
+                gib(catalog),
+                gib(resident)
+            );
+            let payload: u64 = files
+                .iter()
+                .flat_map(|file| file.tensors.iter())
+                .map(|tensor| tensor.stored_bytes)
+                .sum();
+            let size = variant.estimated_size();
+            assert!(
+                size >= payload && size - payload < payload / 100,
+                "{variant}: catalog {size} B, payload {payload} B"
+            );
+        }
+    }
+
     /// The census totals pin the exact figures independently of the plan.
     #[test]
     fn exact_residency_follows_the_loaders_dtype_and_skips() {
@@ -3333,8 +3394,9 @@ pub(super) mod tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
-        // The published checkpoints load well above the catalog's figures on
-        // Metal, so a retry judged by the catalog ran when it could not fit.
+        // The catalog figure covers residency, not the Metal load peak (held
+        // uploads and dequantization scratch), so a retry judged by it would
+        // run when it could not fit.
         for (variant, files) in [
             (
                 ModelVariant::Qwen3ForcedAligner06B,
@@ -3347,10 +3409,7 @@ pub(super) mod tests {
         ] {
             let catalog = super::super::model_memory_estimate(variant).load_peak_bytes;
             let metal = aligner(&files, BackendKind::Metal).load_peak_bytes;
-            assert!(
-                metal > catalog + (2 << 30),
-                "{variant}: {metal} vs {catalog}"
-            );
+            assert!(metal > catalog, "{variant}: {metal} vs {catalog}");
         }
     }
 
@@ -3467,9 +3526,9 @@ pub(super) mod tests {
     }
 
     /// ADM-4 / NDZ-7: the diarizers are priced from their checkpoints at F32
-    /// on the model device: the CUDA device (staging one tensor on the host)
-    /// instead of the catalog's 3.0 / 2.0 GiB device and host for the model's
-    /// life, and host memory on CPU and Metal, where Nemotron-3's BF16
+    /// on the model device: the CUDA device (staging one tensor on the host;
+    /// the catalog priced 3.0 / 2.0 GiB device and host for the model's life),
+    /// and host memory on CPU and Metal, where Nemotron-3's BF16
     /// checkpoint was priced at its stored bytes, half what loads.
     #[test]
     fn sortformer_diarizers_are_priced_from_their_checkpoints() {
@@ -3499,7 +3558,6 @@ pub(super) mod tests {
                     || tensor.name.contains(".activity_head."))
             };
             let f32_bytes = stored(&files, loaded) / stored_dtype.size_in_bytes() as u64 * 4;
-            let catalog = super::super::model_memory_estimate(variant);
             for backend in BACKENDS {
                 let plan = sortformer(&files, backend);
                 assert_eq!(plan.resident_bytes, f32_bytes, "{variant} {backend:?}");
@@ -3517,10 +3575,6 @@ pub(super) mod tests {
                         assert_eq!(authorization.device_bytes, ResourceAmount::Known(f32_bytes));
                         assert!(plan.host_staging_bytes <= 64 << 20, "{variant}");
                         assert_eq!(plan.host_staging_bytes, largest(&files), "{variant}");
-                        assert!(
-                            catalog.resident_bytes > 4 * plan.resident_bytes,
-                            "{variant}"
-                        );
                     }
                 }
             }
