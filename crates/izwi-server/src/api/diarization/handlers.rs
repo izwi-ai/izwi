@@ -22,7 +22,7 @@ use crate::diarization_store::{
     DiarizationStore, DiarizationSummaryStatus, DiarizationUtteranceRecord, DiarizationWordRecord,
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
@@ -191,7 +191,7 @@ pub async fn delete_record(
 pub async fn update_record(
     State(state): State<AppState>,
     Path(record_id): Path<String>,
-    Json(req): Json<UpdateDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<UpdateDiarizationRecordRequest>,
 ) -> Result<Json<DiarizationRecord>, ApiError> {
     let updated = state
         .diarization_store
@@ -207,7 +207,7 @@ pub async fn rerun_record(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     Path(record_id): Path<String>,
-    Json(req): Json<RerunDiarizationRecordRequest>,
+    ApiJson(req): ApiJson<RerunDiarizationRecordRequest>,
 ) -> Result<Response, ApiError> {
     let source_record = state
         .diarization_store

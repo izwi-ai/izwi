@@ -311,7 +311,7 @@ pub(crate) async fn guard_local_request(
     if let Err(err) = guard.check(req.method(), req.headers(), authority) {
         return err.into_response();
     }
-    next.run(req).await
+    crate::error::showing_server_faults(guard.loopback_bind, next.run(req)).await
 }
 
 /// Host name without port or IPv6 brackets.

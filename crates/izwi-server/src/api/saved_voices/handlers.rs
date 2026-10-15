@@ -10,7 +10,7 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_with_diagnostics,
 };
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::saved_voice_store::{
     NewSavedVoice, SavedVoice, SavedVoiceListCursor, SavedVoiceSourceRouteKind, SavedVoiceSummary,
     StoredSavedVoiceAudio,
@@ -122,7 +122,7 @@ fn validate_saved_voice_reference(duration_secs: f32) -> Result<(), ApiError> {
 
 pub async fn create_saved_voice(
     State(state): State<AppState>,
-    Json(req): Json<CreateSavedVoiceRequest>,
+    ApiJson(req): ApiJson<CreateSavedVoiceRequest>,
 ) -> Result<Json<SavedVoice>, ApiError> {
     let name = required_trimmed(req.name.as_deref(), "name")?;
     let reference_text = required_trimmed(req.reference_text.as_deref(), "reference_text")?;

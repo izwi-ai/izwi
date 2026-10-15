@@ -19,7 +19,7 @@ use crate::app::chat_content::{
     flatten_thread_content, validate_media_inputs_for_variant, FlattenedMultimodalContent,
 };
 use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::{
     ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation,
@@ -205,7 +205,7 @@ pub async fn list_threads(
 
 pub async fn create_thread(
     State(state): State<AppState>,
-    Json(req): Json<CreateChatThreadRequest>,
+    ApiJson(req): ApiJson<CreateChatThreadRequest>,
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     let thread = state
         .chat_store
@@ -267,7 +267,7 @@ pub async fn delete_thread(
 pub async fn update_thread(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
-    Json(req): Json<UpdateChatThreadRequest>,
+    ApiJson(req): ApiJson<UpdateChatThreadRequest>,
 ) -> Result<Json<ChatThreadSummary>, ApiError> {
     if req.title.is_none() && req.system_prompt.is_none() {
         return Err(ApiError::bad_request("No thread settings were provided"));
@@ -294,7 +294,7 @@ pub async fn create_thread_message(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<CreateThreadMessageRequest>,
+    ApiJson(req): ApiJson<CreateThreadMessageRequest>,
 ) -> Result<Response, ApiError> {
     let model_variant = parse_chat_model(&req.model)?;
     let model_id = model_variant.dir_name().to_string();

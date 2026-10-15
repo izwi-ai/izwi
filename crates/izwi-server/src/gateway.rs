@@ -1831,9 +1831,16 @@ mod tests {
 
         let response = send(app, valid_chat_request(32)).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(json_body(response).await["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("without a terminal event")));
+        // A server fault reaches the client as a generic message naming the
+        // request; the worker's account of it is only logged.
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "bad_gateway");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(crate::error::SERVER_FAULT_MESSAGE)
+                && message.contains("request ID"),
+            "{message}"
+        );
     }
 
     #[tokio::test]

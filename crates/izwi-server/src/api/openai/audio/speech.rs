@@ -5,7 +5,6 @@ use axum::{
     extract::{Extension, State},
     http::{header, StatusCode},
     response::Response,
-    Json,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,7 @@ use tracing::info;
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_policy::resolve_tts_output_frames;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::{
@@ -180,7 +179,7 @@ async fn send_stream_event(
 pub async fn speech(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<SpeechRequest>,
+    ApiJson(req): ApiJson<SpeechRequest>,
 ) -> Result<Response<Body>, ApiError> {
     crate::api::tts_policy::check_tts_input_length(&req.input)?;
     let req = resolve_saved_voice_request(&state, normalize_speech_request(req)).await?;

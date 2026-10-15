@@ -27,7 +27,7 @@ use crate::app::chat::{
     ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver, LocalChat,
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson, ErrorScope};
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState};
 use crate::ids::new_prefixed_id;
 use crate::state::AppState;
@@ -41,13 +41,16 @@ const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal
 
 /// An in-band error event: the OpenAI error object of the HTTP error the
 /// request would have had before the stream started.
-fn openai_chat_stream_error_payload(error: &ApiError) -> String {
-    error.openai_body().to_string()
+fn openai_chat_stream_error_payload(scope: &ErrorScope, error: &ApiError) -> String {
+    scope.openai_body(error).to_string()
 }
 
-fn openai_chat_stream_interruption_payload(saw_terminal: bool) -> Option<String> {
+fn openai_chat_stream_interruption_payload(
+    scope: &ErrorScope,
+    saw_terminal: bool,
+) -> Option<String> {
     (!saw_terminal).then(|| {
-        openai_chat_stream_error_payload(&ApiError::internal(CHAT_STREAM_INTERRUPTED_ERROR))
+        openai_chat_stream_error_payload(scope, &ApiError::internal(CHAT_STREAM_INTERRUPTED_ERROR))
     })
 }
 
@@ -481,7 +484,7 @@ fn validate_chat_request_compatibility(
 pub async fn completions(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<ChatCompletionRequest>,
+    ApiJson(req): ApiJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     validate_chat_request_compatibility(&req, compatibility_profile())?;
     let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
@@ -887,6 +890,9 @@ fn render_chat_stream(
         }]
     };
 
+    // The body is polled after the handler returns, outside the request's
+    // error scope; capture it here.
+    let errors = ErrorScope::current();
     let stream = async_stream::stream! {
         let mut observer = observer;
         let mut answer = AnswerStream::new(format);
@@ -941,7 +947,7 @@ fn render_chat_stream(
                 }
                 ChatStreamEvent::Failed(error) => {
                     observer.record_failure();
-                    (vec![openai_chat_stream_error_payload(&error)], true)
+                    (vec![openai_chat_stream_error_payload(&errors, &error)], true)
                 }
             };
             for payload in payloads {
@@ -952,7 +958,7 @@ fn render_chat_stream(
                 break;
             }
         }
-        if let Some(payload) = openai_chat_stream_interruption_payload(saw_terminal) {
+        if let Some(payload) = openai_chat_stream_interruption_payload(&errors, saw_terminal) {
             observer.record_failure();
             yield Ok(Event::default().data(payload));
         }
@@ -975,20 +981,21 @@ mod tests {
 
     #[test]
     fn closed_chat_stream_emits_explicit_error_without_terminal_event() {
-        let payload = openai_chat_stream_interruption_payload(false)
+        let payload = openai_chat_stream_interruption_payload(&ErrorScope::current(), false)
             .expect("an interrupted stream should emit an error");
         let json: serde_json::Value = serde_json::from_str(&payload).expect("valid error payload");
 
-        assert_eq!(
-            json.pointer("/error/message")
-                .and_then(|value| value.as_str()),
-            Some(CHAT_STREAM_INTERRUPTED_ERROR)
-        );
+        // A server fault: outside a loopback server's scope the client sees
+        // the generic message, not the internal one.
+        assert!(json
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.starts_with(crate::error::SERVER_FAULT_MESSAGE)));
         assert_eq!(
             json.pointer("/error/type").and_then(|value| value.as_str()),
             Some("server_error")
         );
-        assert!(openai_chat_stream_interruption_payload(true).is_none());
+        assert!(openai_chat_stream_interruption_payload(&ErrorScope::current(), true).is_none());
     }
 
     pub(super) fn generation(text: &str) -> ChatGeneration {

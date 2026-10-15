@@ -442,9 +442,9 @@ async fn assert_paths_agree(paths: &Paths) {
 
     // JSON mode reaches the engine on both paths. The fixture's vocabulary
     // has no JSON token, so the constraint ends generation at once and LFM2
-    // rejects the empty answer; a dropped constraint would answer 200. (The
-    // two paths word this server error differently before a stream starts;
-    // once it has, both send the model's own error.)
+    // rejects the empty answer; a dropped constraint would answer 200. It is
+    // a server fault: the loopback local server shows the model's own error,
+    // and the gateway the same type and code with a redacted message.
     let mut json_mode = json!({
         "model": VARIANT.dir_name(),
         "messages": hello,
@@ -464,9 +464,26 @@ async fn assert_paths_agree(paths: &Paths) {
                 !local["error"].is_null(),
                 "json_object stream: local {local}"
             );
-            assert_eq!(
-                local["error"], remote["error"],
-                "json_object stream: the gateway reports the model's error"
+            for field in ["type", "code", "param"] {
+                assert_eq!(
+                    local["error"][field], remote["error"][field],
+                    "json_object stream: {field}"
+                );
+            }
+            let message = |error: &Value| {
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert!(
+                message(&local).contains("LFM2 generation did not produce a valid answer"),
+                "json_object stream: local {local}"
+            );
+            assert!(
+                message(&remote).starts_with("The server had an error")
+                    && !message(&remote).contains("LFM2"),
+                "json_object stream: gateway {remote}"
             );
         } else {
             assert_eq!(

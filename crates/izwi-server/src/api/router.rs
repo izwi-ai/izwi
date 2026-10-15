@@ -1530,6 +1530,41 @@ mod tests {
         );
     }
 
+    /// EDGE-F14: a malformed JSON body on a local JSON route is an OpenAI
+    /// error object, not axum's plain-text rejection.
+    #[tokio::test]
+    async fn malformed_json_bodies_are_openai_errors_on_local_routes() {
+        let (state, _root) = test_state("malformed_json", false);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state, &config);
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/audio/speech",
+            "/v1/chat/threads",
+        ] {
+            let response = send_request(
+                app.clone(),
+                build_request(Method::POST, path, Some("{\"model\": ")),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json",
+                "{path}"
+            );
+            let body = read_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{path}");
+            assert_eq!(body["error"]["code"], "invalid_value", "{path}");
+        }
+    }
+
     /// TPIPE-14: an over-limit speech input is refused with 413 on both
     /// speech routes before a model is loaded or a record is created.
     #[tokio::test]

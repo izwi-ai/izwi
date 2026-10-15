@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::error::with_request_id;
 use crate::gateway::GatewayState;
 use crate::gateway_security::MAX_GATEWAY_REQUEST_ID_BYTES;
 use crate::state::AppState;
@@ -199,7 +200,7 @@ pub async fn attach_request_context(mut req: Request, next: Next) -> Response {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
 
-    let mut response = next.run(req).await;
+    let mut response = with_request_id(correlation_id.clone(), next.run(req)).await;
     if let Ok(value) = correlation_id.parse() {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
@@ -312,7 +313,7 @@ pub async fn attach_gateway_request_context(
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
-    let mut response = next.run(req).await;
+    let mut response = with_request_id(correlation_id.clone(), next.run(req)).await;
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
@@ -344,7 +345,7 @@ pub async fn attach_gateway_request_id(mut req: Request, next: Next) -> Response
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
-    let mut response = next.run(req).await;
+    let mut response = with_request_id(correlation_id.clone(), next.run(req)).await;
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
@@ -547,7 +548,7 @@ async fn attach_enterprise_request_context_with_hooks(
         req.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
 
-    let mut response = next.run(req).await;
+    let mut response = with_request_id(correlation_id.clone(), next.run(req)).await;
 
     if let Ok(value) = HeaderValue::from_str(&correlation_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);

@@ -1,6 +1,9 @@
 //! API error handling
 
+use std::borrow::Cow;
+
 use axum::{
+    extract::{rejection::JsonRejection, FromRequest, Request},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -13,6 +16,11 @@ use serde_json::json;
 /// clear when another request finishes or a model goes idle, which is
 /// usually within seconds.
 const SERVICE_UNAVAILABLE_RETRY_AFTER_SECS: &str = "5";
+
+/// The message a `5xx` server fault shows the client. Its own message can
+/// name paths, devices and internal state, so it is logged instead.
+pub(crate) const SERVER_FAULT_MESSAGE: &str =
+    "The server had an error while processing your request";
 
 /// The `499` status nginx and izwi use for a request the client cancelled.
 const CLIENT_CLOSED_REQUEST: u16 = 499;
@@ -208,6 +216,71 @@ pub(crate) fn invocation_error_class(code: InvocationErrorCode) -> ErrorClass {
     }
 }
 
+tokio::task_local! {
+    static REQUEST_ID: String;
+    static SHOW_SERVER_FAULTS: bool;
+}
+
+/// Run `future` as the request `request_id`, so a server fault rendered
+/// inside it can name the request in its redacted message.
+pub(crate) async fn with_request_id<F: std::future::Future>(
+    request_id: String,
+    future: F,
+) -> F::Output {
+    REQUEST_ID.scope(request_id, future).await
+}
+
+/// Run `future` with server-fault messages shown in full (`show`) or
+/// redacted. Only a loopback-bound local server shows them: its client is
+/// this machine's user, who also owns the logs. Outside any scope (the
+/// gateway, a network bind) they are redacted.
+pub(crate) async fn showing_server_faults<F: std::future::Future>(
+    show: bool,
+    future: F,
+) -> F::Output {
+    SHOW_SERVER_FAULTS.scope(show, future).await
+}
+
+fn current_request_id() -> Option<String> {
+    REQUEST_ID.try_with(Clone::clone).ok()
+}
+
+/// How the current request renders errors, captured where the request's
+/// scope is set so a body polled later (an SSE stream) renders its error
+/// events the way the request's own errors are rendered.
+#[derive(Debug, Clone)]
+pub(crate) struct ErrorScope {
+    request_id: Option<String>,
+    show_server_faults: bool,
+}
+
+impl ErrorScope {
+    pub(crate) fn current() -> Self {
+        Self {
+            request_id: current_request_id(),
+            show_server_faults: SHOW_SERVER_FAULTS.try_with(|show| *show).unwrap_or(false),
+        }
+    }
+
+    fn render<T>(&self, render: impl FnOnce() -> T) -> T {
+        let render = || SHOW_SERVER_FAULTS.sync_scope(self.show_server_faults, render);
+        match &self.request_id {
+            Some(request_id) => REQUEST_ID.sync_scope(request_id.clone(), render),
+            None => render(),
+        }
+    }
+
+    /// [`ApiError::openai_body`] as the request renders it.
+    pub(crate) fn openai_body(&self, error: &ApiError) -> serde_json::Value {
+        self.render(|| error.openai_body())
+    }
+
+    /// The message the request's client may see for `error`.
+    pub(crate) fn client_message(&self, error: &ApiError) -> String {
+        self.render(|| error.client_message().into_owned())
+    }
+}
+
 /// API error type
 #[derive(Debug, Clone)]
 pub struct ApiError {
@@ -332,13 +405,46 @@ impl ApiError {
         ErrorClass::from_status(self.status)
     }
 
+    /// A server fault: any `5xx` but `503`, whose capacity and readiness
+    /// messages are written for clients.
+    fn server_fault(&self) -> bool {
+        self.status.is_server_error() && self.status != StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    /// The message the client sees. A server fault is logged in full with
+    /// the request ID and, unless the scope shows server faults, replaced
+    /// by a generic message naming the request.
+    fn client_message(&self) -> Cow<'_, str> {
+        if !self.server_fault() {
+            return Cow::Borrowed(&self.message);
+        }
+        let request_id = current_request_id();
+        tracing::error!(
+            status = self.status.as_u16(),
+            request_id = request_id.as_deref().unwrap_or("-"),
+            error = %self.message,
+            "request failed with a server error"
+        );
+        if SHOW_SERVER_FAULTS.try_with(|show| *show).unwrap_or(false) {
+            return Cow::Borrowed(&self.message);
+        }
+        Cow::Owned(match request_id {
+            Some(request_id) => {
+                format!(
+                    "{SERVER_FAULT_MESSAGE}. Include request ID {request_id} when reporting it."
+                )
+            }
+            None => format!("{SERVER_FAULT_MESSAGE}."),
+        })
+    }
+
     /// The OpenAI error object: the HTTP error body, and the payload of an
     /// error event once a stream has started.
     pub fn openai_body(&self) -> serde_json::Value {
         let class = self.class();
         json!({
             "error": {
-                "message": self.message,
+                "message": self.client_message(),
                 "type": class.openai_type(),
                 "param": self.detail.and_then(|detail| detail.param),
                 "code": self
@@ -372,6 +478,44 @@ impl From<izwi_core::Error> for ApiError {
             izwi_core::Error::ContextLengthExceeded(message) => ApiError::of(class, message),
             err => ApiError::of(class, err.to_string()),
         }
+    }
+}
+
+/// A body that is not the JSON a route expects is an OpenAI-shaped `400`
+/// (or `413`/`415`), never axum's plain-text rejection.
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        let class = match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => ErrorClass::PayloadTooLarge,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => ErrorClass::UnsupportedMediaType,
+            _ => ErrorClass::InvalidRequest,
+        };
+        let message = match &rejection {
+            JsonRejection::JsonSyntaxError(_) => {
+                format!(
+                    "The request body is not valid JSON: {}",
+                    rejection.body_text()
+                )
+            }
+            _ => rejection.body_text(),
+        };
+        ApiError::of(class, message)
+    }
+}
+
+/// `axum::Json` whose rejection is an [`ApiError`].
+pub struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req, state).await?;
+        Ok(Self(value))
     }
 }
 
@@ -750,6 +894,104 @@ mod tests {
             ApiError::context_length_exceeded("x").openai_body()["error"]["param"],
             "messages"
         );
+    }
+
+    /// A server fault's own text (paths, devices, internal state) never
+    /// reaches a client outside a loopback-bound local server: the body names
+    /// the request instead. `503` messages are written for clients and stay.
+    #[tokio::test]
+    async fn server_faults_are_redacted_with_the_request_id() {
+        let internal = "Failed to read /var/lib/izwi/models/x.safetensors";
+        let redacted = with_request_id("req-42".into(), async {
+            ApiError::internal(internal).into_response()
+        })
+        .await;
+        assert_eq!(redacted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let message = body(redacted).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!message.contains("/var/lib"), "{message}");
+        assert!(message.contains("req-42"), "{message}");
+
+        let bad_gateway = ApiError::of(ErrorClass::BadGateway, "worker 10.0.0.7 sent junk");
+        let message = bad_gateway.openai_body()["error"]["message"].to_string();
+        assert!(!message.contains("10.0.0.7"), "{message}");
+
+        let shown =
+            showing_server_faults(true, async { ApiError::internal(internal).into_response() })
+                .await;
+        assert_eq!(body(shown).await["error"]["message"], internal);
+
+        let unavailable = ApiError::service_unavailable("all ASR slots are busy");
+        assert_eq!(
+            unavailable.openai_body()["error"]["message"],
+            "all ASR slots are busy"
+        );
+    }
+
+    /// A stream renders its error events later, outside the request's
+    /// scope; the scope captured when the stream starts still applies.
+    #[tokio::test]
+    async fn captured_scope_renders_stream_errors_like_the_request() {
+        let error = ApiError::internal("kernel failed on /dev/gpu0");
+        let shown = showing_server_faults(true, async { ErrorScope::current() }).await;
+        let named = with_request_id("req-7".into(), async { ErrorScope::current() }).await;
+        assert_eq!(shown.client_message(&error), "kernel failed on /dev/gpu0");
+        let message = named.client_message(&error);
+        assert!(
+            message.contains("req-7") && !message.contains("/dev"),
+            "{message}"
+        );
+        assert_eq!(
+            named.openai_body(&error)["error"]["message"],
+            message.as_str()
+        );
+    }
+
+    /// A body that is not valid JSON is an OpenAI error object, not axum's
+    /// plain-text rejection.
+    #[tokio::test]
+    async fn malformed_json_bodies_are_openai_errors() {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[allow(dead_code)]
+            model: String,
+        }
+        let request = |content_type: &str, body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        for (request, status, code) in [
+            (
+                request("application/json", "{\"model\": "),
+                StatusCode::BAD_REQUEST,
+                "invalid_value",
+            ),
+            (
+                request("application/json", "{\"model\": 7}"),
+                StatusCode::BAD_REQUEST,
+                "invalid_value",
+            ),
+            (
+                request("text/plain", "{\"model\": \"m\"}"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+            ),
+        ] {
+            let Err(error) = ApiJson::<Body>::from_request(request, &()).await else {
+                panic!("the body must be rejected");
+            };
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            let body = body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["code"], code);
+        }
     }
 
     /// A typed store error keeps its class; any other store failure is a

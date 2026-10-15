@@ -19,7 +19,7 @@ use crate::app::chat::{
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson, ErrorScope};
 use crate::ids::new_prefixed_id;
 use crate::state::{AppState, StoredResponseInputItem, StoredResponseRecord};
 use izwi_core::{parse_chat_model_variant, ChatMediaInput, ChatMessage, ChatRole, ModelVariant};
@@ -51,7 +51,7 @@ fn response_stream_interruption_payload(response_id: &str, saw_terminal: bool) -
 pub async fn create_response(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<ResponsesCreateRequest>,
+    ApiJson(req): ApiJson<ResponsesCreateRequest>,
 ) -> Result<Response<Body>, ApiError> {
     let model_variant = parse_chat_model_variant(Some(&req.model))
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -290,6 +290,9 @@ async fn create_streaming_response(
     let model_name = execution_request.variant.dir_name().to_string();
     let store_state = state.clone();
     let mut event_rx = start_chat_stream(state.clone(), execution_request).await?;
+    // The body is polled after the handler returns, outside the request's
+    // error scope; capture it here.
+    let errors = ErrorScope::current();
 
     let stream = async_stream::stream! {
         let created_response = ResponseObject {
@@ -484,8 +487,10 @@ async fn create_streaming_response(
                     (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => {
-                    let failed =
-                        response_stream_failure_payload(&response_id_for_task, &error.message);
+                    let failed = response_stream_failure_payload(
+                        &response_id_for_task,
+                        errors.client_message(&error),
+                    );
                     persist_response(
                         &store_state,
                         StoredResponseRecord {

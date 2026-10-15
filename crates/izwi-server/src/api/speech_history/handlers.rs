@@ -39,7 +39,7 @@ use crate::batch_runtime::{
     worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
 use crate::entity::RuntimeProjectionAttempt;
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
     MediaIngestRequest, MediaIngestResult,
@@ -574,7 +574,7 @@ pub async fn create_text_to_speech_record(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
     headers: HeaderMap,
-    Json(req): Json<CreateSpeechHistoryRecordRequest>,
+    ApiJson(req): ApiJson<CreateSpeechHistoryRecordRequest>,
 ) -> Result<Response, ApiError> {
     let idempotency_key = extract_idempotency_key(&headers)?;
     create_record(
@@ -590,7 +590,7 @@ pub async fn create_text_to_speech_record(
 pub async fn create_voice_design_record(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<CreateSpeechHistoryRecordRequest>,
+    ApiJson(req): ApiJson<CreateSpeechHistoryRecordRequest>,
 ) -> Result<Response, ApiError> {
     create_record(state, ctx, req, SpeechRouteKind::VoiceDesign, None).await
 }
@@ -598,7 +598,7 @@ pub async fn create_voice_design_record(
 pub async fn create_voice_cloning_record(
     State(state): State<AppState>,
     Extension(ctx): Extension<RequestContext>,
-    Json(req): Json<CreateSpeechHistoryRecordRequest>,
+    ApiJson(req): ApiJson<CreateSpeechHistoryRecordRequest>,
 ) -> Result<Response, ApiError> {
     create_record(state, ctx, req, SpeechRouteKind::VoiceCloning, None).await
 }
