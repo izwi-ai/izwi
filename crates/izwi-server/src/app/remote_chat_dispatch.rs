@@ -1554,7 +1554,7 @@ mod tests {
         assert!(alternate[0].remaining_time_ms < first[0].remaining_time_ms);
     }
 
-    fn fleet_coordinator() -> (
+    async fn fleet_coordinator() -> (
         Arc<crate::app::fleet_coordinator::FleetCoordinator>,
         tempfile::TempDir,
     ) {
@@ -1563,10 +1563,14 @@ mod tests {
             root.path().join("fleet.sqlite3"),
         ));
         (
-            Arc::new(crate::app::fleet_coordinator::FleetCoordinator::new(
-                store,
-                "gateway-test".to_string(),
-            )),
+            Arc::new(
+                crate::app::fleet_coordinator::FleetCoordinator::new(
+                    store,
+                    "gateway-test".to_string(),
+                )
+                .opened()
+                .await,
+            ),
             root,
         )
     }
@@ -1586,7 +1590,7 @@ mod tests {
             client(&worker.endpoint()),
             1,
         );
-        let (coordinator, _root) = fleet_coordinator();
+        let (coordinator, _root) = fleet_coordinator().await;
         let store = coordinator.store();
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
         let generation = dispatcher(registry)
@@ -1626,16 +1630,23 @@ mod tests {
                 1,
                 4,
             );
-            let coordinator = Arc::new(crate::app::fleet_coordinator::FleetCoordinator::new(
+            let coordinator = crate::app::fleet_coordinator::FleetCoordinator::new(
                 BatchRuntimeStore::initialize_with_database(StoreDatabase::new(fleet_db.clone())),
                 gateway_id.to_string(),
-            ));
+            );
+            (registry, coordinator)
+        };
+        let open = |(registry, coordinator): (
+            WorkerRegistry,
+            crate::app::fleet_coordinator::FleetCoordinator,
+        )| async move {
+            let coordinator = Arc::new(coordinator.opened().await);
             let dispatcher =
                 dispatcher(registry.clone()).with_fleet_coordinator(Arc::clone(&coordinator));
             (registry, coordinator, dispatcher)
         };
-        let (registry_a, coordinator_a, dispatcher_a) = gateway("gateway-a");
-        let (registry_b, coordinator_b, dispatcher_b) = gateway("gateway-b");
+        let (registry_a, coordinator_a, dispatcher_a) = open(gateway("gateway-a")).await;
+        let (registry_b, coordinator_b, dispatcher_b) = open(gateway("gateway-b")).await;
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
         let mut held = Vec::new();
         for _ in 0..2 {
@@ -1683,6 +1694,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hung_fleet_store_costs_at_most_the_claim_timeout() {
+        let worker = ScriptedWorker::spawn(
+            ScriptedResponse::Success("from-fleet".into()),
+            Duration::ZERO,
+        )
+        .await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        register(
+            &registry,
+            "worker-a",
+            "inc-a",
+            client(&worker.endpoint()),
+            1,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("fleet.sqlite3"),
+        ));
+        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        store.set_faults_for_test(Arc::clone(&faults));
+        faults.hang_fleet_calls();
+        let coordinator = Arc::new(
+            crate::app::fleet_coordinator::FleetCoordinator::new(store, "gateway-test".into())
+                .with_claim_timeout(Duration::from_millis(50))
+                .opened()
+                .await,
+        );
+        let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
+        // The worker stays the admission arbiter: a store that never answers
+        // the claim must not hold the request on its time-to-first-token.
+        let generation = tokio::time::timeout(
+            Duration::from_secs(2),
+            dispatcher(registry)
+                .with_fleet_coordinator(coordinator)
+                .generate(2, &context, request(), tenant_work()),
+        )
+        .await
+        .expect("a hung coordination store must not stall dispatch")
+        .unwrap();
+        assert_eq!(generation.text, "from-fleet");
+        faults.answer_fleet_calls();
+    }
+
+    #[tokio::test]
     async fn fleet_claim_loss_still_invokes_and_succeeds() {
         let worker = ScriptedWorker::spawn(
             ScriptedResponse::Success("from-fleet".into()),
@@ -1697,7 +1752,7 @@ mod tests {
             client(&worker.endpoint()),
             1,
         );
-        let (coordinator, _root) = fleet_coordinator();
+        let (coordinator, _root) = fleet_coordinator().await;
         // A peer holds the only observable credit, but this gateway's cached
         // snapshot is stale (empty): selection proceeds, the claim loses, and
         // the worker arbitrates the invocation to success.

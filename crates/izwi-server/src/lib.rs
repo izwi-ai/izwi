@@ -1038,6 +1038,7 @@ async fn gateway_state(
     // arbiter, and 1/N partitioning stays the explicitly-chosen quota
     // fallback (`IZWI_GATEWAY_FLEET_PARTITION`/`_SIZE`).
     let fleet_claim_ttl = crate::gateway_fleet::fleet_claim_ttl_from_env()?;
+    let fleet_claim_timeout = crate::gateway_fleet::fleet_claim_timeout_from_env()?;
     let mut fleet_maintenance: Option<tokio::task::JoinHandle<()>> = None;
     let fleet = match crate::gateway_fleet::fleet_database_from_env()? {
         Some(fleet_database) => {
@@ -1046,7 +1047,7 @@ async fn gateway_state(
                     crate::db::StoreDatabase::new(path)
                 }
                 crate::gateway_fleet::FleetDatabase::Url(url) => {
-                    crate::db::StoreDatabase::from_url(url)
+                    crate::db::StoreDatabase::from_coordination_url(url)
                 }
             };
             let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
@@ -1072,7 +1073,8 @@ async fn gateway_state(
                     store,
                     crate::gateway_fleet::gateway_identity(),
                 )
-                .with_claim_ttl(fleet_claim_ttl),
+                .with_claim_ttl(fleet_claim_ttl)
+                .with_claim_timeout(fleet_claim_timeout),
             );
             let released = coordinator.release_own_claims().await;
             info!(
@@ -1081,6 +1083,7 @@ async fn gateway_state(
                 gateway_id = coordinator.gateway_id(),
                 released_own_claims = released,
                 claim_ttl_ms = fleet_claim_ttl.as_millis() as u64,
+                claim_timeout_ms = fleet_claim_timeout.as_millis() as u64,
                 selection_mode = "shared_atomic_claims",
                 // Parsed once already in run_gateway; re-read here so the
                 // posture log names the effective quota mode.
@@ -1677,13 +1680,17 @@ fn spawn_gateway_worker_poller(
         "Worker status poller cadence"
     );
     tokio::spawn(async move {
+        // Owned by this task, so stopping the poller stops its publisher.
+        let publisher = fleet
+            .as_ref()
+            .map(app::fleet_coordinator::FleetCoordinator::spawn_status_publisher);
         let mut ticker = tokio::time::interval(cadence);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The adopting observation was recorded synchronously.
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match refresh_gateway_worker_status(&registry, &expected, fleet.as_deref()).await {
+            match refresh_gateway_worker_status(&registry, &expected, publisher.as_ref()).await {
                 Ok(status) => {
                     // DS6: a Ready observation of a pending rollout
                     // successor completes the cutover atomically in
@@ -1724,24 +1731,28 @@ fn spawn_gateway_worker_poller(
     })
 }
 
+/// Records one polled status in the registry, then hands it to the fleet
+/// publisher. The registry observation is what keeps the worker fresh, so it
+/// never waits on the coordination store; the publisher shares it with peer
+/// gateways in the background.
 async fn refresh_gateway_worker_status(
     registry: &worker_registry::WorkerRegistry,
     expected: &GatewayWorkerExpectation,
-    fleet: Option<&app::fleet_coordinator::FleetCoordinator>,
+    fleet: Option<&app::fleet_coordinator::FleetStatusPublisher>,
 ) -> anyhow::Result<WorkerStatus> {
     let status = validate_gateway_worker_status(expected, expected.client.status().await?)?;
-    if let Some(coordinator) = fleet {
-        coordinator.publish_and_refresh(&status).await;
-    }
     match registry.observe_status(status.clone()) {
-        Ok(()) => Ok(status),
+        Ok(()) => {}
         Err(worker_registry::WorkerRegistryError::UnknownOrStaleIncarnation) => {
             let descriptor = expected.client.descriptor().await?;
             approve_gateway_worker(registry, expected, descriptor, status.clone())?;
-            Ok(status)
         }
-        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        Err(error) => return Err(anyhow::anyhow!(error.to_string())),
     }
+    if let Some(publisher) = fleet {
+        publisher.publish(status.clone());
+    }
+    Ok(status)
 }
 
 fn required_gateway_value<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
@@ -3826,6 +3837,50 @@ mod tests {
             validated_capacity,
         };
         (worker, expected, descriptor, status)
+    }
+
+    #[tokio::test]
+    async fn status_refresh_never_waits_on_a_hung_fleet_store() {
+        use izwi_serving_client::mock::MockWorkerConfig;
+
+        let registry =
+            worker_registry::WorkerRegistry::new(worker_registry::WorkerRegistryConfig::default())
+                .expect("registry initializes");
+        let (_worker, expected, descriptor, status) =
+            reconnect_expectation(MockWorkerConfig::default()).await;
+        approve_gateway_worker(&registry, &expected, descriptor, status.clone())
+            .expect("initial approval");
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let mut store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
+            crate::db::StoreDatabase::new(root.path().join("fleet.sqlite3")),
+        );
+        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        store.set_faults_for_test(Arc::clone(&faults));
+        faults.hang_fleet_calls();
+        let coordinator = Arc::new(app::fleet_coordinator::FleetCoordinator::new(
+            store,
+            "gateway-test".to_string(),
+        ));
+        let publisher = coordinator.spawn_status_publisher();
+
+        // A coordination store that stops answering must not delay the
+        // observation that keeps the worker fresh: every poll still lands.
+        for _ in 0..3 {
+            let refreshed = tokio::time::timeout(
+                Duration::from_secs(2),
+                refresh_gateway_worker_status(&registry, &expected, Some(&publisher)),
+            )
+            .await
+            .expect("a hung coordination store must not stall the status poll")
+            .expect("status refresh succeeds");
+            assert!(refreshed.status_sequence > status.status_sequence);
+        }
+        assert!(
+            registry.observe_status(status).is_err(),
+            "the registry recorded the newer polled statuses"
+        );
+        faults.answer_fleet_calls();
     }
 
     #[tokio::test]

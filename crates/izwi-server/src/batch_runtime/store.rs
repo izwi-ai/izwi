@@ -67,6 +67,10 @@ pub(crate) enum StoreFaultPoint {
 pub(crate) struct StoreFaults {
     /// Per point: calls still let through, then calls still failed.
     armed: std::sync::Mutex<std::collections::HashMap<StoreFaultPoint, (u32, u32)>>,
+    /// While set, fleet coordination calls hang, as on a database host that
+    /// stopped answering on an established connection.
+    fleet_hung: std::sync::atomic::AtomicBool,
+    fleet_answers: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -85,6 +89,25 @@ impl StoreFaults {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&point)
             .map_or(0, |(_, fail)| *fail)
+    }
+
+    pub(crate) fn hang_fleet_calls(&self) {
+        self.fleet_hung.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn answer_fleet_calls(&self) {
+        self.fleet_hung.store(false, Ordering::SeqCst);
+        self.fleet_answers.notify_waiters();
+    }
+
+    async fn wait_while_fleet_hung(&self) {
+        loop {
+            let answered = self.fleet_answers.notified();
+            if !self.fleet_hung.load(Ordering::SeqCst) {
+                return;
+            }
+            answered.await;
+        }
     }
 
     fn trip(&self, point: StoreFaultPoint) -> bool {
@@ -858,6 +881,15 @@ impl BatchRuntimeStore {
     #[cfg(test)]
     pub(crate) fn set_faults_for_test(&mut self, faults: Arc<StoreFaults>) {
         self.test_faults = Some(faults);
+    }
+
+    /// Hangs a fleet coordination call while the test's faults say the
+    /// store stopped answering.
+    #[cfg(test)]
+    pub(crate) async fn fleet_call_fault(&self) {
+        if let Some(faults) = &self.test_faults {
+            faults.wait_while_fleet_hung().await;
+        }
     }
 
     fn inject_fault(&self, point: StoreFaultPoint) -> anyhow::Result<()> {

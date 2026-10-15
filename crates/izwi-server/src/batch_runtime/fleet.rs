@@ -78,6 +78,8 @@ impl BatchRuntimeStore {
         &self,
         input: &FleetWorkerObservation,
     ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        self.fleet_call_fault().await;
         validate_fleet_id("worker ID", &input.worker_id)?;
         validate_fleet_id("node ID", &input.node_id)?;
         validate_fleet_id("incarnation ID", &input.incarnation_id)?;
@@ -228,6 +230,8 @@ impl BatchRuntimeStore {
         available: u32,
         ttl_ms: u64,
     ) -> anyhow::Result<Option<String>> {
+        #[cfg(test)]
+        self.fleet_call_fault().await;
         validate_fleet_id("worker ID", worker_id)?;
         validate_fleet_id("incarnation ID", incarnation_id)?;
         validate_fleet_id("gateway ID", gateway_id)?;
@@ -356,6 +360,8 @@ impl BatchRuntimeStore {
         worker_id: &str,
         gateway_id: &str,
     ) -> anyhow::Result<u64> {
+        #[cfg(test)]
+        self.fleet_call_fault().await;
         validate_fleet_id("worker ID", worker_id)?;
         validate_fleet_id("gateway ID", gateway_id)?;
         let now = self.fleet_now();

@@ -9,6 +9,11 @@ use tokio::sync::OnceCell;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
+/// Server-side bound on every statement, and on any transaction left idle,
+/// for the fleet coordination store. Coordination queries are single-row
+/// claims, upserts and counts; one that runs this long is a stuck lock or a
+/// hung peer, and must not hold the worker's advisory lock for everyone else.
+const COORDINATION_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 pub async fn initialize_default() -> anyhow::Result<DatabaseConnection> {
@@ -27,7 +32,7 @@ pub async fn connect_default() -> anyhow::Result<DatabaseConnection> {
             .context("Failed to prepare storage layout for SeaORM")?;
     }
 
-    connect_source(&source).await
+    connect_source(&source, None).await
 }
 
 pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> {
@@ -45,7 +50,13 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
 /// Connect to a database by URL. SQLite URLs keep the file-mode options the
 /// path form provides; server backends (PostgreSQL, MySQL) connect with the
 /// same bounded pool settings and no filesystem side effects.
-pub async fn connect_url(url: &str) -> anyhow::Result<DatabaseConnection> {
+///
+/// `statement_timeout`, when set, becomes a server-side statement and
+/// idle-in-transaction timeout on every PostgreSQL session.
+async fn connect_url(
+    url: &str,
+    statement_timeout: Option<Duration>,
+) -> anyhow::Result<DatabaseConnection> {
     let mut options = ConnectOptions::new(url.to_string());
     if url.trim_start().starts_with("sqlite://") {
         apply_sqlite_options(&mut options);
@@ -56,7 +67,19 @@ pub async fn connect_url(url: &str) -> anyhow::Result<DatabaseConnection> {
             .connect_timeout(SQLITE_BUSY_TIMEOUT)
             .acquire_timeout(SQLITE_BUSY_TIMEOUT)
             .sqlx_logging(false);
+        #[cfg(feature = "db-postgres")]
+        if let Some(timeout) = statement_timeout {
+            let millis = timeout.as_millis().to_string();
+            options.map_sqlx_postgres_opts(move |postgres| {
+                postgres.options([
+                    ("statement_timeout", millis.as_str()),
+                    ("idle_in_transaction_session_timeout", millis.as_str()),
+                ])
+            });
+        }
     }
+    #[cfg(not(feature = "db-postgres"))]
+    let _ = statement_timeout;
 
     Database::connect(options)
         .await
@@ -65,10 +88,11 @@ pub async fn connect_url(url: &str) -> anyhow::Result<DatabaseConnection> {
 
 async fn connect_source(
     source: &storage_layout::DatabaseSource,
+    statement_timeout: Option<Duration>,
 ) -> anyhow::Result<DatabaseConnection> {
     match source {
         storage_layout::DatabaseSource::Path(path) => connect_path(path).await,
-        storage_layout::DatabaseSource::Url(url) => connect_url(url).await,
+        storage_layout::DatabaseSource::Url(url) => connect_url(url, statement_timeout).await,
     }
 }
 
@@ -92,6 +116,7 @@ fn apply_sqlite_options(options: &mut ConnectOptions) {
 pub struct StoreDatabase {
     source: Option<storage_layout::DatabaseSource>,
     connection: Arc<OnceCell<DatabaseConnection>>,
+    statement_timeout: Option<Duration>,
 }
 
 impl StoreDatabase {
@@ -105,6 +130,7 @@ impl StoreDatabase {
         Ok(Self {
             source: Some(source),
             connection: Arc::new(OnceCell::new()),
+            statement_timeout: None,
         })
     }
 
@@ -112,6 +138,7 @@ impl StoreDatabase {
         Self {
             source: Some(storage_layout::DatabaseSource::Path(db_path)),
             connection: Arc::new(OnceCell::new()),
+            statement_timeout: None,
         }
     }
 
@@ -121,6 +148,18 @@ impl StoreDatabase {
         Self {
             source: Some(storage_layout::DatabaseSource::Url(url)),
             connection: Arc::new(OnceCell::new()),
+            statement_timeout: None,
+        }
+    }
+
+    /// Address the multi-gateway coordination store through a database URL.
+    /// PostgreSQL sessions carry a server-side statement and
+    /// idle-in-transaction timeout, so a stuck query or an abandoned claim
+    /// transaction cannot hold the per-worker advisory lock indefinitely.
+    pub fn from_coordination_url(url: String) -> Self {
+        Self {
+            statement_timeout: Some(COORDINATION_STATEMENT_TIMEOUT),
+            ..Self::from_url(url)
         }
     }
 
@@ -132,15 +171,17 @@ impl StoreDatabase {
         Self {
             source: None,
             connection: Arc::new(cell),
+            statement_timeout: None,
         }
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
         if let Some(source) = self.source.clone() {
+            let statement_timeout = self.statement_timeout;
             return self
                 .connection
                 .get_or_try_init(|| async move {
-                    let db = connect_source(&source).await?;
+                    let db = connect_source(&source, statement_timeout).await?;
                     Migrator::up(&db)
                         .await
                         .context("Failed to run migrations for SeaORM store")?;

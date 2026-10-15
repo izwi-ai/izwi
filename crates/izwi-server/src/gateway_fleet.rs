@@ -18,6 +18,7 @@ const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";
 const FLEET_SIZE_ENV: &str = "IZWI_GATEWAY_FLEET_SIZE";
 const FLEET_DB_PATH_ENV: &str = "IZWI_GATEWAY_FLEET_DB_PATH";
 const FLEET_CLAIM_TTL_MS_ENV: &str = "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS";
+const FLEET_CLAIM_TIMEOUT_MS_ENV: &str = "IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS";
 const GATEWAY_ID_ENV: &str = "IZWI_GATEWAY_ID";
 const MAX_ENV_VALUE_BYTES: usize = 20;
 const MAX_FLEET_SIZE: u32 = 256;
@@ -29,6 +30,13 @@ const MAX_DB_PATH_BYTES: usize = 4096;
 pub const DEFAULT_FLEET_CLAIM_TTL_MS: u64 = 30_000;
 const MIN_FLEET_CLAIM_TTL_MS: u64 = 100;
 const MAX_FLEET_CLAIM_TTL_MS: u64 = 300_000;
+/// How long a dispatch waits for its capacity claim before invoking without
+/// one. Claims only steer selection, so this sits on the time-to-first-token
+/// path with no correctness role: a slow coordination store must cost at most
+/// this much latency, never an outage.
+pub const DEFAULT_FLEET_CLAIM_TIMEOUT_MS: u64 = 100;
+const MIN_FLEET_CLAIM_TIMEOUT_MS: u64 = 1;
+const MAX_FLEET_CLAIM_TIMEOUT_MS: u64 = 5_000;
 
 /// A bounded fleet partition index and total size.
 ///
@@ -124,6 +132,10 @@ pub enum FleetPartitionError {
         "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS must be a bounded millisecond value between {MIN_FLEET_CLAIM_TTL_MS} and {MAX_FLEET_CLAIM_TTL_MS}"
     )]
     InvalidClaimTtl,
+    #[error(
+        "IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS must be a bounded millisecond value between {MIN_FLEET_CLAIM_TIMEOUT_MS} and {MAX_FLEET_CLAIM_TIMEOUT_MS}"
+    )]
+    InvalidClaimTimeout,
 }
 
 /// A bounded fleet coordination database reference: a SQLite file path
@@ -203,6 +215,28 @@ pub fn fleet_claim_ttl_from_env() -> Result<std::time::Duration, FleetPartitionE
     if !(MIN_FLEET_CLAIM_TTL_MS..=MAX_FLEET_CLAIM_TTL_MS).contains(&millis) {
         return Err(FleetPartitionError::InvalidClaimTtl);
     }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
+/// Resolve how long a dispatch waits for its fleet capacity claim. Unset
+/// keeps the 100ms default; operators may widen it (bounded 1ms–5s) for a
+/// distant coordination store.
+pub fn fleet_claim_timeout_from_env() -> Result<std::time::Duration, FleetPartitionError> {
+    let Some(raw) = std::env::var_os(FLEET_CLAIM_TIMEOUT_MS_ENV) else {
+        return Ok(std::time::Duration::from_millis(
+            DEFAULT_FLEET_CLAIM_TIMEOUT_MS,
+        ));
+    };
+    let millis = raw
+        .to_str()
+        .filter(|raw| {
+            !raw.is_empty()
+                && raw.len() <= MAX_ENV_VALUE_BYTES
+                && raw.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| (MIN_FLEET_CLAIM_TIMEOUT_MS..=MAX_FLEET_CLAIM_TIMEOUT_MS).contains(millis))
+        .ok_or(FleetPartitionError::InvalidClaimTimeout)?;
     Ok(std::time::Duration::from_millis(millis))
 }
 
@@ -372,5 +406,29 @@ mod tests {
             );
         }
         std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TTL_MS");
+    }
+
+    #[test]
+    fn fleet_claim_timeout_defaults_and_bounds() {
+        let _guard = env_lock();
+        std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS");
+        assert_eq!(
+            fleet_claim_timeout_from_env().unwrap(),
+            std::time::Duration::from_millis(DEFAULT_FLEET_CLAIM_TIMEOUT_MS)
+        );
+        std::env::set_var("IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS", "250");
+        assert_eq!(
+            fleet_claim_timeout_from_env().unwrap(),
+            std::time::Duration::from_millis(250)
+        );
+        for invalid in ["0", "5001", "-1", "abc", ""] {
+            std::env::set_var("IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS", invalid);
+            assert_eq!(
+                fleet_claim_timeout_from_env(),
+                Err(FleetPartitionError::InvalidClaimTimeout),
+                "{invalid} must be rejected"
+            );
+        }
+        std::env::remove_var("IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS");
     }
 }

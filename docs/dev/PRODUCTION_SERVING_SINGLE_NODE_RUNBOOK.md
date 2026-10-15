@@ -893,6 +893,18 @@ startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
 immediately instead of waiting out the TTL. Unset means single-gateway
 operation with purely process-local state.
 
+The coordination store never sits on a request's or a status poll's critical
+path. A dispatch waits at most `IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS` (1ms–5s,
+default 100) for its claim and otherwise invokes without one; a claim that
+lands after that is released at once. Status polls record each observation
+locally first and publish it to the store in the background, so a slow or
+hung store cannot make healthy workers look stale. When the store cannot be
+read, a gateway stops counting peer claims for that worker and admission is
+worker-authoritative until the store answers again. PostgreSQL coordination
+sessions carry a 5 s `statement_timeout` and
+`idle_in_transaction_session_timeout`, so a stuck statement or abandoned
+claim transaction cannot hold a worker's advisory lock.
+
 PostgreSQL is the validated server-backed store: the migrator promotes the
 shared DDL per backend and the fleet store execution suite runs against real
 PostgreSQL in CI (`scripts/ci/check-backend-truth.sh cargo-fleet-stores`).

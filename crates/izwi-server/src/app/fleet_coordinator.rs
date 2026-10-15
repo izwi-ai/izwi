@@ -34,7 +34,7 @@ use izwi_serving_protocol::WorkerStatus;
 
 use crate::{
     batch_runtime::store::BatchRuntimeStore,
-    gateway_fleet::DEFAULT_FLEET_CLAIM_TTL_MS,
+    gateway_fleet::{DEFAULT_FLEET_CLAIM_TIMEOUT_MS, DEFAULT_FLEET_CLAIM_TTL_MS},
     worker_registry::{FleetCapacityView, WorkerInstanceKey},
 };
 
@@ -52,6 +52,11 @@ pub(crate) const FLEET_MAINTENANCE_BATCH: usize = 1024;
 /// Cadence of the background maintenance sweep. Slow by design: the reader
 /// side already ignores expired rows, so the sweep only reclaims space.
 pub(crate) const FLEET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on one background status publish (one upsert plus one count). The
+/// publisher runs off the status poller, so this only keeps a hung store
+/// from wedging the publisher; the next status then starts a fresh attempt.
+const FLEET_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Locally cached fresh view of peer gateways' cluster claims, refreshed on
 /// the worker status-poller cadence. Selection reads this synchronously and
@@ -106,11 +111,33 @@ impl Drop for FleetClaimGuard {
     }
 }
 
+/// Latest-value hand-off from one worker's status poller to its background
+/// fleet publisher. Publishing never blocks the poller: a newer status
+/// replaces one the publisher has not picked up yet, and dropping the handle
+/// stops the publisher.
+pub struct FleetStatusPublisher {
+    latest: tokio::sync::watch::Sender<Option<WorkerStatus>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FleetStatusPublisher {
+    pub fn publish(&self, status: WorkerStatus) {
+        self.latest.send_replace(Some(status));
+    }
+}
+
+impl Drop for FleetStatusPublisher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FleetCoordinator {
     store: BatchRuntimeStore,
     gateway_id: String,
     claim_ttl: Duration,
+    claim_timeout: Duration,
     snapshot: FleetCapacitySnapshot,
 }
 
@@ -120,8 +147,16 @@ impl FleetCoordinator {
             store,
             gateway_id,
             claim_ttl: Duration::from_millis(DEFAULT_FLEET_CLAIM_TTL_MS),
+            claim_timeout: Duration::from_millis(DEFAULT_FLEET_CLAIM_TIMEOUT_MS),
             snapshot: FleetCapacitySnapshot::default(),
         }
+    }
+
+    /// Override how long a dispatch waits for its claim
+    /// (`IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS`).
+    pub fn with_claim_timeout(mut self, claim_timeout: Duration) -> Self {
+        self.claim_timeout = claim_timeout;
+        self
     }
 
     /// Override the claim TTL (DS5.3: `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS`).
@@ -151,6 +186,14 @@ impl FleetCoordinator {
         &self.store
     }
 
+    /// Opens (and migrates) the store up front, as gateway boot does, so the
+    /// first claim is not measured against the lazy first open.
+    #[cfg(test)]
+    pub(crate) async fn opened(self) -> Self {
+        self.store.connection().await.expect("fleet store opens");
+        self
+    }
+
     pub fn snapshot_view(&self) -> FleetCapacitySnapshot {
         self.snapshot.clone()
     }
@@ -160,29 +203,85 @@ impl FleetCoordinator {
     }
 
     /// Claim one unit of cluster capacity for a selected worker. Returns
-    /// None when peers already hold every observable credit; the caller
-    /// proceeds to invoke anyway and lets the worker arbitrate, so a lost
-    /// race degrades to one alternate dispatch rather than a dropped request.
+    /// None when peers already hold every observable credit, when the store
+    /// fails, or when it does not answer within the claim timeout; the
+    /// caller proceeds to invoke anyway and lets the worker arbitrate, so a
+    /// lost race or a slow store degrades to worker-authoritative admission
+    /// rather than a delayed or dropped request.
+    ///
+    /// The store call runs on its own task so a claim that lands after the
+    /// dispatcher stopped waiting is released at once instead of shadowing a
+    /// credit until its TTL. The pool's acquire timeout (and, on PostgreSQL,
+    /// the session statement timeout) bounds how long such a task can live.
     pub async fn claim(
         self: &Arc<Self>,
         worker: &WorkerInstanceKey,
         available: u32,
     ) -> Option<FleetClaimGuard> {
-        let claim_id = self
-            .store
-            .try_claim_fleet_capacity(
-                worker.worker_id.as_str(),
-                worker.incarnation_id.as_str(),
-                &self.gateway_id,
-                available,
-                self.claim_ttl_ms(),
-            )
+        let coordinator = Arc::clone(self);
+        let worker_id = worker.worker_id.as_str().to_string();
+        let incarnation_id = worker.incarnation_id.as_str().to_string();
+        let (claimed, wait) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let claim_id = coordinator
+                .store
+                .try_claim_fleet_capacity(
+                    &worker_id,
+                    &incarnation_id,
+                    &coordinator.gateway_id,
+                    available,
+                    coordinator.claim_ttl_ms(),
+                )
+                .await;
+            if let Ok(Some(claim_id)) = claim_id {
+                // A dispatcher that timed out dropped the receiver; the
+                // returned guard then drops here and releases the claim.
+                let _ = claimed.send(FleetClaimGuard {
+                    coordinator,
+                    claim_id,
+                });
+            }
+        });
+        tokio::time::timeout(self.claim_timeout, wait)
             .await
-            .ok()??;
-        Some(FleetClaimGuard {
-            coordinator: Arc::clone(self),
-            claim_id,
-        })
+            .ok()?
+            .ok()
+    }
+
+    /// Start the background publisher for one worker's polled statuses. The
+    /// status poller records each observation locally first and then hands
+    /// it over here, so a slow or hung coordination store can never delay
+    /// the observation that keeps the worker fresh.
+    pub fn spawn_status_publisher(self: &Arc<Self>) -> FleetStatusPublisher {
+        let (latest, mut pending) = tokio::sync::watch::channel(None::<WorkerStatus>);
+        let coordinator = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            while pending.changed().await.is_ok() {
+                let Some(status) = pending.borrow_and_update().clone() else {
+                    continue;
+                };
+                if tokio::time::timeout(
+                    FLEET_PUBLISH_TIMEOUT,
+                    coordinator.publish_and_refresh(&status),
+                )
+                .await
+                .is_err()
+                {
+                    coordinator.forget_peer_claims(&status);
+                }
+            }
+        });
+        FleetStatusPublisher { latest, task }
+    }
+
+    /// A peer-claim count this gateway cannot refresh is not evidence: fall
+    /// back to worker-authoritative admission for that worker.
+    fn forget_peer_claims(&self, status: &WorkerStatus) {
+        self.snapshot.set_worker_claims(
+            status.worker_id.as_str(),
+            status.incarnation_id.as_str(),
+            0,
+        );
     }
 
     async fn release(&self, claim_id: &str) -> bool {
@@ -193,8 +292,9 @@ impl FleetCoordinator {
     }
 
     /// Publish one polled worker status to the shared store and refresh the
-    /// local snapshot entry for that worker. Failures retain the previous
-    /// view; the worker's direct observations remain authoritative locally.
+    /// local snapshot entry for that worker. A failed count clears the
+    /// worker's peer claims: the worker's direct observations remain
+    /// authoritative, and claims only ever steer.
     pub async fn publish_and_refresh(&self, status: &WorkerStatus) {
         let deployments = serde_json::to_string(&status.deployments).unwrap_or_default();
         let observation = crate::batch_runtime::fleet::FleetWorkerObservation {
@@ -208,21 +308,18 @@ impl FleetCoordinator {
             deployments_json: deployments,
         };
         let _ = self.store.observe_fleet_worker(&observation).await;
-        let claims = self
+        match self
             .store
             .count_live_peer_fleet_claims(status.worker_id.as_str(), &self.gateway_id)
             .await
-            .unwrap_or_else(|_| {
-                self.snapshot.cluster_claims(&WorkerInstanceKey {
-                    worker_id: status.worker_id.clone(),
-                    incarnation_id: status.incarnation_id.clone(),
-                })
-            });
-        self.snapshot.set_worker_claims(
-            status.worker_id.as_str(),
-            status.incarnation_id.as_str(),
-            claims,
-        );
+        {
+            Ok(claims) => self.snapshot.set_worker_claims(
+                status.worker_id.as_str(),
+                status.incarnation_id.as_str(),
+                claims,
+            ),
+            Err(_) => self.forget_peer_claims(status),
+        }
     }
 
     /// One bounded maintenance pass: physically remove expired claims (the
@@ -255,21 +352,25 @@ mod tests {
     use crate::db::StoreDatabase;
     use std::sync::atomic::AtomicI64;
 
-    fn coordinator() -> (Arc<FleetCoordinator>, tempfile::TempDir) {
+    async fn coordinator() -> (Arc<FleetCoordinator>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
         let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
             root.path().join("fleet-coord.sqlite3"),
         ));
         store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
         (
-            Arc::new(FleetCoordinator::new(store, "gateway-test".to_string())),
+            Arc::new(
+                FleetCoordinator::new(store, "gateway-test".to_string())
+                    .opened()
+                    .await,
+            ),
             root,
         )
     }
 
     /// Build a coordinator with an explicit claim TTL and expose the store's
     /// test clock so tests can advance fleet time through the shared atomic.
-    fn coordinator_with(
+    async fn coordinator_with(
         claim_ttl: Duration,
     ) -> (Arc<FleetCoordinator>, Arc<AtomicI64>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
@@ -280,7 +381,10 @@ mod tests {
         store.set_test_clock(clock.clone());
         (
             Arc::new(
-                FleetCoordinator::new(store, "gateway-test".to_string()).with_claim_ttl(claim_ttl),
+                FleetCoordinator::new(store, "gateway-test".to_string())
+                    .with_claim_ttl(claim_ttl)
+                    .opened()
+                    .await,
             ),
             clock,
             root,
@@ -297,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_guard_releases_on_drop_and_snapshot_serves_selection() {
-        let (coordinator, _root) = coordinator();
+        let (coordinator, _root) = coordinator().await;
         let key = worker_key();
         assert_eq!(coordinator.snapshot_view().cluster_claims(&key), 0);
         let guard = coordinator.claim(&key, 2).await.expect("claim");
@@ -321,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_returns_none_when_peers_hold_all_credits() {
-        let (coordinator, _root) = coordinator();
+        let (coordinator, _root) = coordinator().await;
         let key = worker_key();
         let _first = coordinator.claim(&key, 1).await.expect("first claim");
         assert!(
@@ -338,13 +442,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("shared-fleet.sqlite3");
         let build = |gateway: &str| {
-            Arc::new(FleetCoordinator::new(
+            FleetCoordinator::new(
                 BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
-            ))
+            )
+            .opened()
         };
-        let old = build("gateway-old");
-        let new = build("gateway-new");
+        let old = Arc::new(build("gateway-old").await);
+        let new = Arc::new(build("gateway-new").await);
         let key = worker_key();
         let _held = old.claim(&key, 1).await.expect("predecessor claim");
         assert!(
@@ -372,13 +477,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("shared-fleet.sqlite3");
         let build = |gateway: &str| {
-            Arc::new(FleetCoordinator::new(
+            FleetCoordinator::new(
                 BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
-            ))
+            )
+            .opened()
         };
-        let own = build("gateway-own");
-        let peer = build("gateway-peer");
+        let own = Arc::new(build("gateway-own").await);
+        let peer = Arc::new(build("gateway-peer").await);
         let key = worker_key();
         let _own_claim = own.claim(&key, 4).await.expect("own claim");
         let _peer_claim = peer.claim(&key, 4).await.expect("peer claim");
@@ -406,6 +512,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hung_store_claims_degrade_to_none_and_late_claims_release() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("fleet-coord.sqlite3"),
+        ));
+        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        store.set_faults_for_test(Arc::clone(&faults));
+        let coordinator = Arc::new(
+            FleetCoordinator::new(store, "gateway-test".to_string())
+                .opened()
+                .await,
+        );
+        let key = worker_key();
+
+        faults.hang_fleet_calls();
+        let started = std::time::Instant::now();
+        assert!(
+            coordinator.claim(&key, 4).await.is_none(),
+            "a claim the store never answers must degrade to no claim"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the claim must give up at its timeout, waited {:?}",
+            started.elapsed()
+        );
+
+        // The store answers again: the abandoned claim lands, and since no
+        // dispatcher holds it any more it must be released, not left to
+        // shadow the credit until its TTL.
+        faults.answer_fleet_calls();
+        // Let the abandoned call reach the store before sampling it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut live = u64::MAX;
+        for _ in 0..200 {
+            live = coordinator
+                .store
+                .count_live_fleet_claims("worker-a")
+                .await
+                .unwrap();
+            if live == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(live, 0, "a claim that lands after its timeout is released");
+        assert!(
+            coordinator.claim(&key, 4).await.is_some(),
+            "claims resume once the store answers"
+        );
+    }
+
+    #[tokio::test]
     async fn coordinator_degrades_to_uncoordinated_on_store_outage() {
         // Store outage equivalent: when the coordination database is
         // unreachable, claims fail closed to None and dispatch proceeds
@@ -426,7 +584,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_ttl_override_bounds_the_shadowing_window() {
-        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500));
+        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500)).await;
         let key = worker_key();
         let _guard = coordinator.claim(&key, 2).await.expect("claim");
         assert_eq!(
@@ -452,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_sweep_reaps_expired_claims_and_prunes_stale_observations() {
-        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500));
+        let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500)).await;
         let key = worker_key();
         let _guard = coordinator.claim(&key, 2).await.expect("claim");
         let observation = crate::batch_runtime::fleet::FleetWorkerObservation {
