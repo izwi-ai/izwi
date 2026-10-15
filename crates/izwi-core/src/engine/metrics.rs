@@ -1,4 +1,4 @@
-//! Metrics and benchmarking infrastructure for the inference engine.
+//! Metrics infrastructure for the inference engine.
 //!
 //! Provides detailed performance tracking including:
 //! - Request latency histograms
@@ -1917,77 +1917,6 @@ fn compute_percentile(samples: &VecDeque<f64>, percentile: f64) -> f64 {
 
     let index = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
     sorted[index]
-}
-
-/// Benchmark results for a test run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkResult {
-    /// Test name/description
-    pub name: String,
-    /// Number of requests in the benchmark
-    pub num_requests: u64,
-    /// Total duration of the benchmark
-    pub total_duration_secs: f64,
-    /// Metrics snapshot at end of benchmark
-    pub metrics: MetricsSnapshot,
-    /// Throughput in requests per second
-    pub throughput_rps: f64,
-    /// Average time to first token (TTFT) in milliseconds
-    pub avg_ttft_ms: f64,
-    /// Average time per output token (TPOT) in milliseconds  
-    pub avg_tpot_ms: f64,
-}
-
-impl BenchmarkResult {
-    /// Create a new benchmark result.
-    pub fn new(
-        name: impl Into<String>,
-        num_requests: u64,
-        total_duration: Duration,
-        metrics: MetricsSnapshot,
-    ) -> Self {
-        let total_secs = total_duration.as_secs_f64();
-
-        Self {
-            name: name.into(),
-            num_requests,
-            total_duration_secs: total_secs,
-            metrics: metrics.clone(),
-            throughput_rps: if total_secs > 0.0 {
-                num_requests as f64 / total_secs
-            } else {
-                0.0
-            },
-            avg_ttft_ms: metrics.p50_latency_ms * 0.3, // Estimate TTFT as ~30% of total latency
-            avg_tpot_ms: if metrics.avg_tokens_per_sec > 0.0 {
-                1000.0 / metrics.avg_tokens_per_sec
-            } else {
-                0.0
-            },
-        }
-    }
-
-    /// Format as a summary string.
-    pub fn summary(&self) -> String {
-        format!(
-            "Benchmark: {}\n\
-             Requests: {}, Duration: {:.2}s\n\
-             Throughput: {:.2} req/s\n\
-             Latency: avg={:.1}ms, p50={:.1}ms, p90={:.1}ms, p99={:.1}ms\n\
-             RTF: {:.3} (< 1.0 = faster than real-time)\n\
-             Tokens/sec: {:.1}",
-            self.name,
-            self.num_requests,
-            self.total_duration_secs,
-            self.throughput_rps,
-            self.metrics.avg_latency_ms,
-            self.metrics.p50_latency_ms,
-            self.metrics.p90_latency_ms,
-            self.metrics.p99_latency_ms,
-            self.metrics.avg_rtf,
-            self.metrics.avg_tokens_per_sec,
-        )
-    }
 }
 
 #[cfg(test)]
