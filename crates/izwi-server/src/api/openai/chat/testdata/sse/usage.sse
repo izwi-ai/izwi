@@ -1,0 +1,12 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"Coun"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"ted."},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk","usage":{"completion_tokens":5,"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":8}}
+
+data: [DONE]
+

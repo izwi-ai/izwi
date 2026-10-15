@@ -1069,7 +1069,7 @@ mod tests {
         (content, calls, finish)
     }
 
-    fn deltas(text: &str, size: usize) -> Vec<ChatStreamEvent> {
+    pub(super) fn deltas(text: &str, size: usize) -> Vec<ChatStreamEvent> {
         let chars: Vec<char> = text.chars().collect();
         std::iter::once(ChatStreamEvent::Started)
             .chain(chars.chunks(size).map(|piece| ChatStreamEvent::Delta {
@@ -1082,7 +1082,7 @@ mod tests {
             .collect()
     }
 
-    fn tool_format(tool_calls: Option<ToolCallFormat>) -> AnswerFormat {
+    pub(super) fn tool_format(tool_calls: Option<ToolCallFormat>) -> AnswerFormat {
         AnswerFormat {
             compat_profile: OpenAiCompatibilityProfile::Strict,
             reasoning: None,
@@ -1797,3 +1797,7 @@ mod timing_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sse_contract.rs"]
+mod sse_contract;

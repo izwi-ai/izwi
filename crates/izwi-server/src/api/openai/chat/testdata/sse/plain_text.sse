@@ -1,0 +1,14 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Hello "},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"there,"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":" world"},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"."},"finish_reason":null,"index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}],"created":0,"id":"chatcmpl-ID","model":"fixture","object":"chat.completion.chunk"}
+
+data: [DONE]
+
