@@ -1296,7 +1296,8 @@ pub(crate) fn is_held_capacity_refusal(error: &Error) -> bool {
 }
 
 /// The short reason a client sees when live memory refuses a claim: the
-/// first domain where `need` plus what is already held for admitted work
+/// first domain where `need` plus what is already reserved but not yet
+/// allocated (admitted requests and loaded models' pending claims)
 /// exceeds `available`, in GB. The full vectors are logged by the caller.
 fn live_capacity_reason(
     need: ResourceVector,
@@ -1330,7 +1331,7 @@ fn live_capacity_reason(
         }
         let gb = |bytes: u64| bytes as f64 / 1e9;
         return format!(
-            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB held for admitted work)",
+            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB reserved, not yet allocated)",
             gb(need),
             gb(free),
             gb(held)
@@ -1797,7 +1798,7 @@ mod tests {
                 unified(104_000_000),
                 unified(2_304_168_748)
             ),
-            "insufficient live memory: needs 3.34 GB, 2.20 GB available (0.10 GB held for admitted work)"
+            "insufficient live memory: needs 3.34 GB, 2.20 GB available (0.10 GB reserved, not yet allocated)"
         );
     }
 

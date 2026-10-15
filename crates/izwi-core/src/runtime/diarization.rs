@@ -3191,6 +3191,81 @@ mod tests {
         }
     }
 
+    /// LIVE-11: a finished pipeline job leaves nothing behind. Its admission
+    /// (with the capacity wait and a cancellation handle), its decode
+    /// settlement and its Sortformer stage lease all return the authority to
+    /// where it started, so the memory live refusals reported as held at
+    /// idle is not the job's: it is loaded models' reserved, not yet
+    /// allocated, claims.
+    #[tokio::test]
+    async fn a_finished_pipeline_job_releases_every_claim() {
+        use crate::backends::BackendKind;
+        use crate::runtime::coordinator::{InferenceCoordinator, JobCancellation, JobSpec};
+        let samples = 3 * PIPELINE_SAMPLE_RATE as usize;
+        let input_bytes = 44 + samples * 2;
+        for backend in [BackendKind::Metal, BackendKind::Cuda, BackendKind::Cpu] {
+            let coordinator = Arc::new(InferenceCoordinator::new(backend, 1, 4));
+            let authority = coordinator.resource_authority();
+            let before = authority.snapshot();
+            let context = RuntimeRequestContext::default();
+            let spec = JobSpec {
+                request_id: "finished-pipeline".to_string(),
+                lane: CoordinatorLane::Pipeline,
+                priority: context.priority,
+                workload_class: context.workload_class,
+                deadline: None,
+                resources: crate::runtime::service::transient_resources(backend, input_bytes)
+                    .checked_add(diarization_decode_resources(backend))
+                    .unwrap(),
+            };
+            let job = wait_for_held_capacity(Duration::from_secs(1), || {
+                coordinator.admit_observed(
+                    spec.clone(),
+                    JobResourceObservation::host(input_bytes as u64),
+                )
+            })
+            .await
+            .unwrap()
+            .with_cancellation(JobCancellation::new());
+            let steady = JobResourceObservation::host((2 * input_bytes + samples * 4) as u64);
+            let peak = JobResourceObservation::host((3 * input_bytes + samples * 4) as u64);
+            settle_decoded_job(&job, backend, peak, steady, Some(String::new())).unwrap();
+            let workspace =
+                crate::models::architectures::sortformer::diarization::default_profile_workspace_estimate(
+                    ModelVariant::DiarStreamingSortformer4SpkV21,
+                    samples,
+                    backend == BackendKind::Cuda,
+                )
+                .unwrap();
+            let stage_coordinator = coordinator.clone();
+            let stage_job = job.clone();
+            coordinator
+                .run_blocking_stage(&job, move || {
+                    diarize_under_workspace_lease(
+                        &stage_coordinator,
+                        &stage_job,
+                        workspace,
+                        |observer| {
+                            observer(SortformerWorkspaceEvent::Materialized { workspace })?;
+                            observer(SortformerWorkspaceEvent::Releasing { workspace })
+                        },
+                    )
+                })
+                .await
+                .unwrap();
+            drop(job);
+
+            let after = authority.snapshot();
+            assert_eq!(after.reserved, before.reserved, "{backend:?}");
+            assert_eq!(after.pending, before.pending, "{backend:?}");
+            assert_eq!(after.materialized, before.materialized, "{backend:?}");
+            assert_eq!(after.reservations, before.reservations, "{backend:?}");
+            let snapshot = coordinator.snapshot();
+            assert_eq!(snapshot.active_jobs, 0, "{backend:?}");
+            assert_eq!(snapshot.active_executions, 0, "{backend:?}");
+        }
+    }
+
     #[tokio::test]
     async fn pipeline_rejects_an_unrunnable_asr_or_aligner_before_diarizing() {
         // No checkpoints exist here: an id that reached Sortformer would fail
