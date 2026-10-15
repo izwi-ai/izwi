@@ -28,8 +28,8 @@ use izwi_core::{
     audio::{AudioEncoder, AudioFormat},
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, ChatMessage, ChatRole, GenerationConfig, GenerationParams,
-    GenerationRequest, RuntimeRequestContext, RuntimeService, SessionModelLeases, VoiceSession,
-    WorkloadClass,
+    GenerationRequest, RuntimeRequestContext, RuntimeService, SessionModelLeases, VoiceLatency,
+    VoiceSession, VoiceSessionPhase, WorkloadClass,
 };
 use izwi_vad::{
     sanitize_score_threshold, EndpointConfig, EndpointDetector, EndpointEndReason, EndpointEvent,
@@ -82,6 +82,9 @@ const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
 const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
+/// Assistant audio sent this long after the audio already sent had finished
+/// playing counts as a playback underrun.
+const PLAYBACK_UNDERRUN_TOLERANCE: Duration = Duration::from_millis(20);
 const LEGACY_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime_v1";
 const TYPED_VOICE_REALTIME_PROTOCOL: &str = "voice_realtime";
 
@@ -666,6 +669,12 @@ struct PendingAudioCommit {
     utterance_id: String,
     utterance_seq: u64,
     turn_config: VoiceTurnConfig,
+    /// When the endpoint decision ended the utterance; the turn's latencies
+    /// are measured from here.
+    endpointed_at: Instant,
+    /// Trailing silence waited for before the decision, when silence (or a
+    /// client pause) ended the utterance.
+    endpointing_delay: Option<Duration>,
 }
 
 struct ActiveTurn {
@@ -687,16 +696,53 @@ struct TurnControlInner {
     cancelled: AtomicBool,
     reason: Mutex<Option<String>>,
     notify: Notify,
+    endpointed_at: Instant,
+    /// Set once the turn has sent assistant audio.
+    speaking: AtomicBool,
+    playback: Mutex<PlaybackClock>,
 }
 
 impl TurnControl {
-    fn new() -> Self {
+    fn new(endpointed_at: Instant) -> Self {
         Self {
             inner: Arc::new(TurnControlInner {
                 cancelled: AtomicBool::new(false),
                 reason: Mutex::new(None),
                 notify: Notify::new(),
+                endpointed_at,
+                speaking: AtomicBool::new(false),
+                playback: Mutex::new(PlaybackClock::default()),
             }),
+        }
+    }
+
+    fn endpointed_at(&self) -> Instant {
+        self.inner.endpointed_at
+    }
+
+    fn is_speaking(&self) -> bool {
+        self.inner.speaking.load(Ordering::Acquire)
+    }
+
+    /// Account for `duration` of assistant audio just sent: the first audio
+    /// is the turn's response latency, and a chunk that found the client's
+    /// playback already drained is an underrun.
+    fn audio_sent(&self, runtime: &RuntimeService, duration: Duration) {
+        let now = Instant::now();
+        if !self.inner.speaking.swap(true, Ordering::AcqRel) {
+            runtime.record_voice_latency(
+                VoiceLatency::TurnFirstAudio,
+                now.saturating_duration_since(self.inner.endpointed_at),
+            );
+        }
+        let underrun = self
+            .inner
+            .playback
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sent(now, duration);
+        if underrun {
+            runtime.record_voice_egress_underrun();
         }
     }
 
@@ -735,6 +781,47 @@ impl TurnControl {
             }
             notified.await;
         }
+    }
+}
+
+/// The server's view of the client's playback: the audio sent so far finishes
+/// playing at `playing_until`, assuming the client plays it as it arrives.
+#[derive(Debug, Default)]
+struct PlaybackClock {
+    playing_until: Option<Instant>,
+}
+
+impl PlaybackClock {
+    /// Account for `duration` of audio sent at `now`; returns whether the
+    /// audio sent before it had already finished playing (an underrun).
+    fn sent(&mut self, now: Instant, duration: Duration) -> bool {
+        let underrun = self
+            .playing_until
+            .is_some_and(|until| now > until + PLAYBACK_UNDERRUN_TOLERANCE);
+        let starts = self
+            .playing_until
+            .filter(|until| *until > now)
+            .unwrap_or(now);
+        self.playing_until = Some(starts + duration);
+        underrun
+    }
+}
+
+/// Move the session phase along with its active turn: Speaking once the turn
+/// has sent audio, Listening once it has ended. `turn` is the active turn's
+/// record id, whether it is still running and whether it has spoken.
+fn follow_turn_phase(session: &mut VoiceSession, turn: Option<(&str, bool, bool)>) {
+    let in_turn = matches!(
+        session.phase(),
+        VoiceSessionPhase::Processing | VoiceSessionPhase::Speaking
+    );
+    match turn {
+        Some((turn_id, true, true)) if session.phase() == VoiceSessionPhase::Processing => {
+            session.begin_speaking(turn_id)
+        }
+        Some((_, true, _)) => {}
+        Some((_, false, _)) | None if in_turn => session.begin_listening(),
+        _ => {}
     }
 }
 
@@ -900,6 +987,10 @@ struct ConnectionState {
     model_leases: SessionModelLeases,
     active_turn: Option<ActiveTurn>,
     voice_session: VoiceSession,
+    voice_session_started_at: Option<Instant>,
+    /// When the current utterance's speech started: a barge-in's latency
+    /// runs from here.
+    speech_started_at: Option<Instant>,
     started: bool,
     transport_session_id: String,
     owner_instance_id: String,
@@ -918,6 +1009,8 @@ impl Default for ConnectionState {
             model_leases: SessionModelLeases::default(),
             active_turn: None,
             voice_session: VoiceSession::default(),
+            voice_session_started_at: None,
+            speech_started_at: None,
             started: false,
             transport_session_id: uuid::Uuid::new_v4().to_string(),
             owner_instance_id: process_owner_instance_id().to_string(),
@@ -934,6 +1027,25 @@ fn process_owner_instance_id() -> &'static str {
 }
 
 impl ConnectionState {
+    fn sync_voice_phase(&mut self) {
+        let turn = self.active_turn.as_ref().map(|turn| {
+            (
+                turn.turn_record_id.as_str(),
+                !turn.task.is_finished(),
+                turn.control.is_speaking(),
+            )
+        });
+        follow_turn_phase(&mut self.voice_session, turn);
+    }
+
+    /// Record a closed session's duration, once.
+    fn record_session_closed(&mut self, runtime: &RuntimeService) {
+        runtime.record_voice_session_closed();
+        if let Some(started) = self.voice_session_started_at.take() {
+            runtime.record_voice_latency(VoiceLatency::SessionDuration, started.elapsed());
+        }
+    }
+
     fn clear_finished_turn(&mut self) {
         if self
             .active_turn
@@ -1232,10 +1344,24 @@ impl StreamingInputState {
             ));
         }
 
+        let trailing_silence =
+            Duration::from_micros((active.silence_ms.max(0.0) * 1000.0).round() as u64);
+        let endpointing_delay = match reason {
+            UtteranceEndReason::Silence => Some(trailing_silence),
+            UtteranceEndReason::ClientPause => Some(
+                trailing_silence
+                    + self
+                        .last_frame_at
+                        .map_or(Duration::ZERO, |last_frame| last_frame.elapsed()),
+            ),
+            UtteranceEndReason::MaxDuration | UtteranceEndReason::StreamStopped => None,
+        };
         let commit = PendingAudioCommit {
             utterance_id: active.utterance_id,
             utterance_seq: active.utterance_seq,
             turn_config: self.config.turn_config.clone(),
+            endpointed_at: Instant::now(),
+            endpointing_delay,
         };
 
         Ok(Some((commit, wav_bytes, reason)))
@@ -1268,6 +1394,11 @@ async fn finalize_stream_vad_utterance(
     if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn").await {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
+    }
+    if let Some(delay) = commit.endpointing_delay {
+        state
+            .runtime
+            .record_voice_latency(VoiceLatency::Endpointing, delay);
     }
 
     let voice_session_id = conn
@@ -1310,7 +1441,7 @@ async fn finalize_stream_vad_utterance(
     let turn_record_id = turn_record.id.clone();
     conn.next_turn_generation = conn.next_turn_generation.saturating_add(1);
     let output_generation = conn.next_turn_generation;
-    let control = TurnControl::new();
+    let control = TurnControl::new(commit.endpointed_at);
     let task = spawn_turn_task(
         state.clone(),
         correlation_id.to_string(),
@@ -1474,6 +1605,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
     actor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     actor_tick.tick().await;
     loop {
+        conn.sync_voice_phase();
         let result = tokio::select! {
             result = ws_rx.next() => result,
             _ = actor_tick.tick() => {
@@ -1560,7 +1692,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         if let Err(err) = state.voice_store.end_session(session_id).await {
             warn!("failed to end voice session on socket close: {err}");
         } else {
-            state.runtime.record_voice_session_closed();
+            conn.record_session_closed(&state.runtime);
         }
     }
     out_tx.close();
@@ -1748,6 +1880,7 @@ async fn handle_text_message(
                     .map_err(|err| format!("Voice storage error: {err}"))?;
                 conn.voice_session.start(session.id.clone());
                 conn.voice_session_id = Some(session.id);
+                conn.voice_session_started_at = Some(Instant::now());
                 state.runtime.record_voice_session_started();
             }
 
@@ -1823,7 +1956,7 @@ async fn handle_text_message(
                     .end_session(session_id)
                     .await
                     .map_err(|err| format!("Voice storage error: {err}"))?;
-                state.runtime.record_voice_session_closed();
+                conn.record_session_closed(&state.runtime);
             }
         }
         ClientEvent::Interrupt { reason } => {
@@ -1875,6 +2008,9 @@ async fn handle_binary_message(
             let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
 
             if let Some((expected, received)) = frame_result.sequence_gap {
+                state.runtime.record_voice_ingress_dropped_frames(u64::from(
+                    received.saturating_sub(expected),
+                ));
                 send_diagnostic_json(
                     out_tx,
                     json!({
@@ -1891,6 +2027,7 @@ async fn handle_binary_message(
             // on `user_speech_rejected`; the turn is cancelled only once the
             // speech is sustained.
             if let Some(evt) = frame_result.speech_start {
+                conn.speech_started_at = Some(Instant::now());
                 send_json(
                     out_tx,
                     json!({
@@ -1906,6 +2043,11 @@ async fn handle_binary_message(
             {
                 state.runtime.record_voice_interruption();
                 state.runtime.record_voice_barge_in();
+                if let Some(started) = conn.speech_started_at {
+                    state
+                        .runtime
+                        .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
+                }
                 conn.voice_session.interrupt("barge_in");
             }
 
@@ -2009,6 +2151,8 @@ fn spawn_turn_task(
                         let asr_model_id = config.asr_model_id.clone();
                         let asr_language = config.asr_language.clone();
                         let mut snapshot = String::new();
+                        let runtime = state.runtime.clone();
+                        let endpointed_at = control.endpointed_at();
                         state
                             .runtime
                             .asr_transcribe_streaming_bytes_with_runtime_context(
@@ -2022,6 +2166,12 @@ fn spawn_turn_task(
                                 move |delta| {
                                     if delta.is_empty() {
                                         return;
+                                    }
+                                    if snapshot.is_empty() {
+                                        runtime.record_voice_latency(
+                                            VoiceLatency::AsrFirstPartial,
+                                            endpointed_at.elapsed(),
+                                        );
                                     }
                                     snapshot.push_str(&delta);
                                     send_turn_text_snapshot(
@@ -2040,6 +2190,11 @@ fn spawn_turn_task(
                             .await
                             .map_err(|err| format!("ASR failed: {err}"))?
                     };
+                    let transcript_final_at = Instant::now();
+                    state.runtime.record_voice_latency(
+                        VoiceLatency::AsrFinal,
+                        transcript_final_at.saturating_duration_since(control.endpointed_at()),
+                    );
 
                     let user_text = transcript.text.trim().to_string();
                     send_turn_json(
@@ -2114,6 +2269,12 @@ fn spawn_turn_task(
                         runtime_context,
                     )
                     .await?;
+                    // The reply is generated whole, so its first speakable
+                    // text arrives with the last.
+                    state.runtime.record_voice_latency(
+                        VoiceLatency::LlmFirstToken,
+                        transcript_final_at.elapsed(),
+                    );
                     let assistant_text = strip_think_tags(&assistant_raw);
 
                     send_turn_json(
@@ -2445,6 +2606,7 @@ async fn stream_tts_to_socket(
     if control.is_cancelled() {
         return Err("Turn cancelled".to_string());
     }
+    let text_ready_at = Instant::now();
     let tts_variant = parse_tts_model_variant(tts_model_id)
         .map_err(|err| format!("Unsupported TTS model: {err}"))?;
     model_leases
@@ -2477,6 +2639,7 @@ async fn stream_tts_to_socket(
     let segments = realtime_speech_segments(text);
     let segment_count = segments.len();
     let mut chunk_seq = 0u32;
+    let mut first_audio = true;
     for (segment_index, segment) in segments.into_iter().enumerate() {
         let last_segment = segment_index + 1 == segment_count;
         let gen_config = GenerationConfig {
@@ -2553,6 +2716,15 @@ async fn stream_tts_to_socket(
                     duration_ms,
                 )
                 .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
+            if sample_count > 0 {
+                if first_audio {
+                    first_audio = false;
+                    state
+                        .runtime
+                        .record_voice_latency(VoiceLatency::TtsFirstAudio, text_ready_at.elapsed());
+                }
+                control.audio_sent(&state.runtime, Duration::from_millis(duration_ms));
+            }
         }
 
         match generation_task.join().await {
@@ -2754,6 +2926,7 @@ async fn stream_unified_s2s_to_socket(
                 let control = control.clone();
                 let delivery_error = delivery_error.clone();
                 let mut text_snapshot = String::new();
+                let runtime = state.runtime.clone();
                 move |chunk| {
                     if control.is_cancelled() {
                         return;
@@ -2791,17 +2964,22 @@ async fn stream_unified_s2s_to_socket(
                                     .saturating_mul(1_000)
                                     .checked_div(chunk.sample_rate.max(1) as u64)
                                     .unwrap_or(0);
-                                if let Err(err) = out_tx.send_audio(
+                                match out_tx.send_audio(
                                     output_generation,
                                     Message::Binary(frame.into()),
                                     encoded.len(),
                                     duration_ms,
                                 ) {
-                                    *delivery_error
-                                        .lock()
-                                        .unwrap_or_else(|poison| poison.into_inner()) =
-                                        Some(format!("Outbound audio delivery failed: {err:?}"));
-                                    control.cancel("outbound_audio_saturated");
+                                    Ok(()) => control
+                                        .audio_sent(&runtime, Duration::from_millis(duration_ms)),
+                                    Err(err) => {
+                                        *delivery_error
+                                            .lock()
+                                            .unwrap_or_else(|poison| poison.into_inner()) = Some(
+                                            format!("Outbound audio delivery failed: {err:?}"),
+                                        );
+                                        control.cancel("outbound_audio_saturated");
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -3847,7 +4025,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_control_wakes_cooperative_cleanup() {
-        let control = TurnControl::new();
+        let control = TurnControl::new(Instant::now());
         let waiting_control = control.clone();
         let waiter = tokio::spawn(async move {
             waiting_control.cancelled().await;
@@ -4009,6 +4187,107 @@ mod tests {
             .expect("a client that stopped sending is paused");
         assert_eq!(commit.utterance_id, utterance_id);
         assert!(matches!(reason, UtteranceEndReason::ClientPause));
+        // SPK-F6: the endpointing delay a pause reports covers the stall.
+        assert!(
+            commit.endpointing_delay.expect("a pause endpoints")
+                >= Duration::from_millis(silence_ms + CLIENT_PAUSE_STALL_ALLOWANCE_MS)
+        );
+    }
+
+    /// SPK-F6: an utterance ended by silence reports the trailing silence the
+    /// detector waited for; a forced end reports none.
+    #[test]
+    fn silence_endpointing_reports_the_trailing_silence() {
+        let mut input = test_streaming_input();
+        input.config.vad_threshold = 0.01;
+        input.endpoint = EndpointDetector::new(input.config.endpoint_config());
+        let frame = pcm16_frame(&[0; 320]);
+        for frame_seq in 1..=10_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        input.active.as_mut().expect("speech").silence_ms = 240.0;
+        let (commit, _, _) = input
+            .finalize_active_utterance(UtteranceEndReason::Silence)
+            .expect("finalize")
+            .expect("voiced utterance");
+        assert_eq!(commit.endpointing_delay, Some(Duration::from_millis(240)));
+
+        for frame_seq in 11..=20_u32 {
+            input
+                .handle_pcm16_frame(frame_seq, 16_000, &frame)
+                .expect("frame");
+        }
+        let (commit, _, _) = input
+            .finalize_active_utterance(UtteranceEndReason::MaxDuration)
+            .expect("finalize")
+            .expect("voiced utterance");
+        assert_eq!(commit.endpointing_delay, None);
+    }
+
+    /// SPK-F6: audio sent after the client finished playing what it had is
+    /// an underrun; audio sent while playback still has queued audio is not.
+    #[test]
+    fn playback_clock_counts_drained_playback_as_an_underrun() {
+        let start = Instant::now();
+        let mut clock = PlaybackClock::default();
+        let chunk = Duration::from_millis(200);
+        assert!(!clock.sent(start, chunk), "the first chunk starts playback");
+        assert!(!clock.sent(start + Duration::from_millis(150), chunk));
+        // Queued until 400 ms; arriving within the tolerance is in time.
+        assert!(!clock.sent(start + Duration::from_millis(410), chunk));
+        // Queued until 610 ms; arriving at 700 ms found playback drained.
+        assert!(clock.sent(start + Duration::from_millis(700), chunk));
+        // Playback restarted at 700 ms, so 850 ms is in time again.
+        assert!(!clock.sent(start + Duration::from_millis(850), chunk));
+    }
+
+    /// SPK-F6: the session reaches Speaking once its turn sends audio and
+    /// returns to Listening when the turn ends.
+    #[test]
+    fn session_phase_follows_the_turn_through_speaking() {
+        let mut session = VoiceSession::default();
+        session.start("session");
+        session.begin_listening();
+        session.begin_processing("turn-1");
+
+        follow_turn_phase(&mut session, Some(("turn-1", true, false)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Processing);
+        follow_turn_phase(&mut session, Some(("turn-1", true, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Speaking);
+        assert_eq!(session.active_turn_id(), Some("turn-1"));
+        follow_turn_phase(&mut session, Some(("turn-1", false, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Listening);
+        follow_turn_phase(&mut session, None);
+        assert_eq!(session.phase(), VoiceSessionPhase::Listening);
+
+        // An interrupted or closed session is not moved by its turn.
+        session.begin_processing("turn-2");
+        session.interrupt("barge_in");
+        follow_turn_phase(&mut session, Some(("turn-2", true, true)));
+        assert_eq!(session.phase(), VoiceSessionPhase::Interrupted);
+        session.close();
+        follow_turn_phase(&mut session, None);
+        assert_eq!(session.phase(), VoiceSessionPhase::Closed);
+    }
+
+    /// SPK-F6: a turn records its response latency at its first audio only,
+    /// and an underrun when it falls behind playback.
+    #[tokio::test]
+    async fn turn_audio_records_first_audio_once_and_underruns() {
+        let runtime = RuntimeService::new(izwi_core::EngineConfig::default()).expect("runtime");
+        let control = TurnControl::new(Instant::now() - Duration::from_millis(300));
+        assert!(!control.is_speaking());
+        control.audio_sent(&runtime, Duration::from_millis(10));
+        assert!(control.is_speaking());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        control.audio_sent(&runtime, Duration::from_millis(10));
+
+        let payload = runtime.telemetry_prometheus().await;
+        let counts = izwi_core::runtime::prometheus::check_histograms(&payload).unwrap();
+        assert_eq!(counts["izwi_voice_turn_first_audio_seconds"], 1);
+        assert!(payload.contains("izwi_voice_audio_egress_underruns_total 1"));
     }
 
     #[test]
