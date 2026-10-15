@@ -1323,6 +1323,7 @@ impl EngineCore {
         scheduled: &[super::scheduler::ScheduledRequest],
     ) {
         self.rollback_unexecuted_schedule(scheduled);
+        self.scheduler.yield_capacity_blocked_prefill(scheduled);
         let retry_at = Instant::now() + self.retry_policy.execution_delay(1);
         for scheduled in scheduled {
             let session = scheduled.session_key();
@@ -10676,6 +10677,148 @@ mod tests {
         // Both held two pages (32 tokens) when they deadlocked; the survivor
         // grows past that once the younger claim is released.
         assert!(older_peak > 32, "older peaked at {older_peak}");
+    }
+
+    /// Managed full-prefill rows whose decode quanta emit tokens, so requests
+    /// finish at their output budget.
+    struct ManagedDecodeExecutor {
+        prompt_tokens: usize,
+    }
+
+    impl ModelExecutor for ManagedDecodeExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            ManagedReceiptExecutor.execution_profile(request)
+        }
+
+        fn cleanup_session(
+            &self,
+            session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            ManagedReceiptExecutor.cleanup_session(session)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            let dispatch = execution.expected_dispatch();
+            Ok(execution
+                .scheduled
+                .iter()
+                .zip(execution.requests)
+                .zip(&execution.batch.rows)
+                .map(|((scheduled, request), row)| {
+                    let decoded = (!scheduled.is_prefill).then_some(scheduled.num_tokens);
+                    let generated = (scheduled.num_computed_tokens + scheduled.num_tokens)
+                        .saturating_sub(self.prompt_tokens);
+                    let mut result = ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput {
+                            request_id: scheduled.request_id.clone(),
+                            audio: None,
+                            text: None,
+                            input_transcription: None,
+                            tokens_processed: scheduled.num_tokens,
+                            tokens_generated: decoded.unwrap_or(0),
+                            finished: decoded.is_some() && generated >= request.params.max_tokens,
+                            phase_timing_override: None,
+                            asr_diagnostics: None,
+                            error: None,
+                            logprobs: Vec::new(),
+                        },
+                    );
+                    result.dispatch = dispatch;
+                    if let Some(reservation) = &row.managed_cache {
+                        result.managed_cache = Some(reservation.completed_write_receipt_for_test());
+                    }
+                    result
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(0)
+        }
+    }
+
+    /// The Metal burst stall: the starvation bound forces a full prefill after
+    /// eight decode-only commits, but the prefill needs managed capacity that
+    /// only the decoding rows free, by finishing. On Metal that was a tensor
+    /// state sequence slot; here it is the pages two full-request claims
+    /// hold. The bound used to keep forcing the withheld prefill with no
+    /// decode budget, so no row ever committed again.
+    #[tokio::test]
+    async fn capacity_blocked_forced_prefill_returns_service_to_decode() {
+        let model = ModelInstanceId::new(98);
+        let prompt: Vec<u32> = (1..=8).collect();
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+            prompt_tokens: prompt.len(),
+        }));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                // 8 prompt + 24 output tokens claim two pages: two holders
+                // fill the arena.
+                max_blocks: 4,
+                max_batch_size: 8,
+                managed_chat_claim_quantum_tokens: 0,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let ids = ["r0", "r1", "r2", "r3"];
+        for id in ids {
+            let mut request = managed_test_request(&mut core, model, id, prompt.clone());
+            request.params.max_tokens = 24;
+            core.add_request(request).expect("add");
+        }
+
+        let mut finished = HashSet::new();
+        for _ in 0..400 {
+            for output in core.step().await.expect("step") {
+                if output.is_finished {
+                    assert!(output.error.is_none(), "{:?}", output.error);
+                    finished.insert(output.request_id);
+                }
+            }
+            if finished.len() == ids.len() {
+                break;
+            }
+        }
+        assert_eq!(finished.len(), ids.len(), "finished {finished:?}");
     }
 
     /// H2: a row whose managed state can never be prepared fails alone. The

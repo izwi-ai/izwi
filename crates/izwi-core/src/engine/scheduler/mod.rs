@@ -2251,6 +2251,27 @@ impl Scheduler {
         }
     }
 
+    /// A prefill withheld for managed capacity waits on state that running
+    /// sequences hold until they finish, so only decode can free it. Clear
+    /// the starvation debt of its prefill mode: the bound then returns the
+    /// next transactions to decode instead of forcing the same prefill
+    /// again with no decode budget, which no commit would ever resolve.
+    pub(crate) fn yield_capacity_blocked_prefill(&mut self, deferred: &[ScheduledRequest]) {
+        for scheduled in deferred.iter().filter(|scheduled| scheduled.is_prefill) {
+            match self
+                .requests
+                .get(&scheduled.request_id)
+                .map(|metadata| metadata.cache_policy.prefill)
+            {
+                Some(PrefillMode::Full) => self.decode_only_steps_with_waiting_full_prefill = 0,
+                Some(PrefillMode::Incremental) => {
+                    self.decode_only_steps_with_waiting_incremental_prefill = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Advance the realtime and codec starvation debts once per committed
     /// decode transaction, keyed on the rows that committed. The core defers
     /// scheduled rows whose lane does not own the physical slot, so a row
