@@ -502,6 +502,22 @@ async fn assert_paths_agree(paths: &Paths) {
         .await;
         assert_eq!(budget["error"]["code"], "context_length_exceeded");
     }
+    // Tools reach the prompt on both paths, rendered alike.
+    let with_tools = assert_same_answer(
+        paths,
+        "tools",
+        json!({
+            "messages": hello,
+            "temperature": 0.0,
+            "max_tokens": 8,
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        }),
+    )
+    .await;
+    assert!(
+        with_tools["prompt_tokens"].as_u64() > greedy["prompt_tokens"].as_u64(),
+        "the tool list is in the prompt: {with_tools} vs {greedy}"
+    );
     assert_same_answer(
         paths,
         "auto truncation",
