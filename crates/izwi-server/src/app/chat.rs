@@ -41,6 +41,9 @@ pub struct ChatExecutionRequest {
     pub presence_penalty: Option<f32>,
     /// OpenAI `seed`: the same seed and parameters sample the same tokens.
     pub seed: Option<u64>,
+    /// OpenAI `stop`: generation ends before the first of these strings,
+    /// which is never returned.
+    pub stop: Vec<String>,
     /// DS9.3: OpenAI `logprobs` flag and `top_logprobs` count (0-20).
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<u8>,
@@ -76,6 +79,7 @@ impl ChatExecutionRequest {
             .resolved_sampling()
             .into_generation_params(self.resolved_max_new_tokens());
         params.seed = self.seed;
+        params.stop_sequences = self.stop.clone();
         if self.logprobs.unwrap_or(false) {
             params.logprobs = true;
         }
@@ -1049,8 +1053,9 @@ fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiE
             "Remote chat execution currently supports text-only requests",
         ));
     }
-    // The worker protocol carries only messages, temperature, top_p and the
-    // output limits; any other control is refused, never silently dropped.
+    // The worker protocol carries only messages, temperature, top_p, stop
+    // strings and the output limits; any other control is refused, never
+    // silently dropped.
     let unsupported = [
         ("tools", !request.chat_config.tools.is_empty()),
         (
@@ -1120,7 +1125,7 @@ fn build_remote_chat_invocation(
             temperature: Some(sampling.temperature),
             top_p: Some(sampling.top_p),
             seed: None,
-            stop: Vec::new(),
+            stop: request.stop,
         },
     };
     let request_id = RequestId::new(new_uuid()).map_err(identifier_error)?;
@@ -1566,6 +1571,7 @@ mod tests {
             repetition_penalty: None,
             presence_penalty: Some(0.25),
             seed: Some(7),
+            stop: vec!["END".into()],
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,
@@ -1580,6 +1586,7 @@ mod tests {
         assert_eq!(params.presence_penalty, 0.25);
         assert_eq!(params.max_tokens, 32);
         assert_eq!(params.seed, Some(7));
+        assert_eq!(params.stop_sequences, ["END"]);
     }
 
     /// The worker protocol cannot carry a seed yet, so the gateway refuses
@@ -1609,6 +1616,7 @@ mod tests {
             repetition_penalty: None,
             presence_penalty: None,
             seed: None,
+            stop: Vec::new(),
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,

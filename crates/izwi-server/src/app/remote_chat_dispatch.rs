@@ -1139,6 +1139,7 @@ mod tests {
             repetition_penalty: None,
             presence_penalty: None,
             seed: None,
+            stop: Vec::new(),
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,
@@ -1283,15 +1284,19 @@ mod tests {
         let context = RequestContext::new("test-request".into(), Principal::local_anonymous());
 
         // Qwen3.5-4B thinks by default; its published profile is T 1.0 and
-        // top-p 0.95, never the worker's greedy default.
+        // top-p 0.95, never the worker's greedy default. Stop strings travel
+        // with it (the worker applies them in the engine).
+        let mut request = request();
+        request.stop = vec!["END".into()];
         dispatcher(registry)
-            .generate(2, &context, request(), tenant_work())
+            .generate(2, &context, request, tenant_work())
             .await
             .unwrap();
         let requests = worker.requests();
         let InvocationInput::Chat { parameters, .. } = &requests[0].input;
         assert_eq!(parameters.temperature, Some(1.0));
         assert_eq!(parameters.top_p, Some(0.95));
+        assert_eq!(parameters.stop, ["END"]);
     }
 
     #[tokio::test]
@@ -1882,6 +1887,7 @@ mod tests {
             repetition_penalty: None,
             presence_penalty: None,
             seed: None,
+            stop: Vec::new(),
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,

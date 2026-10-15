@@ -14,6 +14,7 @@ use super::super::scheduler::ScheduledRequest;
 use super::super::types::AudioOutput;
 use super::super::SessionKey;
 use super::state::ActiveChatDecode;
+use super::stop_sequences::StopSequenceFilter;
 use super::{
     ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
 };
@@ -245,6 +246,7 @@ impl NativeExecutor {
                 stream_sequence: state.stream_sequence,
                 streamed_text: state.streamed_text.clone(),
                 logprobs: state.logprobs.clone(),
+                stop: state.stop.clone(),
             },
         );
         // All CPU continuation state is installed before dropping GPU owners.
@@ -329,6 +331,11 @@ impl NativeExecutor {
         }
         // Fallback path for chat backends that do not expose incremental decode state.
         if !model.supports_incremental_decode() {
+            if StopSequenceFilter::new(&request.params.stop_sequences).is_some() {
+                return Err(Error::InvalidInput(format!(
+                    "Chat model {variant} does not support stop strings"
+                )));
+            }
             let mut phase_timing_override: Option<ExecutorPhaseTiming> = None;
             let output = Self::run_blocking(|| {
                 let generation_started = Instant::now();
@@ -498,6 +505,7 @@ impl NativeExecutor {
                     stream_sequence: saved.stream_sequence,
                     streamed_text: saved.streamed_text.clone(),
                     logprobs: saved.logprobs.clone(),
+                    stop: saved.stop.clone(),
                 })?;
                 suspended.remove(&session);
                 started_replay = true;
@@ -658,6 +666,7 @@ impl NativeExecutor {
                 stream_sequence: 0,
                 streamed_text: String::new(),
                 logprobs: Vec::new(),
+                stop: StopSequenceFilter::new(&request.params.stop_sequences),
             })?;
         }
 
@@ -698,7 +707,7 @@ impl NativeExecutor {
                     prompt_tokens = request.num_prompt_tokens(), max_new_tokens = request.params.max_tokens,
                     prefill = scheduled.is_prefill, "LFM2 quantum diagnostic context");
             }
-            let step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
+            let mut step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
                 match (model.as_ref(), &mut active_state.state) {
                     (NativeChatModel::Qwen38(qwen), NativeChatDecodeState::Qwen38(state)) => {
                         Self::run_blocking(|| qwen.continue_replay_physical(state, start, end))?;
@@ -762,6 +771,7 @@ impl NativeExecutor {
             }
 
             record_lfm_completion(&active_state.state, request, &step);
+            let stream_logprobs = active_state.apply_stop_sequences(&mut step);
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
@@ -788,7 +798,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
-                        step.logprobs.clone(),
+                        stream_logprobs,
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }
@@ -1119,10 +1129,11 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
+        for ((index, _, lease, _), mut step) in active_states.rows.iter_mut().zip(steps) {
             let request = ordered_requests[*index];
             let active_state = lease.require_state_mut()?;
             record_lfm_completion(&active_state.state, request, &step);
+            let stream_logprobs = active_state.apply_stop_sequences(&mut step);
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
@@ -1141,7 +1152,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut active_state.stream_sequence,
                         step.delta.clone(),
-                        step.logprobs.clone(),
+                        stream_logprobs,
                     )?;
                     active_state.streamed_text.push_str(&step.delta);
                 }

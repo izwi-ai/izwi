@@ -24,6 +24,8 @@ mod handler_chat;
 mod handler_tts;
 #[path = "executor/state.rs"]
 mod state;
+#[path = "executor/stop_sequences.rs"]
+mod stop_sequences;
 #[path = "executor/streaming.rs"]
 mod streaming;
 
@@ -3386,10 +3388,19 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
+            // Stop strings are checked on each committed quantum, so a request
+            // with any decodes one token per quantum: no token past its stop
+            // string is sampled, counted or reported.
+            let stops = request
+                .params
+                .stop_sequences
+                .iter()
+                .any(|stop| !stop.is_empty());
             let (preferred_decode_tokens, sustained_decode_quantum, speculative_decode_batch) =
                 request
                     .prepared_chat_model_for_executor()
                     .ok()
+                    .filter(|_| !stops)
                     .map(|model| model.as_ref().speculative_decode_profile())
                     .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;

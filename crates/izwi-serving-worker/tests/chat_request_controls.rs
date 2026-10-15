@@ -158,3 +158,66 @@ async fn a_request_seed_reproduces_sampling_on_metal() {
     .await;
     assert_seed_reproduces_sampling(&runtime).await;
 }
+
+/// A stop string of `len` characters that starts at the first character
+/// other than `a` or a space (past the first character), with the text before
+/// it, or `None` when `text` has no such window.
+fn stop_inside(text: &str, len: usize) -> Option<(String, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let start =
+        (1..chars.len().saturating_sub(len)).find(|&index| !matches!(chars[index].1, 'a' | ' '))?;
+    let from = chars[start].0;
+    let stop = &text[from..chars[start + len].0];
+    (text.find(stop) == Some(from)).then(|| (stop.to_string(), text[..from].to_string()))
+}
+
+/// EXE-F9 / EDGE-F4: a stop string ends generation, is excluded from the
+/// output, and is never streamed, even split across deltas.
+#[tokio::test]
+async fn a_stop_string_ends_generation_without_being_returned() {
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(models.path(), RuntimeDeviceAssignment::Cpu).await;
+    // A seeded run whose text has a stop string that spans several tokens
+    // (so several streamed deltas) and starts after varied text.
+    let mut found = None;
+    for seed in 0..64 {
+        let full = run_chat(&runtime, sampled(Some(seed)), true).await.unwrap();
+        if let Some(stop) = stop_inside(&full.deltas.concat(), 4) {
+            found = Some((seed, full, stop));
+            break;
+        }
+    }
+    let (seed, full, (stop, expected)) = found.expect("a seed samples varied text");
+    assert!(
+        full.deltas.len() > expected.len().min(2),
+        "one delta per token"
+    );
+
+    let with_stop = |streaming| {
+        let mut params = sampled(Some(seed));
+        params.stop_sequences = vec![stop.clone()];
+        run_chat(&runtime, params, streaming)
+    };
+    let streamed = with_stop(true).await.unwrap();
+    assert_eq!(streamed.deltas.concat(), expected);
+    assert_eq!(streamed.generation.text, expected);
+    assert!(streamed.deltas.iter().all(|delta| !delta.contains(&stop)));
+    assert_eq!(
+        streamed.generation.finish_reason,
+        Some(izwi_core::engine::OutputFinishReason::StopToken)
+    );
+    assert!(streamed.generation.tokens_generated < full.generation.tokens_generated);
+
+    let collected = with_stop(false).await.unwrap();
+    assert_eq!(collected.generation.text, expected);
+    // Sampling stops at the token that completes the stop string: the
+    // tokens are the unstopped run's prefix, and usage counts exactly them.
+    let tokens = collected.tokens();
+    assert!(tokens.len() < full.tokens().len());
+    assert_eq!(tokens[..], full.tokens()[..tokens.len()]);
+    assert_eq!(collected.generation.tokens_generated, tokens.len());
+    assert_eq!(
+        collected.generation.finish_reason,
+        Some(izwi_core::engine::OutputFinishReason::StopToken)
+    );
+}

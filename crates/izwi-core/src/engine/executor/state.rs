@@ -50,6 +50,7 @@ pub(super) struct SuspendedChatDecode {
     pub(super) streamed_text: String,
     /// DS9.3: logprob entries accumulated across committed quanta.
     pub(super) logprobs: Vec<crate::engine::TokenLogprob>,
+    pub(super) stop: Option<super::stop_sequences::StopSequenceFilter>,
 }
 
 pub(super) struct ActiveChatDecode {
@@ -64,9 +65,27 @@ pub(super) struct ActiveChatDecode {
     /// DS9.3: logprob entries accumulated across committed quanta, published
     /// with the terminal output.
     pub(super) logprobs: Vec<crate::engine::TokenLogprob>,
+    /// The request's stop strings, with any text held back because it may
+    /// begin one.
+    pub(super) stop: Option<super::stop_sequences::StopSequenceFilter>,
 }
 
 impl ActiveChatDecode {
+    /// Apply the request's stop strings to one committed step (see
+    /// [`StopSequenceFilter::apply`]) and return the logprob entries to
+    /// publish with the step's delta.
+    ///
+    /// [`StopSequenceFilter::apply`]: super::stop_sequences::StopSequenceFilter::apply
+    pub(super) fn apply_stop_sequences(
+        &mut self,
+        step: &mut crate::models::registry::NativeChatDecodeStep,
+    ) -> Vec<crate::engine::TokenLogprob> {
+        match self.stop.as_mut() {
+            Some(stop) => stop.apply(step),
+            None => step.logprobs.clone(),
+        }
+    }
+
     /// DS9.3: record one committed step's logprob entries and, on the
     /// terminal step, hand back the request's whole list. Streaming does not
     /// change this: SSE deltas carry their own entries, and the terminal

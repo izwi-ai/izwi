@@ -34,6 +34,7 @@ use izwi_core::{
     ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
     ModelFamily, ModelVariant,
 };
+use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 
@@ -771,10 +772,6 @@ fn validate_chat_request_compatibility(
         )));
     }
 
-    if profile.is_strict() && req.stop.is_some() {
-        return Err(ApiError::bad_request(strict_guardrail_message("stop")));
-    }
-
     if profile.is_strict() {
         if let Some(tool_choice) = &req.tool_choice {
             if !tool_choice.is_null()
@@ -941,6 +938,35 @@ pub async fn gateway_completions(
     ))
 }
 
+/// The most OpenAI `stop` strings a chat request may carry.
+const MAX_CHAT_STOP_SEQUENCES: usize = 4;
+
+/// OpenAI `stop`: one string or an array of at most four non-empty strings.
+fn chat_stop_sequences(stop: Option<&serde_json::Value>) -> Result<Vec<String>, ApiError> {
+    let invalid = || {
+        ApiError::bad_request(format!(
+            "`stop` must be a string or an array of at most {MAX_CHAT_STOP_SEQUENCES} non-empty strings of at most {MAX_STOP_SEQUENCE_BYTES} bytes"
+        ))
+    };
+    let sequences = match stop {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::String(stop)) => vec![stop.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(invalid()),
+    };
+    if sequences.len() > MAX_CHAT_STOP_SEQUENCES
+        || sequences
+            .iter()
+            .any(|stop| stop.is_empty() || stop.len() > MAX_STOP_SEQUENCE_BYTES)
+    {
+        return Err(invalid());
+    }
+    Ok(sequences)
+}
+
 /// DS9.2: models whose sampler enforces the JSON grammar. Others reject
 /// `json_object` rather than silently ignoring the request.
 fn ensure_response_format_supported(
@@ -968,6 +994,7 @@ fn prepare_execution_request(
     ctx: &RequestContext,
 ) -> Result<(ModelVariant, ChatExecutionRequest), ApiError> {
     let variant = parse_chat_model(&req.model)?;
+    let stop_sequences = chat_stop_sequences(req.stop.as_ref())?;
     if let Some(response_format) = &req.response_format {
         ensure_response_format_supported(variant, response_format)?;
     }
@@ -1006,6 +1033,7 @@ fn prepare_execution_request(
             presence_penalty: req.presence_penalty,
             // A bit-preserving cast keeps distinct seeds distinct.
             seed: req.seed.map(|seed| seed as u64),
+            stop: stop_sequences,
             logprobs: req.logprobs,
             top_logprobs: req.top_logprobs,
             response_format_json_object: req
@@ -1985,8 +2013,9 @@ mod tests {
         assert!(err.message.contains("frequency_penalty"));
     }
 
+    /// EXE-F9 / EDGE-F4: `stop` is implemented, so strict mode accepts it.
     #[test]
-    fn validates_rejects_stop_sequences() {
+    fn strict_profile_accepts_stop_sequences() {
         let req = ChatCompletionRequest {
             model: "Qwen3.5-4B".to_string(),
             messages: vec![OpenAiInboundMessage {
@@ -2020,9 +2049,34 @@ mod tests {
             reasoning_format: None,
         };
 
-        let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
-            .expect_err("should reject");
-        assert!(err.message.contains("stop"));
+        validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
+            .expect("strict mode accepts stop");
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_up_to_four_strings() {
+        let parse = |value: serde_json::Value| chat_stop_sequences(Some(&value));
+        assert_eq!(parse(json!(null)).unwrap(), Vec::<String>::new());
+        assert_eq!(chat_stop_sequences(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse(json!("END")).unwrap(), ["END"]);
+        assert_eq!(parse(json!([])).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse(json!(["a", "b", "c", "d"])).unwrap(),
+            ["a", "b", "c", "d"]
+        );
+        for invalid in [
+            json!(["a", "b", "c", "d", "e"]),
+            json!(""),
+            json!(["ok", ""]),
+            json!([1]),
+            json!(7),
+            json!({"stop": "x"}),
+            json!("x".repeat(MAX_STOP_SEQUENCE_BYTES + 1)),
+        ] {
+            let error = parse(invalid.clone()).expect_err("invalid stop");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{invalid}");
+            assert!(error.message.contains("`stop`"), "{}", error.message);
+        }
     }
 
     #[test]

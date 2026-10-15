@@ -89,6 +89,7 @@ pub async fn create_response(
         repetition_penalty: req.repetition_penalty,
         presence_penalty: req.presence_penalty,
         seed: None,
+        stop: Vec::new(),
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
