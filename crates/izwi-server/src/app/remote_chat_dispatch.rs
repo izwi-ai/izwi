@@ -377,7 +377,7 @@ impl RemoteChatDispatcher {
                     // makes the public SSE encoder emit its generic explicit
                     // interruption rather than fabricated success.
                     let _ = public_tx.try_send(ChatStreamEvent::Failed(
-                        FORWARDED_CHAT_SLOW_CONSUMER_ERROR.into(),
+                        ApiError::service_unavailable(FORWARDED_CHAT_SLOW_CONSUMER_ERROR),
                     ));
                     break;
                 }

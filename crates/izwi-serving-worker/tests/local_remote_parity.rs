@@ -410,7 +410,8 @@ async fn assert_paths_agree(paths: &Paths) {
     // JSON mode reaches the engine on both paths. The fixture's vocabulary
     // has no JSON token, so the constraint ends generation at once and LFM2
     // rejects the empty answer; a dropped constraint would answer 200. (The
-    // two paths word this server error differently.)
+    // two paths word this server error differently before a stream starts;
+    // once it has, both send the model's own error.)
     let mut json_mode = json!({
         "model": VARIANT.dir_name(),
         "messages": hello,
@@ -427,8 +428,12 @@ async fn assert_paths_agree(paths: &Paths) {
             // Both streams start, then fail.
             assert_eq!((local_status, remote_status), (200, 200));
             assert!(
-                !local["error"].is_null() && !remote["error"].is_null(),
-                "json_object stream: local {local}, gateway {remote}"
+                !local["error"].is_null(),
+                "json_object stream: local {local}"
+            );
+            assert_eq!(
+                local["error"], remote["error"],
+                "json_object stream: the gateway reports the model's error"
             );
         } else {
             assert_eq!(

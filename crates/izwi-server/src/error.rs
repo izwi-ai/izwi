@@ -21,7 +21,7 @@ fn is_transient_capacity_refusal(message: &str) -> bool {
 }
 
 /// API error type
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
     pub message: String,
@@ -140,11 +140,11 @@ impl ApiError {
             detail: None,
         }
     }
-}
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let body = Json(json!({
+    /// The OpenAI error object: the HTTP error body, and the payload of an
+    /// error event once a stream has started.
+    pub fn openai_body(&self) -> serde_json::Value {
+        json!({
             "error": {
                 "message": self.message,
                 "type": match self.status {
@@ -163,7 +163,13 @@ impl IntoResponse for ApiError {
                     .and_then(|detail| detail.code)
                     .unwrap_or(self.status.as_str())
             }
-        }));
+        })
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Json(self.openai_body());
         let mut response = (self.status, body).into_response();
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             response.headers_mut().insert(

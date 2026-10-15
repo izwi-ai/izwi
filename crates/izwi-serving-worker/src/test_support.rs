@@ -9,10 +9,11 @@
 //! worker break the wire contract.
 
 use crate::{
-    AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionTeardown,
-    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsStageStream,
-    WorkerConfig, WorkerService, DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY,
-    DEFAULT_MAX_EVENT_BYTES, DEFAULT_SLOW_CONSUMER_TIMEOUT, REALTIME_SESSION_DEFAULT_LIMITS,
+    AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
+    ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
+    RealtimeTtsStageStream, WorkerConfig, WorkerService, DEFAULT_ATTEMPT_RETENTION,
+    DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_EVENT_BYTES, DEFAULT_SLOW_CONSUMER_TIMEOUT,
+    REALTIME_SESSION_DEFAULT_LIMITS,
 };
 use async_trait::async_trait;
 use izwi_core::{AudioChunk, RuntimeAsrRealtimeEvent};
@@ -45,6 +46,8 @@ pub enum WorkerScript {
     ManyTextDeltas { count: usize, text_bytes: usize },
     /// Each text as its own delta, then completion.
     TextDeltas(Vec<String>),
+    /// One delta of `output_text`, then the model fails with `code`.
+    TextDeltaThenFail(InvocationErrorCode),
     /// An empty text delta every `output_cadence`: progress without output.
     EmptyDeltaTrickle,
     /// No output, and the runtime cannot confirm teardown: the worker ends
@@ -688,8 +691,17 @@ impl AdmittedExecution for ScriptedExecution {
             (WorkerScript::Hang, _) | (WorkerScript::TextDeltaThenHang, 1..) => {
                 std::future::pending().await
             }
-            (WorkerScript::TextDeltaThenHang | WorkerScript::LoseAfterPartial, 0) => {
-                self.delta(self.config.output_text.clone())
+            (
+                WorkerScript::TextDeltaThenHang
+                | WorkerScript::LoseAfterPartial
+                | WorkerScript::TextDeltaThenFail(_),
+                0,
+            ) => self.delta(self.config.output_text.clone()),
+            (WorkerScript::TextDeltaThenFail(code), 1) => {
+                Some(ExecutionEvent::Failed(ExecutionFailure {
+                    code: *code,
+                    message: "scripted model failure".into(),
+                }))
             }
             (WorkerScript::ManyTextDeltas { count, text_bytes }, step) if step < *count => {
                 self.delta("x".repeat(*text_bytes))
@@ -723,6 +735,9 @@ impl AdmittedExecution for ScriptedExecution {
             WorkerScript::LoseAfterAccept | WorkerScript::LoseAfterPartial
         ) {
             return ExecutionTeardown::Unconfirmed;
+        }
+        if matches!(self.config.script, WorkerScript::TextDeltaThenFail(_)) {
+            return ExecutionTeardown::Failed;
         }
         if self.cancelled.load(Ordering::SeqCst) {
             tokio::time::sleep(self.config.cancellation_delay).await;

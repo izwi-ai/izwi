@@ -484,7 +484,8 @@ async fn create_streaming_response(
                     (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => {
-                    let failed = response_stream_failure_payload(&response_id_for_task, error);
+                    let failed =
+                        response_stream_failure_payload(&response_id_for_task, &error.message);
                     persist_response(
                         &store_state,
                         StoredResponseRecord {

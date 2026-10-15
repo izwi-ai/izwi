@@ -1154,6 +1154,7 @@ mod tests {
         ApprovedDeployment, ApprovedWorker, BackendPolicy, WorkerRegistry, WorkerRegistryConfig,
         WorkerRegistryError,
     };
+    use izwi_serving_protocol::InvocationErrorCode;
     use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig, WorkerScript};
 
     const TEST_API_KEY: &str = "test-public-api-key-123456";
@@ -1534,6 +1535,47 @@ mod tests {
             json!({"city": "Paris"})
         );
         assert_eq!(finish.as_deref(), Some("tool_calls"));
+    }
+
+    /// A model failure after the stream started reaches the client as an
+    /// OpenAI error event with the worker's error class, not a generic one.
+    #[tokio::test]
+    async fn gateway_stream_errors_keep_the_worker_error_type() {
+        let model = ModelVariant::Qwen354BGguf;
+        let (state, _worker) = registry_gateway_state_with_config(
+            model,
+            TestWorkerConfig {
+                public_model: ModelAlias::new(model.dir_name()).expect("static model alias"),
+                script: WorkerScript::TextDeltaThenFail(InvocationErrorCode::InvalidInput),
+                ..TestWorkerConfig::default()
+            },
+        )
+        .await;
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        let request = chat_request(json!({
+            "model": model.dir_name(),
+            "messages": [{"role": "user", "content": "fail"}],
+            "stream": true
+        }));
+        let response = send(app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("SSE response should be bounded");
+        let body = String::from_utf8(body.to_vec()).expect("SSE should be UTF-8");
+        let events: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(events.last(), Some(&"[DONE]"), "{body}");
+        let error: serde_json::Value =
+            serde_json::from_str(events[events.len() - 2]).expect("error event JSON");
+        assert_eq!(
+            error["error"]["message"], "scripted model failure",
+            "{body}"
+        );
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(body.contains("deterministic test response"));
     }
 
     #[tokio::test]

@@ -274,7 +274,9 @@ pub enum ChatStreamEvent {
         logprobs: Vec<izwi_core::engine::TokenLogprob>,
     },
     Completed(Box<ChatGeneration>),
-    Failed(String),
+    /// The stream failed after it started; the error is sent to the client
+    /// as an in-band error event.
+    Failed(ApiError),
     ShuttingDown,
 }
 
@@ -442,9 +444,9 @@ impl ChatDeltaSink {
                 Ok(Ok(permit)) => self.send_pending(permit),
                 Ok(Err(_)) => return,
                 Err(_) => {
-                    let _ = self.event_tx.try_send(ChatStreamEvent::Failed(
-                        CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
-                    ));
+                    let _ = self
+                        .event_tx
+                        .try_send(ChatStreamEvent::Failed(backpressure_error()));
                     return;
                 }
             }
@@ -473,15 +475,17 @@ where
     // poll. Check the latch even when the generation branch wins the select
     // so lost text can never be reported as a successful completion.
     if result.is_none() || sink.is_stalled() {
-        return Some(ChatStreamEvent::Failed(
-            CHAT_STREAM_BACKPRESSURE_ERROR.to_string(),
-        ));
+        return Some(ChatStreamEvent::Failed(backpressure_error()));
     }
 
     match result.expect("completed generation result must be present") {
         Ok(generation) => Some(ChatStreamEvent::Completed(Box::new(generation))),
-        Err(err) => Some(ChatStreamEvent::Failed(err.to_string())),
+        Err(err) => Some(ChatStreamEvent::Failed(ApiError::from(err))),
     }
+}
+
+fn backpressure_error() -> ApiError {
+    ApiError::service_unavailable(CHAT_STREAM_BACKPRESSURE_ERROR)
 }
 
 async fn send_chat_terminal(event_tx: mpsc::Sender<ChatStreamEvent>, event: ChatStreamEvent) {
@@ -974,19 +978,19 @@ where
                 event = worker_stream.next_event() => event,
                 () = event_tx.closed() => return,
                 () = sink.stalled() => {
-                    break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
+                    break ChatStreamEvent::Failed(backpressure_error());
                 }
             };
             let event = match event {
                 Ok(Some(event)) => event,
                 Ok(None) => {
-                    break ChatStreamEvent::Failed(
-                        "Worker chat stream ended without a terminal event".into(),
-                    )
+                    break ChatStreamEvent::Failed(bad_gateway_error(
+                        "Worker chat stream ended without a terminal event",
+                    ))
                 }
                 Err(error) => {
                     on_worker_error(&error);
-                    break ChatStreamEvent::Failed(map_worker_client_error(error).message);
+                    break ChatStreamEvent::Failed(map_worker_client_error(error));
                 }
             };
             match event.event {
@@ -1000,7 +1004,7 @@ where
                     logprobs,
                 } => {
                     if let Err(error) = append_remote_text(&mut text, &delta, max_output_bytes) {
-                        break ChatStreamEvent::Failed(error.message);
+                        break ChatStreamEvent::Failed(error);
                     }
                     let entries = logprob_entries.extend(logprobs);
                     sink.offer(delta, entries);
@@ -1008,7 +1012,7 @@ where
                         return;
                     }
                     if sink.is_stalled() {
-                        break ChatStreamEvent::Failed(CHAT_STREAM_BACKPRESSURE_ERROR.into());
+                        break ChatStreamEvent::Failed(backpressure_error());
                     }
                 }
                 InvocationEventKind::Usage { usage } => latest_usage = Some(usage),
@@ -1029,24 +1033,22 @@ where
                         logprob_entries.finish(),
                     ) {
                         Ok(generation) => break ChatStreamEvent::Completed(Box::new(generation)),
-                        Err(error) => break ChatStreamEvent::Failed(error.message),
+                        Err(error) => break ChatStreamEvent::Failed(error),
                     }
                 }
                 InvocationEventKind::Error { code, message } => {
                     if let Some(lease) = tenant_work.take() {
                         lease.confirm_stopped();
                     }
-                    break ChatStreamEvent::Failed(
-                        map_worker_terminal_error(code, message).message,
-                    );
+                    break ChatStreamEvent::Failed(map_worker_terminal_error(code, message));
                 }
                 InvocationEventKind::Cancelled { reason } => {
                     if let Some(lease) = tenant_work.take() {
                         lease.confirm_stopped();
                     }
-                    break ChatStreamEvent::Failed(
+                    break ChatStreamEvent::Failed(cancelled_error(
                         reason.unwrap_or_else(|| "Worker cancelled chat invocation".into()),
-                    );
+                    ));
                 }
             }
         };
@@ -2055,7 +2057,7 @@ mod tests {
         match drain_chat_stream(&mut event_rx).await {
             (_, _, None) => {}
             (_, _, Some(ChatStreamEvent::Failed(error))) => {
-                assert_eq!(error, CHAT_STREAM_BACKPRESSURE_ERROR)
+                assert_eq!(error.message, CHAT_STREAM_BACKPRESSURE_ERROR)
             }
             (_, _, other) => panic!("unexpected terminal {other:?}"),
         }

@@ -39,18 +39,15 @@ use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 
-fn openai_chat_stream_error_payload(message: impl Into<String>) -> String {
-    serde_json::json!({
-        "error": {
-            "message": message.into(),
-            "type": "server_error"
-        }
-    })
-    .to_string()
+/// An in-band error event: the OpenAI error object of the HTTP error the
+/// request would have had before the stream started.
+fn openai_chat_stream_error_payload(error: &ApiError) -> String {
+    error.openai_body().to_string()
 }
 
 fn openai_chat_stream_interruption_payload(saw_terminal: bool) -> Option<String> {
-    (!saw_terminal).then(|| openai_chat_stream_error_payload(CHAT_STREAM_INTERRUPTED_ERROR))
+    (!saw_terminal)
+        .then(|| openai_chat_stream_error_payload(&ApiError::internal(CHAT_STREAM_INTERRUPTED_ERROR)))
 }
 
 #[allow(dead_code)]
@@ -943,12 +940,14 @@ fn render_chat_stream(
                 }
                 ChatStreamEvent::Failed(error) => {
                     observer.record_failure();
-                    (vec![openai_chat_stream_error_payload(error)], true)
+                    (vec![openai_chat_stream_error_payload(&error)], true)
                 }
                 ChatStreamEvent::ShuttingDown => {
                     observer.record_failure();
                     (
-                        vec![openai_chat_stream_error_payload("Server is shutting down")],
+                        vec![openai_chat_stream_error_payload(&ApiError::service_unavailable(
+                            "Server is shutting down",
+                        ))],
                         true,
                     )
                 }

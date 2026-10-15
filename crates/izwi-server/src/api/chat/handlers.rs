@@ -495,7 +495,7 @@ async fn create_streaming_thread_message(
                     (payload, true)
                 }
                 ChatStreamEvent::Failed(error) => (
-                    thread_stream_error_payload(error),
+                    thread_stream_error_payload(error.message),
                     true,
                 ),
                 ChatStreamEvent::ShuttingDown => (
