@@ -221,6 +221,8 @@ struct TranscribedChunk {
     range: AudioChunk,
     text: String,
     language: Option<String>,
+    /// The decode stopped at its token budget, so the text may be cut short.
+    hit_token_budget: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,9 +269,16 @@ impl DiarizationAsrModel {
         audio: &[f32],
         sample_rate: u32,
         language: Option<&str>,
+        options: NativeAsrGenerationOptions,
     ) -> Result<NativeAsrTranscription> {
         match self {
-            Self::Native(model) => model.transcribe_with_details(audio, sample_rate, language),
+            Self::Native(model) => model.transcribe_with_details_and_prompt_and_options(
+                audio,
+                sample_rate,
+                language,
+                None,
+                options,
+            ),
             Self::Voxtral(_) => Err(Error::InferenceError(
                 "Voxtral ASR requires lifecycle-owned physical invocation state".to_string(),
             )),
@@ -798,7 +807,7 @@ impl RuntimeService {
             asr_model.max_audio_seconds_hint(),
             asr_model.audio_token_rate(),
             self.model_registry.effective_context(asr_variant),
-            |_| NativeAsrGenerationOptions::default().max_new_tokens,
+            diarization_asr_max_new_tokens,
         )?;
         tracing::info!(
             variant = %asr_variant,
@@ -821,11 +830,17 @@ impl RuntimeService {
         // into this block and drops at its end, so the ASR is evictable before
         // the aligner runs and the refinement LLM loads (ADM-8). Dropping only
         // the lease would let eviction count weights the model still pins.
-        let (asr_text, chunk_texts, detected_language) = {
+        let (asr_text, chunk_texts, detected_language, single_pass_hit_budget) = {
             let _asr_lease = asr_lease;
             let (asr_model, asr_contract, asr_state) = (asr_model, asr_contract, asr_state);
             if use_single_pass_asr {
                 let audio_for_task = audio.clone();
+                // Size the decode budget from the duration, as each chunk's
+                // budget covers its own audio on the chunked path.
+                let options = NativeAsrGenerationOptions {
+                    max_new_tokens: diarization_asr_max_new_tokens(audio.duration_secs),
+                    ..NativeAsrGenerationOptions::default()
+                };
                 let transcription = if invocation_asr {
                     self.coordinator
                         .run_loaded_blocking_stage_with_invocation_workspace(
@@ -841,7 +856,7 @@ impl RuntimeService {
                                     PIPELINE_SAMPLE_RATE,
                                     None,
                                     None,
-                                    NativeAsrGenerationOptions::default(),
+                                    options,
                                     leases,
                                 )
                             },
@@ -860,12 +875,19 @@ impl RuntimeService {
                                     &audio_for_task.samples,
                                     PIPELINE_SAMPLE_RATE,
                                     None,
+                                    options,
                                 )
                             },
                         )
                         .await?
                 };
-                (transcription.text, Vec::new(), transcription.language)
+                let hit_budget = asr_hit_token_budget(transcription.diagnostics.as_ref());
+                (
+                    transcription.text,
+                    Vec::new(),
+                    transcription.language,
+                    hit_budget,
+                )
             } else if invocation_asr {
                 let (cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
                 let mut assembler = TranscriptAssembler::new(cfg);
@@ -880,6 +902,12 @@ impl RuntimeService {
                     let chunk_audio = audio.clone();
                     let chunk_start = chunk.start_sample;
                     let chunk_end = chunk.end_sample;
+                    let options = NativeAsrGenerationOptions {
+                        max_new_tokens: diarization_asr_max_new_tokens(
+                            chunk.len_samples() as f32 / PIPELINE_SAMPLE_RATE as f32,
+                        ),
+                        ..NativeAsrGenerationOptions::default()
+                    };
                     let transcription = self
                         .coordinator
                         .run_loaded_blocking_stage_with_invocation_workspace(
@@ -895,7 +923,7 @@ impl RuntimeService {
                                     PIPELINE_SAMPLE_RATE,
                                     None,
                                     None,
-                                    NativeAsrGenerationOptions::default(),
+                                    options,
                                     leases,
                                 )
                             },
@@ -904,11 +932,17 @@ impl RuntimeService {
                     assembler.push_chunk_text(&transcription.text);
                     transcribed.push(TranscribedChunk {
                         range: chunk,
+                        hit_token_budget: asr_hit_token_budget(transcription.diagnostics.as_ref()),
                         text: transcription.text,
                         language: transcription.language,
                     });
                 }
-                (assembler.finish().trim().to_string(), transcribed, None)
+                (
+                    assembler.finish().trim().to_string(),
+                    transcribed,
+                    None,
+                    false,
+                )
             } else {
                 let audio_for_task = audio.clone();
                 let (text, chunks) = self
@@ -924,13 +958,16 @@ impl RuntimeService {
                         },
                     )
                     .await?;
-                (text, chunks, None)
+                (text, chunks, None, false)
             }
         };
         let asr_words = extract_words(&asr_text);
+        let mut warnings = asr_token_budget_warnings(
+            single_pass_hit_budget.then_some((0.0, audio.duration_secs)),
+            &chunk_texts,
+        );
 
         let mut model_aligned_words = 0usize;
-        let mut warnings = Vec::new();
         let mut alignments = if asr_text.is_empty() {
             Vec::new()
         } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
@@ -1194,6 +1231,71 @@ fn degrade_pipeline_chunk_config(
     cfg
 }
 
+/// Decode tokens one diarization ASR invocation may emit for `seconds` of
+/// audio: the native default (enough for a chunk) or, for a longer single
+/// pass, a duration budget well above dense speech, so the transcript is not
+/// cut at a fixed token count.
+const DIARIZATION_ASR_TOKENS_PER_SECOND: f32 = 8.0;
+const DIARIZATION_ASR_TOKEN_RESERVE: usize = 64;
+
+fn diarization_asr_max_new_tokens(seconds: f32) -> usize {
+    let scaled = if seconds.is_finite() && seconds > 0.0 {
+        (seconds * DIARIZATION_ASR_TOKENS_PER_SECOND).ceil() as usize
+            + DIARIZATION_ASR_TOKEN_RESERVE
+    } else {
+        0
+    };
+    scaled.max(NativeAsrGenerationOptions::default().max_new_tokens)
+}
+
+/// Whether an ASR decode stopped at its token budget, as reported by a
+/// `stop_reason` of `max_tokens` anywhere in its diagnostics.
+fn asr_hit_token_budget(diagnostics: Option<&serde_json::Value>) -> bool {
+    fn search(value: &serde_json::Value, depth: usize) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.get("stop_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| reason == "max_tokens")
+                    || (depth < 4 && map.values().any(|child| search(child, depth + 1)))
+            }
+            serde_json::Value::Array(items) => {
+                depth < 4 && items.iter().any(|child| search(child, depth + 1))
+            }
+            _ => false,
+        }
+    }
+    diagnostics.is_some_and(|value| search(value, 0))
+}
+
+/// One warning per ASR pass that stopped at its token budget: the single pass
+/// over `(start, end)` seconds, or each such chunk.
+fn asr_token_budget_warnings(
+    single_pass: Option<(f32, f32)>,
+    chunks: &[TranscribedChunk],
+) -> Vec<String> {
+    let chunk_spans = chunks
+        .iter()
+        .filter(|chunk| chunk.hit_token_budget)
+        .map(|chunk| {
+            (
+                chunk.range.start_sample as f32 / PIPELINE_SAMPLE_RATE as f32,
+                chunk.range.end_sample as f32 / PIPELINE_SAMPLE_RATE as f32,
+            )
+        });
+    single_pass
+        .into_iter()
+        .chain(chunk_spans)
+        .map(|(start, end)| {
+            let warning = format!(
+                "ASR for {start:.2}-{end:.2} s stopped at its token budget; the transcript may be cut short"
+            );
+            warn!("{warning}");
+            warning
+        })
+        .collect()
+}
+
 /// One ASR pass over the whole file is allowed only when it fits the
 /// combined ASR/aligner chunk limit (`None` = unbounded). Without an aligner
 /// the ASR limit alone still applies: invocation-backed families reject
@@ -1241,14 +1343,22 @@ fn transcribe_audio_chunks(
             continue;
         }
         let chunk_audio = &audio.samples[chunk.start_sample..chunk.end_sample];
+        let options = NativeAsrGenerationOptions {
+            max_new_tokens: diarization_asr_max_new_tokens(
+                chunk_audio.len() as f32 / PIPELINE_SAMPLE_RATE as f32,
+            ),
+            ..NativeAsrGenerationOptions::default()
+        };
         let transcription = model.transcribe_with_details(
             chunk_audio,
             PIPELINE_SAMPLE_RATE,
             language.as_deref(),
+            options,
         )?;
         assembler.push_chunk_text(&transcription.text);
         transcribed.push(TranscribedChunk {
             range: chunk,
+            hit_token_budget: asr_hit_token_budget(transcription.diagnostics.as_ref()),
             text: transcription.text,
             language: transcription.language,
         });
@@ -3668,11 +3778,56 @@ Here is the refined transcript:
                 range: *range,
                 text: format!("alpha{index} beta{index} gamma{index}"),
                 language: None,
+                hit_token_budget: false,
             })
             .collect::<Vec<_>>();
         let timings = fallback_word_timings_from_chunks(&transcribed, sample_rate);
         assert!(!timings.is_empty());
         let last_end_ms = timings.iter().map(|(_, _, end)| *end).max().unwrap();
         assert!(last_end_ms > 30_000, "timings must cover the later chunks");
+    }
+
+    #[test]
+    fn single_pass_asr_budget_grows_with_duration() {
+        let default = NativeAsrGenerationOptions::default().max_new_tokens;
+        assert_eq!(diarization_asr_max_new_tokens(0.0), default);
+        assert_eq!(diarization_asr_max_new_tokens(30.0), default);
+        assert_eq!(diarization_asr_max_new_tokens(f32::NAN), default);
+        // 600 s of dense speech needs far more than the 768-token default.
+        assert_eq!(diarization_asr_max_new_tokens(600.0), 600 * 8 + 64);
+        assert!(diarization_asr_max_new_tokens(180.0) > default);
+    }
+
+    #[test]
+    fn asr_token_budget_stops_become_warnings() {
+        let granite = serde_json::json!({
+            "generation": {"stats": {"stop_reason": "max_tokens"}}
+        });
+        assert!(asr_hit_token_budget(Some(&granite)));
+        assert!(asr_hit_token_budget(Some(
+            &serde_json::json!({"stop_reason": "max_tokens"})
+        )));
+        assert!(!asr_hit_token_budget(Some(
+            &serde_json::json!({"stop_reason": "stop_token"})
+        )));
+        assert!(!asr_hit_token_budget(None));
+
+        let chunk = |start: usize, end: usize, hit: bool| TranscribedChunk {
+            range: AudioChunk {
+                start_sample: start * PIPELINE_SAMPLE_RATE as usize,
+                end_sample: end * PIPELINE_SAMPLE_RATE as usize,
+            },
+            text: "words".to_string(),
+            language: None,
+            hit_token_budget: hit,
+        };
+        let warnings = asr_token_budget_warnings(
+            Some((0.0, 95.0)),
+            &[chunk(0, 30, false), chunk(27, 57, true)],
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("0.00-95.00 s"), "{warnings:?}");
+        assert!(warnings[1].contains("27.00-57.00 s"), "{warnings:?}");
+        assert!(asr_token_budget_warnings(None, &[chunk(0, 30, false)]).is_empty());
     }
 }
