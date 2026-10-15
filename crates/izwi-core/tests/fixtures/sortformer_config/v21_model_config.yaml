@@ -1,0 +1,89 @@
+# The model_config.yaml of nvidia/diar_streaming_sortformer_4spk-v2.1@cd03eee9 (extracted from the .nemo), less the
+# training-only sections: activity_loss, loss, optim, phantom_loss, spec_augment, test_ds, train_ds, validation_ds.
+sample_rate: 16000
+pil_weight: 0.5
+ats_weight: 0.5
+max_num_of_spks: 4
+streaming_mode: true
+model_defaults:
+  fc_d_model: 512
+  tf_d_model: 192
+preprocessor:
+  _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+  normalize: NA
+  window_size: 0.025
+  sample_rate: 16000
+  window_stride: 0.01
+  window: hann
+  features: 128
+  n_fft: 512
+  frame_splicing: 1
+  dither: 1.0e-05
+sortformer_modules:
+  _target_: nemo.collections.asr.modules.sortformer_modules.SortformerModules
+  num_spks: 4
+  dropout_rate: 0.5
+  fc_d_model: 512
+  tf_d_model: 192
+  spkcache_len: 188
+  fifo_len: 0
+  chunk_len: 188
+  spkcache_update_period: 188
+  chunk_left_context: 1
+  chunk_right_context: 1
+  spkcache_sil_frames_per_spk: 3
+  scores_add_rnd: 0
+  pred_score_threshold: 0.25
+  max_index: 99999
+  scores_boost_latest: 0.05
+  sil_threshold: 0.2
+  strong_boost_rate: 0.75
+  weak_boost_rate: 1.5
+  min_pos_scores_rate: 0.5
+  causal_attn_rate: 0.5
+  causal_attn_rc: 7
+encoder:
+  _target_: nemo.collections.asr.modules.ConformerEncoder
+  feat_in: 128
+  feat_out: -1
+  n_layers: 17
+  d_model: 512
+  subsampling: dw_striding
+  subsampling_factor: 8
+  subsampling_conv_channels: 256
+  causal_downsampling: false
+  ff_expansion_factor: 4
+  self_attention_model: rel_pos
+  n_heads: 8
+  att_context_size:
+  - -1
+  - -1
+  att_context_style: regular
+  xscaling: true
+  untie_biases: true
+  pos_emb_max_len: 5000
+  conv_kernel_size: 9
+  conv_norm_type: batch_norm
+  conv_context_size: null
+  dropout: 0.1
+  dropout_pre_encoder: 0.1
+  dropout_emb: 0.0
+  dropout_att: 0.1
+  stochastic_depth_drop_prob: 0.0
+  stochastic_depth_mode: linear
+  stochastic_depth_start_layer: 1
+transformer_encoder:
+  _target_: nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder
+  num_layers: 18
+  hidden_size: 192
+  inner_size: 768
+  num_attention_heads: 8
+  attn_score_dropout: 0.5
+  attn_layer_dropout: 0.5
+  ffn_dropout: 0.5
+  hidden_act: relu
+  pre_ln: false
+  pre_ln_final_layer_norm: true
+lr: 0.0001
+target: nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel
+nemo_version: 2.6.0rc0

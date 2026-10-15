@@ -69,7 +69,6 @@ const NEMOTRON3_ROPE_LAYERS: usize = 31;
 const NEMOTRON3_ROPE_D_MODEL: usize = 512;
 const NEMOTRON3_ROPE_FF_DIM: usize = 2048;
 const NEMOTRON3_ROPE_HEADS: usize = 8;
-const NEMOTRON3_ROPE_THETA: f32 = 10_000.0;
 const NEMOTRON3_ROPE_MAX_POSITIONS: usize = 5_000;
 const NEMOTRON3_MAX_CHUNK_LEN: usize = 340;
 const NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT: usize = 40;
@@ -154,8 +153,16 @@ struct SortformerModelConfig {
     sample_rate: Option<u32>,
     max_num_of_spks: Option<usize>,
     streaming_mode: Option<bool>,
+    /// NeMo `SortformerEncLabelModel`: probability rows at 10 ms instead of
+    /// the encoded rate (absent: false).
+    high_resolution: Option<bool>,
+    /// Output frame period in 10 ms units (absent: the encoder's
+    /// subsampling factor).
+    output_subsampling_factor: Option<usize>,
+    async_streaming: Option<bool>,
     preprocessor: Option<SortformerPreprocessorConfig>,
     encoder: Option<SortformerEncoderConfig>,
+    transformer_encoder: Option<SortformerTransformerConfig>,
     sortformer_modules: Option<SortformerModulesConfig>,
 }
 
@@ -169,13 +176,45 @@ struct SortformerPreprocessorConfig {
     normalize: Option<String>,
 }
 
+/// The graph-defining fields of the `encoder` section: NeMo's
+/// `ConformerEncoder` (v2.1) or `TransformerEncoder` (Nemotron-3). An absent
+/// field takes that class's default, which is what NeMo builds.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SortformerEncoderConfig {
     #[serde(rename = "_target_")]
     target: Option<String>,
+    n_heads: Option<usize>,
     xscaling: Option<bool>,
     subsampling: Option<String>,
+    subsampling_factor: Option<usize>,
+    self_attention_model: Option<String>,
+    causal_downsampling: Option<bool>,
+    att_context_size: Option<serde_yaml::Value>,
     conv_norm_type: Option<String>,
+    conv_context_size: Option<serde_yaml::Value>,
+    untie_biases: Option<bool>,
+    use_bias: Option<bool>,
+    global_tokens: Option<usize>,
+    reduction: Option<serde_yaml::Value>,
+    qkv_bias: Option<bool>,
+    qk_norm: Option<bool>,
+    pre_block_norm: Option<bool>,
+    attn_mode: Option<String>,
+    rope_base: Option<f64>,
+    rotary_fraction: Option<f64>,
+    causal_tail_len: Option<usize>,
+}
+
+/// v2.1's `transformer_encoder` section (NeMo
+/// `transformer_encoders.TransformerEncoder`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SortformerTransformerConfig {
+    #[serde(rename = "_target_")]
+    target: Option<String>,
+    num_attention_heads: Option<usize>,
+    hidden_act: Option<String>,
+    pre_ln: Option<bool>,
+    mask_future: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,28 +223,62 @@ enum SortformerEncoderKind {
     FeatureStackingRope,
 }
 
-/// Discriminates the acoustic graph from the checkpoint's encoder section.
-/// An absent section keeps the historical Conformer default; anything that is
-/// not one of the two served graphs fails closed.
-fn resolve_encoder_kind(cfg: Option<&SortformerEncoderConfig>) -> Result<SortformerEncoderKind> {
-    let Some(cfg) = cfg else {
-        return Ok(SortformerEncoderKind::Conformer);
-    };
+/// The graph a checkpoint yaml defines, checked against the one izwi runs
+/// (SRT-8, NDZ-4): a field outside the served set fails the load instead
+/// of loading same-shaped weights into a different graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SortformerGraphSpec {
+    /// v2.1: `dw_striding` subsampling, a relative-position Conformer and a
+    /// post-LN ReLU transformer at the encoded rate.
+    Conformer {
+        heads: usize,
+        xscaling: bool,
+        transformer_heads: usize,
+    },
+    /// Nemotron-3: feature stacking, a pre-norm RoPE transformer with full
+    /// attention, and the subpixel upsampler to 10 ms rows.
+    FeatureStackingRope {
+        heads: usize,
+        stacking_factor: usize,
+        rope_base: f32,
+    },
+}
+
+impl SortformerGraphSpec {
+    fn encoder_kind(self) -> SortformerEncoderKind {
+        match self {
+            Self::Conformer { .. } => SortformerEncoderKind::Conformer,
+            Self::FeatureStackingRope { .. } => SortformerEncoderKind::FeatureStackingRope,
+        }
+    }
+}
+
+/// Discriminates the acoustic graph from the encoder's `_target_`; anything
+/// that is not one of the two served encoders fails closed.
+fn resolve_encoder_kind(cfg: &SortformerEncoderConfig) -> Result<SortformerEncoderKind> {
     let target = cfg
         .target
         .as_deref()
         .and_then(|value| value.rsplit('.').next())
         .unwrap_or("");
-    match (target, cfg.subsampling.as_deref()) {
-        ("ConformerEncoder", _) | ("", None) => Ok(SortformerEncoderKind::Conformer),
-        ("TransformerEncoder", Some("feature_stacking")) => {
-            Ok(SortformerEncoderKind::FeatureStackingRope)
-        }
+    match target {
+        "ConformerEncoder" => Ok(SortformerEncoderKind::Conformer),
+        "TransformerEncoder" => Ok(SortformerEncoderKind::FeatureStackingRope),
         _ => Err(Error::ModelLoadError(format!(
-            "unsupported Sortformer encoder target {:?} with subsampling {:?}",
-            cfg.target, cfg.subsampling
+            "unsupported Sortformer encoder target {:?}",
+            cfg.target
         ))),
     }
+}
+
+/// Fails the load unless the yaml's `field` holds the `served` value.
+fn require_config<T: PartialEq + std::fmt::Debug>(field: &str, value: T, served: T) -> Result<()> {
+    if value == served {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "unsupported Sortformer config {field} = {value:?}; izwi serves only {served:?}"
+    )))
 }
 
 /// The Conformer conv module folds an inference BatchNorm into its depthwise
@@ -219,8 +292,202 @@ fn validate_conv_norm_type(cfg: Option<&SortformerEncoderConfig>) -> Result<()> 
     }
 }
 
+/// Full-context attention: NeMo's default `att_context_size` (absent or
+/// null) or `[-1, -1]`. A limited or multi-lookahead context fails closed.
+fn validate_full_attention_context(value: Option<&serde_yaml::Value>) -> Result<()> {
+    let full = match value {
+        None | Some(serde_yaml::Value::Null) => true,
+        Some(serde_yaml::Value::Sequence(items)) => {
+            items.len() == 2 && items.iter().all(|item| item.as_i64() == Some(-1))
+        }
+        Some(_) => false,
+    };
+    if full {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "unsupported Sortformer config encoder.att_context_size = {value:?}; izwi serves only [-1, -1]"
+    )))
+}
+
+/// Reads and validates every graph-defining field of a Sortformer checkpoint
+/// yaml. Shape-defining values (layers, widths) come from the tensors and
+/// the production topology pins; these are the flags the tensors cannot
+/// show. Head counts and the RoPE base are taken from the yaml.
+fn resolve_graph_spec(config: &SortformerModelConfig) -> Result<SortformerGraphSpec> {
+    let encoder = config.encoder.as_ref().ok_or_else(|| {
+        Error::ModelLoadError("Sortformer config has no encoder section".to_string())
+    })?;
+    let modules = config.sortformer_modules.clone().unwrap_or_default();
+    require_config(
+        "async_streaming",
+        config.async_streaming.unwrap_or(false),
+        false,
+    )?;
+    let high_resolution = config.high_resolution.unwrap_or(false);
+    let learnable_silence = modules.use_learnable_sil_emb.unwrap_or(false);
+    match resolve_encoder_kind(encoder)? {
+        SortformerEncoderKind::Conformer => {
+            // NeMo `ConformerEncoder` defaults: striding x4, rel_pos, 4 heads.
+            require_config(
+                "encoder.subsampling",
+                encoder.subsampling.as_deref().unwrap_or("striding"),
+                "dw_striding",
+            )?;
+            let factor = encoder.subsampling_factor.unwrap_or(4);
+            require_config(
+                "encoder.subsampling_factor",
+                factor,
+                TS_VAD_UNIT_FRAME_COUNT,
+            )?;
+            require_config(
+                "encoder.causal_downsampling",
+                encoder.causal_downsampling.unwrap_or(false),
+                false,
+            )?;
+            require_config(
+                "encoder.self_attention_model",
+                encoder.self_attention_model.as_deref().unwrap_or("rel_pos"),
+                "rel_pos",
+            )?;
+            validate_full_attention_context(encoder.att_context_size.as_ref())?;
+            validate_conv_norm_type(Some(encoder))?;
+            require_config(
+                "encoder.conv_context_size",
+                encoder.conv_context_size.as_ref(),
+                None,
+            )?;
+            require_config(
+                "encoder.untie_biases",
+                encoder.untie_biases.unwrap_or(true),
+                true,
+            )?;
+            require_config("encoder.use_bias", encoder.use_bias.unwrap_or(true), true)?;
+            require_config(
+                "encoder.global_tokens",
+                encoder.global_tokens.unwrap_or(0),
+                0,
+            )?;
+            require_config("encoder.reduction", encoder.reduction.as_ref(), None)?;
+            require_config("high_resolution", high_resolution, false)?;
+            require_config(
+                "output_subsampling_factor",
+                config.output_subsampling_factor.unwrap_or(factor),
+                factor,
+            )?;
+            require_config(
+                "sortformer_modules.use_learnable_sil_emb",
+                learnable_silence,
+                false,
+            )?;
+            let transformer = config.transformer_encoder.as_ref().ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Sortformer Conformer config has no transformer_encoder section".to_string(),
+                )
+            })?;
+            require_config(
+                "transformer_encoder._target_",
+                transformer
+                    .target
+                    .as_deref()
+                    .and_then(|value| value.rsplit('.').next()),
+                Some("TransformerEncoder"),
+            )?;
+            // NeMo `TransformerEncoder` defaults: ReLU, post-LN, one head.
+            require_config(
+                "transformer_encoder.hidden_act",
+                transformer.hidden_act.as_deref().unwrap_or("relu"),
+                "relu",
+            )?;
+            require_config(
+                "transformer_encoder.pre_ln",
+                transformer.pre_ln.unwrap_or(false),
+                false,
+            )?;
+            require_config(
+                "transformer_encoder.mask_future",
+                transformer.mask_future.unwrap_or(false),
+                false,
+            )?;
+            Ok(SortformerGraphSpec::Conformer {
+                heads: encoder.n_heads.unwrap_or(4),
+                xscaling: encoder.xscaling.unwrap_or(true),
+                transformer_heads: transformer.num_attention_heads.unwrap_or(1),
+            })
+        }
+        SortformerEncoderKind::FeatureStackingRope => {
+            // NeMo `TransformerEncoder` defaults: feature stacking x4,
+            // rel_pos, no xscaling, pre-block norm, full attention.
+            require_config(
+                "encoder.subsampling",
+                encoder.subsampling.as_deref().unwrap_or("feature_stacking"),
+                "feature_stacking",
+            )?;
+            let factor = encoder.subsampling_factor.unwrap_or(4);
+            require_config(
+                "encoder.self_attention_model",
+                encoder.self_attention_model.as_deref().unwrap_or("rel_pos"),
+                "rope",
+            )?;
+            require_config("encoder.xscaling", encoder.xscaling.unwrap_or(false), false)?;
+            require_config("encoder.qkv_bias", encoder.qkv_bias.unwrap_or(false), false)?;
+            require_config("encoder.qk_norm", encoder.qk_norm.unwrap_or(false), false)?;
+            require_config(
+                "encoder.pre_block_norm",
+                encoder.pre_block_norm.unwrap_or(true),
+                true,
+            )?;
+            require_config(
+                "encoder.attn_mode",
+                encoder.attn_mode.as_deref().unwrap_or("full"),
+                "full",
+            )?;
+            require_config(
+                "encoder.rotary_fraction",
+                encoder.rotary_fraction.unwrap_or(1.0),
+                1.0,
+            )?;
+            require_config(
+                "encoder.causal_tail_len",
+                encoder.causal_tail_len.unwrap_or(0),
+                0,
+            )?;
+            let rope_base = encoder.rope_base.unwrap_or(10_000.0);
+            if !(rope_base.is_finite() && rope_base > 1.0) {
+                return Err(Error::ModelLoadError(format!(
+                    "unsupported Sortformer config encoder.rope_base = {rope_base}"
+                )));
+            }
+            require_config("high_resolution", high_resolution, true)?;
+            require_config(
+                "output_subsampling_factor",
+                config.output_subsampling_factor.unwrap_or(factor),
+                1,
+            )?;
+            require_config(
+                "sortformer_modules.use_learnable_sil_emb",
+                learnable_silence,
+                true,
+            )?;
+            if config.transformer_encoder.is_some() {
+                return Err(Error::ModelLoadError(
+                    "unsupported Sortformer config: a transformer_encoder beside the RoPE encoder"
+                        .to_string(),
+                ));
+            }
+            Ok(SortformerGraphSpec::FeatureStackingRope {
+                heads: encoder.n_heads.unwrap_or(8),
+                stacking_factor: factor,
+                rope_base: rope_base as f32,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SortformerModulesConfig {
+    num_spks: Option<usize>,
+    use_learnable_sil_emb: Option<bool>,
     fc_d_model: Option<usize>,
     subsampling_factor: Option<usize>,
     spkcache_len: Option<usize>,
@@ -1181,12 +1448,18 @@ impl SortformerDiarizerModel {
 
         let expected_spks = expected_speaker_count(variant)?;
         let num_spks = config.max_num_of_spks.unwrap_or(expected_spks);
-        if num_spks != expected_spks {
+        let module_spks = config
+            .sortformer_modules
+            .as_ref()
+            .and_then(|modules| modules.num_spks)
+            .unwrap_or(num_spks);
+        if num_spks != expected_spks || module_spks != expected_spks {
             return Err(Error::ModelLoadError(format!(
-                "Unsupported Sortformer speaker count {num_spks}; {} expects {expected_spks}",
+                "Unsupported Sortformer speaker count {num_spks} (sortformer_modules.num_spks {module_spks}); {} expects {expected_spks}",
                 variant.dir_name()
             )));
         }
+        let graph = resolve_graph_spec(&config)?;
 
         let device = sortformer_model_device(&device_profile);
         let vb =
@@ -1219,7 +1492,7 @@ impl SortformerDiarizerModel {
             resolve_streaming_profile(),
             num_spks,
             streaming_mode,
-            config.encoder.clone(),
+            graph,
             modules_cfg.clone(),
             device.clone(),
             device_profile.kind.is_cuda(),
@@ -1657,7 +1930,7 @@ impl SortformerInferenceModel {
         profile: SortformerStreamingProfile,
         num_spks: usize,
         streaming_mode: bool,
-        encoder_cfg: Option<SortformerEncoderConfig>,
+        graph: SortformerGraphSpec,
         modules_cfg: SortformerModulesConfig,
         device: Device,
         separate_device_memory: bool,
@@ -1669,21 +1942,35 @@ impl SortformerInferenceModel {
         }
         let feature_bins = preprocessor_cfg.features.unwrap_or(128);
         let preprocessor = SortformerPreprocessor::load(vb, preprocessor_cfg)?;
-        let encoder_kind = resolve_encoder_kind(encoder_cfg.as_ref())?;
-        let encoder = match encoder_kind {
-            SortformerEncoderKind::Conformer => {
-                validate_conv_norm_type(encoder_cfg.as_ref())?;
-                SortformerAcousticEncoder::Conformer(SortformerConformerEncoder::load(
-                    vb.pp("encoder"),
-                    encoder_cfg.and_then(|cfg| cfg.xscaling).unwrap_or(true),
-                )?)
+        let encoder_kind = graph.encoder_kind();
+        let encoder = match graph {
+            SortformerGraphSpec::Conformer {
+                heads, xscaling, ..
+            } => {
+                let encoder = SortformerConformerEncoder::load(vb.pp("encoder"), xscaling)?;
+                if let Some(layer) = encoder
+                    .layers
+                    .iter()
+                    .find(|layer| layer.self_attn.num_heads != heads)
+                {
+                    return Err(Error::ModelLoadError(format!(
+                        "Sortformer config encoder.n_heads = {heads} does not match the checkpoint's {} relative-position heads",
+                        layer.self_attn.num_heads
+                    )));
+                }
+                SortformerAcousticEncoder::Conformer(encoder)
             }
-            SortformerEncoderKind::FeatureStackingRope => {
-                SortformerAcousticEncoder::FeatureStackingRope(SortformerRopeEncoder::load(
-                    vb.pp("encoder"),
-                    feature_bins,
-                )?)
-            }
+            SortformerGraphSpec::FeatureStackingRope {
+                heads,
+                stacking_factor,
+                rope_base,
+            } => SortformerAcousticEncoder::FeatureStackingRope(SortformerRopeEncoder::load(
+                vb.pp("encoder"),
+                feature_bins,
+                heads,
+                stacking_factor,
+                rope_base,
+            )?),
         };
 
         let encoder_proj_w = vb
@@ -1693,13 +1980,20 @@ impl SortformerInferenceModel {
         let encoder_proj =
             mlx::load_linear(proj_in, proj_out, vb.pp("sortformer_modules.encoder_proj"))?;
 
-        let expander = match encoder_kind {
-            SortformerEncoderKind::Conformer => SortformerFrameExpander::SortformerTransformer(
-                SortformerTransformerEncoder::load(vb.pp("transformer_encoder"))?,
-            ),
-            SortformerEncoderKind::FeatureStackingRope => SortformerFrameExpander::SubpixelUpsampler(
-                SortformerSubpixelUpsampler::load(vb.pp("sortformer_modules"))?,
-            ),
+        let expander = match graph {
+            SortformerGraphSpec::Conformer {
+                transformer_heads, ..
+            } => {
+                SortformerFrameExpander::SortformerTransformer(SortformerTransformerEncoder::load(
+                    vb.pp("transformer_encoder"),
+                    transformer_heads,
+                )?)
+            }
+            SortformerGraphSpec::FeatureStackingRope { .. } => {
+                SortformerFrameExpander::SubpixelUpsampler(SortformerSubpixelUpsampler::load(
+                    vb.pp("sortformer_modules"),
+                )?)
+            }
         };
         let head = SortformerSpeakerHead::load(vb.pp("sortformer_modules"), num_spks)?;
         let silence_embedding = match encoder_kind {
@@ -3397,7 +3691,7 @@ struct SortformerTransformerEncoder {
 }
 
 impl SortformerTransformerEncoder {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, num_heads: usize) -> Result<Self> {
         let mut layers = Vec::new();
         let mut idx = 0usize;
         loop {
@@ -3405,7 +3699,7 @@ impl SortformerTransformerEncoder {
             if !layer_vb.contains_tensor("layer_norm_1.weight") {
                 break;
             }
-            layers.push(SortformerTransformerLayer::load(layer_vb)?);
+            layers.push(SortformerTransformerLayer::load(layer_vb, num_heads)?);
             idx += 1;
         }
         if layers.is_empty() {
@@ -3441,7 +3735,7 @@ struct SortformerTransformerLayer {
 }
 
 impl SortformerTransformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, num_heads: usize) -> Result<Self> {
         let d_model = vb
             .pp("layer_norm_1")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -3467,8 +3761,7 @@ impl SortformerTransformerLayer {
             )));
         }
 
-        let num_heads = 8usize;
-        if d_model % num_heads != 0 {
+        if num_heads == 0 || d_model % num_heads != 0 {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer transformer hidden size {d_model} is not divisible by {num_heads} heads"
             )));
@@ -3696,19 +3989,25 @@ struct SortformerRopeEncoder {
 }
 
 impl SortformerRopeEncoder {
-    fn load(vb: VarBuilder, feature_bins: usize) -> Result<Self> {
+    /// `num_heads`, `stacking_factor` and `rope_base` are the yaml's
+    /// `n_heads`, `subsampling_factor` and `rope_base`.
+    fn load(
+        vb: VarBuilder,
+        feature_bins: usize,
+        num_heads: usize,
+        stacking_factor: usize,
+        rope_base: f32,
+    ) -> Result<Self> {
         let proj_vb = vb.pp("pre_encode.proj");
         let proj_w = proj_vb.get_unchecked_dtype("weight", DType::F32)?;
         let (proj_out, proj_in) = proj_w.dims2()?;
-        if feature_bins == 0 || proj_in % feature_bins != 0 {
+        if feature_bins == 0 || proj_in != stacking_factor * feature_bins {
             return Err(Error::ModelLoadError(format!(
-                "unsupported Sortformer rope stacking projection [{proj_out}, {proj_in}] for {feature_bins} mel bins"
+                "unsupported Sortformer rope stacking projection [{proj_out}, {proj_in}] for {stacking_factor} stacked frames of {feature_bins} mel bins"
             )));
         }
-        let stacking_factor = proj_in / feature_bins;
         let d_model = proj_out;
-        let num_heads = NEMOTRON3_ROPE_HEADS;
-        if d_model % num_heads != 0 || !(d_model / num_heads).is_multiple_of(2) {
+        if num_heads == 0 || d_model % num_heads != 0 || !(d_model / num_heads).is_multiple_of(2) {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer rope hidden size {d_model} does not split into even {num_heads} heads"
             )));
@@ -3743,7 +4042,7 @@ impl SortformerRopeEncoder {
 
         let rope_inv_freq = (0..head_dim)
             .step_by(2)
-            .map(|i| 1.0 / NEMOTRON3_ROPE_THETA.powf(i as f32 / head_dim as f32))
+            .map(|i| 1.0 / rope_base.powf(i as f32 / head_dim as f32))
             .collect();
 
         Ok(Self {
@@ -5815,6 +6114,10 @@ mod tests {
     /// Builds a synthetic `SortformerRopeEncoder` checkpoint: 2 layers,
     /// d_model 64 (8 heads x 8), FFN 32, 16 mel bins stacked by 4.
     fn rope_encoder_fixture() -> Result<SortformerRopeEncoder> {
+        rope_encoder_fixture_with_base(10_000.0)
+    }
+
+    fn rope_encoder_fixture_with_base(rope_base: f32) -> Result<SortformerRopeEncoder> {
         fn seed_values(len: usize, seed: f32) -> Vec<f32> {
             (0..len)
                 .map(|i| ((i as f32 + 1.0) * seed) * 0.01)
@@ -5853,7 +6156,7 @@ mod tests {
             insert(&mut tensors, format!("{prefix}ffn.net.3.bias"), vec![64], 0.0);
         }
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        SortformerRopeEncoder::load(vb.pp("encoder"), 16)
+        SortformerRopeEncoder::load(vb.pp("encoder"), 16, 8, 4, rope_base)
     }
 
     #[test]
@@ -6606,6 +6909,373 @@ mod tests {
         }
     }
 
+    const V21_MODEL_CONFIG: &str =
+        include_str!("../../../../../tests/fixtures/sortformer_config/v21_model_config.yaml");
+    const NEMOTRON3_MODEL_CONFIG: &str =
+        include_str!("../../../../../tests/fixtures/sortformer_config/nemotron3_model_config.yaml");
+
+    /// The yaml with the value at `path` replaced (`Some`) or removed
+    /// (`None`), parsed as a Sortformer config.
+    fn edited_config(
+        yaml: &str,
+        path: &[&str],
+        value: Option<serde_yaml::Value>,
+    ) -> SortformerModelConfig {
+        let mut root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let (last, parents) = path.split_last().unwrap();
+        let mut node = &mut root;
+        for key in parents {
+            node = node.get_mut(*key).unwrap();
+        }
+        let map = node.as_mapping_mut().unwrap();
+        match value {
+            Some(value) => {
+                map.insert((*last).into(), value);
+            }
+            None => {
+                map.remove(*last);
+            }
+        }
+        serde_yaml::from_value(root).unwrap()
+    }
+
+    fn yaml_value(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).unwrap()
+    }
+
+    /// SRT-8 / NDZ-4: both published checkpoint yamls resolve to the graph
+    /// izwi runs, with head counts and the RoPE base read from the yaml.
+    #[test]
+    fn published_sortformer_yamls_resolve_the_served_graphs() {
+        let v21: SortformerModelConfig = serde_yaml::from_str(V21_MODEL_CONFIG).unwrap();
+        assert_eq!(
+            resolve_graph_spec(&v21).unwrap(),
+            SortformerGraphSpec::Conformer {
+                heads: 8,
+                xscaling: true,
+                transformer_heads: 8,
+            }
+        );
+        let nemotron: SortformerModelConfig = serde_yaml::from_str(NEMOTRON3_MODEL_CONFIG).unwrap();
+        assert_eq!(
+            resolve_graph_spec(&nemotron).unwrap(),
+            SortformerGraphSpec::FeatureStackingRope {
+                heads: 8,
+                stacking_factor: 8,
+                rope_base: 10_000.0,
+            }
+        );
+    }
+
+    /// SRT-8 / NDZ-4: a graph-defining field the graph does not implement
+    /// fails the load and names the field, whether it is set or left to a
+    /// NeMo default izwi does not serve.
+    #[test]
+    fn unserved_sortformer_graph_fields_fail_closed() {
+        let cases: &[(&str, &[&str], Option<&str>, &str)] = &[
+            (
+                V21_MODEL_CONFIG,
+                &["async_streaming"],
+                Some("true"),
+                "async_streaming",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "_target_"],
+                Some("x.SqueezeformerEncoder"),
+                "encoder target",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                Some("striding"),
+                "encoder.subsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                None,
+                "encoder.subsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling_factor"],
+                Some("4"),
+                "encoder.subsampling_factor",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "causal_downsampling"],
+                Some("true"),
+                "encoder.causal_downsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                Some("abs_pos"),
+                "encoder.self_attention_model",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "att_context_size"],
+                Some("[70, 1]"),
+                "encoder.att_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "att_context_size"],
+                Some("[[-1, -1], [70, 1]]"),
+                "encoder.att_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "conv_norm_type"],
+                Some("layer_norm"),
+                "conv_norm_type",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "conv_context_size"],
+                Some("causal"),
+                "encoder.conv_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "untie_biases"],
+                Some("false"),
+                "encoder.untie_biases",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "use_bias"],
+                Some("false"),
+                "encoder.use_bias",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "global_tokens"],
+                Some("4"),
+                "encoder.global_tokens",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["high_resolution"],
+                Some("true"),
+                "high_resolution",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                Some("1"),
+                "output_subsampling_factor",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["sortformer_modules", "use_learnable_sil_emb"],
+                Some("true"),
+                "use_learnable_sil_emb",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder"],
+                None,
+                "transformer_encoder",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "pre_ln"],
+                Some("true"),
+                "transformer_encoder.pre_ln",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "hidden_act"],
+                Some("gelu"),
+                "transformer_encoder.hidden_act",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "mask_future"],
+                Some("true"),
+                "transformer_encoder.mask_future",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                Some("dw_striding"),
+                "encoder.subsampling",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                Some("rel_pos"),
+                "encoder.self_attention_model",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                None,
+                "encoder.self_attention_model",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "xscaling"],
+                Some("true"),
+                "encoder.xscaling",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "qkv_bias"],
+                Some("true"),
+                "encoder.qkv_bias",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "qk_norm"],
+                Some("true"),
+                "encoder.qk_norm",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "pre_block_norm"],
+                Some("false"),
+                "encoder.pre_block_norm",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "attn_mode"],
+                Some("causal"),
+                "encoder.attn_mode",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rotary_fraction"],
+                Some("0.5"),
+                "encoder.rotary_fraction",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rope_base"],
+                Some("0.0"),
+                "encoder.rope_base",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "causal_tail_len"],
+                Some("16"),
+                "encoder.causal_tail_len",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["high_resolution"],
+                Some("false"),
+                "high_resolution",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                Some("8"),
+                "output_subsampling_factor",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                None,
+                "output_subsampling_factor",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["sortformer_modules", "use_learnable_sil_emb"],
+                Some("false"),
+                "use_learnable_sil_emb",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["transformer_encoder"],
+                Some("{num_attention_heads: 8}"),
+                "transformer_encoder",
+            ),
+        ];
+        for (yaml, path, value, field) in cases {
+            let config = edited_config(yaml, path, value.map(yaml_value));
+            let err = resolve_graph_spec(&config)
+                .expect_err(&format!("{path:?} = {value:?} must fail closed"))
+                .to_string();
+            assert!(err.contains(field), "{path:?} = {value:?}: {err}");
+        }
+    }
+
+    /// NDZ-4: the head counts and the RoPE base come from the yaml (NeMo
+    /// defaults when absent), and a head count off the production topology
+    /// is refused by its pin rather than loaded with eight heads.
+    #[test]
+    fn sortformer_head_counts_and_rope_base_come_from_the_yaml() {
+        let spec = |yaml, path: &[&str], value: Option<&str>| {
+            resolve_graph_spec(&edited_config(yaml, path, value.map(yaml_value))).unwrap()
+        };
+        assert!(matches!(
+            spec(V21_MODEL_CONFIG, &["encoder", "n_heads"], Some("4")),
+            SortformerGraphSpec::Conformer { heads: 4, .. }
+        ));
+        assert!(matches!(
+            spec(V21_MODEL_CONFIG, &["encoder", "n_heads"], None),
+            SortformerGraphSpec::Conformer { heads: 4, .. }
+        ));
+        assert!(matches!(
+            spec(
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "num_attention_heads"],
+                Some("4")
+            ),
+            SortformerGraphSpec::Conformer {
+                transformer_heads: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spec(
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "num_attention_heads"],
+                None
+            ),
+            SortformerGraphSpec::Conformer {
+                transformer_heads: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spec(NEMOTRON3_MODEL_CONFIG, &["encoder", "n_heads"], Some("16")),
+            SortformerGraphSpec::FeatureStackingRope { heads: 16, .. }
+        ));
+        assert!(matches!(
+            spec(
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rope_base"],
+                Some("500000.0")
+            ),
+            SortformerGraphSpec::FeatureStackingRope {
+                rope_base: 500_000.0,
+                ..
+            }
+        ));
+
+        let cfg = production_workspace_streaming_config();
+        let mut topology = SortformerWorkspaceTopology::v21_production();
+        assert!(topology.validate_production(cfg).is_ok());
+        topology.expander = SortformerFrameExpanderTopology::SortformerTransformer {
+            layers: PRODUCTION_TRANSFORMER_LAYERS,
+            d_model: PRODUCTION_TRANSFORMER_D_MODEL,
+            inner_dim: PRODUCTION_TRANSFORMER_INNER_DIM,
+            heads: 4,
+        };
+        assert!(topology.validate_production(cfg).is_err());
+
+        // The RoPE frequencies follow the yaml's base.
+        let encoder = rope_encoder_fixture_with_base(100.0).unwrap();
+        let head_dim = encoder.head_dim as f32;
+        assert!((encoder.rope_inv_freq[1] - 100f32.powf(-2.0 / head_dim)).abs() < 1e-7);
+    }
+
     /// A synthetic v2.1-shaped streaming model: the synthetic Conformer
     /// encoder, a projection to 8, one 8-head transformer layer and the
     /// 4-speaker head, streaming 6-frame chunks through an 8-row cache and
@@ -6718,7 +7388,7 @@ mod tests {
             encoder: SortformerAcousticEncoder::Conformer(encoder),
             encoder_proj: mlx::load_linear(d, h, vb.pp("sortformer_modules.encoder_proj")).unwrap(),
             expander: SortformerFrameExpander::SortformerTransformer(
-                SortformerTransformerEncoder::load(vb.pp("transformer_encoder")).unwrap(),
+                SortformerTransformerEncoder::load(vb.pp("transformer_encoder"), 8).unwrap(),
             ),
             head: SortformerSpeakerHead::load(vb.pp("sortformer_modules"), 4).unwrap(),
             num_speakers: 4,

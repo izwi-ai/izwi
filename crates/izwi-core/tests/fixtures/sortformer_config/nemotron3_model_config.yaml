@@ -1,0 +1,80 @@
+# The model_config.yaml of nvidia/Nemotron-3-Diarization@f667ed73 (extracted from the .nemo), less the
+# training-only sections: activity_loss, loss, optim, phantom_loss, spec_augment, test_ds, train_ds, validation_ds.
+sample_rate: 16000
+pil_weight: 0.75
+ats_weight: 0.25
+ats_tolerance: 0
+activity_weight: 0.5
+phantom_weight: 0.1
+phantom_target: both
+phantom_threshold: 0.25
+phantom_temperature: 0.5
+max_num_of_spks: 8
+high_resolution: true
+output_subsampling_factor: 1
+streaming_mode: true
+max_causal_tail_len: 222
+causal_tail_prob: 0.5
+min_causal_tail_block_size: 1
+max_causal_tail_block_size: 8
+model_defaults:
+  fc_d_model: 512
+  tf_d_model: 192
+preprocessor:
+  _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+  normalize: NA
+  window_size: 0.025
+  sample_rate: 16000
+  window_stride: 0.01
+  window: hann
+  features: 128
+  n_fft: 512
+  frame_splicing: 1
+  dither: 1.0e-05
+sortformer_modules:
+  _target_: nemo.collections.asr.modules.sortformer_modules.SortformerModules
+  num_spks: 8
+  dropout_rate: 0.5
+  fc_d_model: 512
+  tf_d_model: 192
+  spkcache_len: 264
+  fifo_len: 0
+  chunk_len: 264
+  spkcache_update_period: 264
+  chunk_left_context: 0
+  chunk_right_context: 0
+  spkcache_sil_frames_per_spk: 1
+  scores_add_rnd: 0
+  pred_score_threshold: 0.25
+  max_index: 99999
+  scores_boost_latest: 0.05
+  sil_threshold: 0.2
+  strong_boost_rate: 0.75
+  weak_boost_rate: 1.5
+  min_pos_scores_rate: 0.5
+  causal_attn_rate: 0
+  use_learnable_sil_emb: true
+encoder:
+  _target_: nemo.collections.asr.modules.TransformerEncoder
+  feat_in: 128
+  feat_out: -1
+  n_layers: 31
+  d_model: 512
+  n_heads: 8
+  subsampling: feature_stacking
+  subsampling_factor: 8
+  ff_expansion: 4.0
+  self_attention_model: rope
+  pos_emb_max_len: 5000
+  xscaling: false
+  qkv_bias: false
+  qk_norm: false
+  pre_block_norm: true
+  attn_mode: full
+  drop_rate: 0.1
+  dropout_pre_encoder: 0.1
+  dropout_emb: 0.0
+  sync_max_audio_length: true
+lr: 0.0001
+target: nemo.collections.asr.models.sortformer_diar_models.SortformerEncLabelModel
+nemo_version: 3.0.0
