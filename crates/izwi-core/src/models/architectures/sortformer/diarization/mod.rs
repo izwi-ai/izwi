@@ -1,4 +1,6 @@
 mod nemo;
+#[cfg(test)]
+mod parity_tests;
 mod physical;
 
 use std::collections::{BTreeMap, HashMap};
@@ -4311,11 +4313,12 @@ mod tests {
     use crate::backends::{BackendKind, DeviceKind};
     use crate::runtime::audio_io::decode_audio_bytes;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
+    /// The crate-wide environment lock, so the profile tests here order
+    /// against every other test that touches the process environment.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::env_test_lock()
     }
 
     fn streaming_cfg_for_test() -> SortformerStreamingConfig {
@@ -5044,6 +5047,11 @@ mod tests {
         assert_eq!(segments[1].speaker, "SPEAKER_01");
     }
 
+    /// Expected segments come from NeMo's card very-high-latency profile
+    /// (340/40/40/300) on 44.1 kHz input through the model-internal linear
+    /// resampler, so the test pins both instead of inheriting the default
+    /// profile. Probability parity on canonical 16 kHz input lives in
+    /// `parity_tests`.
     #[test]
     #[ignore = "requires local Sortformer checkpoint"]
     fn sortformer_local_checkpoint_matches_diarization_2_reference_segments() {
@@ -5074,12 +5082,38 @@ mod tests {
         let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
         let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
 
-        let model = SortformerDiarizerModel::load(
-            &model_dir,
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            DeviceProfile::cpu(),
-        )
-        .expect("sortformer checkpoint should load");
+        assert_eq!(
+            sample_rate, 44_100,
+            "the expected segments encode 44.1 kHz input"
+        );
+
+        let model = {
+            let _env = env_lock().lock().unwrap();
+            let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, "high");
+            let model = SortformerDiarizerModel::load(
+                &model_dir,
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                DeviceProfile::cpu(),
+            );
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            model.expect("sortformer checkpoint should load")
+        };
+        let streaming = model.model.streaming.expect("bounded streaming profile");
+        assert_eq!(
+            (
+                streaming.chunk_len,
+                streaming.chunk_right_context,
+                streaming.fifo_len,
+                streaming.spkcache_update_period,
+                streaming.spkcache_len,
+            ),
+            (340, 40, 40, 300, 188)
+        );
         let diarization = model
             .diarize(&samples, sample_rate, &DiarizationConfig::default())
             .expect("sortformer diarization should run");
@@ -5164,11 +5198,14 @@ mod tests {
         let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
         let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
 
-        let model = SortformerDiarizerModel::load(
-            &model_dir,
-            ModelVariant::Nemotron3Diarization,
-            DeviceProfile::cpu(),
-        )
+        let model = {
+            let _env = env_lock().lock().unwrap();
+            SortformerDiarizerModel::load(
+                &model_dir,
+                ModelVariant::Nemotron3Diarization,
+                DeviceProfile::cpu(),
+            )
+        }
         .expect("nemotron3 checkpoint should load");
         let config = DiarizationConfig {
             max_speakers: Some(8),
