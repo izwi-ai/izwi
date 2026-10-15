@@ -73,6 +73,23 @@ pub struct ChatRequestConfig {
     pub tools: Vec<Value>,
     #[serde(default)]
     pub media_inputs: Vec<ChatMediaInput>,
+    #[serde(default)]
+    pub truncation: ChatTruncation,
+}
+
+/// What a chat request does when it does not fit the model's context
+/// (OpenAI Responses' `truncation`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatTruncation {
+    /// Reject the request with `ContextLengthExceeded` when the prompt does
+    /// not fit, or when an explicit `max_tokens` does not fit beside it. An
+    /// unset `max_tokens` takes the rest of the context.
+    #[default]
+    Disabled,
+    /// Drop the oldest complete turns until the prompt fits, and shorten
+    /// the output budget to the remaining context.
+    Auto,
 }
 
 /// Model-agnostic chat generation controls used by native chat backends.

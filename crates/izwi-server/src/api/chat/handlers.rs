@@ -21,7 +21,9 @@ use crate::app::chat_content::{
 use crate::chat_store::{sanitize_system_prompt, ChatThreadMessage, ChatThreadSummary};
 use crate::error::ApiError;
 use crate::state::AppState;
-use izwi_core::{ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs};
+use izwi_core::{
+    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs, ChatTruncation,
+};
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 const CHAT_EMPTY_RESPONSE_ERROR: &str =
@@ -111,6 +113,11 @@ pub struct CreateThreadMessageRequest {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub presence_penalty: Option<f32>,
+    /// `"auto"` drops the thread's oldest turns when it outgrows the model's
+    /// context; `"disabled"` (the default) rejects the message with
+    /// `context_length_exceeded`. The chat UI opts in.
+    #[serde(default)]
+    pub truncation: Option<ChatTruncation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,6 +348,7 @@ pub async fn create_thread_message(
         req.chat_template_kwargs.as_ref(),
         Vec::new(),
         media_inputs,
+        req.truncation,
     )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,

@@ -6,11 +6,11 @@ use super::{
 use async_trait::async_trait;
 use izwi_core::{
     engine::{OutputFinishReason, WorkloadClass},
-    AudioChunk, ChatMessage as CoreChatMessage, ChatRole as CoreChatRole, Error as CoreError,
-    GenerationConfig, GenerationParams, GenerationRequest, ModelVariant, RuntimeAsrRealtimeEvent,
-    RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
-    RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition, RuntimeHealth,
-    RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
+    AudioChunk, ChatMessage as CoreChatMessage, ChatRequestConfig, ChatRole as CoreChatRole,
+    ChatTruncation, Error as CoreError, GenerationConfig, GenerationParams, GenerationRequest,
+    ModelVariant, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeChatInvocation,
+    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeChatTeardownDisposition,
+    RuntimeHealth, RuntimeRequestContext, RuntimeService, RuntimeTelemetrySnapshot,
 };
 use izwi_serving_protocol::{
     ChatRole, FinishReason, InvocationErrorCode, InvocationInput, InvocationRequest,
@@ -209,7 +209,14 @@ impl InvocationExecutor for RuntimeChatExecutor {
                 variant: self.variant,
                 messages,
                 params,
-                chat_config: Default::default(),
+                // The protocol cannot yet say whether the caller set
+                // `max_tokens` (the output limit is the gateway's ceiling) or
+                // carry `truncation`, so the worker keeps automatic
+                // truncation until protocol minor 4 carries both.
+                chat_config: ChatRequestConfig {
+                    truncation: ChatTruncation::Auto,
+                    ..ChatRequestConfig::default()
+                },
                 correlation_id: Some(request.request_id.as_str().to_owned()),
                 runtime_context,
                 streaming: self.streaming,
@@ -304,7 +311,9 @@ fn map_admission_error(error: CoreError) -> AdmissionFailure {
         CoreError::Timeout(_) => RejectionCode::QueueWaitExceeded,
         CoreError::ModelNotFound(_) | CoreError::ModelLoadError(_) => RejectionCode::ModelNotReady,
         CoreError::Cancelled(_) => RejectionCode::WorkerDraining,
-        CoreError::InvalidInput(_) | CoreError::ConfigError(_) => RejectionCode::InvalidRequest,
+        CoreError::InvalidInput(_)
+        | CoreError::ContextLengthExceeded(_)
+        | CoreError::ConfigError(_) => RejectionCode::InvalidRequest,
         _ => RejectionCode::ModelNotReady,
     };
     AdmissionFailure::new(code, error.to_string())
@@ -313,7 +322,9 @@ fn map_admission_error(error: CoreError) -> AdmissionFailure {
 pub(crate) fn map_execution_error(error: CoreError) -> ExecutionFailure {
     let code = match error {
         CoreError::Timeout(_) => InvocationErrorCode::DeadlineExceeded,
-        CoreError::InvalidInput(_) => InvocationErrorCode::InvalidInput,
+        CoreError::InvalidInput(_) | CoreError::ContextLengthExceeded(_) => {
+            InvocationErrorCode::InvalidInput
+        }
         CoreError::Overloaded(_) | CoreError::Backpressure(_) => {
             InvocationErrorCode::WorkerUnavailable
         }

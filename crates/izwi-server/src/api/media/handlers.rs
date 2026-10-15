@@ -92,6 +92,7 @@ fn listable_media_root(state: &AppState) -> Result<PathBuf, ApiError> {
                 message:
                     "GET /v1/media listing is only available for local media storage providers"
                         .to_string(),
+                detail: None,
             }),
         None => Ok(storage_layout::resolve_media_root()),
     }

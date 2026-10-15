@@ -23,9 +23,10 @@ use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkL
 use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, resolve_chat_sampling, ChatGeneration, ChatMediaInput, ChatMessage,
-    ChatReasoningEffort, ChatRequestConfig, ChatSamplingRequest, ChatTemplateKwargs,
-    GenerationParams, ModelVariant, ResolvedChatSampling, WorkloadClass,
+    parse_chat_model_variant, resolve_chat_max_tokens, resolve_chat_sampling, ChatGeneration,
+    ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatSamplingRequest,
+    ChatTemplateKwargs, ChatTruncation, GenerationParams, ModelVariant, ResolvedChatSampling,
+    WorkloadClass,
 };
 
 #[derive(Debug, Clone)]
@@ -55,7 +56,7 @@ pub struct ChatExecutionRequest {
 
 impl ChatExecutionRequest {
     fn resolved_max_new_tokens(&self) -> usize {
-        max_new_tokens(self.variant, self.max_completion_tokens, self.max_tokens)
+        resolve_chat_max_tokens(self.max_completion_tokens, self.max_tokens)
     }
 
     /// The sampling this request runs with: explicit values, else the model
@@ -207,6 +208,7 @@ pub fn resolve_chat_request_config(
     chat_template_kwargs: Option<&ChatTemplateKwargs>,
     tools: Vec<serde_json::Value>,
     media_inputs: Vec<ChatMediaInput>,
+    truncation: Option<ChatTruncation>,
 ) -> Result<ChatRequestConfig, ApiError> {
     let template = chat_template_kwargs.cloned().unwrap_or_default();
     Ok(ChatRequestConfig {
@@ -227,6 +229,7 @@ pub fn resolve_chat_request_config(
         )?,
         tools,
         media_inputs,
+        truncation: truncation.unwrap_or_default(),
     })
 }
 
@@ -463,21 +466,6 @@ async fn send_chat_terminal_with_timeout(
     // best-effort for that transport, but it must never retain inference or
     // workload capacity indefinitely.
     let _ = tokio::time::timeout(timeout, event_tx.send(event)).await;
-}
-
-pub fn max_new_tokens(
-    _variant: ModelVariant,
-    max_completion_tokens: Option<usize>,
-    max_tokens: Option<usize>,
-) -> usize {
-    let requested = max_completion_tokens.or(max_tokens);
-
-    // Preserve an omitted OpenAI output limit until the exact prompt has been
-    // tokenized. The engine first bounds this sentinel by its backend context
-    // capacity, then `enforce_chat_context_window` reduces it to the loaded
-    // model's exact remaining context. This matches production serving engines
-    // such as vLLM and avoids imposing an unrelated API-layer token ceiling.
-    requested.unwrap_or(usize::MAX).max(1)
 }
 
 pub fn parse_chat_model(model_id: &str) -> Result<ModelVariant, ApiError> {
@@ -1246,6 +1234,7 @@ pub(crate) fn map_worker_client_error(error: WorkerClientError) -> ApiError {
                 RejectionCode::DuplicateAttemptConflict => ApiError {
                     status: StatusCode::CONFLICT,
                     message,
+                    detail: None,
                 },
                 RejectionCode::Unauthenticated | RejectionCode::UnsupportedProtocolVersion => {
                     bad_gateway_error(message)
@@ -1290,6 +1279,7 @@ fn request_timeout_error(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::REQUEST_TIMEOUT,
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -1297,6 +1287,7 @@ fn cancelled_error(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -1304,6 +1295,7 @@ fn bad_gateway_error(message: impl Into<String>) -> ApiError {
     ApiError {
         status: StatusCode::BAD_GATEWAY,
         message: message.into(),
+        detail: None,
     }
 }
 
@@ -1739,6 +1731,7 @@ mod tests {
             }),
             Vec::new(),
             Vec::new(),
+            None,
         )
         .expect_err("conflicting enable_thinking must fail");
 
@@ -1758,38 +1751,14 @@ mod tests {
             }),
             Vec::new(),
             Vec::new(),
+            Some(ChatTruncation::Auto),
         )
         .expect("matching fields should resolve");
 
         assert_eq!(config.enable_thinking, Some(true));
         assert_eq!(config.reasoning_effort, Some(ChatReasoningEffort::Low));
         assert_eq!(config.preserve_thinking, Some(false));
-    }
-
-    #[test]
-    fn chat_models_leave_omitted_output_limits_for_exact_context_resolution() {
-        for variant in [
-            ModelVariant::Gemma34BIt,
-            ModelVariant::Lfm2512BInstructGguf,
-            ModelVariant::Qwen314BGguf,
-            ModelVariant::Qwen352BGguf,
-        ] {
-            assert_eq!(max_new_tokens(variant, None, None), usize::MAX);
-        }
-    }
-
-    #[test]
-    fn explicit_chat_output_limits_are_not_capped_at_4096() {
-        assert_eq!(
-            max_new_tokens(ModelVariant::Qwen3827BFp8, None, Some(32_768)),
-            32_768
-        );
-        assert_eq!(
-            max_new_tokens(ModelVariant::Qwen3827BFp8, Some(65_536), Some(32_768)),
-            65_536,
-            "max_completion_tokens must retain precedence over legacy max_tokens"
-        );
-        assert_eq!(max_new_tokens(ModelVariant::Qwen3827BFp8, Some(0), None), 1);
+        assert_eq!(config.truncation, ChatTruncation::Auto);
     }
 
     #[tokio::test]

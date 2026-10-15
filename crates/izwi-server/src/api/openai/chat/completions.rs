@@ -32,7 +32,7 @@ use crate::ids::new_uuid;
 use crate::state::AppState;
 use izwi_core::{
     ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort, ChatRole, ChatTemplateKwargs,
-    ModelFamily, ModelVariant,
+    ChatTruncation, ModelFamily, ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
@@ -112,6 +112,11 @@ pub struct ChatCompletionRequest {
     /// `"none"` (the default) leaves it inside `content`.
     #[serde(default)]
     pub reasoning_format: Option<String>,
+    /// Izwi extension mirroring OpenAI Responses: `"disabled"` (the default)
+    /// rejects a request that does not fit the context with
+    /// `context_length_exceeded`; `"auto"` drops the oldest turns instead.
+    #[serde(default)]
+    pub truncation: Option<ChatTruncation>,
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
@@ -1018,6 +1023,7 @@ fn prepare_execution_request(
         req.chat_template_kwargs.as_ref(),
         req.tools.clone().unwrap_or_default(),
         media_inputs,
+        req.truncation,
     )?;
     Ok((
         variant,
@@ -2006,6 +2012,7 @@ mod tests {
             preserve_thinking: None,
             chat_template_kwargs: None,
             reasoning_format: None,
+            truncation: None,
         };
 
         let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -2047,6 +2054,7 @@ mod tests {
             preserve_thinking: None,
             chat_template_kwargs: None,
             reasoning_format: None,
+            truncation: None,
         };
 
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -2112,6 +2120,7 @@ mod tests {
             preserve_thinking: None,
             chat_template_kwargs: None,
             reasoning_format: None,
+            truncation: None,
         };
 
         validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)
@@ -2360,6 +2369,7 @@ mod timing_contract_tests {
             preserve_thinking: None,
             chat_template_kwargs: None,
             reasoning_format: None,
+            truncation: None,
         };
         assert!(validate_chat_request_compatibility(&req(Some(true), Some(20)), profile()).is_ok());
         assert!(validate_chat_request_compatibility(&req(Some(true), None), profile()).is_ok());
@@ -2405,6 +2415,7 @@ mod timing_contract_tests {
             preserve_thinking: None,
             chat_template_kwargs: None,
             reasoning_format: None,
+            truncation: None,
         };
         assert!(validate_chat_request_compatibility(&req("json_object"), profile()).is_ok());
         assert!(

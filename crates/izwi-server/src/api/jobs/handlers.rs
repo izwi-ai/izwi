@@ -359,6 +359,7 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
         return ApiError {
             status: axum::http::StatusCode::TOO_MANY_REQUESTS,
             message: err.to_string(),
+            detail: None,
         };
     }
     ApiError::internal(format!("Batch runtime storage error: {err}"))

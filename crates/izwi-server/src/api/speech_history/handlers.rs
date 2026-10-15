@@ -862,6 +862,7 @@ async fn create_record(
                 return Err(ApiError {
                     status: StatusCode::TOO_MANY_REQUESTS,
                     message: err.message,
+                    detail: None,
                 });
             }
             return Err(err);
@@ -979,6 +980,7 @@ async fn accept_durable_text_tts_record(
                     message:
                         "Idempotency-Key was already used for a different text-to-speech request"
                             .to_string(),
+                    detail: None,
                 });
             }
             DurableIdempotencyBegin::InProgress { .. } => {
@@ -986,6 +988,7 @@ async fn accept_durable_text_tts_record(
                     status: StatusCode::CONFLICT,
                     message: "A matching text-to-speech request is still being accepted"
                         .to_string(),
+                    detail: None,
                 });
             }
             DurableIdempotencyBegin::CapacityExceeded => {
@@ -1089,6 +1092,7 @@ async fn accept_durable_text_tts_record(
                 status: StatusCode::CONFLICT,
                 message: "Text-to-speech idempotency reservation expired before acceptance"
                     .to_string(),
+                detail: None,
             })
         }
     }

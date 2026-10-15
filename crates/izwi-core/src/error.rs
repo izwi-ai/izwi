@@ -7,6 +7,11 @@ pub enum Error {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// The prompt, or the prompt plus an explicit output budget, does not
+    /// fit the model's context.
+    #[error("{0}")]
+    ContextLengthExceeded(String),
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
@@ -74,6 +79,7 @@ impl Error {
     pub(crate) fn replicate(&self) -> Self {
         match self {
             Self::InvalidInput(message) => Self::InvalidInput(message.clone()),
+            Self::ContextLengthExceeded(message) => Self::ContextLengthExceeded(message.clone()),
             Self::ModelNotFound(message) => Self::ModelNotFound(message.clone()),
             Self::ModelError(message) => Self::ModelError(message.clone()),
             Self::ModelLoadError(message) => Self::ModelLoadError(message.clone()),

@@ -245,6 +245,7 @@ async fn parse_alignment_request(req: Request) -> Result<AlignmentRequest, ApiEr
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 

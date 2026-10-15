@@ -618,6 +618,7 @@ fn alternate_deadline_error() -> ApiError {
     ApiError {
         status: axum::http::StatusCode::REQUEST_TIMEOUT,
         message: "Chat request deadline expired before alternate dispatch".into(),
+        detail: None,
     }
 }
 

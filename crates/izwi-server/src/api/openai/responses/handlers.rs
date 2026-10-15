@@ -77,6 +77,7 @@ pub async fn create_response(
         req.chat_template_kwargs.as_ref(),
         req.tools.clone().unwrap_or_default(),
         media_inputs,
+        req.truncation,
     )?;
     let execution_request = ChatExecutionRequest {
         variant: model_variant,

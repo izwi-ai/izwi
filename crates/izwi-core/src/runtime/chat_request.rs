@@ -5,6 +5,22 @@
 use crate::engine::GenerationParams;
 use crate::model::ModelVariant;
 
+/// `GenerationParams::max_tokens` for a chat request that did not set an
+/// output budget: it runs with the rest of the model's context.
+pub const CHAT_MAX_TOKENS_UNSET: usize = usize::MAX;
+
+/// A chat request's output budget from OpenAI's `max_completion_tokens`
+/// (preferred) and legacy `max_tokens`, or [`CHAT_MAX_TOKENS_UNSET`].
+pub fn resolve_chat_max_tokens(
+    max_completion_tokens: Option<usize>,
+    max_tokens: Option<usize>,
+) -> usize {
+    max_completion_tokens
+        .or(max_tokens)
+        .unwrap_or(CHAT_MAX_TOKENS_UNSET)
+        .max(1)
+}
+
 /// Sampling controls a chat request set explicitly. `None` keeps the model
 /// family's published profile, or the engine default for models without one.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -186,6 +202,15 @@ mod tests {
             repetition_penalty,
             presence_penalty,
         }
+    }
+
+    /// An omitted budget stays unset until the exact prompt is known, and an
+    /// explicit one is not capped at an API-layer ceiling.
+    #[test]
+    fn chat_output_budgets_prefer_max_completion_tokens() {
+        assert_eq!(resolve_chat_max_tokens(None, None), CHAT_MAX_TOKENS_UNSET);
+        assert_eq!(resolve_chat_max_tokens(None, Some(32_768)), 32_768);
+        assert_eq!(resolve_chat_max_tokens(Some(65_536), Some(32_768)), 65_536);
     }
 
     #[test]

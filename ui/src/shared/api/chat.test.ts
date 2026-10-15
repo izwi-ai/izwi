@@ -319,6 +319,7 @@ describe("ChatApiClient thread streaming", () => {
       top_k: 7,
       repetition_penalty: 1.2,
       presence_penalty: 0.4,
+      truncation: "auto",
     });
 
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
@@ -329,6 +330,7 @@ describe("ChatApiClient thread streaming", () => {
       top_k: 7,
       repetition_penalty: 1.2,
       presence_penalty: 0.4,
+      truncation: "auto",
     });
   });
 

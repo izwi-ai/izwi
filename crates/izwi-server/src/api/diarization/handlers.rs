@@ -27,8 +27,8 @@ use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, resolve_diarization_model_variant_strict,
-    ChatMessage, ChatRequestConfig, ChatRole, DiarizationConfig, GenerationParams, ModelVariant,
-    RuntimeRequestContext, RuntimeService, WorkloadClass,
+    ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation, DiarizationConfig, GenerationParams,
+    ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -815,7 +815,12 @@ async fn generate_diarization_summary(
                 },
             ],
             params,
-            ChatRequestConfig::default(),
+            // Long transcripts keep fitting the summary model by trimming the
+            // output budget, as before D8.
+            ChatRequestConfig {
+                truncation: ChatTruncation::Auto,
+                ..ChatRequestConfig::default()
+            },
             correlation_id,
             runtime_context,
         )
@@ -1125,6 +1130,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 

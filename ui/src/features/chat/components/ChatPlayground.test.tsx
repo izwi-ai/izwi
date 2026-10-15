@@ -512,6 +512,7 @@ describe("ChatPlayground", () => {
       expect.objectContaining({
         model_id: "Qwen3.5-4B",
         content: "Describe this",
+        truncation: "auto",
         content_parts: [
           { type: "text", text: "Describe this" },
           {

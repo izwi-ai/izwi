@@ -272,6 +272,7 @@ impl LocalRequestGuard {
             return Err(ApiError {
                 status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 message: "Use application/json or multipart/form-data".to_string(),
+                detail: None,
             });
         }
         Ok(())

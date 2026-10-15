@@ -195,8 +195,9 @@ Supported request fields:
 |-------|-------|
 | `model` | Required model variant. Must resolve to a chat-capable model. |
 | `messages` | Required array. Roles: `system`, `user`, `assistant`, `tool`. |
-| `max_tokens`, `max_completion_tokens` | Optional output budgets. |
-| `stream` | `true` returns SSE chat chunks. |
+| `max_tokens`, `max_completion_tokens` | Optional output budgets (`max_completion_tokens` wins). Unset, the reply may use the rest of the context. An explicit budget that does not fit beside the prompt is a `400` (as in vLLM) unless `truncation` is `auto`. |
+| `truncation` | Izwi extension, as in the Responses API. `disabled` (default): a prompt that does not fit the context is a `400` with `code: context_length_exceeded`, `param: messages` and the token counts. `auto`: the oldest complete turns are dropped (the system message and newest user message are kept) and an explicit budget is shortened to the remaining context. Through the gateway, workers still truncate automatically until the worker protocol carries this field. |
+| `stream` | `true` returns SSE chat chunks.
 | `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `seed` | Optional signed 64-bit sampling seed. The same seed and parameters sample the same tokens on the same backend; without one, each request samples independently. Not yet supported through the gateway (400). |
@@ -478,6 +479,7 @@ Request fields:
 | `input` | Text, one input item, or an array of input items. |
 | `instructions` | Optional system instruction. Required if `input` is empty. |
 | `max_output_tokens` | Optional output limit. |
+| `truncation` | `disabled` (default) or `auto`; same behavior as chat completions. |
 | `stream` | `true` returns SSE events. |
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
@@ -768,6 +770,7 @@ Send-message request fields:
 | `enable_thinking` | Izwi extension for thinking-capable models. |
 | `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Qwen3.8 reasoning controls; compatible kwargs must not conflict with direct fields. |
 | `top_k`, `repetition_penalty`, `presence_penalty` | Optional sampling controls. |
+| `truncation` | `disabled` (default) or `auto`. The chat UI sends `auto`, so a long thread drops its oldest turns instead of failing. |
 
 Streaming thread events:
 

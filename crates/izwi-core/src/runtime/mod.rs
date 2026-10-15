@@ -42,7 +42,10 @@ pub(crate) use asr::{
     invocation_decode_room,
 };
 pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
-pub use chat_request::{resolve_chat_sampling, ChatSamplingRequest, ResolvedChatSampling};
+pub use chat_request::{
+    resolve_chat_max_tokens, resolve_chat_sampling, ChatSamplingRequest, ResolvedChatSampling,
+    CHAT_MAX_TOKENS_UNSET,
+};
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceCapability, ConformanceExecutionClass,

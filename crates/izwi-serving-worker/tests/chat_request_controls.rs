@@ -8,9 +8,9 @@ use common::metal_leg_device;
 use common::write_tiny_lfm_fixture;
 use izwi_core::backends::RuntimeDeviceAssignment;
 use izwi_core::{
-    ChatGeneration, ChatMessage, ChatRole, EngineConfig, GenerationParams, ModelVariant,
-    RuntimeChatInvocationEvent, RuntimeChatInvocationRequest, RuntimeRequestContext,
-    RuntimeService, WorkloadClass,
+    ChatGeneration, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation, EngineConfig,
+    GenerationParams, ModelVariant, RuntimeChatInvocationEvent, RuntimeChatInvocationRequest,
+    RuntimeRequestContext, RuntimeService, WorkloadClass, CHAT_MAX_TOKENS_UNSET,
 };
 use std::time::{Duration, Instant};
 
@@ -59,17 +59,38 @@ async fn run_chat(
     params: GenerationParams,
     streaming: bool,
 ) -> izwi_core::Result<ChatRun> {
+    run_conversation(
+        runtime,
+        vec![message(ChatRole::User, "hello")],
+        params,
+        Default::default(),
+        streaming,
+    )
+    .await
+}
+
+fn message(role: ChatRole, content: &str) -> ChatMessage {
+    ChatMessage {
+        role,
+        content: content.into(),
+    }
+}
+
+async fn run_conversation(
+    runtime: &RuntimeService,
+    messages: Vec<ChatMessage>,
+    params: GenerationParams,
+    chat_config: ChatRequestConfig,
+    streaming: bool,
+) -> izwi_core::Result<ChatRun> {
     let runtime_context = RuntimeRequestContext::new(WorkloadClass::Interactive)
         .with_deadline(Instant::now() + Duration::from_secs(30));
     let mut invocation = runtime
         .start_chat_invocation(RuntimeChatInvocationRequest {
             variant: VARIANT,
-            messages: vec![ChatMessage {
-                role: ChatRole::User,
-                content: "hello".into(),
-            }],
+            messages,
             params,
-            chat_config: Default::default(),
+            chat_config,
             correlation_id: None,
             runtime_context,
             streaming,
@@ -220,4 +241,121 @@ async fn a_stop_string_ends_generation_without_being_returned() {
         collected.generation.finish_reason,
         Some(izwi_core::engine::OutputFinishReason::StopToken)
     );
+}
+
+fn greedy(max_tokens: usize) -> GenerationParams {
+    GenerationParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        max_tokens,
+        ..GenerationParams::default()
+    }
+}
+
+fn truncation(truncation: ChatTruncation) -> ChatRequestConfig {
+    ChatRequestConfig {
+        truncation,
+        ..ChatRequestConfig::default()
+    }
+}
+
+/// A conversation of `turns` complete user/assistant turns and a new user
+/// message; on the fixture's 32-token context ten turns overflow.
+fn conversation(turns: usize) -> Vec<ChatMessage> {
+    let mut messages = vec![message(ChatRole::System, "be brief")];
+    for _ in 0..turns {
+        messages.push(message(ChatRole::User, "a"));
+        messages.push(message(ChatRole::Assistant, "b"));
+    }
+    messages.push(message(ChatRole::User, "hello"));
+    messages
+}
+
+fn expect_context_length_error(result: izwi_core::Result<ChatRun>, expected: &str) {
+    match result {
+        Err(izwi_core::Error::ContextLengthExceeded(message)) => {
+            assert!(message.contains(expected), "{message}")
+        }
+        Err(other) => panic!("expected a context-length error, got {other}"),
+        Ok(run) => panic!(
+            "expected a context-length error, got a {}-token prompt",
+            run.generation.prompt_tokens
+        ),
+    }
+}
+
+/// D8: a conversation that outgrows the context is rejected by default, the
+/// way OpenAI and vLLM reject it, and drops its oldest turns only when the
+/// request opts into truncation.
+#[tokio::test]
+async fn prompt_overflow_is_rejected_unless_truncation_is_requested() {
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(models.path(), RuntimeDeviceAssignment::Cpu).await;
+    let disabled = run_conversation(
+        &runtime,
+        conversation(10),
+        greedy(CHAT_MAX_TOKENS_UNSET),
+        ChatRequestConfig::default(),
+        false,
+    )
+    .await;
+    expect_context_length_error(disabled, "maximum context length is 32 tokens");
+
+    let truncated = run_conversation(
+        &runtime,
+        conversation(10),
+        greedy(CHAT_MAX_TOKENS_UNSET),
+        truncation(ChatTruncation::Auto),
+        false,
+    )
+    .await
+    .expect("auto truncation drops the oldest turns");
+    assert!(truncated.generation.prompt_tokens < 32);
+}
+
+/// D8, following vLLM: an explicit `max_tokens` that does not fit beside the
+/// prompt is rejected, an unset one takes the rest of the context, and
+/// truncation shortens an explicit one instead.
+#[tokio::test]
+async fn an_output_budget_that_does_not_fit_is_rejected_unless_unset_or_truncated() {
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(models.path(), RuntimeDeviceAssignment::Cpu).await;
+    let conversation = || vec![message(ChatRole::User, "hello")];
+
+    let fits = run_conversation(
+        &runtime,
+        conversation(),
+        greedy(4),
+        Default::default(),
+        false,
+    )
+    .await
+    .expect("a budget that fits runs");
+    let prompt = fits.generation.prompt_tokens;
+    let remaining = 32 - prompt;
+
+    expect_context_length_error(
+        run_conversation(
+            &runtime,
+            conversation(),
+            greedy(remaining + 1),
+            Default::default(),
+            false,
+        )
+        .await,
+        &format!(
+            "({prompt} in the messages, {} in the completion)",
+            remaining + 1
+        ),
+    );
+    for (params, chat_config) in [
+        (greedy(CHAT_MAX_TOKENS_UNSET), ChatRequestConfig::default()),
+        (greedy(remaining + 1), truncation(ChatTruncation::Auto)),
+    ] {
+        let run = run_conversation(&runtime, conversation(), params, chat_config, false)
+            .await
+            .expect("an unset or truncated budget runs");
+        assert!(run.generation.tokens_generated <= remaining);
+    }
 }

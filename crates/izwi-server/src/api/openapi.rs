@@ -2019,6 +2019,8 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     pub seed: Option<i64>,
     pub stop: Option<serde_json::Value>,
+    /// `"disabled"` (default) or `"auto"`.
+    pub truncation: Option<String>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
     pub enable_thinking: Option<bool>,

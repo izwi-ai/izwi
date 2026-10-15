@@ -1,4 +1,4 @@
-use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs};
+use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -41,6 +41,10 @@ pub struct ResponsesCreateRequest {
     pub preserve_thinking: Option<bool>,
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// OpenAI `truncation`: `"disabled"` (the default) rejects input that
+    /// does not fit the context; `"auto"` drops the oldest turns instead.
+    #[serde(default)]
+    pub truncation: Option<ChatTruncation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

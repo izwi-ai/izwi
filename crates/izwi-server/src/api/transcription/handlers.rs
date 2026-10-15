@@ -47,8 +47,8 @@ use async_trait::async_trait;
 use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAsrStatus;
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
-    ChatRequestConfig, ChatRole, GenerationParams, ModelVariant, RuntimeRequestContext,
-    RuntimeService, WorkloadClass,
+    ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams, ModelVariant,
+    RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -1610,6 +1610,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedTranscriptionCreateR
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 
@@ -1985,8 +1986,11 @@ async fn generate_transcription_summary_attempt(
             variant,
             transcription_summary_messages(transcription),
             transcription_summary_params(),
+            // Long transcripts keep fitting the summary model by trimming the
+            // output budget, as before D8.
             ChatRequestConfig {
                 enable_thinking,
+                truncation: ChatTruncation::Auto,
                 ..Default::default()
             },
             correlation_id,

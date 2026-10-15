@@ -122,10 +122,11 @@ pub use runtime::{
     VOICE_TTS_FIRST_AUDIO_MS, VOICE_VAD_SPEECH_START_MS,
 };
 pub use runtime::{
-    resolve_chat_sampling, validate_asr_language, AsrTranscription, ChatGeneration,
-    ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationResult, DiarizationSegment,
-    DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord, GenerationRequest,
-    GenerationResult, ResolvedChatSampling, TtsStopReason, TtsStreamingMode,
+    resolve_chat_max_tokens, resolve_chat_sampling, validate_asr_language, AsrTranscription,
+    ChatGeneration, ChatSamplingRequest, ChunkStats, DiarizationConfig, DiarizationResult,
+    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
+    GenerationRequest, GenerationResult, ResolvedChatSampling, TtsStopReason, TtsStreamingMode,
+    CHAT_MAX_TOKENS_UNSET,
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,
@@ -163,7 +164,7 @@ pub use catalog::{
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
-    ChatTemplateKwargs,
+    ChatTemplateKwargs, ChatTruncation,
 };
 
 // Canonical native registry/device exports.

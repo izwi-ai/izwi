@@ -734,6 +734,7 @@ async fn parse_transcription_request(req: Request) -> Result<TranscriptionReques
     Err(ApiError {
         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
         message: "Expected `Content-Type: application/json` or `multipart/form-data`".to_string(),
+        detail: None,
     })
 }
 
