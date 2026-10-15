@@ -15,7 +15,7 @@ use crate::models::registry::{
     NativeAsrGenerationOptions, NativeAsrModel, NativeAsrTranscription, VoxtralModelLease,
 };
 use crate::models::shared::chat::{ChatMessage, ChatRole};
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind, InferenceStateRequirement};
+use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
     MAX_AUDIO_SOURCE_BYTES,
@@ -24,7 +24,6 @@ use crate::runtime::coordinator::{
     wait_for_held_capacity, InferenceCoordinator, JobLease, JobResourceObservation,
 };
 use crate::runtime::forced_alignment::{AlignedWindow, AlignmentSource, SampleWindow};
-use crate::runtime::request::{DiarizationRuntimeRequest, RuntimeAudioInput};
 use crate::runtime::service::{
     copy_preparation_bytes, copy_preparation_string, CapabilityLoadOptions, RuntimeService,
 };
@@ -301,25 +300,6 @@ where
     }
 }
 
-fn runtime_audio_bytes(audio: &RuntimeAudioInput) -> usize {
-    match audio {
-        RuntimeAudioInput::Base64(audio) => audio.capacity(),
-        RuntimeAudioInput::Bytes(audio) => audio.capacity(),
-    }
-}
-
-fn diarization_request_audio_observation(
-    retained_input_bytes: usize,
-    request: &DiarizationRuntimeRequest,
-    audio: &PipelineAudio,
-) -> Result<JobResourceObservation> {
-    diarization_input_observation(
-        retained_input_bytes,
-        &[runtime_audio_bytes(&request.audio)],
-        audio,
-    )
-}
-
 #[derive(Debug, Clone)]
 struct TranscribedChunk {
     range: AudioChunk,
@@ -365,27 +345,6 @@ impl DiarizationAsrModel {
         match self {
             Self::Native(model) => model.audio_token_rate(),
             Self::Voxtral(_) => None,
-        }
-    }
-
-    fn transcribe_with_details(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        language: Option<&str>,
-        options: NativeAsrGenerationOptions,
-    ) -> Result<NativeAsrTranscription> {
-        match self {
-            Self::Native(model) => model.transcribe_with_details_and_prompt_and_options(
-                audio,
-                sample_rate,
-                language,
-                None,
-                options,
-            ),
-            Self::Voxtral(_) => Err(Error::InferenceError(
-                "Voxtral ASR requires lifecycle-owned physical invocation state".to_string(),
-            )),
         }
     }
 
@@ -515,17 +474,6 @@ impl OwnedDiarizationAudioInput {
 }
 
 impl RuntimeService {
-    async fn diarize_samples_stage(
-        &self,
-        job: &JobLease,
-        audio: PipelineAudio,
-        variant: ModelVariant,
-        config: DiarizationConfig,
-    ) -> Result<DiarizationResult> {
-        let diarizer = self.load_diarizer(job, variant).await?;
-        self.run_diarizer(job, diarizer, audio, config).await
-    }
-
     async fn load_diarizer(&self, job: &JobLease, variant: ModelVariant) -> Result<LoadedDiarizer> {
         let (residency_lease, execution_contract, state_binding) = self
             .load_capability_with_state_for_job(
@@ -799,109 +747,6 @@ impl RuntimeService {
         Ok((pipeline_job, audio))
     }
 
-    async fn diarize_input(
-        &self,
-        audio_input: DiarizationAudioInput<'_>,
-        model_id: Option<&str>,
-        config: &DiarizationConfig,
-    ) -> Result<DiarizationResult> {
-        let input_bytes = audio_input.input_bytes();
-        if input_bytes == 0 {
-            return Err(Error::InvalidInput(
-                "diarization request missing audio input".to_string(),
-            ));
-        }
-        audio_input.validate_retained_size()?;
-        let variant = resolve_diarization_model_variant(model_id);
-        self.observe_broker_capability_request(CapabilityKind::Diarization, Some(variant), false)?;
-        let context = RuntimeRequestContext::default();
-        let mut spec = self.coordinator_job_for_input(
-            uuid::Uuid::new_v4().to_string(),
-            CoordinatorLane::Pipeline,
-            context,
-            input_bytes,
-        );
-        spec.resources = spec.resources.checked_add(diarization_decode_resources(
-            self.backend_context().backend_kind,
-        ))?;
-        let observed_input_bytes = u64::try_from(input_bytes)
-            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?;
-        let job = self
-            .coordinator
-            .admit_observed(spec, JobResourceObservation::host(observed_input_bytes))
-            .await?;
-        let owned_audio_input = audio_input.into_owned_for_job(&job).await?;
-        job.record_materialized_usage(JobResourceObservation::host(
-            u64::try_from(
-                input_bytes
-                    .checked_add(owned_audio_input.retained_bytes())
-                    .ok_or_else(|| {
-                        Error::Overloaded("diarization retained input overflowed".to_string())
-                    })?,
-            )
-            .map_err(|_| Error::Overloaded("diarization input exceeds u64".to_string()))?,
-        ))?;
-        let model_id = model_id.map(ToOwned::to_owned);
-        let config = config.clone();
-        let observation_job = job.clone();
-        let backend = self.backend_context().backend_kind;
-        let (runtime_request, audio) = self
-            .coordinator
-            .run_host_blocking_stage(&job, move || {
-                let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
-                let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                let runtime_request =
-                    DiarizationRuntimeRequest::from_bytes(variant, audio_bytes, config)?
-                        .with_pipeline_models(model_id, None, None, None);
-                let steady_usage =
-                    diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
-                let peak_usage = diarization_input_observation(
-                    input_bytes,
-                    &[
-                        runtime_audio_bytes(&runtime_request.audio),
-                        retained_source.as_ref().map_or(0, String::capacity),
-                    ],
-                    &audio,
-                )?;
-                settle_decoded_job(
-                    &observation_job,
-                    backend,
-                    peak_usage,
-                    steady_usage,
-                    retained_source,
-                )?;
-                Ok((runtime_request, audio))
-            })
-            .await?;
-        self.diarize_samples_stage(&job, audio, variant, runtime_request.config)
-            .await
-    }
-
-    /// Run speaker diarization over a single audio input.
-    pub async fn diarize(
-        &self,
-        audio_base64: &str,
-        model_id: Option<&str>,
-        config: &DiarizationConfig,
-    ) -> Result<DiarizationResult> {
-        self.diarize_input(
-            DiarizationAudioInput::Base64(audio_base64),
-            model_id,
-            config,
-        )
-        .await
-    }
-
-    pub async fn diarize_bytes(
-        &self,
-        audio_bytes: &[u8],
-        model_id: Option<&str>,
-        config: &DiarizationConfig,
-    ) -> Result<DiarizationResult> {
-        self.diarize_input(DiarizationAudioInput::Bytes(audio_bytes), model_id, config)
-            .await
-    }
-
     /// Run diarization and produce speaker-attributed transcript artifacts.
     pub async fn diarize_with_transcript(
         &self,
@@ -1127,11 +972,6 @@ impl RuntimeService {
             let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
             let use_single_pass_asr =
                 should_use_single_pass_diarization_asr(audio.duration_secs, chunk_limit);
-            let invocation_asr = matches!(
-                asr_contract.metadata.state_requirement,
-                InferenceStateRequirement::Invocation
-                    | InferenceStateRequirement::RetainedAndInvocation
-            );
             // Every ASR handle (residency lease, model, contract and state) moves
             // into this block and drops at its end, so the ASR is evictable before
             // the aligner runs and the refinement LLM loads (ADM-8). Dropping only
@@ -1148,46 +988,27 @@ impl RuntimeService {
                         max_new_tokens: diarization_asr_max_new_tokens(audio.duration_secs),
                         ..NativeAsrGenerationOptions::default()
                     };
-                    let transcription = if invocation_asr {
-                        self.coordinator
-                            .run_loaded_blocking_stage_with_invocation_workspace(
-                                &pipeline_job,
-                                asr_contract,
-                                asr_state,
-                                WorkUnit::AtomicJob {
-                                    kind: "diarization.transcribe".to_string(),
-                                },
-                                move |leases| {
-                                    asr_model.transcribe_from_invocation_workspace(
-                                        &audio_for_task.samples,
-                                        PIPELINE_SAMPLE_RATE,
-                                        language.as_deref(),
-                                        None,
-                                        options,
-                                        leases,
-                                    )
-                                },
-                            )
-                            .await?
-                    } else {
-                        self.coordinator
-                            .run_loaded_blocking_stage(
-                                &pipeline_job,
-                                asr_contract,
-                                WorkUnit::AtomicJob {
-                                    kind: "diarization.transcribe".to_string(),
-                                },
-                                move || {
-                                    asr_model.transcribe_with_details(
-                                        &audio_for_task.samples,
-                                        PIPELINE_SAMPLE_RATE,
-                                        language.as_deref(),
-                                        options,
-                                    )
-                                },
-                            )
-                            .await?
-                    };
+                    let transcription = self
+                        .coordinator
+                        .run_loaded_blocking_stage_with_invocation_workspace(
+                            &pipeline_job,
+                            asr_contract,
+                            asr_state,
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.transcribe".to_string(),
+                            },
+                            move |leases| {
+                                asr_model.transcribe_from_invocation_workspace(
+                                    &audio_for_task.samples,
+                                    PIPELINE_SAMPLE_RATE,
+                                    language.as_deref(),
+                                    None,
+                                    options,
+                                    leases,
+                                )
+                            },
+                        )
+                        .await?;
                     let hit_budget = asr_hit_token_budget(transcription.diagnostics.as_ref());
                     let window = SampleWindow::new(
                         0,
@@ -1196,7 +1017,7 @@ impl RuntimeService {
                         transcription.language.as_deref(),
                     );
                     (vec![window], Vec::new(), hit_budget)
-                } else if invocation_asr {
+                } else {
                     let (_cfg, chunks) = plan_invocation_asr_chunks(&audio, chunk_limit)?;
                     let mut transcribed = Vec::with_capacity(chunks.len());
                     for chunk in chunks {
@@ -1247,28 +1068,6 @@ impl RuntimeService {
                         });
                     }
                     (chunk_windows(&transcribed), transcribed, false)
-                } else {
-                    let audio_for_task = audio.clone();
-                    let language = options.language.clone();
-                    let chunks = self
-                        .coordinator
-                        .run_loaded_blocking_stage(
-                            &pipeline_job,
-                            asr_contract,
-                            WorkUnit::AtomicJob {
-                                kind: "diarization.transcribe_chunks".to_string(),
-                            },
-                            move || {
-                                transcribe_audio_chunks(
-                                    asr_model,
-                                    &audio_for_task,
-                                    language.as_deref(),
-                                    chunk_limit,
-                                )
-                            },
-                        )
-                        .await?;
-                    (chunk_windows(&chunks), chunks, false)
                 }
             };
             Ok::<_, Error>((
@@ -1654,50 +1453,6 @@ fn plan_invocation_asr_chunks(
         ));
     }
     Ok((cfg, chunks))
-}
-
-fn transcribe_audio_chunks(
-    model: DiarizationAsrModel,
-    audio: &PipelineAudio,
-    language: Option<&str>,
-    chunk_limit: Option<f32>,
-) -> Result<Vec<TranscribedChunk>> {
-    let cfg = pipeline_chunk_config();
-    let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
-    if chunks.is_empty() {
-        return Err(Error::InvalidInput(
-            "ASR chunk planner produced no chunks".to_string(),
-        ));
-    }
-
-    let language = language.map(|value| value.to_string());
-    let mut transcribed = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len() {
-            continue;
-        }
-        let chunk_audio = &audio.samples[chunk.start_sample..chunk.end_sample];
-        let options = NativeAsrGenerationOptions {
-            max_new_tokens: diarization_asr_max_new_tokens(
-                chunk_audio.len() as f32 / PIPELINE_SAMPLE_RATE as f32,
-            ),
-            ..NativeAsrGenerationOptions::default()
-        };
-        let transcription = model.transcribe_with_details(
-            chunk_audio,
-            PIPELINE_SAMPLE_RATE,
-            language.as_deref(),
-            options,
-        )?;
-        transcribed.push(TranscribedChunk {
-            range: chunk,
-            hit_token_budget: asr_hit_token_budget(transcription.diagnostics.as_ref()),
-            text: transcription.text,
-            language: transcription.language,
-        });
-    }
-
-    Ok(transcribed)
 }
 
 /// Alignment windows of the transcribed chunks: each chunk's audio with the
@@ -2087,11 +1842,6 @@ fn clamp_outlier_word_spans(alignments: &mut [(String, u32, u32)], stitched: &[S
             .min(next_start)
             .max(start.saturating_add(1));
     }
-}
-
-fn fallback_word_timings(text: &str, duration_secs: f32) -> Vec<(String, u32, u32)> {
-    let words = extract_words(text);
-    fallback_word_timings_from_words(&words, duration_secs)
 }
 
 pub(super) fn fallback_word_timings_from_words(
@@ -2554,7 +2304,9 @@ fn stabilize_word_speakers(words: &mut [DiarizationWord]) {
             break;
         }
 
-        for run_idx in 1..runs.len() {
+        // From the first run: an edge run has one neighbour, and a leading
+        // fragment can only be absorbed into the run after it.
+        for run_idx in 0..runs.len() {
             let run = runs[run_idx];
             let avg_confidence = average_run_confidence(words, run.start, run.end);
             let duration = (words[run.end].end_secs - words[run.start].start_secs).max(0.0);
@@ -3780,29 +3532,6 @@ mod tests {
     }
 
     #[test]
-    fn diarization_transcript_observation_retains_one_encoded_copy() {
-        let mut encoded = Vec::with_capacity(64);
-        encoded.extend_from_slice(&[1_u8, 2, 3, 4]);
-        let request = DiarizationRuntimeRequest::from_bytes(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            encoded,
-            DiarizationConfig::default(),
-        )
-        .expect("runtime request");
-        let audio = PipelineAudio {
-            samples: Arc::from(vec![0.0_f32; 8]),
-            sample_rate: PIPELINE_SAMPLE_RATE,
-            duration_secs: 8.0 / PIPELINE_SAMPLE_RATE as f32,
-        };
-
-        let observation = diarization_request_audio_observation(10, &request, &audio)
-            .expect("steady observation");
-
-        assert_eq!(runtime_audio_bytes(&request.audio), 64);
-        assert_eq!(observation.host_bytes, 10 + 64 + 8 * 4);
-    }
-
-    #[test]
     fn sortformer_workspace_authorization_bounds_all_supported_backends() {
         let one_second = production_workspace_authorization(16_000, false).unwrap();
         let production_limit = production_workspace_authorization(MAX_PIPELINE_SAMPLES, false)
@@ -3891,7 +3620,8 @@ mod tests {
 
     #[test]
     fn fallback_word_timings_generates_monotonic_ranges() {
-        let timings = fallback_word_timings("hello world from test", 2.0);
+        let timings =
+            fallback_word_timings_from_words(&extract_words("hello world from test"), 2.0);
         assert_eq!(timings.len(), 4);
         for (idx, (_, start, end)) in timings.iter().enumerate() {
             assert!(end > start, "word {} should have positive duration", idx);
@@ -4558,6 +4288,45 @@ mod tests {
         stabilize_word_speakers(&mut words);
 
         assert_eq!(words[2].speaker, "SPEAKER_01");
+    }
+
+    /// PIPE-17: a low-confidence one-word fragment before the first turn is
+    /// absorbed into the run that follows it; the scan used to start at the
+    /// second run, so a leading fragment was never considered.
+    #[test]
+    fn stabilize_word_speakers_absorbs_low_confidence_leading_fragment() {
+        let fragment = DiarizationWord {
+            overlaps_segment: false,
+            ..test_word("um", "SPEAKER_01", 0.0, 0.3, 0.2)
+        };
+        let mut words = vec![
+            fragment,
+            test_word("so", "SPEAKER_00", 0.4, 0.6, 0.85),
+            test_word("today", "SPEAKER_00", 0.6, 1.0, 0.85),
+            test_word("we", "SPEAKER_00", 1.0, 1.2, 0.85),
+            test_word("start", "SPEAKER_00", 1.2, 1.8, 0.85),
+            test_word("right", "SPEAKER_01", 2.4, 2.7, 0.8),
+            test_word("okay", "SPEAKER_01", 2.7, 3.0, 0.8),
+        ];
+
+        stabilize_word_speakers(&mut words);
+
+        let speakers = words
+            .iter()
+            .map(|word| word.speaker.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            speakers,
+            [
+                "SPEAKER_00",
+                "SPEAKER_00",
+                "SPEAKER_00",
+                "SPEAKER_00",
+                "SPEAKER_00",
+                "SPEAKER_01",
+                "SPEAKER_01",
+            ]
+        );
     }
 
     #[test]

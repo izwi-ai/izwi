@@ -6532,6 +6532,15 @@ mod tests {
                     contract_supports_atomic_blocking(&contract),
                     "{variant}/{backend:?} long-form contract has no atomic stage"
                 );
+                // The pipeline transcribes only from an invocation workspace.
+                assert!(
+                    matches!(
+                        contract.metadata.state_requirement,
+                        InferenceStateRequirement::Invocation
+                            | InferenceStateRequirement::RetainedAndInvocation
+                    ),
+                    "{variant}/{backend:?} ASR is not invocation-backed"
+                );
                 assert!(
                     contract
                         .adapter_binding()
