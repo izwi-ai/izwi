@@ -2286,6 +2286,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_job_routes_hide_jobs_owned_by_another_tenant() {
+        let mut principal = Principal::local_anonymous();
+        principal.id = "tenant-a-user".to_string();
+        principal.tenant_id = Some("tenant-a".to_string());
+        let owner_key =
+            crate::api::request_context::RequestContext::new("test".to_string(), principal.clone())
+                .tenant_key()
+                .expect("authenticated tenant has a key");
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.auth = Arc::new(FixedPrincipalAuth(principal));
+        let (owner_state, owner_dir) = test_state_with_hooks("runtime_job_tenant", false, hooks);
+        owner_state.lifecycle.mark_ready();
+        let job = owner_state
+            .batch_runtime_store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("Qwen3-TTS-0.6B".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: None,
+                route_record_id: None,
+                input_media_asset_id: None,
+                input_text_asset_id: None,
+                request_json: serde_json::json!({"tenant_key": owner_key, "text": "secret"}),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 1}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .expect("runtime job");
+        let serve_config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+
+        // The same store seen by the anonymous principal: the job is missing.
+        let mut anonymous_state = owner_state.clone();
+        anonymous_state.enterprise_hooks = EnterpriseHooks::noop();
+        let anonymous = create_router(anonymous_state, &serve_config);
+        for (method, suffix) in [
+            (Method::GET, ""),
+            (Method::GET, "/artifacts"),
+            (Method::POST, "/cancel"),
+            (Method::POST, "/retry"),
+        ] {
+            let path = format!("/v1/jobs/{}{suffix}", job.id);
+            assert_route_status(
+                anonymous.clone(),
+                method,
+                &path,
+                None,
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        }
+        let unchanged = owner_state
+            .batch_runtime_store
+            .get_job(&job.id)
+            .await
+            .expect("job lookup")
+            .expect("job exists");
+        assert_eq!(unchanged.status, RuntimeJobStatus::Queued);
+
+        let owner = create_router(owner_state, &serve_config);
+        let trace = send_request(
+            owner,
+            build_request(Method::GET, &format!("/v1/jobs/{}", job.id), None),
+        )
+        .await;
+        assert_eq!(trace.status(), StatusCode::OK);
+        assert_eq!(
+            read_json(trace).await["job"]["request_json"]["text"],
+            "secret"
+        );
+
+        drop(owner_dir);
+    }
+
+    #[tokio::test]
     async fn media_upload_registers_runtime_assets_and_canonical_derivative() {
         let (app, temp_dir) = test_api_app("media_upload_runtime_assets", false);
         let upload_body = media_upload_audio_json_body();
@@ -3166,6 +3249,15 @@ mod tests {
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct FixedPrincipalAuth(Principal);
+
+    #[async_trait]
+    impl AuthProvider for FixedPrincipalAuth {
+        async fn authenticate(&self, _request: &RequestEnvelope) -> HookResult<Principal> {
+            Ok(self.0.clone())
         }
     }
 
