@@ -85,6 +85,10 @@ use crate::models::architectures::qwen3::asr::{
 use crate::models::architectures::qwen3::core::{
     qwen3_dense_projection_fusion_enabled, qwen3_quantized_projection_grouping_for_hidden_size,
 };
+use crate::models::architectures::sortformer::diarization::{
+    sortformer_checkpoint_paths, sortformer_extraction_is_current,
+    sortformer_uses_selected_model_device,
+};
 use crate::models::architectures::vibevoice::asr::{
     resolve_vibevoice_tokenizer_projection_precision, vibevoice_asr_audio_dtype,
     vibevoice_asr_weight_dtype, vibevoice_tensor_is_f16_tokenizer_projection,
@@ -165,11 +169,23 @@ pub(super) fn is_asr_variant(variant: ModelVariant) -> bool {
     ) || variant.family() == ModelFamily::GraniteSpeechAsr
 }
 
-/// Whether this module prices `variant`: the ASR variants and the forced
-/// aligner, which is not one of them (stateless, with no request floor or
-/// state fit).
+/// Whether this module prices `variant`: the ASR variants, and the forced
+/// aligner and the Sortformer diarizers, which are not (stateless, with no
+/// request floor or state fit).
 pub(super) fn has_plan(variant: ModelVariant) -> bool {
-    is_asr_variant(variant) || variant.family() == ModelFamily::Qwen3ForcedAligner
+    is_asr_variant(variant)
+        || matches!(
+            variant.family(),
+            ModelFamily::Qwen3ForcedAligner | ModelFamily::SortformerDiarization
+        )
+}
+
+/// Whether a load of `variant` on `backend` puts its weights on that
+/// backend's device. Only the Sortformer diarizers keep theirs in host memory
+/// off CUDA ([`sortformer_uses_selected_model_device`]).
+pub(super) fn weights_on_backend_device(variant: ModelVariant, backend: BackendKind) -> bool {
+    variant.family() != ModelFamily::SortformerDiarization
+        || sortformer_uses_selected_model_device(backend)
 }
 
 pub(super) fn residency_plan(
@@ -199,6 +215,10 @@ pub(super) fn residency_plan(
         // has no request floor or state fit.
         ModelVariant::Qwen3ForcedAligner06B | ModelVariant::Qwen3ForcedAligner06B4Bit => {
             aligner_plan(variant, model_path, device, backend)
+        }
+        // Likewise the diarizers, whose weights stay in host memory off CUDA.
+        ModelVariant::DiarStreamingSortformer4SpkV21 | ModelVariant::Nemotron3Diarization => {
+            sortformer_plan(variant, model_path, backend)
         }
         _ => Ok(None),
     }
@@ -241,6 +261,14 @@ impl AsrResidencyPlan {
             load_peak_bytes: ledger.peak,
             host_staging_bytes: ledger.host_peak,
         })
+    }
+
+    /// This plan in `backend`'s domains: weights priced on the host (a
+    /// [`BackendKind::Cpu`] ledger) for a load on a backend whose device does
+    /// not hold them, so on Metal they count in unified memory.
+    fn in_domain_of(mut self, backend: BackendKind) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub(super) fn estimate(&self) -> Result<ModelMemoryEstimate> {
@@ -1546,14 +1574,15 @@ fn parakeet_plan(
     if paths.checkpoint_path.is_file() {
         // An unreadable checkpoint is repacked on disk before it loads.
         let payload = std::fs::metadata(&paths.checkpoint_path)?.len();
-        return price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some);
+        return price_nemo_first_load(backend, payload, DType::F32, PARAKEET_WEIGHT_DTYPE, 0, 0)
+            .map(Some);
     }
     if !paths.nemo_path.is_file() {
         return Ok(None);
     }
     // First load: the archive is streamed to disk through small buffers.
     let payload = nemo_payload_bytes(&paths.nemo_path)?;
-    price_nemo_first_load(backend, payload, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some)
+    price_nemo_first_load(backend, payload, DType::F32, PARAKEET_WEIGHT_DTYPE, 0, 0).map(Some)
 }
 
 fn nemotron_plan(
@@ -1585,7 +1614,7 @@ fn nemotron_plan(
     // over-estimate when the projections load in F16.
     let payload = nemo_payload_bytes(&paths.nemo_path)?;
     let memo = NemoFamily::Nemotron.memo_bytes();
-    price_nemo_first_load(backend, payload, dtype, 0, memo).map(Some)
+    price_nemo_first_load(backend, payload, DType::F32, dtype, 0, memo).map(Some)
 }
 
 /// Parakeet and Nemotron (`VarBuilder::from_pth`): each tensor is read into a
@@ -1632,26 +1661,28 @@ fn price_nemo(
 }
 
 /// A NeMo load before its checkpoint has been extracted, so there is no tensor
-/// list to read: the F32 checkpoint is priced from the archive's `payload`
-/// (which also holds the small config and tokenizer members) cast to `dtype`,
-/// with one tensor's copies bounded by [`NEMO_UNLISTED_TENSOR_BYTES`], after
-/// an `extraction` host buffer that is freed before any weight loads.
+/// list to read: the checkpoint, stored at `stored`, is priced from the
+/// archive's `payload` (which also holds the small config and tokenizer
+/// members) cast to `dtype`, with one tensor's copies bounded by
+/// [`NEMO_UNLISTED_TENSOR_BYTES`], after an `extraction` host buffer that is
+/// freed before any weight loads.
 fn price_nemo_first_load(
     backend: BackendKind,
     payload: u64,
+    stored: DType,
     dtype: DType,
     extraction: u64,
     memo_bytes: u64,
 ) -> Result<AsrResidencyPlan> {
     let weights = payload
-        .checked_div(DType::F32.size_in_bytes() as u64)
+        .checked_div(stored.size_in_bytes() as u64)
         .and_then(|elements| elements.checked_mul(dtype.size_in_bytes() as u64))
         .ok_or_else(overflow)?;
     let mut ledger = Ledger::new(backend);
     ledger.host_buffer(extraction);
     // One tensor's host copy (which on the CPU is the weight itself) and the
     // stored-dtype upload a cast replaces.
-    let cast_source = if dtype != DType::F32 {
+    let cast_source = if dtype != stored {
         NEMO_UNLISTED_TENSOR_BYTES
     } else {
         0
@@ -1678,6 +1709,73 @@ fn price_nemo_first_load(
         },
     })?;
     AsrResidencyPlan::from_ledger(ledger, memo_bytes)
+}
+
+/// The stored dtype of each published Sortformer checkpoint (the census
+/// fixtures pin it), which prices a first load before there is a tensor list.
+fn sortformer_checkpoint_dtype(variant: ModelVariant) -> Result<DType> {
+    match variant {
+        ModelVariant::DiarStreamingSortformer4SpkV21 => Ok(DType::F32),
+        ModelVariant::Nemotron3Diarization => Ok(DType::BF16),
+        _ => Err(Error::ModelLoadError(format!(
+            "{variant} is not a Sortformer diarizer"
+        ))),
+    }
+}
+
+/// The Sortformer diarizers (ADM-4, NDZ-7): F32 weights on the model device,
+/// which is the load backend's device only on CUDA. On CPU and Metal they are
+/// priced on the host (the Metal plan's unified domain), so Nemotron-3's BF16
+/// checkpoint counts at its F32 size and CUDA no longer holds the catalog's
+/// device and host figures for the model's life.
+fn sortformer_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    backend: BackendKind,
+) -> Result<Option<AsrResidencyPlan>> {
+    let paths = sortformer_checkpoint_paths(model_path, variant)?;
+    let weights = if sortformer_uses_selected_model_device(backend) {
+        backend
+    } else {
+        BackendKind::Cpu
+    };
+    if sortformer_extraction_is_current(&paths) {
+        if let Some(file) = census_checkpoint_file(&paths.checkpoint_path)? {
+            return price_sortformer(&[file], weights).map(|plan| Some(plan.in_domain_of(backend)));
+        }
+    }
+    if !paths.nemo_path.is_file() {
+        return Ok(None);
+    }
+    // First load (or a stale extraction): the archive is streamed to disk
+    // through small buffers before the weights load.
+    let payload = nemo_payload_bytes(&paths.nemo_path)?;
+    let stored = sortformer_checkpoint_dtype(variant)?;
+    price_nemo_first_load(weights, payload, stored, DType::F32, 0, 0)
+        .map(|plan| Some(plan.in_domain_of(backend)))
+}
+
+/// `VarBuilder::from_pth` at F32: each tensor the loader reads is copied into
+/// a host buffer and cast to F32 on the model device. The featurizer filter
+/// bank and window go back to host vectors, the BatchNorm counters are never
+/// read, and neither are `hidden_to_spks` or the activity head (NeMo does not
+/// use them for predictions). The folded depthwise kernels and Nemotron-3's
+/// transposed fused QKV replace their sources at the same size, and the
+/// BatchNorm parameters folded into them (about 0.1 MiB) are priced as kept.
+fn price_sortformer(files: &[CensusFile], backend: BackendKind) -> Result<AsrResidencyPlan> {
+    let mut ledger = Ledger::new(backend);
+    for tensor in files.iter().flat_map(|file| file.tensors.iter()) {
+        let name = tensor.name.as_str();
+        if name.ends_with(".num_batches_tracked")
+            || name.starts_with("preprocessor.")
+            || name.starts_with("sortformer_modules.hidden_to_spks.")
+            || name.starts_with("sortformer_modules.activity_head.")
+        {
+            continue;
+        }
+        ledger.var(tensor, Source::Copied, &[DType::F32])?;
+    }
+    AsrResidencyPlan::from_ledger(ledger, 0)
 }
 
 /// The uncompressed payload of a `.nemo` archive, a tar that some checkpoints
@@ -2462,6 +2560,19 @@ pub(super) mod tests {
         price_lfm25_audio(&census, backend, LFM_ROPE_TABLES).unwrap()
     }
 
+    /// The diarizers as loaded: F32 weights on CUDA's device, and in host
+    /// memory on CPU and Metal (counted in Metal's unified domain).
+    fn sortformer(files: &[CensusFile], backend: BackendKind) -> AsrResidencyPlan {
+        let weights = if sortformer_uses_selected_model_device(backend) {
+            backend
+        } else {
+            BackendKind::Cpu
+        };
+        price_sortformer(files, weights)
+            .unwrap()
+            .in_domain_of(backend)
+    }
+
     pub(in super::super) fn gib(bytes: u64) -> f64 {
         bytes as f64 / GIB
     }
@@ -2510,6 +2621,8 @@ pub(super) mod tests {
         let qwen17 = census!("qwen3_asr_1_7b_q8_0.json");
         let aligner_dense = census!("qwen3_forced_aligner_0_6b.json");
         let aligner_4bit = census!("qwen3_forced_aligner_0_6b_4bit.json");
+        let sortformer_v21 = census!("diar_streaming_sortformer_4spk_v2_1.json");
+        let nemotron_diarization = census!("nemotron_3_diarization.json");
         type Row<'a> = (
             &'a str,
             Box<dyn Fn(BackendKind) -> AsrResidencyPlan + 'a>,
@@ -2572,6 +2685,18 @@ pub(super) mod tests {
                 "ForcedAligner-0.6B-4bit",
                 Box::new(|b| aligner(&aligner_4bit, b)),
                 [3.42, 2.30, 2.68, 2.30],
+            ),
+            // ADM-4: F32 on every backend, in host memory on Metal (no
+            // allocator rounding); the catalog held 3.0 / 2.0 GiB on CUDA.
+            (
+                "Sortformer-4spk-v2.1",
+                Box::new(|b| sortformer(&sortformer_v21, b)),
+                [0.44, 0.44, 0.44, 0.44],
+            ),
+            (
+                "Nemotron-3-Diarization",
+                Box::new(|b| sortformer(&nemotron_diarization, b)),
+                [0.37, 0.37, 0.37, 0.37],
             ),
         ];
         for (label, plan, [cpu, metal_exact, metal_allocated, cuda]) in rows {
@@ -3254,7 +3379,10 @@ pub(super) mod tests {
                 1_126_895_360,
             ),
         ] {
-            assert!(super::super::reconciles_device_usage(variant));
+            assert!(super::super::reconciles_device_usage(
+                variant,
+                BackendKind::Metal
+            ));
             let plan = if variant == ModelVariant::Qwen3ForcedAligner06B {
                 // `IZWI_METAL_DTYPE=f32` keeps the dense text at F32 (D8).
                 let f32_text = AlignerLoad {
@@ -3297,13 +3425,19 @@ pub(super) mod tests {
             ModelVariant::ParakeetTdt06BV3,
             ModelVariant::Qwen3Tts12Hz06BCustomVoice,
         ] {
-            assert!(super::super::reconciles_device_usage(variant), "{variant}");
+            assert!(
+                super::super::reconciles_device_usage(variant, BackendKind::Metal),
+                "{variant}"
+            );
         }
         for variant in [
             ModelVariant::Qwen306B,
             ModelVariant::DiarStreamingSortformer4SpkV21,
         ] {
-            assert!(!super::super::reconciles_device_usage(variant), "{variant}");
+            assert!(
+                !super::super::reconciles_device_usage(variant, BackendKind::Metal),
+                "{variant}"
+            );
         }
     }
 
@@ -3332,6 +3466,166 @@ pub(super) mod tests {
         }
     }
 
+    /// ADM-4 / NDZ-7: the diarizers are priced from their checkpoints at F32
+    /// on the model device: the CUDA device (staging one tensor on the host)
+    /// instead of the catalog's 3.0 / 2.0 GiB device and host for the model's
+    /// life, and host memory on CPU and Metal, where Nemotron-3's BF16
+    /// checkpoint was priced at its stored bytes, half what loads.
+    #[test]
+    fn sortformer_diarizers_are_priced_from_their_checkpoints() {
+        let _env = env_lock();
+        for (variant, files, stored_dtype) in [
+            (
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                census!("diar_streaming_sortformer_4spk_v2_1.json"),
+                DType::F32,
+            ),
+            (
+                ModelVariant::Nemotron3Diarization,
+                census!("nemotron_3_diarization.json"),
+                DType::BF16,
+            ),
+        ] {
+            assert!(!is_asr_variant(variant) && has_plan(variant));
+            assert_eq!(sortformer_checkpoint_dtype(variant).unwrap(), stored_dtype);
+            assert!(files[0].tensors.iter().all(|tensor| {
+                tensor.name.ends_with(".num_batches_tracked")
+                    || tensor.dtype == StoredDType::Dense(stored_dtype)
+            }));
+            let loaded = |tensor: &CensusTensor| {
+                !(tensor.name.ends_with(".num_batches_tracked")
+                    || tensor.name.starts_with("preprocessor.")
+                    || tensor.name.contains(".hidden_to_spks.")
+                    || tensor.name.contains(".activity_head."))
+            };
+            let f32_bytes = stored(&files, loaded) / stored_dtype.size_in_bytes() as u64 * 4;
+            let catalog = super::super::model_memory_estimate(variant);
+            for backend in BACKENDS {
+                let plan = sortformer(&files, backend);
+                assert_eq!(plan.resident_bytes, f32_bytes, "{variant} {backend:?}");
+                assert_eq!(plan.logical_resident_bytes, f32_bytes);
+                let authorization = plan.resource_plan().unwrap().resident_authorization;
+                match backend {
+                    BackendKind::Cpu => {
+                        assert_eq!(authorization.host_bytes, ResourceAmount::Known(f32_bytes))
+                    }
+                    BackendKind::Metal => assert_eq!(
+                        authorization.unified_bytes,
+                        ResourceAmount::Known(f32_bytes)
+                    ),
+                    BackendKind::Cuda => {
+                        assert_eq!(authorization.device_bytes, ResourceAmount::Known(f32_bytes));
+                        assert!(plan.host_staging_bytes <= 64 << 20, "{variant}");
+                        assert_eq!(plan.host_staging_bytes, largest(&files), "{variant}");
+                        assert!(
+                            catalog.resident_bytes > 4 * plan.resident_bytes,
+                            "{variant}"
+                        );
+                    }
+                }
+            }
+            // Not reconciled against the Metal device observer, which does
+            // not see host tensors; reconciled on CUDA.
+            assert!(!super::super::reconciles_device_usage(
+                variant,
+                BackendKind::Metal
+            ));
+            assert!(super::super::reconciles_device_usage(
+                variant,
+                BackendKind::Cuda
+            ));
+        }
+    }
+
+    /// The diarizer plan follows the extraction: a first load (only the
+    /// `.nemo`) is priced from the archive payload at the stored dtype, the
+    /// current extraction from its checkpoint header, and an extraction the
+    /// archive has moved past as a first load again. Admission and the OOM
+    /// retry price the same plan.
+    #[test]
+    fn sortformer_plans_follow_the_extraction() {
+        use std::io::Write;
+        let _env = env_lock();
+        let performance = crate::performance::PerformanceConfig::default();
+        let variant = ModelVariant::Nemotron3Diarization;
+        let dir = temp_dir("sortformer");
+        let checkpoint =
+            include_bytes!("../../../tests/fixtures/asr_residency/sortformer_tiny_bf16.ckpt");
+        let nemo_path = dir.join("Nemotron-3-Diarization.nemo");
+        let write_nemo = |config: &[u8]| {
+            let mut builder = tar::Builder::new(std::fs::File::create(&nemo_path).unwrap());
+            for (name, contents) in [
+                ("./model_config.yaml", config),
+                ("./model_weights.ckpt", &checkpoint[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, contents).unwrap();
+            }
+            builder.into_inner().unwrap().flush().unwrap();
+        };
+        write_nemo(b"revision: 1\n");
+        let payload = std::fs::metadata(&nemo_path).unwrap().len();
+        let plan = |backend| {
+            residency_plan(variant, &dir, &profile(backend))
+                .unwrap()
+                .expect("the diarizer has a residency plan")
+        };
+        let check_retry = || {
+            for backend in BACKENDS {
+                let device = profile(backend);
+                let admitted = super::super::checkpoint_resource_plan(variant, &dir, &device)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    super::super::load_domain_bytes(admitted.load_authorization, backend),
+                    ResourceAmount::Known(super::super::retry_load_peak_bytes(
+                        variant,
+                        backend,
+                        &performance,
+                        Some((&dir, &device)),
+                    )),
+                    "{backend:?}"
+                );
+            }
+        };
+        // First load: the BF16 payload at F32.
+        for backend in BACKENDS {
+            assert_eq!(plan(backend).resident_bytes, payload * 2, "{backend:?}");
+        }
+        check_retry();
+
+        // Extracted: the checkpoint's one loaded 64 x 32 BF16 tensor at F32.
+        crate::models::architectures::sortformer::diarization::ensure_sortformer_artifacts(
+            &dir, variant,
+        )
+        .unwrap();
+        for backend in BACKENDS {
+            let plan = plan(backend);
+            assert_eq!(plan.resident_bytes, 64 * 32 * 4, "{backend:?}");
+            let host = if backend == BackendKind::Cuda {
+                64 * 32 * 2
+            } else {
+                0
+            };
+            assert_eq!(plan.host_staging_bytes, host, "{backend:?}");
+        }
+        check_retry();
+
+        // A re-published archive the next load will extract again.
+        write_nemo(b"revision: 2\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&nemo_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(plan(BackendKind::Cpu).resident_bytes, payload * 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Variants without a plan, and checkpoints whose files are missing (the
     /// loader reports those), keep the generic estimate.
     #[test]
@@ -3353,6 +3647,8 @@ pub(super) mod tests {
             ModelVariant::Lfm25Audio15BGguf,
             ModelVariant::Qwen3ForcedAligner06B,
             ModelVariant::Qwen3ForcedAligner06B4Bit,
+            ModelVariant::DiarStreamingSortformer4SpkV21,
+            ModelVariant::Nemotron3Diarization,
         ] {
             assert!(
                 residency_plan(variant, &dir, &device).unwrap().is_none(),
@@ -3447,12 +3743,20 @@ pub(super) mod tests {
     fn first_nemo_loads_price_the_payload_and_the_extraction_buffer() {
         let payload: u64 = 2_509_332_480;
         let extraction = payload.next_power_of_two();
-        let cpu =
-            price_nemo_first_load(BackendKind::Cpu, payload, DType::F32, extraction, 0).unwrap();
+        let cpu = price_nemo_first_load(
+            BackendKind::Cpu,
+            payload,
+            DType::F32,
+            DType::F32,
+            extraction,
+            0,
+        )
+        .unwrap();
         assert_eq!(cpu.resident_bytes, payload);
         // Extraction precedes the weights: the peak is the larger of the two.
         assert_eq!(cpu.load_peak_bytes, extraction);
-        let cuda = price_nemo_first_load(BackendKind::Cuda, payload, DType::BF16, 0, 7).unwrap();
+        let cuda = price_nemo_first_load(BackendKind::Cuda, payload, DType::F32, DType::BF16, 0, 7)
+            .unwrap();
         assert_eq!(cuda.resident_bytes, payload / 2);
         assert_eq!(cuda.memo_bytes, 7);
         assert_eq!(cuda.host_staging_bytes, NEMO_UNLISTED_TENSOR_BYTES);

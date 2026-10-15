@@ -18,10 +18,20 @@ pub struct SortformerArtifacts {
     pub checkpoint_path: PathBuf,
 }
 
-pub fn ensure_sortformer_artifacts(
+/// Where `ensure_sortformer_artifacts` finds the `.nemo` archive and puts the
+/// files it extracts, computed without touching the filesystem. Load
+/// admission reads the checkpoint header (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone)]
+pub(crate) struct SortformerCheckpointPaths {
+    pub(crate) nemo_path: PathBuf,
+    pub(crate) extracted_dir: PathBuf,
+    pub(crate) checkpoint_path: PathBuf,
+}
+
+pub(crate) fn sortformer_checkpoint_paths(
     model_dir: &Path,
     variant: ModelVariant,
-) -> Result<SortformerArtifacts> {
+) -> Result<SortformerCheckpointPaths> {
     let nemo_filename = match variant {
         ModelVariant::DiarStreamingSortformer4SpkV21 => "diar_streaming_sortformer_4spk-v2.1.nemo",
         ModelVariant::Nemotron3Diarization => "Nemotron-3-Diarization.nemo",
@@ -32,8 +42,37 @@ pub fn ensure_sortformer_artifacts(
             )));
         }
     };
+    let extracted_dir = model_dir.join("sortformer-native");
+    Ok(SortformerCheckpointPaths {
+        nemo_path: model_dir.join(nemo_filename),
+        checkpoint_path: extracted_dir.join("model_weights.ckpt"),
+        extracted_dir,
+    })
+}
 
-    let nemo_path = model_dir.join(nemo_filename);
+/// Whether the extracted checkpoint is the one the next load serves: its
+/// stamp records the archive's current size and modification time. Reads
+/// metadata only; a load settles a changed time by digest, and admission
+/// prices anything else as a first load.
+pub(crate) fn sortformer_extraction_is_current(paths: &SortformerCheckpointPaths) -> bool {
+    let Some(stamp) = ExtractionStamp::read(&paths.extracted_dir.join(EXTRACTION_STAMP_FILE))
+    else {
+        return false;
+    };
+    paths.checkpoint_path.is_file()
+        && ExtractionStamp::of(&paths.nemo_path, None)
+            .is_ok_and(|current| stamp.same_file_metadata(&current))
+}
+
+pub fn ensure_sortformer_artifacts(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<SortformerArtifacts> {
+    let SortformerCheckpointPaths {
+        nemo_path,
+        extracted_dir,
+        checkpoint_path,
+    } = sortformer_checkpoint_paths(model_dir, variant)?;
     if !nemo_path.exists() {
         return Err(Error::ModelNotFound(format!(
             "Missing .nemo checkpoint for {} at {}",
@@ -42,7 +81,6 @@ pub fn ensure_sortformer_artifacts(
         )));
     }
 
-    let extracted_dir = model_dir.join("sortformer-native");
     fs::create_dir_all(&extracted_dir).map_err(|e| {
         Error::ModelLoadError(format!(
             "Failed to create Sortformer cache directory {}: {}",
@@ -52,7 +90,6 @@ pub fn ensure_sortformer_artifacts(
     })?;
 
     let model_config_path = extracted_dir.join("model_config.yaml");
-    let checkpoint_path = extracted_dir.join("model_weights.ckpt");
     let stamp_path = extracted_dir.join(EXTRACTION_STAMP_FILE);
     let extracted = model_config_path.exists() && checkpoint_path.exists();
     if !extracted || !extraction_matches_archive(&nemo_path, &stamp_path)? {

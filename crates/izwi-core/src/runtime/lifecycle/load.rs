@@ -554,11 +554,14 @@ fn admit_asr_request_floor(
     Ok(authorization)
 }
 
-/// Whether a load of `variant` is reconciled against the device observer:
-/// the families whose admission is a residency plan (ASR, the forced aligner
-/// and TTS), so an observed excess means the plan under-prices the loader.
-fn reconciles_device_usage(variant: ModelVariant) -> bool {
-    asr_memory::has_plan(variant) || tts_memory::has_plan(variant)
+/// Whether a load of `variant` on `backend` is reconciled against the device
+/// observer: the families whose admission is a residency plan (ASR, the
+/// forced aligner, the Sortformer diarizers and TTS), so an observed excess
+/// means the plan under-prices the loader, as long as the weights land where
+/// the observer looks (Sortformer on Metal loads into host memory).
+fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
+    (asr_memory::has_plan(variant) || tts_memory::has_plan(variant))
+        && asr_memory::weights_on_backend_device(variant, backend)
 }
 
 /// A request envelope in `backend`'s ledger domains: host and accelerator
@@ -1986,18 +1989,19 @@ impl ModelLifecycleController {
     }
 
     /// One reconciliation checkpoint for a load priced by a residency plan
-    /// (ASR, the forced aligner and TTS), or `None` for other families and
-    /// backends without a device observer (CPU).
+    /// (ASR, the forced aligner, the diarizers and TTS), or `None` for other
+    /// families, for weights the observer cannot see, and for backends
+    /// without a device observer (CPU).
     fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
-        if !reconciles_device_usage(variant) {
+        let backend = self.backend_router.context().backend_kind;
+        if !reconciles_device_usage(variant, backend) {
             return None;
         }
         let authority = self.coordinator.resource_authority();
         let observed = authority.observed_device_usage_bytes()?;
         Some(DeviceUsageSample {
             observed,
-            reserved: authority
-                .reserved_bytes_in_domain(self.backend_router.context().backend_kind),
+            reserved: authority.reserved_bytes_in_domain(backend),
         })
     }
 
@@ -2523,7 +2527,7 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
-            if reconciles_device_usage(variant) {
+            if reconciles_device_usage(variant, backend) {
                 // The cached live sample can predate the fence that released
                 // the load's staging; the state fits read a fresh one.
                 self.coordinator

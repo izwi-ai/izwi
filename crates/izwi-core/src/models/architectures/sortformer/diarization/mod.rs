@@ -19,7 +19,7 @@ use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::{BackendKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kernels::depthwise_conv::{
@@ -34,7 +34,10 @@ use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
 use crate::runtime::{DiarizationConfig, DiarizationResult, DiarizationSegment};
 
-use nemo::{ensure_sortformer_artifacts, SortformerArtifacts};
+use nemo::SortformerArtifacts;
+pub(crate) use nemo::{
+    ensure_sortformer_artifacts, sortformer_checkpoint_paths, sortformer_extraction_is_current,
+};
 pub(crate) use physical::SortformerPhysicalStateSpec;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -1868,15 +1871,18 @@ impl SortformerDiarizerModel {
 }
 
 fn sortformer_model_device(device_profile: &DeviceProfile) -> Device {
-    if sortformer_uses_selected_model_device(device_profile.kind) {
+    if sortformer_uses_selected_model_device(BackendKind::from(device_profile.kind)) {
         device_profile.device.clone()
     } else {
         Device::Cpu
     }
 }
 
-fn sortformer_uses_selected_model_device(kind: DeviceKind) -> bool {
-    kind.is_cuda()
+/// Whether the weights live on the `backend`'s device: only CUDA; Metal and
+/// CPU loads keep them in host memory (on Metal, outside what the Metal
+/// device observer sees). Load admission prices the same placement.
+pub(crate) fn sortformer_uses_selected_model_device(backend: BackendKind) -> bool {
+    backend == BackendKind::Cuda
 }
 
 #[derive(Debug, Clone)]
@@ -4997,7 +5003,7 @@ fn normalize_all_features(mel: &mut [f32], n_mels: usize, frames: usize, valid_f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{BackendKind, DeviceKind};
+    use crate::backends::BackendKind;
     use crate::runtime::audio_io::decode_audio_bytes;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -5221,9 +5227,9 @@ mod tests {
 
     #[test]
     fn sortformer_only_uses_selected_model_device_for_cuda() {
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Cpu));
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Metal));
-        assert!(sortformer_uses_selected_model_device(DeviceKind::Cuda));
+        assert!(!sortformer_uses_selected_model_device(BackendKind::Cpu));
+        assert!(!sortformer_uses_selected_model_device(BackendKind::Metal));
+        assert!(sortformer_uses_selected_model_device(BackendKind::Cuda));
     }
 
     #[test]
