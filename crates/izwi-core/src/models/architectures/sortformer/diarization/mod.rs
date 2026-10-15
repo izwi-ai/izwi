@@ -1623,7 +1623,8 @@ impl SortformerDiarizerModel {
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
             audio
         } else {
-            resampled_samples = resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE);
+            resampled_samples =
+                crate::audio::resample_mono_high_quality(audio, sample_rate, TARGET_SAMPLE_RATE)?;
             &resampled_samples
         };
 
@@ -5034,34 +5035,6 @@ fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -
 
 fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
-}
-
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if audio.is_empty() || src_rate == 0 || dst_rate == 0 {
-        return Vec::new();
-    }
-    if src_rate == dst_rate {
-        return audio.to_vec();
-    }
-
-    let src_len = audio.len();
-    let dst_len = ((src_len as u64) * (dst_rate as u64) / (src_rate as u64))
-        .max(1)
-        .min(usize::MAX as u64) as usize;
-    let mut out = Vec::with_capacity(dst_len);
-
-    let scale = src_rate as f64 / dst_rate as f64;
-    for i in 0..dst_len {
-        let src_pos = i as f64 * scale;
-        let idx0 = src_pos.floor() as usize;
-        let idx1 = (idx0 + 1).min(src_len.saturating_sub(1));
-        let frac = (src_pos - idx0 as f64) as f32;
-        let sample0 = audio[idx0];
-        let sample1 = audio[idx1];
-        out.push(sample0 + (sample1 - sample0) * frac);
-    }
-
-    out
 }
 
 fn hann_window(win_length: usize) -> Vec<f32> {

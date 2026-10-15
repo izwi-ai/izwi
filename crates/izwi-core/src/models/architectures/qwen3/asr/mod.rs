@@ -5,10 +5,9 @@ mod config;
 mod tokenizer;
 mod word_units;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{fs, io::Read};
 
@@ -1419,9 +1418,8 @@ fn qwen3_asr_resampled_sample_count(
     dst_rate: u32,
 ) -> Result<usize> {
     // Keep this ordering identical to `resample`: an identity conversion does
-    // not inspect rates, and an empty non-identity conversion produces no
-    // samples. Sharing this helper prevents admission geometry from drifting
-    // from the physical front end.
+    // not inspect rates. Sharing this helper prevents admission geometry from
+    // drifting from the physical front end.
     if src_rate == dst_rate {
         return Ok(input_samples);
     }
@@ -1430,14 +1428,11 @@ fn qwen3_asr_resampled_sample_count(
             "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
         )));
     }
-    if input_samples == 0 {
-        return Ok(0);
-    }
-    Ok(((input_samples as u64)
-        .saturating_mul(dst_rate as u64)
-        .checked_div(src_rate as u64)
-        .unwrap_or(0) as usize)
-        .max(1))
+    Ok(crate::audio::target_sample_count(
+        input_samples,
+        src_rate,
+        dst_rate,
+    ))
 }
 
 fn qwen3_asr_mel_frame_count(samples: usize, n_fft: usize, hop_length: usize) -> Result<usize> {
@@ -4552,224 +4547,11 @@ fn env_bool(name: &str) -> Option<bool> {
     })
 }
 
+/// The canonical resampler (soxr HQ response), so a direct caller at
+/// another rate gets the front end production audio gets (QFA-4).
 fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    let out_len = qwen3_asr_resampled_sample_count(audio.len(), src_rate, dst_rate)?;
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if out_len == 0 {
-        return Ok(Vec::new());
-    }
-    let kernel = cached_resample_kernel(src_rate, dst_rate);
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let numerator = (i as u128) * (src_rate as u128);
-        let center = (numerator / (dst_rate as u128)) as isize;
-        let phase_idx = ((numerator % (dst_rate as u128)) / (kernel.gcd as u128)) as usize;
-        let phase = &kernel.phases[phase_idx];
-        let sample_start = center - RESAMPLE_SINC_HALF + 1;
-
-        if sample_start >= 0
-            && sample_start + RESAMPLE_SINC_TAPS as isize <= audio.len() as isize
-            && phase.weight_sum.abs() > 1e-9
-        {
-            let base = sample_start as usize;
-            let mut acc = 0.0f64;
-            for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
-                acc += audio[base + tap_idx] as f64 * coeff;
-            }
-            out.push((acc / phase.weight_sum) as f32);
-            continue;
-        }
-
-        let mut acc = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
-            let j = sample_start + tap_idx as isize;
-            if let Some(sample) = (j >= 0)
-                .then_some(j as usize)
-                .and_then(|idx| audio.get(idx))
-            {
-                acc += *sample as f64 * coeff;
-                weight_sum += coeff;
-            }
-        }
-
-        out.push(if weight_sum.abs() > 1e-9 {
-            (acc / weight_sum) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(out)
-}
-
-const RESAMPLE_SINC_HALF: isize = 16;
-const RESAMPLE_SINC_TAPS: usize = (RESAMPLE_SINC_HALF as usize) * 2;
-const RESAMPLE_KAISER_BETA: f64 = 6.0;
-
-struct ResamplePhase {
-    coeffs: [f64; RESAMPLE_SINC_TAPS],
-    weight_sum: f64,
-}
-
-struct ResampleKernel {
-    gcd: u32,
-    phases: Vec<ResamplePhase>,
-}
-
-fn cached_resample_kernel(src_rate: u32, dst_rate: u32) -> Arc<ResampleKernel> {
-    static CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<ResampleKernel>>>> = OnceLock::new();
-
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(kernel) = guard.get(&(src_rate, dst_rate)) {
-            return Arc::clone(kernel);
-        }
-    }
-
-    let kernel = Arc::new(ResampleKernel::new(src_rate, dst_rate));
-    if let Ok(mut guard) = cache.lock() {
-        Arc::clone(
-            guard
-                .entry((src_rate, dst_rate))
-                .or_insert_with(|| Arc::clone(&kernel)),
-        )
-    } else {
-        kernel
-    }
-}
-
-impl ResampleKernel {
-    fn new(src_rate: u32, dst_rate: u32) -> Self {
-        // Antirez/qwen-asr uses a bounded windowed-sinc resampler with a Kaiser
-        // window for anti-aliasing when downsampling. Coefficients depend only
-        // on the rational source/destination phase, so cache the polyphase table
-        // and keep the sample-edge renormalization in the hot loop.
-        let gcd = gcd_u32(src_rate, dst_rate);
-        let period = (dst_rate / gcd) as usize;
-        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0);
-        let inv_i0_beta = 1.0 / bessel_i0(RESAMPLE_KAISER_BETA);
-        let mut phases = Vec::with_capacity(period);
-
-        for phase_idx in 0..period {
-            let frac = phase_idx as f64 / period as f64;
-            let mut coeffs = [0.0f64; RESAMPLE_SINC_TAPS];
-            for (tap_idx, coeff) in coeffs.iter_mut().enumerate() {
-                let offset = tap_idx as isize - RESAMPLE_SINC_HALF + 1;
-                let d = offset as f64 - frac;
-                *coeff = sinc(d * cutoff)
-                    * kaiser_window(
-                        d,
-                        RESAMPLE_SINC_HALF as f64,
-                        RESAMPLE_KAISER_BETA,
-                        inv_i0_beta,
-                    )
-                    * cutoff;
-            }
-            let weight_sum = coeffs.iter().copied().sum();
-            phases.push(ResamplePhase { coeffs, weight_sum });
-        }
-
-        Self { gcd, phases }
-    }
-}
-
-fn gcd_u32(mut lhs: u32, mut rhs: u32) -> u32 {
-    while rhs != 0 {
-        let rem = lhs % rhs;
-        lhs = rhs;
-        rhs = rem;
-    }
-    lhs
-}
-
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-9 {
-        1.0
-    } else {
-        let pix = std::f64::consts::PI * x;
-        pix.sin() / pix
-    }
-}
-
-fn kaiser_window(distance: f64, half_width: f64, beta: f64, inv_i0_beta: f64) -> f64 {
-    let normalized = distance / half_width;
-    if normalized <= -1.0 || normalized >= 1.0 {
-        return 0.0;
-    }
-    let inner = (1.0 - normalized * normalized).max(0.0).sqrt();
-    bessel_i0(beta * inner) * inv_i0_beta
-}
-
-fn bessel_i0(x: f64) -> f64 {
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    let xx = x * x;
-    for k in 1..=20 {
-        let k = k as f64;
-        term *= xx / (4.0 * k * k);
-        sum += term;
-    }
-    sum
-}
-
-#[cfg(test)]
-fn resample_reference(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if src_rate == 0 || dst_rate == 0 {
-        return Err(Error::InvalidInput(format!(
-            "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
-        )));
-    }
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let cutoff = ratio.min(1.0);
-    let out_len = ((audio.len() as u64)
-        .saturating_mul(dst_rate as u64)
-        .checked_div(src_rate as u64)
-        .unwrap_or(0) as usize)
-        .max(1);
-    let inv_i0_beta = 1.0 / bessel_i0(RESAMPLE_KAISER_BETA);
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let center = src_pos.floor() as isize;
-        let mut acc = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for j in (center - RESAMPLE_SINC_HALF + 1)..=(center + RESAMPLE_SINC_HALF) {
-            let d = j as f64 - src_pos;
-            let coeff = sinc(d * cutoff)
-                * kaiser_window(
-                    d,
-                    RESAMPLE_SINC_HALF as f64,
-                    RESAMPLE_KAISER_BETA,
-                    inv_i0_beta,
-                )
-                * cutoff;
-            if let Some(sample) = (j >= 0)
-                .then_some(j as usize)
-                .and_then(|idx| audio.get(idx))
-            {
-                acc += *sample as f64 * coeff;
-                weight_sum += coeff;
-            }
-        }
-
-        out.push(if weight_sum.abs() > 1e-9 {
-            (acc / weight_sum) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(out)
+    qwen3_asr_resampled_sample_count(audio.len(), src_rate, dst_rate)?;
+    crate::audio::resample_mono_high_quality(audio, src_rate, dst_rate)
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -6369,42 +6151,6 @@ mod tests {
     }
 
     #[test]
-    fn resample_polyphase_matches_scalar_reference() {
-        let input = (0..4096)
-            .map(|idx| {
-                let t = idx as f32;
-                (t * 0.013).sin() * 0.65 + (t * 0.071).cos() * 0.25
-            })
-            .collect::<Vec<_>>();
-
-        for (src_rate, dst_rate) in [
-            (48_000, 16_000),
-            (44_100, 16_000),
-            (24_000, 16_000),
-            (16_000, 48_000),
-        ] {
-            let optimized = resample(&input, src_rate, dst_rate).expect("optimized resample");
-            let reference =
-                resample_reference(&input, src_rate, dst_rate).expect("reference resample");
-            assert_eq!(
-                optimized.len(),
-                reference.len(),
-                "length mismatch for {src_rate}->{dst_rate}"
-            );
-
-            let max_diff = optimized
-                .iter()
-                .zip(reference.iter())
-                .map(|(lhs, rhs)| (lhs - rhs).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_diff <= 1e-6,
-                "max diff {max_diff} exceeded tolerance for {src_rate}->{dst_rate}"
-            );
-        }
-    }
-
-    #[test]
     fn resample_rejects_zero_sample_rates() {
         let input = vec![0.0f32, 1.0];
         let err = resample(&input, 0, 16_000).expect_err("zero source rate");
@@ -6412,17 +6158,6 @@ mod tests {
 
         let err = resample(&input, 16_000, 0).expect_err("zero destination rate");
         assert!(format!("{err}").contains("Invalid sample rate"));
-    }
-
-    #[test]
-    fn resample_keeps_constant_signal_stable() {
-        let input = vec![0.75f32; 128];
-        let output = resample(&input, 48_000, 16_000).expect("resample");
-
-        assert_eq!(output.len(), 42);
-        for value in output {
-            assert!((value - 0.75).abs() < 1e-3, "unexpected value: {value}");
-        }
     }
 
     #[test]
@@ -6707,12 +6442,11 @@ mod tests {
     /// cpu (default) or metal; `IZWI_ALIGNER_DUMP` names a file for the
     /// timings.
     ///
-    /// With the production decode, the canonical resampler differs from the
-    /// reference's soxr_hq near 8 kHz and moves test.wav's `AIautonomous` end
-    /// by 800 ms (measured 2026-10-15: mean 15.5 ms over 134 boundaries).
-    /// Given the reference's own 16 kHz audio (`IZWI_ALIGNER_AUDIO_DIR`), every
-    /// boundary must also be within 160 ms (measured: all equal, CPU and
-    /// Metal).
+    /// Every boundary must also be within 160 ms, with the production decode
+    /// or the reference's own 16 kHz audio (`IZWI_ALIGNER_AUDIO_DIR`). Both
+    /// measure all equal on CPU: the canonical resampler matches soxr_hq. It
+    /// once passed 7.3-8 kHz whole and moved test.wav's `AIautonomous` end by
+    /// 800 ms (mean 15.5 ms over 134 boundaries).
     #[test]
     #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and IZWI_ALIGNER_REFERENCE_DIR"]
     fn forced_aligner_matches_the_reference_timings() {
@@ -6727,12 +6461,9 @@ mod tests {
             device,
         )
         .expect("load aligner");
-        let reference_audio = std::env::var("IZWI_ALIGNER_AUDIO_DIR").ok();
-        let data = reference_audio
-            .clone()
+        let data = std::env::var("IZWI_ALIGNER_AUDIO_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"));
-        let reference_audio = reference_audio.is_some();
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"));
         let mut dump = serde_json::Map::new();
         let mut off_target = Vec::new();
         for name in ["fox", "test"] {
@@ -6783,12 +6514,7 @@ mod tests {
                     deltas.iter().filter(|delta| **delta > 0.0).count(),
                     deltas.len()
                 );
-                let max_bound = if reference_audio {
-                    160.0
-                } else {
-                    f64::INFINITY
-                };
-                if variant == "windowed" && (mean > 40.0 || max > max_bound) {
+                if variant == "windowed" && (mean > 40.0 || max > 160.0) {
                     off_target.push(format!("{name}: mean {mean:.1} ms, max {max} ms"));
                 }
             }
