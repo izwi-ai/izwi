@@ -366,9 +366,7 @@ impl RemoteChatDispatcher {
                 };
                 let terminal = matches!(
                     event,
-                    ChatStreamEvent::Completed(_)
-                        | ChatStreamEvent::Failed(_)
-                        | ChatStreamEvent::ShuttingDown
+                    ChatStreamEvent::Completed(_) | ChatStreamEvent::Failed(_)
                 );
                 let sent = tokio::time::timeout(slow_consumer_timeout, public_tx.send(event)).await;
                 if !matches!(sent, Ok(Ok(()))) {

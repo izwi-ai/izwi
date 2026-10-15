@@ -42,6 +42,7 @@ pub(crate) use asr::{
     invocation_decode_room,
 };
 pub use asr::{validate_asr_language, RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream};
+pub use chat::AdmittedChatStream;
 pub use chat_request::{
     chat_supports_json_object, chat_supports_tools, resolve_chat_max_tokens, resolve_chat_sampling,
     ChatGenerationControls, ChatSamplingRequest, ResolvedChatSampling, CHAT_MAX_TOKENS_UNSET,

@@ -277,7 +277,6 @@ pub enum ChatStreamEvent {
     /// The stream failed after it started; the error is sent to the client
     /// as an in-band error event.
     Failed(ApiError),
-    ShuttingDown,
 }
 
 /// Completion acknowledgement for a stream whose producer owns an external
@@ -619,7 +618,7 @@ impl ChatBackend for LocalChat {
         self,
         request: ChatExecutionRequest,
     ) -> Result<(mpsc::Receiver<ChatStreamEvent>, ()), ApiError> {
-        Ok((spawn_chat_stream(self.0, request), ()))
+        Ok((start_chat_stream(self.0, request).await?, ()))
     }
 }
 
@@ -1313,84 +1312,80 @@ fn bad_gateway_error(message: impl Into<String>) -> ApiError {
     }
 }
 
-pub fn spawn_chat_stream(
+/// Start a chat stream on this process's runtime. The request is admitted
+/// first, so a request that cannot run (its prompt does not fit the context,
+/// the server is shutting down) fails here, before a streamed response
+/// commits to `200`.
+pub async fn start_chat_stream(
     state: AppState,
     request: ChatExecutionRequest,
-) -> mpsc::Receiver<ChatStreamEvent> {
-    spawn_chat_stream_inner(state, request, (), None)
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError> {
+    start_chat_stream_inner(state, request, (), None).await
 }
 
-/// Spawn a chat stream while retaining `keepalive` until inference has fully
+/// [`start_chat_stream`] retaining `keepalive` until inference has fully
 /// unwound and the response consumer has handled the terminal event. This is
 /// used by persisted thread chats to keep their per-thread turn lock through
 /// cancellation and atomic terminal persistence.
-pub fn spawn_chat_stream_with_keepalive<K>(
+pub async fn start_chat_stream_with_keepalive<K>(
     state: AppState,
     request: ChatExecutionRequest,
     keepalive: K,
-) -> (mpsc::Receiver<ChatStreamEvent>, ChatStreamCompletion)
+) -> Result<(mpsc::Receiver<ChatStreamEvent>, ChatStreamCompletion), ApiError>
 where
     K: Send + 'static,
 {
     let (completion_tx, completion_rx) = oneshot::channel();
-    let events = spawn_chat_stream_inner(state, request, keepalive, Some(completion_rx));
-    (
+    let events = start_chat_stream_inner(state, request, keepalive, Some(completion_rx)).await?;
+    Ok((
         events,
         ChatStreamCompletion {
             sender: Some(completion_tx),
         },
-    )
+    ))
 }
 
-fn spawn_chat_stream_inner<K>(
+async fn start_chat_stream_inner<K>(
     state: AppState,
     request: ChatExecutionRequest,
     keepalive: K,
     completion_rx: Option<oneshot::Receiver<()>>,
-) -> mpsc::Receiver<ChatStreamEvent>
+) -> Result<mpsc::Receiver<ChatStreamEvent>, ApiError>
 where
     K: Send + 'static,
 {
     let runtime = state.runtime.clone();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
-    let variant = request.variant;
-    let messages = request.messages;
-    let correlation_id = request.correlation_id;
+    let permit = state
+        .acquire_owned_workload_permit(WorkloadClass::Streaming)
+        .await
+        .map_err(|_| ApiError::service_unavailable("Server is shutting down"))?;
+    let admitted = runtime
+        .admit_streaming_chat(
+            request.variant,
+            request.messages,
+            params,
+            chat_config,
+            request.correlation_id.as_deref(),
+            permit.runtime_context(),
+        )
+        .await?;
 
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     let sink = ChatDeltaSink::new(event_tx.clone(), izwi_core::stream_slow_consumer_timeout());
     tokio::spawn(async move {
         async move {
-            let permit = match state
-                .acquire_owned_workload_permit(WorkloadClass::Streaming)
-                .await
-            {
-                Ok(permit) => permit,
-                Err(_) => {
-                    send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
-                    return;
-                }
-            };
-
             if event_tx.send(ChatStreamEvent::Started).await.is_err() {
                 return;
             }
 
-            let generation = runtime.chat_generate_streaming_tokens_with_runtime_context(
-                variant,
-                messages,
-                params,
-                chat_config,
-                correlation_id.as_deref(),
-                permit.runtime_context(),
-                {
-                    let sink = sink.clone();
-                    move |delta: String, logprobs: Vec<izwi_core::engine::TokenLogprob>| {
-                        sink.offer(delta, logprobs);
-                    }
-                },
-            );
+            let generation = runtime.run_admitted_streaming_chat(admitted, {
+                let sink = sink.clone();
+                move |delta: String, logprobs: Vec<izwi_core::engine::TokenLogprob>| {
+                    sink.offer(delta, logprobs);
+                }
+            });
             let terminal = resolve_chat_terminal(&sink, generation).await;
             drop(permit);
             if let Some(terminal) = terminal {
@@ -1405,7 +1400,7 @@ where
         drop(keepalive);
     });
 
-    event_rx
+    Ok(event_rx)
 }
 
 #[cfg(test)]
@@ -1425,7 +1420,13 @@ where
         let permit = match semaphore.acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                send_chat_terminal(event_tx, ChatStreamEvent::ShuttingDown).await;
+                send_chat_terminal(
+                    event_tx,
+                    ChatStreamEvent::Failed(ApiError::service_unavailable(
+                        "Server is shutting down",
+                    )),
+                )
+                .await;
                 return;
             }
         };

@@ -125,6 +125,11 @@ fn reconcile_streamed_chat_text(
     )))
 }
 
+/// A streaming chat request that passed admission and has not started; see
+/// [`RuntimeService::admit_streaming_chat`]. Dropping it releases the
+/// admission.
+pub struct AdmittedChatStream(AdmittedEngineRequest);
+
 impl RuntimeService {
     /// Admit one chat request and return its worker-facing execution handle.
     ///
@@ -672,23 +677,64 @@ impl RuntimeService {
         chat_config: ChatRequestConfig,
         correlation_id: Option<&str>,
         runtime_context: RuntimeRequestContext,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<ChatGeneration>
     where
         F: FnMut(String, Vec<crate::engine::TokenLogprob>) + Send + 'static,
     {
         let admitted = self
-            .build_chat_request_with_params_and_config(
+            .admit_streaming_chat(
                 variant,
                 messages,
                 params,
                 chat_config,
                 correlation_id,
                 runtime_context,
-                true,
-                None,
             )
             .await?;
+        self.run_admitted_streaming_chat(admitted, on_delta).await
+    }
+
+    /// Admit a streaming chat request without starting it: the prompt fits
+    /// the context (or the request fails with `ContextLengthExceeded`), and
+    /// the request holds its coordinator capacity and model residency until
+    /// [`Self::run_admitted_streaming_chat`] runs it or it is dropped. A
+    /// server admits before it commits to a streamed response, so an
+    /// admission failure is still a plain HTTP error.
+    pub async fn admit_streaming_chat(
+        &self,
+        variant: ModelVariant,
+        messages: Vec<ChatMessage>,
+        params: GenerationParams,
+        chat_config: ChatRequestConfig,
+        correlation_id: Option<&str>,
+        runtime_context: RuntimeRequestContext,
+    ) -> Result<AdmittedChatStream> {
+        self.build_chat_request_with_params_and_config(
+            variant,
+            messages,
+            params,
+            chat_config,
+            correlation_id,
+            runtime_context,
+            true,
+            None,
+        )
+        .await
+        .map(AdmittedChatStream)
+    }
+
+    /// Run an admitted streaming chat request; `on_delta` receives each
+    /// text delta with its logprob entries.
+    pub async fn run_admitted_streaming_chat<F>(
+        &self,
+        admitted: AdmittedChatStream,
+        mut on_delta: F,
+    ) -> Result<ChatGeneration>
+    where
+        F: FnMut(String, Vec<crate::engine::TokenLogprob>) + Send + 'static,
+    {
+        let AdmittedChatStream(admitted) = admitted;
         let mut streamed_text = String::new();
         let output = self
             .run_admitted_streaming_request(admitted, |chunk| {

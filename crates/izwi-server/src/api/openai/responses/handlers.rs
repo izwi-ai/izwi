@@ -15,7 +15,7 @@ use crate::api::openai::convert::{
 use crate::api::openai::tool_calls::resolve_tool_policy;
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    chat_top_k, generate_chat, resolve_chat_request_config, spawn_chat_stream,
+    chat_top_k, generate_chat, resolve_chat_request_config, start_chat_stream,
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
@@ -289,7 +289,7 @@ async fn create_streaming_response(
     let message_id = new_prefixed_id("msg_");
     let model_name = execution_request.variant.dir_name().to_string();
     let store_state = state.clone();
-    let mut event_rx = spawn_chat_stream(state.clone(), execution_request);
+    let mut event_rx = start_chat_stream(state.clone(), execution_request).await?;
 
     let stream = async_stream::stream! {
         let created_response = ResponseObject {
@@ -500,32 +500,6 @@ async fn create_streaming_response(
                             output_tokens: 0,
                             input_cached_tokens: 0,
                             error: Some("Response generation failed".to_string()),
-                            metadata: metadata.clone(),
-                        },
-                        req.store,
-                    )
-                    .await;
-                    (failed, true)
-                }
-                ChatStreamEvent::ShuttingDown => {
-                    let failed = response_stream_failure_payload(
-                        &response_id_for_task,
-                        "Server is shutting down",
-                    );
-                    persist_response(
-                        &store_state,
-                        StoredResponseRecord {
-                            id: response_id_for_task.clone(),
-                            tenant_scope: tenant_scope.clone(),
-                            created_at,
-                            status: "failed".to_string(),
-                            model: model_name.clone(),
-                            input_items: input_items.clone(),
-                            output_text: None,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            input_cached_tokens: 0,
-                            error: Some("Server is shutting down".to_string()),
                             metadata: metadata.clone(),
                         },
                         req.store,

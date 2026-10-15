@@ -444,23 +444,31 @@ async fn assert_paths_agree(paths: &Paths) {
         }
     }
 
-    // D8: overflow is the same OpenAI 400 on both paths, unless the request
-    // opts into truncation.
-    let overflow = assert_same_error(
-        paths,
-        "prompt overflow",
-        json!({"messages": long_conversation(), "temperature": 0.0}),
-    )
-    .await;
-    assert_eq!(overflow["error"]["code"], "context_length_exceeded");
-    assert_eq!(overflow["error"]["param"], "messages");
-    let budget = assert_same_error(
-        paths,
-        "budget overflow",
-        json!({"messages": hello, "temperature": 0.0, "max_tokens": CONTEXT_TOKENS + 8}),
-    )
-    .await;
-    assert_eq!(budget["error"]["code"], "context_length_exceeded");
+    // D8: overflow is the same OpenAI 400 on both paths, streamed or not,
+    // unless the request opts into truncation. A stream is admitted before
+    // its response starts, so its overflow is a 400 too.
+    for stream in [false, true] {
+        let overflow = assert_same_error(
+            paths,
+            &format!("prompt overflow (stream {stream})"),
+            json!({"messages": long_conversation(), "temperature": 0.0, "stream": stream}),
+        )
+        .await;
+        assert_eq!(overflow["error"]["code"], "context_length_exceeded");
+        assert_eq!(overflow["error"]["param"], "messages");
+        let budget = assert_same_error(
+            paths,
+            &format!("budget overflow (stream {stream})"),
+            json!({
+                "messages": hello,
+                "temperature": 0.0,
+                "max_tokens": CONTEXT_TOKENS + 8,
+                "stream": stream,
+            }),
+        )
+        .await;
+        assert_eq!(budget["error"]["code"], "context_length_exceeded");
+    }
     assert_same_answer(
         paths,
         "auto truncation",

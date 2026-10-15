@@ -12,7 +12,7 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::api::request_context::RequestContext;
 use crate::app::chat::{
-    generate_chat, parse_chat_model, resolve_chat_request_config, spawn_chat_stream_with_keepalive,
+    generate_chat, parse_chat_model, resolve_chat_request_config, start_chat_stream_with_keepalive,
     validate_chat_request_ranges, ChatExecutionRequest, ChatStreamEvent,
 };
 use crate::app::chat_content::{
@@ -425,7 +425,7 @@ async fn create_streaming_thread_message(
     let user_message_for_start = user_message.clone();
     let correlation_id = execution_request.correlation_id.clone();
     let (mut event_rx, stream_completion) =
-        spawn_chat_stream_with_keepalive(state, execution_request, turn_guard);
+        start_chat_stream_with_keepalive(state, execution_request, turn_guard).await?;
 
     let stream = async_stream::stream! {
         let mut stream_completion = Some(stream_completion);
@@ -496,10 +496,6 @@ async fn create_streaming_thread_message(
                 }
                 ChatStreamEvent::Failed(error) => (
                     thread_stream_error_payload(error.message),
-                    true,
-                ),
-                ChatStreamEvent::ShuttingDown => (
-                    thread_stream_error_payload("Server is shutting down"),
                     true,
                 ),
             };

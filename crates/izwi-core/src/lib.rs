@@ -129,9 +129,9 @@ pub use runtime::{
 };
 pub use runtime::{
     runtime_trace_contracts, sanitized_replay_record, stream_slow_consumer_timeout,
-    trace_contract_for_phase, AudioChunk, CoordinatorSnapshot, EngineRuntimeTelemetrySnapshot,
-    GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot, InferenceOptions,
-    PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeAsrRealtimeEvent,
+    trace_contract_for_phase, AdmittedChatStream, AudioChunk, CoordinatorSnapshot,
+    EngineRuntimeTelemetrySnapshot, GenerationConfig, InferenceBrokerRuntimeTelemetrySnapshot,
+    InferenceOptions, PipelineRuntimeTelemetrySnapshot, ReplayRedaction, RuntimeAsrRealtimeEvent,
     RuntimeAsrRealtimeStream, RuntimeChatInvocation, RuntimeChatInvocationEvent,
     RuntimeChatInvocationRequest, RuntimeChatTeardown, RuntimeChatTeardownDisposition,
     RuntimeHealth, RuntimeLatencyStats, RuntimeObservabilityTelemetrySnapshot,
