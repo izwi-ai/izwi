@@ -14,7 +14,7 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-use tokenizers::tokenizer::step_decode_stream;
+use tokenizers::tokenizer::{step_decode_stream, DecodeStreamError};
 use tokenizers::AddedToken;
 use tokenizers::SplitDelimiterBehavior;
 use tokenizers::Tokenizer as HfTokenizer;
@@ -52,7 +52,10 @@ pub struct IncrementalDecoder {
     prefix: String,
     prefix_index: usize,
     all_ids: Vec<u32>,
+    /// The streamed text, or after a divergence the one-shot decode the
+    /// stream continued from. Equals the one-shot decode once finished.
     emitted: String,
+    divergences: u64,
     finished: bool,
 }
 
@@ -65,9 +68,32 @@ impl IncrementalDecoder {
             prefix_index: 0,
             all_ids: Vec::new(),
             emitted: String::new(),
+            divergences: 0,
             finished: false,
         }
     }
+
+    /// The one-shot decode of every token once
+    /// [`Tokenizer::finish_incremental_decode`] has run.
+    pub fn decoded_text(&self) -> &str {
+        &self.emitted
+    }
+
+    /// Steps at which a decoder that is not prefix-stable rewrote text the
+    /// stream had already emitted. Byte-level decoders never do.
+    pub fn divergences(&self) -> u64 {
+        self.divergences
+    }
+}
+
+/// `current` after the longest character prefix it shares with `previous`.
+fn text_after_shared_prefix(previous: &str, current: &str) -> String {
+    let shared = previous
+        .char_indices()
+        .zip(current.chars())
+        .find(|((_, emitted), next)| emitted != next)
+        .map_or(previous.len().min(current.len()), |((at, _), _)| at);
+    current.get(shared..).unwrap_or_default().to_owned()
 }
 
 const QWEN2_PRETOKENIZER_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
@@ -436,16 +462,35 @@ impl Tokenizer {
             ));
         }
         decoder.all_ids.push(token_id);
-        let delta = step_decode_stream(
+        let delta = match step_decode_stream(
             &self.inner,
             vec![token_id],
             decoder.skip_special_tokens,
             &mut decoder.stream_ids,
             &mut decoder.prefix,
             &mut decoder.prefix_index,
-        )
-        .map_err(|e| Error::TokenizationError(e.to_string()))?
-        .unwrap_or_default();
+        ) {
+            Ok(delta) => delta.unwrap_or_default(),
+            // ByteFallback decodes a run of byte tokens as one sequence, so a
+            // stray byte turns a character the stream already emitted into
+            // U+FFFD. Emitted text cannot be retracted: continue after the
+            // longest prefix it shares with the one-shot decode, as
+            // whole-sequence re-decoding streamed, and restart the window.
+            Err(error) if error.downcast_ref::<DecodeStreamError>().is_some() => {
+                let decoded = self
+                    .inner
+                    .decode(&decoder.all_ids, decoder.skip_special_tokens)
+                    .map_err(|e| Error::TokenizationError(e.to_string()))?;
+                let delta = text_after_shared_prefix(&decoder.emitted, &decoded);
+                decoder.emitted = decoded;
+                decoder.stream_ids.clear();
+                decoder.prefix.clear();
+                decoder.prefix_index = 0;
+                decoder.divergences += 1;
+                return Ok(delta);
+            }
+            Err(error) => return Err(Error::TokenizationError(error.to_string())),
+        };
         decoder.emitted.push_str(&delta);
         Ok(delta)
     }
@@ -455,6 +500,8 @@ impl Tokenizer {
     /// This is idempotent and deliberately compares against a one-shot decode,
     /// ensuring streamed deltas plus this suffix have exactly the same decoder
     /// semantics even when generation ends part-way through a byte sequence.
+    /// A decoder that is not prefix-stable can have rewritten emitted text;
+    /// the suffix then follows the longest shared prefix.
     pub fn finish_incremental_decode(&self, decoder: &mut IncrementalDecoder) -> Result<String> {
         if decoder.finished {
             return Ok(String::new());
@@ -463,14 +510,14 @@ impl Tokenizer {
             .inner
             .decode(&decoder.all_ids, decoder.skip_special_tokens)
             .map_err(|e| Error::TokenizationError(e.to_string()))?;
-        let suffix = decoded.strip_prefix(&decoder.emitted).ok_or_else(|| {
-            Error::TokenizationError(format!(
-                "Incremental decode diverged from one-shot decode: emitted {:?}, decoded {:?}",
-                decoder.emitted, decoded
-            ))
-        })?;
-        let suffix = suffix.to_string();
-        decoder.emitted.push_str(&suffix);
+        let suffix = match decoded.strip_prefix(&decoder.emitted) {
+            Some(suffix) => suffix.to_string(),
+            None => {
+                decoder.divergences += 1;
+                text_after_shared_prefix(&decoder.emitted, &decoded)
+            }
+        };
+        decoder.emitted = decoded;
         decoder.finished = true;
         Ok(suffix)
     }
@@ -733,6 +780,44 @@ mod tests {
             tokenizer.decode_incrementally(&mut decoder, ids[0]),
             Err(Error::TokenizationError(message)) if message.contains("after incremental decoding was finished")
         ));
+    }
+
+    #[test]
+    fn incremental_decode_continues_when_byte_fallback_rewrites_emitted_text() {
+        // SentencePiece-style byte fallback decodes a run of byte tokens as
+        // one sequence: a stray continuation byte after "é" turns the whole
+        // run, including the emitted "é", into U+FFFD.
+        let tokenizer = Tokenizer::from_hf_json_bytes(
+            br#"{
+            "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+            "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"}]},
+            "model":{"type":"WordLevel","unk_token":"b",
+                "vocab":{"<0xC3>":0,"<0xA9>":1,"b":2}}
+        }"#,
+        )
+        .expect("tokenizer");
+        let ids = [0, 1, 1, 2, 0, 1];
+        let mut decoder = IncrementalDecoder::new(true);
+        let deltas = ids
+            .iter()
+            .map(|id| {
+                tokenizer
+                    .decode_incrementally(&mut decoder, *id)
+                    .expect("a rewrite is not an error")
+            })
+            .collect::<Vec<_>>();
+        let suffix = tokenizer
+            .finish_incremental_decode(&mut decoder)
+            .expect("finish after a rewrite");
+        let one_shot = tokenizer.decode(&ids).expect("one-shot decode");
+        assert_eq!(one_shot, "\u{FFFD}\u{FFFD}\u{FFFD}bé");
+        // The stream continues after the longest prefix it shares with the
+        // one-shot decode, as whole-sequence re-decoding streamed.
+        assert_eq!(deltas, ["", "é", "", "\u{FFFD}\u{FFFD}\u{FFFD}b", "", "é"]);
+        assert_eq!(suffix, "");
+        assert_eq!(decoder.decoded_text(), one_shot);
+        assert_eq!(decoder.divergences(), 1);
     }
 
     #[test]
