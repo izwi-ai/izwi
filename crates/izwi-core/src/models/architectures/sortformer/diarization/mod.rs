@@ -780,27 +780,99 @@ struct SortformerStreamingChunkPlan {
     right_offset: usize,
 }
 
+/// `(rows, D)` embeddings kept on the model device. Empty is `None`, so no
+/// zero-sized tensor reaches a device kernel. Every operation is an exact
+/// copy (`narrow`, `cat`, `index_select`), so the values match the host rows
+/// they replace bit for bit.
+#[derive(Debug, Clone, Default)]
+struct EmbeddingRows(Option<Tensor>);
+
+impl EmbeddingRows {
+    fn new(tensor: Tensor) -> Result<Self> {
+        let (rows, _) = tensor.dims2()?;
+        Ok(Self((rows > 0).then_some(tensor)))
+    }
+
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |tensor| tensor.dims()[0])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn tensor(&self) -> Option<&Tensor> {
+        self.0.as_ref()
+    }
+
+    fn narrow(&self, start: usize, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Ok(Self(None));
+        }
+        let tensor = self.0.as_ref().ok_or_else(|| {
+            Error::InferenceError("Sortformer embedding rows out of range".into())
+        })?;
+        Ok(Self(Some(tensor.narrow(0, start, len)?)))
+    }
+
+    fn cat(parts: &[&Self]) -> Result<Self> {
+        let tensors = parts
+            .iter()
+            .filter_map(|part| part.0.as_ref())
+            .collect::<Vec<_>>();
+        Ok(Self(match tensors.as_slice() {
+            [] => None,
+            [only] => Some((*only).clone()),
+            many => Some(Tensor::cat(many, 0)?),
+        }))
+    }
+
+    fn index_select(&self, indices: &[u32]) -> Result<Self> {
+        if indices.is_empty() {
+            return Ok(Self(None));
+        }
+        let tensor = self.0.as_ref().ok_or_else(|| {
+            Error::InferenceError("Sortformer embedding rows out of range".into())
+        })?;
+        let indices = Tensor::from_slice(indices, indices.len(), tensor.device())?;
+        Ok(Self(Some(tensor.index_select(&indices, 0)?)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SortformerStreamingState {
-    spkcache: Vec<Vec<f32>>,
+    spkcache: EmbeddingRows,
     spkcache_preds: Option<Vec<Vec<f32>>>,
-    fifo: Vec<Vec<f32>>,
+    fifo: EmbeddingRows,
     fifo_preds: Vec<Vec<f32>>,
     mean_sil_emb: Vec<f32>,
     n_sil_frames: usize,
+    /// Device-to-host reads the state update made (silent FIFO rows for the
+    /// running silence mean).
+    host_reads: u64,
 }
 
 impl SortformerStreamingState {
     fn new(emb_dim: usize) -> Self {
         Self {
-            spkcache: Vec::new(),
+            spkcache: EmbeddingRows::default(),
             spkcache_preds: None,
-            fifo: Vec::new(),
+            fifo: EmbeddingRows::default(),
             fifo_preds: Vec::new(),
             mean_sil_emb: vec![0.0; emb_dim],
             n_sil_frames: 0,
+            host_reads: 0,
         }
     }
+}
+
+/// Per-model counters for the streaming loop (SRT-7), reported under
+/// `streaming_path` in `family_diagnostics`.
+#[derive(Debug, Default)]
+struct SortformerStreamingCounters {
+    chunks: AtomicU64,
+    host_reads: AtomicU64,
+    physical_state_commits: AtomicU64,
 }
 
 fn commit_sortformer_streaming_state(
@@ -978,22 +1050,25 @@ fn commit_sortformer_streaming_state(
 }
 
 fn padded_embedding_tensor(
-    rows: &[Vec<f32>],
+    rows: &EmbeddingRows,
     capacity: usize,
     hidden: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    let mut flat = vec![0.0_f32; capacity.saturating_mul(hidden)];
-    for (index, row) in rows.iter().enumerate() {
-        if row.len() != hidden {
-            return Err(Error::InferenceError(format!(
-                "Sortformer embedding row has width {}; expected {hidden}",
-                row.len()
-            )));
-        }
-        flat[index * hidden..(index + 1) * hidden].copy_from_slice(row);
+    let Some(tensor) = rows.tensor() else {
+        return Tensor::zeros((capacity, hidden), DType::F32, device).map_err(Error::from);
+    };
+    let (len, width) = tensor.dims2()?;
+    if width != hidden || len > capacity {
+        return Err(Error::InferenceError(format!(
+            "Sortformer embedding rows [{len}, {width}] do not fit [{capacity}, {hidden}]"
+        )));
     }
-    Tensor::from_vec(flat, (capacity, hidden), device).map_err(Error::from)
+    tensor
+        .to_device(device)?
+        .pad_with_zeros(0, 0, capacity - len)?
+        .contiguous()
+        .map_err(Error::from)
 }
 
 fn padded_prediction_tensor(
@@ -1182,6 +1257,7 @@ impl SortformerDiarizerModel {
             "streaming_profile": self.model.streaming_profile.name(),
             "streaming": streaming,
             "kernels": self.model.encoder.kernel_diagnostics(),
+            "streaming_path": self.model.streaming_path_diagnostics(),
         })
     }
 
@@ -1571,6 +1647,7 @@ struct SortformerInferenceModel {
     /// Nemotron-3's learned silence embedding used for cache silence slots;
     /// v2.1 keeps None and tracks a running silence mean instead.
     silence_embedding: Option<Vec<f32>>,
+    streaming_counters: SortformerStreamingCounters,
 }
 
 impl SortformerInferenceModel {
@@ -1661,6 +1738,7 @@ impl SortformerInferenceModel {
             streaming: Some(streaming),
             streaming_profile: profile,
             silence_embedding,
+            streaming_counters: SortformerStreamingCounters::default(),
         };
         model.validate_production_topology(proj_in, proj_out)?;
         Ok(model)
@@ -1906,7 +1984,7 @@ impl SortformerInferenceModel {
         samples: &[f32],
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
-        mut physical_state: Option<&mut InvocationTensorLease>,
+        physical_state: Option<&mut InvocationTensorLease>,
     ) -> Result<Vec<Vec<f32>>> {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         if let Some(silence) = &self.silence_embedding {
@@ -1914,6 +1992,11 @@ impl SortformerInferenceModel {
         }
         let track_silence_mean = self.silence_embedding.is_none();
         let mut total_preds = Vec::new();
+        // The cache, FIFO and chunk embeddings stay on the model device; the
+        // only per-chunk host reads are the probabilities (once) and, for the
+        // running silence mean, the silent rows popped from the FIFO.
+        let mut chunks = 0u64;
+        let mut host_reads = 0u64;
         for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
             let chunk = self
                 .preprocessor
@@ -1927,31 +2010,28 @@ impl SortformerInferenceModel {
                 continue;
             }
 
-            let chunk_rows = tensor_to_embedding_rows(&chunk_pre_encoded, chunk_pre_encoded_len)?;
-            let mut composite_rows =
-                Vec::with_capacity(state.spkcache.len() + state.fifo.len() + chunk_rows.len());
-            composite_rows.extend(state.spkcache.iter().cloned());
-            composite_rows.extend(state.fifo.iter().cloned());
-            composite_rows.extend(chunk_rows.iter().cloned());
-            if composite_rows.is_empty() {
+            let chunk_rows =
+                EmbeddingRows::new(chunk_pre_encoded.i((0, ..chunk_pre_encoded_len, ..))?)?;
+            let composite = EmbeddingRows::cat(&[&state.spkcache, &state.fifo, &chunk_rows])?;
+            let Some(composite) = composite.tensor() else {
                 continue;
-            }
+            };
+            chunks += 1;
 
-            let composite = tensor_from_embedding_rows(
-                &composite_rows,
-                cfg.fc_d_model,
-                chunk_pre_encoded.device(),
-            )?;
-            let (encoded, encoded_len) = self.encoder.forward_pre_encoded(
-                &composite,
-                state.spkcache.len() + state.fifo.len() + chunk_rows.len(),
-            )?;
+            let composite_len = composite.dim(0)?;
+            let (encoded, encoded_len) = self
+                .encoder
+                .forward_pre_encoded(&composite.unsqueeze(0)?, composite_len)?;
             let probs = self.forward_probabilities(&encoded, encoded_len)?;
+            let output_rows = encoded_len * cfg.output_frames_per_encoded_frame;
+            let prob_rows = tensor_to_probability_rows(&probs, output_rows, self.num_speakers)?;
+            host_reads += 1;
+            let pooled;
             let pred_rows = if cfg.output_frames_per_encoded_frame == 1 {
-                tensor_to_probability_rows(&probs, encoded_len, self.num_speakers)?
+                &prob_rows
             } else {
-                let mut pooled = pool_upsampled_probabilities(
-                    &probs,
+                let mut rows = pool_probability_rows(
+                    &prob_rows,
                     encoded_len,
                     cfg.output_frames_per_encoded_frame,
                     self.num_speakers,
@@ -1961,38 +2041,41 @@ impl SortformerInferenceModel {
                 // zero probability before the cache sees it.
                 let chunk_mel_frames = plan.feature_end - plan.feature_start;
                 if chunk_mel_frames % cfg.output_frames_per_encoded_frame != 0 {
-                    if let Some(last) = pooled.last_mut() {
+                    if let Some(last) = rows.last_mut() {
                         last.fill(0.0);
                     }
                 }
-                pooled
+                pooled = rows;
+                &pooled
             };
             let (updated_state, _chunk_preds, output_range) = update_streaming_state(
                 state,
                 &chunk_rows,
-                &pred_rows,
+                pred_rows,
                 pre_encoded_left_offset(plan.left_offset, cfg.subsampling_factor),
                 pre_encoded_right_offset(plan.right_offset, cfg.subsampling_factor),
                 track_silence_mean,
                 cfg,
             )?;
-            state = if let Some(lease) = physical_state.as_deref_mut() {
-                commit_sortformer_streaming_state(lease, cfg, &updated_state)?;
-                updated_state
-            } else {
-                updated_state
-            };
-            if output_range.is_empty() {
-                continue;
-            }
-            let output_len = output_range.len();
-            let chunk_output = probs.i((.., output_range, ..))?;
-            total_preds.extend(tensor_to_probability_rows(
-                &chunk_output,
-                output_len,
-                self.num_speakers,
-            )?);
+            state = updated_state;
+            total_preds.extend_from_slice(&prob_rows[output_range]);
         }
+        host_reads += state.host_reads;
+        // Nothing reads the invocation state back while the stream runs, so
+        // it is committed once, with the final cache, instead of being staged
+        // on the arena device after every chunk.
+        if let Some(lease) = physical_state {
+            commit_sortformer_streaming_state(lease, cfg, &state)?;
+            self.streaming_counters
+                .physical_state_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.streaming_counters
+            .chunks
+            .fetch_add(chunks, Ordering::Relaxed);
+        self.streaming_counters
+            .host_reads
+            .fetch_add(host_reads, Ordering::Relaxed);
         if cfg.output_frames_per_encoded_frame > 1 {
             // The upsampler pads the final stacked group; trim the trailing
             // rows back to the mel frame count.
@@ -2000,6 +2083,15 @@ impl SortformerInferenceModel {
         }
 
         Ok(total_preds)
+    }
+
+    fn streaming_path_diagnostics(&self) -> serde_json::Value {
+        let counters = &self.streaming_counters;
+        serde_json::json!({
+            "chunks": counters.chunks.load(Ordering::Relaxed),
+            "host_reads": counters.host_reads.load(Ordering::Relaxed),
+            "physical_state_commits": counters.physical_state_commits.load(Ordering::Relaxed),
+        })
     }
 
     fn forward_probabilities(&self, encoded: &Tensor, encoded_len: usize) -> Result<Tensor> {
@@ -2138,21 +2230,6 @@ fn pre_encoded_right_offset(right_offset: usize, subsampling_factor: usize) -> u
     ((right_offset as f32) / (subsampling_factor as f32)).ceil() as usize
 }
 
-fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec<f32>>> {
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let view = tensor.i((0, ..row_count, ..))?;
-    let (_, emb_dim) = view.dims2()?;
-    crate::models::shared::telemetry::record_host_read(DType::F32, row_count * emb_dim);
-    let values = view.flatten_all()?.to_vec1::<f32>()?;
-    Ok(values
-        .chunks(emb_dim)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>())
-}
-
 fn tensor_to_probability_rows(
     tensor: &Tensor,
     row_count: usize,
@@ -2178,61 +2255,44 @@ fn tensor_to_probability_rows(
         .collect::<Vec<_>>())
 }
 
-fn tensor_from_embedding_rows(
-    rows: &[Vec<f32>],
-    emb_dim: usize,
-    device: &Device,
-) -> Result<Tensor> {
-    if rows.is_empty() {
-        return Tensor::zeros((1, 0, emb_dim), DType::F32, device).map_err(Error::from);
-    }
-    let mut flat = Vec::with_capacity(rows.len() * emb_dim);
-    for row in rows {
-        if row.len() != emb_dim {
-            return Err(Error::InferenceError(format!(
-                "Inconsistent Sortformer embedding row size {}; expected {}",
-                row.len(),
-                emb_dim
-            )));
-        }
-        flat.extend_from_slice(row);
-    }
-    Tensor::from_vec(flat, (1, rows.len(), emb_dim), device).map_err(Error::from)
-}
-
 /// Pools the upsampled probability rows back to the encoded frame rate for
 /// streaming cache management, matching the reference `_pool_probs`
-/// (sigmoid has already been applied by the speaker head).
-fn pool_upsampled_probabilities(
-    probs: &Tensor,
+/// (sigmoid has already been applied by the speaker head). The rows are
+/// already on the host; the arithmetic is Candle's CPU `mean`: an in-order
+/// sum from zero, then a multiply by `1 / factor`.
+fn pool_probability_rows(
+    rows: &[Vec<f32>],
     encoded_len: usize,
     upsample_factor: usize,
     num_speakers: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    if encoded_len == 0 {
-        return Ok(Vec::new());
-    }
-    let (_, rows, speaker_dim) = probs.dims3()?;
-    if speaker_dim != num_speakers || rows != encoded_len * upsample_factor {
+    if rows.len() != encoded_len * upsample_factor
+        || rows.iter().any(|row| row.len() != num_speakers)
+    {
         return Err(Error::InferenceError(format!(
-            "unexpected Sortformer upsampled probability shape [{rows}, {speaker_dim}]; expected [{}, {num_speakers}]",
+            "unexpected Sortformer upsampled probability rows ({}); expected [{}, {num_speakers}]",
+            rows.len(),
             encoded_len * upsample_factor
         )));
     }
-    let pooled = probs
-        .reshape((1, encoded_len, upsample_factor, num_speakers))?
-        .mean(2)?;
-    crate::models::shared::telemetry::record_host_read(DType::F32, encoded_len * num_speakers);
-    let values = pooled.flatten_all()?.to_vec1::<f32>()?;
-    Ok(values
-        .chunks(num_speakers)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>())
+    let scale = (1.0 / upsample_factor as f64) as f32;
+    Ok(rows
+        .chunks_exact(upsample_factor.max(1))
+        .map(|group| {
+            let mut sum = vec![0.0f32; num_speakers];
+            for row in group {
+                for (acc, value) in sum.iter_mut().zip(row) {
+                    *acc += value;
+                }
+            }
+            sum.into_iter().map(|value| value * scale).collect()
+        })
+        .collect())
 }
 
 fn update_streaming_state(
     mut state: SortformerStreamingState,
-    chunk_rows: &[Vec<f32>],
+    chunk_rows: &EmbeddingRows,
     preds: &[Vec<f32>],
     lc: usize,
     rc: usize,
@@ -2254,7 +2314,7 @@ fn update_streaming_state(
     let chunk_valid_len = chunk_rows.len().saturating_sub(lc + rc);
     let chunk_start = lc.min(chunk_rows.len());
     let chunk_end = (chunk_start + chunk_valid_len).min(chunk_rows.len());
-    let chunk_payload = chunk_rows[chunk_start..chunk_end].to_vec();
+    let chunk_payload = chunk_rows.narrow(chunk_start, chunk_end - chunk_start)?;
     let chunk_preds =
         preds[spkcache_len + fifo_len + chunk_start..spkcache_len + fifo_len + chunk_end].to_vec();
     let output_start = (spkcache_len + fifo_len + chunk_start)
@@ -2262,7 +2322,7 @@ fn update_streaming_state(
     let output_end =
         (spkcache_len + fifo_len + chunk_end) * cfg.output_frames_per_encoded_frame;
 
-    state.fifo.extend(chunk_payload.clone());
+    state.fifo = EmbeddingRows::cat(&[&state.fifo, &chunk_payload])?;
     state.fifo_preds.extend(chunk_preds.clone());
 
     if fifo_len + chunk_payload.len() > cfg.fifo_len {
@@ -2274,17 +2334,19 @@ fn update_streaming_state(
             .spkcache_update_period
             .max(overflow)
             .min(fifo_len + chunk_payload.len());
-        let pop_out_embs = state.fifo[..pop_out_len].to_vec();
+        let pop_out_embs = state.fifo.narrow(0, pop_out_len)?;
         let pop_out_preds = state.fifo_preds[..pop_out_len].to_vec();
 
         if track_silence_mean {
-            update_silence_profile(&mut state, &pop_out_embs, &pop_out_preds, cfg.sil_threshold);
+            update_silence_profile(&mut state, &pop_out_embs, &pop_out_preds, cfg.sil_threshold)?;
         }
-        state.fifo.drain(..pop_out_len);
+        state.fifo = state
+            .fifo
+            .narrow(pop_out_len, state.fifo.len() - pop_out_len)?;
         state.fifo_preds.drain(..pop_out_len);
 
         let prev_spkcache_len = state.spkcache.len();
-        state.spkcache.extend(pop_out_embs);
+        state.spkcache = EmbeddingRows::cat(&[&state.spkcache, &pop_out_embs])?;
         if let Some(spkcache_preds) = state.spkcache_preds.as_mut() {
             spkcache_preds.extend(pop_out_preds);
         } else if state.spkcache.len() > cfg.spkcache_len {
@@ -2311,15 +2373,32 @@ fn update_streaming_state(
 
 fn update_silence_profile(
     state: &mut SortformerStreamingState,
-    emb_seq: &[Vec<f32>],
+    emb_seq: &EmbeddingRows,
     preds: &[Vec<f32>],
     sil_threshold: f32,
-) {
-    for (emb, pred) in emb_seq.iter().zip(preds.iter()) {
-        let is_silence = pred.iter().copied().sum::<f32>() < sil_threshold;
-        if !is_silence {
-            continue;
-        }
+) -> Result<()> {
+    if emb_seq.len() != preds.len() {
+        return Err(Error::InferenceError(format!(
+            "Sortformer silence update has {} embeddings for {} prediction rows",
+            emb_seq.len(),
+            preds.len()
+        )));
+    }
+    let silent = preds
+        .iter()
+        .enumerate()
+        .filter(|(_, pred)| pred.iter().copied().sum::<f32>() < sil_threshold)
+        .map(|(index, _)| index as u32)
+        .collect::<Vec<_>>();
+    let Some(silent_rows) = emb_seq.index_select(&silent)?.0 else {
+        return Ok(());
+    };
+    // Only the silent rows come to the host, in frame order, so the running
+    // mean keeps its sequential f32 arithmetic.
+    let (rows, width) = silent_rows.dims2()?;
+    crate::models::shared::telemetry::record_host_read(DType::F32, rows * width);
+    state.host_reads += 1;
+    for emb in silent_rows.to_vec2::<f32>()? {
         let total = state.n_sil_frames as f32;
         for (idx, value) in emb.iter().copied().enumerate() {
             state.mean_sil_emb[idx] = if state.n_sil_frames == 0 {
@@ -2330,14 +2409,15 @@ fn update_silence_profile(
         }
         state.n_sil_frames += 1;
     }
+    Ok(())
 }
 
 fn compress_spkcache(
-    emb_seq: &[Vec<f32>],
+    emb_seq: &EmbeddingRows,
     preds: &[Vec<f32>],
     mean_sil_emb: &[f32],
     cfg: SortformerStreamingConfig,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+) -> Result<(EmbeddingRows, Vec<Vec<f32>>)> {
     if emb_seq.len() != preds.len() {
         return Err(Error::InferenceError(format!(
             "Sortformer speaker cache compression length mismatch: {} embeddings vs {} prediction rows",
@@ -2402,24 +2482,38 @@ fn compress_spkcache(
     // The order feeds position-dependent attention over the cache.
     selected.sort_by_key(|a| (a.score == f32::NEG_INFINITY, a.flat_index));
 
-    let mut spkcache = Vec::with_capacity(cfg.spkcache_len);
+    // Gather on the device: row `emb_seq.len()` of the source is the
+    // silence embedding.
+    let silence_row = emb_seq.len() as u32;
+    let mut rows = Vec::with_capacity(cfg.spkcache_len);
     let mut spkcache_preds = Vec::with_capacity(cfg.spkcache_len);
     for candidate in selected {
-        if candidate.score.is_finite() {
-            if let Some(frame_idx) = candidate.frame_index {
-                spkcache.push(emb_seq[frame_idx].clone());
+        match candidate.frame_index {
+            Some(frame_idx) if candidate.score.is_finite() => {
+                rows.push(frame_idx as u32);
                 spkcache_preds.push(preds[frame_idx].clone());
-            } else {
-                spkcache.push(mean_sil_emb.to_vec());
+            }
+            _ => {
+                rows.push(silence_row);
                 spkcache_preds.push(vec![0.0; cfg.num_speakers]);
             }
-        } else {
-            spkcache.push(mean_sil_emb.to_vec());
-            spkcache_preds.push(vec![0.0; cfg.num_speakers]);
         }
     }
+    let source = if rows.contains(&silence_row) {
+        let device = emb_seq
+            .tensor()
+            .map_or(Device::Cpu, |tensor| tensor.device().clone());
+        let silence = EmbeddingRows::new(Tensor::from_slice(
+            mean_sil_emb,
+            (1, mean_sil_emb.len()),
+            &device,
+        )?)?;
+        EmbeddingRows::cat(&[emb_seq, &silence])?
+    } else {
+        emb_seq.clone()
+    };
 
-    Ok((spkcache, spkcache_preds))
+    Ok((source.index_select(&rows)?, spkcache_preds))
 }
 
 fn get_log_pred_scores(
@@ -2757,6 +2851,7 @@ impl SortformerPreprocessor {
 struct SortformerPathCounters {
     conformer_depthwise_conv1d: AtomicU64,
     subsampling_depthwise_conv2d: AtomicU64,
+    rel_pos_tables_built: AtomicU64,
 }
 
 impl SortformerPathCounters {
@@ -2767,6 +2862,10 @@ impl SortformerPathCounters {
     fn subsampling_depthwise_conv2d(&self) -> u64 {
         self.subsampling_depthwise_conv2d.load(Ordering::Relaxed)
     }
+
+    fn rel_pos_tables_built(&self) -> u64 {
+        self.rel_pos_tables_built.load(Ordering::Relaxed)
+    }
 }
 
 struct SortformerConformerEncoder {
@@ -2776,6 +2875,9 @@ struct SortformerConformerEncoder {
     input_scale: f64,
     frame_stride_samples: usize,
     counters: Arc<SortformerPathCounters>,
+    /// The relative-position table of the last composite length: the
+    /// steady-state chunks all share one length.
+    rel_pos_cache: std::sync::Mutex<Option<(usize, Tensor)>>,
 }
 
 impl SortformerConformerEncoder {
@@ -2811,6 +2913,7 @@ impl SortformerConformerEncoder {
             },
             frame_stride_samples: 160 * 8,
             counters,
+            rel_pos_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -2835,11 +2938,29 @@ impl SortformerConformerEncoder {
             pre_encoded.clone()
         };
         let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, self.d_model, x.device())?;
+        let pos_emb = self.rel_pos_embedding(pos_len, x.device())?;
         for layer in &self.layers {
             x = layer.forward(&x, &pos_emb)?;
         }
         Ok((x, encoded_len))
+    }
+
+    fn rel_pos_embedding(&self, len: usize, device: &Device) -> Result<Tensor> {
+        let mut cache = self
+            .rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Sortformer position cache poisoned".into()))?;
+        if let Some((cached_len, table)) = cache.as_ref() {
+            if *cached_len == len && table.device().same_device(device) {
+                return Ok(table.clone());
+            }
+        }
+        let table = build_rel_positional_embedding(len, self.d_model, device)?;
+        self.counters
+            .rel_pos_tables_built
+            .fetch_add(1, Ordering::Relaxed);
+        *cache = Some((len, table.clone()));
+        Ok(table)
     }
 
     fn frame_stride_samples(&self) -> usize {
@@ -3528,6 +3649,7 @@ impl SortformerAcousticEncoder {
                 "shared_depthwise_conv1d_calls_total": shared_total,
                 "shared_depthwise_conv2d_calls_total":
                     crate::kernels::depthwise_conv::depthwise_conv2d_calls(),
+                "rel_pos_tables_built": encoder.counters.rel_pos_tables_built(),
             }),
             // Feature stacking and RoPE attention: no depthwise convolution.
             Self::FeatureStackingRope(_) => serde_json::json!({
@@ -4683,14 +4805,28 @@ mod tests {
         owner.lease().unwrap()
     }
 
+    /// Host rows as device-resident streaming embeddings.
+    fn emb_rows(rows: &[Vec<f32>]) -> EmbeddingRows {
+        let width = rows.first().map_or(0, Vec::len);
+        let flat = rows.iter().flatten().copied().collect::<Vec<_>>();
+        EmbeddingRows::new(Tensor::from_vec(flat, (rows.len(), width), &Device::Cpu).unwrap())
+            .unwrap()
+    }
+
+    fn host_rows(rows: &EmbeddingRows) -> Vec<Vec<f32>> {
+        rows.tensor()
+            .map_or_else(Vec::new, |tensor| tensor.to_vec2::<f32>().unwrap())
+    }
+
     fn synthetic_streaming_state(cfg: &SortformerStreamingConfig) -> SortformerStreamingState {
         SortformerStreamingState {
-            spkcache: vec![vec![0.5; cfg.fc_d_model]; 4.min(cfg.spkcache_len)],
+            spkcache: emb_rows(&vec![vec![0.5; cfg.fc_d_model]; 4.min(cfg.spkcache_len)]),
             spkcache_preds: Some(vec![vec![0.25; cfg.num_speakers]; 4.min(cfg.spkcache_len)]),
-            fifo: Vec::new(),
+            fifo: EmbeddingRows::default(),
             fifo_preds: Vec::new(),
             mean_sil_emb: vec![0.1; cfg.fc_d_model],
             n_sil_frames: 12,
+            host_reads: 0,
         }
     }
 
@@ -5343,11 +5479,19 @@ mod tests {
             vec![0.9, 0.0, 0.0, 0.0],
             vec![0.8, 0.0, 0.0, 0.0],
         ];
-        let (state, first_chunk_preds, _) =
-            update_streaming_state(state, &first_chunk, &first_preds, 0, 0, true, cfg).unwrap();
+        let (state, first_chunk_preds, _) = update_streaming_state(
+            state,
+            &emb_rows(&first_chunk),
+            &first_preds,
+            0,
+            0,
+            true,
+            cfg,
+        )
+        .unwrap();
         assert_eq!(first_chunk_preds, first_preds);
         assert!(state.spkcache.is_empty());
-        assert_eq!(state.fifo, first_chunk);
+        assert_eq!(host_rows(&state.fifo), first_chunk);
 
         let second_chunk = vec![vec![3.0, 3.0], vec![4.0, 4.0]];
         let second_preds = vec![
@@ -5356,11 +5500,22 @@ mod tests {
             vec![0.0, 0.9, 0.0, 0.0],
             vec![0.0, 0.8, 0.0, 0.0],
         ];
-        let (state, second_chunk_preds, _) =
-            update_streaming_state(state, &second_chunk, &second_preds, 0, 0, true, cfg).unwrap();
+        let (state, second_chunk_preds, _) = update_streaming_state(
+            state,
+            &emb_rows(&second_chunk),
+            &second_preds,
+            0,
+            0,
+            true,
+            cfg,
+        )
+        .unwrap();
 
-        assert_eq!(state.spkcache, vec![vec![1.0, 1.0], vec![2.0, 2.0]]);
-        assert_eq!(state.fifo, vec![vec![3.0, 3.0], vec![4.0, 4.0]]);
+        assert_eq!(
+            host_rows(&state.spkcache),
+            vec![vec![1.0, 1.0], vec![2.0, 2.0]]
+        );
+        assert_eq!(host_rows(&state.fifo), vec![vec![3.0, 3.0], vec![4.0, 4.0]]);
         assert!(state.spkcache_preds.is_none());
         assert_eq!(
             second_chunk_preds,
@@ -5384,16 +5539,18 @@ mod tests {
             ..streaming_cfg_for_test()
         };
         let mut state = SortformerStreamingState::new(2);
-        state.fifo = (0..186).map(|i| vec![i as f32, 0.0]).collect();
+        state.fifo = emb_rows(&(0..186).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>());
         let chunk = (186..192).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>();
         let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; 192];
 
-        let (state, _, _) = update_streaming_state(state, &chunk, &preds, 0, 0, true, cfg).unwrap();
+        let (state, _, _) =
+            update_streaming_state(state, &emb_rows(&chunk), &preds, 0, 0, true, cfg).unwrap();
 
         assert_eq!(state.spkcache.len(), 144);
         assert_eq!(state.fifo.len(), 48);
-        assert_eq!(state.fifo[0], vec![144.0, 0.0]);
-        assert_eq!(state.fifo[47], vec![191.0, 0.0]);
+        let fifo = host_rows(&state.fifo);
+        assert_eq!(fifo[0], vec![144.0, 0.0]);
+        assert_eq!(fifo[47], vec![191.0, 0.0]);
     }
 
     /// The pop arithmetic against NeMo's signed formula on hand-computed
@@ -5420,8 +5577,8 @@ mod tests {
                 ..streaming_cfg_for_test()
             };
             let mut state = SortformerStreamingState::new(2);
-            state.fifo = vec![vec![0.0, 0.0]; current];
-            let chunk = vec![vec![1.0, 1.0]; chunk_len];
+            state.fifo = emb_rows(&vec![vec![0.0, 0.0]; current]);
+            let chunk = emb_rows(&vec![vec![1.0, 1.0]; chunk_len]);
             let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; current + chunk_len];
             let (state, _, _) =
                 update_streaming_state(state, &chunk, &preds, 0, 0, true, cfg).unwrap();
@@ -5454,7 +5611,9 @@ mod tests {
         }
         let silence = vec![-1.0, -1.0];
 
-        let (cache, cache_preds) = compress_spkcache(&emb_seq, &preds, &silence, cfg).unwrap();
+        let (cache, cache_preds) =
+            compress_spkcache(&emb_rows(&emb_seq), &preds, &silence, cfg).unwrap();
+        let cache = host_rows(&cache);
 
         // Kept: speaker 0's frames 0-2 then its silence pad, speaker 1's
         // frames 5-6 then its pad, the pads of speakers 2 and 3, and the
@@ -5857,15 +6016,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_upsampled_probabilities_averages_within_encoded_frames() {
-        let probs = Tensor::from_vec(
-            vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-            (1, 4, 2),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let pooled =
-            pool_upsampled_probabilities(&probs, 2, 2, 2).unwrap();
+    fn pool_probability_rows_averages_within_encoded_frames() {
+        let probs = vec![
+            vec![0.1f32, 0.2],
+            vec![0.3, 0.4],
+            vec![0.5, 0.6],
+            vec![0.7, 0.8],
+        ];
+        let pooled = pool_probability_rows(&probs, 2, 2, 2).unwrap();
         let expected = [vec![0.2, 0.3], vec![0.6, 0.7]];
         for (row, expected_row) in pooled.iter().zip(expected.iter()) {
             for (value, expected_value) in row.iter().zip(expected_row.iter()) {
@@ -5873,8 +6031,39 @@ mod tests {
             }
         }
 
-        assert!(pool_upsampled_probabilities(&probs, 2, 2, 4).is_err());
-        assert!(pool_upsampled_probabilities(&probs, 3, 2, 2).is_err());
+        assert!(pool_probability_rows(&probs, 2, 2, 4).is_err());
+        assert!(pool_probability_rows(&probs, 3, 2, 2).is_err());
+    }
+
+    /// SRT-7: host pooling of the once-read probabilities is bit-identical
+    /// to the device `mean` it replaces (Nemotron-3's 8x upsampled rows).
+    #[test]
+    fn host_pooling_matches_candle_mean_bit_for_bit() {
+        let (encoded_len, factor, speakers) = (37, 8, 8);
+        let values = random_values(encoded_len * factor * speakers, 0xB17E, 0.5, 0.5);
+        let probs = Tensor::from_vec(
+            values.clone(),
+            (1, encoded_len * factor, speakers),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let expected = probs
+            .reshape((1, encoded_len, factor, speakers))
+            .unwrap()
+            .mean(2)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let rows = values
+            .chunks(speakers)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>();
+        let pooled = pool_probability_rows(&rows, encoded_len, factor, speakers).unwrap();
+        for (actual, expected) in pooled.iter().flatten().zip(expected.iter().flatten()) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
     }
 
     #[test]
@@ -5883,7 +6072,7 @@ mod tests {
         cfg.output_frames_per_encoded_frame = 8;
 
         let state = SortformerStreamingState::new(2);
-        let chunk_rows = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
+        let chunk_rows = emb_rows(&[vec![1.0, 1.0], vec![2.0, 2.0]]);
         let preds = vec![vec![0.9, 0.0, 0.0, 0.0], vec![0.8, 0.0, 0.0, 0.0]];
         let (_, _, output_range) =
             update_streaming_state(state, &chunk_rows, &preds, 0, 0, false, cfg).unwrap();
@@ -5892,7 +6081,7 @@ mod tests {
         // Left/right context frames are attended but not emitted: their
         // upsampled rows sit outside the output range.
         let state = SortformerStreamingState::new(2);
-        let chunk_rows = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        let chunk_rows = emb_rows(&[vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]]);
         let preds = vec![
             vec![0.9, 0.0, 0.0, 0.0],
             vec![0.8, 0.0, 0.0, 0.0],
@@ -6414,6 +6603,181 @@ mod tests {
         assert!(validate_conv_norm_type(Some(&cfg(Some("batch_norm")))).is_ok());
         for other in ["layer_norm", "group_norm", "fused_batch_norm"] {
             assert!(validate_conv_norm_type(Some(&cfg(Some(other)))).is_err());
+        }
+    }
+
+    /// A synthetic v2.1-shaped streaming model: the synthetic Conformer
+    /// encoder, a projection to 8, one 8-head transformer layer and the
+    /// 4-speaker head, streaming 6-frame chunks through an 8-row cache and
+    /// a 4-row FIFO so the cache compresses every few chunks. Every frame
+    /// counts as silent, so the running silence mean is exercised.
+    fn synthetic_streaming_model(layers: usize) -> SortformerInferenceModel {
+        let mut tensors = conformer_encoder_tensors(layers);
+        let (d, h, inner) = (SYNTHETIC_D_MODEL, 8, 16);
+        let mut seed = 0xFEED_0001_u64;
+        let mut insert = |name: &str, shape: &[usize], scale: f32, offset: f32| {
+            seed += 0x9E37_79B9;
+            tensors.insert(name.to_string(), random_tensor(shape, seed, scale, offset));
+        };
+        insert("sortformer_modules.encoder_proj.weight", &[h, d], 0.3, 0.0);
+        insert("sortformer_modules.encoder_proj.bias", &[h], 0.1, 0.0);
+        let l = "transformer_encoder.layers.0.";
+        for norm in ["layer_norm_1", "layer_norm_2"] {
+            insert(&format!("{l}{norm}.weight"), &[h], 0.1, 1.0);
+            insert(&format!("{l}{norm}.bias"), &[h], 0.1, 0.0);
+        }
+        for linear in ["query_net", "key_net", "value_net", "out_projection"] {
+            insert(
+                &format!("{l}first_sub_layer.{linear}.weight"),
+                &[h, h],
+                0.3,
+                0.0,
+            );
+            insert(&format!("{l}first_sub_layer.{linear}.bias"), &[h], 0.1, 0.0);
+        }
+        insert(
+            &format!("{l}second_sub_layer.dense_in.weight"),
+            &[inner, h],
+            0.3,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_in.bias"),
+            &[inner],
+            0.1,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_out.weight"),
+            &[h, inner],
+            0.3,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_out.bias"),
+            &[h],
+            0.1,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.first_hidden_to_hidden.weight",
+            &[h, h],
+            0.4,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.first_hidden_to_hidden.bias",
+            &[h],
+            0.1,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.single_hidden_to_spks.weight",
+            &[4, h],
+            1.5,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.single_hidden_to_spks.bias",
+            &[4],
+            0.5,
+            0.0,
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let preprocessor = SortformerPreprocessor::load(
+            &vb,
+            SortformerPreprocessorConfig {
+                sample_rate: Some(TARGET_SAMPLE_RATE),
+                window_size: Some(0.025),
+                window_stride: Some(0.01),
+                features: Some(SYNTHETIC_FEATURE_BINS),
+                n_fft: Some(512),
+                normalize: Some("NA".to_string()),
+            },
+        )
+        .unwrap();
+        let encoder = SortformerConformerEncoder::load(vb.pp("encoder"), true).unwrap();
+        let streaming = SortformerStreamingConfig {
+            fc_d_model: d,
+            spkcache_len: 8,
+            fifo_len: 4,
+            chunk_len: 6,
+            spkcache_update_period: 3,
+            chunk_left_context: 1,
+            chunk_right_context: 2,
+            spkcache_sil_frames_per_spk: 1,
+            sil_threshold: 10.0,
+            ..production_workspace_streaming_config()
+        }
+        .validate()
+        .unwrap();
+        SortformerInferenceModel {
+            device: Device::Cpu,
+            separate_device_memory: false,
+            preprocessor,
+            encoder: SortformerAcousticEncoder::Conformer(encoder),
+            encoder_proj: mlx::load_linear(d, h, vb.pp("sortformer_modules.encoder_proj")).unwrap(),
+            expander: SortformerFrameExpander::SortformerTransformer(
+                SortformerTransformerEncoder::load(vb.pp("transformer_encoder")).unwrap(),
+            ),
+            head: SortformerSpeakerHead::load(vb.pp("sortformer_modules"), 4).unwrap(),
+            num_speakers: 4,
+            streaming: Some(streaming),
+            streaming_profile: SortformerStreamingProfile::Model,
+            silence_embedding: None,
+            streaming_counters: SortformerStreamingCounters::default(),
+        }
+    }
+
+    /// SRT-7: the streaming loop keeps its state on the model device. Per
+    /// chunk it reads the probabilities once (plus the silent FIFO rows for
+    /// the running silence mean), reuses the relative-position table of a
+    /// repeated composite length, and commits the physical invocation state
+    /// once at the end instead of after every chunk. The physical and plain
+    /// paths give bit-identical probabilities.
+    #[test]
+    fn streaming_state_stays_on_device_with_bounded_host_reads() {
+        let model = synthetic_streaming_model(2);
+        let cfg = model.streaming.unwrap();
+        let samples = random_values(16_000 * 6, 0xA0D10, 0.3, 0.0);
+        let feature_frames = model.preprocessor.feature_frame_count(samples.len());
+        let planned = plan_streaming_feature_chunks(feature_frames, cfg).len() as u64;
+        assert!(planned >= 8, "{planned} chunks");
+
+        let plain = model
+            .infer_speaker_probabilities_streaming(&samples, feature_frames, cfg, None)
+            .unwrap();
+        let path = model.streaming_path_diagnostics();
+        let chunks = path["chunks"].as_u64().unwrap();
+        let host_reads = path["host_reads"].as_u64().unwrap();
+        assert_eq!(chunks, planned);
+        assert!(
+            host_reads > chunks && host_reads <= 2 * chunks,
+            "{host_reads} host reads over {chunks} chunks"
+        );
+        assert_eq!(path["physical_state_commits"], serde_json::json!(0));
+        let SortformerAcousticEncoder::Conformer(encoder) = &model.encoder else {
+            unreachable!("synthetic model is a Conformer");
+        };
+        let tables = encoder.counters.rel_pos_tables_built();
+        assert!(
+            tables >= 1 && tables < chunks / 2,
+            "{tables} tables, {chunks} chunks"
+        );
+        assert_eq!(encoder.counters.conformer_depthwise_conv1d(), 2 * chunks);
+
+        let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+        let physical = model
+            .infer_speaker_probabilities_streaming(&samples, feature_frames, cfg, Some(&mut lease))
+            .unwrap();
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 1);
+        assert_eq!(
+            model.streaming_path_diagnostics()["physical_state_commits"],
+            serde_json::json!(1)
+        );
+        assert_eq!(physical.len(), plain.len());
+        for (a, b) in physical.iter().flatten().zip(plain.iter().flatten()) {
+            assert_eq!(a.to_bits(), b.to_bits());
         }
     }
 }

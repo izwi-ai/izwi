@@ -761,6 +761,13 @@ fn sortformer_streaming_timings_on_diarization_2() {
             let expected = 2 * chunks * 2;
             assert_eq!(calls.as_u64(), Some(expected as u64), "{run} conv2d calls");
         }
+        // SRT-7: at most two host reads per chunk (the probabilities, and the
+        // silent rows for v2.1's running silence mean).
+        let path = model.family_diagnostics()["streaming_path"].clone();
+        println!("bench {run} streaming path: {path}");
+        if let Some(reads) = path.get("host_reads").and_then(serde_json::Value::as_u64) {
+            assert!(reads <= 2 * 2 * chunks as u64, "{run}: {reads} host reads");
+        }
         let flat = probs.iter().flatten().copied().collect::<Vec<f32>>();
         if let Some(tag) = &dump_tag {
             std::fs::create_dir_all(&dump_dir).expect("create bench dump dir");
