@@ -284,10 +284,7 @@ impl LocalRequestGuard {
         }
         if self.any_origin
             || DESKTOP_CORS_ORIGINS.contains(&origin.as_str())
-            || self
-                .allowed_origins
-                .iter()
-                .any(|allowed| *allowed == origin)
+            || self.allowed_origins.contains(&origin)
         {
             return true;
         }
@@ -555,7 +552,10 @@ mod tests {
                 "{origin}"
             );
         }
-        assert_eq!(check(&guard, Method::POST, &[host.clone()]), None);
+        assert_eq!(
+            check(&guard, Method::POST, std::slice::from_ref(&host)),
+            None
+        );
         for origin in [
             "https://attacker.example",
             "null",
@@ -595,7 +595,7 @@ mod tests {
             None
         );
         assert_eq!(
-            check(&configured, Method::POST, &[evil.clone()]),
+            check(&configured, Method::POST, std::slice::from_ref(&evil)),
             Some(StatusCode::FORBIDDEN)
         );
         let wildcard = guard_for("0.0.0.0", true, &["*"]);
