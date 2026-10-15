@@ -3010,8 +3010,10 @@ fn causal_sdpa_by_query_blocks(
     let sequence = query.dim(2)?;
     let block = block.max(1);
     let mut outputs = Vec::with_capacity(sequence.div_ceil(block));
-    let mut start = 0;
-    while start < sequence {
+    // The last block attends the most keys. Running it first lets the host
+    // allocator reuse its freed buffers for every later, smaller block;
+    // ascending order grows each allocation and strands the freed ones.
+    for start in (0..sequence).step_by(block).rev() {
         let end = (start + block).min(sequence);
         let rows = end - start;
         #[cfg(test)]
@@ -3035,11 +3037,11 @@ fn causal_sdpa_by_query_blocks(
             mask.as_ref().map(CompactGqaMask::Additive),
             scale,
         )?);
-        start = end;
     }
     if outputs.len() == 1 {
         return Ok(outputs.remove(0));
     }
+    outputs.reverse();
     Tensor::cat(&outputs, 2).map_err(Error::from)
 }
 
