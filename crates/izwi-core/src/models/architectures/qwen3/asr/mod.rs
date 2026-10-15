@@ -3859,6 +3859,18 @@ fn qwen3_asr_weight_precisions(
             requested, selected.dtype, device.kind
         );
         selected
+    } else if device.kind.is_metal()
+        && model_family == ModelFamily::Qwen3ForcedAligner
+        && MetalDTypeOverride::from_env() != MetalDTypeOverride::F32
+    {
+        // D8: the aligner reads one 80 ms timestamp class per boundary and
+        // never decodes, so F16 text moved no boundary on test.wav or a 175 s
+        // cut against F32 (Metal, 2026-10-15) and halves its residency. The
+        // load-time probe reloads the text at F32 if F16 fails.
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "Metal runs dense aligner text at F16 behind the load-time probe".into(),
+        }
     } else if device.kind.is_metal() {
         // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
         // utterances. Prefer f32 unless the user explicitly overrides it.
@@ -6871,13 +6883,70 @@ mod tests {
     }
 }
 
+#[cfg(all(test, feature = "metal"))]
+mod metal_f16_text_tests {
+    use super::tests::local_models_root;
+    use super::*;
+    use crate::backends::DeviceSelector;
+
+    /// D8 gate: the dense aligner's F16 Metal text moves at most 2 of
+    /// test.wav's word boundaries by more than 80 ms against F32 text
+    /// (measured 2026-10-15: none moved, here and on a 175 s cut).
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and a Metal device"]
+    fn dense_aligner_f16_text_keeps_test_wav_boundaries() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let bytes = std::fs::read(data.join("test.wav")).expect("test.wav");
+        let (audio, rate) =
+            crate::audio::decode_audio_bytes_to_mono(&bytes).expect("decode test.wav");
+        let text = std::fs::read_to_string(data.join("test.md")).expect("test.md");
+        let align = |pin_f32: bool| {
+            if pin_f32 {
+                std::env::set_var("IZWI_METAL_DTYPE", "f32");
+            }
+            let device = DeviceSelector::detect_with_preference(Some("metal")).expect("metal");
+            let model = Qwen3AsrModel::load(
+                &local_models_root().join("Qwen3-ForcedAligner-0.6B"),
+                ModelVariant::Qwen3ForcedAligner06B,
+                device,
+            );
+            std::env::remove_var("IZWI_METAL_DTYPE");
+            let model = model.expect("load");
+            let dtype = model.text_dtype;
+            let words = model
+                .force_align(&audio, rate, text.trim(), None)
+                .expect("align");
+            (dtype, words)
+        };
+        let (f16_dtype, f16) = align(false);
+        let (f32_dtype, f32) = align(true);
+        assert_eq!((f16_dtype, f32_dtype), (DType::F16, DType::F32));
+        assert_eq!(f16.len(), f32.len());
+        let boundaries = f16
+            .iter()
+            .zip(&f32)
+            .flat_map(|(a, b)| [a.1.abs_diff(b.1), a.2.abs_diff(b.2)])
+            .collect::<Vec<_>>();
+        let moved = boundaries.iter().filter(|delta| **delta > 80).count();
+        eprintln!(
+            "F16 vs F32 text: {moved}/{} boundaries moved > 80 ms, max {} ms",
+            boundaries.len(),
+            boundaries.iter().max().copied().unwrap_or(0)
+        );
+        assert!(moved <= 2, "{moved} boundaries moved > 80 ms");
+    }
+}
+
 #[cfg(test)]
 mod precision_tests {
     use candle_core::{DType, Device};
 
     use super::{
         load_qwen3_asr_components, qwen3_asr_audio_self_check, qwen3_asr_text_self_check,
-        select_quantized_text_dtype, Qwen3AsrModel,
+        qwen3_asr_weight_precisions, select_quantized_text_dtype, Qwen3AsrModel,
     };
     use crate::backends::{DTypeSelection, DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::catalog::ModelFamily;
@@ -7050,6 +7119,51 @@ mod precision_tests {
         assert_eq!(
             select_quantized_text_dtype(&DeviceProfile::cpu(), ModelFamily::Qwen3Asr, DType::BF16)
                 .dtype,
+            DType::F32
+        );
+    }
+
+    /// D8: dense aligner text takes the F16 tier on Metal (probed at load)
+    /// unless `IZWI_METAL_DTYPE=f32`; dense Qwen3-ASR text stays F32.
+    #[test]
+    fn dense_aligner_text_takes_f16_on_metal_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metal = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let text = |family| {
+            qwen3_asr_weight_precisions(&metal, family, false, false, Some("bfloat16"))
+                .unwrap()
+                .0
+        };
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let aligner = text(ModelFamily::Qwen3ForcedAligner);
+        assert_eq!(aligner.dtype, DType::F16);
+        assert!(aligner.reason.contains("probe"), "{}", aligner.reason);
+        assert_eq!(text(ModelFamily::Qwen3Asr).dtype, DType::F32);
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        let pinned = text(ModelFamily::Qwen3ForcedAligner);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(
+            qwen3_asr_weight_precisions(
+                &DeviceProfile::cpu(),
+                ModelFamily::Qwen3ForcedAligner,
+                false,
+                false,
+                Some("bfloat16")
+            )
+            .unwrap()
+            .0
+            .dtype,
             DType::F32
         );
     }
