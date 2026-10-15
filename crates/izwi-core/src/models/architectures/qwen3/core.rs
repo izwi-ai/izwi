@@ -407,6 +407,8 @@ thread_local! {
     static QWEN3_ROPE_TABLE_BUILDS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
     static QWEN3_HEAD_ROWS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static QWEN3_SDPA_QUERY_BLOCKS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn record_mrope_position_readback() {
@@ -438,6 +440,11 @@ fn thread_rope_table_builds() -> u64 {
 #[cfg(test)]
 fn thread_head_rows() -> u64 {
     QWEN3_HEAD_ROWS_THREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn thread_sdpa_query_blocks() -> u64 {
+    QWEN3_SDPA_QUERY_BLOCKS_THREAD.with(std::cell::Cell::get)
 }
 
 pub fn qwen3_runtime_profiling_enabled() -> bool {
@@ -1524,16 +1531,27 @@ impl Qwen3Attention {
             }
         }
 
-        let mask = (sequence > 1)
-            .then(|| causal_mask(sequence, sequence, start_pos, query.device(), query.dtype()))
-            .transpose()?;
-        let output = compact_gqa_sdpa_bhsd(
-            &query,
-            &key_heads,
-            &value_heads,
-            mask.as_ref().map(CompactGqaMask::Additive),
-            1.0 / (self.head_dim as f64).sqrt(),
-        )?
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let output = if start_pos == 0 {
+            causal_sdpa_by_query_blocks(
+                &query,
+                &key_heads,
+                &value_heads,
+                scale,
+                QWEN3_STATELESS_QUERY_BLOCK,
+            )?
+        } else {
+            let mask = (sequence > 1)
+                .then(|| causal_mask(sequence, sequence, start_pos, query.device(), query.dtype()))
+                .transpose()?;
+            compact_gqa_sdpa_bhsd(
+                &query,
+                &key_heads,
+                &value_heads,
+                mask.as_ref().map(CompactGqaMask::Additive),
+                scale,
+            )?
+        }
         .transpose(1, 2)?
         .reshape((batch, sequence, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&output).map_err(Error::from)
@@ -2971,6 +2989,60 @@ pub fn build_mrope_cache(
     )
 }
 
+/// Query rows per block of the portable causal prefill (CPU, and CUDA
+/// without FlashAttention; Metal runs fused SDPA). The portable SDPA keeps
+/// the scaled, masked and softmaxed `[heads, rows, keys]` scores alive at
+/// once: about 3 GB per layer for a 4,000-token prompt (a 180 s aligner
+/// window of ordinary speech). A block bounds that at `block / prompt` of it.
+pub(crate) const QWEN3_STATELESS_QUERY_BLOCK: usize = 256;
+
+/// Causal attention over a whole prompt from position 0, `block` query rows
+/// at a time. Row `i` attends keys `0..=i`, so a block reads only the keys up
+/// to its last row; the rows past it are masked in an unblocked pass anyway.
+/// One block is exactly the unblocked computation.
+fn causal_sdpa_by_query_blocks(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    scale: f64,
+    block: usize,
+) -> Result<Tensor> {
+    let sequence = query.dim(2)?;
+    let block = block.max(1);
+    let mut outputs = Vec::with_capacity(sequence.div_ceil(block));
+    let mut start = 0;
+    while start < sequence {
+        let end = (start + block).min(sequence);
+        let rows = end - start;
+        #[cfg(test)]
+        QWEN3_SDPA_QUERY_BLOCKS_THREAD.with(|count| count.set(count.get() + 1));
+        let mask = (end > 1)
+            .then(|| causal_mask(rows, end, start, query.device(), query.dtype()))
+            .transpose()?;
+        let (query, key, value) = if rows == sequence {
+            (query.clone(), key.clone(), value.clone())
+        } else {
+            (
+                query.narrow(2, start, rows)?,
+                key.narrow(2, 0, end)?,
+                value.narrow(2, 0, end)?,
+            )
+        };
+        outputs.push(compact_gqa_sdpa_bhsd(
+            &query,
+            &key,
+            &value,
+            mask.as_ref().map(CompactGqaMask::Additive),
+            scale,
+        )?);
+        start = end;
+    }
+    if outputs.len() == 1 {
+        return Ok(outputs.remove(0));
+    }
+    Tensor::cat(&outputs, 2).map_err(Error::from)
+}
+
 pub fn causal_mask(
     seq_len: usize,
     total_len: usize,
@@ -3485,6 +3557,67 @@ mod tests {
             assert_eq!(thread_rope_table_builds() - before, 1);
             assert_eq!(bitwise(&expected), bitwise(&actual));
         }
+    }
+
+    /// QFA-9: the portable causal prefill attends by blocks of query rows
+    /// and matches one unblocked pass; a prompt longer than a block runs
+    /// one block per 256 rows.
+    #[test]
+    fn query_blocked_causal_attention_matches_one_pass() {
+        let device = Device::Cpu;
+        let random = |heads: usize, seed: u64| {
+            Tensor::from_vec(
+                crate::kernels::numeric_check::xorshift_values(heads * 300 * 8, seed, 1.0),
+                (1, heads, 300, 8),
+                &device,
+            )
+            .unwrap()
+        };
+        let (query, key, value) = (random(4, 1), random(2, 2), random(2, 3));
+        let scale = 1.0 / 8f64.sqrt();
+        let whole = causal_sdpa_by_query_blocks(&query, &key, &value, scale, 300).unwrap();
+        let mask = causal_mask(300, 300, 0, &device, DType::F32).unwrap();
+        let reference = compact_gqa_sdpa_bhsd(
+            &query,
+            &key,
+            &value,
+            Some(CompactGqaMask::Additive(&mask)),
+            scale,
+        )
+        .unwrap();
+        assert_eq!(bitwise(&whole), bitwise(&reference));
+        for block in [1usize, 7, 64, 299] {
+            let before = thread_sdpa_query_blocks();
+            let blocked = causal_sdpa_by_query_blocks(&query, &key, &value, scale, block).unwrap();
+            assert_eq!(
+                thread_sdpa_query_blocks() - before,
+                300usize.div_ceil(block) as u64
+            );
+            let delta = (&blocked - &reference)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(delta <= 1e-6, "block {block} moved attention by {delta}");
+        }
+
+        let model = tiny_qwen3_model(&device);
+        let embeds = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(300 * 4, 5, 1.0),
+            (1, 300, 4),
+            &device,
+        )
+        .unwrap();
+        let before = thread_sdpa_query_blocks();
+        model
+            .forward_stateless_with_embeds(&embeds, 0, None)
+            .unwrap();
+        assert_eq!(thread_sdpa_query_blocks() - before, 2);
     }
 
     /// QFA-9: scoring only the requested rows runs the head over those rows
