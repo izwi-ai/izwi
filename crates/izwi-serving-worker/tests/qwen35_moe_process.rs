@@ -241,10 +241,9 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
     );
     assert!(body.contains("[DONE]"), "terminal stream marker expected");
 
-    // The json_object allowlist admits the family end to end: this request
-    // must reach the worker instead of failing with the grammar-aware-sampler
-    // 400. (The fixture tokenizer has no JSON characters, so the constrained
-    // decode legitimately finishes immediately on a stop token.)
+    // The family allows json_object locally, but the worker protocol cannot
+    // carry the constraint yet, so the gateway refuses it with an
+    // OpenAI-shaped 400 instead of returning unconstrained text.
     let constrained = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -262,10 +261,13 @@ async fn separate_cpu_worker_executes_tiny_qwen35_moe_over_real_http() {
         ))
         .unwrap();
     let response = app.oneshot(constrained).await.unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("response_format")));
 }
