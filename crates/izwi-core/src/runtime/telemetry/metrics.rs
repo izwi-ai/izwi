@@ -1967,9 +1967,9 @@ mod tests {
             5
         );
         // Admission (20 ms) precedes the runtime timings: 25 ms <= 50 ms bucket.
-        assert!(payload.contains(&format!(
-            "izwi_request_duration_seconds_bucket{{model=\"Qwen3-0.6B\",backend=\"cpu\",task=\"chat\",outcome=\"completed\",le=\"0.05\"}} 1"
-        )));
+        assert!(payload.contains(
+            "izwi_request_duration_seconds_bucket{model=\"Qwen3-0.6B\",backend=\"cpu\",task=\"chat\",outcome=\"completed\",le=\"0.05\"} 1"
+        ));
         // Failed requests count toward duration but not toward token totals.
         assert!(payload
             .contains("izwi_request_prompt_tokens_total{model=\"Qwen3-0.6B\",task=\"chat\"} 50"));
