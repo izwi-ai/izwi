@@ -63,6 +63,53 @@ This is an evidence statement, not a performance certificate: reuse on the
 fixture lanes is counter-proven (counters + output equivalence), not
 wall-clock-proven.
 
+## Certified decode batch widths by family and backend (EXE-F7)
+
+A chat family's continuous decode runs every row through one forward. The
+widest batch it may run at on each backend is recorded in one table in code,
+`crates/izwi-core/src/catalog/batch_width.rs`. Each loaded model clamps the
+engine width (automatic, or `IZWI_MAX_BATCH_SIZE`) to its family's width.
+Every other capability (TTS, ASR, realtime) stays at two on CPU and Metal.
+The automatic engine width on CPU and Metal is the widest certified family
+(eight). Staged transaction rows for TTS and ASR stay at two, and a chat
+model stages one step at its own width.
+
+A width is certified on CPU or Metal when both of these hold:
+
+- Parity: greedy decode at that width picks the width-1 tokens, teacher-forced
+  over 8 prompts. The width-1 top logits move by at most the tolerance.
+- Throughput: aggregate tokens/s rise with the width in an interleaved
+  in-process A/B. Each step of every width runs in turn, so machine load hits
+  all widths alike.
+
+The tests below are ignored and need the checkpoint.
+
+| Family | CPU | Metal | CUDA | Evidence (M1 Pro, 2026-10-16) |
+|---|---|---|---|---|
+| LFM2 / LFM2.5 | 8 | 8 | 32 (unmeasured) | Parity `lfm25_decode_matches_across_batch_widths_on_{cpu,metal}`: widths 2, 4 and 8 match width 1 on every decisive step (339–340). Worst top-8 logit delta is 0 on the CPU and 0.0096 on Metal. Throughput `lfm25_batch_width_scaling_{cpu,metal}` at widths 1/2/4/8: Metal 133/153/226/258 and 91/136/210/258 tok/s; CPU 89/113/134/155 and 90/107/136/165 tok/s. Metal's small-batch mat-vec serves 2..=8 rows, which bounds the family at 8 |
+| Qwen3.5 | 2 | 8 | 32 (unmeasured) | `qwen35_decode_width_parity_and_throughput_{cpu,metal}` (0.8B; 2B on Metal): every width is bit-identical to width 1. Metal 0.8B gives 109/125/136/144 and 112/130/141/148 tok/s; 2B gives 40/57/72/77. On the CPU, 0.8B gives 21/22/25/26, then 11/16/15/15 on a repeat under load. That is no repeatable gain past two, so the CPU stays at 2 |
+| Qwen3, Qwen3-MoE, Gemma3, Qwen3.6, Qwen3.8 | 2 | 2 | 32 (unmeasured) | No checkpoint on the measuring machine; the historical portable width |
+
+CUDA keeps its automatic width of eight (VRAM-tiered admission) and the
+kernel/metadata ceiling of 32. No CUDA width has been measured.
+
+Live check (Metal, LFM2.5-1.2B, release build). The sweep used 32 prompts of
+256 words and 128 output tokens at rates 1, 2, 4 and inf, alternating runs on
+one binary:
+
+| Config | Output tok/s at rates 1/2/4/inf | TPOT p50 at rate inf |
+|---|---|---|
+| `IZWI_MAX_BATCH_SIZE=2` (before) | 82–107 | 74–80 ms |
+| Automatic (8) | 118–157 at rates 2, 4 and inf | 46–51 ms |
+
+These are three rounds. At rate 1 both configs run about 96–100 tok/s,
+because the load is below what width two serves. Mean batch rows went from
+2.0 to about 6.5, and TTFT p95 at rate inf went from 31–34 s to 22–24 s.
+In one automatic round, live-memory admission refused 11 of 32 requests at
+rate 4 with 503, because the shared machine was low on free memory. That
+admission reserves a fixed amount per request and does not depend on width.
+The other rounds had no failures.
+
 ## Scheduler step sizes by backend (SCH-F3)
 
 | Backend | Token budget per step | Prefill chunk | Chunked prefill |
@@ -80,7 +127,8 @@ step. Enabling chunked prefill (`IZWI_ENABLE_CHUNKED_PREFILL=1`) also fails
 requests under concurrent long prompts on CPU and Metal. The managed KV
 coordinator rejects decode rows with "transaction N is active or has already
 reached a terminal state" after a prefill row is withheld for tensor-state
-capacity. This happens with the old sizes too: it is a known open defect.
+capacity. This happens with the old sizes and width too: it is a known open
+defect.
 
 ## Hierarchical KV offload by lane (DS4)
 

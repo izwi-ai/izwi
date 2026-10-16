@@ -156,10 +156,11 @@ impl BatchSizePreference {
         match self {
             Self::Fixed(rows) => rows.get(),
             Self::Auto => match backend {
-                // Both portable backends have complete width-two chat kernels;
-                // keep the conservative hard cap while enabling useful
-                // continuous tensor batching by default.
-                BackendKind::Cpu | BackendKind::Metal => 2,
+                // The widest certified family width; each loaded model then
+                // clamps to its own family's (`catalog::batch_width`).
+                BackendKind::Cpu | BackendKind::Metal => {
+                    crate::catalog::max_certified_decode_width(backend)
+                }
                 BackendKind::Cuda => 8,
             },
         }
@@ -1130,8 +1131,9 @@ mod managed_kv_default_tests {
     fn physical_batch_defaults_are_backend_aware() {
         let preference = EngineConfig::default().max_batch_size;
         assert_eq!(preference, BatchSizePreference::Auto);
-        assert_eq!(preference.resolve(BackendKind::Cpu), 2);
-        assert_eq!(preference.resolve(BackendKind::Metal), 2);
+        // The widest certified family; each model clamps to its own.
+        assert_eq!(preference.resolve(BackendKind::Cpu), 8);
+        assert_eq!(preference.resolve(BackendKind::Metal), 8);
         assert_eq!(preference.resolve(BackendKind::Cuda), 8);
     }
 
@@ -1157,7 +1159,7 @@ mod managed_kv_default_tests {
         assert_eq!(config.max_retained_sequences, 0);
         assert_eq!(config.max_staged_transactions, 0);
         assert_eq!(config.max_queued_requests, 128);
-        assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 2);
+        assert_eq!(config.max_batch_size.resolve(BackendKind::Cpu), 8);
         assert_eq!(
             config.physical_execution_mode,
             PhysicalExecutionMode::Serial

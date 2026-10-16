@@ -5,11 +5,15 @@
 //! under `crate::artifacts`, while legacy `crate::model` paths remain
 //! available for backward compatibility.
 
+mod batch_width;
 mod cuda_support;
 mod metadata;
 mod prefix_reuse;
 mod variant;
 
+pub(crate) use batch_width::{
+    certified_decode_width, engine_row_width, max_certified_decode_width,
+};
 pub use cuda_support::{
     CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind,
     CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo,

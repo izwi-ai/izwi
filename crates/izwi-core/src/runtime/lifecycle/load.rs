@@ -1996,6 +1996,39 @@ impl ModelLifecycleController {
         })
     }
 
+    /// Staged rows for a chat model on CPU or Metal when the engine's are
+    /// automatic: one step's launch at the model's own decode width, which
+    /// may exceed the engine rows' portable width (`catalog::batch_width`).
+    /// `None` keeps the engine rows (CUDA, or an operator's explicit limit).
+    fn portable_chat_staged_rows(
+        &self,
+        bundle_draft: &LoadedModelBundleDraft,
+        backend: BackendKind,
+    ) -> Result<Option<u32>> {
+        let engine = self.core_engine.config();
+        if backend == BackendKind::Cuda || !engine.automatic_row_limits.staged_transactions {
+            return Ok(None);
+        }
+        let width = bundle_draft
+            .execution_contracts(CapabilityKind::Chat)?
+            .iter()
+            .flat_map(|contract| contract.stages.iter())
+            .map(|stage| stage.max_batch_size)
+            .max()
+            .unwrap_or(1);
+        let rows = crate::runtime::service::automatic_staged_transaction_rows(
+            width,
+            engine
+                .resolved_physical_execution_capacity()
+                .candidate_dispatch_limit
+                .get(),
+            engine.max_retained_sequences,
+        );
+        u32::try_from(rows)
+            .map(Some)
+            .map_err(|_| Error::InvalidInput("managed state transaction limit exceeds u32".into()))
+    }
+
     fn asr_state_rows(&self) -> (usize, usize) {
         let engine = self.core_engine.config();
         asr_state_rows(
@@ -2559,7 +2592,11 @@ impl ModelLifecycleController {
                                 "loaded model {variant} publishes managed KV, but the {backend:?} build has no direct paged-attention runtime"
                             )));
                         }
-                        let capacity_policy = managed_chat_capacity_policy(variant, backend);
+                        let mut capacity_policy = managed_chat_capacity_policy(variant, backend);
+                        if capacity_policy.staged_transaction_rows.is_none() {
+                            capacity_policy.staged_transaction_rows =
+                                self.portable_chat_staged_rows(&bundle_draft, backend)?;
+                        }
                         let physical = self
                             .core_engine
                             .load_managed_model_cache_with_capacity_policy(
@@ -5498,6 +5535,49 @@ mod tests {
 
     /// ASR rows: chat's automatic rows (320 on an H100) collapse to 8, never
     /// below one decode batch; operator rows stay as configured.
+    /// On CPU and Metal the engine rows stay at the portable width (TTS and
+    /// ASR fit their state on them), and a chat model stages one step's
+    /// launch at its own certified decode width (EXE-F7).
+    #[test]
+    fn portable_chat_models_stage_rows_at_their_decode_width() {
+        use crate::runtime::adapters::LoadedModelBundleDraft;
+        let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(8, 1).unwrap();
+        let staged = |runtime: &RuntimeService, variant: ModelVariant| {
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(992),
+                ModelInstanceId::new(1),
+                variant,
+                BackendKind::Cpu,
+            )
+            .unwrap();
+            draft.seal_chat_workspace(8_192).unwrap();
+            runtime
+                .model_lifecycle
+                .portable_chat_staged_rows(&draft, BackendKind::Cpu)
+                .unwrap()
+        };
+        let automatic = RuntimeService::new(EngineConfig {
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(automatic.core_engine.config().max_staged_transactions, 2);
+        assert_eq!(
+            staged(&automatic, ModelVariant::Lfm2512BInstructGguf),
+            Some(8)
+        );
+        assert_eq!(staged(&automatic, ModelVariant::Qwen306B), Some(2));
+
+        let explicit = RuntimeService::new(EngineConfig {
+            backend: BackendPreference::Cpu,
+            max_staged_transactions: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(staged(&explicit, ModelVariant::Lfm2512BInstructGguf), None);
+    }
+
     #[test]
     fn asr_state_rows_come_from_the_asr_policy_not_chat_rows() {
         assert_eq!(asr_state_rows(true, 320, 4), (8, 4));

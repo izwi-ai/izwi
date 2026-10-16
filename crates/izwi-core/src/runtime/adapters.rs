@@ -235,6 +235,10 @@ pub(crate) trait ModelCapabilityAdapter {
 pub(crate) struct RuntimeAdapterRegistry {
     adapters: HashMap<(CapabilityKind, ModelVariant), AdapterMetadata>,
     max_tensor_batch_size: usize,
+    /// Chat's engine width, which each chat model clamps to its family's
+    /// certified width (`catalog::batch_width`); other capabilities run at
+    /// `max_tensor_batch_size`.
+    max_chat_tensor_batch_size: usize,
     request_parallelism: usize,
     loaded_adapter_factories: Vec<Arc<dyn loaded::LoadedExecutionAdapterFactory>>,
 }
@@ -252,6 +256,7 @@ impl RuntimeAdapterRegistry {
         let mut registry = Self {
             adapters: HashMap::new(),
             max_tensor_batch_size: max_tensor_batch_size.max(1),
+            max_chat_tensor_batch_size: max_tensor_batch_size.max(1),
             request_parallelism: request_parallelism.max(1),
             loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
         };
@@ -294,8 +299,18 @@ impl RuntimeAdapterRegistry {
             })
     }
 
+    /// Set chat's engine width apart from the other capabilities' width.
+    pub(crate) fn with_chat_tensor_batch_size(mut self, rows: usize) -> Self {
+        self.max_chat_tensor_batch_size = rows.max(1);
+        self
+    }
+
     pub(crate) fn max_tensor_batch_size(&self) -> usize {
         self.max_tensor_batch_size
+    }
+
+    pub(crate) fn max_chat_tensor_batch_size(&self) -> usize {
+        self.max_chat_tensor_batch_size
     }
 
     pub(crate) fn request_parallelism(&self) -> usize {

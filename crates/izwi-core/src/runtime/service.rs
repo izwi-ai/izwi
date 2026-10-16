@@ -137,7 +137,7 @@ fn effective_physical_execution_parallelism(
 /// most `tensor_width` rows (formation defers rows it cannot launch before
 /// staging them). The memory-derived row ceiling bounds retained sessions
 /// only; staged rows past the launch width are reserved state never used.
-fn automatic_staged_transaction_rows(
+pub(crate) fn automatic_staged_transaction_rows(
     tensor_width: usize,
     candidate_dispatch_limit: usize,
     retained_rows: usize,
@@ -3524,8 +3524,13 @@ impl RuntimeService {
 
         let mut worker_config = WorkerConfig::from(&core_config);
         if automatic_staged_transactions {
+            // Engine rows back every model without its own row fit; a chat
+            // model sizes its staged rows from its decode width at load.
             let staged = automatic_staged_transaction_rows(
-                worker_config.max_tensor_batch_size,
+                crate::catalog::engine_row_width(
+                    selected_backend_kind,
+                    worker_config.max_tensor_batch_size,
+                ),
                 core_config
                     .resolved_physical_execution_capacity()
                     .candidate_dispatch_limit
@@ -3542,10 +3547,18 @@ impl RuntimeService {
         worker_config.model_registry = Some(model_registry.clone());
         worker_config.backend = selected_backend_kind;
         worker_config.backend_context = backend_context.clone();
-        let adapter_registry = Arc::new(RuntimeAdapterRegistry::built_in_with_execution_limits(
-            worker_config.max_tensor_batch_size,
-            worker_config.request_parallelism,
-        )?);
+        // Chat models clamp the engine width to their family's certified
+        // width; every other capability runs at the engine rows' width.
+        let adapter_registry = Arc::new(
+            RuntimeAdapterRegistry::built_in_with_execution_limits(
+                crate::catalog::engine_row_width(
+                    selected_backend_kind,
+                    worker_config.max_tensor_batch_size,
+                ),
+                worker_config.request_parallelism,
+            )?
+            .with_chat_tensor_batch_size(worker_config.max_tensor_batch_size),
+        );
         worker_config.static_tensor_batch_variants =
             Arc::new(adapter_registry.static_tensor_batch_variants(selected_backend_kind));
         let execution_parallelism = effective_physical_execution_parallelism(
@@ -11301,6 +11314,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(automatic.config().max_retained_sequences, 8);
+        // Engine rows and non-chat adapters stay at the portable width; chat
+        // runs at the engine width, clamped per family, and sizes its own
+        // staged rows.
+        assert_eq!(automatic.adapter_registry.max_tensor_batch_size(), 2);
+        assert_eq!(automatic.adapter_registry.max_chat_tensor_batch_size(), 8);
         assert_eq!(automatic.config().max_staged_transactions, 2);
         let core = automatic.core_engine.config();
         assert_eq!(core.max_staged_transactions, 2);

@@ -689,14 +689,14 @@ fn lfm25_kquant_mat_vec_matches_candle_on_real_weights() {
 }
 
 /// Aggregate decode throughput by batch width: B rows decode together in one
-/// batched step, for B = 1, 2 and 4, interleaved step by step.
+/// batched step, for B = 1, 2, 4 and 8, interleaved step by step.
 fn batch_width_scaling(profile: DeviceProfile) {
     let dir = models_dir_for_bench().join("LFM2.5-1.2B-Instruct-GGUF");
     if !dir.exists() {
         return;
     }
     let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
-    let widths = [1usize, 2, 4];
+    let widths = [1usize, 2, 4, 8];
     let sessions: Vec<Sessions> = widths.iter().map(|_| Sessions::new(&model)).collect();
     let config = ChatGenerationConfig::default();
     let mut groups: Vec<Vec<ChatDecodeState>> = widths
@@ -705,7 +705,17 @@ fn batch_width_scaling(profile: DeviceProfile) {
         .map(|(&width, sessions)| {
             (0..width)
                 .map(|row| {
-                    let prompt: Vec<u32> = (0..32).map(|i| 1000 + i + row as u32 * 50).collect();
+                    // A real request per row, long enough that no row ends
+                    // inside the timed steps.
+                    let prompt = model
+                        .prompt_token_ids(&[ChatMessage {
+                            role: ChatRole::User,
+                            content: format!(
+                                "Write a detailed 500-word essay on topic number {row}: \
+                                 the history of bridges."
+                            ),
+                        }])
+                        .unwrap();
                     let mut state = model
                         .begin_resumable_prefill_state_managed(
                             &prompt,

@@ -4774,7 +4774,16 @@ impl RuntimeAdapterRegistry {
             execution_group_id,
             model_instance_id,
             backend_kind,
-            max_tensor_batch_size: self.max_tensor_batch_size(),
+            // A chat model runs at most its family's certified width.
+            max_tensor_batch_size: if metadata.capability == CapabilityKind::Chat {
+                self.max_chat_tensor_batch_size()
+                    .min(crate::catalog::certified_decode_width(
+                        metadata.model_variant.family(),
+                        backend_kind,
+                    ))
+            } else {
+                self.max_tensor_batch_size()
+            },
             request_parallelism: self.request_parallelism(),
         };
         let adapter = self
@@ -5992,6 +6001,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Built as the runtime builds it on each backend, a chat model's
+    /// stages run at most its family's certified width and every other
+    /// capability at the engine rows' width (EXE-F7).
+    #[test]
+    fn loaded_models_clamp_to_their_family_certified_width() {
+        let widest = |variant: ModelVariant, backend: BackendKind| {
+            let registry = RuntimeAdapterRegistry::built_in_with_execution_limits(
+                crate::catalog::engine_row_width(backend, 8),
+                1,
+            )
+            .unwrap()
+            .with_chat_tensor_batch_size(8);
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(45),
+                ModelInstanceId::new(1),
+                variant,
+                backend,
+            )
+            .unwrap();
+            // Audio preparation seals carry the engine rows' width; the chat
+            // workspace seal has none.
+            install_test_preparation_seals(
+                &draft,
+                backend,
+                crate::catalog::engine_row_width(backend, 8),
+            );
+            draft
+                .capabilities
+                .keys()
+                .flat_map(|capability| draft.execution_contracts(*capability).unwrap())
+                .flat_map(|contract| contract.stages.to_vec())
+                .map(|stage| stage.max_batch_size)
+                .max()
+                .unwrap()
+        };
+        for backend in [BackendKind::Cpu, BackendKind::Metal] {
+            assert_eq!(widest(ModelVariant::Lfm2512BInstructGguf, backend), 8);
+            assert_eq!(widest(ModelVariant::Qwen306B, backend), 2);
+            assert_eq!(widest(ModelVariant::WhisperLargeV3Turbo, backend), 2);
+        }
+        assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Metal), 8);
+        assert_eq!(widest(ModelVariant::Qwen3508BGguf, BackendKind::Cpu), 2);
+        assert_eq!(widest(ModelVariant::Qwen306B, BackendKind::Cuda), 8);
+        assert_eq!(
+            widest(ModelVariant::WhisperLargeV3Turbo, BackendKind::Cuda),
+            8
+        );
     }
 
     #[test]

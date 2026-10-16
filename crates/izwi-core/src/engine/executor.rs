@@ -1068,13 +1068,11 @@ impl WorkerConfig {
         }
     }
 
+    /// The hard tensor width ceiling: the widest certified family on CPU and
+    /// Metal, the kernel and metadata limit on CUDA (whose runtime default
+    /// stays VRAM-tiered and resource-admitted).
     fn tensor_batch_cap(backend: BackendKind) -> usize {
-        match backend {
-            BackendKind::Cpu | BackendKind::Metal => 2,
-            // Runtime CUDA defaults remain VRAM-tiered and resource-admitted;
-            // this is only the hard kernel/metadata width ceiling.
-            BackendKind::Cuda => 32,
-        }
+        crate::catalog::max_certified_decode_width(backend)
     }
 
     fn request_parallelism_override() -> Option<usize> {
@@ -5870,9 +5868,9 @@ mod tests {
     }
 
     #[test]
-    fn tensor_batch_caps_are_backend_conservative() {
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 2);
-        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 2);
+    fn tensor_batch_caps_are_the_widest_certified_width() {
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cpu), 8);
+        assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Metal), 8);
         assert_eq!(WorkerConfig::tensor_batch_cap(BackendKind::Cuda), 32);
     }
 

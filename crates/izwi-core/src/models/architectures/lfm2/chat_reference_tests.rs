@@ -27,7 +27,8 @@ use std::sync::Arc;
 const PAGE_TOKENS: u32 = 16;
 /// 512 tokens per session: a fixture prompt plus 256 decoded tokens.
 const PAGES_PER_SESSION: u32 = 32;
-const SESSIONS: u32 = 4;
+/// Enough sessions for one width-8 decode batch.
+const SESSIONS: u32 = 8;
 /// Reference steps whose top-2 margin is below this are near ties; any
 /// quantized backend may legitimately pick either token there.
 const NEAR_TIE: f32 = 0.5;
@@ -619,4 +620,155 @@ fn lfm25_f16_kv_tracks_f32_kv_on_cuda() {
         return;
     }
     run_kv_dtype_leg(profile, 0.25);
+}
+
+/// One step of a solo greedy decode: the token chosen, the top-2 margin and
+/// the top-8 logits.
+struct SoloStep {
+    next: u32,
+    margin: f32,
+    top: Vec<(u32, f32)>,
+}
+
+fn solo_step(values: &[f32]) -> SoloStep {
+    let mut indexed: Vec<(u32, f32)> = values
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(id, value)| (id as u32, value))
+        .collect();
+    indexed.sort_by(|lhs, rhs| rhs.1.total_cmp(&lhs.1));
+    indexed.truncate(8);
+    SoloStep {
+        next: indexed[0].0,
+        margin: indexed[0].1 - indexed[1].1,
+        top: indexed,
+    }
+}
+
+/// Decode parity across tensor batch widths, for the certified widths in
+/// `catalog::batch_width`: eight prompts decode greedily one row at a time
+/// (width 1), then together at widths 2, 4 and 8, teacher-forced with the
+/// solo tokens. Every decisive step must pick the solo token, and the solo
+/// top-8 logits may move by at most `max_logit_delta` (the op shapes differ:
+/// Metal's small-batch mat-vec serves 2..=8 rows, Candle's mat-vec one).
+fn run_width_parity_leg(profile: DeviceProfile, max_logit_delta: f32) {
+    const ROWS: usize = 8;
+    const STEPS: usize = 48;
+    let dir = models_dir().join("LFM2.5-1.2B-Instruct-GGUF");
+    if !dir.exists() {
+        eprintln!("skipping: {} is missing", dir.display());
+        return;
+    }
+    let model = Lfm2ChatModel::load(&dir, ModelVariant::Lfm2512BInstructGguf, profile).unwrap();
+    let backend = format!("{:?}", model.device_kind());
+    let prompts: Vec<Vec<u32>> = (0..ROWS)
+        .map(|row| {
+            (0..24 + 3 * row)
+                .map(|i| 1000 + ((i * 7919 + row * 104_729) % 30_000) as u32)
+                .collect()
+        })
+        .collect();
+    // Decode `rows` together from their prefill argmax. `choose(row, step,
+    // logits)` picks each row's next input. Returns each row's logits rows.
+    let decode = |rows: &[usize], choose: &dyn Fn(usize, usize, &[f32]) -> u32| {
+        let sessions = Sessions::new(&model);
+        let mut states = Vec::with_capacity(rows.len());
+        let mut pending = Vec::with_capacity(rows.len());
+        for (slot, &index) in rows.iter().enumerate() {
+            let prompt = &prompts[index];
+            let mut state = prefill(&model, prompt, sessions.session(slot as u32), &[]);
+            pending.push(argmax_of(&row(&state.unconsumed_output.take().unwrap())));
+            state.position = prompt.len();
+            states.push(state);
+        }
+        let mut out = vec![Vec::with_capacity(STEPS); rows.len()];
+        for step in 0..STEPS {
+            let positions: Vec<usize> = states.iter().map(|state| state.position).collect();
+            let mut shortconv = Vec::new();
+            let mut caches = Vec::new();
+            for state in states.iter_mut() {
+                shortconv.push(&mut state.shortconv);
+                caches.push(&mut state.physical_kv);
+            }
+            let logits = model
+                .text_model
+                .forward_token_ids_retained_batch(&pending, &positions, &mut shortconv, &mut caches)
+                .unwrap();
+            drop(shortconv);
+            drop(caches);
+            for (slot, &index) in rows.iter().enumerate() {
+                let values = row(&logits.i(slot).unwrap());
+                pending[slot] = choose(index, step, &values);
+                states[slot].position += 1;
+                out[slot].push(values);
+            }
+        }
+        out
+    };
+
+    let solo: Vec<Vec<SoloStep>> = (0..ROWS)
+        .map(|index| {
+            decode(&[index], &|_, _, values| argmax_of(values))
+                .remove(0)
+                .iter()
+                .map(|values| solo_step(values))
+                .collect()
+        })
+        .collect();
+    for width in [2usize, 4, 8] {
+        let mut decisive = 0usize;
+        let mut worst = 0f32;
+        for group in (0..ROWS).collect::<Vec<_>>().chunks(width) {
+            let batched = decode(group, &|index, step, _| solo[index][step].next);
+            for (slot, &index) in group.iter().enumerate() {
+                for (step, values) in batched[slot].iter().enumerate() {
+                    let reference = &solo[index][step];
+                    for (id, expected) in &reference.top {
+                        worst = worst.max(abs_err(values[*id as usize], *expected));
+                    }
+                    if reference.margin >= NEAR_TIE {
+                        decisive += 1;
+                        assert_eq!(
+                            argmax_of(values),
+                            reference.next,
+                            "{backend} width {width}: row {index} step {step} left the solo \
+                             token (margin {:.3})",
+                            reference.margin
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{backend} width {width}: {decisive} decisive steps agree with width 1, \
+             worst top-8 logit delta {worst:.4}"
+        );
+        assert!(
+            worst <= max_logit_delta,
+            "{backend} width {width}: top-8 logit delta {worst} exceeds {max_logit_delta}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_decode_matches_across_batch_widths_on_cpu() {
+    // Measured on aarch64: widths 2, 4 and 8 equal width 1 exactly.
+    run_width_parity_leg(DeviceProfile::cpu(), 0.05);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_decode_matches_across_batch_widths_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    // Measured worst delta 0.0096 at widths 2, 4 and 8 (M1 Pro).
+    run_width_parity_leg(profile, 0.05);
 }
