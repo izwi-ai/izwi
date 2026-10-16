@@ -5554,6 +5554,8 @@ impl EngineCore {
                                 committed.session.request_id.clone(),
                                 SequencePhase::Prefill,
                             ));
+                            self.scheduler
+                                .yield_prefill_to_waiting(&committed.session.request_id);
                         }
                         executor_outputs.push(committed);
                     }
@@ -13143,6 +13145,7 @@ mod tests {
                         .iter()
                         .any(|r| r.id == row.request_id && r.task_type == TaskType::ASR);
                     if !asr {
+                        self.log.lock().unwrap().push("chat-prefill");
                         return ExecutorStepResult::new(
                             row,
                             MockExecutor::build_outputs(std::slice::from_ref(row)).remove(0),
@@ -13205,8 +13208,10 @@ mod tests {
     }
 
     /// The most long-form windows the device ran between two chat steps
-    /// while a long-form transcription ran beside chat streams.
-    async fn windows_between_chat_steps(by_chunk: bool) -> usize {
+    /// while a long-form transcription ran beside chat streams, and whether
+    /// a chat request that arrived during the transcription began before it
+    /// ended.
+    async fn long_form_beside_chat(by_chunk: bool) -> (usize, bool) {
         let windows = 12;
         let log = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(LongFormMockExecutor {
@@ -13267,8 +13272,19 @@ mod tests {
         core.add_request(asr).unwrap();
         log.lock().unwrap().clear();
 
-        let mut transcribed = false;
+        let (mut transcribed, mut late_added) = (false, false);
         for _ in 0..1_000 {
+            // A chat request arrives once the transcription has begun.
+            if !late_added && log.lock().unwrap().contains(&"asr-window") {
+                late_added = true;
+                log.lock().unwrap().push("chat-late-arrived");
+                let mut late = EngineCoreRequest::tts("chat-late");
+                late.id = "chat-late".to_string();
+                late.prompt_tokens = vec![1];
+                late.params.max_tokens = 1_000;
+                late.bind_model_instance(ModelInstanceId::new(1)).unwrap();
+                core.add_request(late).unwrap();
+            }
             for output in core.step().await.unwrap() {
                 if output.request_id == "long-form" && output.is_finished {
                     assert!(output.error.is_none(), "{:?}", output.error);
@@ -13285,10 +13301,29 @@ mod tests {
             log.iter().filter(|event| **event == "asr-window").count(),
             windows
         );
-        log.split(|event| *event == "chat")
+        let last_window = log.iter().rposition(|event| *event == "asr-window");
+        let arrived = log
+            .iter()
+            .position(|event| *event == "chat-late-arrived")
+            .expect("the late chat request arrived");
+        let late_prefill = log
+            .iter()
+            .skip(arrived)
+            .position(|event| *event == "chat-prefill")
+            .map(|offset| arrived + offset);
+        let model_calls = log
+            .iter()
+            .filter(|event| **event != "chat-late-arrived")
+            .collect::<Vec<_>>();
+        let windows = model_calls
+            .split(|event| **event != "asr-window")
             .map(<[_]>::len)
             .max()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let late_chat_began = late_prefill
+            .zip(last_window)
+            .is_some_and(|(prefill, window)| prefill < window);
+        (windows, late_chat_began)
     }
 
     /// Phase 3c exit test: a long-form transcription beside chat streams
@@ -13296,7 +13331,12 @@ mod tests {
     /// the streams keep advancing with bounded inter-token gaps.
     #[tokio::test]
     async fn long_form_asr_beside_chat_holds_the_device_one_window_at_a_time() {
-        assert_eq!(windows_between_chat_steps(true).await, 1);
+        let (windows, late_chat_began) = long_form_beside_chat(true).await;
+        assert_eq!(windows, 1, "windows between two chat model calls");
+        assert!(
+            late_chat_began,
+            "a chat request arriving mid-transcription waited for it"
+        );
     }
 
     #[tokio::test]

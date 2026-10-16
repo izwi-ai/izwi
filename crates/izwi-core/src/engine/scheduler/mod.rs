@@ -747,6 +747,11 @@ struct RunningRequest {
     /// capacity-withheld turn; decode rotates through equal-priority rows by
     /// it (0: never served).
     last_service: u64,
+    /// A resumable atomic prefill (a long-form ASR job) just committed one
+    /// operation: its next operation waits until another ready prompt has
+    /// taken a prefill slot, so a long job does not hold new requests until
+    /// it ends.
+    yield_prefill_to_waiting: bool,
 }
 
 impl Scheduler {
@@ -938,6 +943,7 @@ impl Scheduler {
                 first_token_emitted: false,
                 paused: false,
                 last_service: 0,
+                yield_prefill_to_waiting: false,
             },
         );
         let initial_service_clock = self.next_realtime_service_clock.saturating_sub(1);
@@ -1743,11 +1749,41 @@ impl Scheduler {
         // Phase 2a: continue incomplete prefills before admitting new waiting requests.
         // An in-flight quantum is excluded until update_after_step commits its
         // progress, preventing duplicate plans when schedule is polled again.
+        // A resumable atomic prefill that just ran one operation steps aside
+        // until another prompt of its lanes (waiting, or admitted and not yet
+        // run) has taken a prefill slot.
+        let yielding = self
+            .running
+            .iter()
+            .filter(|(id, running)| running.yield_prefill_to_waiting && self.lane_admits(lanes, id))
+            .map(|(id, _)| id.clone())
+            .collect::<HashSet<_>>();
+        let ready = |metadata: &RequestMetadata| {
+            lanes.admits(metadata.lane)
+                && !self.capacity_waiting(metadata)
+                && metadata
+                    .retry_not_before
+                    .is_none_or(|retry| retry <= scheduling_now)
+        };
+        let other_prompt_ready = !yielding.is_empty()
+            && (self
+                .waiting_members
+                .iter()
+                .any(|request_id| self.requests.get(request_id).is_some_and(ready))
+                || self.running.iter().any(|(request_id, running)| {
+                    !running.prefill_complete
+                        && !running.prefill_in_flight
+                        && !yielding.contains(request_id)
+                        && self.requests.get(request_id).is_some_and(ready)
+                }));
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
             .filter(|(id, r)| {
-                !r.prefill_complete && !r.prefill_in_flight && self.lane_admits(lanes, id)
+                !r.prefill_complete
+                    && !r.prefill_in_flight
+                    && self.lane_admits(lanes, id)
+                    && !(other_prompt_ready && yielding.contains(*id))
             })
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
@@ -2052,6 +2088,7 @@ impl Scheduler {
                 first_token_emitted: false,
                 paused: false,
                 last_service: 0,
+                yield_prefill_to_waiting: false,
             };
 
             let plan_id = self.next_plan_id;
@@ -2092,6 +2129,21 @@ impl Scheduler {
 
         for request_id in deferred_waiting {
             self.enqueue_waiting_request(request_id);
+        }
+        // The step aside ends once another prompt was scheduled, none is
+        // ready, or the slot went unused (the prompts cannot run now).
+        if !other_prompt_ready
+            || result
+                .prefill_requests
+                .iter()
+                .any(|row| !yielding.contains(&row.request_id))
+            || (result.decode_requests.is_empty() && result.prefill_requests.is_empty())
+        {
+            for request_id in &yielding {
+                if let Some(running) = self.running.get_mut(request_id) {
+                    running.yield_prefill_to_waiting = false;
+                }
+            }
         }
 
         result
@@ -2736,6 +2788,15 @@ impl Scheduler {
             }
             debts
         });
+    }
+
+    /// One operation of a resumable atomic prefill (a long-form ASR chunk)
+    /// committed without completing the prompt: offer the next prefill slot
+    /// to another ready prompt before the job's next operation.
+    pub(crate) fn yield_prefill_to_waiting(&mut self, request_id: &RequestId) {
+        if let Some(running) = self.running.get_mut(request_id) {
+            running.yield_prefill_to_waiting = true;
+        }
     }
 
     /// Release an uncommitted prefill quantum so the exact request session can
@@ -5029,6 +5090,44 @@ mod tests {
                 .expect("prefill scheduled");
             scheduler.update_after_step(&row.request_id, row.num_tokens, 1, 1.0);
         }
+    }
+
+    /// After one operation of a resumable atomic prefill (a long-form ASR
+    /// chunk), a waiting prompt takes the next prefill slot; the job's next
+    /// operation follows.
+    #[test]
+    fn a_yielded_atomic_prefill_lets_other_prompts_go_first() {
+        let mut scheduler = small_scheduler();
+        let long = build_request(TaskType::ASR, "long-form", Priority::Normal);
+        assert!(scheduler.add_request(&long));
+        let first = scheduler.schedule();
+        assert_eq!(first.prefill_requests[0].request_id, "long-form");
+        // The chunk committed without completing the prompt.
+        scheduler.update_after_step(&long.id, 0, 0, 1.0);
+        scheduler.yield_prefill_to_waiting(&long.id);
+        let prompt = build_request(TaskType::Chat, "prompt", Priority::Normal);
+        assert!(scheduler.add_request(&prompt));
+
+        let next = scheduler.schedule();
+        let rows = next
+            .prefill_requests
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["prompt"]);
+        // The core withheld the prompt's quantum: admitted but not yet run,
+        // it still goes before the job's next operation.
+        scheduler.release_unexecuted_quantum(&next.prefill_requests[0]);
+        scheduler.yield_prefill_to_waiting(&long.id);
+        let retry = scheduler.schedule();
+        let rows = retry
+            .prefill_requests
+            .iter()
+            .map(|row| row.request_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["prompt"]);
+        let after = scheduler.schedule();
+        assert_eq!(after.prefill_requests[0].request_id, "long-form");
     }
 
     /// With lane step drivers each lane's starvation guard counts its own
