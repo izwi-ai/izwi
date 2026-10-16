@@ -30,6 +30,7 @@ const FLEET_DB_PATH_ENV: &str = "IZWI_GATEWAY_FLEET_DB_PATH";
 const FLEET_CLAIM_TTL_MS_ENV: &str = "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS";
 const FLEET_CLAIM_TIMEOUT_MS_ENV: &str = "IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS";
 const GATEWAY_ID_ENV: &str = "IZWI_GATEWAY_ID";
+const MAX_GATEWAY_ID_BYTES: usize = 128;
 const MAX_ENV_VALUE_BYTES: usize = 20;
 const MAX_FLEET_SIZE: u32 = 256;
 const MAX_DB_PATH_BYTES: usize = 4096;
@@ -136,7 +137,7 @@ pub enum FleetPartitionError {
     MissingPartition,
     #[error("IZWI_GATEWAY_FLEET_DB_PATH must be a bounded absolute path or database URL")]
     InvalidDbPath,
-    #[error("IZWI_GATEWAY_ID exceeds its encoded size limit")]
+    #[error("IZWI_GATEWAY_ID must be 1-128 ASCII letters, digits, '-' or '_'")]
     InvalidGatewayId,
     #[error(
         "IZWI_GATEWAY_FLEET_CLAIM_TTL_MS must be a bounded millisecond value between {MIN_FLEET_CLAIM_TTL_MS} and {MAX_FLEET_CLAIM_TTL_MS}"
@@ -186,23 +187,31 @@ pub fn fleet_database_from_env() -> Result<Option<FleetDatabase>, FleetPartition
     Ok(Some(FleetDatabase::Path(path)))
 }
 
-/// Stable gateway identity for fleet claim ownership. Operator-set via
-/// `IZWI_GATEWAY_ID`; otherwise unique per process boot. A restarted
-/// gateway never inherits its predecessor's in-flight claims — TTL expiry
-/// and worker-authoritative teardown own that recovery.
-pub fn gateway_identity() -> String {
-    match std::env::var(GATEWAY_ID_ENV) {
-        Ok(id)
-            if !id.is_empty()
-                && id.len() <= 128
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) =>
-        {
-            id
-        }
-        _ => format!("gateway-{}", std::process::id()),
+/// The gateway's identity for fleet claim ownership: `IZWI_GATEWAY_ID` when
+/// the operator sets it (an invalid value fails boot rather than falling
+/// back), otherwise a random identity unique to this process boot. It is
+/// never derived from the process id: every container's gateway is PID 1,
+/// so PID-based identities collided, and a restarting gateway then
+/// released its peers' live claims while counting theirs as its own. A
+/// restarted gateway never inherits its predecessor's in-flight claims;
+/// TTL expiry and worker-authoritative teardown own that recovery.
+pub fn gateway_identity() -> Result<String, FleetPartitionError> {
+    match std::env::var_os(GATEWAY_ID_ENV) {
+        Some(id) => id
+            .into_string()
+            .ok()
+            .filter(|id| valid_gateway_id(id))
+            .ok_or(FleetPartitionError::InvalidGatewayId),
+        None => Ok(format!("gateway-{}", uuid::Uuid::new_v4().simple())),
     }
+}
+
+fn valid_gateway_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_GATEWAY_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Resolve the fleet capacity-claim TTL. Unset keeps the historical 30s
@@ -388,10 +397,29 @@ mod tests {
     fn gateway_identity_prefers_bounded_operator_value() {
         let _guard = env_lock();
         std::env::set_var("IZWI_GATEWAY_ID", "gateway-east-1");
-        assert_eq!(gateway_identity(), "gateway-east-1");
-        std::env::set_var("IZWI_GATEWAY_ID", "not valid!!");
-        assert!(gateway_identity().starts_with("gateway-"));
+        assert_eq!(gateway_identity().unwrap(), "gateway-east-1");
+        for invalid in ["not valid!!", "", &"g".repeat(129)] {
+            std::env::set_var("IZWI_GATEWAY_ID", invalid);
+            assert_eq!(
+                gateway_identity(),
+                Err(FleetPartitionError::InvalidGatewayId),
+                "{invalid:?} must fail boot, not fall back"
+            );
+        }
         std::env::remove_var("IZWI_GATEWAY_ID");
+    }
+
+    /// Every container's gateway is PID 1: the default identity must not
+    /// depend on the process id, so two boots never share one.
+    #[test]
+    fn default_gateway_identity_is_unique_per_boot() {
+        let _guard = env_lock();
+        std::env::remove_var("IZWI_GATEWAY_ID");
+        let first = gateway_identity().unwrap();
+        let second = gateway_identity().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, format!("gateway-{}", std::process::id()));
+        assert!(valid_gateway_id(&first), "{first}");
     }
 
     #[test]

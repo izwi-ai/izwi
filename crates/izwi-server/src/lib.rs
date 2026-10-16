@@ -1067,7 +1067,7 @@ async fn gateway_state(
             let coordinator = Arc::new(
                 app::fleet_coordinator::FleetCoordinator::new(
                     store,
-                    crate::gateway_fleet::gateway_identity(),
+                    crate::gateway_fleet::gateway_identity()?,
                 )
                 .with_claim_ttl(fleet_claim_ttl)
                 .with_claim_timeout(fleet_claim_timeout),
