@@ -1146,3 +1146,27 @@ async fn retry_policy_delays_claims_and_enforces_attempt_budget() {
         RuntimeJobStatus::Failed
     );
 }
+
+/// Nodes sharing a database must agree on lease time whatever their own
+/// wall clocks say: the store reads the database server's clock.
+#[tokio::test]
+async fn leases_follow_the_database_clock_not_the_process_wall_clock() {
+    let database = TestDatabase::new().await;
+    let db = database.database();
+    db.skew_wall_clock_for_test(60 * 60 * 1000);
+    let store = BatchRuntimeStore::initialize_with_database(db);
+    create_test_job_and_stage(&store, 0, "clock_stage", 1).await;
+
+    let claimed = store
+        .claim_next_stage("worker-1", 60_000)
+        .await
+        .expect("claim")
+        .expect("stage claimed");
+    let lease_expires_at =
+        i64::try_from(claimed.stage.lease_expires_at.expect("lease")).expect("lease fits");
+    let expected = current_timestamp_millis() + 60_000;
+    assert!(
+        (lease_expires_at - expected).abs() < 10_000,
+        "lease expires at {lease_expires_at}, expected about {expected}"
+    );
+}

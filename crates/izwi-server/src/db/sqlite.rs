@@ -3,11 +3,14 @@ use crate::{
     storage_layout,
 };
 use anyhow::Context;
-use sea_orm::{sqlx::sqlite::SqliteJournalMode, ConnectOptions, Database, DatabaseConnection};
+use sea_orm::{
+    sqlx::sqlite::SqliteJournalMode, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
+    DbBackend, Statement,
+};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -158,6 +161,78 @@ pub struct StoreDatabase {
     connection: Arc<OnceCell<DatabaseConnection>>,
     statement_timeout: Option<Duration>,
     schema: Schema,
+    clock: Arc<DatabaseClock>,
+}
+
+/// How often a store re-reads the database server's clock.
+const DATABASE_CLOCK_RESYNC: Duration = Duration::from_secs(30);
+
+/// The database server's clock, sampled at most every
+/// [`DATABASE_CLOCK_RESYNC`] and advanced with this process's monotonic
+/// clock in between. Every node sharing a database then measures leases,
+/// claim TTLs and expiry against one clock, whatever its own wall clock
+/// says. Before the first sample the process wall clock stands in.
+#[derive(Debug, Default)]
+struct DatabaseClock {
+    sample: std::sync::Mutex<Option<(i64, Instant)>>,
+    #[cfg(test)]
+    wall_clock_skew_ms: std::sync::atomic::AtomicI64,
+}
+
+impl DatabaseClock {
+    fn now_millis(&self) -> i64 {
+        let sample = *self
+            .sample
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match sample {
+            Some((database_ms, sampled_at)) => database_ms.saturating_add(
+                i64::try_from(sampled_at.elapsed().as_millis()).unwrap_or(i64::MAX),
+            ),
+            None => self.wall_clock_millis(),
+        }
+    }
+
+    fn wall_clock_millis(&self) -> i64 {
+        let now = crate::batch_runtime::store::current_timestamp_millis();
+        #[cfg(test)]
+        let now = now + self.wall_clock_skew_ms.load(std::sync::atomic::Ordering::SeqCst);
+        now
+    }
+
+    fn is_due(&self) -> bool {
+        self.sample
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_none_or(|(_, sampled_at)| sampled_at.elapsed() >= DATABASE_CLOCK_RESYNC)
+    }
+
+    /// Read the server's clock, attributing it to the midpoint of the round
+    /// trip. A failed read keeps the previous sample.
+    async fn sync(&self, db: &DatabaseConnection) {
+        let sql = match db.get_database_backend() {
+            DbBackend::Postgres => "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+            _ => "SELECT CAST(ROUND((julianday('now') - 2440587.5) * 86400000.0) AS INTEGER)",
+        };
+        let sent = Instant::now();
+        let read = db
+            .query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+            .await;
+        let round_trip = sent.elapsed();
+        match read.map(|row| row.map(|row| row.try_get_by_index::<i64>(0))) {
+            Ok(Some(Ok(database_ms))) => {
+                *self
+                    .sample
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    Some((database_ms, sent + round_trip / 2));
+            }
+            other => tracing::warn!(
+                error = ?other.err(),
+                "Failed to read the database clock; keeping the previous sample"
+            ),
+        }
+    }
 }
 
 impl StoreDatabase {
@@ -173,6 +248,7 @@ impl StoreDatabase {
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
             schema: Schema::App,
+            clock: Arc::default(),
         })
     }
 
@@ -182,6 +258,7 @@ impl StoreDatabase {
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
             schema: Schema::App,
+            clock: Arc::default(),
         }
     }
 
@@ -193,6 +270,7 @@ impl StoreDatabase {
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
             schema: Schema::App,
+            clock: Arc::default(),
         }
     }
 
@@ -224,28 +302,48 @@ impl StoreDatabase {
             connection: Arc::new(cell),
             statement_timeout: None,
             schema: Schema::App,
+            clock: Arc::default(),
         }
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
-        if let Some(source) = self.source.clone() {
-            let statement_timeout = self.statement_timeout;
-            let schema = self.schema;
-            return self
+        let db = match self.source.clone() {
+            Some(source) => {
+                let statement_timeout = self.statement_timeout;
+                let schema = self.schema;
+                self.connection
+                    .get_or_try_init(|| async move {
+                        let db = connect_source(&source, statement_timeout).await?;
+                        Migrator::up_schema(&db, schema)
+                            .await
+                            .context("Failed to run migrations for SeaORM store")?;
+                        Ok::<_, anyhow::Error>(db)
+                    })
+                    .await?
+            }
+            None => self
                 .connection
-                .get_or_try_init(|| async move {
-                    let db = connect_source(&source, statement_timeout).await?;
-                    Migrator::up_schema(&db, schema)
-                        .await
-                        .context("Failed to run migrations for SeaORM store")?;
-                    Ok(db)
-                })
-                .await;
+                .get()
+                .context("Store database was constructed without a connection")?,
+        };
+        if self.clock.is_due() {
+            self.clock.sync(db).await;
         }
+        Ok(db)
+    }
 
-        self.connection
-            .get()
-            .context("Store database was constructed without a connection")
+    /// The current time in Unix milliseconds by the database server's clock
+    /// (see [`DatabaseClock`]).
+    pub fn now_millis(&self) -> i64 {
+        self.clock.now_millis()
+    }
+
+    /// Skew this process's wall clock, which the database clock replaces.
+    #[cfg(test)]
+    pub(crate) fn skew_wall_clock_for_test(&self, skew_ms: i64) {
+        self.clock
+            .wall_clock_skew_ms
+            .store(skew_ms, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

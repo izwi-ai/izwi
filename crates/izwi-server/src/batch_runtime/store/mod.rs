@@ -213,12 +213,14 @@ impl BatchRuntimeStore {
         Ok(())
     }
 
+    /// The store's time: the database server's clock (see
+    /// `StoreDatabase::now_millis`), or a test's clock.
     pub(crate) fn now_millis(&self) -> i64 {
         #[cfg(test)]
         if let Some(clock) = &self.test_clock {
             return clock.load(Ordering::SeqCst);
         }
-        current_timestamp_millis()
+        self.db.now_millis()
     }
 
     fn pcm_replay_entry_limit(&self) -> u64 {

@@ -163,7 +163,7 @@ impl FleetStore {
         if let Some(clock) = &self.test_clock {
             return clock.load(Ordering::SeqCst);
         }
-        crate::batch_runtime::store::current_timestamp_millis()
+        self.db.now_millis()
     }
 
     /// Publish one worker observation. Returns true when the row was created
