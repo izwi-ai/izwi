@@ -115,17 +115,16 @@ impl PassbandFilter {
 /// every call.
 fn dot(taps: &[f32], window: &[f32]) -> f32 {
     let mut lanes = [0.0f32; 8];
-    let mut taps_chunks = taps.chunks_exact(8);
-    let mut window_chunks = window.chunks_exact(8);
-    for (tap, sample) in (&mut taps_chunks).zip(&mut window_chunks) {
+    let (taps_chunks, taps_tail) = taps.as_chunks::<8>();
+    let (window_chunks, window_tail) = window.as_chunks::<8>();
+    for (tap, sample) in taps_chunks.iter().zip(window_chunks) {
         for lane in 0..8 {
             lanes[lane] += tap[lane] * sample[lane];
         }
     }
-    let tail = taps_chunks
-        .remainder()
+    let tail = taps_tail
         .iter()
-        .zip(window_chunks.remainder())
+        .zip(window_tail)
         .map(|(tap, sample)| tap * sample)
         .sum::<f32>();
     lanes.iter().sum::<f32>() + tail

@@ -98,8 +98,10 @@ fn parity_audio(name: &str) -> Option<Vec<f32>> {
     );
     Some(
         bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
     )
 }
@@ -422,7 +424,9 @@ fn nemotron3_pooled_outcome(
     for (speaker, expected) in pooled {
         let speaker = speaker.parse::<usize>().expect("speaker id");
         let actual = probs
-            .chunks_exact(10)
+            .as_chunks::<10>()
+            .0
+            .iter()
             .map(|rows| vec![rows.iter().map(|row| row[speaker]).sum::<f32>() / 10.0])
             .collect::<Vec<_>>();
         let expected = expected
@@ -817,8 +821,10 @@ fn sortformer_streaming_timings_on_diarization_2() {
             let path = dump_dir.join(format!("{run}-{tag}.f32"));
             let baseline = std::fs::read(&path)
                 .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect::<Vec<f32>>();
             assert_eq!(baseline.len(), flat.len(), "{run} baseline length");
             let bit_exact = baseline

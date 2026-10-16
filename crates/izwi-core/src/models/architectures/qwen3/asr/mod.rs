@@ -4013,8 +4013,10 @@ fn reference_word_timings(classes: &[u32], segment_time_ms: u32) -> Vec<(u32, u3
         .map(|class| f64::from(*class) * f64::from(segment_time_ms))
         .collect::<Vec<_>>();
     fix_timestamp_sequence(&timestamps)
-        .chunks_exact(2)
-        .map(|pair| (pair[0], pair[1]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[start, end]| (start, end))
         .collect()
 }
 
@@ -6237,8 +6239,10 @@ mod tests {
             (&fox_windowed[..], &fox_windowed_fixed_ms[..]),
         ] {
             let expected = fixed_ms
-                .chunks_exact(2)
-                .map(|pair| (pair[0], pair[1]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[start, end]| (start, end))
                 .collect::<Vec<_>>();
             assert_eq!(reference_word_timings(classes, 80), expected);
         }
