@@ -14,6 +14,12 @@
 
 use std::fmt;
 
+mod fleet;
+
+#[cfg(test)]
+pub(crate) use fleet::FleetFaults;
+pub use fleet::{FleetStore, FleetWorkerObservation};
+
 const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";
 const FLEET_SIZE_ENV: &str = "IZWI_GATEWAY_FLEET_SIZE";
 const FLEET_DB_PATH_ENV: &str = "IZWI_GATEWAY_FLEET_DB_PATH";

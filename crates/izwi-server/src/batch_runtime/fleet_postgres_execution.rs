@@ -1,8 +1,8 @@
 //! DS5.1 execution evidence: the fleet coordination store and the durable
-//! store run against real PostgreSQL. The SQLite suites in `fleet.rs` and
-//! `db/sqlite.rs` prove the operation semantics; this module proves the
-//! dialect-conditional SQL and the promoted column types behave identically
-//! on a server backend.
+//! store run against real PostgreSQL. The SQLite suites in
+//! `gateway_fleet/fleet.rs` and `db/sqlite.rs` prove the operation
+//! semantics; this module proves the dialect-conditional SQL and the
+//! promoted column types behave identically on a server backend.
 //!
 //! Tests are skipped unless the `db-postgres` cargo feature is enabled and
 //! `IZWI_TEST_FLEET_PG_URL` points at a *disposable* PostgreSQL database
@@ -10,11 +10,9 @@
 //! tables in the target schema and re-runs the migrations, so the database
 //! must not hold state anyone cares about.
 
-use crate::batch_runtime::fleet::FleetWorkerObservation;
-use crate::batch_runtime::store::BatchRuntimeStore;
+use crate::gateway_fleet::{FleetStore, FleetWorkerObservation};
 use crate::db::migrator::Migrator;
 use crate::db::raw;
-use crate::db::StoreDatabase;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -37,10 +35,10 @@ fn pg_url() -> Option<String> {
 
 type PgTestGuard = tokio::sync::MutexGuard<'static, ()>;
 
-async fn fresh_store() -> Option<(BatchRuntimeStore, PgTestGuard)> {
+async fn fresh_store() -> Option<(FleetStore, PgTestGuard)> {
     let guard = PG_TEST_LOCK.lock().await;
     let url = pg_url()?;
-    let store = BatchRuntimeStore::initialize_with_database(StoreDatabase::from_url(url));
+    let store = FleetStore::from_url(url);
     let connection = store.connection().await.expect("postgres connection opens");
     drop_all_tables(connection).await.expect("tables drop");
     Migrator::up(connection).await.expect("migrations run");
@@ -207,8 +205,7 @@ async fn postgres_fleet_capacity_claims_are_atomic_across_connections() {
     let _guard = PG_TEST_LOCK.lock().await;
     let mut stores = Vec::new();
     for _ in 0..2 {
-        let mut store =
-            BatchRuntimeStore::initialize_with_database(StoreDatabase::from_url(url.clone()));
+        let store = FleetStore::from_url(url.clone());
         // Warm both connections (running migrations) before the race so the
         // test measures claim atomicity, not first-open contention.
         store.connection().await.expect("postgres connection opens");

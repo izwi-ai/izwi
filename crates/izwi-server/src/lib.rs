@@ -91,7 +91,7 @@ use state::AppState;
 
 pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
 pub use gateway::{create_gateway_router, GatewayState};
-pub use gateway_fleet::{FleetPartition, FleetPartitionError};
+pub use gateway_fleet::{FleetPartition, FleetPartitionError, FleetStore};
 pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
 pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
 pub use gateway_tenant_concurrency::{
@@ -1038,7 +1038,7 @@ async fn gateway_state(
                     crate::db::StoreDatabase::from_coordination_url(url)
                 }
             };
-            let store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
+            let store = crate::gateway_fleet::FleetStore::new(
                 store_database,
             );
             // Two fleet gateways booting simultaneously race the SQLite
@@ -4085,10 +4085,10 @@ mod tests {
             .expect("initial approval");
 
         let root = tempfile::tempdir().expect("temp dir");
-        let mut store = crate::batch_runtime::store::BatchRuntimeStore::initialize_with_database(
+        let mut store = crate::gateway_fleet::FleetStore::new(
             crate::db::StoreDatabase::new(root.path().join("fleet.sqlite3")),
         );
-        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        let faults = Arc::new(crate::gateway_fleet::FleetFaults::default());
         store.set_faults_for_test(Arc::clone(&faults));
         faults.hang_fleet_calls();
         let coordinator = Arc::new(app::fleet_coordinator::FleetCoordinator::new(

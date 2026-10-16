@@ -1,4 +1,4 @@
-//! Multi-gateway fleet coordination over the shared SQLite store.
+//! Multi-gateway fleet coordination over a shared SQLite or PostgreSQL store.
 //!
 //! Single-gateway deployments never touch this module. When operators run
 //! several gateways against one worker fleet, each gateway publishes its
@@ -19,10 +19,14 @@
 //!   stops consuming cluster capacity without any explicit recovery.
 //! - All inputs are bounded before they reach SQL.
 
-use super::store::BatchRuntimeStore;
-use crate::db::raw;
+use crate::db::{raw, StoreDatabase};
 use anyhow::Context;
-use sea_orm::{ConnectionTrait, DbBackend, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, TransactionTrait};
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, Ordering},
+    Arc,
+};
 
 const MAX_FLEET_ID_BYTES: usize = 256;
 const MAX_FLEET_DEPLOYMENTS_JSON_BYTES: usize = 64 * 1024;
@@ -66,9 +70,100 @@ pub struct FleetWorkerView {
     pub observer_gateway_id: String,
 }
 
-impl BatchRuntimeStore {
+/// The shared coordination database the gateways of one fleet publish
+/// worker observations and capacity claims to. It holds no job state.
+#[derive(Debug, Clone)]
+pub struct FleetStore {
+    db: StoreDatabase,
+    #[cfg(test)]
+    test_clock: Option<Arc<AtomicI64>>,
+    #[cfg(test)]
+    test_faults: Option<Arc<FleetFaults>>,
+}
+
+/// Lets a test make fleet calls hang, as on a database host that stopped
+/// answering on an established connection.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FleetFaults {
+    hung: AtomicBool,
+    answers: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl FleetFaults {
+    pub(crate) fn hang_fleet_calls(&self) {
+        self.hung.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn answer_fleet_calls(&self) {
+        self.hung.store(false, Ordering::SeqCst);
+        self.answers.notify_waiters();
+    }
+
+    async fn wait_while_hung(&self) {
+        loop {
+            let answered = self.answers.notified();
+            if !self.hung.load(Ordering::SeqCst) {
+                return;
+            }
+            answered.await;
+        }
+    }
+}
+
+impl FleetStore {
+    pub fn new(db: StoreDatabase) -> Self {
+        Self {
+            db,
+            #[cfg(test)]
+            test_clock: None,
+            #[cfg(test)]
+            test_faults: None,
+        }
+    }
+
+    /// Address the coordination store through a SQLite file path, for fleet
+    /// tooling and process rigs that inspect a coordination database.
+    pub fn from_path(db_path: std::path::PathBuf) -> Self {
+        Self::new(StoreDatabase::new(db_path))
+    }
+
+    /// Address the coordination store through a bounded database URL
+    /// (PostgreSQL fleet profile, DS5).
+    pub fn from_url(url: String) -> Self {
+        Self::new(StoreDatabase::from_url(url))
+    }
+
+    pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
+        self.db.connection().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
+        self.test_clock = Some(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_faults_for_test(&mut self, faults: Arc<FleetFaults>) {
+        self.test_faults = Some(faults);
+    }
+
+    /// Hangs a fleet coordination call while the test's faults say the
+    /// store stopped answering.
+    #[cfg(test)]
+    async fn fleet_call_fault(&self) {
+        if let Some(faults) = &self.test_faults {
+            faults.wait_while_hung().await;
+        }
+    }
+
     fn fleet_now(&self) -> i64 {
-        self.now_millis()
+        #[cfg(test)]
+        if let Some(clock) = &self.test_clock {
+            return clock.load(Ordering::SeqCst);
+        }
+        crate::batch_runtime::store::current_timestamp_millis()
     }
 
     /// Publish one worker observation. Returns true when the row was created
@@ -476,14 +571,10 @@ fn fleet_reap_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::StoreDatabase;
-    use std::sync::{atomic::AtomicI64, Arc};
 
-    fn test_store_at(clock_ms: i64) -> (BatchRuntimeStore, tempfile::TempDir) {
+    fn test_store_at(clock_ms: i64) -> (FleetStore, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("temp dir");
-        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-            root.path().join("fleet.sqlite3"),
-        ));
+        let mut store = FleetStore::from_path(root.path().join("fleet.sqlite3"));
         store.set_test_clock(Arc::new(AtomicI64::new(clock_ms)));
         (store, root)
     }
@@ -736,9 +827,7 @@ mod tests {
         let db_path = root.path().join("shared-fleet.sqlite3");
         let mut stores = Vec::new();
         for _ in 0..2 {
-            let mut store = BatchRuntimeStore::initialize_with_database(
-                crate::db::StoreDatabase::new(db_path.clone()),
-            );
+            let mut store = FleetStore::from_path(db_path.clone());
             store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
             stores.push(store);
         }

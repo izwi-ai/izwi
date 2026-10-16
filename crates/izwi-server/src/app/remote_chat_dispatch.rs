@@ -789,7 +789,7 @@ mod tests {
         INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
     };
 
-    use crate::batch_runtime::store::BatchRuntimeStore;
+    use crate::gateway_fleet::FleetStore;
     use crate::db::StoreDatabase;
 
     use crate::worker_registry::{ApprovedDeployment, ApprovedWorker, WorkerRegistryConfig};
@@ -1737,7 +1737,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let root = tempfile::tempdir().unwrap();
-        let store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        let store = FleetStore::new(StoreDatabase::new(
             root.path().join("fleet.sqlite3"),
         ));
         (
@@ -1809,7 +1809,7 @@ mod tests {
                 4,
             );
             let coordinator = crate::app::fleet_coordinator::FleetCoordinator::new(
-                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(fleet_db.clone())),
+                FleetStore::new(StoreDatabase::new(fleet_db.clone())),
                 gateway_id.to_string(),
             );
             (registry, coordinator)
@@ -1887,10 +1887,10 @@ mod tests {
             1,
         );
         let root = tempfile::tempdir().unwrap();
-        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        let mut store = FleetStore::new(StoreDatabase::new(
             root.path().join("fleet.sqlite3"),
         ));
-        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        let faults = Arc::new(crate::gateway_fleet::FleetFaults::default());
         store.set_faults_for_test(Arc::clone(&faults));
         faults.hang_fleet_calls();
         let coordinator = Arc::new(

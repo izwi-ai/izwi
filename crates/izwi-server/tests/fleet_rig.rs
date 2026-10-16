@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 
 use izwi_core::ModelVariant;
-use izwi_server::batch_runtime::store::BatchRuntimeStore;
+use izwi_server::FleetStore;
 use izwi_serving_protocol::{ModelAlias, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
@@ -275,7 +275,7 @@ where
 /// Claim a worker's single fleet credit for the rig. A gateway releases its
 /// own dispatch claim asynchronously once the worker accepts, so the credit
 /// may still be held for a moment after that request; retry until it frees.
-async fn claim_until(claims: &BatchRuntimeStore, worker_id: &str, ttl_ms: u64) -> String {
+async fn claim_until(claims: &FleetStore, worker_id: &str, ttl_ms: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let claim = claims
@@ -328,7 +328,7 @@ async fn fleet_gateways_share_atomic_admission_across_processes() {
 
     // Sample the shared claim table while both gateways dispatch: the fence
     // must never show more live claims than the worker's single credit.
-    let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
+    let claims = FleetStore::from_path(fleet_db.clone());
     let sampler = tokio::spawn(async move {
         let mut max_live: u64 = 0;
         let deadline = Instant::now() + Duration::from_secs(6);
@@ -543,7 +543,7 @@ async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
     // and every worker's sequence advances monotonically under concurrent
     // publishers. Publishing is poller-cadence asynchronous, so wait for
     // both workers to appear before comparing samples.
-    let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
+    let claims = FleetStore::from_path(fleet_db.clone());
     let deadline = Instant::now() + Duration::from_secs(10);
     let first = loop {
         let view = claims
@@ -609,7 +609,7 @@ async fn fleet_capacity_claims_steer_dispatch_between_workers() {
     .await;
     wait_ready(&gateway).await;
 
-    let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
+    let claims = FleetStore::from_path(fleet_db.clone());
     let held = claim_until(&claims, WORKER_ONE_ID, 60_000).await;
 
     // The gateway learns the rig's claim on its poller cadence, so converge
@@ -696,7 +696,7 @@ async fn fleet_recovers_after_a_gateway_death_and_expired_claims() {
     // a live claim under its own identity. Forge it with a TTL long enough
     // for the survivor's poller to observe it on a loaded runner; nothing
     // ever releases it, so only TTL expiry can free worker one again.
-    let claims = BatchRuntimeStore::initialize_with_database_path(fleet_db.clone());
+    let claims = FleetStore::from_path(fleet_db.clone());
     let _dead_claim = claims
         .try_claim_fleet_capacity(WORKER_ONE_ID, "test-incarnation-1", "gateway-a", 1, 3_000)
         .await
@@ -770,7 +770,7 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
     };
 
     // Clean slate for the coordination schema.
-    let rig = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    let rig = FleetStore::from_url(fleet_url.clone());
     {
         let db = rig.connection().await.expect("postgres connection opens");
         let rows = db
@@ -788,7 +788,7 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
         }
     }
     // Reconnect to force a fresh migration run on the cleaned database.
-    let rig = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    let rig = FleetStore::from_url(fleet_url.clone());
     rig.count_live_fleet_claims(WORKER_ONE_ID)
         .await
         .expect("migrations run on the cleaned database");
@@ -810,7 +810,7 @@ async fn fleet_rig_postgres_lane_shares_admission_and_degrades_on_outage() {
 
     // T07 across processes on PostgreSQL: the claim fence holds under
     // concurrent dispatch from both gateways.
-    let sampler_store = BatchRuntimeStore::initialize_with_database_url(fleet_url.clone());
+    let sampler_store = FleetStore::from_url(fleet_url.clone());
     let sampler = tokio::spawn(async move {
         let mut max_live: u64 = 0;
         let deadline = Instant::now() + Duration::from_secs(6);

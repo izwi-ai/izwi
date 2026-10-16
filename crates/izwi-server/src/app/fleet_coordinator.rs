@@ -33,8 +33,7 @@ use std::{
 use izwi_serving_protocol::WorkerStatus;
 
 use crate::{
-    batch_runtime::store::BatchRuntimeStore,
-    gateway_fleet::{DEFAULT_FLEET_CLAIM_TIMEOUT_MS, DEFAULT_FLEET_CLAIM_TTL_MS},
+    gateway_fleet::{FleetStore, DEFAULT_FLEET_CLAIM_TIMEOUT_MS, DEFAULT_FLEET_CLAIM_TTL_MS},
     worker_registry::{FleetCapacityView, WorkerInstanceKey},
 };
 
@@ -134,7 +133,7 @@ impl Drop for FleetStatusPublisher {
 
 #[derive(Debug, Clone)]
 pub struct FleetCoordinator {
-    store: BatchRuntimeStore,
+    store: FleetStore,
     gateway_id: String,
     claim_ttl: Duration,
     claim_timeout: Duration,
@@ -142,7 +141,7 @@ pub struct FleetCoordinator {
 }
 
 impl FleetCoordinator {
-    pub fn new(store: BatchRuntimeStore, gateway_id: String) -> Self {
+    pub fn new(store: FleetStore, gateway_id: String) -> Self {
         Self {
             store,
             gateway_id,
@@ -182,7 +181,7 @@ impl FleetCoordinator {
     }
 
     #[cfg(test)]
-    pub(crate) fn store(&self) -> &BatchRuntimeStore {
+    pub(crate) fn store(&self) -> &FleetStore {
         &self.store
     }
 
@@ -297,7 +296,7 @@ impl FleetCoordinator {
     /// authoritative, and claims only ever steer.
     pub async fn publish_and_refresh(&self, status: &WorkerStatus) {
         let deployments = serde_json::to_string(&status.deployments).unwrap_or_default();
-        let observation = crate::batch_runtime::fleet::FleetWorkerObservation {
+        let observation = crate::gateway_fleet::FleetWorkerObservation {
             worker_id: status.worker_id.as_str().to_string(),
             node_id: status.node_id.as_str().to_string(),
             incarnation_id: status.incarnation_id.as_str().to_string(),
@@ -354,7 +353,7 @@ mod tests {
 
     async fn coordinator() -> (Arc<FleetCoordinator>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        let mut store = FleetStore::new(StoreDatabase::new(
             root.path().join("fleet-coord.sqlite3"),
         ));
         store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
@@ -374,7 +373,7 @@ mod tests {
         claim_ttl: Duration,
     ) -> (Arc<FleetCoordinator>, Arc<AtomicI64>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        let mut store = FleetStore::new(StoreDatabase::new(
             root.path().join("fleet-coord.sqlite3"),
         ));
         let clock = Arc::new(AtomicI64::new(1_000));
@@ -443,7 +442,7 @@ mod tests {
         let db_path = root.path().join("shared-fleet.sqlite3");
         let build = |gateway: &str| {
             FleetCoordinator::new(
-                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
+                FleetStore::new(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
             )
             .opened()
@@ -478,7 +477,7 @@ mod tests {
         let db_path = root.path().join("shared-fleet.sqlite3");
         let build = |gateway: &str| {
             FleetCoordinator::new(
-                BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone())),
+                FleetStore::new(StoreDatabase::new(db_path.clone())),
                 gateway.to_string(),
             )
             .opened()
@@ -514,10 +513,10 @@ mod tests {
     #[tokio::test]
     async fn hung_store_claims_degrade_to_none_and_late_claims_release() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        let mut store = FleetStore::new(StoreDatabase::new(
             root.path().join("fleet-coord.sqlite3"),
         ));
-        let faults = Arc::new(crate::batch_runtime::store::StoreFaults::default());
+        let faults = Arc::new(crate::gateway_fleet::FleetFaults::default());
         store.set_faults_for_test(Arc::clone(&faults));
         let coordinator = Arc::new(
             FleetCoordinator::new(store, "gateway-test".to_string())
@@ -571,7 +570,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dead_path = root.path().join("gone").join("fleet.sqlite3");
         let coordinator = Arc::new(FleetCoordinator::new(
-            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(dead_path)),
+            FleetStore::new(StoreDatabase::new(dead_path)),
             "gateway-outage".to_string(),
         ));
         let key = worker_key();
@@ -613,7 +612,7 @@ mod tests {
         let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500)).await;
         let key = worker_key();
         let _guard = coordinator.claim(&key, 2).await.expect("claim");
-        let observation = crate::batch_runtime::fleet::FleetWorkerObservation {
+        let observation = crate::gateway_fleet::FleetWorkerObservation {
             worker_id: "worker-a".to_string(),
             node_id: "node-1".to_string(),
             incarnation_id: "inc-a".to_string(),
