@@ -1,18 +1,14 @@
 //! Realtime transcription websocket endpoint for `/transcription`.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
-use izwi_core::{
-    audio::{AudioEncoder, AudioFormat},
-    RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass,
-};
+use futures::StreamExt;
+use izwi_core::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::app::realtime_protocol::{
@@ -20,15 +16,19 @@ use crate::app::realtime_protocol::{
     RealtimeDeliveryClass, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol,
     RealtimeServerEnvelope, RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
 };
+#[cfg(test)]
+use crate::app::realtime_transport::MailboxOutput;
+use crate::app::realtime_transport::{
+    now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, pcm16_i16_to_f32, spawn_writer,
+    wav_bytes_from_pcm16_mono, ClientPcm16Frame, OutboundClass, OutboundEnqueueError, OutboundItem,
+    OutboundLimits, OutboundMailbox,
+};
 use crate::state::AppState;
 
 pub(crate) const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
 pub(crate) const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
 
 pub(crate) const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
-pub(crate) const WS_BIN_VERSION: u8 = 1;
-pub(crate) const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
-pub(crate) const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
 
 const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
@@ -37,7 +37,6 @@ const INFERENCE_MIN_INTERVAL_MS: u64 = 350;
 const MIN_INFERENCE_AUDIO_MS: u32 = 180;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WORKER_COMMAND_QUEUE_CAPACITY: usize = 512;
-const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 // LocalAgreement-2 style stabilization (as used in whisper_streaming):
 // commit only the common prefix between the previous and current hypothesis.
 // Text-only approximation of whisper_streaming's timestamp boundary filtering:
@@ -70,7 +69,7 @@ impl OutboundTx {
 
     fn with_capacity(runtime: Arc<RuntimeService>, label: &'static str, capacity: usize) -> Self {
         Self {
-            mailbox: Arc::new(OutboundMailbox::new(capacity)),
+            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::items(capacity))),
             runtime,
             label,
         }
@@ -81,7 +80,7 @@ impl OutboundTx {
     }
 
     fn send_snapshot(&self, key: &'static str, message: Message) -> bool {
-        self.send_class(message, OutboundClass::Coalescible(key))
+        self.send_class(message, OutboundClass::Coalescible(key.to_string()))
     }
 
     fn send_diagnostic(&self, message: Message) -> bool {
@@ -89,7 +88,11 @@ impl OutboundTx {
     }
 
     fn send_class(&self, message: Message, class: OutboundClass) -> bool {
-        match self.mailbox.enqueue(OutboundItem { message, class }) {
+        match self.mailbox.enqueue(OutboundItem {
+            message,
+            class,
+            turn_generation: None,
+        }) {
             Ok(()) => true,
             Err(OutboundEnqueueError::Closed) => false,
             Err(err) => {
@@ -104,6 +107,7 @@ impl OutboundTx {
         }
     }
 
+    #[cfg(test)]
     async fn next(&self) -> Option<MailboxOutput> {
         self.mailbox.next().await
     }
@@ -114,135 +118,6 @@ impl OutboundTx {
 
     fn fail(&self, reason: &'static str) {
         self.mailbox.fail(reason);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundClass {
-    Critical,
-    Coalescible(&'static str),
-    Droppable,
-}
-
-struct OutboundItem {
-    message: Message,
-    class: OutboundClass,
-}
-
-struct OutboundMailbox {
-    capacity: usize,
-    state: Mutex<OutboundMailboxState>,
-    notify: Notify,
-}
-
-#[derive(Default)]
-struct OutboundMailboxState {
-    queue: VecDeque<OutboundItem>,
-    close_reason: Option<String>,
-    closed: bool,
-}
-
-enum MailboxOutput {
-    Message(Message),
-    Close(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundEnqueueError {
-    QueueSaturated,
-    DroppedDiagnostic,
-    Closed,
-}
-
-impl OutboundMailbox {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            state: Mutex::new(OutboundMailboxState::default()),
-            notify: Notify::new(),
-        }
-    }
-
-    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if state.closed {
-            return Err(OutboundEnqueueError::Closed);
-        }
-        if let OutboundClass::Coalescible(key) = item.class {
-            if let Some(existing) = state
-                .queue
-                .iter_mut()
-                .find(|queued| queued.class == OutboundClass::Coalescible(key))
-            {
-                existing.message = item.message;
-                return Ok(());
-            }
-        }
-        if state.queue.len() >= self.capacity {
-            return match item.class {
-                OutboundClass::Critical => {
-                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
-                    drop(state);
-                    self.notify.notify_one();
-                    Err(OutboundEnqueueError::QueueSaturated)
-                }
-                OutboundClass::Coalescible(_) => Err(OutboundEnqueueError::QueueSaturated),
-                OutboundClass::Droppable => Err(OutboundEnqueueError::DroppedDiagnostic),
-            };
-        }
-        state.queue.push_back(item);
-        drop(state);
-        self.notify.notify_one();
-        Ok(())
-    }
-
-    async fn next(&self) -> Option<MailboxOutput> {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if let Some(reason) = state.close_reason.take() {
-                    state.queue.clear();
-                    state.closed = true;
-                    return Some(MailboxOutput::Close(reason));
-                }
-                if let Some(item) = state.queue.pop_front() {
-                    return Some(MailboxOutput::Message(item.message));
-                }
-                if state.closed {
-                    return None;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
-        drop(state);
-        self.notify.notify_waiters();
-    }
-
-    fn fail(&self, reason: &'static str) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if !state.closed {
-            state.close_reason = Some(reason.to_string());
-        }
-        drop(state);
-        self.notify.notify_one();
     }
 }
 
@@ -547,30 +422,11 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         return;
     };
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, mut ws_rx) = socket.split();
     let out_tx = OutboundTx::new(state.runtime.clone(), "transcription realtime");
     let (worker_tx, worker_rx) = mpsc::channel::<WorkerCommand>(WORKER_COMMAND_QUEUE_CAPACITY);
 
-    let writer_tx = out_tx.clone();
-    let writer = tokio::spawn(async move {
-        while let Some(output) = writer_tx.next().await {
-            let message = match output {
-                MailboxOutput::Message(message) => message,
-                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
-                    code: 1011,
-                    reason: reason.into(),
-                })),
-            };
-            let terminal = matches!(message, Message::Close(_));
-            if !matches!(
-                tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await,
-                Ok(Ok(()))
-            ) || terminal
-            {
-                break;
-            }
-        }
-    });
+    let writer = spawn_writer(ws_tx, out_tx.mailbox.clone(), 1011);
 
     let worker = tokio::spawn(run_worker(
         state.clone(),
@@ -2090,53 +1946,16 @@ fn normalize_word(token: &str) -> String {
 }
 
 pub(crate) fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
-    if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
-        return Err("Unexpected binary message (missing transcription frame header)".to_string());
-    }
-
-    let version = data[4];
-    if version != WS_BIN_VERSION {
-        return Err(format!("Unsupported binary frame version {version}"));
-    }
-
-    let kind = data[5];
-    match kind {
-        WS_BIN_KIND_CLIENT_PCM16 => {
-            let sample_rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let frame_seq = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            Ok(BinaryMessageKind::ClientPcm16Frame {
-                frame_seq,
-                sample_rate,
-                payload: data[WS_BIN_CLIENT_HEADER_LEN..].to_vec(),
-            })
-        }
-        other => Err(format!("Unsupported binary frame kind {other}")),
-    }
-}
-
-fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.as_chunks::<2>().0 {
-        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    out
-}
-
-fn pcm16_i16_to_f32(samples_i16: &[i16]) -> Vec<f32> {
-    samples_i16
-        .iter()
-        .map(|sample| *sample as f32 / 32768.0)
-        .collect()
-}
-
-fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
-    if sample_rate == 0 {
-        return Err("Invalid sample rate 0".to_string());
-    }
-    let samples_f32 = pcm16_i16_to_f32(samples_i16);
-    AudioEncoder::new(sample_rate, 1)
-        .encode(&samples_f32, AudioFormat::Wav)
-        .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
+    let ClientPcm16Frame {
+        frame_seq,
+        sample_rate,
+        payload,
+    } = parse_client_pcm16_frame(data, WS_BIN_MAGIC, "transcription")?;
+    Ok(BinaryMessageKind::ClientPcm16Frame {
+        frame_seq,
+        sample_rate,
+        payload,
+    })
 }
 
 fn send_json(tx: &OutboundTx, value: serde_json::Value) {
@@ -2149,13 +1968,6 @@ fn send_json_snapshot(tx: &OutboundTx, key: &'static str, value: serde_json::Val
 
 fn send_json_diagnostic(tx: &OutboundTx, value: serde_json::Value) {
     let _ = tx.send_diagnostic(Message::Text(value.to_string().into()));
-}
-
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn send_worker_command(tx: &mpsc::Sender<WorkerCommand>, command: WorkerCommand) -> bool {

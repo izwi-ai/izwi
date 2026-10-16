@@ -12,12 +12,12 @@
 //! - interruption / barge-in cancellation
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use izwi_agent::{
     planner::{PlanningMode, SimplePlanner},
     AgentDefinition, AgentEngine, AgentSession, AgentTurnOptions, MemoryMessage, MemoryMessageMeta,
@@ -47,6 +47,11 @@ use crate::app::realtime_protocol::{
     RealtimeProtocol, RealtimeServerEvent, RealtimeSpeechEndReason, RealtimeTurnStatus,
     VOICE_REALTIME_VERSION,
 };
+use crate::app::realtime_transport::{
+    now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, spawn_writer,
+    wav_bytes_from_pcm16_mono, ClientPcm16Frame, OutboundClass, OutboundEnqueueError, OutboundItem,
+    OutboundLimits, OutboundMailbox,
+};
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
 use crate::state::{AppState, StoredAgentSessionRecord};
@@ -59,10 +64,7 @@ const DEFAULT_CHAT_MODEL: &str = "Qwen3.5-4B";
 const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
-const WS_BIN_VERSION: u8 = 1;
-const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
 const WS_BIN_KIND_ASSISTANT_PCM16: u8 = 2;
-const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
 const WS_BIN_ASSISTANT_HEADER_LEN: usize = 24;
 const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
 const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
@@ -79,7 +81,6 @@ const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
 const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
 const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
 const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
-const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
 /// Assistant audio sent this long after the audio already sent had finished
@@ -191,7 +192,7 @@ struct OutboundTx {
 impl OutboundTx {
     fn new(runtime: Arc<RuntimeService>, label: &'static str) -> Self {
         Self {
-            mailbox: Arc::new(OutboundMailbox::new(OutboundLimits::from_env())),
+            mailbox: Arc::new(OutboundMailbox::new(voice_outbound_limits())),
             wire: Arc::new(Mutex::new(VoiceOutboundWireState::default())),
             runtime,
             label,
@@ -208,12 +209,8 @@ impl OutboundTx {
     }
 
     fn send_text_snapshot(&self, generation: u64, key: String, message: Message) -> bool {
-        self.enqueue(
-            message,
-            OutboundClass::CoalescibleText(key),
-            Some(generation),
-        )
-        .is_ok()
+        self.enqueue(message, OutboundClass::Coalescible(key), Some(generation))
+            .is_ok()
     }
 
     fn send_audio(
@@ -249,7 +246,7 @@ impl OutboundTx {
     }
 
     fn send_diagnostic(&self, message: Message) -> bool {
-        self.enqueue(message, OutboundClass::Diagnostic, None)
+        self.enqueue(message, OutboundClass::Droppable, None)
             .is_ok()
     }
 
@@ -337,218 +334,19 @@ impl OutboundTx {
         serde_json::to_string(&typed.envelope(event, utterance_id, turn_id)).map(Some)
     }
 
-    async fn next(&self) -> Option<MailboxOutput> {
-        self.mailbox.next().await
-    }
-
     fn close(&self) {
         self.mailbox.close();
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OutboundClass {
-    Critical,
-    CoalescibleText(String),
-    Audio { bytes: usize, duration_ms: u64 },
-    Diagnostic,
-}
-
-struct OutboundItem {
-    message: Message,
-    class: OutboundClass,
-    turn_generation: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OutboundLimits {
-    max_items: usize,
-    max_audio_bytes: usize,
-    max_audio_ms: u64,
-}
-
-impl OutboundLimits {
-    fn from_env() -> Self {
-        Self {
-            max_items: env_usize("IZWI_VOICE_WS_OUTBOUND_ITEMS", WS_OUTBOUND_QUEUE_CAPACITY),
-            max_audio_bytes: env_usize(
-                "IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES",
-                WS_OUTBOUND_AUDIO_MAX_BYTES,
-            ),
-            max_audio_ms: env_u64("IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", WS_OUTBOUND_AUDIO_MAX_MS),
-        }
-    }
-}
-
-struct OutboundMailbox {
-    limits: OutboundLimits,
-    state: Mutex<OutboundMailboxState>,
-    notify: Notify,
-    minimum_turn_generation: AtomicU64,
-}
-
-#[derive(Default)]
-struct OutboundMailboxState {
-    queue: VecDeque<OutboundItem>,
-    audio_bytes: usize,
-    audio_ms: u64,
-    close_reason: Option<String>,
-    closed: bool,
-}
-
-enum MailboxOutput {
-    Message(Message),
-    Close(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundEnqueueError {
-    Cutoff,
-    AudioSaturated,
-    QueueSaturated,
-    Closed,
-    DroppedDiagnostic,
-}
-
-impl OutboundMailbox {
-    fn new(limits: OutboundLimits) -> Self {
-        Self {
-            limits,
-            state: Mutex::new(OutboundMailboxState::default()),
-            notify: Notify::new(),
-            minimum_turn_generation: AtomicU64::new(0),
-        }
-    }
-
-    fn enqueue(&self, item: OutboundItem) -> Result<(), OutboundEnqueueError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if item.turn_generation.is_some_and(|generation| {
-            generation < self.minimum_turn_generation.load(Ordering::Acquire)
-        }) {
-            return Err(OutboundEnqueueError::Cutoff);
-        }
-        if state.closed {
-            return Err(OutboundEnqueueError::Closed);
-        }
-
-        if let OutboundClass::CoalescibleText(key) = &item.class {
-            if let Some(existing) = state.queue.iter_mut().find(|queued| {
-                queued.turn_generation == item.turn_generation
-                    && matches!(&queued.class, OutboundClass::CoalescibleText(existing_key) if existing_key == key)
-            }) {
-                existing.message = item.message;
-                return Ok(());
-            }
-        }
-
-        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
-            if state.audio_bytes.saturating_add(*bytes) > self.limits.max_audio_bytes
-                || state.audio_ms.saturating_add(*duration_ms) > self.limits.max_audio_ms
-            {
-                state.close_reason = Some("outbound_audio_saturated".to_string());
-                self.notify.notify_one();
-                return Err(OutboundEnqueueError::AudioSaturated);
-            }
-        }
-
-        if state.queue.len() >= self.limits.max_items {
-            match &item.class {
-                OutboundClass::Critical => {
-                    state.close_reason = Some("critical_outbound_queue_saturated".to_string());
-                    self.notify.notify_one();
-                    return Err(OutboundEnqueueError::QueueSaturated);
-                }
-                OutboundClass::Audio { .. } => {
-                    state.close_reason = Some("outbound_audio_saturated".to_string());
-                    self.notify.notify_one();
-                    return Err(OutboundEnqueueError::AudioSaturated);
-                }
-                OutboundClass::Diagnostic => {
-                    return Err(OutboundEnqueueError::DroppedDiagnostic);
-                }
-                OutboundClass::CoalescibleText(_) => {
-                    return Err(OutboundEnqueueError::QueueSaturated);
-                }
-            }
-        }
-
-        if let OutboundClass::Audio { bytes, duration_ms } = &item.class {
-            state.audio_bytes = state.audio_bytes.saturating_add(*bytes);
-            state.audio_ms = state.audio_ms.saturating_add(*duration_ms);
-        }
-        state.queue.push_back(item);
-        drop(state);
-        self.notify.notify_one();
-        Ok(())
-    }
-
-    fn cutoff_turn(&self, generation: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        self.minimum_turn_generation
-            .fetch_max(generation.saturating_add(1), Ordering::AcqRel);
-        let mut retained = VecDeque::with_capacity(state.queue.len());
-        while let Some(item) = state.queue.pop_front() {
-            if item.turn_generation == Some(generation) {
-                subtract_audio_depth(&mut state, &item.class);
-            } else {
-                retained.push_back(item);
-            }
-        }
-        state.queue = retained;
-    }
-
-    fn accepts_turn_generation(&self, generation: u64) -> bool {
-        generation >= self.minimum_turn_generation.load(Ordering::Acquire)
-    }
-
-    async fn next(&self) -> Option<MailboxOutput> {
-        loop {
-            let notified = self.notify.notified();
-            {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                if let Some(reason) = state.close_reason.take() {
-                    state.queue.clear();
-                    state.audio_bytes = 0;
-                    state.audio_ms = 0;
-                    state.closed = true;
-                    return Some(MailboxOutput::Close(reason));
-                }
-                if let Some(item) = state.queue.pop_front() {
-                    subtract_audio_depth(&mut state, &item.class);
-                    return Some(MailboxOutput::Message(item.message));
-                }
-                if state.closed {
-                    return None;
-                }
-            }
-            notified.await;
-        }
-    }
-
-    fn close(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        state.closed = true;
-        drop(state);
-        self.notify.notify_waiters();
-    }
-}
-
-fn subtract_audio_depth(state: &mut OutboundMailboxState, class: &OutboundClass) {
-    if let OutboundClass::Audio { bytes, duration_ms } = class {
-        state.audio_bytes = state.audio_bytes.saturating_sub(*bytes);
-        state.audio_ms = state.audio_ms.saturating_sub(*duration_ms);
+fn voice_outbound_limits() -> OutboundLimits {
+    OutboundLimits {
+        max_items: env_usize("IZWI_VOICE_WS_OUTBOUND_ITEMS", WS_OUTBOUND_QUEUE_CAPACITY),
+        max_audio_bytes: env_usize(
+            "IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES",
+            WS_OUTBOUND_AUDIO_MAX_BYTES,
+        ),
+        max_audio_ms: env_u64("IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", WS_OUTBOUND_AUDIO_MAX_MS),
     }
 }
 
@@ -894,15 +692,6 @@ struct StreamingInputState {
     pre_roll: VecDeque<i16>,
     active: Option<StreamingActiveUtterance>,
     last_frame_at: Option<Instant>,
-}
-
-#[derive(Debug)]
-enum BinaryMessageKind {
-    ClientPcm16Frame {
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: Vec<u8>,
-    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1479,52 +1268,6 @@ fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
         .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
 }
 
-fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
-    if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != WS_BIN_MAGIC {
-        return Err("Unexpected binary message (missing voice realtime frame header)".to_string());
-    }
-
-    let version = data[4];
-    if version != WS_BIN_VERSION {
-        return Err(format!("Unsupported binary frame version {version}"));
-    }
-
-    let kind = data[5];
-    match kind {
-        WS_BIN_KIND_CLIENT_PCM16 => {
-            if data.len() < WS_BIN_CLIENT_HEADER_LEN {
-                return Err("Client PCM16 frame too short".to_string());
-            }
-            let sample_rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-            let frame_seq = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            Ok(BinaryMessageKind::ClientPcm16Frame {
-                frame_seq,
-                sample_rate,
-                payload: data[WS_BIN_CLIENT_HEADER_LEN..].to_vec(),
-            })
-        }
-        other => Err(format!("Unsupported binary frame kind {other}")),
-    }
-}
-
-fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.as_chunks::<2>().0 {
-        out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
-    }
-    out
-}
-
-fn wav_bytes_from_pcm16_mono(samples_i16: &[i16], sample_rate: u32) -> Result<Vec<u8>, String> {
-    if sample_rate == 0 {
-        return Err("Invalid sample rate 0".to_string());
-    }
-    let samples_f32: Vec<f32> = samples_i16.iter().map(|s| *s as f32 / 32768.0).collect();
-    AudioEncoder::new(sample_rate, 1)
-        .encode(&samples_f32, AudioFormat::Wav)
-        .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
-}
-
 fn encode_assistant_audio_binary_frame(
     utterance_seq: u64,
     chunk_seq: u32,
@@ -1534,7 +1277,7 @@ fn encode_assistant_audio_binary_frame(
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(WS_BIN_ASSISTANT_HEADER_LEN + payload_pcm16.len());
     out.extend_from_slice(WS_BIN_MAGIC);
-    out.push(WS_BIN_VERSION);
+    out.push(crate::app::realtime_transport::WS_BIN_VERSION);
     out.push(WS_BIN_KIND_ASSISTANT_PCM16);
     let flags: u16 = if is_final { 1 } else { 0 };
     out.extend_from_slice(&flags.to_le_bytes());
@@ -1568,28 +1311,9 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         return;
     };
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (ws_tx, mut ws_rx) = socket.split();
     let out_tx = OutboundTx::new(state.runtime.clone(), "voice realtime");
-    let writer_out_tx = out_tx.clone();
-
-    let writer = tokio::spawn(async move {
-        while let Some(output) = writer_out_tx.next().await {
-            let message = match output {
-                MailboxOutput::Message(message) => message,
-                MailboxOutput::Close(reason) => Message::Close(Some(CloseFrame {
-                    code: 1013,
-                    reason: reason.into(),
-                })),
-            };
-            match tokio::time::timeout(WS_WRITER_SEND_TIMEOUT, ws_tx.send(message)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => break,
-            }
-            if ws_tx.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let writer = spawn_writer(ws_tx, out_tx.mailbox.clone(), 1013);
 
     let mut conn = ConnectionState::default();
     send_json(
@@ -1990,103 +1714,98 @@ async fn handle_binary_message(
     conn: &mut ConnectionState,
     audio_bytes: Vec<u8>,
 ) -> Result<(), String> {
-    match parse_binary_message(&audio_bytes)? {
-        BinaryMessageKind::ClientPcm16Frame {
-            frame_seq,
-            sample_rate,
-            payload,
-        } => {
-            if !conn.started {
-                return Err("Session not started. Send `session_start` first.".to_string());
-            }
-            let Some(streaming) = conn.streaming_input.as_mut() else {
-                return Err(
-                    "Received streaming audio frame before `input_stream_start`.".to_string(),
-                );
-            };
-
-            let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
-
-            if let Some((expected, received)) = frame_result.sequence_gap {
-                state.runtime.record_voice_ingress_dropped_frames(u64::from(
-                    received.saturating_sub(expected),
-                ));
-                send_diagnostic_json(
-                    out_tx,
-                    json!({
-                        "type": "input_sequence_gap",
-                        "expected_frame_sequence": expected,
-                        "received_frame_sequence": received,
-                        "missing_frames": received.saturating_sub(expected),
-                        "action": "continue",
-                    }),
-                );
-            }
-
-            // Clients may duck playback on `user_speech_start` and resume it
-            // on `user_speech_rejected`; the turn is cancelled only once the
-            // speech is sustained.
-            if let Some(evt) = frame_result.speech_start {
-                conn.speech_started_at = Some(Instant::now());
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_start",
-                        "utterance_id": evt.utterance_id,
-                        "utterance_seq": evt.utterance_seq,
-                    }),
-                );
-            }
-
-            if frame_result.barge_in
-                && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await
-            {
-                state.runtime.record_voice_interruption();
-                state.runtime.record_voice_barge_in();
-                if let Some(started) = conn.speech_started_at {
-                    state
-                        .runtime
-                        .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
-                }
-                conn.voice_session.interrupt("barge_in");
-            }
-
-            if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_end",
-                        "utterance_id": commit.utterance_id,
-                        "utterance_seq": commit.utterance_seq,
-                        "reason": end_reason.as_str(),
-                    }),
-                );
-                finalize_stream_vad_utterance(
-                    state,
-                    correlation_id,
-                    out_tx,
-                    conn,
-                    commit,
-                    wav_bytes,
-                    end_reason,
-                )
-                .await?;
-            }
-
-            if let Some(evt) = frame_result.speech_rejected {
-                send_json(
-                    out_tx,
-                    json!({
-                        "type": "user_speech_rejected",
-                        "utterance_id": evt.utterance_id,
-                        "utterance_seq": evt.utterance_seq,
-                    }),
-                );
-            }
-
-            Ok(())
-        }
+    let ClientPcm16Frame {
+        frame_seq,
+        sample_rate,
+        payload,
+    } = parse_client_pcm16_frame(&audio_bytes, WS_BIN_MAGIC, "voice realtime")?;
+    if !conn.started {
+        return Err("Session not started. Send `session_start` first.".to_string());
     }
+    let Some(streaming) = conn.streaming_input.as_mut() else {
+        return Err("Received streaming audio frame before `input_stream_start`.".to_string());
+    };
+
+    let frame_result = streaming.handle_pcm16_frame(frame_seq, sample_rate, &payload)?;
+
+    if let Some((expected, received)) = frame_result.sequence_gap {
+        state
+            .runtime
+            .record_voice_ingress_dropped_frames(u64::from(received.saturating_sub(expected)));
+        send_diagnostic_json(
+            out_tx,
+            json!({
+                "type": "input_sequence_gap",
+                "expected_frame_sequence": expected,
+                "received_frame_sequence": received,
+                "missing_frames": received.saturating_sub(expected),
+                "action": "continue",
+            }),
+        );
+    }
+
+    // Clients may duck playback on `user_speech_start` and resume it
+    // on `user_speech_rejected`; the turn is cancelled only once the
+    // speech is sustained.
+    if let Some(evt) = frame_result.speech_start {
+        conn.speech_started_at = Some(Instant::now());
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_start",
+                "utterance_id": evt.utterance_id,
+                "utterance_seq": evt.utterance_seq,
+            }),
+        );
+    }
+
+    if frame_result.barge_in
+        && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await
+    {
+        state.runtime.record_voice_interruption();
+        state.runtime.record_voice_barge_in();
+        if let Some(started) = conn.speech_started_at {
+            state
+                .runtime
+                .record_voice_latency(VoiceLatency::BargeIn, started.elapsed());
+        }
+        conn.voice_session.interrupt("barge_in");
+    }
+
+    if let Some((commit, wav_bytes, end_reason)) = frame_result.finalized_utterance {
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_end",
+                "utterance_id": commit.utterance_id,
+                "utterance_seq": commit.utterance_seq,
+                "reason": end_reason.as_str(),
+            }),
+        );
+        finalize_stream_vad_utterance(
+            state,
+            correlation_id,
+            out_tx,
+            conn,
+            commit,
+            wav_bytes,
+            end_reason,
+        )
+        .await?;
+    }
+
+    if let Some(evt) = frame_result.speech_rejected {
+        send_json(
+            out_tx,
+            json!({
+                "type": "user_speech_rejected",
+                "utterance_id": evt.utterance_id,
+                "utterance_seq": evt.utterance_seq,
+            }),
+        );
+    }
+
+    Ok(())
 }
 
 fn spawn_turn_task(
@@ -3588,13 +3307,6 @@ fn send_turn_error(
     );
 }
 
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 fn strip_think_tags(input: &str) -> String {
     let open_tag = "<think>";
     let close_tag = "</think>";
@@ -3737,8 +3449,6 @@ impl ModelBackend for IzwiRuntimeBackend {
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::ws::Message;
-
     use super::*;
 
     fn test_streaming_input() -> StreamingInputState {
@@ -3894,133 +3604,6 @@ mod tests {
         assert_eq!(next.connection_epoch, 1);
         assert_eq!(next.sequence, 0);
         assert_eq!(next.validate_successor(&first), Ok(()));
-    }
-
-    #[tokio::test]
-    async fn outbound_mailbox_coalesces_text_snapshots() {
-        let mailbox = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 100,
-            max_audio_ms: 100,
-        });
-
-        for text in ["first", "latest"] {
-            mailbox
-                .enqueue(OutboundItem {
-                    message: Message::Text(text.into()),
-                    class: OutboundClass::CoalescibleText("transcript-1".to_string()),
-                    turn_generation: Some(1),
-                })
-                .expect("snapshot should enqueue");
-        }
-
-        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
-            panic!("latest text snapshot should be delivered");
-        };
-        assert_eq!(text.as_str(), "latest");
-    }
-
-    #[tokio::test]
-    async fn outbound_mailbox_preserves_audio_order_and_closes_on_saturation() {
-        let ordered = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 8,
-            max_audio_ms: 100,
-        });
-        for byte in [1_u8, 2_u8] {
-            ordered
-                .enqueue(OutboundItem {
-                    message: Message::Binary(vec![byte].into()),
-                    class: OutboundClass::Audio {
-                        bytes: 1,
-                        duration_ms: 10,
-                    },
-                    turn_generation: Some(1),
-                })
-                .expect("audio should enqueue");
-        }
-        for expected in [1_u8, 2_u8] {
-            let Some(MailboxOutput::Message(Message::Binary(bytes))) = ordered.next().await else {
-                panic!("audio should be delivered in order");
-            };
-            assert_eq!(bytes.as_ref(), &[expected]);
-        }
-
-        let saturated = OutboundMailbox::new(OutboundLimits {
-            max_items: 4,
-            max_audio_bytes: 1,
-            max_audio_ms: 10,
-        });
-        saturated
-            .enqueue(OutboundItem {
-                message: Message::Binary(vec![1].into()),
-                class: OutboundClass::Audio {
-                    bytes: 1,
-                    duration_ms: 10,
-                },
-                turn_generation: Some(1),
-            })
-            .expect("first audio should enqueue");
-        assert_eq!(
-            saturated.enqueue(OutboundItem {
-                message: Message::Binary(vec![2].into()),
-                class: OutboundClass::Audio {
-                    bytes: 1,
-                    duration_ms: 1,
-                },
-                turn_generation: Some(1),
-            }),
-            Err(OutboundEnqueueError::AudioSaturated)
-        );
-        assert!(matches!(
-            saturated.next().await,
-            Some(MailboxOutput::Close(reason)) if reason == "outbound_audio_saturated"
-        ));
-    }
-
-    #[tokio::test]
-    async fn outbound_mailbox_drops_diagnostics_and_cuts_off_cancelled_turns() {
-        let mailbox = OutboundMailbox::new(OutboundLimits {
-            max_items: 2,
-            max_audio_bytes: 100,
-            max_audio_ms: 100,
-        });
-        mailbox
-            .enqueue(OutboundItem {
-                message: Message::Text("cancelled".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(7),
-            })
-            .expect("cancelled turn event should initially enqueue");
-        mailbox
-            .enqueue(OutboundItem {
-                message: Message::Text("next".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(8),
-            })
-            .expect("next turn event should enqueue");
-        assert_eq!(
-            mailbox.enqueue(OutboundItem {
-                message: Message::Text("diagnostic".into()),
-                class: OutboundClass::Diagnostic,
-                turn_generation: None,
-            }),
-            Err(OutboundEnqueueError::DroppedDiagnostic)
-        );
-
-        mailbox.cutoff_turn(7);
-        assert_eq!(
-            mailbox.enqueue(OutboundItem {
-                message: Message::Text("late".into()),
-                class: OutboundClass::Critical,
-                turn_generation: Some(7),
-            }),
-            Err(OutboundEnqueueError::Cutoff)
-        );
-        let Some(MailboxOutput::Message(Message::Text(text))) = mailbox.next().await else {
-            panic!("next turn output should remain queued");
-        };
-        assert_eq!(text.as_str(), "next");
     }
 
     #[tokio::test]

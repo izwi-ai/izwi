@@ -20,7 +20,6 @@
 //! carries the full final text and replaces the accumulation.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
@@ -45,6 +44,7 @@ use crate::app::realtime_relay::{
     RelayStage, SessionGuard, SessionRegistration, SessionRegistryError, WorkerSide,
     REGISTRATION_TTL,
 };
+use crate::app::realtime_transport::now_unix_millis;
 use crate::app::transcription_realtime::{
     negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
     TranscriptionWireProtocol, LEGACY_REALTIME_PROTOCOL,
@@ -1075,13 +1075,6 @@ fn control_wire(frame: &RealtimeClientFrame) -> WireMessage {
             .expect("control frame encodes")
             .into(),
     )
-}
-
-fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// The approved speech_to_text stage, refused explicitly when unconfigured.
