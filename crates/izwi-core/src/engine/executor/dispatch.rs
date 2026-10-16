@@ -15,6 +15,20 @@ use super::{
 use crate::engine::ReadyQuantum;
 use crate::engine::{BatchDispatch, BatchDispatchKind};
 
+/// A mixed batch's decode rows and prefill spans; decode rows come first.
+pub(super) fn split_mixed_rows(
+    scheduled: &[ScheduledRequest],
+) -> Result<(&[ScheduledRequest], &[ScheduledRequest])> {
+    let decode_rows = scheduled.iter().take_while(|row| !row.is_prefill).count();
+    let (decode, prefill) = scheduled.split_at(decode_rows);
+    if prefill.iter().any(|row| !row.is_prefill) {
+        return Err(Error::InvalidInput(
+            "a mixed batch puts a decode row after a prefill span".into(),
+        ));
+    }
+    Ok((decode, prefill))
+}
+
 type RouteHandler =
     fn(&NativeExecutor, &EngineCoreRequest, &ScheduledRequest) -> Result<ModelSessionResult>;
 type VariantMatcher = fn(ModelVariant) -> bool;
@@ -122,7 +136,7 @@ impl NativeExecutor {
             .find(|route| route.matches(task, variant))
     }
 
-    fn execute_single_request(
+    pub(super) fn execute_single_request(
         &self,
         requests: &[&EngineCoreRequest],
         scheduled_req: &ScheduledRequest,
@@ -458,7 +472,24 @@ impl NativeExecutor {
         scheduled: &[ScheduledRequest],
         rows: Option<&[ReadyQuantum]>,
     ) -> Result<Vec<ExecutorStepResult>> {
-        let managed_caches = scheduled
+        let managed_caches = Self::continuous_chat_managed_states(requests, scheduled, rows)?;
+        let outputs = self.chat_decode_batch_with_managed(requests, scheduled, managed_caches)?;
+        self.finish_scheduled_execution(
+            requests,
+            scheduled,
+            outputs,
+            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
+            rows,
+        )
+    }
+
+    /// Each continuous chat row's managed views from its reservation.
+    fn continuous_chat_managed_states(
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: Option<&[ReadyQuantum]>,
+    ) -> Result<Vec<Option<super::RetainedRowManagedState>>> {
+        scheduled
             .iter()
             .map(|scheduled| {
                 let reservation = rows
@@ -475,15 +506,63 @@ impl NativeExecutor {
                     })
                     .transpose()
             })
-            .collect::<Result<Vec<_>>>()?;
-        let outputs = self.chat_decode_batch_with_managed(requests, scheduled, managed_caches)?;
+            .collect()
+    }
+
+    /// One mixed physical batch of a chat model: decode rows first, then
+    /// prefill spans, in one mixed model call, or with `force_split` through
+    /// the split handlers.
+    pub(super) fn execute_mixed_chat_requests_with_rows(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+        force_split: bool,
+    ) -> Result<Vec<ExecutorStepResult>> {
+        let outputs = if force_split {
+            self.chat_mixed_step_split(requests, scheduled, rows)?
+        } else {
+            let managed_caches =
+                Self::continuous_chat_managed_states(requests, scheduled, Some(rows))?;
+            self.chat_mixed_step_with_managed(requests, scheduled, managed_caches)?
+        };
         self.finish_scheduled_execution(
             requests,
             scheduled,
             outputs,
-            BatchDispatch::new(BatchDispatchKind::TensorContinuous, scheduled.len()),
-            rows,
+            BatchDispatch::new(BatchDispatchKind::TensorMixed, scheduled.len()),
+            Some(rows),
         )
+    }
+
+    /// The split execution of one mixed batch: its decode rows as one
+    /// continuous decode call, then each prefill span through the scalar
+    /// handler, in batch order. Rows commit exactly as a mixed call's do.
+    pub(super) fn chat_mixed_step_split(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        rows: &[ReadyQuantum],
+    ) -> Result<Vec<ModelSessionResult>> {
+        let (decode, prefill) = split_mixed_rows(scheduled)?;
+        let mut outputs = Vec::with_capacity(scheduled.len());
+        if !decode.is_empty() {
+            let managed_caches =
+                Self::continuous_chat_managed_states(requests, decode, Some(rows))?;
+            outputs.extend(self.chat_decode_batch_with_managed(
+                requests,
+                decode,
+                managed_caches,
+            )?);
+        }
+        for row in prefill {
+            let reservation = rows
+                .iter()
+                .find(|ready| ready.plan_id == row.plan_id)
+                .and_then(|ready| ready.managed_cache.as_ref());
+            outputs.push(self.execute_single_request(requests, row, reservation));
+        }
+        Ok(outputs)
     }
 
     pub(super) fn execute_continuous_asr_requests_with_rows(

@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::models::registry::{
-    NativeChatDecodeCheckpoint, NativeChatDecodeState, NativeChatDecodeStep, NativeChatModel,
+    MixedInput, MixedRow, MixedRowStep, NativeChatDecodeCheckpoint, NativeChatDecodeState,
+    NativeChatDecodeStep, NativeChatModel,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::ChatGenerationConfig;
@@ -318,8 +319,9 @@ impl NativeExecutor {
             ));
         }
         let model = request.prepared_chat_model_for_executor()?;
-        let resumable_prefill =
-            self.config.enable_chunked_prefill && model.supports_resumable_prefill();
+        let resumable_prefill = (self.config.enable_chunked_prefill
+            || super::binds_mixed_step(request))
+            && model.supports_resumable_prefill();
         if managed_cache.is_some()
             && scheduled.is_prefill
             && !resumable_prefill
@@ -1046,40 +1048,7 @@ impl NativeExecutor {
             match managed_cache {
                 Some(mut views) => {
                     let tensor_reservation = views.tensor_state.clone();
-                    let family = request.model_variant.map(|variant| variant.family());
-                    let (cache, mtp_cache) = if family
-                        == Some(crate::catalog::ModelFamily::Qwen38Chat)
-                    {
-                        let target =
-                            views.take_paged_domain(super::QWEN38_TARGET_ATTENTION_DOMAIN, true)?;
-                        let mtp =
-                            views.take_paged_domain(super::QWEN38_MTP_ATTENTION_DOMAIN, false)?;
-                        views.ensure_all_paged_consumed()?;
-                        (
-                            target.ok_or_else(|| {
-                                Error::InferenceError(
-                                    "continuous Qwen3.8 row lost its target cache".into(),
-                                )
-                            })?,
-                            mtp,
-                        )
-                    } else if family == Some(crate::catalog::ModelFamily::Qwen35MoeChat) {
-                        let target = views
-                            .take_paged_domain(super::QWEN36_MOE_TARGET_ATTENTION_DOMAIN, true)?;
-                        let mtp = views
-                            .take_paged_domain(super::QWEN36_MOE_MTP_ATTENTION_DOMAIN, false)?;
-                        views.ensure_all_paged_consumed()?;
-                        (
-                            target.ok_or_else(|| {
-                                Error::InferenceError(
-                                    "continuous Qwen3.6-MoE row lost its target cache".into(),
-                                )
-                            })?,
-                            mtp,
-                        )
-                    } else {
-                        (views.take_only_paged()?, None)
-                    };
+                    let (cache, mtp_cache) = Self::continuous_row_caches(request, &mut views)?;
                     let tensor_arena = request
                         .managed_cache_runtime()
                         .and_then(|runtime| runtime.tensor_state());
@@ -1180,75 +1149,15 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for ((index, _, lease, _), mut step) in active_states.rows.iter_mut().zip(steps) {
-            let request = ordered_requests[*index];
-            let active_state = lease.require_state_mut()?;
-            record_lfm_completion(&active_state.state, request, &step);
-            let stream_logprobs = active_state.apply_stop_sequences(&mut step);
-            let step_tokens_generated = step
-                .tokens_generated
-                .saturating_sub(active_state.last_tokens_generated);
-            active_state.last_tokens_generated = step.tokens_generated;
-            // Recorded before the stream branch: a non-streamed row has no
-            // sender, and its terminal output must still carry every entry.
-            let terminal_logprobs = active_state.record_step_logprobs(&step.logprobs, step.finished);
-            let stream_result = (|| -> Result<()> {
-                let Some(tx) = Self::stream_sender(request) else {
-                    return Ok(());
-                };
-                if !step.delta.is_empty() || !stream_logprobs.is_empty() {
-                    Self::stream_chat_text_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active_state.stream_sequence,
-                        step.delta.clone(),
-                        stream_logprobs,
-                    )?;
-                    active_state.streamed_text.push_str(&step.delta);
-                }
-                if step.finished {
-                    Self::stream_final_marker_with_policy(
-                        &tx,
-                        request.stream_policy,
-                        &request.id,
-                        &mut active_state.stream_sequence,
-                    )?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = stream_result {
-                outputs[*index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
-                    request.id.clone(),
-                    format!("continuous chat stream staging failed: {error}"),
-                )));
-                continue;
-            }
-
-            let managed_cache_completions = active_state.state.take_managed_write_completions();
-            outputs[*index] = Some(
-                ModelSessionResult::sequence(ExecutorOutput {
-                    request_id: request.id.clone(),
-                    audio: Some(AudioOutput::empty(24_000)),
-                    text: Some(if step.finished {
-                        canonical_chat_terminal_text(&active_state.streamed_text, step.text)
-                    } else {
-                        step.text
-                    }),
-                    input_transcription: None,
-                    tokens_processed: 1,
-                    tokens_generated: step_tokens_generated,
-                    finished: step.finished,
-                    phase_timing_override: None,
-                    asr_diagnostics: None,
-                    error: None,
-                    logprobs: terminal_logprobs,
-                })
-                .with_managed_cache_completions(managed_cache_completions),
+        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
+            let (output, continues) = Self::publish_shared_row_step(
+                ordered_requests[*index],
+                lease.require_state_mut()?,
+                step,
+                1,
             );
-            if !step.finished {
-                continuing[*index] = true;
-            }
+            outputs[*index] = Some(output);
+            continuing[*index] = continues;
         }
 
         let committed_states = active_states.commit();
@@ -1270,6 +1179,410 @@ impl NativeExecutor {
             .map(|output| {
                 output.ok_or_else(|| {
                     Error::InferenceError("continuous chat row produced no result".into())
+                })
+            })
+            .collect()
+    }
+
+    /// The target cache, and the MTP cache of a family with one, of a
+    /// continuous chat row's managed views.
+    fn continuous_row_caches(
+        request: &EngineCoreRequest,
+        views: &mut super::RetainedRowManagedState,
+    ) -> Result<(PhysicalPagedKvCache, Option<PhysicalPagedKvCache>)> {
+        let family = request.model_variant.map(|variant| variant.family());
+        let (target, mtp, name) = if family == Some(crate::catalog::ModelFamily::Qwen38Chat) {
+            (
+                super::QWEN38_TARGET_ATTENTION_DOMAIN,
+                super::QWEN38_MTP_ATTENTION_DOMAIN,
+                "Qwen3.8",
+            )
+        } else if family == Some(crate::catalog::ModelFamily::Qwen35MoeChat) {
+            (
+                super::QWEN36_MOE_TARGET_ATTENTION_DOMAIN,
+                super::QWEN36_MOE_MTP_ATTENTION_DOMAIN,
+                "Qwen3.6-MoE",
+            )
+        } else {
+            return Ok((views.take_only_paged()?, None));
+        };
+        let target = views.take_paged_domain(target, true)?;
+        let mtp = views.take_paged_domain(mtp, false)?;
+        views.ensure_all_paged_consumed()?;
+        let target = target.ok_or_else(|| {
+            Error::InferenceError(format!("continuous {name} row lost its target cache"))
+        })?;
+        Ok((target, mtp))
+    }
+
+    /// Publish one row's step of a shared model call: stop strings,
+    /// logprobs, stream deltas and the final marker, then the row's output.
+    /// Returns the output and whether the row continues.
+    fn publish_shared_row_step(
+        request: &EngineCoreRequest,
+        active_state: &mut ActiveChatDecode,
+        mut step: NativeChatDecodeStep,
+        tokens_processed: usize,
+    ) -> (ModelSessionResult, bool) {
+        record_lfm_completion(&active_state.state, request, &step);
+        let stream_logprobs = active_state.apply_stop_sequences(&mut step);
+        let step_tokens_generated = step
+            .tokens_generated
+            .saturating_sub(active_state.last_tokens_generated);
+        active_state.last_tokens_generated = step.tokens_generated;
+        // Recorded before the stream branch: a non-streamed row has no
+        // sender, and its terminal output must still carry every entry.
+        let terminal_logprobs = active_state.record_step_logprobs(&step.logprobs, step.finished);
+        let stream_result = (|| -> Result<()> {
+            let Some(tx) = Self::stream_sender(request) else {
+                return Ok(());
+            };
+            if !step.delta.is_empty() || !stream_logprobs.is_empty() {
+                Self::stream_chat_text_with_policy(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active_state.stream_sequence,
+                    step.delta.clone(),
+                    stream_logprobs,
+                )?;
+                active_state.streamed_text.push_str(&step.delta);
+            }
+            if step.finished {
+                Self::stream_final_marker_with_policy(
+                    &tx,
+                    request.stream_policy,
+                    &request.id,
+                    &mut active_state.stream_sequence,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = stream_result {
+            return (
+                ModelSessionResult::sequence(ExecutorOutput::error(
+                    request.id.clone(),
+                    format!("continuous chat stream staging failed: {error}"),
+                )),
+                false,
+            );
+        }
+
+        let managed_cache_completions = active_state.state.take_managed_write_completions();
+        let output = ModelSessionResult::sequence(ExecutorOutput {
+            request_id: request.id.clone(),
+            audio: Some(AudioOutput::empty(24_000)),
+            text: Some(if step.finished {
+                canonical_chat_terminal_text(&active_state.streamed_text, step.text)
+            } else {
+                step.text
+            }),
+            input_transcription: None,
+            tokens_processed,
+            tokens_generated: step_tokens_generated,
+            finished: step.finished,
+            phase_timing_override: None,
+            asr_diagnostics: None,
+            error: None,
+            logprobs: terminal_logprobs,
+        })
+        .with_managed_cache_completions(managed_cache_completions);
+        (output, !step.finished)
+    }
+
+    /// Run one mixed physical batch of a chat model whose loaded family runs
+    /// mixed steps: one-token decode rows first, then resumable prefill
+    /// spans, in one model call and one sampling readback.
+    ///
+    /// Every row binds its managed views before the call. A row with state
+    /// checkpoints its quantum, so a failed call rolls it back; a prefill row
+    /// starting its first span begins its state first, as the scalar
+    /// handler does. Each row then publishes like a continuous decode row: a
+    /// non-final span reports its span and no token; a final span publishes
+    /// its bootstrap token.
+    pub(super) fn chat_mixed_step_with_managed(
+        &self,
+        requests: &[&EngineCoreRequest],
+        scheduled: &[ScheduledRequest],
+        managed_caches: Vec<Option<super::RetainedRowManagedState>>,
+    ) -> Result<Vec<ModelSessionResult>> {
+        if scheduled.is_empty()
+            || managed_caches.len() != scheduled.len()
+            || scheduled
+                .windows(2)
+                .any(|pair| pair[0].is_prefill && !pair[1].is_prefill)
+            || scheduled
+                .iter()
+                .any(|row| !row.is_prefill && row.num_tokens != 1)
+        {
+            return Err(Error::InvalidInput(
+                "a mixed chat step takes one-token decode rows, then prefill spans, each with its managed views".into(),
+            ));
+        }
+        let ordered_requests = scheduled
+            .iter()
+            .map(|scheduled| {
+                requests
+                    .iter()
+                    .copied()
+                    .find(|request| request.id == scheduled.request_id)
+                    .ok_or_else(|| {
+                        Error::InferenceError(format!(
+                            "mixed chat request {} is missing its snapshot",
+                            scheduled.request_id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut outputs = ordered_requests
+            .iter()
+            .map(|request| {
+                request.is_cancelled().then(|| {
+                    ModelSessionResult::cancelled_before_dispatch(ExecutorOutput::cancelled(
+                        request.id.clone(),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        let live_indices = (0..scheduled.len())
+            .filter(|index| outputs[*index].is_none())
+            .collect::<Vec<_>>();
+        let Some(&first_live) = live_indices.first() else {
+            return outputs
+                .into_iter()
+                .map(|output| {
+                    output.ok_or_else(|| {
+                        Error::InferenceError("cancelled chat row produced no result".into())
+                    })
+                })
+                .collect();
+        };
+        let model = ordered_requests[first_live].prepared_chat_model_for_executor()?;
+        if !model.supports_mixed_step() {
+            return Err(Error::InvalidInput(
+                "loaded chat model does not run mixed prefill and decode steps".into(),
+            ));
+        }
+        for index in live_indices.iter().copied().skip(1) {
+            let row_model = ordered_requests[index].prepared_chat_model_for_executor()?;
+            if !Arc::ptr_eq(&model, &row_model) {
+                return Err(Error::InferenceError(
+                    "mixed chat batch spans different loaded model instances".into(),
+                ));
+            }
+        }
+
+        let mut checked_out = Vec::with_capacity(live_indices.len());
+        for index in live_indices.iter().copied() {
+            let request = ordered_requests[index];
+            let session = scheduled[index].session_key();
+            let variant = Self::resolve_variant(request)?;
+            let lease = ExecutorStateLease::checkout(
+                &self.chat_decode_states,
+                session.clone(),
+                variant,
+                "mixed chat step",
+            )?;
+            if lease.state().is_some_and(|state| state.variant != variant) {
+                return Err(Error::InferenceError(
+                    "mixed chat state variant does not match its request".into(),
+                ));
+            }
+            checked_out.push((index, session, lease));
+        }
+        let mut active_states = ContinuousChatStateBatch::new(checked_out);
+        let mut managed_caches = managed_caches;
+        for (index, session, lease, checkpoint) in &mut active_states.rows {
+            let request = ordered_requests[*index];
+            let row = &scheduled[*index];
+            let mut views = managed_caches[*index].take().ok_or_else(|| {
+                Error::InferenceError("mixed chat row has no managed-cache reservation".into())
+            })?;
+            let tensor_reservation = views.tensor_state.clone();
+            let (cache, mtp_cache) = Self::continuous_row_caches(request, &mut views)?;
+            let tensor_arena = request
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state());
+            if tensor_arena.is_some() != tensor_reservation.is_some() {
+                return Err(Error::InferenceError(
+                    "mixed hybrid row lost its tensor-state reservation".into(),
+                ));
+            }
+            lease.mark_dirty();
+            if lease.state().is_some() {
+                let active_state = lease.require_state_mut()?;
+                if let (Some(arena), Some(reservation)) = (tensor_arena, tensor_reservation) {
+                    active_state
+                        .state
+                        .bind_hybrid_tensor_sequence(reservation.sequence)?;
+                    active_state.state.restore_hybrid_tensor_state(arena)?;
+                }
+                *checkpoint = Some(
+                    active_state
+                        .state
+                        .begin_continuous_quantum(cache, mtp_cache)?,
+                );
+                continue;
+            }
+            if !begins_resumable_prefill_state(row, true, request)
+                || self
+                    .suspended_chat_states
+                    .lock()
+                    .map_err(|_| Error::InferenceError("suspended chat mutex poisoned".into()))?
+                    .contains_key(session)
+            {
+                return Err(Error::InferenceError(format!(
+                    "mixed chat row {} has no decode state to continue",
+                    request.id
+                )));
+            }
+            let messages = Self::chat_messages(request)?;
+            let generation_config = Self::chat_generation_config(request);
+            let mut state = Self::run_blocking(|| {
+                model.start_resumable_prefill_state_managed(
+                    messages,
+                    request.params.max_tokens.max(1),
+                    &generation_config,
+                    request.prepared_chat_prompt_for_executor()?,
+                    &request.prompt_tokens,
+                    cache,
+                    mtp_cache,
+                )
+            })?;
+            if let Some(reservation) = tensor_reservation {
+                state.bind_hybrid_tensor_sequence(reservation.sequence)?;
+                if let Some(arena) = tensor_arena {
+                    state.restore_hybrid_tensor_state(arena)?;
+                }
+            }
+            lease.install_state(ActiveChatDecode {
+                variant: Self::resolve_variant(request)?,
+                state,
+                last_tokens_generated: 0,
+                stream_sequence: 0,
+                streamed_text: String::new(),
+                logprobs: Vec::new(),
+                stop: StopSequenceFilter::new(&request.params.stop_sequences),
+            })?;
+        }
+
+        let mut spans = Vec::with_capacity(active_states.rows.len());
+        for (index, _, lease, _) in &active_states.rows {
+            let request = ordered_requests[*index];
+            let row = &scheduled[*index];
+            spans.push(if row.is_prefill {
+                let (start, end) = resumable_prefill_span(row, request.num_prompt_tokens())?;
+                // An attached prefix can leave the state's cursor above the
+                // scheduled start; the model feeds from its own cursor.
+                let start = lease
+                    .state()
+                    .and_then(|active| active.state.prefill_progress())
+                    .unwrap_or(start)
+                    .max(start);
+                Some((start, end))
+            } else {
+                None
+            });
+        }
+        let mut rows = Vec::with_capacity(active_states.rows.len());
+        for ((index, _, lease, _), span) in active_states.rows.iter_mut().zip(&spans) {
+            let request = ordered_requests[*index];
+            let input = match *span {
+                Some((span_start, span_end)) => MixedInput::Prefill {
+                    prompt: &request.prompt_tokens,
+                    prepared: request.prepared_chat_prompt_for_executor()?,
+                    span_start,
+                    span_end,
+                },
+                None => MixedInput::Decode,
+            };
+            rows.push(MixedRow {
+                state: &mut lease.require_state_mut()?.state,
+                input,
+            });
+        }
+        let live_width = rows.len();
+        let steps = Self::run_blocking(|| model.step_mixed(&mut rows))?;
+        drop(rows);
+        if steps.len() != live_width {
+            return Err(Error::InferenceError(
+                "mixed chat model returned the wrong number of rows".into(),
+            ));
+        }
+        crate::engine::metrics::record_engine_model_call(
+            crate::engine::metrics::EngineModelCall::NativeTensor {
+                mode: crate::engine::NativeBatchMode::Mixed,
+                rows: live_width,
+            },
+        );
+
+        for (index, _, lease, _) in &mut active_states.rows {
+            if let Some(arena) = ordered_requests[*index]
+                .managed_cache_runtime()
+                .and_then(|runtime| runtime.tensor_state())
+            {
+                lease
+                    .require_state_mut()?
+                    .state
+                    .stage_hybrid_tensor_state(arena, scheduled[*index].plan_id)?;
+            }
+        }
+
+        let mut continuing = vec![false; scheduled.len()];
+        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
+            let row = &scheduled[*index];
+            let active_state = lease.require_state_mut()?;
+            let (step, tokens_processed) = match step {
+                MixedRowStep::Progress { input_tokens } => {
+                    if !row.is_prefill || input_tokens != row.num_tokens {
+                        return Err(Error::InferenceError(
+                            "mixed chat row reported progress that is not its prefill span".into(),
+                        ));
+                    }
+                    let step = NativeChatDecodeStep {
+                        delta: String::new(),
+                        text: String::new(),
+                        tokens_generated: active_state.last_tokens_generated,
+                        input_tokens_committed: 0,
+                        finished: false,
+                        logprobs: Vec::new(),
+                    };
+                    (step, input_tokens)
+                }
+                MixedRowStep::Token(step) if row.is_prefill => (step, row.num_tokens),
+                MixedRowStep::Token(step) => {
+                    let tokens = step.input_tokens_committed;
+                    (step, tokens)
+                }
+            };
+            let (output, continues) = Self::publish_shared_row_step(
+                ordered_requests[*index],
+                active_state,
+                step,
+                tokens_processed,
+            );
+            outputs[*index] = Some(output);
+            continuing[*index] = continues;
+        }
+
+        for (index, _, lease) in active_states.commit() {
+            let transition = if continuing[index] {
+                lease.restore()
+            } else {
+                lease.release()
+            };
+            if let Err(error) = transition {
+                outputs[index] = Some(ModelSessionResult::sequence(ExecutorOutput::error(
+                    ordered_requests[index].id.clone(),
+                    format!("mixed chat state transition failed: {error}"),
+                )));
+            }
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    Error::InferenceError("mixed chat row produced no result".into())
                 })
             })
             .collect()
@@ -1754,5 +2067,338 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Two chat requests over one tiny Qwen3.8 model, managed cache and
+    /// executor: "decoder" already prefilled, "prompt" not started.
+    struct MixedWorld {
+        executor: NativeExecutor,
+        manager: crate::engine::cache::managed::ManagedKvCacheManager,
+        runtime: Arc<crate::engine::ManagedKvModelRuntime>,
+        decoder: EngineCoreRequest,
+        prompt: EngineCoreRequest,
+    }
+
+    impl MixedWorld {
+        fn new(
+            lease: &crate::models::registry::ChatModelLease,
+            capability: &crate::kv::InferenceStateCapability,
+        ) -> Self {
+            use crate::backends::BackendKind;
+            use crate::engine::ModelInstanceId;
+            use crate::models::architectures::qwen38::chat::recovery_tests::prepared_prompt;
+            use crate::models::registry::NativeChatPreparedPrompt;
+
+            let instance = ModelInstanceId::new(9292);
+            let mut manager = crate::engine::cache::managed::ManagedKvCacheManager::new(None);
+            let runtime = manager
+                .bind_request(instance, BackendKind::Cpu, 16, 4, capability)
+                .unwrap()
+                .unwrap();
+            let request = |id: &str| {
+                let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: id.into(),
+                }])
+                .with_model_variant(ModelVariant::Qwen3827BFp8);
+                request.id = id.into();
+                request.model_instance_id = Some(instance);
+                request.params.max_tokens = 12;
+                request.params.temperature = 0.8;
+                let prepared = prepared_prompt();
+                request
+                    .install_chat_execution_preparation_with_model(
+                        ModelVariant::Qwen3827BFp8,
+                        prepared.prompt_ids().to_vec(),
+                        Some(NativeChatPreparedPrompt::Qwen38(prepared)),
+                        lease.clone(),
+                        32,
+                    )
+                    .unwrap();
+                request
+                    .install_managed_cache_runtime(runtime.clone())
+                    .unwrap();
+                request
+            };
+            let mut world = Self {
+                executor: NativeExecutor::new(super::super::WorkerConfig {
+                    enable_chunked_prefill: true,
+                    ..Default::default()
+                }),
+                manager,
+                runtime: runtime.clone(),
+                decoder: request("decoder"),
+                prompt: request("prompt"),
+            };
+            let decoder = world.decoder.clone();
+            let prefill = Self::row(&decoder, 1, 0, decoder.num_prompt_tokens(), true);
+            let reservation = world.reserve(&decoder, &prefill);
+            let result =
+                world
+                    .executor
+                    .execute_single_request(&[&decoder], &prefill, Some(&reservation));
+            world.commit(&reservation, &result);
+            world
+        }
+
+        fn row(
+            request: &EngineCoreRequest,
+            plan: u64,
+            start: usize,
+            end: usize,
+            prefill: bool,
+        ) -> ScheduledRequest {
+            ScheduledRequest {
+                plan_id: plan,
+                request_id: request.id.clone(),
+                sequence_id: 1,
+                num_tokens: end - start,
+                is_prefill: prefill,
+                num_computed_tokens: start,
+                work: WorkUnit::SequenceStep {
+                    phase: if prefill {
+                        SequencePhase::Prefill
+                    } else {
+                        SequencePhase::Decode
+                    },
+                    input: InputRange { start, end },
+                    max_output_steps: end - start,
+                    auxiliary_state: None,
+                },
+            }
+        }
+
+        fn reserve(
+            &mut self,
+            request: &EngineCoreRequest,
+            row: &ScheduledRequest,
+        ) -> crate::engine::ManagedCacheReservation {
+            self.manager
+                .prepare_incremental(
+                    &self.runtime,
+                    row.plan_id,
+                    &row.session_key(),
+                    &row.work,
+                    Some(request),
+                )
+                .unwrap()
+                .unwrap()
+        }
+
+        fn commit(
+            &mut self,
+            reservation: &crate::engine::ManagedCacheReservation,
+            result: &ModelSessionResult,
+        ) {
+            assert!(result.output.error.is_none(), "{:?}", result.output.error);
+            let receipt = reservation
+                .completed_write_receipt(&result.managed_cache_completions)
+                .unwrap();
+            self.manager
+                .finalize(reservation, Some(&receipt), true)
+                .unwrap();
+        }
+
+        fn views(
+            &self,
+            requests: &[&EngineCoreRequest],
+            rows: &[ScheduledRequest],
+            reservations: &[crate::engine::ManagedCacheReservation],
+        ) -> Vec<Option<super::super::RetainedRowManagedState>> {
+            rows.iter()
+                .zip(requests)
+                .zip(reservations)
+                .map(|((row, request), reservation)| {
+                    Some(
+                        super::super::retained_row_managed_state_for_row(request, row, reservation)
+                            .unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        /// A ready row carrying `reservation`; only the reservation is read.
+        fn ready(
+            row: &ScheduledRequest,
+            reservation: &crate::engine::ManagedCacheReservation,
+        ) -> crate::engine::ReadyQuantum {
+            crate::engine::ReadyQuantum {
+                plan_id: row.plan_id,
+                session: row.session_key(),
+                lane: crate::engine::BatchLaneKey {
+                    execution_group: crate::engine::ExecutionGroupId::new(1),
+                    model_instance: crate::engine::ModelInstanceId::new(9292),
+                    adapter_instance: crate::engine::AdapterInstanceId::new(1),
+                    adapter_abi: crate::engine::AdapterAbiRevision::new(1),
+                    capability_id: "chat".into(),
+                    stage_id: crate::engine::StageId::new(3),
+                    backend: crate::backends::BackendKind::Cpu,
+                    device_ordinal: None,
+                    compute_dtype: "f32".into(),
+                    state_dtype: "f32".into(),
+                    tensor_layout: "ragged".into(),
+                    quantization: "adapter-owned".into(),
+                    state_schema: "test".into(),
+                    kernel_mode: "chat.step.mixed".into(),
+                    semantic_mode: "chat.sequence_step".into(),
+                    shape_bucket: "ragged".into(),
+                },
+                work: row.work.clone(),
+                cost: crate::engine::WorkCost::new(row.num_tokens as u64, row.num_tokens as u64, 0),
+                managed_cache: Some(reservation.clone()),
+            }
+        }
+    }
+
+    fn session_summary(
+        result: &ModelSessionResult,
+    ) -> (String, usize, usize, Option<String>, bool) {
+        (
+            result.output.request_id.clone(),
+            result.output.tokens_processed,
+            result.output.tokens_generated,
+            result.output.text.clone(),
+            result.output.finished,
+        )
+    }
+
+    /// `IZWI_MIXED_FORCE_SPLIT` runs a mixed batch (a decode row, then a
+    /// final prefill span) through the split handlers with each row's own
+    /// managed reservation, in batch order: every row's output, and the next
+    /// decode step, equal those of the same rows run one handler at a time.
+    /// The mixed call itself refuses a model without a mixed forward before
+    /// it touches any row's state.
+    #[test]
+    fn forced_split_mixed_step_runs_the_split_handlers_in_batch_order() {
+        use crate::kv::InferenceStateContractProvider;
+        use crate::models::architectures::qwen38::chat::recovery_tests::model_fixture;
+        use crate::models::registry::ChatModelLease;
+
+        let model = model_fixture(true);
+        let capability = model.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Qwen38(model));
+        let mut oracle = MixedWorld::new(&lease, &capability);
+        let mut reference = MixedWorld::new(&lease, &capability);
+        let (decoder, prompt) = (oracle.decoder.clone(), oracle.prompt.clone());
+        let decode_at = decoder.num_prompt_tokens();
+        let span_tokens = prompt.num_prompt_tokens();
+        let scheduled = [
+            MixedWorld::row(&decoder, 2, decode_at, decode_at + 1, false),
+            MixedWorld::row(&prompt, 3, 0, span_tokens, true),
+        ];
+
+        // Aborted transactions stay terminal, so the refused attempt takes
+        // its own plan ids.
+        let refused_rows = scheduled.clone().map(|mut row| {
+            row.plan_id += 100;
+            row
+        });
+        let reservations = refused_rows
+            .iter()
+            .zip([&decoder, &prompt])
+            .map(|(row, request)| oracle.reserve(request, row))
+            .collect::<Vec<_>>();
+        let views = oracle.views(&[&decoder, &prompt], &refused_rows, &reservations);
+        let refused = oracle
+            .executor
+            .chat_mixed_step_with_managed(&[&decoder, &prompt], &refused_rows, views)
+            .unwrap_err();
+        assert!(refused.to_string().contains("mixed"), "{refused}");
+        for reservation in &reservations {
+            oracle.manager.finalize(reservation, None, false).unwrap();
+        }
+
+        let reservations = scheduled
+            .iter()
+            .zip([&decoder, &prompt])
+            .map(|(row, request)| oracle.reserve(request, row))
+            .collect::<Vec<_>>();
+        let rows = scheduled
+            .iter()
+            .zip(&reservations)
+            .map(|(row, reservation)| MixedWorld::ready(row, reservation))
+            .collect::<Vec<_>>();
+        let mixed = oracle
+            .executor
+            .chat_mixed_step_split(&[&decoder, &prompt], &scheduled, &rows)
+            .unwrap();
+        assert_eq!(mixed.len(), 2);
+        for (reservation, result) in reservations.iter().zip(&mixed) {
+            oracle.commit(reservation, result);
+        }
+
+        let (reference_decoder, reference_prompt) =
+            (reference.decoder.clone(), reference.prompt.clone());
+        let reservation = reference.reserve(&reference_decoder, &scheduled[0]);
+        let views = reference.views(
+            &[&reference_decoder],
+            &scheduled[..1],
+            std::slice::from_ref(&reservation),
+        );
+        let mut split = reference
+            .executor
+            .chat_decode_batch_with_managed(&[&reference_decoder], &scheduled[..1], views)
+            .unwrap();
+        reference.commit(&reservation, &split[0]);
+        let reservation = reference.reserve(&reference_prompt, &scheduled[1]);
+        split.push(reference.executor.execute_single_request(
+            &[&reference_prompt],
+            &scheduled[1],
+            Some(&reservation),
+        ));
+        reference.commit(&reservation, &split[1]);
+
+        assert_eq!(
+            mixed.iter().map(session_summary).collect::<Vec<_>>(),
+            split.iter().map(session_summary).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (
+                mixed[0].output.tokens_processed,
+                mixed[1].output.tokens_processed
+            ),
+            (1, span_tokens)
+        );
+
+        // Both worlds continue identically: one more decode row for every
+        // request that has not finished.
+        let next = [
+            MixedWorld::row(&decoder, 4, decode_at + 1, decode_at + 2, false),
+            MixedWorld::row(&prompt, 5, span_tokens, span_tokens + 1, false),
+        ]
+        .into_iter()
+        .zip(&mixed)
+        .filter(|(_, result)| !result.output.finished)
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
+        assert!(!next.is_empty(), "the fixture finished every row at once");
+        let step = |world: &mut MixedWorld| {
+            let requests = next
+                .iter()
+                .map(|row| {
+                    if row.request_id == world.decoder.id {
+                        world.decoder.clone()
+                    } else {
+                        world.prompt.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let refs = requests.iter().collect::<Vec<_>>();
+            let reservations = next
+                .iter()
+                .zip(&requests)
+                .map(|(row, request)| world.reserve(request, row))
+                .collect::<Vec<_>>();
+            let views = world.views(&refs, &next, &reservations);
+            let results = world
+                .executor
+                .chat_decode_batch_with_managed(&refs, &next, views)
+                .unwrap();
+            for (reservation, result) in reservations.iter().zip(&results) {
+                world.commit(reservation, result);
+            }
+            results.iter().map(session_summary).collect::<Vec<_>>()
+        };
+        assert_eq!(step(&mut oracle), step(&mut reference));
     }
 }

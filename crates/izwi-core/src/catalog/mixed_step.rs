@@ -82,7 +82,10 @@ mod tests {
             assert!(mixed_step_enabled_with(Some(on), family, backend), "{on}");
         }
         for off in ["0", "false", "off"] {
-            assert!(!mixed_step_enabled_with(Some(off), family, backend), "{off}");
+            assert!(
+                !mixed_step_enabled_with(Some(off), family, backend),
+                "{off}"
+            );
         }
         assert_eq!(
             mixed_step_enabled_with(Some("maybe"), family, backend),

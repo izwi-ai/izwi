@@ -132,6 +132,10 @@ pub(super) enum NativeBatchRoute {
     ChatContinuousDecode {
         stage_id: StageId,
     },
+    /// Decode rows and prefill spans of a mixed-step chat model in one call.
+    ChatMixedStep {
+        stage_id: StageId,
+    },
     Audio {
         task: TaskType,
         stage: NativeAudioStage,
@@ -221,6 +225,19 @@ impl NativeBatchRoute {
             })?;
         let task = first_request.task_type;
         let role = Self::audio_stage(&first_scheduled.work);
+        // A mixed batch holds sequence rows of both phases; any other batch
+        // runs one stage role.
+        let mixed = execution.batch.mode == NativeBatchMode::Mixed;
+        let row_role_matches = |row_role: NativeAudioStage| {
+            if mixed {
+                matches!(
+                    row_role,
+                    NativeAudioStage::SequencePrefill | NativeAudioStage::SequenceDecode
+                )
+            } else {
+                row_role == role
+            }
+        };
 
         for scheduled in execution.scheduled {
             let request = execution
@@ -234,7 +251,7 @@ impl NativeBatchRoute {
                         scheduled.request_id
                     ))
                 })?;
-            if request.task_type != task || Self::audio_stage(&scheduled.work) != role {
+            if request.task_type != task || !row_role_matches(Self::audio_stage(&scheduled.work)) {
                 return Err(Error::InvalidInput(
                     "native physical batch mixed task or stage roles".to_string(),
                 ));
@@ -277,12 +294,17 @@ impl NativeBatchRoute {
                     stage_id: execution.batch.lane.stage_id,
                 })
             }
-            (TaskType::ASR | TaskType::TTS, stage, mode) => Ok(Self::Audio {
-                task,
-                stage,
-                mode,
+            (TaskType::Chat, _, NativeBatchMode::Mixed) => Ok(Self::ChatMixedStep {
                 stage_id: execution.batch.lane.stage_id,
             }),
+            (TaskType::ASR | TaskType::TTS, stage, mode) if mode != NativeBatchMode::Mixed => {
+                Ok(Self::Audio {
+                    task,
+                    stage,
+                    mode,
+                    stage_id: execution.batch.lane.stage_id,
+                })
+            }
             _ => Err(Error::InvalidInput(
                 "loaded stage has no compatible native executor route".to_string(),
             )),
@@ -2961,6 +2983,34 @@ impl NativeExecutor {
     }
 }
 
+/// Whether the request's loaded adapter runs it in a mixed prefill+decode
+/// stage, whose prefill spans are resumable whatever the engine's chunked
+/// prefill switch says.
+fn binds_mixed_step(request: &EngineCoreRequest) -> bool {
+    request.execution_adapter_binding().is_some_and(|binding| {
+        binding
+            .stages
+            .iter()
+            .any(|stage| stage.batch_mode == NativeBatchMode::Mixed)
+    })
+}
+
+/// `IZWI_MIXED_FORCE_SPLIT=1` runs mixed physical batches through the split
+/// prefill and decode handlers: the parity oracle for a family's mixed
+/// forward, and a production kill switch.
+const MIXED_FORCE_SPLIT_ENV: &str = "IZWI_MIXED_FORCE_SPLIT";
+
+fn mixed_force_split_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+}
+
+fn mixed_force_split() -> bool {
+    static FORCE_SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE_SPLIT.get_or_init(|| {
+        mixed_force_split_from(std::env::var(MIXED_FORCE_SPLIT_ENV).ok().as_deref())
+    })
+}
+
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
     scheduled.len() == 1 && !scheduled[0].is_prefill && scheduled[0].num_tokens > 1
 }
@@ -3311,7 +3361,7 @@ impl ModelExecutor for NativeExecutor {
             // incremental decode: the exact loaded family must publish a
             // resumable prefill safe point. Unsupported families remain full.
             profile.prefill = resolved_resumable_prefill_mode(
-                self.config.enable_chunked_prefill,
+                self.config.enable_chunked_prefill || binds_mixed_step(request),
                 resumable_prefill_proof,
             );
             profile.incremental_decode = true;
@@ -3517,6 +3567,31 @@ impl ModelExecutor for NativeExecutor {
                         execution.scheduled,
                         Some(&execution.batch.rows),
                     ),
+                NativeBatchRoute::ChatMixedStep { .. } => {
+                    let force_split = mixed_force_split();
+                    if !force_split
+                        && !execution.requests.iter().all(|request| {
+                            request
+                                .prepared_chat_model_for_executor()
+                                .is_ok_and(|model| model.supports_mixed_step())
+                        })
+                    {
+                        return Err(PhysicalDispatchError::not_started(
+                            Error::InvalidInput(
+                                "loaded chat model does not run mixed prefill and decode steps"
+                                    .into(),
+                            ),
+                            width,
+                            FailureOrigin::ExecutorValidation,
+                        ));
+                    }
+                    self.execute_mixed_chat_requests_with_rows(
+                        execution.requests,
+                        execution.scheduled,
+                        &execution.batch.rows,
+                        force_split,
+                    )
+                }
                 NativeBatchRoute::Audio {
                     task: TaskType::ASR,
                     stage: NativeAudioStage::RealtimePreparation,
@@ -5568,6 +5643,175 @@ mod tests {
             scheduled: &scheduled,
         })
         .is_err());
+    }
+
+    /// A two-row chat batch in `mode` under one stage: a decode row and a
+    /// prefill row of another request, in `order`.
+    fn two_phase_chat_batch(
+        selector: StageWorkSelector,
+        mode: NativeBatchMode,
+        decode_first: bool,
+    ) -> (Vec<EngineCoreRequest>, Vec<ScheduledRequest>, PhysicalBatch) {
+        let fixture = |phase| {
+            native_route_fixture(
+                TaskType::Chat,
+                "chat",
+                ModelVariant::Qwen306B,
+                selector,
+                "chat.step.mixed",
+                mode,
+                phase,
+            )
+        };
+        let (decode_request, decode, mut batch) = fixture(SequencePhase::Decode);
+        let (mut prefill_request, mut prefill, _) = fixture(SequencePhase::Prefill);
+        prefill_request.id = "native-route-prefill".to_string();
+        prefill.request_id = prefill_request.id.clone();
+        prefill.plan_id = 12;
+        let mut row = batch.rows[0].clone();
+        row.plan_id = prefill.plan_id;
+        row.session = prefill.session_key();
+        row.work = prefill.work.clone();
+        let (requests, scheduled) = if decode_first {
+            batch.rows.push(row);
+            (vec![decode_request, prefill_request], vec![decode, prefill])
+        } else {
+            batch.rows.insert(0, row);
+            (vec![prefill_request, decode_request], vec![prefill, decode])
+        };
+        batch.materialized_tensor_elements = 2;
+        batch.validate().unwrap();
+        (requests, scheduled, batch)
+    }
+
+    #[test]
+    fn native_route_runs_both_phases_only_in_a_mixed_chat_batch() {
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        execution.validate().unwrap();
+        assert_eq!(
+            NativeBatchRoute::resolve(&execution).unwrap(),
+            NativeBatchRoute::ChatMixedStep {
+                stage_id: StageId::new(7)
+            }
+        );
+        assert_eq!(
+            execution.expected_dispatch().kind,
+            super::super::BatchDispatchKind::TensorMixed
+        );
+
+        // A prefill span before a decode row breaks the mixed layout.
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            false,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        assert!(PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        }
+        .validate()
+        .is_err());
+        assert!(dispatch::split_mixed_rows(&scheduled).is_err());
+
+        // A continuous batch runs one phase, even under a stage selecting both.
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Continuous,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let execution = PhysicalBatchExecution {
+            batch: &batch,
+            requests: &requests,
+            scheduled: &scheduled,
+        };
+        assert!(execution.validate().is_err());
+        assert!(NativeBatchRoute::resolve(&execution).is_err());
+    }
+
+    #[test]
+    fn mixed_rows_split_into_decode_rows_then_prefill_spans() {
+        let (_, scheduled, _) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let (decode, prefill) = dispatch::split_mixed_rows(&scheduled).unwrap();
+        assert_eq!(decode.len(), 1);
+        assert!(!decode[0].is_prefill);
+        assert_eq!(prefill.len(), 1);
+        assert!(prefill[0].is_prefill);
+        let (decode, prefill) = dispatch::split_mixed_rows(&scheduled[1..]).unwrap();
+        assert!(decode.is_empty());
+        assert_eq!(prefill.len(), 1);
+    }
+
+    #[test]
+    fn mixed_force_split_reads_its_switch() {
+        for on in ["1", "true", " on "] {
+            assert!(mixed_force_split_from(Some(on)), "{on}");
+        }
+        for off in [None, Some("0"), Some("false"), Some("split")] {
+            assert!(!mixed_force_split_from(off), "{off:?}");
+        }
+    }
+
+    /// The compatibility executor has no mixed route and refuses a mixed
+    /// batch before model entry.
+    #[test]
+    fn compatibility_executors_refuse_mixed_batches_before_model_entry() {
+        struct Compatibility;
+        impl ModelExecutor for Compatibility {
+            fn execute_prefill(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("refused before model entry")
+            }
+            fn execute_decode(
+                &self,
+                _requests: &[&EngineCoreRequest],
+                _scheduled: &[ScheduledRequest],
+            ) -> Result<Vec<ExecutorStepResult>> {
+                unreachable!("refused before model entry")
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+            fn initialize(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn shutdown(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (requests, scheduled, batch) = two_phase_chat_batch(
+            StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+            true,
+        );
+        let requests = requests.iter().collect::<Vec<_>>();
+        let error = Compatibility
+            .execute_physical_batch(PhysicalBatchExecution {
+                batch: &batch,
+                requests: &requests,
+                scheduled: &scheduled,
+            })
+            .unwrap_err();
+        assert_eq!(error.provenance.dispatch_state, DispatchState::NotStarted);
     }
 
     fn qwen38_test_reservation(domains: &[(CacheDomainId, KvArenaId)]) -> ManagedCacheReservation {
