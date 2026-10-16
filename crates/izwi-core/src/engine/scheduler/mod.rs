@@ -30,6 +30,14 @@ pub(super) const MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE: usize = 8;
 /// Least common multiple of the workload weights: one class service unit is
 /// worth `CLASS_VIRTUAL_TIME_UNITS / weight` units of weighted virtual time.
 const CLASS_VIRTUAL_TIME_UNITS: u64 = 120;
+/// Lost prefix cursors after which a request stops re-probing the managed
+/// prefix index and prefills from zero, so pages evicted between every probe
+/// and its prepare cannot replan the same request forever.
+const MAX_MANAGED_PREFIX_CURSOR_LOSSES: u8 = 2;
+
+/// Schedule-time managed prefix probe for one exact session: the cursor its
+/// first prefill span may start at, or `None` for a zero-start prefill.
+pub(crate) type ManagedPrefixProbe<'a> = dyn FnMut(&SessionKey) -> Option<u32> + 'a;
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -573,11 +581,14 @@ struct RequestMetadata {
     /// The prompt's first-turn (system prompt) boundary, clipped like the
     /// history boundary so requests sharing only a system prompt can attach.
     managed_preamble_boundary: Option<u32>,
-    /// DS1.5: admission-time managed prefix cursor. Tokens below this cursor
-    /// are already resident (shared pages plus a forked tensor snapshot), so
-    /// the first prefill span starts here instead of zero. `None` means a
-    /// conventional zero-start prefill.
+    /// DS1.5: managed prefix cursor, probed at admission and again when a
+    /// resumable prefill is selected before any progress (SCH-F7). Tokens
+    /// below this cursor are already resident (shared pages plus a forked
+    /// tensor snapshot), so the first prefill span starts here instead of
+    /// zero. `None` means a conventional zero-start prefill.
     managed_prefix_cursor: Option<u32>,
+    /// Probed cursors this request lost before prepare could attach them.
+    managed_prefix_cursor_losses: u8,
 }
 
 impl RequestMetadata {
@@ -794,6 +805,7 @@ impl Scheduler {
             managed_snapshot_boundary: request.managed_snapshot_boundary(),
             managed_preamble_boundary: request.managed_preamble_boundary(),
             managed_prefix_cursor: request.managed_prefix_cursor(),
+            managed_prefix_cursor_losses: 0,
         };
 
         self.requests.insert(request.id.clone(), metadata);
@@ -861,6 +873,7 @@ impl Scheduler {
                 managed_snapshot_boundary: request.managed_snapshot_boundary(),
                 managed_preamble_boundary: request.managed_preamble_boundary(),
                 managed_prefix_cursor: request.managed_prefix_cursor(),
+                managed_prefix_cursor_losses: 0,
             },
         );
         self.running.insert(
@@ -1088,6 +1101,22 @@ impl Scheduler {
 
     /// Schedule requests for the next step.
     pub fn schedule(&mut self) -> ScheduleResult {
+        self.schedule_inner(None)
+    }
+
+    /// [`Self::schedule`], re-probing the managed prefix index for every
+    /// resumable prefill selected before it has made progress (SCH-F7).
+    pub(crate) fn schedule_with_prefix_probe(
+        &mut self,
+        probe: &mut ManagedPrefixProbe<'_>,
+    ) -> ScheduleResult {
+        self.schedule_inner(Some(probe))
+    }
+
+    fn schedule_inner(
+        &mut self,
+        mut prefix_probe: Option<&mut ManagedPrefixProbe<'_>>,
+    ) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
         self.refresh_tenant_service();
@@ -1652,7 +1681,7 @@ impl Scheduler {
                     .then_with(|| a.3.cmp(&b.3))
             });
 
-            let (request_id, _priority, sequence_id, num_computed) =
+            let (request_id, _priority, sequence_id, mut num_computed) =
                 incomplete_prefill_candidates.remove(0);
             if remaining_batch == 0 || remaining_prefill_budget == 0 {
                 break;
@@ -1662,6 +1691,21 @@ impl Scheduler {
                 Some(m) => m.clone(),
                 None => continue,
             };
+
+            // A resumable prefill restarting from zero (after a recompute
+            // or a lost cursor) starts above the prefix resident now.
+            if num_computed == 0 && metadata.cache_policy.prefill == PrefillMode::Incremental {
+                if let Some(probe) = prefix_probe.as_deref_mut() {
+                    num_computed = self
+                        .reprobe_managed_prefix_cursor(&request_id, probe)
+                        .map_or(0, |cursor| {
+                            (cursor as usize).min(metadata.prefill_tokens().saturating_sub(1))
+                        });
+                    if let Some(running) = self.running.get_mut(&request_id) {
+                        running.num_tokens_processed = num_computed;
+                    }
+                }
+            }
 
             let remaining_prompt = metadata.prefill_tokens().saturating_sub(num_computed);
             if remaining_prompt == 0 {
@@ -1770,7 +1814,7 @@ impl Scheduler {
             };
             waiting_attempts = waiting_attempts.saturating_add(1);
 
-            let metadata = match self.requests.get(&request_id) {
+            let mut metadata = match self.requests.get(&request_id) {
                 Some(m) => m.clone(),
                 None => continue,
             };
@@ -1798,6 +1842,14 @@ impl Scheduler {
             }
             // A full-prefill adapter always runs the whole prompt from position
             // 0, so a probed prefix cursor only applies to resumable prefill.
+            // Its first selection re-probes: a burst sharing a system prompt
+            // is admitted before the first request publishes it.
+            if !full_prefill {
+                if let Some(probe) = prefix_probe.as_deref_mut() {
+                    metadata.managed_prefix_cursor =
+                        self.reprobe_managed_prefix_cursor(&request_id, probe);
+                }
+            }
             let prefix_start = if full_prefill {
                 0
             } else {
@@ -2582,12 +2634,33 @@ impl Scheduler {
             return false;
         }
         metadata.managed_prefix_cursor = None;
+        metadata.managed_prefix_cursor_losses =
+            metadata.managed_prefix_cursor_losses.saturating_add(1);
         if let Some(running) = self.running.get_mut(request_id) {
             running.num_tokens_processed = 0;
             running.prefill_complete = false;
             running.prefill_in_flight = false;
         }
         true
+    }
+
+    /// SCH-F7: replace a not-yet-started resumable prefill's cursor with the
+    /// probe's answer for its exact session. A capacity replay keeps its
+    /// zero start (the executor restarts a suspended replay only at context
+    /// 0), and a request that lost too many cursors stops probing.
+    fn reprobe_managed_prefix_cursor(
+        &mut self,
+        request_id: &RequestId,
+        probe: &mut ManagedPrefixProbe<'_>,
+    ) -> Option<u32> {
+        let metadata = self.requests.get_mut(request_id)?;
+        if metadata.replay_prompt_tokens.is_none()
+            && metadata.managed_prefix_cursor_losses < MAX_MANAGED_PREFIX_CURSOR_LOSSES
+        {
+            let session = SessionKey::new(request_id.clone(), metadata.sequence_id);
+            metadata.managed_prefix_cursor = probe(&session);
+        }
+        metadata.managed_prefix_cursor
     }
 
     /// Defer the next execution quantum for an exact session. This clears an
@@ -3858,6 +3931,7 @@ mod tests {
             managed_snapshot_boundary: None,
             managed_preamble_boundary: None,
             managed_prefix_cursor: None,
+            managed_prefix_cursor_losses: 0,
         }
     }
 
@@ -4020,6 +4094,64 @@ mod tests {
         profile.cache_mode = CacheMode::ExternalPaged;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile));
+    }
+
+    #[test]
+    fn resumable_prefill_reprobes_its_prefix_when_selected_from_zero() {
+        // SCH-F7: the cursor comes from a probe when the request is selected,
+        // and again when a lost cursor sends it back to zero; after
+        // MAX_MANAGED_PREFIX_CURSOR_LOSSES losses it prefills from zero.
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1024,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        });
+        let mut request = build_request(TaskType::Chat, "reprobed", Priority::Normal);
+        request.prompt_tokens = (0..100).collect();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler
+            .get_sequence_id(&request.id)
+            .expect("request epoch");
+        let session = SessionKey::new(request.id.clone(), epoch);
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        assert!(scheduler.update_execution_profile(&session, &profile));
+
+        let mut probes = 0;
+        for (offered, expected_start) in [(64, 64), (48, 48), (32, 0)] {
+            let scheduled = scheduler.schedule_with_prefix_probe(&mut |probed| {
+                assert_eq!(probed, &session);
+                probes += 1;
+                Some(offered)
+            });
+            let row = scheduled
+                .prefill_requests
+                .iter()
+                .find(|row| row.request_id == request.id)
+                .expect("prefill is scheduled");
+            assert_eq!(row.num_computed_tokens, expected_start, "offered {offered}");
+            assert_eq!(
+                row.work,
+                WorkUnit::SequenceStep {
+                    phase: SequencePhase::Prefill,
+                    input: InputRange {
+                        start: expected_start,
+                        end: 100,
+                    },
+                    max_output_steps: 100 - expected_start,
+                    auxiliary_state: None,
+                }
+            );
+            if expected_start > 0 {
+                // Prepare found the probed pages gone.
+                assert!(scheduler.reset_managed_prefix_cursor(&request.id));
+            }
+        }
+        assert_eq!(probes, 2);
     }
 
     #[test]

@@ -1780,6 +1780,37 @@ impl ManagedKvCacheManager {
         Ok(None)
     }
 
+    /// SCH-F7: [`Self::probe_managed_prefix`] for one exact session at
+    /// schedule time. It offers a cursor only where prepare would attach it:
+    /// an initial session generation (a reset generation must rebuild from
+    /// context 0), no committed table tokens, and no live tensor sequence that
+    /// a snapshot fork would have to cross. Anything else would lose the
+    /// cursor at prepare and replan the request.
+    pub(crate) fn probe_managed_prefix_for_session(
+        &mut self,
+        runtime: &ManagedKvModelRuntime,
+        request: &EngineCoreRequest,
+        session: &SessionKey,
+    ) -> Result<Option<u32>> {
+        if let Some(state) = self.models.get(&runtime.plan.model_instance) {
+            let restarted = state
+                .session_generations
+                .get(session)
+                .is_some_and(|generation| *generation != ManagedSessionGeneration::INITIAL);
+            let committed = state.runtime.plan.groups.iter().any(|group| {
+                state
+                    .coordinators
+                    .get(&group.arena)
+                    .and_then(|coordinator| coordinator.snapshot(session, group.domain).ok())
+                    .is_some_and(|snapshot| snapshot.committed_tokens > 0)
+            });
+            if restarted || committed || state.tensor_sequences.contains_key(session) {
+                return Ok(None);
+            }
+        }
+        self.probe_managed_prefix(runtime, request)
+    }
+
     /// Incremental admission is only safe for execution adapters that can
     /// replay an already-streamed request after capacity preemption.
     pub(crate) fn prepare_incremental(
@@ -5842,6 +5873,92 @@ mod tests {
         assert_eq!((warm.prefix_hits, warm.prefix_misses), (1, 1));
         assert_eq!(warm.prefix_query_tokens, 63 + 64);
         assert_eq!(warm.prefix_hit_tokens, 64);
+    }
+
+    #[test]
+    fn schedule_time_probe_offers_a_cursor_only_where_prepare_attaches_it() {
+        // SCH-F7: a session that committed tokens, or restarted into a
+        // subordinate generation, must rebuild from context 0; offering it
+        // a cursor would only be lost again at prepare.
+        let model = ModelInstanceId::new(708);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                8,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .unwrap()
+            .expect("managed runtime");
+        let history = (0..64).collect::<Vec<u32>>();
+        let publisher = SessionKey::new("publisher".into(), 1);
+        let reservation = manager
+            .prepare(
+                &runtime,
+                61,
+                &publisher,
+                &sequence_work(0, history.len()),
+                Some(&prefix_request(model, history.clone())),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        manager
+            .finalize(
+                &reservation,
+                Some(&reservation.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        manager.release_session(&publisher).unwrap();
+
+        let mut next_turn = history;
+        next_turn.push(7);
+        let request = prefix_request(model, next_turn);
+        let fresh = SessionKey::new("fresh".into(), 1);
+        assert_eq!(
+            manager
+                .probe_managed_prefix_for_session(&runtime, &request, &fresh)
+                .unwrap(),
+            Some(64)
+        );
+
+        let restarted = SessionKey::new("restarted".into(), 1);
+        let first = manager
+            .prepare(
+                &runtime,
+                62,
+                &restarted,
+                &sequence_work(0, 5),
+                Some(&request),
+            )
+            .unwrap()
+            .expect("managed reservation");
+        manager
+            .finalize(
+                &first,
+                Some(&first.completed_write_receipt_for_test()),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .probe_managed_prefix_for_session(&runtime, &request, &restarted)
+                .unwrap(),
+            None,
+            "a session with committed tokens"
+        );
+        manager
+            .reset_session_generation(&runtime, &restarted, ManagedSessionGeneration::INITIAL)
+            .unwrap();
+        assert_eq!(
+            manager
+                .probe_managed_prefix_for_session(&runtime, &request, &restarted)
+                .unwrap(),
+            None,
+            "a subordinate session generation"
+        );
     }
 
     #[test]

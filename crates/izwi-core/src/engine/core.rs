@@ -4827,7 +4827,10 @@ impl EngineCore {
         // Phase 1: Schedule
         self.refresh_scheduler_execution_profiles().await;
         self.reconcile_due_cleanup().await;
-        let schedule_result = self.scheduler.schedule();
+        let (managed_kv_cache, requests) = (&mut self.managed_kv_cache, &mut self.requests);
+        let schedule_result = self.scheduler.schedule_with_prefix_probe(&mut |session| {
+            reprobe_managed_prefix(managed_kv_cache, requests, session)
+        });
 
         // Reconcile capability-authoritative state for expired sessions before
         // newly scheduled work executes.
@@ -6631,6 +6634,33 @@ impl Drop for EngineCore {
             debug!("EngineCore dropped while still initialized");
         }
     }
+}
+
+/// SCH-F7: probe the managed prefix index for a resumable prefill the
+/// scheduler selected before it made progress, and keep the request's own
+/// cursor (which prepare and the executor read) equal to the scheduler's.
+/// A probe failure plans a zero-start prefill, like the admission probe.
+fn reprobe_managed_prefix(
+    managed_kv_cache: &mut ManagedKvCacheManager,
+    requests: &mut HashMap<RequestId, Arc<EngineCoreRequest>>,
+    session: &super::SessionKey,
+) -> Option<u32> {
+    let request = requests.get_mut(&session.request_id)?;
+    let runtime = request.managed_cache_runtime()?.clone();
+    let cursor = managed_kv_cache
+        .probe_managed_prefix_for_session(&runtime, request, session)
+        .unwrap_or_else(|error| {
+            warn!(
+                request_id = %session.request_id,
+                error = %error,
+                "managed prefix probe failed; planning a zero-start prefill"
+            );
+            None
+        });
+    if request.managed_prefix_cursor() != cursor {
+        Arc::make_mut(request).set_managed_prefix_cursor(cursor);
+    }
+    cursor
 }
 
 #[cfg(test)]
@@ -11383,6 +11413,104 @@ mod tests {
             )
             .await;
         }
+    }
+
+    /// SCH-F7: a burst sharing a 64-token system prompt is admitted before
+    /// any of it is published, so every admission probe misses. A request
+    /// must start above the shared pages committed when its first prefill
+    /// span is scheduled, not those committed at admission. With one row per
+    /// step the first request prefills its whole prompt before any other is
+    /// selected, so each of the other N-1 attaches the full system prompt.
+    #[tokio::test]
+    async fn burst_sharing_a_system_prompt_attaches_it_once_published() {
+        const REQUESTS: usize = 4;
+        let model = ModelInstanceId::new(941);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+            incremental_prefill: true,
+            ..Default::default()
+        }));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: true,
+                chunked_prefill_threshold: 32,
+                block_size: 16,
+                max_blocks: 512,
+                max_batch_size: 1,
+                enable_prefix_caching: true,
+                managed_prefix_cache_salt: Some("burst".to_string()),
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let contract = crate::kv::test_contract();
+        let capability = crate::kv::InferenceStateCapability::Managed(contract.clone());
+        let physical = core
+            .load_managed_model_cache(model, &capability, None)
+            .expect("load managed state")
+            .expect("physical managed state");
+        let system = (1..=64).collect::<Vec<u32>>();
+        for index in 0..REQUESTS {
+            let id = format!("burst-{index}");
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: id.clone(),
+            }])
+            .with_model_variant(ModelVariant::Qwen306B);
+            request.id = id;
+            request.params.max_tokens = 2;
+            let mut prompt = system.clone();
+            prompt.extend((0..8).map(|token| 1_000 + 8 * index as u32 + token));
+            request
+                .install_chat_execution_preparation(ModelVariant::Qwen306B, prompt, None, 4096)
+                .expect("prepare prompt");
+            // What a chat prompt with a system message declares, so every
+            // prefill span inside the system prompt publishes its pages.
+            request.managed_preamble_boundary = Some(system.len() as u32);
+            request.bind_model_instance(model).expect("model instance");
+            bind_managed_test_runtime(
+                &mut request,
+                model,
+                contract.clone(),
+                physical.clone(),
+                PrefillMode::Incremental,
+            );
+            core.add_request(request).expect("add");
+        }
+
+        let mut cached = HashMap::new();
+        for _ in 0..500 {
+            for output in core.step().await.expect("step") {
+                assert!(output.error.is_none(), "{:?}", output.error);
+                if output.is_finished {
+                    cached.insert(
+                        output.request_id.clone(),
+                        output.token_stats.cached_prefix_tokens,
+                    );
+                }
+            }
+            if cached.len() == REQUESTS {
+                break;
+            }
+        }
+        assert_eq!(cached.len(), REQUESTS, "{cached:?}");
+        for index in 0..REQUESTS {
+            let expected = (index > 0).then_some(64);
+            assert_eq!(
+                cached[&format!("burst-{index}")],
+                expected,
+                "request {index}: {cached:?}"
+            );
+        }
+        let telemetry = core.managed_kv_cache.telemetry_snapshot();
+        let followers = REQUESTS as u64 - 1;
+        assert_eq!(
+            (telemetry.prefix_hits, telemetry.prefix_hit_tokens),
+            (followers, 64 * followers)
+        );
     }
 
     /// Managed decode rows dispatched as one continuous native batch of up
