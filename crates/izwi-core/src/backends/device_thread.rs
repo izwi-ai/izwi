@@ -35,7 +35,8 @@ use crate::error::{Error, Result};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// The device a [`DeviceThread`] owns.
+/// The device a [`DeviceThread`] owns: Candle's device location, so a Metal
+/// device is keyed by its registry id and a CUDA device by its ordinal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceThreadKey {
     Cpu,
@@ -52,11 +53,12 @@ impl DeviceThreadKey {
         }
     }
 
-    /// The metric label of this device: `cpu`, `metal:0`, `cuda:1`.
+    /// The metric label of this device: `cpu`, `metal` (a Mac has one
+    /// Metal device; its registry id is not a readable label), `cuda:1`.
     pub fn label(self) -> String {
         match self {
             Self::Cpu => "cpu".to_string(),
-            Self::Metal(ordinal) => format!("metal:{ordinal}"),
+            Self::Metal(_) => "metal".to_string(),
             Self::Cuda(ordinal) => format!("cuda:{ordinal}"),
         }
     }
@@ -64,7 +66,7 @@ impl DeviceThreadKey {
     fn thread_name(self) -> String {
         match self {
             Self::Cpu => "izwi-device-cpu-0".to_string(),
-            Self::Metal(ordinal) => format!("izwi-device-metal-{ordinal}"),
+            Self::Metal(registry_id) => format!("izwi-device-metal-{registry_id}"),
             Self::Cuda(ordinal) => format!("izwi-device-cuda-{ordinal}"),
         }
     }

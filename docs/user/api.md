@@ -972,7 +972,7 @@ tenant IDs are used.
 | `izwi_engine_batch_rows`, `izwi_engine_batch_tokens` | none | Rows and work units (tokens, or frames for speech) per dispatched physical batch. |
 | `izwi_engine_model_calls_per_step` | none | Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch. |
 | `izwi_engine_mixed_rows`, `izwi_engine_mixed_tokens` | `phase` (`decode`, `prefill`) on rows | Rows of each phase and tokens per committed mixed prefill+decode batch (models certified for mixed steps). |
-| `izwi_engine_device_idle_seconds` | `device` (`cpu`, `metal:0`, `cuda:0`) | Time the device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps. |
+| `izwi_engine_device_idle_seconds` | `device` (`cpu`, `metal`, `cuda:0`) | Time the device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps. |
 | `izwi_engine_device_ops_off_thread_total` | none | Counter of device operations (model calls, KV page operations, state allocation and frees) that ran off their device's thread. Zero in a healthy process. |
 | `izwi_runtime_stage_duration_seconds` | `stage`, `workload_class` | Duration of runtime pipeline stages. |
 | `izwi_voice_turn_first_audio_seconds` | none | Realtime voice: endpoint decision to the turn's first assistant audio. |
