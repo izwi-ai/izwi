@@ -176,6 +176,25 @@ the mixed stage served the run. Mixed steps run decode rows one token at a
 time, so `tokens_per_delta` drops to 1 where the split path streams
 multi-token quanta. The LFM2.5 results are in the support matrix.
 
+### Device idle between steps
+
+Every model call, KV page operation, model load and free runs on one thread
+per device. `izwi_engine_device_idle_seconds{device}` records how long the
+device waited between two model steps while the engine had work: the host
+commit, delivery, prepare and dispatch between them.
+`izwi_engine_device_ops_off_thread_total` counts device operations that ran
+on any other thread; it must stay 0.
+
+Measured on an M-series Mac (Metal, LFM2.5-1.2B-Instruct Q4_K_M, 32
+requests at concurrency 8, 128 tokens in and out, machine shared with other
+work): 628 gaps, mean 0.60 ms, 87% at or below 0.5 ms, against an ITL p50
+of 31.8 ms (about 2% of a step). Per step, prepare took 0.33 ms, commit
+0.11 ms and delivery 0.003 ms. Moving output assembly and delivery off the
+gap (starting the next step after the KV commit) would save under 0.1 ms
+of the 0.6 ms, so the step driver keeps prepare, execute and commit in
+order. The ignored `step_host_overhead_bench` prints the same gap
+(`device_idle`) for a mock model with a fixed device time.
+
 ## Regression check per backend
 
 `--profile regression` is a small deterministic profile. It uses 24 seeded
