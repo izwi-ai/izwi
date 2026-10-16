@@ -22,17 +22,19 @@ use crate::api::audio_payload::{
 use crate::api::request_context::RequestContext;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, NewIdempotencyRecord, NewJobStage, NewJobStageDispatch,
-        NewRuntimeArtifact, NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
+        sha256_hex, BatchRuntimeStore, DurableJobAcceptanceOutcome, NewDurableJobAcceptance,
+        NewDurableJobArtifact, NewDurableJobStage, NewIdempotencyRecord, NewRuntimeArtifact,
+        NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
-        RuntimeJobStatus, RuntimeStageStatus, StageResourceHints,
+        RuntimeJobStatus, StageResourceHints,
     },
     worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
 use crate::entity::RuntimeProjectionAttempt;
 use crate::error::ApiError;
+use crate::ids::new_uuid;
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
 };
@@ -476,101 +478,98 @@ async fn enqueue_batch_transcription_job(
         .ok_or_else(|| ApiError::internal("Audio ingest did not create a canonical asset"))?;
     let duration_secs = source_asset.duration_secs.unwrap_or_default();
 
-    let job = state
+    let original_artifact_id = new_uuid();
+    let canonical_artifact_id = new_uuid();
+    let accepted = state
         .batch_runtime_store
-        .create_job(NewRuntimeJob {
-            job_kind: RuntimeJobKind::AsrTranscription,
-            status: RuntimeJobStatus::Queued,
-            priority: 0,
-            model_id: request_snapshot.model_id.clone(),
-            capability: Some("asr".to_string()),
-            route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
-            route_record_id: Some(placeholder.id.clone()),
-            input_media_asset_id: Some(source_asset.id.clone()),
-            input_text_asset_id: None,
-            request_json: request_json.clone(),
-            model_snapshot_json: serde_json::json!({}),
-            retry_policy_json: serde_json::json!({"max_attempts": 2}),
-            max_attempts: 2,
-            idempotency_key: idempotency_key.clone(),
-            correlation_id,
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    let original_artifact = state
-        .batch_runtime_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: job.id.clone(),
-            stage_id: None,
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputOriginal,
-            media_asset_id: Some(source_asset.id),
-            text_asset_id: None,
-            storage_key: Some(source_asset.storage_key),
-            content_type: Some(source_asset.content_type),
-            filename: source_asset.filename,
-            size_bytes: Some(source_asset.size_bytes),
-            sha256: source_asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "source_sample_rate_hz": source_asset.sample_rate_hz,
-                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
-            }),
-            retention_policy: "default".to_string(),
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    let canonical_artifact = state
-        .batch_runtime_store
-        .create_artifact(NewRuntimeArtifact {
-            job_id: job.id.clone(),
-            stage_id: None,
-            artifact_kind: RuntimeArtifactKind::Media,
-            artifact_role: RuntimeArtifactRole::InputCanonical,
-            media_asset_id: Some(canonical.asset.id),
-            text_asset_id: None,
-            storage_key: Some(canonical.asset.storage_key),
-            content_type: Some(canonical.asset.content_type),
-            filename: canonical.asset.filename,
-            size_bytes: Some(canonical.asset.size_bytes),
-            sha256: canonical.asset.sha256,
-            metadata_json: serde_json::json!({
-                "route_record_id": placeholder.id,
-                "source_artifact_id": original_artifact.id,
-                "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
-                "timebase": {
-                    "source_sample_rate_hz": source_asset.sample_rate_hz,
-                    "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
-                }
-            }),
-            retention_policy: "default".to_string(),
-        })
-        .await
-        .map_err(map_store_error)?;
-
-    state
-        .batch_runtime_store
-        .create_stage_with_dispatch(NewJobStageDispatch {
-            stage: NewJobStage {
-                job_id: job.id.clone(),
+        .accept_durable_job(NewDurableJobAcceptance {
+            job: NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: request_snapshot.model_id.clone(),
+                capability: Some("asr".to_string()),
+                route_record_kind: Some(request_snapshot.record_mode.as_db_value().to_string()),
+                route_record_id: Some(placeholder.id.clone()),
+                input_media_asset_id: Some(source_asset.id.clone()),
+                input_text_asset_id: None,
+                request_json: request_json.clone(),
+                model_snapshot_json: serde_json::json!({}),
+                retry_policy_json: serde_json::json!({"max_attempts": 2}),
+                max_attempts: 2,
+                idempotency_key: idempotency_key.clone(),
+                correlation_id,
+            },
+            text_input: None,
+            artifacts: vec![
+                NewDurableJobArtifact {
+                    id: original_artifact_id.clone(),
+                    artifact_kind: RuntimeArtifactKind::Media,
+                    artifact_role: RuntimeArtifactRole::InputOriginal,
+                    media_asset_id: Some(source_asset.id),
+                    text_asset_id: None,
+                    storage_key: Some(source_asset.storage_key),
+                    content_type: Some(source_asset.content_type),
+                    filename: source_asset.filename,
+                    size_bytes: Some(source_asset.size_bytes),
+                    sha256: source_asset.sha256,
+                    metadata_json: serde_json::json!({
+                        "route_record_id": placeholder.id,
+                        "source_sample_rate_hz": source_asset.sample_rate_hz,
+                        "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id()
+                    }),
+                    retention_policy: "default".to_string(),
+                },
+                NewDurableJobArtifact {
+                    id: canonical_artifact_id.clone(),
+                    artifact_kind: RuntimeArtifactKind::Media,
+                    artifact_role: RuntimeArtifactRole::InputCanonical,
+                    media_asset_id: Some(canonical.asset.id),
+                    text_asset_id: None,
+                    storage_key: Some(canonical.asset.storage_key),
+                    content_type: Some(canonical.asset.content_type),
+                    filename: canonical.asset.filename,
+                    size_bytes: Some(canonical.asset.size_bytes),
+                    sha256: canonical.asset.sha256,
+                    metadata_json: serde_json::json!({
+                        "route_record_id": placeholder.id,
+                        "source_artifact_id": original_artifact_id,
+                        "canonical_profile": CanonicalAudioProfile::SpeechRecognition16KhzMonoWav.id(),
+                        "timebase": {
+                            "source_sample_rate_hz": source_asset.sample_rate_hz,
+                            "canonical_sample_rate_hz": canonical.asset.sample_rate_hz
+                        }
+                    }),
+                    retention_policy: "default".to_string(),
+                },
+            ],
+            stages: vec![NewDurableJobStage {
                 sequence: 0,
                 stage_kind: BATCH_ASR_STAGE_KIND.to_string(),
-                status: RuntimeStageStatus::Queued,
                 capability: Some("asr".to_string()),
                 model_id: request_snapshot.model_id,
                 max_attempts: 2,
-                input_artifact_ids: vec![canonical_artifact.id],
-            },
-            queue_class: asr_queue_class(duration_secs),
-            resource_hints: StageResourceHints {
-                estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
-                ..StageResourceHints::default()
-            },
+                input_artifact_ids: vec![canonical_artifact_id],
+                queue_class: asr_queue_class(duration_secs),
+                resource_hints: StageResourceHints {
+                    estimated_duration_ms: Some((duration_secs.max(0.0) * 1_000.0) as u64),
+                    ..StageResourceHints::default()
+                },
+            }],
+            reservation: None,
+            idempotency_response: serde_json::Value::Null,
+            idempotency_retention_ms: 0,
         })
         .await
         .map_err(map_store_error)?;
+    let job = match accepted {
+        DurableJobAcceptanceOutcome::Committed(accepted) => accepted.job,
+        DurableJobAcceptanceOutcome::ReservationLost => {
+            return Err(ApiError::internal(
+                "Unkeyed transcription acceptance reported a lost reservation",
+            ))
+        }
+    };
 
     state.runtime.record_batch_asr_pipeline_job();
 

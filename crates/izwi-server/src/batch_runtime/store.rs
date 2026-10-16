@@ -48,7 +48,7 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_pcm_replay_entry_limit: Option<u64>,
     #[cfg(test)]
-    test_durable_tts_acceptance_failpoint: Option<DurableTtsAcceptanceFailpoint>,
+    test_durable_acceptance_failpoint: Option<DurableAcceptanceFailpoint>,
     #[cfg(test)]
     test_faults: Option<Arc<StoreFaults>>,
 }
@@ -325,8 +325,72 @@ pub enum DurableTextTtsAcceptanceOutcome {
     ReservationLost,
 }
 
+/// One queued job graph accepted in a single write transaction: an optional
+/// text input, the job, its input artifacts, every stage, and, when keyed, the
+/// idempotency result. The caller names the text input and artifacts so that
+/// artifact metadata and stage inputs can reference them before they exist.
+#[derive(Debug, Clone)]
+pub struct NewDurableJobAcceptance {
+    pub job: NewRuntimeJob,
+    pub text_input: Option<NewDurableTextInput>,
+    pub artifacts: Vec<NewDurableJobArtifact>,
+    pub stages: Vec<NewDurableJobStage>,
+    pub reservation: Option<DurableIdempotencyReservation>,
+    /// The bounded replay payload committed with a keyed acceptance.
+    pub idempotency_response: serde_json::Value,
+    pub idempotency_retention_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDurableTextInput {
+    pub id: String,
+    pub asset: NewTextAsset,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDurableJobArtifact {
+    pub id: String,
+    pub artifact_kind: RuntimeArtifactKind,
+    pub artifact_role: RuntimeArtifactRole,
+    pub media_asset_id: Option<String>,
+    pub text_asset_id: Option<String>,
+    pub storage_key: Option<String>,
+    pub content_type: Option<String>,
+    pub filename: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub metadata_json: serde_json::Value,
+    pub retention_policy: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDurableJobStage {
+    pub sequence: u32,
+    pub stage_kind: String,
+    pub capability: Option<String>,
+    pub model_id: Option<String>,
+    pub max_attempts: u32,
+    pub input_artifact_ids: Vec<String>,
+    pub queue_class: QueueClass,
+    pub resource_hints: StageResourceHints,
+}
+
+#[derive(Debug, Clone)]
+pub struct DurableJobAcceptance {
+    pub job: RuntimeJob,
+    pub artifacts: Vec<RuntimeArtifact>,
+    pub stages: Vec<JobStage>,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum DurableJobAcceptanceOutcome {
+    Committed(DurableJobAcceptance),
+    ReservationLost,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DurableTtsAcceptanceFailpoint {
+enum DurableAcceptanceFailpoint {
     Projection,
     TextAsset,
     Job,
@@ -832,7 +896,7 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_pcm_replay_entry_limit: None,
             #[cfg(test)]
-            test_durable_tts_acceptance_failpoint: None,
+            test_durable_acceptance_failpoint: None,
             #[cfg(test)]
             test_faults: None,
         }
@@ -872,11 +936,8 @@ impl BatchRuntimeStore {
     }
 
     #[cfg(test)]
-    fn set_durable_tts_acceptance_failpoint(
-        &mut self,
-        failpoint: Option<DurableTtsAcceptanceFailpoint>,
-    ) {
-        self.test_durable_tts_acceptance_failpoint = failpoint;
+    fn set_durable_acceptance_failpoint(&mut self, failpoint: Option<DurableAcceptanceFailpoint>) {
+        self.test_durable_acceptance_failpoint = failpoint;
     }
 
     #[cfg(test)]
@@ -923,13 +984,13 @@ impl BatchRuntimeStore {
         super::speech_progress::MAX_PCM_REPLAY_ENTRIES
     }
 
-    fn inject_durable_tts_acceptance_failure(
+    fn inject_durable_acceptance_failure(
         &self,
-        failpoint: DurableTtsAcceptanceFailpoint,
+        failpoint: DurableAcceptanceFailpoint,
     ) -> anyhow::Result<()> {
         #[cfg(test)]
-        if self.test_durable_tts_acceptance_failpoint == Some(failpoint) {
-            bail!("Injected durable text TTS acceptance failure after {failpoint:?}");
+        if self.test_durable_acceptance_failpoint == Some(failpoint) {
+            bail!("Injected durable acceptance failure after {failpoint:?}");
         }
         #[cfg(not(test))]
         let _ = failpoint;
@@ -2945,19 +3006,7 @@ impl BatchRuntimeStore {
         let admission_tenant = speech_admission_tenant(&input.request_json)?;
 
         if let Some(reservation) = input.reservation.as_ref() {
-            validate_durable_idempotency_identity(
-                &reservation.tenant_scope,
-                &reservation.operation,
-                &reservation.idempotency_key,
-                reservation.digest_version,
-                &reservation.request_digest,
-            )?;
-            validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
-            anyhow::ensure!(
-                (1..=MAX_DURABLE_IDEMPOTENCY_RETENTION_MS)
-                    .contains(&input.idempotency_retention_ms),
-                "Durable idempotency retention must be between 1 and {MAX_DURABLE_IDEMPOTENCY_RETENTION_MS} milliseconds"
-            );
+            validate_acceptance_reservation(reservation, input.idempotency_retention_ms)?;
         }
 
         let now = self.now_millis();
@@ -3022,23 +3071,7 @@ impl BatchRuntimeStore {
 
         if let Some(reservation) = input.reservation.as_ref() {
             lock_durable_idempotency(&tx).await?;
-            let Some(stored) = load_durable_idempotency_with(
-                &tx,
-                &reservation.tenant_scope,
-                &reservation.operation,
-                &reservation.idempotency_key,
-            )
-            .await?
-            else {
-                tx.rollback().await?;
-                return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
-            };
-            if stored.state != "reserved"
-                || stored.expires_at <= now_u64
-                || stored.digest_version != reservation.digest_version
-                || stored.request_digest != reservation.request_digest
-                || stored.reservation_token != reservation.reservation_token
-            {
+            if !durable_reservation_is_live_with(&tx, reservation, now_u64).await? {
                 tx.rollback().await?;
                 return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
             }
@@ -3075,7 +3108,7 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create durable text TTS projection")?;
-        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Projection)?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Projection)?;
 
         tx.execute_raw(raw::statement(
             &tx,
@@ -3099,7 +3132,7 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create durable text TTS input")?;
-        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::TextAsset)?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::TextAsset)?;
 
         tx.execute_raw(raw::statement(
             &tx,
@@ -3140,7 +3173,7 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create durable text TTS job")?;
-        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Job)?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Job)?;
 
         tx.execute_raw(raw::statement(
             &tx,
@@ -3167,7 +3200,7 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create durable text TTS input artifact")?;
-        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Artifact)?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Artifact)?;
 
         tx.execute_raw(raw::statement(
             &tx,
@@ -3214,47 +3247,26 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create durable text TTS stage")?;
-        self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Stage)?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Stage)?;
 
         if let Some(reservation) = input.reservation.as_ref() {
-            let expires_at = now_u64
-                .checked_add(input.idempotency_retention_ms)
-                .context("Durable idempotency retention expiry overflow")?;
-            let result = tx
-                .execute_raw(raw::statement(
-                    &tx,
-                    r#"
-                    UPDATE durable_idempotency_keys_v2
-                    SET state = 'committed', updated_at = ?1, expires_at = ?2,
-                        runtime_job_id = ?3, response_json = ?4
-                    WHERE tenant_scope = ?5 AND operation = ?6
-                      AND idempotency_key = ?7 AND state = 'reserved'
-                      AND reservation_token = ?8 AND digest_version = ?9
-                      AND request_digest = ?10 AND expires_at > ?1
-                    "#,
-                    vec![
-                        now.into(),
-                        i64::try_from(expires_at)?.into(),
-                        job_id.clone().into(),
-                        response_json_string
-                            .clone()
-                            .expect("keyed response was bounded")
-                            .into(),
-                        reservation.tenant_scope.clone().into(),
-                        reservation.operation.clone().into(),
-                        reservation.idempotency_key.clone().into(),
-                        reservation.reservation_token.clone().into(),
-                        i64::from(reservation.digest_version).into(),
-                        reservation.request_digest.clone().into(),
-                    ],
-                )?)
-                .await
-                .context("Failed to commit durable text TTS idempotency result")?;
-            if result.rows_affected() != 1 {
+            let committed = commit_durable_reservation_with(
+                &tx,
+                reservation,
+                now_u64,
+                input.idempotency_retention_ms,
+                &job_id,
+                response_json_string
+                    .as_deref()
+                    .expect("keyed response was bounded"),
+            )
+            .await
+            .context("Failed to commit durable text TTS idempotency result")?;
+            if !committed {
                 tx.rollback().await?;
                 return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
             }
-            self.inject_durable_tts_acceptance_failure(DurableTtsAcceptanceFailpoint::Idempotency)?;
+            self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Idempotency)?;
         }
 
         let job = get_job_with(&tx, &job_id)
@@ -3276,6 +3288,336 @@ impl BatchRuntimeStore {
                 job,
                 stage,
                 input_artifact,
+            },
+        ))
+    }
+
+    /// Atomically accept one queued job graph: its text input, the job, its
+    /// input artifacts, every stage and, when keyed, the idempotency result.
+    /// No worker can claim a stage, and no job can exist without its stages,
+    /// before the whole graph commits. Speech jobs take admission inside the
+    /// same transaction.
+    pub async fn accept_durable_job(
+        &self,
+        input: NewDurableJobAcceptance,
+    ) -> anyhow::Result<DurableJobAcceptanceOutcome> {
+        let NewDurableJobAcceptance {
+            mut job,
+            text_input,
+            artifacts,
+            stages,
+            reservation,
+            idempotency_response,
+            idempotency_retention_ms,
+        } = input;
+        anyhow::ensure!(
+            job.status == RuntimeJobStatus::Queued,
+            StoreError::invalid("Durable job acceptance requires a queued job")
+        );
+        anyhow::ensure!(
+            !stages.is_empty(),
+            StoreError::invalid("Durable job acceptance requires at least one stage")
+        );
+        anyhow::ensure!(
+            job.max_attempts > 0 && stages.iter().all(|stage| stage.max_attempts > 0),
+            StoreError::invalid("Durable job acceptance requires at least one attempt")
+        );
+        let text_input_id = text_input.as_ref().map(|text| text.id.clone());
+        anyhow::ensure!(
+            job.input_text_asset_id == text_input_id,
+            StoreError::invalid("Durable job text input must be the job's text input")
+        );
+        let mut artifact_ids = std::collections::HashSet::new();
+        for artifact in &artifacts {
+            validate_bounded_field("artifact ID", &artifact.id, 64)?;
+            anyhow::ensure!(
+                artifact_ids.insert(artifact.id.as_str()),
+                StoreError::invalid("Durable job artifact IDs must be unique")
+            );
+            anyhow::ensure!(
+                artifact.text_asset_id.is_none() || artifact.text_asset_id == text_input_id,
+                StoreError::invalid(
+                    "Durable job artifacts may only reference the job's text input"
+                )
+            );
+        }
+        let mut sequences = std::collections::HashSet::new();
+        for stage in &stages {
+            validate_bounded_field("stage kind", &stage.stage_kind, 128)?;
+            anyhow::ensure!(
+                sequences.insert(stage.sequence),
+                StoreError::invalid("Durable job stage sequences must be unique")
+            );
+            anyhow::ensure!(
+                stage
+                    .input_artifact_ids
+                    .iter()
+                    .all(|id| artifact_ids.contains(id.as_str())),
+                StoreError::invalid("Durable job stages may only consume the job's artifacts")
+            );
+        }
+        let response_json = match reservation.as_ref() {
+            Some(reservation) => {
+                validate_acceptance_reservation(reservation, idempotency_retention_ms)?;
+                anyhow::ensure!(
+                    job.idempotency_key.is_none()
+                        || job.idempotency_key.as_ref() == Some(&reservation.idempotency_key),
+                    StoreError::invalid("Durable job idempotency key must match its reservation")
+                );
+                job.idempotency_key = Some(reservation.idempotency_key.clone());
+                Some(bounded_json_string(
+                    &idempotency_response,
+                    MAX_DURABLE_IDEMPOTENCY_RESULT_BYTES,
+                    "Durable idempotency result",
+                )?)
+            }
+            None => None,
+        };
+        let admission_tenant = if job.job_kind == RuntimeJobKind::TtsSpeech {
+            Some(speech_admission_tenant(&job.request_json)?)
+        } else {
+            None
+        };
+        let request_json = json_to_db_string(&job.request_json, "{}")?;
+        let model_snapshot_json = json_to_db_string(&job.model_snapshot_json, "{}")?;
+        let retry_policy_json = json_to_db_string(&job.retry_policy_json, "{}")?;
+
+        let now = self.now_millis();
+        let now_u64 = nonnegative_timestamp(now)?;
+        let job_id = new_uuid();
+        let db = self.db.connection().await?;
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start durable job acceptance transaction")?;
+
+        if let Some(reservation) = reservation.as_ref() {
+            lock_durable_idempotency(&tx).await?;
+            if !durable_reservation_is_live_with(&tx, reservation, now_u64).await? {
+                tx.rollback().await?;
+                return Ok(DurableJobAcceptanceOutcome::ReservationLost);
+            }
+        }
+        if let Some(tenant) = admission_tenant.as_deref() {
+            self.check_tts_admission(&tx, tenant).await?;
+        }
+
+        if let Some(text) = text_input {
+            let normalized_text = text
+                .asset
+                .normalized_text
+                .unwrap_or_else(|| text.asset.raw_text.clone());
+            let character_count = normalized_text.chars().count() as u64;
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                INSERT INTO text_assets (
+                    id, created_at, updated_at, raw_text, normalized_text,
+                    language_hint, character_count, sha256, safety_status,
+                    retention_policy, structure_json
+                )
+                VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                vec![
+                    text.id.into(),
+                    now.into(),
+                    text.asset.raw_text.into(),
+                    normalized_text.into(),
+                    opt_string(text.asset.language_hint),
+                    u64_to_i64_value(character_count)?,
+                    opt_string(text.asset.sha256),
+                    text.asset.safety_status.into(),
+                    text.asset.retention_policy.into(),
+                    json_to_db_string(&text.asset.structure_json, "{}")?.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to create durable job text input")?;
+            self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::TextAsset)?;
+        }
+
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            INSERT INTO runtime_jobs (
+                id, created_at, updated_at, queued_at, started_at, finished_at,
+                job_kind, status, priority, model_id, capability,
+                route_record_kind, route_record_id, input_media_asset_id,
+                input_text_asset_id, request_json, model_snapshot_json,
+                progress_json, error_code, error_message, attempt_count,
+                max_attempts, retry_policy_json, idempotency_key,
+                correlation_id, cancellation_reason, admission_tenant
+            )
+            VALUES (?1, ?2, ?2, ?2, NULL, NULL, ?3, 'queued', ?4, ?5, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12, NULL, NULL, NULL, 0, ?13, ?14, ?15,
+                    ?16, NULL, ?17)
+            "#,
+            vec![
+                job_id.clone().into(),
+                now.into(),
+                job.job_kind.as_db_value().into(),
+                job.priority.into(),
+                opt_string(job.model_id),
+                opt_string(job.capability),
+                opt_string(job.route_record_kind),
+                opt_string(job.route_record_id),
+                opt_string(job.input_media_asset_id),
+                opt_string(job.input_text_asset_id),
+                request_json.into(),
+                model_snapshot_json.into(),
+                u32_to_i64_value(job.max_attempts).into(),
+                retry_policy_json.into(),
+                opt_string(job.idempotency_key),
+                opt_string(job.correlation_id),
+                opt_string(admission_tenant),
+            ],
+        )?)
+        .await
+        .context("Failed to create durable runtime job")?;
+        self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Job)?;
+
+        let artifact_ids = artifacts
+            .iter()
+            .map(|artifact| artifact.id.clone())
+            .collect::<Vec<_>>();
+        for artifact in artifacts {
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                INSERT INTO runtime_artifacts (
+                    id, job_id, stage_id, created_at, artifact_kind,
+                    artifact_role, media_asset_id, text_asset_id, storage_key,
+                    content_type, filename, size_bytes, sha256, metadata_json,
+                    retention_policy
+                )
+                VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14)
+                "#,
+                vec![
+                    artifact.id.into(),
+                    job_id.clone().into(),
+                    now.into(),
+                    artifact.artifact_kind.as_db_value().into(),
+                    artifact.artifact_role.as_db_value().into(),
+                    opt_string(artifact.media_asset_id),
+                    opt_string(artifact.text_asset_id),
+                    opt_string(artifact.storage_key),
+                    opt_string(artifact.content_type),
+                    opt_string(artifact.filename),
+                    opt_u64(artifact.size_bytes),
+                    opt_string(artifact.sha256),
+                    json_to_db_string(&artifact.metadata_json, "{}")?.into(),
+                    artifact.retention_policy.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to create durable job input artifact")?;
+            self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Artifact)?;
+        }
+
+        let mut stage_ids = Vec::with_capacity(stages.len());
+        for stage in stages {
+            let stage_id = new_uuid();
+            let resource_hints = stage.resource_hints.normalized();
+            tx.execute_raw(raw::statement(
+                &tx,
+                r#"
+                INSERT INTO job_stages (
+                    id, job_id, created_at, updated_at, sequence, stage_kind,
+                    queue_class, resource_hints_json, resource_target,
+                    required_backend, required_device_class,
+                    min_resource_memory_bytes, resource_concurrency_weight,
+                    status, capability, model_id, worker_id, lease_expires_at,
+                    available_at, attempt_token, attempt_count, max_attempts,
+                    input_artifact_ids_json, output_artifact_ids_json,
+                    progress_json, started_at, finished_at, error_code,
+                    error_message, cancellation_state
+                )
+                VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        'queued', ?13, ?14, NULL, NULL, ?3, NULL, 0, ?15, ?16,
+                        '[]', NULL, NULL, NULL, NULL, NULL, NULL)
+                "#,
+                vec![
+                    stage_id.clone().into(),
+                    job_id.clone().into(),
+                    now.into(),
+                    u32_to_i64_value(stage.sequence).into(),
+                    stage.stage_kind.into(),
+                    stage.queue_class.as_db_value().into(),
+                    json_to_db_string(&json!(resource_hints), "{}")?.into(),
+                    resource_hints.target.as_db_value().into(),
+                    opt_string(
+                        resource_hints
+                            .backend
+                            .map(|backend| backend.as_db_value().to_string()),
+                    ),
+                    opt_string(
+                        resource_hints
+                            .device_class
+                            .map(|device| device.as_db_value().to_string()),
+                    ),
+                    opt_u64(resource_hints.min_memory_bytes),
+                    u32_to_i64_value(resource_hints.concurrency_weight).into(),
+                    opt_string(stage.capability),
+                    opt_string(stage.model_id),
+                    u32_to_i64_value(stage.max_attempts).into(),
+                    json_to_db_string(&json!(stage.input_artifact_ids), "[]")?.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to create durable job stage")?;
+            stage_ids.push(stage_id);
+            self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Stage)?;
+        }
+
+        if let (Some(reservation), Some(response_json)) =
+            (reservation.as_ref(), response_json.as_deref())
+        {
+            let committed = commit_durable_reservation_with(
+                &tx,
+                reservation,
+                now_u64,
+                idempotency_retention_ms,
+                &job_id,
+                response_json,
+            )
+            .await
+            .context("Failed to commit durable job idempotency result")?;
+            if !committed {
+                tx.rollback().await?;
+                return Ok(DurableJobAcceptanceOutcome::ReservationLost);
+            }
+            self.inject_durable_acceptance_failure(DurableAcceptanceFailpoint::Idempotency)?;
+        }
+
+        let job = get_job_with(&tx, &job_id)
+            .await?
+            .ok_or_else(|| anyhow!("Accepted durable job was not found"))?;
+        let mut artifacts = Vec::with_capacity(artifact_ids.len());
+        for id in &artifact_ids {
+            artifacts.push(
+                get_artifact_with(&tx, id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Accepted durable job artifact was not found"))?,
+            );
+        }
+        let mut stages = Vec::with_capacity(stage_ids.len());
+        for id in &stage_ids {
+            stages.push(
+                get_stage_with(&tx, id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Accepted durable job stage was not found"))?,
+            );
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit durable job acceptance transaction")?;
+
+        Ok(DurableJobAcceptanceOutcome::Committed(
+            DurableJobAcceptance {
+                job,
+                artifacts,
+                stages,
             },
         ))
     }
@@ -6988,6 +7330,90 @@ async fn load_durable_idempotency_with<C: ConnectionTrait>(
     .transpose()
 }
 
+fn validate_acceptance_reservation(
+    reservation: &DurableIdempotencyReservation,
+    retention_ms: u64,
+) -> anyhow::Result<()> {
+    validate_durable_idempotency_identity(
+        &reservation.tenant_scope,
+        &reservation.operation,
+        &reservation.idempotency_key,
+        reservation.digest_version,
+        &reservation.request_digest,
+    )?;
+    validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
+    anyhow::ensure!(
+        (1..=MAX_DURABLE_IDEMPOTENCY_RETENTION_MS).contains(&retention_ms),
+        "Durable idempotency retention must be between 1 and {MAX_DURABLE_IDEMPOTENCY_RETENTION_MS} milliseconds"
+    );
+    Ok(())
+}
+
+/// Whether `reservation` still owns its unexpired, uncommitted row.
+async fn durable_reservation_is_live_with<C: ConnectionTrait>(
+    db: &C,
+    reservation: &DurableIdempotencyReservation,
+    now: u64,
+) -> anyhow::Result<bool> {
+    let Some(stored) = load_durable_idempotency_with(
+        db,
+        &reservation.tenant_scope,
+        &reservation.operation,
+        &reservation.idempotency_key,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    Ok(stored.state == "reserved"
+        && stored.expires_at > now
+        && stored.digest_version == reservation.digest_version
+        && stored.request_digest == reservation.request_digest
+        && stored.reservation_token == reservation.reservation_token)
+}
+
+/// Commit a reservation's replay result inside the acceptance transaction
+/// that creates its job. False means the reservation was lost or expired.
+async fn commit_durable_reservation_with<C: ConnectionTrait>(
+    db: &C,
+    reservation: &DurableIdempotencyReservation,
+    now: u64,
+    retention_ms: u64,
+    runtime_job_id: &str,
+    response_json: &str,
+) -> anyhow::Result<bool> {
+    let expires_at = now
+        .checked_add(retention_ms)
+        .context("Durable idempotency retention expiry overflow")?;
+    let result = db
+        .execute_raw(raw::statement(
+            db,
+            r#"
+            UPDATE durable_idempotency_keys_v2
+            SET state = 'committed', updated_at = ?1, expires_at = ?2,
+                runtime_job_id = ?3, response_json = ?4
+            WHERE tenant_scope = ?5 AND operation = ?6
+              AND idempotency_key = ?7 AND state = 'reserved'
+              AND reservation_token = ?8 AND digest_version = ?9
+              AND request_digest = ?10 AND expires_at > ?1
+            "#,
+            vec![
+                i64::try_from(now)?.into(),
+                i64::try_from(expires_at)?.into(),
+                runtime_job_id.into(),
+                response_json.into(),
+                reservation.tenant_scope.clone().into(),
+                reservation.operation.clone().into(),
+                reservation.idempotency_key.clone().into(),
+                reservation.reservation_token.clone().into(),
+                i64::from(reservation.digest_version).into(),
+                reservation.request_digest.clone().into(),
+            ],
+        )?)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 async fn delete_durable_idempotency_with<C: ConnectionTrait>(
     db: &C,
     tenant_scope: &str,
@@ -9625,12 +10051,12 @@ mod tests {
     #[tokio::test]
     async fn durable_text_tts_acceptance_rolls_back_every_partial_graph_failpoint() {
         for failpoint in [
-            DurableTtsAcceptanceFailpoint::Projection,
-            DurableTtsAcceptanceFailpoint::TextAsset,
-            DurableTtsAcceptanceFailpoint::Job,
-            DurableTtsAcceptanceFailpoint::Artifact,
-            DurableTtsAcceptanceFailpoint::Stage,
-            DurableTtsAcceptanceFailpoint::Idempotency,
+            DurableAcceptanceFailpoint::Projection,
+            DurableAcceptanceFailpoint::TextAsset,
+            DurableAcceptanceFailpoint::Job,
+            DurableAcceptanceFailpoint::Artifact,
+            DurableAcceptanceFailpoint::Stage,
+            DurableAcceptanceFailpoint::Idempotency,
         ] {
             let (mut store, _root) = build_store();
             let request = durable_idempotency_request(
@@ -9648,12 +10074,12 @@ mod tests {
                 DurableIdempotencyBegin::Acquired(reservation) => reservation,
                 outcome => panic!("unexpected reservation outcome: {outcome:?}"),
             };
-            store.set_durable_tts_acceptance_failpoint(Some(failpoint));
+            store.set_durable_acceptance_failpoint(Some(failpoint));
             let error = store
                 .accept_durable_text_tts(durable_text_tts_acceptance(Some(reservation)))
                 .await
                 .expect_err("failpoint must roll back acceptance");
-            assert!(error.to_string().contains("Injected durable text TTS"));
+            assert!(error.to_string().contains("Injected durable acceptance"));
             assert_eq!(
                 durable_text_tts_row_counts(&store).await,
                 [0, 0, 0, 0, 0, 1],
@@ -9672,6 +10098,289 @@ mod tests {
                 DurableIdempotencyBegin::InProgress { .. }
             ));
         }
+    }
+
+    async fn durable_job_media_asset(store: &BatchRuntimeStore) -> String {
+        store
+            .create_media_asset(NewMediaAsset {
+                asset_kind: "audio_original".to_string(),
+                storage_namespace: "tts_reference".to_string(),
+                storage_key: format!("uploads/reference/{}.wav", new_uuid()),
+                content_type: "audio/wav".to_string(),
+                filename: Some("reference.wav".to_string()),
+                size_bytes: 4,
+                sha256: Some(sha256_hex(&[1, 2, 3, 4])),
+                duration_secs: Some(1.0),
+                sample_rate_hz: Some(24_000),
+                channel_count: Some(1),
+                peak_amplitude: None,
+                rms_amplitude: None,
+                source_asset_id: None,
+                canonical_profile_version: None,
+                scan_status: "passed".to_string(),
+                retention_policy: "default".to_string(),
+                metadata_json: json!({}),
+            })
+            .await
+            .expect("media asset")
+            .id
+    }
+
+    /// A reference-voice TTS graph: text input, reference media, one stage
+    /// consuming both.
+    fn durable_speech_job_acceptance(
+        media_asset_id: &str,
+        reservation: Option<DurableIdempotencyReservation>,
+    ) -> NewDurableJobAcceptance {
+        let text_id = new_uuid();
+        let text_artifact = new_uuid();
+        let media_artifact = new_uuid();
+        NewDurableJobAcceptance {
+            job: NewRuntimeJob {
+                job_kind: RuntimeJobKind::TtsSpeech,
+                status: RuntimeJobStatus::Queued,
+                priority: 0,
+                model_id: Some("Qwen3-TTS-12Hz-1.7B-Base".to_string()),
+                capability: Some("tts".to_string()),
+                route_record_kind: Some("text_to_speech".to_string()),
+                route_record_id: Some("record-1".to_string()),
+                input_media_asset_id: Some(media_asset_id.to_string()),
+                input_text_asset_id: Some(text_id.clone()),
+                request_json: json!({"tenant_key": null, "input_text": "clone me"}),
+                model_snapshot_json: json!({"version": 1}),
+                retry_policy_json: json!({"max_attempts": 2}),
+                max_attempts: 2,
+                idempotency_key: None,
+                correlation_id: Some("durable-job-test".to_string()),
+            },
+            text_input: Some(NewDurableTextInput {
+                id: text_id.clone(),
+                asset: NewTextAsset {
+                    raw_text: "clone me".to_string(),
+                    normalized_text: None,
+                    language_hint: None,
+                    sha256: Some(sha256_hex(b"clone me")),
+                    safety_status: "unchecked".to_string(),
+                    retention_policy: "default".to_string(),
+                    structure_json: json!({"source": "tts_input"}),
+                },
+            }),
+            artifacts: vec![
+                NewDurableJobArtifact {
+                    id: text_artifact.clone(),
+                    artifact_kind: RuntimeArtifactKind::Text,
+                    artifact_role: RuntimeArtifactRole::InputOriginal,
+                    media_asset_id: None,
+                    text_asset_id: Some(text_id),
+                    storage_key: None,
+                    content_type: Some("text/plain".to_string()),
+                    filename: None,
+                    size_bytes: Some(8),
+                    sha256: None,
+                    metadata_json: json!({"input_kind": "text"}),
+                    retention_policy: "default".to_string(),
+                },
+                NewDurableJobArtifact {
+                    id: media_artifact.clone(),
+                    artifact_kind: RuntimeArtifactKind::Media,
+                    artifact_role: RuntimeArtifactRole::InputCanonical,
+                    media_asset_id: Some(media_asset_id.to_string()),
+                    text_asset_id: None,
+                    storage_key: None,
+                    content_type: Some("audio/wav".to_string()),
+                    filename: None,
+                    size_bytes: Some(4),
+                    sha256: None,
+                    metadata_json: json!({"source_artifact_id": text_artifact}),
+                    retention_policy: "default".to_string(),
+                },
+            ],
+            stages: vec![NewDurableJobStage {
+                sequence: 0,
+                stage_kind: "tts_synthesize".to_string(),
+                capability: Some("tts".to_string()),
+                model_id: Some("Qwen3-TTS-12Hz-1.7B-Base".to_string()),
+                max_attempts: 2,
+                input_artifact_ids: vec![text_artifact, media_artifact],
+                queue_class: QueueClass::BatchTts,
+                resource_hints: StageResourceHints::default(),
+            }],
+            reservation,
+            idempotency_response: json!({"record_id": "record-1"}),
+            idempotency_retention_ms: 60_000,
+        }
+    }
+
+    async fn durable_job_row_counts(store: &BatchRuntimeStore) -> [u64; 5] {
+        let counts = durable_text_tts_row_counts(store).await;
+        [counts[1], counts[2], counts[3], counts[4], counts[5]]
+    }
+
+    #[tokio::test]
+    async fn durable_job_acceptance_rolls_back_every_partial_graph_failpoint() {
+        for failpoint in [
+            DurableAcceptanceFailpoint::TextAsset,
+            DurableAcceptanceFailpoint::Job,
+            DurableAcceptanceFailpoint::Artifact,
+            DurableAcceptanceFailpoint::Stage,
+            DurableAcceptanceFailpoint::Idempotency,
+        ] {
+            let (mut store, _root) = build_store();
+            let media = durable_job_media_asset(&store).await;
+            let request = durable_idempotency_request(
+                "tenant-a",
+                "speech.text_to_speech.create",
+                "job-rollback-key",
+                b"clone me",
+                60_000,
+            );
+            let DurableIdempotencyBegin::Acquired(reservation) = store
+                .reserve_durable_idempotency(request.clone())
+                .await
+                .expect("reserve acceptance")
+            else {
+                panic!("reservation must be acquired");
+            };
+            store.set_durable_acceptance_failpoint(Some(failpoint));
+            let error = store
+                .accept_durable_job(durable_speech_job_acceptance(&media, Some(reservation)))
+                .await
+                .expect_err("failpoint must roll back acceptance");
+            assert!(error.to_string().contains("Injected durable acceptance"));
+            // Text assets, jobs, artifacts, stages; the reservation survives.
+            assert_eq!(
+                durable_job_row_counts(&store).await,
+                [0, 0, 0, 0, 1],
+                "partial graph survived {failpoint:?}"
+            );
+            assert!(store
+                .claim_next_stage("worker-after-rollback", 60_000)
+                .await
+                .expect("claim after rollback")
+                .is_none());
+            assert!(matches!(
+                store
+                    .reserve_durable_idempotency(request)
+                    .await
+                    .expect("reservation remains fenced"),
+                DurableIdempotencyBegin::InProgress { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_job_acceptance_commits_one_claimable_graph_and_replays() {
+        let (store, _root) = build_store();
+        let media = durable_job_media_asset(&store).await;
+        let request = durable_idempotency_request(
+            "tenant-a",
+            "speech.text_to_speech.create",
+            "job-key",
+            b"clone me",
+            60_000,
+        );
+        let DurableIdempotencyBegin::Acquired(reservation) = store
+            .reserve_durable_idempotency(request.clone())
+            .await
+            .expect("reserve")
+        else {
+            panic!("reservation must be acquired");
+        };
+        let input = durable_speech_job_acceptance(&media, Some(reservation));
+        let text_id = input.text_input.as_ref().unwrap().id.clone();
+        let DurableJobAcceptanceOutcome::Committed(accepted) =
+            store.accept_durable_job(input).await.expect("accept")
+        else {
+            panic!("reservation unexpectedly lost");
+        };
+        assert_eq!(durable_job_row_counts(&store).await, [1, 1, 2, 1, 1]);
+        assert_eq!(accepted.job.status, RuntimeJobStatus::Queued);
+        assert_eq!(
+            accepted.job.input_text_asset_id.as_deref(),
+            Some(text_id.as_str())
+        );
+        assert_eq!(accepted.job.idempotency_key.as_deref(), Some("job-key"));
+        assert_eq!(accepted.stages.len(), 1);
+        assert_eq!(
+            accepted.stages[0].input_artifact_ids,
+            accepted
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(accepted
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.job_id == accepted.job.id));
+        let claimed = store
+            .claim_next_stage("worker-a", 60_000)
+            .await
+            .expect("claim")
+            .expect("accepted stage is claimable");
+        assert_eq!(claimed.job.id, accepted.job.id);
+
+        let DurableIdempotencyBegin::Replay(replay) = store
+            .reserve_durable_idempotency(request)
+            .await
+            .expect("replay")
+        else {
+            panic!("committed key must replay");
+        };
+        assert_eq!(replay.runtime_job_id, accepted.job.id);
+        assert_eq!(replay.response_json, json!({"record_id": "record-1"}));
+    }
+
+    #[tokio::test]
+    async fn durable_job_acceptance_rejects_partial_graphs_and_lost_reservations() {
+        let (mut store, _root) = build_store();
+        let media = durable_job_media_asset(&store).await;
+
+        let mut stageless = durable_speech_job_acceptance(&media, None);
+        stageless.stages.clear();
+        assert!(store.accept_durable_job(stageless).await.is_err());
+        let mut dangling = durable_speech_job_acceptance(&media, None);
+        dangling.stages[0].input_artifact_ids.push(new_uuid());
+        assert!(store.accept_durable_job(dangling).await.is_err());
+        assert_eq!(durable_job_row_counts(&store).await, [0, 0, 0, 0, 0]);
+
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let request = durable_idempotency_request(
+            "tenant-a",
+            "speech.text_to_speech.create",
+            "expiring-key",
+            b"clone me",
+            1_000,
+        );
+        let DurableIdempotencyBegin::Acquired(reservation) = store
+            .reserve_durable_idempotency(request)
+            .await
+            .expect("reserve")
+        else {
+            panic!("reservation must be acquired");
+        };
+        clock.store(2_000, Ordering::SeqCst);
+        assert!(matches!(
+            store
+                .accept_durable_job(durable_speech_job_acceptance(&media, Some(reservation)))
+                .await
+                .expect("expired reservation is an outcome"),
+            DurableJobAcceptanceOutcome::ReservationLost
+        ));
+        assert_eq!(durable_job_row_counts(&store).await, [0, 0, 0, 0, 1]);
+
+        store.test_tts_admission_limits = Some((1, 1));
+        store
+            .accept_durable_job(durable_speech_job_acceptance(&media, None))
+            .await
+            .expect("first speech job fits");
+        let error = store
+            .accept_durable_job(durable_speech_job_acceptance(&media, None))
+            .await
+            .expect_err("admission is checked inside acceptance");
+        assert!(error.to_string().contains("admission capacity exhausted"));
+        assert_eq!(durable_job_row_counts(&store).await, [1, 1, 2, 1, 1]);
     }
 
     #[tokio::test]
@@ -9879,7 +10588,7 @@ mod tests {
         let (mut store, _root) = build_store();
         let mut acceptance = durable_text_tts_acceptance(None);
         acceptance.idempotency_retention_ms = 0;
-        store.set_durable_tts_acceptance_failpoint(Some(DurableTtsAcceptanceFailpoint::Stage));
+        store.set_durable_acceptance_failpoint(Some(DurableAcceptanceFailpoint::Stage));
         assert!(store
             .accept_durable_text_tts(acceptance.clone())
             .await
@@ -9894,7 +10603,7 @@ mod tests {
             .expect("claim rolled-back graph")
             .is_none());
 
-        store.set_durable_tts_acceptance_failpoint(None);
+        store.set_durable_acceptance_failpoint(None);
         let accepted = match store
             .accept_durable_text_tts(acceptance)
             .await
