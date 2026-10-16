@@ -50,12 +50,15 @@ fn rewrite_indexed_placeholders(
     sql: String,
     values: Vec<Value>,
 ) -> anyhow::Result<(String, Vec<Value>)> {
-    if values.is_empty() {
-        return Ok((sql, values));
-    }
-
     let placeholders = parse_placeholders(&sql)?;
-    if placeholders.is_empty() {
+    // Debug and test builds hold every statement to an exact match between
+    // the placeholders and the bound values, so a misnumbered placeholder or
+    // a value the SQL never reads fails the test suite on either backend.
+    // Release builds skip the check: PostgreSQL declares each bound value's
+    // type when preparing, so an unread trailing value is not an error there.
+    #[cfg(debug_assertions)]
+    ensure_placeholders_match_values(&placeholders, values.len())?;
+    if values.is_empty() || placeholders.is_empty() {
         return Ok((sql, values));
     }
 
@@ -64,6 +67,31 @@ fn rewrite_indexed_placeholders(
         DbBackend::Postgres => rewrite_postgres(sql, placeholders, values),
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     }
+}
+
+/// Every bound value is read by a placeholder, and every placeholder has a
+/// value: the distinct placeholder indexes are exactly `1..=value_count`.
+#[cfg(debug_assertions)]
+fn ensure_placeholders_match_values(
+    placeholders: &[Placeholder],
+    value_count: usize,
+) -> anyhow::Result<()> {
+    let mut used = vec![false; value_count];
+    for placeholder in placeholders {
+        anyhow::ensure!(
+            placeholder.index <= value_count,
+            "SQL placeholder ?{} has no matching value; only {value_count} values were supplied",
+            placeholder.index
+        );
+        used[placeholder.index - 1] = true;
+    }
+    if let Some(unused) = used.iter().position(|used| !used) {
+        bail!(
+            "SQL binds {value_count} values but no placeholder reads value ?{}",
+            unused + 1
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +220,30 @@ mod tests {
             .expect("statement should build");
 
         assert_eq!(statement.sql, "SELECT ?1");
+    }
+
+    #[test]
+    fn values_no_placeholder_reads_are_rejected() {
+        for backend in [DbBackend::Sqlite, DbBackend::Postgres] {
+            let error = statement_for_backend(
+                backend,
+                "SELECT ?1, ?3",
+                vec!["a".into(), "b".into(), "c".into()],
+            )
+            .expect_err("an unread value should fail");
+            assert!(
+                error.to_string().contains("no placeholder reads value ?2"),
+                "{error}"
+            );
+            let error = statement_for_backend(backend, "SELECT 1 = 1", vec!["a".into()])
+                .expect_err("a statement without placeholders binds nothing");
+            assert!(
+                error.to_string().contains("no placeholder reads value ?1"),
+                "{error}"
+            );
+        }
+        statement_for_backend(DbBackend::Sqlite, "SELECT ?2, ?1, ?2", vec![1.into(), 2.into()])
+            .expect("reused and reordered placeholders cover every value");
     }
 
     #[test]

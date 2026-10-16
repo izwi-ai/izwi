@@ -877,7 +877,7 @@ enum LeaseValidity {
 impl LeaseValidity {
     fn sql_predicate(self) -> &'static str {
         match self {
-            Self::Expired => "lease_expires_at <= ?7",
+            Self::Expired => "lease_expires_at <= ?1",
             // Owner-fenced relinquish must not depend on wall-clock expiry:
             // attempt identity still protects against a reclaimed lease.
             Self::Any => "1 = 1",
@@ -896,10 +896,11 @@ enum CancellationSettlement {
 }
 
 impl CancellationSettlement {
-    fn stale_before(self) -> i64 {
+    /// The value the predicate reads at its placeholder, when it reads one.
+    fn bound_value(self) -> Option<Value> {
         match self {
-            Self::OwnerTeardown => 0,
-            Self::AbandonedOwner { stale_before } => stale_before,
+            Self::OwnerTeardown => None,
+            Self::AbandonedOwner { stale_before } => Some(stale_before.into()),
         }
     }
 
@@ -4936,9 +4937,8 @@ impl BatchRuntimeStore {
         if limit == 0 {
             return Ok(0);
         }
-        let settlement = CancellationSettlement::AbandonedOwner {
-            stale_before: now.saturating_sub(ABANDONED_CANCELLATION_GRACE_MS),
-        };
+        let stale_before = now.saturating_sub(ABANDONED_CANCELLATION_GRACE_MS);
+        let settlement = CancellationSettlement::AbandonedOwner { stale_before };
         let rows = db
             .query_all_raw(raw::statement(
                 db,
@@ -4956,10 +4956,7 @@ impl BatchRuntimeStore {
                     "#,
                     settlement.sql_predicate(1)
                 ),
-                vec![
-                    settlement.stale_before().into(),
-                    i64::try_from(limit)?.into(),
-                ],
+                vec![stale_before.into(), i64::try_from(limit)?.into()],
             )?)
             .await
             .context("Failed to list abandoned runtime stage cancellations")?;
@@ -6354,7 +6351,7 @@ impl BatchRuntimeStore {
                     updated_at = ?1,
                     lease_expires_at = NULL,
                     worker_id = NULL,
-                    available_at = ?8,
+                    available_at = ?7,
                     attempt_token = NULL,
                     error_code = ?2,
                     error_message = ?3
@@ -6362,7 +6359,7 @@ impl BatchRuntimeStore {
                   AND status IN ('running', 'postprocessing')
                   AND worker_id = ?5
                   AND attempt_count = ?6
-                  AND (attempt_token = ?9 OR (attempt_token IS NULL AND ?9 IS NULL))
+                  AND (attempt_token = ?8 OR (attempt_token IS NULL AND ?8 IS NULL))
                   AND lease_expires_at IS NOT NULL
                   AND {}
                 "#,
@@ -6379,7 +6376,6 @@ impl BatchRuntimeStore {
                     stage.id.clone().into(),
                     lease.worker_id.clone().into(),
                     u32_to_i64_value(lease.attempt_count).into(),
-                    now.into(),
                     available_at.into(),
                     opt_string(lease.attempt_token.clone()),
                 ],
@@ -6440,19 +6436,16 @@ impl BatchRuntimeStore {
                     "#,
             settlement.sql_predicate(6)
         );
+        let mut values = vec![
+            now.into(),
+            lease.stage_id.clone().into(),
+            lease.worker_id.clone().into(),
+            u32_to_i64_value(lease.attempt_count).into(),
+            opt_string(lease.attempt_token.clone()),
+        ];
+        values.extend(settlement.bound_value());
         let result = db
-            .execute_raw(raw::statement(
-                db,
-                sql,
-                vec![
-                    now.into(),
-                    lease.stage_id.clone().into(),
-                    lease.worker_id.clone().into(),
-                    u32_to_i64_value(lease.attempt_count).into(),
-                    opt_string(lease.attempt_token.clone()),
-                    settlement.stale_before().into(),
-                ],
-            )?)
+            .execute_raw(raw::statement(db, sql, values)?)
             .await
             .context("Failed to finalize runtime stage cancellation")?;
         if result.rows_affected() == 0 {
@@ -6604,7 +6597,7 @@ impl BatchRuntimeStore {
                   AND status IN ('running', 'postprocessing')
                   AND worker_id = ?5
                   AND attempt_count = ?6
-                  AND (attempt_token = ?8 OR (attempt_token IS NULL AND ?8 IS NULL))
+                  AND (attempt_token = ?7 OR (attempt_token IS NULL AND ?7 IS NULL))
                   AND lease_expires_at IS NOT NULL
                   AND {}
                 "#,
@@ -6621,7 +6614,6 @@ impl BatchRuntimeStore {
                     stage.id.clone().into(),
                     lease.worker_id.clone().into(),
                     u32_to_i64_value(lease.attempt_count).into(),
-                    now.into(),
                     opt_string(lease.attempt_token.clone()),
                 ],
             )?)
