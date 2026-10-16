@@ -132,6 +132,7 @@ struct Rig {
     approvals: PathBuf,
     original_approvals: String,
     worker_binary: PathBuf,
+    old_port: u16,
 }
 
 impl Rig {
@@ -146,6 +147,22 @@ impl Rig {
         abort_grace_secs: u64,
         commit_grace_secs: u64,
     ) -> Self {
+        Self::build_full(window_secs, abort_grace_secs, commit_grace_secs, false)
+    }
+
+    /// The replacement takes over the old worker's bind, as on a one-GPU
+    /// node where both generations want the same device: the two cannot run
+    /// side by side, so the rollout recreates.
+    fn build_recreate() -> Self {
+        Self::build_full(2, 1, 1, true)
+    }
+
+    fn build_full(
+        window_secs: u64,
+        abort_grace_secs: u64,
+        commit_grace_secs: u64,
+        share_bind: bool,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap().keep();
         let run_dir = root.join("run");
         let work_dir = root.join("work");
@@ -155,7 +172,7 @@ impl Rig {
         }
 
         let old_port = free_port();
-        let new_port = free_port();
+        let new_port = if share_bind { old_port } else { free_port() };
         let workers = [
             (OLD_WORKER, old_port, "TOKEN_OLD"),
             (REPLACEMENT, new_port, "TOKEN_NEW"),
@@ -294,6 +311,7 @@ impl Rig {
             approvals,
             original_approvals,
             worker_binary,
+            old_port,
         }
     }
 
@@ -542,6 +560,85 @@ fn replacement_exit_during_window_aborts_and_restores() {
     terminate(&mut supervisor);
 }
 
+/// The approvals as a sorted list of entries, ignoring order and comments.
+fn entries(text: &str) -> Vec<String> {
+    let mut entries: Vec<String> = text
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn serving(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+#[test]
+fn a_node_without_room_for_both_generations_recreates() {
+    let rig = Rig::build_recreate();
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let committed = wait_until(Duration::from_secs(60), || {
+        read_file(&rig.state_file()).contains("committed")
+    });
+    let state = read_file(&rig.state_file());
+    assert!(committed, "the recreate rollout must commit: {state}");
+    assert!(state.contains("\"recreate\""), "{state}");
+    assert!(
+        rig.root.join("worker-old.exited").exists(),
+        "the old generation drains before the replacement takes its bind"
+    );
+    let approvals = read_file(&rig.approvals);
+    assert!(approvals.contains("worker-new|chat|chat-model|chat-prod|2"));
+    assert!(!approvals.contains("chat-prod|1"), "{approvals}");
+    assert!(approvals.contains("asr-prod|4"), "{approvals}");
+    assert!(serving(rig.old_port), "the replacement serves on the shared bind");
+    terminate(&mut supervisor);
+}
+
+#[test]
+fn a_failed_recreate_rolls_back_to_the_old_generation() {
+    let rig = Rig::build_recreate();
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(rig.root.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest[REPLACEMENT.worker_id]["serve"] = serde_json::json!(false);
+    std::fs::write(
+        rig.root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let script = FAKE_WORKER_SCRIPT.replace(
+        "{manifest}",
+        &rig.root.join("manifest.json").display().to_string(),
+    );
+    std::fs::write(&rig.worker_binary, script).unwrap();
+    make_executable(&rig.worker_binary);
+
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let drained = wait_until(Duration::from_secs(30), || {
+        rig.root.join("worker-old.exited").exists()
+    });
+    assert!(drained, "the recreate drains the old generation first");
+    let rolled_back = wait_until(Duration::from_secs(60), || {
+        !rig.state_file().exists()
+            && entries(&read_file(&rig.approvals)) == entries(&rig.original_approvals)
+            && serving(rig.old_port)
+    });
+    assert!(
+        rolled_back,
+        "a replacement that never gets ready restores the approvals and relaunches the old generation: {}",
+        read_file(&rig.approvals)
+    );
+    assert!(
+        supervisor.try_wait().unwrap().is_none(),
+        "the supervisor keeps supervising the old generation"
+    );
+    terminate(&mut supervisor);
+}
+
 #[test]
 fn abort_keeps_a_peer_edit_made_during_the_window() {
     let rig = Rig::build(8, 1);
@@ -650,7 +747,7 @@ fn rollout_status_and_abort_commands_manage_persisted_state() {
     std::fs::write(
         rig.state_file(),
         format!(
-            r#"{{"schema_version":2,"plan_digest":"sha256:placeholder","phase":"window_open","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approval_lines":["{added}"]}}"#,
+            r#"{{"schema_version":2,"plan_digest":"sha256:placeholder","phase":"window_open","strategy":"blue_green","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approval_lines":["{added}"]}}"#,
             rig.approvals.display(),
             rig.target_config.display(),
         ),

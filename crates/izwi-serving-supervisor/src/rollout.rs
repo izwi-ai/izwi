@@ -104,6 +104,75 @@ pub struct RolloutPlan {
     /// to the old workers first. At least one gateway refresh interval;
     /// unset defaults to exactly one.
     commit_grace_secs: Option<u64>,
+    /// How the generations change places. `auto` (the default) runs them
+    /// side by side when both fit the node, and otherwise recreates.
+    #[serde(default)]
+    strategy: StrategyChoice,
+}
+
+/// The rollout strategy a plan asks for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyChoice {
+    #[default]
+    Auto,
+    BlueGreen,
+    Recreate,
+}
+
+/// How a rollout replaces the old generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutStrategy {
+    /// Both generations run during a window; the gateway cuts over without
+    /// a gap. Needs room for both on the node.
+    BlueGreen,
+    /// Drain the old generation, then start the new one: the only way on a
+    /// node with one GPU, at the cost of downtime while the new generation
+    /// loads (a Kubernetes rolling update with maxSurge 0).
+    Recreate,
+}
+
+impl RolloutStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RolloutStrategy::BlueGreen => "blue_green",
+            RolloutStrategy::Recreate => "recreate",
+        }
+    }
+}
+
+/// Picks the strategy for a validated rollout. Blue-green needs the
+/// current workers and the replacements to fit the node together — host
+/// memory, CPU threads, distinct worker ids and binds, and exclusive
+/// devices — which a one-GPU node never satisfies; `auto` recreates then.
+pub fn resolve_strategy(
+    choice: StrategyChoice,
+    current: &ValidatedNodeConfig,
+    target: &ValidatedNodeConfig,
+    spec: &RolloutSpec,
+    inventory: &crate::HostInventory,
+    binaries: &crate::BinaryCatalog,
+) -> Result<RolloutStrategy, RolloutError> {
+    if choice == StrategyChoice::Recreate {
+        return Ok(RolloutStrategy::Recreate);
+    }
+    let mut union = current.config().clone();
+    union.workers.extend(
+        target
+            .config()
+            .workers
+            .iter()
+            .filter(|worker| spec.rolling_for(worker.worker_id.as_str()).is_some())
+            .cloned(),
+    );
+    match (choice, union.validate(inventory, binaries)) {
+        (_, Ok(_)) => Ok(RolloutStrategy::BlueGreen),
+        (StrategyChoice::BlueGreen, Err(error)) => Err(RolloutError::InvalidPlan(format!(
+            "blue-green runs both generations at once, but the current workers and the replacements do not fit this node together: {error}; use strategy = \"recreate\" or \"auto\""
+        ))),
+        (_, Err(_)) => Ok(RolloutStrategy::Recreate),
+    }
 }
 
 fn default_gateway_approvals_refresh_secs() -> u64 {
@@ -204,6 +273,10 @@ impl RolloutPlan {
     }
 
     /// The shared approvals file path the coordinator rewrites.
+    pub fn strategy(&self) -> StrategyChoice {
+        self.strategy
+    }
+
     pub fn shared_approvals_path(&self) -> &Path {
         &self.shared_approvals_path
     }
@@ -302,6 +375,8 @@ impl RolloutPlan {
         hasher.update(self.gateway_approvals_refresh_secs.to_le_bytes());
         hasher.update([0]);
         hasher.update(self.commit_grace_secs().to_le_bytes());
+        hasher.update([0]);
+        hasher.update([self.strategy as u8]);
         hasher.update([0]);
         hasher.update(target_config_bytes);
         format!("sha256:{:x}", hasher.finalize())
@@ -473,6 +548,7 @@ pub struct RolloutState {
     pub schema_version: u16,
     pub plan_digest: String,
     pub phase: RolloutPhase,
+    pub strategy: RolloutStrategy,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
     #[serde(default)]
@@ -485,6 +561,10 @@ pub struct RolloutState {
     /// The replacement lines this rollout adds to the shared approvals
     /// file; an abort removes exactly these.
     pub approval_lines: Vec<String>,
+    /// The old generation's lines the commit view removed; an abort after
+    /// it puts them back.
+    #[serde(default)]
+    pub removed_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -493,6 +573,10 @@ pub enum RolloutPhase {
     LaunchingReplacement,
     WindowOpen,
     DrainingOld,
+    /// Recreate: the commit view is written and the old generation drains.
+    RecreateDrainingOld,
+    /// Recreate: the old generation is gone and the replacements launch.
+    RecreateLaunching,
     Committed,
     Aborted,
 }
@@ -504,11 +588,24 @@ impl RolloutPhase {
         matches!(self, RolloutPhase::Committed | RolloutPhase::Aborted)
     }
 
+    /// Phases in which the old generation has been retired: a resumed
+    /// supervisor never relaunches it.
+    pub fn old_generation_retired(self) -> bool {
+        matches!(
+            self,
+            RolloutPhase::DrainingOld
+                | RolloutPhase::RecreateDrainingOld
+                | RolloutPhase::RecreateLaunching
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             RolloutPhase::LaunchingReplacement => "launching_replacement",
             RolloutPhase::WindowOpen => "window_open",
             RolloutPhase::DrainingOld => "draining_old",
+            RolloutPhase::RecreateDrainingOld => "recreate_draining_old",
+            RolloutPhase::RecreateLaunching => "recreate_launching",
             RolloutPhase::Committed => "committed",
             RolloutPhase::Aborted => "aborted",
         }
@@ -740,25 +837,31 @@ mod tests {
         )
     }
 
-    fn validated(toml_text: &str) -> ValidatedNodeConfig {
-        std::fs::create_dir_all("/tmp/izwi-work").unwrap();
-        std::fs::create_dir_all("/tmp/izwi-run").unwrap();
-        std::fs::create_dir_all("/tmp/izwi-models/chat").unwrap();
-        let config = crate::config::NodeConfig::parse_bounded(toml_text.as_bytes()).unwrap();
-        let inventory = crate::config::HostInventory {
+    fn inventory() -> crate::config::HostInventory {
+        crate::config::HostInventory {
             effective_cpu_ids: vec![0, 1, 2, 3],
             allocatable_host_memory_bytes: u64::MAX,
             metal_devices: vec![],
             cuda_devices: vec![],
-        };
-        let binaries = crate::config::BinaryCatalog::new(vec![(
+        }
+    }
+
+    fn binaries() -> crate::config::BinaryCatalog {
+        crate::config::BinaryCatalog::new(vec![(
             crate::config::WorkerBinaryFlavor::Cpu,
             crate::config::BinaryRecord {
                 path: "/usr/bin/true".into(),
                 supported_backends: vec![izwi_serving_protocol::BackendKind::Cpu],
             },
-        )]);
-        config.validate(&inventory, &binaries).unwrap()
+        )])
+    }
+
+    fn validated(toml_text: &str) -> ValidatedNodeConfig {
+        std::fs::create_dir_all("/tmp/izwi-work").unwrap();
+        std::fs::create_dir_all("/tmp/izwi-run").unwrap();
+        std::fs::create_dir_all("/tmp/izwi-models/chat").unwrap();
+        let config = crate::config::NodeConfig::parse_bounded(toml_text.as_bytes()).unwrap();
+        config.validate(&inventory(), &binaries()).unwrap()
     }
 
     fn spec_for(current: &ValidatedNodeConfig, target: &ValidatedNodeConfig) -> RolloutSpec {
@@ -889,6 +992,37 @@ mod tests {
             toml::from_str(&plan_toml("/tmp/t.toml", "/tmp/a", "worker-c", 10)).unwrap();
         assert!(matches!(
             wrong_canary.validate(&current, &target).unwrap_err(),
+            RolloutError::InvalidPlan(_)
+        ));
+    }
+
+    /// A node that cannot hold both generations (here the replacement
+    /// takes the old worker's bind, as a one-GPU node would share its
+    /// device) recreates under `auto` and refuses an explicit blue-green.
+    #[test]
+    fn strategy_follows_whether_both_generations_fit() {
+        let current = validated(&current_toml(1));
+        let target = validated(&target_toml(2));
+        let spec = spec_for(&current, &target);
+        let resolve = |choice, target: &ValidatedNodeConfig| {
+            resolve_strategy(choice, &current, target, &spec, &inventory(), &binaries())
+        };
+        assert_eq!(
+            resolve(StrategyChoice::Auto, &target).unwrap(),
+            RolloutStrategy::BlueGreen
+        );
+        assert_eq!(
+            resolve(StrategyChoice::Recreate, &target).unwrap(),
+            RolloutStrategy::Recreate
+        );
+
+        let shared = validated(&target_toml(2).replace("127.0.0.1:9480", "127.0.0.1:9470"));
+        assert_eq!(
+            resolve(StrategyChoice::Auto, &shared).unwrap(),
+            RolloutStrategy::Recreate
+        );
+        assert!(matches!(
+            resolve(StrategyChoice::BlueGreen, &shared).unwrap_err(),
             RolloutError::InvalidPlan(_)
         ));
     }
@@ -1046,6 +1180,7 @@ mod tests {
             schema_version: ROLLOUT_STATE_SCHEMA_VERSION,
             plan_digest: "sha256:abc".to_string(),
             phase: RolloutPhase::WindowOpen,
+            strategy: RolloutStrategy::BlueGreen,
             started_at_ms: 1,
             updated_at_ms: 2,
             window_deadline_ms: Some(3),
@@ -1059,6 +1194,7 @@ mod tests {
             approval_lines: vec![
                 "v1|http://127.0.0.1:9480|node-a|worker-b|chat|chat-model|chat-prod|2".to_string(),
             ],
+            removed_lines: Vec::new(),
         };
         persist_state(dir.path(), &state).unwrap();
         assert_eq!(load_state(dir.path()).unwrap().as_ref(), Some(&state));
