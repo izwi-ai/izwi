@@ -39,8 +39,11 @@ izwi-serving-supervisor          validates, starts, fences, restarts, drains
   workers, or accelerator delegation are initialized.
 - The supervisor assigns each child its CPU threads/memory or accelerator
   identity/memory before process startup. It clears the child environment,
-  restores only an allowlist, and injects the validated assignment. It starts
-  initial workers serially and serializes their allocation-heavy load stage.
+  restores only an allowlist plus the worker's validated
+  `[workers.environment]` table, and injects the validated assignment. Each
+  worker has its own supervision task, so one slow load or crash loop never
+  stalls the others; `max_parallel_model_loads` (default 1) bounds how many
+  workers load at once.
 - Each worker owns exactly one loaded model, runtime, scheduler, model
   generation, and authoritative admission semaphore. One invocation never
   crosses workers or devices.
@@ -235,8 +238,26 @@ variables itself, including the declared `IZWI_WORKER_PRECISION`,
 `IZWI_WORKER_EXECUTION_REPRESENTATION`, `IZWI_WORKER_MAX_CONTEXT_TOKENS` and
 `IZWI_WORKER_MAX_OUTPUT_TOKENS`. It clears everything else except a short
 allowlist (`PATH`, `RUST_LOG`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, temp
-directories), so the variables below take their defaults on supervised
-workers; set them only on a worker you start yourself.
+directories) and the worker's own `[workers.environment]` table:
+
+```toml
+[[workers]]
+worker_id = "chat-cuda-1"
+# ...
+[workers.environment]
+IZWI_KV_HOST_OFFLOAD = "0"                      # any IZWI_* switch
+IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS = "60000"
+LD_LIBRARY_PATH = "/usr/local/cuda/lib64"      # loader and cache paths
+```
+
+The table accepts `IZWI_*` names and `LD_LIBRARY_PATH`, `CUDA_HOME`,
+`CUDA_PATH`, `HF_HOME`, `HF_HUB_OFFLINE` and `RUST_BACKTRACE`. Validation
+rejects every variable the supervisor sets itself (identity, assignment,
+budgets, locks, `CUDA_VISIBLE_DEVICES`), anything that looks like a
+credential (`TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `*_KEY`)
+and the worker's `bearer_token_env`, and bounds the table (64 entries, 4 KiB
+per value, 64 KiB in all). The supervisor's own variables are set last, so
+they always win. The variables below can be set this way:
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -443,7 +464,7 @@ supervisor keep a Prometheus textfile for a node exporter's textfile collector.
 It is replaced atomically whenever it changes and holds the gauges
 `izwi_supervisor_workers`, `_workers_running`, `_workers_quarantined` and
 `_workers_restart_pending`, and the counters
-`izwi_supervisor_{launch_attempts,readiness_failures,restarts_scheduled,quarantines,unexpected_exits,stop_failures,autoscale_ups,autoscale_downs,rollouts_committed,rollouts_aborted,rollouts_degraded}_total`.
+`izwi_supervisor_{launch_attempts,readiness_failures,restarts_scheduled,quarantines,unexpected_exits,liveness_restarts,stop_failures,autoscale_ups,autoscale_downs,rollouts_committed,rollouts_aborted,rollouts_degraded}_total`.
 A rollout runs before the supervision loop, so rollout counters appear once it
 has finished.
 
@@ -831,12 +852,30 @@ same local drain path. The supervisor also uses kill-on-drop as a final ownershi
 fence. Do not start a replacement supervisor until the node generation barrier
 confirms prior workers released their fences.
 
-An unexpected worker exit is restarted with the configured bounded policy. A
-worker that exceeds `max_restarts_per_window` is quarantined; restart the
-supervisor only after diagnosing the cause. A healthy replacement receives a
-new incarnation. Gateway polling may approve it only when logical worker/node,
-capacity, deployment, artifact, generation, execution profile, and capability
-remain unchanged.
+An unexpected worker exit is restarted with the configured bounded policy.
+So is a ready worker that stops answering: every `[liveness] period_ms`
+(default 5000) the supervisor asks the worker's status; an answer that does
+not come within `timeout_ms` (3000), comes from another identity, or
+reports a failed runtime counts as a failure, and `failure_threshold` (3)
+failures in a row terminate the worker (no cooperative drain: it cannot be
+asked anything) and restart it like a crash. A deployment that is merely
+not ready (a drain-recoverable fault) does not count.
+
+A worker that exceeds `max_restarts_per_window` is quarantined. It is
+retried once every `restart.quarantine_retry_ms` (default 600000; 0 waits
+for an operator), and a retry that stays up for `stable_reset_ms` ends the
+quarantine. Clear it at once, after diagnosing the cause, with SIGHUP (every
+quarantined worker) or, on any platform,
+
+```
+izwi-serving-supervisor --config /etc/izwi/node.toml <inventory flags> --clear-quarantine chat-cpu-1   # or: all
+```
+
+which leaves a request in the runtime directory that the running supervisor
+applies within a second. A cleared worker relaunches with a fresh restart
+budget. A healthy replacement receives a new incarnation. Gateway polling
+may approve it only when logical worker/node, capacity, deployment,
+artifact, generation, execution profile, and capability remain unchanged.
 
 There is no hot config or model reload in this profile. For a model update or
 rollback:
@@ -860,35 +899,60 @@ atomic, supervisor-computed approvals view and adds an automatic abort path.
 The manual sequence remains the fallback for changes a rollout plan cannot
 express (node identity, capacity, non-rolling workers).
 
-### Coordinated blue-green rollout (DS6)
+### Coordinated rollout (DS6)
 
 One supervisor invocation performs the cutover with automatic abort. Write a
 rollout plan that names the already-validated target node config (new nonzero
 generations), the gateway's shared approvals file, the canary replacement, and
-the soak/abort windows:
+how to learn that the gateways adopted each view:
 
 ```toml
 schema_version = 1
 target_node_config = "/etc/izwi/node-v2.toml"   # absolute path; validated in full before anything changes
-shared_approvals_path = "/etc/izwi/shared-approvals.toml"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
+shared_approvals_path = "/var/lib/izwi/shared-approvals"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
 canary_worker_id = "chat-worker-2"              # replacement launched first; its readiness failure aborts
-gateway_approvals_refresh_secs = 30             # the gateways' IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS, in seconds (1–3600, default 30)
-window_secs = 60                                # soak window before the commit view (≥ 2× the refresh, ≤ 3600; default 2× the refresh)
-commit_grace_secs = 30                          # wait after the commit view before draining the old generation (≥ the refresh, ≤ 3600; default the refresh)
+strategy = "auto"                               # auto (default), blue_green or recreate
 abort_grace_secs = 30                           # wait after an abort restore before stopping replacements (0–300)
+
+# Recommended: ask the gateways instead of guessing from their refresh interval.
+[gateway_ack]
+admin_urls = ["http://127.0.0.1:8080"]          # every gateway reading the file
+admin_key_env = "IZWI_GATEWAY_ADMIN_KEY"        # supervisor env var holding the gateways' admin key
+timeout_secs = 120                              # per view; not acknowledged in time aborts (1–3600)
 ```
 
-The supervisor cannot ask the gateways when they adopted a view, so the
-timings are sized from the refresh interval the plan declares: a window of at
-least two refreshes lets every gateway adopt the window view (and cut over)
-before the commit view lands, and a commit grace of at least one refresh lets
+With `[gateway_ack]` the supervisor polls each gateway's
+`GET /internal/admin/approvals` (admin key; it reports the adopted file's
+digest, the approval lines and the generation each pool routes to) after
+every view it writes, and moves on only when every gateway reports the view
+adopted. `window_secs` (default 0) is then a pure soak after the
+acknowledged cutover, and no commit grace is needed. Without it the
+supervisor cannot know when a view was adopted and falls back to timers
+sized from the refresh interval the plan declares:
+
+```toml
+gateway_approvals_refresh_secs = 30   # the gateways' IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS, in seconds (1–3600, default 30)
+window_secs = 60                      # ≥ 2× the refresh, ≤ 3600; default 2× the refresh
+commit_grace_secs = 30                # ≥ the refresh, ≤ 3600; default the refresh
+```
+
+A window of two refreshes lets every gateway adopt the window view (and cut
+over) before the commit view lands, and a commit grace of one refresh lets
 every gateway stop routing to the old generation before it drains. Declare
-the gateways' real refresh interval; plan validation rejects shorter windows
-and graces. Gateway-acknowledged adoption replaces these timers in a later
-release.
+the gateways' real refresh interval; plan validation rejects shorter timers.
 
 The target config's non-rolling workers and node identity must match the
 running config exactly; only the rolling deployments' generations advance.
+
+**Strategy.** Blue-green runs both generations side by side, so plan
+validation checks that the current workers and the replacements fit the
+node together: host memory, CPU threads, distinct worker ids and binds, and
+exclusive devices. A single Metal device or GPU never fits twice, so `auto`
+(the default) uses blue-green when the union fits and recreate otherwise;
+`blue_green` refuses a plan that does not fit and says why. Recreate drains
+the old generation and then starts the new one, like a Kubernetes rolling
+update with `maxSurge: 0`: the deployment is unavailable from the drain
+until the replacements are ready (the model load time).
 
 Start (or restart) the supervisor with the plan — `--config` stays the current
 (old) config; the plan carries the target:
@@ -899,53 +963,84 @@ izwi-serving-supervisor --config /etc/izwi/node-v1.toml \
   --rollout-plan /etc/izwi/rollout.toml
 ```
 
-The supervisor then:
+A blue-green rollout then:
 
 1. launches the current generation's workers, then the replacements
    canary-first (canary readiness failure aborts immediately);
-2. writes the window view — both generations approved, one atomic file
-   write — and persists `window_open` state; the gateway adopts the view at
-   runtime and moves admission to the new generation the moment it observes
-   it Ready (never two eligible generations, never zero);
-3. after the soak window writes the commit view (new generation only), waits
-   `commit_grace_secs` for the gateways to adopt it, and drains the old
-   workers — the point of no return — then records
-   `committed` and keeps supervising the replacements; repoint the service
-   definition at the target config for the next supervisor restart.
+2. adds the replacements' lines to the shared file (the window view) and
+   persists `window_open`; each gateway adopts the view at runtime and
+   moves admission to the new generation the moment it observes it Ready
+   (never two eligible generations, never zero). With `[gateway_ack]` the
+   rollout waits until every gateway reports that cutover; not in time, it
+   aborts;
+3. after the soak, writes the commit view (this node's old-generation lines
+   removed), waits for every gateway to acknowledge it (or the commit grace),
+   persists `draining_old` — the point of no return — and drains the old
+   workers, then records `committed` and keeps supervising the
+   replacements. A commit view not acknowledged in time aborts: the old
+   lines go back and the old generation never stopped serving.
+
+A recreate rollout writes the commit view first (`recreate_draining_old`),
+waits for the acknowledgement or the commit grace, stops the old
+generation, launches the replacements canary-first (`recreate_launching`)
+and records `committed` once they are ready. If a replacement fails
+readiness, or an operator aborts, the view is restored and the old
+generation is launched again.
+
+Repoint the service definition at the target config before the next
+supervisor restart. Under systemd, run the rollout as the unit: add a
+drop-in (`systemctl edit izwi-serving-supervisor`) whose `ExecStart` appends
+`--rollout-plan /etc/izwi/rollout.toml`, and restart the unit (any
+supervisor restart drains and relaunches the current generation first).
+Once `--rollout-status` reports `committed`, change the drop-in to the
+target `--config` without the plan and run `systemctl daemon-reload`; the
+next restart then finds the committed state matching its config. Leaving
+the plan in place would stage the same rollout again on that restart.
 
 Monitor and intervene without guessing:
 
 - `--rollout-status` reports the persisted phase (`launching_replacement`,
-  `window_open`, `draining_old`, `committed`, `aborted`) and window deadline.
+  `window_open`, `draining_old`, `recreate_draining_old`,
+  `recreate_launching`, `committed`, `aborted`) and window deadline.
 - Abort while reversible: send SIGUSR2 to the supervisor, or stop it —
   shutdown during launch/window aborts and restores automatically. A
-  replacement that exits during the window aborts too. The abort restores
-  the pre-rollout approvals byte-identically first, waits
-  `abort_grace_secs` so the gateway stops routing to the replacements, then
-  drains them; the old generation never stopped serving.
+  replacement that exits during the window aborts too. The abort removes
+  exactly the lines the rollout added (and puts back any it removed) under
+  the approvals file lock, so the file is byte-identical to the pre-rollout
+  file unless someone else edited it meanwhile, and their edit is kept. It
+  then waits `abort_grace_secs` so the gateway stops routing to the
+  replacements and drains them.
 - If the supervisor dies mid-rollout, managed workers self-drain and a fresh
   start fails closed until you rerun `--rollout-plan` (resume with the same
   plan: the old generation relaunches only in pre-drain states, replacements
-  relaunch alongside it; in `draining_old` the old generation is never
-  relaunched) or `--rollout-abort` (restore without launching anything).
-  Terminal states clear automatically; a `committed` state requires the
-  committed target config's digest.
+  relaunch alongside it, and a resumed window runs in full again; past the
+  drain the old generation is never relaunched) or `--rollout-abort`
+  (restore the approvals without launching anything; after a recreate's
+  drain, start the supervisor with the old config to serve the old
+  generation again). Terminal states clear automatically; a `committed`
+  state requires the committed target config's digest.
 - Rollback after `committed` is a new rollout plan back to the previous
   configuration with a fresh generation — never a generation reuse.
 
 Limit the blast radius honestly: `draining_old` is irreversible (worker
 control-pipe EOF cannot be un-sent), the coordinator covers one supervisor
-and one gateway over one shared approvals file, and hand-editing the shared
-approvals file is still possible — it now has runtime effect, so leave the
-file to the rollout command.
+over one shared approvals file, and the views it writes use the workers'
+loopback endpoints, so every gateway must run on the same host.
+Hand-editing the shared approvals file is still possible and now safe
+against the supervisor's own edits (they all take the file's lock and start
+from what is there), but it has runtime effect.
 
 ### Signal-driven worker autoscaling (DS7)
 
-The supervisor can act as a capacity manager for one deployment on its node:
-scale out on sustained queue depth, scale in after a stabilized idle window.
-It is supervisor-managed — no Kubernetes, no external scaler — and
-fleet-profile only: the supervisor owns the v1 pinned approval lines of its
-autoscaled deployments in the gateway's shared approvals file.
+**Scope.** This is an optional, default-off capability for one host. The
+desktop and single-node profile does not need it (a single GPU can never
+hold a second worker), and fleets should scale with Kubernetes and KEDA on
+the workers' metrics instead (see "Service managers and Kubernetes"). The
+supervisor can act as a capacity manager for one deployment on its node:
+scale out on sustained load, scale in after a stabilized idle window. It owns
+the v1 pinned approval lines of its autoscaled deployments in the gateway's
+shared approvals file; those lines carry the workers' loopback endpoints, so
+the gateways must run on the same host.
 
 Autoscaling is off unless the node config carries an `[autoscaling]` block.
 All workers of an autoscaled deployment are declared in the node config as
@@ -955,15 +1050,16 @@ rest are standbys that only a scale-up decision starts:
 
 ```toml
 [autoscaling]
-shared_approvals_path = "/etc/izwi/shared-approvals"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
-# evaluation_interval_ms = 1000                       # 100–60000, default 1000
+shared_approvals_path = "/var/lib/izwi/shared-approvals"  # the gateway's IZWI_GATEWAY_SHARED_APPROVALS_PATH file
+# evaluation_interval_ms = 1000                           # 100–60000, default 1000
 
 [autoscaling.deployments.chat-prod]
 min_workers = 1                              # launched at startup, never scaled down
 max_workers = 3                              # must equal the declared worker count for the deployment
-scale_up_queue_depth = 4                     # a running worker reporting queued >= this depth...
+scale_up_queue_depth = 4                     # a running worker holding >= this many invocations (active + queued)...
 scale_up_sustained_polls = 3                 # ...for this many consecutive evaluations
-scale_down_stabilization_window_ms = 60000   # 1000–86400000; hysteresis + idle window
+# scale_up_stabilization_window_ms = 0       # hold scale-up this long after any scale event (default 0)
+scale_down_stabilization_window_ms = 60000   # 1000–86400000; hold scale-down this long, and the idle window
 ```
 
 Startup behavior with the block present: the supervisor reconciles the shared
@@ -975,47 +1071,49 @@ through untouched), launches exactly the min set, and evaluates every
 Scale semantics:
 
 - **Scale-up** requires the deployment below `max_workers`, a standby
-  available, hysteresis clear, and a running worker at or above
-  `scale_up_queue_depth` for `scale_up_sustained_polls` consecutive
-  evaluations. The standby launches through the standard launch/readiness
-  path (readiness is awaited inline, like the canary path) and gains its
-  approvals line only after readiness.
-- **Scale-down** requires the deployment above `min_workers`, hysteresis
-  clear, and a non-core worker fully idle (zero queued, zero active, zero
-  reserved sessions) for the whole stabilization window. The worker's line
-  is removed first (the gateway stops routing new work after its view
+  available, the scale-up window clear, and a running worker holding at
+  least `scale_up_queue_depth` invocations (active plus queued; workers do
+  not queue today, so this is the active count and validation rejects a
+  depth above the workers' `max_active_invocations`) for
+  `scale_up_sustained_polls` consecutive evaluations. The standby starts
+  through the standard launch path; the supervisor does not wait for it and
+  publishes its approvals line once it is ready. A worker that crashed is
+  never picked as a standby.
+- **Scale-down** requires the deployment above `min_workers`, the
+  scale-down window clear, and a non-core worker fully idle (zero queued,
+  zero active, zero reserved sessions) for the whole window. The worker's
+  line is removed first (the gateway stops routing new work after its view
   refresh), its control pipe closes immediately (it stops admission without
   waiting for the gateway TTL), the supervisor waits for zero active work,
-  and only then runs the standard drain/stop. The slot returns to the
-  standby pool; scale-down never touches the startup min set.
-- **Hysteresis** is shared by both directions: no scale event may start
-  within `scale_down_stabilization_window_ms` of the previous scale event.
-- **Budgets** (DS7.3): every scale-up reserves the candidate's declared
-  budgets in the node resource ledger first — host memory, CPU threads,
-  device exclusivity — and a reservation that would overcommit is rejected
-  with a diagnostic instead of launched. Config validation already proves
-  the full declared replica set fits the node, so a rejection means ledger
-  misuse, not reachable config state.
+  and only then stops it. The slot returns to the standby pool; scale-down
+  never touches the startup min set.
+- **Windows** are per direction, like the Kubernetes HPA: after any scale
+  event, scale-up waits `scale_up_stabilization_window_ms` (default 0, so a
+  burst scales out at once) and scale-down waits
+  `scale_down_stabilization_window_ms`. They run on the monotonic clock.
+- **Budgets**: config validation proves the whole declared replica set
+  (standbys included) fits the node at once — host memory, CPU threads and
+  device exclusivity — so a scale-up needs no check of its own.
 
 Operate it like the rest of the supervisor:
 
 - `--validate-only` prints the parsed policy; SIGUSR1 diagnostics include an
   `autoscale deployment=... running=N standby=N draining=N` line per
   autoscaled deployment plus `autoscale_ups_total`/`autoscale_downs_total`.
-- Decisions freeze (never guess) while a worker is restart-pending, a status
-  poll fails, or an approvals write fails; the affected deployment resumes
-  deciding once observability is whole again.
+- Decisions freeze (never guess) while a worker of the deployment is
+  restart-pending or loading, a status poll fails, or an approvals write
+  fails; the deployment resumes deciding once observability is whole again.
+  A quarantined worker does not freeze it.
 - Standbys are ordinary declared workers: they resolve secrets at startup
-  and are covered by the restart controller once activated. A quarantined
-  standby stays standby until an operator clears it.
+  and are covered by the restart controller once activated.
 - Autoscaling and `--rollout-plan` are mutually exclusive in one supervisor
   run (both own the shared view). Stop autoscaling by removing the block
   before rolling; scale state is in-memory by design — a supervisor restart
   returns to the declared min set and reconciles the view to it.
 - Hand-editing lines for autoscaled deployments of this node is futile (the
   next reconciliation overwrites them) and a standalone-form line colliding
-  with an autoscaled endpoint fails the view write closed; the fleet
-  profile's v1 pinned form is required.
+  with an autoscaled endpoint fails the view write closed; the v1 pinned
+  form is required.
 
 ## Troubleshooting
 
@@ -1033,7 +1131,7 @@ Operate it like the rest of the supervisor:
 | Request returns overload/unavailable | Gateway semaphore, fresh eligible workers, worker authoritative capacity, drain state, circuit logs | Shed load or add an independently budgeted worker; do not create an unbounded proxy queue |
 | Same tenant receives 429 | Concurrency: `IZWI_GATEWAY_TENANT_MAX_CONCURRENT` and exact attempts still awaiting terminal teardown. Rate: `IZWI_GATEWAY_TENANT_REQUESTS_PER_MINUTE` / `IZWI_GATEWAY_TENANT_BURST_REQUESTS` | Wait for confirmed completion/teardown or raise the limits only with measured capacity; do not release on client disconnect |
 | Stream stops without terminal output | Timeout, proxy disconnect, slow consumer, worker/protocol error | Treat result as unknown; inspect the exact attempt and never replay automatically |
-| Worker repeatedly restarts or is quarantined | First failure, resource limits, manifest/model load, lock ownership, stable-uptime threshold | Drain the gateway, fix root cause, validate, then restart supervisor |
+| Worker repeatedly restarts or is quarantined | First failure, resource limits, manifest/model load, lock ownership, stable-uptime threshold; `failed N consecutive liveness probes` means it stopped answering | Fix the root cause, then `--clear-quarantine <worker>` (or SIGHUP); otherwise it is retried every `quarantine_retry_ms` |
 | New worker incarnation is ignored | Logical worker/node, capacity, artifact/generation/profile/capability drift | Make node config and gateway approval agree; do not accept status-advertised drift |
 
 Use structured service logs and request IDs, but do not log authorization
@@ -1081,9 +1179,9 @@ coordination database — a SQLite file with
 `IZWI_GATEWAY_FLEET_DB_PATH=/absolute/path/fleet.sqlite3`, or a shared
 PostgreSQL database with
 `IZWI_GATEWAY_FLEET_DB_PATH=postgres://user:pass@db-host:5432/izwi_fleet` —
-to share worker observations and capacity claims. Each gateway publishes its
-polled worker statuses (monotonic per incarnation; incarnation changes always
-win) and claims one short-lived capacity unit per dispatch; selection steers
+to share in-transit capacity claims (each gateway polls every worker's status
+itself). Each gateway claims one short-lived capacity unit per dispatch;
+selection steers
 away from peer-filled workers while the worker remains the atomic admission
 arbiter, so a lost race degrades to one alternate dispatch. A claim covers
 only the transit from selection to the worker's acceptance and is released
@@ -1092,19 +1190,23 @@ work. Peer views count other gateways' claims only, since each gateway already
 tracks its own dispatches locally. Unreleased claims expire by
 TTL — `IZWI_GATEWAY_FLEET_CLAIM_TTL_MS`, bounded 100ms–300s, default 30000 —
 which is the crash-recovery path: no explicit recovery protocol. A slow
-background sweep additionally reaps expired claims and prunes observation
-rows for workers that stopped reporting beyond 24h, so a long-lived fleet
-does not leak rows. Each gateway also releases its own leftover claims at
-startup (same `IZWI_GATEWAY_ID` after a restart), so capacity frees
-immediately instead of waiting out the TTL. Unset means single-gateway
-operation with purely process-local state.
+background sweep additionally reaps expired claims, so a long-lived fleet
+does not leak rows. Each gateway's claims carry its identity,
+`IZWI_GATEWAY_ID` (1–128 ASCII letters, digits, `-` or `_`; an invalid value
+fails boot). Unset, the gateway takes a random identity for this boot, never
+one derived from its process id (every container is PID 1); with a stable
+operator-set identity a restarted gateway also releases its leftover claims
+at startup instead of waiting out the TTL. Unset
+`IZWI_GATEWAY_FLEET_DB_PATH` means single-gateway operation with purely
+process-local state; that is the default.
 
 The coordination store never sits on a request's or a status poll's critical
 path. A dispatch waits at most `IZWI_GATEWAY_FLEET_CLAIM_TIMEOUT_MS` (1ms–5s,
 default 100) for its claim and otherwise invokes without one; a claim that
 lands after that is released at once. Status polls record each observation
-locally first and publish it to the store in the background, so a slow or
-hung store cannot make healthy workers look stale. When the store cannot be
+locally first and refresh the worker's peer-claim count from the store in
+the background, so a slow or hung store cannot make healthy workers look
+stale. When the store cannot be
 read, a gateway stops counting peer claims for that worker and admission is
 worker-authoritative until the store answers again. PostgreSQL coordination
 sessions carry a 5 s `statement_timeout` and
@@ -1138,7 +1240,7 @@ worker first within a single plain boot; remaining workers start only after
 the canary reaches readiness, and the supervisor exits if it fails. It orders
 launches only — it never moves gateway routing between generations and
 cannot be combined with `--rollout-*`. For a generation cutover use the
-coordinated blue-green rollout (see "Drain, shutdown, and restart"), which
+coordinated rollout (see "Drain, shutdown, and restart"), which
 adds the dual-generation approval window, automatic abort, and resume.
 
 **Worker TLS.** The worker terminates TLS when both
@@ -1149,6 +1251,52 @@ are rejected without TLS unless `IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1`
 acknowledges a private network. Supervised workers bind loopback only.
 Remote deployment needs separate-machine handshake evidence before any
 support claim.
+
+## Service managers and Kubernetes (scope D1)
+
+The supported scopes are deliberately narrow:
+
+- **Desktop and single node** (first-class): the supervisor with its
+  per-worker supervision, liveness probing, bounded restarts and
+  quarantine, plus the coordinated rollout (recreate on a one-GPU node).
+  Run the supervisor and the gateway under a service manager:
+  `config/serving/systemd/izwi-serving-supervisor.service` and
+  `izwi-gateway.service` are ready-made units (secrets in mode-0600
+  environment files, `KillMode=mixed` so stopping the supervisor drains its
+  workers, `RuntimeDirectory=izwi` for the node lease and fences).
+- **Optional, default off**: supervisor autoscaling (an `[autoscaling]`
+  block) and multi-gateway coordination (`IZWI_GATEWAY_FLEET_DB_PATH`).
+  Both stay runtime switches in the one release binary rather than cargo
+  features, so nothing changes for a node that does not set them and a
+  fleet operator needs no custom build. Neither is needed on one host.
+- **Fleets**: let Kubernetes supervise, scale and roll out.
+  `config/serving/kubernetes/` holds a worker StatefulSet with a GPU
+  request and liveness on the worker status (`worker.yaml`; a StatefulSet so
+  every replica keeps the stable endpoint and identity the gateway's v1
+  approvals pin), a gateway Deployment and Service in the
+  `fleet-one-gateway` topology with mutual TLS, identities from pod names
+  and the approvals in a ConfigMap (`gateway.yaml`), and a KEDA
+  ScaledObject that scales the workers on `izwi_worker_active_invocations`
+  with immediate scale-out and a five-minute scale-in window, plus the
+  Prometheus scrape job the workers need (`autoscaling.yaml`). Approve every
+  worker ordinal up to the scaler's maximum; the gateway adopts each worker
+  when it answers.
+
+Rollouts on Kubernetes: Argo Rollouts and plain rolling updates manage
+Deployments' ReplicaSets, and a worker generation is pinned in the
+approvals, so roll a generation out as the supervisor does: create a second
+StatefulSet for the new generation (its own ordinals and deployment
+generation), add its lines to the `izwi-approvals` ConfigMap next to the old
+ones (the window view; each gateway cuts over when it sees a new worker
+Ready, never two eligible generations), confirm with each gateway's
+`GET /internal/admin/approvals` that the pool routes to the new generation,
+then remove the old lines, wait for the gateways to report that view, and
+scale the old StatefulSet to zero. The one approval the fleet-one-gateway
+topology requires on the command line moves with the gateway Deployment's
+arguments, which a rolling update of the gateways applies. Argo Rollouts fits the gateway
+Deployment (a canary of a new gateway build behind the Service), and an
+Argo Rollouts `AnalysisTemplate` can gate a worker generation's promotion
+on the gateways' error rate or on `izwi_worker_failed_total`.
 
 ## Evidence and support matrix
 
@@ -1164,7 +1312,7 @@ to unrelated local-engine tests elsewhere in the repository.
 | Real CUDA execution | The supervisor accepts, validates and launches CUDA assignments with the exact declared UUID (`multi_lane_launch.rs`); no NVIDIA device was available to execute on | Not established |
 | Physical multi-GPU | Parser/topology and scripted-runtime replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
-| Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals with monotonic observations, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
+| Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,

@@ -16,7 +16,7 @@ is never promoted to real hardware or performance evidence.
 | One machine, Apple silicon | One gateway | Metal worker (metal-feature build, device identity `metal:<registryID>` verified at startup) | **Real Metal inference executed**: 120 gateway-routed generations through a metal worker (debug build, tiny synthetic fixture, `benchmarks/manifests/ds07-metal-baseline.json`); `backend_parity.rs` proves greedy Metal outputs equal CPU outputs on the fixture, including the DS1.5 committed-prefix attach leg (`benchmarks/manifests/ds15-metal-summary.json`); supervisor launch + exact device identity process-evidenced (`multi_lane_launch.rs`) | Development Metal lane proven on the fixture; not a production model, capacity, soak, or performance certificate |
 | One machine, NVIDIA | One gateway | CUDA-capable worker binary via `--cuda-worker-binary` | The supervisor accepts, validates, and launches CUDA assignments with exact declared UUID and device-visibility environment (process test `multi_lane_launch.rs`); no CUDA toolchain or NVIDIA device was available in this work session | Supervision code-complete; CUDA execution not run — no CUDA or multi-GPU support claim |
 | Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the worker terminates TLS/mTLS from bounded file references (supervised workers stay loopback-only), but no separate-machine handshake or artifact path was exercised | Not supported as an operational profile |
-| Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals + monotonic observation registry), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); a hung coordination store is unit-tested: status polls and dispatch proceed and admission falls back to the worker. Capacity claims cover only the transit to worker acceptance and steer selection while the worker remains the atomic admission arbiter | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL is not supported; circuit state and accepted-work ownership stay per-gateway |
+| Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); a hung coordination store is unit-tested: status polls and dispatch proceed and admission falls back to the worker. Capacity claims cover only the transit to worker acceptance and steer selection while the worker remains the atomic admission arbiter | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL is not supported; circuit state and accepted-work ownership stay per-gateway |
 
 ## Worker contract, health, and stream backpressure
 
@@ -190,25 +190,45 @@ to the cold run).
 | Metal | Supported on the fixture lane — counter-proven (`benchmarks/manifests/ds4-metal-summary.json`: on-leg demotions=7, promotions=3, host_pages=4; charged to the shared unified ledger, so the win is retention/admission headroom, never more memory) | Not a production model, capacity, soak, or performance certificate |
 | CUDA | Not run — no hardware in this work session; the pool is designed as additional capacity across PCIe there | Recorded `not run`, never `passed` |
 
-## Coordinated blue-green rollout by scope (DS6)
+## Supervision (single node)
 
-One supervisor command (`--rollout-plan`) performs a deployment-generation
-cutover: canary-first replacement launch, an atomic approvals view that
-approves both generations for the soak window, a structurally
-never-two-eligible / never-zero-eligible gateway cutover (DINV-07), then
-drain of the old generation. Automatic aborts (canary/replacement readiness
-failure, replacement exit during the window, SIGUSR2, shutdown) restore the
-pre-rollout approvals byte-identically and leave the old generation serving.
-The commit is still a timer: the plan declares the gateways' approvals
-refresh interval, the window must cover two refreshes and a commit grace of
-at least one refresh separates the commit view from the old generation's
-drain. Design and evidence:
-runbook section "Coordinated blue-green rollout".
+Each worker has its own supervision task, so one worker's slow load or crash
+loop never stalls exit handling, restarts, diagnostics or autoscaling for the
+others, and `max_parallel_model_loads` bounds concurrent loads. A ready
+worker whose status stops answering (a wedged device or deadlock) is
+restarted by the liveness probe. A quarantined worker is retried every
+`restart.quarantine_retry_ms` and an operator clears it with SIGHUP or
+`--clear-quarantine`. Operators pass `IZWI_*` switches and loader paths to
+supervised workers through a validated `[workers.environment]` table.
 
 | Scope | Status | Evidence |
 |---|---|---|
-| One supervisor + one gateway over one shared approvals file (single node) | Supported on the process-evidenced lane | Supervisor process tests (`tests/rollout.rs`): canary-failure abort with byte-identical approvals restore, promotion through window → drain → commit with on-disk view assertions, replacement-exit abort, SIGKILL resume with fail-closed fresh start, status/abort command semantics; gateway rig (real gateway process, scripted-runtime workers on real TCP, T37 pattern): continuous traffic across window → abort-restore and window → commit with zero failed requests, and the draining predecessor receives nothing after cutover |
-| Fleet-wide (multi-gateway) cutover | Not implemented — the coordinator writes one shared approvals file; each additional gateway adopts the same views, but no multi-gateway rollout rig or fleet-wide abort evidence exists | Recorded `not implemented`, never `supported` |
+| CPU lane (python fake workers serving the readiness contract) | Process-evidenced | `tests/supervision.rs`: a load that never finishes does not hold back the next worker or SIGUSR1 diagnostics (two load slots), one load slot serializes loads in config order, a worker whose status hangs is restarted into a new incarnation, and a quarantined worker is relaunched by the slow retry, by `--clear-quarantine` and by SIGHUP; launch and config unit tests for the environment table |
+| Metal / CUDA lanes | Launch assignment process-evidenced (`multi_lane_launch.rs`); liveness and quarantine paths are backend-independent but were not run against a wedged real device | Recorded `not run` for real device faults |
+
+## Coordinated rollout by scope (DS6)
+
+One supervisor command (`--rollout-plan`) performs a deployment-generation
+cutover. Blue-green (when both generations fit the node: plan validation
+checks host memory, CPU threads, worker ids, binds and exclusive devices
+together) launches the replacements canary-first, adds them to the shared
+approvals file for a window in which the gateway cuts over without two or
+zero eligible generations (DINV-07), then removes the old generation and
+drains it. Recreate (`auto` picks it when the generations do not fit, as on
+one Metal device or GPU) drains the old generation first and launches the
+replacements, rolling back to the old generation if they fail. With a
+`[gateway_ack]` section the rollout moves on only once every gateway's
+`GET /internal/admin/approvals` reports the view adopted; without it, the
+window and commit grace are timers sized from the declared refresh
+interval. Aborts (readiness failure, replacement exit, SIGUSR2, shutdown, an
+unacknowledged view) remove exactly the lines the rollout added under the
+approvals file lock, so a peer's concurrent edit is kept. Design and
+evidence: runbook section "Coordinated rollout (DS6)".
+
+| Scope | Status | Evidence |
+|---|---|---|
+| One supervisor + gateways on the same host over one shared approvals file | Supported on the process-evidenced lane | Supervisor process tests (`tests/rollout.rs`): canary-failure abort, promotion through window → drain → commit with on-disk view assertions, replacement-exit abort, an abort that keeps a peer's edit made during the window, SIGKILL resume with fail-closed fresh start, status/abort command semantics, recreate on a shared bind (commit, and rollback when the replacement never gets ready), and acknowledgement against a fake gateway admin endpoint (commit and drain wait for it; an unacknowledged window aborts); gateway rig (`rollout_gateway.rs`, real gateway process): continuous traffic across window → abort-restore and window → commit with zero failed requests, and the admin route reports each view adopted and the cutover |
+| Fleet-wide (multi-host) cutover | Not implemented in the supervisor — its views carry loopback worker endpoints. For fleets, roll generations with Kubernetes as the runbook's "Service managers and Kubernetes" section describes | Recorded `not implemented`, never `supported` |
 
 `draining_old` is the point of no return (worker control-pipe EOF cannot be
 un-sent); rollback after `committed` is a new rollout plan with a fresh
@@ -216,21 +236,23 @@ generation. Not a production soak or hardware-capacity certificate.
 
 ## Signal-driven worker autoscaling (DS7)
 
-The supervisor can scale one deployment's worker count within explicit
-declared bounds: out on sustained queue depth, in after a stabilized idle
-window with drain. It is supervisor-managed — no Kubernetes, no
-external scaler — and fleet-profile only: the supervisor owns the v1 pinned
-approval lines of its autoscaled deployments in the gateway's shared
-approvals file, and the gateway adopts the add/remove at runtime with no
-gateway-side change. Scale decisions respect the node resource ledger
-(declared host memory, CPU threads, device exclusivity; overcommitting
-scale-ups are rejected with diagnostics, never launched), per-deployment
-hysteresis, and drain-before-stop (never below the declared min set). Design
-and evidence: runbook section "Signal-driven worker autoscaling (DS7)".
+Optional and off by default (an `[autoscaling]` block enables it); fleets
+should scale with Kubernetes and KEDA on the workers' metrics instead
+(`config/serving/kubernetes/autoscaling.yaml`). The supervisor can scale one
+deployment's worker count within explicit declared bounds: out on sustained
+load (outstanding invocations), in after a stabilized idle window with
+drain. It owns the v1 pinned approval lines of its autoscaled deployments in
+the gateway's shared approvals file; the lines carry loopback endpoints, so
+the gateways run on the same host. Scale-up and scale-down have separate
+stabilization windows (scale-up 0 by default), decisions freeze while a
+worker of the deployment is restarting, a crashed worker is never re-picked
+as a standby, and config validation proves the whole declared replica set
+fits the node. Design and evidence: runbook section "Signal-driven worker
+autoscaling (DS7)".
 
 | Scope | Status | Evidence |
 |---|---|---|
-| One supervisor, one autoscaled deployment, CPU lane | Supported on the process-evidenced lane (T38) | Policy unit tests (signals → decisions, hysteresis, bounds, ledger overcommit, view add/remove/reconciliation) in `crates/izwi-serving-supervisor/src/autoscale.rs`; process rig `tests/autoscale.rs` — sustained queue depth scales 1→2 with the approvals line published only after readiness, the idle window scales 2→1 with unapprove → admission stop → drain observed and the core set untouched, the disabled configuration launches every declared worker and never touches the shared view, `--validate-only` reports the policy, and `--rollout-plan` is refused while autoscaling is on |
+| One supervisor, one autoscaled deployment, CPU lane | Supported on the process-evidenced lane (T38) | Policy unit tests (signals → decisions, per-direction windows, outstanding-load signal, lost-worker exclusion, bounds, view add/remove/reconciliation) in `crates/izwi-serving-supervisor/src/autoscale.rs`; process rig `tests/autoscale.rs` — sustained load scales 1→2 with the approvals line published only after readiness, the idle window scales 2→1 with unapprove → admission stop → drain observed and the core set untouched, the disabled configuration launches every declared worker and never touches the shared view, `--validate-only` reports the policy, and `--rollout-plan` is refused while autoscaling is on |
 | One supervisor, multiple autoscaled deployments | Not run — the policy supports a map of deployments and the state machine is per-deployment, but the process rig exercises one deployment | Recorded `not run`, never `passed` |
 | Metal / CUDA autoscaled lanes | Not run — scale-out on exclusive-device lanes requires distinct declared devices (config validation already enforces exclusivity); no multi-device autoscale rig exists | Recorded `not run`, never `passed` |
 
@@ -295,8 +317,8 @@ partitioned, its quota slice until it restarts; the others keep serving.
   ownership reset with the process. Within one live gateway, accepted-work
   ownership survives public timeout/disconnect until exact worker teardown is
   proven; it is not a crash-persistent or shared fleet authority. Fleet
-  gateways share worker observations, capacity-claim steering, and (when
-  partitioned) quota slicing through the coordination database; admission
+  gateways share capacity-claim steering and (when partitioned) quota
+  slicing through the coordination database; admission
   itself stays worker-authoritative and accepted-work ownership stays
   gateway-local. The T25 supervisor generation fence is process-evidenced
   (`tests/generation_fence_collision.rs`).
