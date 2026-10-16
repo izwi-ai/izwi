@@ -22,6 +22,7 @@ use crate::kv::v2::StateDomainId;
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::architectures::qwen3::core::{Qwen3Config, Qwen3Model};
+use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
@@ -138,6 +139,15 @@ impl ChatDecodeState {
         self.decoder = checkpoint.decoder;
         self.finished = checkpoint.finished;
     }
+}
+
+/// One prefill row of a mixed step: the prompt span `[span_start,
+/// span_end)` that continues `state`'s resumable prefill.
+pub(crate) struct MixedPrefillRow<'s, 'p> {
+    pub(crate) state: &'s mut ChatDecodeState,
+    pub(crate) prompt: &'p [u32],
+    pub(crate) span_start: usize,
+    pub(crate) span_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +670,162 @@ impl Qwen3ChatModel {
             .collect()
     }
 
+    /// One mixed step: `decode` rows take one token each and every
+    /// `prefill` row continues its resumable prefill over `[span_start,
+    /// span_end)` of its prompt, in one model forward and one sampling
+    /// readback. Returns each decode row's step, and for each prefill row its
+    /// bootstrap token when the span ends the prompt. A step of only decode
+    /// rows, or of one prefill row, is exactly the split path's call.
+    pub(crate) fn step_mixed(
+        &self,
+        decode: &mut [&mut ChatDecodeState],
+        prefill: &mut [MixedPrefillRow<'_, '_>],
+    ) -> Result<(Vec<ChatDecodeStep>, Vec<Option<ChatDecodeStep>>)> {
+        match (decode.is_empty(), &mut *prefill) {
+            (_, []) => return Ok((self.decode_step_batch(decode)?, Vec::new())),
+            (true, [row]) => {
+                let complete = self.continue_resumable_prefill(
+                    &mut *row.state,
+                    row.prompt,
+                    row.span_start,
+                    row.span_end,
+                )?;
+                let bootstrap = complete
+                    .then(|| self.decode_step(&mut *row.state))
+                    .transpose()?;
+                return Ok((Vec::new(), vec![bootstrap]));
+            }
+            _ => {}
+        }
+        if decode.iter().any(|state| {
+            state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+        }) {
+            return Err(Error::InvalidInput(
+                "Qwen3 mixed step contains a non-decodable decode row".to_string(),
+            ));
+        }
+        let mut prefill_spans = Vec::with_capacity(prefill.len());
+        let mut prefill_ids = Vec::new();
+        for row in prefill.iter() {
+            let state = &*row.state;
+            let physical_start = state.cache.context_len();
+            if state.prefill_progress != row.span_start
+                || row.span_start >= row.span_end
+                || row.span_end > row.prompt.len()
+                || state.finished
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_some()
+                || !state.generated_ids.is_empty()
+                || state.pos != physical_start
+                || physical_start >= row.span_end
+                || (row.span_start != 0 && physical_start != row.span_start)
+            {
+                return Err(Error::InvalidInput(format!(
+                    "Qwen3 mixed prefill span [{},{}) is incompatible with cursor {} and prompt length {}",
+                    row.span_start,
+                    row.span_end,
+                    state.prefill_progress,
+                    row.prompt.len()
+                )));
+            }
+            prefill_spans.push(MixedRowSpan {
+                start_pos: physical_start,
+                q_len: row.span_end - physical_start,
+            });
+            prefill_ids.extend_from_slice(&row.prompt[physical_start..row.span_end]);
+        }
+        let mut spans = Vec::with_capacity(decode.len() + prefill.len());
+        let mut input_ids = Vec::with_capacity(decode.len() + prefill_ids.len());
+        for state in decode.iter_mut() {
+            spans.push(MixedRowSpan {
+                start_pos: state.pos,
+                q_len: 1,
+            });
+            input_ids.push(state.pending_token.take().expect("pending token checked"));
+        }
+        spans.extend(prefill_spans);
+        input_ids.extend(prefill_ids);
+        let completes = prefill
+            .iter()
+            .map(|row| row.span_end == row.prompt.len())
+            .collect::<Vec<_>>();
+        let sample_rows = (0..decode.len())
+            .chain(
+                completes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, complete)| **complete)
+                    .map(|(row, _)| decode.len() + row),
+            )
+            .collect::<Vec<_>>();
+        let layout = MixedRowLayout::new(spans, decode.len())?;
+        let logits = {
+            let mut caches = decode
+                .iter_mut()
+                .map(|state| &mut state.cache)
+                .chain(prefill.iter_mut().map(|row| &mut row.state.cache))
+                .collect::<Vec<_>>();
+            self.text_model
+                .forward_managed_mixed(&input_ids, layout, &mut caches, &sample_rows)?
+        };
+        for state in decode.iter_mut() {
+            state.pos += 1;
+            state.pending_logprobs.clear();
+        }
+        for row in prefill.iter_mut() {
+            row.state.pos = row.span_end;
+            row.state.prefill_progress = row.span_end;
+            row.state.pending_logprobs.clear();
+        }
+
+        let Some(logits) = logits else {
+            return Ok((Vec::new(), prefill.iter().map(|_| None).collect()));
+        };
+        // Decode rows and final spans sample from one readback.
+        let sampled = {
+            let mut samplers = decode
+                .iter_mut()
+                .map(|state| &mut state.sampler)
+                .chain(
+                    prefill
+                        .iter_mut()
+                        .zip(&completes)
+                        .filter(|(_, complete)| **complete)
+                        .map(|(row, _)| &mut row.state.sampler),
+                )
+                .collect::<Vec<_>>();
+            sample_chat_rows(&mut samplers, &logits, self.tokenizer.vocab_size)?
+        };
+        let mut sampled = sampled.into_iter();
+        let mut accept = |state: &mut ChatDecodeState| {
+            let (next, raw) = sampled
+                .next()
+                .ok_or_else(|| Error::InferenceError("Qwen3 mixed step lost a row".into()))?;
+            let entry = raw
+                .map(|raw| {
+                    crate::models::shared::sampling::resolve_token_logprob(
+                        &self.tokenizer.inner,
+                        &raw,
+                    )
+                })
+                .transpose()?;
+            self.accept_token(state, next, entry)
+        };
+        let decode_steps = decode
+            .iter_mut()
+            .map(|state| accept(state))
+            .collect::<Result<Vec<_>>>()?;
+        let prefill_steps = prefill
+            .iter_mut()
+            .zip(completes)
+            .map(|(row, complete)| complete.then(|| accept(&mut *row.state)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((decode_steps, prefill_steps))
+    }
+
     /// Emit `next`, or end the row on a stop token. Text is decoded
     /// incrementally, so a step costs the same however long the reply is.
     fn accept_token(
@@ -1054,6 +1220,13 @@ mod tests {
     }
 }
 
+/// The tiny Qwen3 chat model: eight whole-character pieces, and specials
+/// past the vocabulary, so a row ends only at its token budget.
+#[cfg(test)]
+pub(crate) fn tiny_chat_model_for_test(device: &candle_core::Device) -> Qwen3ChatModel {
+    stream_tests::tiny_chat_model(device, stream_tests::ASCII_PIECES)
+}
+
 #[cfg(test)]
 mod stream_tests {
     use super::*;
@@ -1069,12 +1242,12 @@ mod stream_tests {
     /// bytes of "é", the three bytes of "€", and "b".
     const SPLIT_PIECES: &str = r#"{"a":0,"Ġ":1,"Ã":2,"©":3,"â":4,"Ĥ":5,"¬":6,"b":7}"#;
     /// Eight whole-character pieces.
-    const ASCII_PIECES: &str = r#"{"a":0,"Ġ":1,"b":2,"c":3,"Ġd":4,"e":5,"f":6,"g":7}"#;
+    pub(super) const ASCII_PIECES: &str = r#"{"a":0,"Ġ":1,"b":2,"c":3,"Ġd":4,"e":5,"f":6,"g":7}"#;
 
     /// The tiny model with a byte-level WordLevel tokenizer over `pieces`.
     /// The specials sit past the vocabulary, so a row ends only at its token
     /// budget.
-    fn tiny_chat_model(device: &Device, pieces: &str) -> Qwen3ChatModel {
+    pub(super) fn tiny_chat_model(device: &Device, pieces: &str) -> Qwen3ChatModel {
         let inner = Tokenizer::from_hf_json_bytes(
             format!(
                 r#"{{
@@ -1315,5 +1488,88 @@ mod stream_tests {
             return;
         };
         assert_one_readback_per_batch_step(&device);
+    }
+
+    /// A mixed step whose op shapes equal a split call's (only decode rows,
+    /// or one prefill row) is that call: same tokens, logprobs and state.
+    #[test]
+    fn mixed_steps_with_split_shapes_are_the_split_calls() {
+        let device = Device::Cpu;
+        let model = tiny_chat_model(&device, ASCII_PIECES);
+        let configs = [
+            ChatGenerationConfig {
+                temperature: 0.8,
+                seed: 3,
+                logprobs: true,
+                top_logprobs: 2,
+                ..ChatGenerationConfig::default()
+            },
+            ChatGenerationConfig::default(),
+        ];
+        let summary = |state: &ChatDecodeState| {
+            (
+                state.pos,
+                state.prefill_progress,
+                state.pending_token,
+                state.generated_ids.clone(),
+                state.cache.context_len(),
+            )
+        };
+        let mut split = prefilled_rows(&model, &device, &configs, 8);
+        let mut mixed = prefilled_rows(&model, &device, &configs, 8);
+        for (split, mixed) in split.iter_mut().zip(&mut mixed) {
+            model.decode_step(split).unwrap();
+            model.decode_step(mixed).unwrap();
+        }
+        for _ in 0..3 {
+            let expected = model
+                .decode_step_batch(&mut split.iter_mut().collect::<Vec<_>>())
+                .unwrap();
+            let (actual, prefill) = model
+                .step_mixed(&mut mixed.iter_mut().collect::<Vec<_>>(), &mut [])
+                .unwrap();
+            assert!(prefill.is_empty());
+            for (row, (expected, actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(expected.delta, actual.delta);
+                assert_eq!(summary(&split[row]), summary(&mixed[row]));
+                assert_eq!(split[row].pending_logprobs, mixed[row].pending_logprobs);
+            }
+        }
+
+        let caches = test_physical_caches_on(&device, 1, 1, 2, 16, 2);
+        let mut states = caches
+            .into_iter()
+            .map(|cache| {
+                model
+                    .begin_resumable_prefill_managed(&PROMPT, 8, &configs[0], cache)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (mut split, mut mixed) = (states.remove(0), states.remove(0));
+        for (start, end) in [(0, 2), (2, PROMPT.len())] {
+            let complete = model
+                .continue_resumable_prefill(&mut split, &PROMPT, start, end)
+                .unwrap();
+            let expected = complete.then(|| model.decode_step(&mut split).unwrap());
+            let (decode, mut prefill) = model
+                .step_mixed(
+                    &mut [],
+                    &mut [MixedPrefillRow {
+                        state: &mut mixed,
+                        prompt: &PROMPT,
+                        span_start: start,
+                        span_end: end,
+                    }],
+                )
+                .unwrap();
+            assert!(decode.is_empty());
+            let actual = prefill.remove(0);
+            assert_eq!(
+                expected.map(|step| step.delta),
+                actual.map(|step| step.delta)
+            );
+            assert_eq!(summary(&split), summary(&mixed));
+            assert_eq!(split.pending_logprobs, mixed.pending_logprobs);
+        }
     }
 }

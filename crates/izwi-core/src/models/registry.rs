@@ -79,7 +79,7 @@ use crate::models::architectures::qwen3::asr::{
 };
 use crate::models::architectures::qwen3::chat::{
     ChatDecodeCheckpoint as Qwen3ChatDecodeCheckpoint, ChatDecodeState as Qwen3ChatDecodeState,
-    ChatGenerationOutput, Qwen3ChatModel,
+    ChatGenerationOutput, MixedPrefillRow as Qwen3MixedPrefillRow, Qwen3ChatModel,
 };
 use crate::models::architectures::qwen3::tts::Qwen3TtsModel;
 use crate::models::architectures::qwen35::chat::{
@@ -5016,18 +5016,91 @@ impl NativeChatModel {
     }
 
     /// Whether this loaded model runs prefill spans and one-token decode rows
-    /// in one model call ([`Self::step_mixed`]). No family does yet; each
-    /// joins in its own trunk once its mixed forward matches the split path.
+    /// in one model call ([`Self::step_mixed`]). Each family joins in its own
+    /// trunk once its mixed forward matches the split path; whether a loaded
+    /// model publishes the mixed stage is `catalog::mixed_step`'s call.
     pub fn supports_mixed_step(&self) -> bool {
-        false
+        matches!(self, Self::Qwen3(_))
     }
 
     /// Run `rows` (decode rows first, then prefill spans) in one forward and
     /// one sampling readback.
-    pub(crate) fn step_mixed(&self, _rows: &mut [MixedRow<'_>]) -> Result<Vec<MixedRowStep>> {
-        Err(Error::InvalidInput(
-            "loaded chat model does not run mixed prefill and decode steps".into(),
-        ))
+    pub(crate) fn step_mixed(&self, rows: &mut [MixedRow<'_>]) -> Result<Vec<MixedRowStep>> {
+        let decode_rows = rows
+            .iter()
+            .take_while(|row| matches!(row.input, MixedInput::Decode))
+            .count();
+        if rows[decode_rows..]
+            .iter()
+            .any(|row| matches!(row.input, MixedInput::Decode))
+        {
+            return Err(Error::InvalidInput(
+                "mixed chat rows must list decode rows before prefill spans".into(),
+            ));
+        }
+        let crossed = || {
+            Error::InvalidInput("mixed chat step crossed model family or prepared prompt".into())
+        };
+        match self {
+            Self::Qwen3(model) => {
+                let mut decode = Vec::with_capacity(decode_rows);
+                let mut prefill = Vec::with_capacity(rows.len() - decode_rows);
+                for row in rows.iter_mut() {
+                    match (&mut *row.state, &row.input) {
+                        (NativeChatDecodeState::Qwen3(state), MixedInput::Decode) => {
+                            decode.push(state)
+                        }
+                        (
+                            NativeChatDecodeState::Qwen3(state),
+                            MixedInput::Prefill {
+                                prompt,
+                                prepared: None,
+                                span_start,
+                                span_end,
+                            },
+                        ) => prefill.push(Qwen3MixedPrefillRow {
+                            state,
+                            prompt,
+                            span_start: *span_start,
+                            span_end: *span_end,
+                        }),
+                        _ => return Err(crossed()),
+                    }
+                }
+                let (decode_steps, prefill_steps) = model.step_mixed(&mut decode, &mut prefill)?;
+                let decoded = decode_steps.into_iter().zip(decode).map(|(step, state)| {
+                    MixedRowStep::Token(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: 1,
+                        finished: step.finished,
+                        logprobs: std::mem::take(&mut state.pending_logprobs),
+                    })
+                });
+                let prefilled =
+                    prefill_steps
+                        .into_iter()
+                        .zip(prefill)
+                        .map(|(step, row)| match step {
+                            Some(step) => MixedRowStep::Token(NativeChatDecodeStep {
+                                delta: step.delta,
+                                text: step.text,
+                                tokens_generated: step.tokens_generated,
+                                input_tokens_committed: 1,
+                                finished: step.finished,
+                                logprobs: std::mem::take(&mut row.state.pending_logprobs),
+                            }),
+                            None => MixedRowStep::Progress {
+                                input_tokens: row.span_end - row.span_start,
+                            },
+                        });
+                Ok(decoded.chain(prefilled).collect())
+            }
+            _ => Err(Error::InvalidInput(
+                "loaded chat model does not run mixed prefill and decode steps".into(),
+            )),
+        }
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {

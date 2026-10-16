@@ -1531,6 +1531,12 @@ fn qwen3_asr_admit_frames(
 }
 
 impl Qwen3AsrModel {
+    /// The loaded text decoder, for trunk tests on real weights.
+    #[cfg(test)]
+    pub(crate) fn into_text_model(self) -> Qwen3Model {
+        self.text_model
+    }
+
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
         let gguf_path = resolve_qwen_asr_gguf_path(model_dir, variant);
         let gguf_loader = if let Some(path) = gguf_path.as_ref() {

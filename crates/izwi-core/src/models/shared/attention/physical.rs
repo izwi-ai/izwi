@@ -1109,6 +1109,29 @@ pub(crate) fn test_physical_caches_on(
     capacity_tokens: usize,
     rows: usize,
 ) -> Vec<PhysicalPagedKvCache> {
+    test_physical_caches_with_dtype_on(
+        device,
+        candle_core::DType::F32,
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        capacity_tokens,
+        rows,
+    )
+}
+
+/// [`test_physical_caches_on`] storing K/V as `dtype`, for models whose
+/// activations are not F32.
+#[cfg(test)]
+pub(crate) fn test_physical_caches_with_dtype_on(
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+    num_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    capacity_tokens: usize,
+    rows: usize,
+) -> Vec<PhysicalPagedKvCache> {
     use crate::backends::kv::{CpuKvArena, KvArenaConfig, KvLayerConfig};
     use crate::backends::BackendKind;
     use crate::engine::ModelInstanceId;
@@ -1142,7 +1165,7 @@ pub(crate) fn test_physical_caches_on(
         page_tokens: page_tokens as u32,
         capacity_pages: (capacity_pages * rows) as u32,
         growth: None,
-        dtype: candle_core::DType::F32,
+        dtype,
         layers: bindings
             .iter()
             .map(|&binding| KvLayerConfig {

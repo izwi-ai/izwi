@@ -35,6 +35,7 @@ use crate::models::shared::attention::gqa::{compact_gqa_sdpa_bhsd, CompactGqaMas
 use crate::models::shared::moe::{
     ExpertSet, ExpertActivationCounters, SparseMoeConfig, SparseMoeDispatcher,
 };
+use crate::models::shared::attention::mixed::{MixedRowLayout, PreparedPhysicalMixedStep};
 use crate::models::shared::attention::physical::{PhysicalPagedKvCache, PreparedPhysicalPagedStep};
 use crate::models::shared::telemetry::{record_rope_kernel, record_rope_manual};
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -1611,6 +1612,80 @@ impl Qwen3Attention {
         let out = out.reshape((bsz, 1, self.num_heads * self.head_dim))?;
         self.o_proj.forward(&out).map_err(Error::from)
     }
+
+    /// One mixed step: `x` is `[1, tokens, hidden]` in `step`'s row layout.
+    /// Projections run on every token at once; QK-norm and RoPE take the
+    /// shapes the split paths give them (one-token decode rows, then each
+    /// prefill span from its own position).
+    fn forward_managed_mixed(
+        &self,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let tokens = x.dim(1)?;
+        let layout = step.layout();
+        let decode = layout.decode_rows();
+        let (q, k, v) = self.qkv_proj.forward(x)?;
+        let q = q.reshape((tokens, self.num_heads, self.head_dim))?;
+        let k = k.reshape((tokens, self.num_kv_heads, self.head_dim))?;
+        let mut queries = Vec::with_capacity(layout.rows().len());
+        let mut keys = Vec::with_capacity(layout.rows().len());
+        if decode > 0 {
+            let (q, k) = self.apply_qk_norm_pair(
+                q.narrow(0, 0, decode)?.unsqueeze(1)?,
+                k.narrow(0, 0, decode)?.unsqueeze(1)?,
+                1,
+            )?;
+            for (row, span) in layout.rows()[..decode].iter().enumerate() {
+                let (q, k) = self.apply_rope_pair(
+                    q.i(row)?.unsqueeze(0)?,
+                    k.i(row)?.unsqueeze(0)?,
+                    span.start_pos,
+                    None,
+                )?;
+                queries.push(q.reshape((1, self.num_heads, self.head_dim))?);
+                keys.push(k.reshape((1, self.num_kv_heads, self.head_dim))?);
+            }
+        }
+        if decode < tokens {
+            let prefill = tokens - decode;
+            let (q, k) = self.apply_qk_norm_pair(
+                q.narrow(0, decode, prefill)?.unsqueeze(0)?,
+                k.narrow(0, decode, prefill)?.unsqueeze(0)?,
+                prefill,
+            )?;
+            for (row, span) in layout.rows().iter().enumerate().skip(decode) {
+                let offset = layout.token_offset(row) - decode;
+                let (q, k) = self.apply_rope_pair(
+                    q.narrow(1, offset, span.q_len)?,
+                    k.narrow(1, offset, span.q_len)?,
+                    span.start_pos,
+                    None,
+                )?;
+                queries.push(q.reshape((span.q_len, self.num_heads, self.head_dim))?);
+                keys.push(k.reshape((span.q_len, self.num_kv_heads, self.head_dim))?);
+            }
+        }
+        let queries = Tensor::cat(&queries, 0)?.contiguous()?;
+        let keys = Tensor::cat(&keys, 0)?.contiguous()?;
+        let values = v
+            .reshape((tokens, self.num_kv_heads, self.head_dim))?
+            .contiguous()?;
+        let out = step.write_and_attend(
+            caches,
+            layer_idx,
+            &queries,
+            &keys,
+            &values,
+            1.0 / (self.head_dim as f32).sqrt(),
+            None,
+            None,
+        )?;
+        let out = out.reshape((1, tokens, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out).map_err(Error::from)
+    }
 }
 
 struct Qwen3Mlp {
@@ -2042,6 +2117,23 @@ impl Qwen3Layer {
             completions,
             layer_idx,
         )?;
+        let x = x.broadcast_add(&attn_out)?;
+        let normed = self.post_attention_layernorm.forward(&x)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        x.broadcast_add(&mlp_out).map_err(Error::from)
+    }
+
+    fn forward_managed_mixed(
+        &self,
+        x: &Tensor,
+        caches: &[&PhysicalPagedKvCache],
+        step: &mut PreparedPhysicalMixedStep,
+        layer_idx: usize,
+    ) -> Result<Tensor> {
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self
+            .self_attn
+            .forward_managed_mixed(&normed, caches, step, layer_idx)?;
         let x = x.broadcast_add(&attn_out)?;
         let normed = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&normed)?;
@@ -2538,6 +2630,70 @@ impl Qwen3Model {
         Ok(logits)
     }
 
+    /// One forward over a mixed step: `input_ids` holds every row's new
+    /// tokens in `layout` order (one-token decode rows first, then prefill
+    /// spans), and `caches[i]` is row `i`'s cache. Every token runs through
+    /// the projections and MLP together; each layer writes all K/V once and
+    /// attends in at most two paged calls. Returns `[sample_rows, vocab]`
+    /// logits of the last token of each row in `sample_rows`, or `None` when
+    /// no row samples. Caches advance only when the whole forward succeeds.
+    pub(crate) fn forward_managed_mixed(
+        &self,
+        input_ids: &[u32],
+        layout: MixedRowLayout,
+        caches: &mut [&mut PhysicalPagedKvCache],
+        sample_rows: &[usize],
+    ) -> Result<Option<Tensor>> {
+        if input_ids.len() != layout.total_tokens()
+            || caches.len() != layout.rows().len()
+            || sample_rows.iter().any(|row| *row >= caches.len())
+        {
+            return Err(Error::InvalidInput(
+                "Qwen3 mixed step inputs do not match its row layout".to_string(),
+            ));
+        }
+        if self.cfg.sliding_window().is_some() {
+            return Err(Error::InvalidInput(
+                "Qwen3 managed execution does not yet support sliding-window block tables"
+                    .to_string(),
+            ));
+        }
+        let key_head_dim = self.cfg.attention_geometry()?.key_head_dim();
+        for cache in caches.iter() {
+            cache.validate_model(
+                self.cfg.num_hidden_layers,
+                self.cfg.num_key_value_heads,
+                key_head_dim,
+            )?;
+        }
+        let sample_tokens = sample_rows
+            .iter()
+            .map(|row| u32::try_from(layout.last_token(*row)))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("Qwen3 mixed step exceeds u32 tokens".into()))?;
+        let (step, logits) = {
+            let refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            let mut step = PreparedPhysicalMixedStep::new(&refs, layout)?;
+            let logits = (|| -> Result<Option<Tensor>> {
+                let ids = Tensor::from_slice(input_ids, (1, input_ids.len()), &self.device)?;
+                let mut x = self.embeddings(&ids)?;
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    x = layer.forward_managed_mixed(&x, &refs, &mut step, layer_idx)?;
+                }
+                if sample_tokens.is_empty() {
+                    return Ok(None);
+                }
+                let hidden = self.norm.forward(&x)?.squeeze(0)?;
+                let sample_tokens =
+                    Tensor::from_vec(sample_tokens, sample_rows.len(), &self.device)?;
+                self.logits_from_hidden(&hidden.index_select(&sample_tokens, 0)?)
+                    .map(Some)
+            })();
+            (step, logits)
+        };
+        step.finish(caches, logits)
+    }
+
     /// MRoPE position ids that hold `start_pos..start_pos + seq_len` on every
     /// axis (all of Qwen3-ASR's: it has no vision spans) are plain 1-D RoPE.
     /// Check them with one readback per forward and drop them, so every layer
@@ -2956,6 +3112,10 @@ fn qwen3_rope_kernel_policy(is_metal: bool, is_cuda: bool, override_enabled: Opt
 pub(crate) fn tiny_qwen3_model_for_test(device: &Device) -> Qwen3Model {
     tests::tiny_qwen3_model(device)
 }
+
+#[cfg(test)]
+#[path = "core_mixed_tests.rs"]
+mod mixed_tests;
 
 #[cfg(test)]
 mod tests {

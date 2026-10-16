@@ -1529,12 +1529,16 @@ impl NativeExecutor {
         }
 
         let mut continuing = vec![false; scheduled.len()];
-        for ((index, _, lease, _), step) in active_states.rows.iter_mut().zip(steps) {
+        for (((index, _, lease, _), step), span) in
+            active_states.rows.iter_mut().zip(steps).zip(&spans)
+        {
             let row = &scheduled[*index];
             let active_state = lease.require_state_mut()?;
             let (step, tokens_processed) = match step {
+                // The model reports the span it fed, which an attached prefix
+                // can shorten; the scheduler receives the scheduled span.
                 MixedRowStep::Progress { input_tokens } => {
-                    if !row.is_prefill || input_tokens != row.num_tokens {
+                    if span.is_none_or(|(start, end)| input_tokens != end - start) {
                         return Err(Error::InferenceError(
                             "mixed chat row reported progress that is not its prefill span".into(),
                         ));
@@ -1547,7 +1551,7 @@ impl NativeExecutor {
                         finished: false,
                         logprobs: Vec::new(),
                     };
-                    (step, input_tokens)
+                    (step, row.num_tokens)
                 }
                 MixedRowStep::Token(step) if row.is_prefill => (step, row.num_tokens),
                 MixedRowStep::Token(step) => {
@@ -1594,6 +1598,7 @@ mod tests {
     use super::*;
     use crate::engine::{GenerationParams, InputRange, SequencePhase, WorkUnit};
     use crate::model::ModelVariant;
+    use crate::models::registry::NativeChatPreparedPrompt;
     use crate::models::shared::chat::{ChatMessage, ChatRole};
 
     #[test]
@@ -2080,14 +2085,32 @@ mod tests {
     }
 
     impl MixedWorld {
+        /// Two Qwen3.8 requests with the fixture's prepared prompt.
         fn new(
             lease: &crate::models::registry::ChatModelLease,
             capability: &crate::kv::InferenceStateCapability,
         ) -> Self {
+            use crate::models::architectures::qwen38::chat::recovery_tests::prepared_prompt;
+
+            Self::with_prompts(lease, capability, ModelVariant::Qwen3827BFp8, |_| {
+                let prepared = prepared_prompt();
+                (
+                    prepared.prompt_ids().to_vec(),
+                    Some(NativeChatPreparedPrompt::Qwen38(prepared)),
+                )
+            })
+        }
+
+        /// A `decoder` request, prefilled and ready to decode, and a `prompt`
+        /// request, each with the prompt `prompt(id)` returns.
+        fn with_prompts(
+            lease: &crate::models::registry::ChatModelLease,
+            capability: &crate::kv::InferenceStateCapability,
+            variant: ModelVariant,
+            prompt: impl Fn(&str) -> (Vec<u32>, Option<NativeChatPreparedPrompt>),
+        ) -> Self {
             use crate::backends::BackendKind;
             use crate::engine::ModelInstanceId;
-            use crate::models::architectures::qwen38::chat::recovery_tests::prepared_prompt;
-            use crate::models::registry::NativeChatPreparedPrompt;
 
             let instance = ModelInstanceId::new(9292);
             let mut manager = crate::engine::cache::managed::ManagedKvCacheManager::new(None);
@@ -2100,17 +2123,17 @@ mod tests {
                     role: ChatRole::User,
                     content: id.into(),
                 }])
-                .with_model_variant(ModelVariant::Qwen3827BFp8);
+                .with_model_variant(variant);
                 request.id = id.into();
                 request.model_instance_id = Some(instance);
                 request.params.max_tokens = 12;
                 request.params.temperature = 0.8;
-                let prepared = prepared_prompt();
+                let (prompt_ids, prepared) = prompt(id);
                 request
                     .install_chat_execution_preparation_with_model(
-                        ModelVariant::Qwen3827BFp8,
-                        prepared.prompt_ids().to_vec(),
-                        Some(NativeChatPreparedPrompt::Qwen38(prepared)),
+                        variant,
+                        prompt_ids,
+                        prepared,
                         lease.clone(),
                         32,
                     )
@@ -2400,5 +2423,97 @@ mod tests {
             results.iter().map(session_summary).collect::<Vec<_>>()
         };
         assert_eq!(step(&mut oracle), step(&mut reference));
+    }
+
+    /// Steps of a mixed batch through the loaded family's mixed forward,
+    /// against the same steps through the forced-split oracle
+    /// (`IZWI_MIXED_FORCE_SPLIT`) from the same start: the decoder decodes
+    /// while the prompt prefills in a non-final and a final span, then both
+    /// decode. Every row's output of every step must be equal.
+    fn assert_mixed_steps_match_forced_split(world: impl Fn() -> MixedWorld) {
+        let (mut mixed, mut split) = (world(), world());
+        let (decoder, prompt) = (mixed.decoder.clone(), mixed.prompt.clone());
+        let decode_at = decoder.num_prompt_tokens();
+        let prompt_len = prompt.num_prompt_tokens();
+        let first = prompt_len / 2;
+        let steps = [
+            [
+                MixedWorld::row(&decoder, 2, decode_at, decode_at + 1, false),
+                MixedWorld::row(&prompt, 3, 0, first, true),
+            ],
+            [
+                MixedWorld::row(&decoder, 4, decode_at + 1, decode_at + 2, false),
+                MixedWorld::row(&prompt, 5, first, prompt_len, true),
+            ],
+            [
+                MixedWorld::row(&decoder, 6, decode_at + 2, decode_at + 3, false),
+                MixedWorld::row(&prompt, 7, prompt_len, prompt_len + 1, false),
+            ],
+        ];
+        let requests = [&decoder, &prompt];
+        for (step, scheduled) in steps.iter().enumerate() {
+            let reservations = scheduled
+                .iter()
+                .zip(requests)
+                .map(|(row, request)| mixed.reserve(request, row))
+                .collect::<Vec<_>>();
+            let views = mixed.views(&requests, scheduled, &reservations);
+            let actual = mixed
+                .executor
+                .chat_mixed_step_with_managed(&requests, scheduled, views)
+                .unwrap();
+            for (reservation, result) in reservations.iter().zip(&actual) {
+                mixed.commit(reservation, result);
+            }
+
+            let reservations = scheduled
+                .iter()
+                .zip(requests)
+                .map(|(row, request)| split.reserve(request, row))
+                .collect::<Vec<_>>();
+            let rows = scheduled
+                .iter()
+                .zip(&reservations)
+                .map(|(row, reservation)| MixedWorld::ready(row, reservation))
+                .collect::<Vec<_>>();
+            let expected = split
+                .executor
+                .chat_mixed_step_split(&requests, scheduled, &rows)
+                .unwrap();
+            for (reservation, result) in reservations.iter().zip(&expected) {
+                split.commit(reservation, result);
+            }
+            assert!(
+                actual.iter().all(|result| !result.output.finished),
+                "step {step}: the fixture finished a row"
+            );
+            assert_eq!(
+                actual.iter().map(session_summary).collect::<Vec<_>>(),
+                expected.iter().map(session_summary).collect::<Vec<_>>(),
+                "step {step}"
+            );
+        }
+    }
+
+    /// Qwen3 mixed steps commit exactly what the split handlers commit.
+    #[test]
+    fn qwen3_mixed_steps_match_the_forced_split_oracle() {
+        use crate::kv::InferenceStateContractProvider;
+        use crate::models::architectures::qwen3::chat::tiny_chat_model_for_test;
+        use crate::models::registry::ChatModelLease;
+
+        let model = tiny_chat_model_for_test(&candle_core::Device::Cpu);
+        let capability = model.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Qwen3(model));
+        assert!(lease.supports_mixed_step());
+        assert_mixed_steps_match_forced_split(|| {
+            MixedWorld::with_prompts(&lease, &capability, ModelVariant::Qwen306B, |id| {
+                let prompt = match id {
+                    "decoder" => vec![0, 1, 7, 2],
+                    _ => vec![3, 5, 0, 6, 1, 4, 2, 7, 5],
+                };
+                (prompt, None)
+            })
+        });
     }
 }
