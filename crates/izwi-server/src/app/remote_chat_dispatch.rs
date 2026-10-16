@@ -33,9 +33,6 @@ use crate::worker_registry::{
     WorkerInstanceKey, WorkerRegistry, WorkerRegistryError, WorkerSelectionRequest,
 };
 
-const FORWARDED_CHAT_STREAM_CAPACITY: usize = 64;
-const FORWARDED_CHAT_SLOW_CONSUMER_ERROR: &str =
-    "Chat stream consumer is too slow; worker relay was cancelled";
 const RETRY_BACKOFF_BASE_MS: u64 = 10;
 const RETRY_BACKOFF_JITTER_MS: u64 = 10;
 const RETRY_BACKOFF_MAX_MS: u64 = 100;
@@ -207,49 +204,16 @@ impl RemoteChatDispatcher {
             .await?;
         let registry = self.registry.clone();
         let key = selected.key.clone();
-        let slow_consumer_timeout = self.config.slow_consumer_timeout;
-        let mut worker_events = spawn_started_remote_chat_stream(
+        // The relay task holds the registry reservation; dropping the
+        // receiver propagates cancellation toward the exact accepted
+        // attempt. There is intentionally no reselection.
+        Ok(spawn_started_remote_chat_stream(
             &remote,
             stream,
             move |error| report_stream_error(&registry, &key, error),
             tenant_work,
-        );
-
-        let (public_tx, public_rx) = mpsc::channel(FORWARDED_CHAT_STREAM_CAPACITY);
-        tokio::spawn(async move {
-            // Keep the reservation alive while the private stream is live.
-            // Dropping either receiver propagates cancellation toward the
-            // exact accepted attempt; there is intentionally no reselection.
-            let _dispatch = selected.dispatch;
-            loop {
-                let event = tokio::select! {
-                    event = worker_events.recv() => event,
-                    () = public_tx.closed() => break,
-                };
-                let Some(event) = event else {
-                    break;
-                };
-                let terminal = matches!(
-                    event,
-                    ChatStreamEvent::Completed(_) | ChatStreamEvent::Failed(_)
-                );
-                let sent = tokio::time::timeout(slow_consumer_timeout, public_tx.send(event)).await;
-                if !matches!(sent, Ok(Ok(()))) {
-                    // If a slot opened at the timeout boundary, preserve a
-                    // specific terminal reason. Otherwise closing the channel
-                    // makes the public SSE encoder emit its generic explicit
-                    // interruption rather than fabricated success.
-                    let _ = public_tx.try_send(ChatStreamEvent::Failed(
-                        ApiError::service_unavailable(FORWARDED_CHAT_SLOW_CONSUMER_ERROR),
-                    ));
-                    break;
-                }
-                if terminal {
-                    break;
-                }
-            }
-        });
-        Ok(public_rx)
+            selected.dispatch,
+        ))
     }
 
     async fn start(
@@ -1439,9 +1403,12 @@ mod tests {
         assert_eq!(worker_b.requests().len(), 1);
     }
 
+    /// A worker burst three times the relay channel's capacity.
+    const BURST_DELTAS: usize = 192;
+
     #[tokio::test]
     async fn paused_public_reader_receives_every_worker_delta() {
-        let count = FORWARDED_CHAT_STREAM_CAPACITY * 3;
+        let count = BURST_DELTAS;
         let worker =
             ScriptedWorker::spawn(ScriptedResponse::ManyDeltas(count), Duration::ZERO).await;
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
@@ -1483,7 +1450,7 @@ mod tests {
     #[tokio::test]
     async fn non_draining_public_stream_cannot_retain_registry_dispatch() {
         let worker = ScriptedWorker::spawn(
-            ScriptedResponse::ManyDeltas(FORWARDED_CHAT_STREAM_CAPACITY * 3),
+            ScriptedResponse::ManyDeltas(BURST_DELTAS),
             Duration::ZERO,
         )
         .await;

@@ -959,19 +959,24 @@ fn worker_chat_generation(
 /// the public chat stream channel. Dropping the receiver closes the channel,
 /// drops the private stream, and schedules exact-attempt cancellation;
 /// neither layer retries the invocation.
-pub(crate) fn spawn_started_remote_chat_stream<F>(
+/// `reservation` (the registry dispatch) lives in the relay task until the
+/// terminal event is delivered or the consumer goes away.
+pub(crate) fn spawn_started_remote_chat_stream<F, R>(
     remote: &RemoteChatExecution,
     mut worker_stream: InvocationStream,
     on_worker_error: F,
     tenant_work: BoundTenantWorkLease,
+    reservation: R,
 ) -> mpsc::Receiver<ChatStreamEvent>
 where
     F: Fn(&WorkerClientError) + Send + Sync + 'static,
+    R: Send + 'static,
 {
     let max_output_bytes = remote.config.max_output_bytes;
     let slow_consumer_timeout = remote.config.slow_consumer_timeout;
     let (event_tx, event_rx) = mpsc::channel(CHAT_STREAM_CAPACITY);
     tokio::spawn(async move {
+        let _reservation = reservation;
         let started = Instant::now();
         let mut logprob_entries = RemoteLogprobCollector::default();
         let sink = ChatDeltaSink::new(event_tx.clone(), slow_consumer_timeout);
