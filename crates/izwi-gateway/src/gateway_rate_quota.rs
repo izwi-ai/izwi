@@ -145,19 +145,19 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GatewayRateDecision {
+pub enum GatewayRateDecision {
     Allowed,
     Limited,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum GatewayRateQuotaError {
+pub enum GatewayRateQuotaError {
     #[error("gateway tenant rate state is unavailable")]
     StateUnavailable,
 }
 
 #[derive(Clone)]
-pub(crate) struct GatewayRateQuota {
+pub struct GatewayRateQuota {
     inner: Arc<GatewayRateQuotaInner>,
 }
 
@@ -185,24 +185,24 @@ struct TokenBucket {
 
 /// One limit's state for `x-ratelimit-*` headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LimitWindow {
-    pub(crate) limit: u64,
-    pub(crate) remaining: u64,
+pub struct LimitWindow {
+    pub limit: u64,
+    pub remaining: u64,
     /// Until the bucket is full again.
-    pub(crate) reset: Duration,
+    pub reset: Duration,
     /// Until one more unit is available (zero when one already is).
-    pub(crate) retry_after: Duration,
+    pub retry_after: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RateLimitSnapshot {
-    pub(crate) requests: LimitWindow,
-    pub(crate) tokens: Option<LimitWindow>,
+pub struct RateLimitSnapshot {
+    pub requests: LimitWindow,
+    pub tokens: Option<LimitWindow>,
 }
 
 /// The token-rate outcome of an admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TokenDecision {
+pub enum TokenDecision {
     Allowed,
     Limited { retry_after: Duration },
 }
@@ -214,7 +214,7 @@ struct TenantBucket {
 }
 
 impl GatewayRateQuota {
-    pub(crate) fn new(config: GatewayRateQuotaConfig) -> Self {
+    pub fn new(config: GatewayRateQuotaConfig) -> Self {
         Self {
             inner: Arc::new(GatewayRateQuotaInner {
                 config,
@@ -224,7 +224,7 @@ impl GatewayRateQuota {
         }
     }
 
-    pub(crate) fn check(
+    pub fn check(
         &self,
         tenant_key: [u8; 32],
     ) -> Result<GatewayRateDecision, GatewayRateQuotaError> {
@@ -232,10 +232,7 @@ impl GatewayRateQuota {
     }
 
     /// Whether `check` would allow the tenant now, without spending a token.
-    pub(crate) fn peek(
-        &self,
-        tenant_key: [u8; 32],
-    ) -> Result<GatewayRateDecision, GatewayRateQuotaError> {
+    pub fn peek(&self, tenant_key: [u8; 32]) -> Result<GatewayRateDecision, GatewayRateQuotaError> {
         let now = self.inner.started_at.elapsed();
         let state = self
             .inner
@@ -312,7 +309,7 @@ impl GatewayRateQuota {
     /// large request can still run from a full bucket; the balance may then
     /// go negative. Without a token limit every request is allowed and
     /// nothing is reserved.
-    pub(crate) fn reserve_tokens(
+    pub fn reserve_tokens(
         &self,
         tenant_key: [u8; 32],
         estimate: u64,
@@ -393,7 +390,7 @@ impl GatewayRateQuota {
 
     /// The tenant's request and token limits now, for `x-ratelimit-*`
     /// headers. Nothing is spent.
-    pub(crate) fn snapshot(&self, tenant_key: [u8; 32]) -> Option<RateLimitSnapshot> {
+    pub fn snapshot(&self, tenant_key: [u8; 32]) -> Option<RateLimitSnapshot> {
         let now = self.inner.started_at.elapsed();
         let state = self.inner.state.lock().ok()?;
         let config = &self.inner.config;
@@ -446,7 +443,7 @@ impl GatewayRateQuota {
 /// completion; dropped unsettled, the reservation is refunded unless the
 /// request already started streaming (then the estimate stands, so leaving
 /// mid-stream cannot dodge the charge).
-pub(crate) struct TokenReservation {
+pub struct TokenReservation {
     quota: GatewayRateQuota,
     tenant_key: [u8; 32],
     reserved: u64,
@@ -454,11 +451,11 @@ pub(crate) struct TokenReservation {
 }
 
 impl TokenReservation {
-    pub(crate) fn mark_started(&mut self) {
+    pub fn mark_started(&mut self) {
         self.keep_on_drop = true;
     }
 
-    pub(crate) fn settle(mut self, actual: u64) {
+    pub fn settle(mut self, actual: u64) {
         self.quota.adjust_tokens(
             self.tenant_key,
             i128::from(self.reserved) - i128::from(actual),

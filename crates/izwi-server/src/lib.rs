@@ -37,14 +37,9 @@ mod diarization_store;
 mod entity;
 mod error;
 mod gateway;
-mod gateway_deployments;
 mod gateway_fleet;
 mod gateway_principal_keys;
-mod gateway_rate_quota;
 mod gateway_security;
-mod gateway_shared_approvals;
-mod gateway_tenant_concurrency;
-mod gateway_worker_tls;
 mod ids;
 mod local_security;
 mod logging;
@@ -65,7 +60,6 @@ mod voice_defaults;
 mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
-pub mod worker_registry;
 
 use batch_runtime::store::DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT;
 use batch_runtime::types::{
@@ -79,6 +73,12 @@ use izwi_core::{
     parse_model_variant, RuntimeService, ServeRuntimeConfig, ServeRuntimeConfigOverrides,
 };
 use izwi_hooks::EnterpriseHooks;
+// The gateway's accelerator-free components live in izwi-gateway; these
+// aliases keep their `crate::` paths for the gateway role still hosted here.
+use izwi_gateway::{
+    gateway_deployments, gateway_rate_quota, gateway_shared_approvals, gateway_tenant_concurrency,
+    gateway_worker_tls,
+};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
     render_approvals_text, CredentialId, DeploymentId, ModelAlias, ModelGeneration, ModelReadiness,
@@ -97,6 +97,7 @@ pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
 pub use gateway_tenant_concurrency::{
     GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError,
 };
+pub use izwi_gateway::worker_registry;
 
 /// The local role's HTTP API over an already started runtime, without the
 /// listener, preload and persistence lifecycle of `izwi serve`. Integration

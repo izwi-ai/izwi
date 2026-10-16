@@ -7,6 +7,7 @@ members = [
     "crates/izwi-hooks",
     "crates/izwi-vad",
     "crates/izwi-server",
+    "crates/izwi-gateway",
     "crates/izwi-cli",
     "crates/izwi-desktop",
     "crates/izwi-serving-protocol",

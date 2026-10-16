@@ -92,7 +92,7 @@ pub enum GatewayTenantConcurrencyConfigError {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum TenantWorkAdmissionError {
+pub enum TenantWorkAdmissionError {
     #[error("tenant concurrent-work limit is exhausted")]
     TenantLimit,
     #[error("gateway concurrent-work ownership capacity is exhausted")]
@@ -102,7 +102,7 @@ pub(crate) enum TenantWorkAdmissionError {
 }
 
 #[derive(Clone)]
-pub(crate) struct GatewayTenantConcurrency {
+pub struct GatewayTenantConcurrency {
     inner: Arc<TenantConcurrencyInner>,
 }
 
@@ -146,7 +146,7 @@ struct BoundAttempt {
 }
 
 impl GatewayTenantConcurrency {
-    pub(crate) fn new(config: GatewayTenantConcurrencyConfig) -> Self {
+    pub fn new(config: GatewayTenantConcurrencyConfig) -> Self {
         Self {
             inner: Arc::new(TenantConcurrencyInner {
                 config,
@@ -156,7 +156,7 @@ impl GatewayTenantConcurrency {
         }
     }
 
-    pub(crate) fn try_reserve(
+    pub fn try_reserve(
         &self,
         tenant_key: [u8; 32],
     ) -> Result<UnboundTenantWorkLease, TenantWorkAdmissionError> {
@@ -192,7 +192,7 @@ impl GatewayTenantConcurrency {
         })
     }
 
-    pub(crate) fn active_owned_work(&self) -> u64 {
+    pub fn active_owned_work(&self) -> u64 {
         self.inner.active_owned_work.load(Ordering::Relaxed)
     }
 
@@ -352,7 +352,7 @@ struct TenantLeaseCore {
     lease_id: u64,
 }
 
-pub(crate) struct UnboundTenantWorkLease {
+pub struct UnboundTenantWorkLease {
     core: Option<TenantLeaseCore>,
 }
 
@@ -366,11 +366,7 @@ impl fmt::Debug for UnboundTenantWorkLease {
 }
 
 impl UnboundTenantWorkLease {
-    pub(crate) fn bind(
-        mut self,
-        client: WorkerClient,
-        identity: AttemptIdentity,
-    ) -> BoundTenantWorkLease {
+    pub fn bind(mut self, client: WorkerClient, identity: AttemptIdentity) -> BoundTenantWorkLease {
         let core = self.core.take().expect("tenant work lease is live");
         core.owner.bind(core.lease_id, client, identity);
         BoundTenantWorkLease { core: Some(core) }
@@ -385,7 +381,7 @@ impl Drop for UnboundTenantWorkLease {
     }
 }
 
-pub(crate) struct BoundTenantWorkLease {
+pub struct BoundTenantWorkLease {
     core: Option<TenantLeaseCore>,
 }
 
@@ -399,13 +395,13 @@ impl fmt::Debug for BoundTenantWorkLease {
 }
 
 impl BoundTenantWorkLease {
-    pub(crate) fn prove_unaccepted(mut self) -> UnboundTenantWorkLease {
+    pub fn prove_unaccepted(mut self) -> UnboundTenantWorkLease {
         let core = self.core.take().expect("tenant work lease is live");
         core.owner.unbind(core.lease_id);
         UnboundTenantWorkLease { core: Some(core) }
     }
 
-    pub(crate) fn confirm_stopped(mut self) {
+    pub fn confirm_stopped(mut self) {
         if let Some(core) = self.core.take() {
             core.owner.release(core.lease_id);
         }

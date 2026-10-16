@@ -13,8 +13,7 @@ const CLIENT_KEY_REF_ENV: &str = "IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF";
 const MAX_REFERENCE_BYTES: usize = 4096;
 const MAX_CA_REFS_BYTES: usize = MAX_REFERENCE_BYTES * MAX_PRIVATE_CA_ROOTS;
 
-pub(crate) fn worker_client_tls_from_env(
-) -> Result<WorkerClientTlsConfig, GatewayWorkerTlsConfigError> {
+pub fn worker_client_tls_from_env() -> Result<WorkerClientTlsConfig, GatewayWorkerTlsConfigError> {
     let ca_refs = optional_env(PRIVATE_CA_REFS_ENV)?;
     let certificate_ref = optional_env(CLIENT_CERT_REF_ENV)?;
     let private_key_ref = optional_env(CLIENT_KEY_REF_ENV)?;
@@ -90,7 +89,7 @@ fn read_bounded_pem(reference: &str) -> Result<Vec<u8>, GatewayWorkerTlsConfigEr
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum GatewayWorkerTlsConfigError {
+pub enum GatewayWorkerTlsConfigError {
     #[error("gateway worker TLS references must be bounded absolute file: references")]
     InvalidReference,
     #[error("gateway worker TLS configuration has too many private CA roots")]
