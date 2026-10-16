@@ -20,7 +20,7 @@ test-support = []
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["http2"] }
 bytes = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }

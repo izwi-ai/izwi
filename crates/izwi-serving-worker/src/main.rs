@@ -760,7 +760,7 @@ impl WorkerTlsConfig {
                     .next()
                     .context("server private key file contains no key PEM blocks")?;
 
-                let config = if let Some(ca_ref) = client_ca_ref {
+                let mut config = if let Some(ca_ref) = client_ca_ref {
                     let ca_bytes = load_pem_file(&ca_ref, "client CA")?;
                     let ca_items = rustls_pemfile::read_all(&mut ca_bytes.as_slice())
                         .map_err(|_| anyhow::anyhow!("client CA PEM is invalid"))?;
@@ -796,6 +796,11 @@ impl WorkerTlsConfig {
                         .map_err(|e| anyhow::anyhow!("invalid server TLS configuration: {e}"))?
                 };
 
+                // HTTP/2 lets a gateway multiplex its invocations and status
+                // polls over one connection per worker; HTTP/1.1 stays
+                // available for clients that do not offer h2 (WebSocket
+                // upgrades included).
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
                 Ok(Some(Self {
                     acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
                 }))
@@ -1592,20 +1597,7 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio_rustls::rustls;
 
-        let files = tempfile::tempdir().unwrap();
-        let (cert, key) = (files.path().join("cert.pem"), files.path().join("key.pem"));
-        std::fs::write(&cert, TEST_TLS_CERT_PEM).unwrap();
-        std::fs::write(&key, TEST_TLS_KEY_PEM).unwrap();
-        let tls = {
-            let _lock = ENV_LOCK.lock().unwrap();
-            std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
-            std::env::set_var(WORKER_TLS_CERT_REF_ENV, format!("file:{}", cert.display()));
-            std::env::set_var(WORKER_TLS_KEY_REF_ENV, format!("file:{}", key.display()));
-            let tls = WorkerTlsConfig::from_env();
-            std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-            std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
-            tls.unwrap().unwrap()
-        };
+        let tls = test_tls_config();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = tcp.local_addr().unwrap();
         let handshake_timeout = Duration::from_secs(1);
@@ -1650,6 +1642,67 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
             .await
             .expect("the server closes a stalled handshake");
         assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
+        server.abort();
+    }
+
+    fn test_tls_config() -> WorkerTlsConfig {
+        let files = tempfile::tempdir().unwrap();
+        let (cert, key) = (files.path().join("cert.pem"), files.path().join("key.pem"));
+        std::fs::write(&cert, TEST_TLS_CERT_PEM).unwrap();
+        std::fs::write(&key, TEST_TLS_KEY_PEM).unwrap();
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
+        std::env::set_var(WORKER_TLS_CERT_REF_ENV, format!("file:{}", cert.display()));
+        std::env::set_var(WORKER_TLS_KEY_REF_ENV, format!("file:{}", key.display()));
+        let tls = WorkerTlsConfig::from_env();
+        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
+        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
+        tls.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn gateway_client_speaks_http2_to_a_tls_worker() {
+        use izwi_serving_client::{WorkerClient, WorkerClientConfig, WorkerClientTlsConfig};
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        let listener =
+            TlsListener::new(tcp, test_tls_config().acceptor, Duration::from_secs(1)).unwrap();
+        let versions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&versions);
+        let app = axum::Router::new().route(
+            izwi_serving_protocol::WORKER_STATUS_PATH,
+            axum::routing::get(move |request: axum::extract::Request| async move {
+                seen.lock().unwrap().push(request.version());
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = WorkerClient::new(
+            &format!("https://localhost:{}/", address.port()),
+            izwi_serving_protocol::ServiceCredentials {
+                credential_id: izwi_serving_protocol::CredentialId::new("gateway").unwrap(),
+                bearer_token: izwi_serving_protocol::ServiceBearerToken::new("secret").unwrap(),
+            },
+            WorkerClientConfig {
+                tls: WorkerClientTlsConfig::from_pem(
+                    vec![TEST_TLS_CA_PEM.as_bytes().to_vec()],
+                    None,
+                    None,
+                )
+                .unwrap(),
+                ..WorkerClientConfig::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let _ = client.status().await;
+        }
+        assert_eq!(
+            *versions.lock().unwrap(),
+            vec![axum::http::Version::HTTP_2; 2]
+        );
         server.abort();
     }
 
