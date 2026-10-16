@@ -140,22 +140,13 @@ async fn apply_migration<C: ConnectionTrait>(
             }
         }
         (Schema::App, 2) => {
-            // The claim filters on the stage's resource-hints version in SQL
-            // (every stage written so far is version 1), and a partial index
-            // keeps the claim scan to claimable stages, not the history.
-            ensure_column(
-                db,
-                &CompatibilityColumn {
-                    table: "job_stages",
-                    column: "resource_hints_version",
-                    definition: "INTEGER NOT NULL DEFAULT 1",
-                },
-            )
-            .await?;
-            db.execute_unprepared(
-                "CREATE INDEX IF NOT EXISTS idx_job_stages_claimable ON job_stages(queue_class, available_at) WHERE status IN ('queued', 'retrying')",
-            )
-            .await?;
+            for column in STAGE_CLAIM_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+            for statement in STAGE_CLAIM_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -891,6 +882,19 @@ const FLEET_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
 ];
 
+/// App migration 2: the claim filters on the stage's resource-hints version
+/// in SQL (every stage written before it is version 1), and a partial index
+/// keeps the claim scan to claimable stages rather than the history.
+const STAGE_CLAIM_COLUMNS: &[CompatibilityColumn] = &[CompatibilityColumn {
+    table: "job_stages",
+    column: "resource_hints_version",
+    definition: "INTEGER NOT NULL DEFAULT 1",
+}];
+
+const STAGE_CLAIM_SCHEMA: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_job_stages_claimable ON job_stages(queue_class, available_at) WHERE status IN ('queued', 'retrying');",
+];
+
 /// Seed quota usage from the records that exist when the usage table is
 /// first created. Later changes are counted in the record transactions.
 const QUOTA_USAGE_BACKFILL: &[&str] = &[
@@ -1359,6 +1363,79 @@ async fn ensure_default_voice_profile<C: ConnectionTrait>(db: &C) -> anyhow::Res
     Ok(())
 }
 
+/// The application schema as one PostgreSQL script, for operators who
+/// manage the schema themselves: every app migration's statements on an
+/// empty database, the versions they record, and the seed data. The shipped
+/// copy is docs/dev/postgres-schema.sql; a test keeps it equal to this.
+#[cfg(test)]
+pub(crate) fn postgres_schema_sql() -> String {
+    let mut sql = String::from(
+        "-- Izwi application schema for PostgreSQL (provider-managed migrations).\n\
+         -- Generated from crates/izwi-server/src/db/migrator.rs: do not edit. Regenerate with\n\
+         --   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-server --lib postgres_schema\n\
+         -- Apply it to an empty schema. It records the migrations it contains in\n\
+         -- schema_migrations, so Izwi applies nothing further when it starts.\n\n\
+         BEGIN;\n\n",
+    );
+    let mut push = |statement: &str| {
+        let statement = dialect_ddl(DbBackend::Postgres, statement);
+        let statement = statement.trim().trim_end_matches(';');
+        // The constants are indented for the Rust source; dedent their body.
+        let mut lines = statement.lines();
+        sql.push_str(lines.next().unwrap_or_default());
+        let body = lines.collect::<Vec<_>>();
+        let indent = body
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| line.len() - line.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        for line in body {
+            sql.push('\n');
+            sql.push_str(line.get(indent..).unwrap_or_else(|| line.trim_start()));
+        }
+        sql.push_str(";\n\n");
+    };
+    let add_column = |column: &CompatibilityColumn| {
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}",
+            column.table, column.column, column.definition
+        )
+    };
+    // Migration 1, as `apply_migration` runs it on an empty database.
+    for statement in BASELINE_SCHEMA {
+        push(statement);
+    }
+    for column in COMPATIBILITY_COLUMNS {
+        push(&add_column(column));
+    }
+    for statement in POST_COMPATIBILITY_SCHEMA.iter().chain(QUOTA_USAGE_BACKFILL) {
+        push(statement);
+    }
+    // Migration 2.
+    for column in STAGE_CLAIM_COLUMNS {
+        push(&add_column(column));
+    }
+    for statement in STAGE_CLAIM_SCHEMA {
+        push(statement);
+    }
+    push(SCHEMA_MIGRATIONS_DDL);
+    for (version, name) in Schema::App.migrations() {
+        push(&format!(
+            "INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', {version}, '{name}', 0) ON CONFLICT DO NOTHING"
+        ));
+    }
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    sql.push_str(&format!(
+        "INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ({}, {}, {}, 1, 0, 0) ON CONFLICT (id) DO NOTHING;\n\n",
+        quote(DEFAULT_VOICE_PROFILE_ID),
+        quote(DEFAULT_VOICE_PROFILE_NAME),
+        quote(DEFAULT_VOICE_AGENT_SYSTEM_PROMPT),
+    ));
+    sql.push_str("COMMIT;\n");
+    sql
+}
+
 fn current_timestamp_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1448,6 +1525,90 @@ mod tests {
         db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
             .await
             .expect("the baseline recreated the index");
+    }
+
+    fn shipped_postgres_schema_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/dev/postgres-schema.sql")
+    }
+
+    #[test]
+    fn shipped_postgres_schema_is_generated_from_the_migrator() {
+        let generated = postgres_schema_sql();
+        let path = shipped_postgres_schema_path();
+        if std::env::var_os("IZWI_WRITE_POSTGRES_SCHEMA").is_some() {
+            std::fs::write(&path, &generated).expect("schema file is written");
+        }
+        let shipped = std::fs::read_to_string(&path).expect("schema file is readable");
+        assert!(
+            shipped == generated,
+            "docs/dev/postgres-schema.sql is stale; regenerate it with \
+             IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-server --lib postgres_schema"
+        );
+    }
+
+    async fn postgres_columns_and_indexes(db: &DatabaseConnection) -> Vec<String> {
+        let schema: String = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_schema()",
+            ))
+            .await
+            .expect("schema query")
+            .expect("schema row")
+            .try_get_by_index(0)
+            .expect("schema name");
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT table_name || '.' || column_name || ' ' || data_type || ' ' || is_nullable || ' ' || COALESCE(column_default, '') FROM information_schema.columns WHERE table_schema = current_schema()",
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()",
+        ] {
+            for row in db
+                .query_all_raw(Statement::from_string(DbBackend::Postgres, sql))
+                .await
+                .expect("catalog query")
+            {
+                let line: String = row.try_get_by_index(0).expect("catalog value");
+                rows.push(line.replace(&format!("{schema}."), ""));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// The shipped script builds exactly the schema the migrator builds, and
+    /// the migrator then finds nothing to apply.
+    #[tokio::test]
+    async fn postgres_schema_script_builds_the_migrated_schema() {
+        let migrated = TestDatabase::new().await;
+        let migrated_store = migrated.database();
+        let migrated_db = migrated_store.connection().await.expect("migrator runs");
+        if migrated_db.get_database_backend() != DbBackend::Postgres {
+            return;
+        }
+        let scripted = TestDatabase::new().await;
+        let scripted_db = scripted.connect_unmigrated().await;
+        let script = std::fs::read_to_string(shipped_postgres_schema_path())
+            .expect("schema file is readable");
+        scripted_db
+            .execute_unprepared(&script)
+            .await
+            .expect("the shipped script applies to an empty schema");
+        Migrator::up(&scripted_db)
+            .await
+            .expect("the migrator accepts the scripted schema");
+        assert_eq!(
+            count(
+                &scripted_db,
+                "SELECT COUNT(*) FROM schema_migrations WHERE applied_at <> 0"
+            )
+            .await,
+            0,
+            "the migrator applied nothing beyond the script"
+        );
+        assert_eq!(
+            postgres_columns_and_indexes(&scripted_db).await,
+            postgres_columns_and_indexes(migrated_db).await
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
