@@ -161,6 +161,21 @@ other traffic off the server during a run, or the deltas include it.
 exactly. `--save-samples` adds the per-request records (every ITL gap, token
 counts, errors) to each point.
 
+### Mixed prefill+decode A/B
+
+To compare a family's mixed steps with the split stages, run the same sweep
+against two servers of one binary: `IZWI_MIXED_STEP=0` and
+`IZWI_MIXED_STEP=1`, alternating the order across rounds. Use prompts long
+enough to need several steps (`--input-len 1000 --input-len-range 0.5`) at
+rates that keep decodes running while prompts arrive. Read ITL p95 beside
+throughput: a mixed step puts a prefill span into every inter-token gap,
+so a throughput gain can come with a longer tail. The counted
+`izwi_engine_model_calls_per_step` histogram (1 for a mixed step) and
+`izwi_engine_mixed_rows{phase}` / `izwi_engine_mixed_tokens` show whether
+the mixed stage served the run. Mixed steps run decode rows one token at a
+time, so `tokens_per_delta` drops to 1 where the split path streams
+multi-token quanta. The LFM2.5 results are in the support matrix.
+
 ## Regression check per backend
 
 `--profile regression` is a small deterministic profile. It uses 24 seeded

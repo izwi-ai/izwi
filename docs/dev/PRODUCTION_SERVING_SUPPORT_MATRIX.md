@@ -130,6 +130,49 @@ reached a terminal state" after a prefill row is withheld for tensor-state
 capacity. This happens with the old sizes and width too: it is a known open
 defect.
 
+## Mixed prefill+decode steps by family and backend (Phase 3a)
+
+A chat family certified in `crates/izwi-core/src/catalog/mixed_step.rs`
+runs prefill spans beside one-token decode rows in one model call and one
+sampling readback (`chat.step.mixed`, one token budget per step). Everyone
+else keeps the split prefill and decode stages. `IZWI_MIXED_STEP=0|1`
+overrides the table (A/B runs and a kill switch), and `IZWI_MIXED_FORCE_SPLIT=1`
+runs mixed batches through the split handlers (the parity oracle).
+
+A cell is certified when the mixed forward matches the split calls (exact
+where op shapes match, otherwise a tolerance with teacher-forced greedy
+agreement) and the mixed step is a measured win: an interleaved in-process
+A/B plus a live serving sweep with no tail regression.
+
+| Family | CPU | Metal | CUDA | Evidence (M1 Pro, 2026-10-16) |
+|---|---|---|---|---|
+| LFM2 / LFM2.5 | Not certified | Not certified | Not run | Parity `lfm25_mixed_steps_match_split_calls_on_{cpu,metal}`: bit-exact on the CPU (logits, KV pages, ShortConv state); on Metal top-8 logits 0.33 (the Metal-vs-F32 reference error is also 0.33), KV 1.8%, every decisive step agrees. In-process A/B `lfm25_mixed_vs_split_step_timing_{cpu,metal}`: Metal mixed/split 0.90–0.96 for 8 decode rows beside spans of 64–376 tokens, 1.02–1.07 for 4 rows beside short spans; CPU 0.91–1.03 (prefill dominates, so no measurable gain). Live sweep below: no win on the ITL tail |
+| Qwen3 | Not certified | Not certified | Not run | Trunk parity on the Qwen3-ASR-0.6B Q8 text model: bit-exact on the CPU, Metal F16 logits 0.055. No Qwen3 chat checkpoint to measure serving |
+| Other chat families | Split | Split | Split | No mixed forward yet |
+
+Live sweep (Metal, LFM2.5-1.2B, release build of this branch): 32 prompts of
+500–1,500 words with 128 output tokens at rates 2, 4 and inf. `split` is the
+default (chunked prefill off), `chunked` sets `IZWI_ENABLE_CHUNKED_PREFILL=1`,
+`mixed` sets `IZWI_MIXED_STEP=1` (384-token budget), and `mixed128` adds
+`IZWI_MAX_TOKENS_PER_STEP=128 IZWI_CHUNKED_PREFILL_THRESHOLD=120`. Clean
+points only; round 2 lost requests to live-memory admission (503) on the
+shared machine in every config:
+
+| Config (rounds) | Output tok/s at 2/4/inf | TTFT p50 at 2/4/inf (s) | TPOT p50 (ms) | ITL p95 (ms) |
+|---|---|---|---|---|
+| split (2) | 80–89 | 15.5–17.4 / 21.6 / 22.0–22.2 | 78–90 | 74–95 |
+| chunked (2) | 80–87 | 18.5 / 22.4 / 23.2–23.5 | 67–86 | 198–211 |
+| mixed (2) | 73–92 | 17.0–21.4 / 21.3 / 24.4 | 72–92 | 317–371 |
+| mixed128 (1) | 86–93 | 17.0 / 20.6 / 21.1 | 68–75 | 128–133 |
+
+Every mixed step was one model call. A mixed step carries a prefill span
+beside every decode row, so a 384-token span (about 0.35 s on Metal) lands
+in every inter-token gap while prompts wait; the split default parks decode
+only for the steps that prefill a whole prompt. A 128-token budget halves
+the tail and beats chunked prefill on throughput, TTFT and ITL p95, but it
+still trails the default's ITL p95 and has one round. LFM2 therefore stays
+uncertified on CPU and Metal; CUDA is unvalidated (no NVIDIA device).
+
 ## Hierarchical KV offload by lane (DS4)
 
 Offload is explicit opt-in (`host_kv_pool_budget_bytes` on the assignment or

@@ -19,7 +19,12 @@ pub(crate) const MIXED_STEP_ENV: &str = "IZWI_MIXED_STEP";
 ///
 /// | Family | CPU | Metal | CUDA |
 /// |---|---|---|---|
-/// | every chat family | no | no | no |
+/// | LFM2 / LFM2.5 | no: parity holds (bit-exact), no measured win | no: parity holds, ITL p95 regresses | no: not run |
+/// | Qwen3 | no: no chat checkpoint to measure | no: same | no: not run |
+/// | every other chat family | no: no mixed forward | no | no |
+///
+/// The LFM2 measurements are in `docs/dev/PRODUCTION_SERVING_SUPPORT_MATRIX.md`
+/// ("Mixed prefill+decode steps").
 pub(crate) const fn certified_mixed_step(_family: ModelFamily, _backend: BackendKind) -> bool {
     false
 }
