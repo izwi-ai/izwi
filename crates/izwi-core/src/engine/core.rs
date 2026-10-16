@@ -7238,6 +7238,26 @@ mod tests {
         physical: Arc<super::super::ManagedKvModelRuntime>,
         prefill: PrefillMode,
     ) {
+        bind_managed_test_runtime_with_batch(
+            request,
+            model_instance,
+            state_contract,
+            physical,
+            prefill,
+            NativeBatchMode::None,
+            1,
+        );
+    }
+
+    fn bind_managed_test_runtime_with_batch(
+        request: &mut EngineCoreRequest,
+        model_instance: ModelInstanceId,
+        state_contract: crate::kv::v2::InferenceStateContract,
+        physical: Arc<super::super::ManagedKvModelRuntime>,
+        prefill: PrefillMode,
+        batch_mode: NativeBatchMode,
+        max_batch_size: usize,
+    ) {
         let variant = request.model_variant.expect("managed test model");
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
@@ -7247,11 +7267,12 @@ mod tests {
         profile.cache_namespace = Some("core-test-state-v2".to_string());
         profile.kv_dtype = "state_v2_resolved".to_string();
         profile.resolved_from_loaded_model = true;
+        profile.max_batch_size = max_batch_size;
         let stage = super::super::StageDescriptor::from_execution_profile(
             super::super::StageId::new(1),
             "chat.test.physical",
             &profile,
-            NativeBatchMode::None,
+            batch_mode,
         );
         let execution = super::super::ExecutionAdapterBinding {
             execution_group_id: super::super::ExecutionGroupId::new(1),
@@ -11150,6 +11171,194 @@ mod tests {
                 &prompts,
             )
             .await;
+        }
+    }
+
+    /// Managed decode rows dispatched as one continuous native batch of up
+    /// to `width` rows, for the host-overhead benchmark below.
+    struct BatchedDecodeExecutor {
+        width: usize,
+        last_decode_rows: Arc<AtomicUsize>,
+    }
+
+    impl ModelExecutor for BatchedDecodeExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mut profile = ManagedReceiptExecutor.execution_profile(request)?;
+            profile.incremental_decode = true;
+            profile.prefill_batch = NativeBatchMode::Continuous;
+            profile.decode_batch = NativeBatchMode::Continuous;
+            profile.concurrency = ConcurrencyClass::Batchable;
+            profile.max_batch_size = self.width;
+            profile.resolved_from_loaded_model = true;
+            Some(profile)
+        }
+
+        fn cleanup_session(
+            &self,
+            session: &super::super::SessionKey,
+        ) -> super::super::executor::CacheReleaseReport {
+            ManagedReceiptExecutor.cleanup_session(session)
+        }
+
+        fn execute_physical_batch(
+            &self,
+            execution: super::super::executor::PhysicalBatchExecution<'_>,
+        ) -> super::super::executor::PhysicalDispatchResult {
+            if !execution.is_prefill() {
+                self.last_decode_rows
+                    .store(execution.scheduled.len(), Ordering::Relaxed);
+            }
+            ManagedDecodeExecutor::default().execute_physical_batch(execution)
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical dispatch is overridden")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> CacheReleaseReport {
+            CacheReleaseReport::confirmed(0)
+        }
+    }
+
+    /// Mean host microseconds per decode step (prepare, then execute and
+    /// commit) with `rows` running requests in one native batch and a
+    /// no-op executor, measured over `steps` steps after every row decodes.
+    async fn measure_step_host_overhead(rows: usize, steps: usize) -> (f64, f64) {
+        let model = ModelInstanceId::new(101);
+        let last_decode_rows = Arc::new(AtomicUsize::new(0));
+        let executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
+            width: rows,
+            last_decode_rows: last_decode_rows.clone(),
+        }));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: false,
+                block_size: 16,
+                // Full-request claims of 8 prompt + 4,000 output tokens.
+                max_blocks: rows * 256,
+                max_batch_size: rows,
+                max_tokens_per_step: rows * 16,
+                max_retained_sequences: rows,
+                max_staged_transactions: rows,
+                managed_chat_claim_quantum_tokens: 0,
+                backend: BackendKind::Cpu,
+                ..Default::default()
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+        let contract = crate::kv::test_contract();
+        let capability = crate::kv::InferenceStateCapability::Managed(contract.clone());
+        let physical = core
+            .load_managed_model_cache(model, &capability, None)
+            .expect("load managed state")
+            .expect("physical managed state");
+        for index in 0..rows {
+            let id = format!("bench-{index}");
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: id.clone(),
+            }])
+            .with_model_variant(ModelVariant::Qwen306B);
+            request.id = id;
+            request.params.max_tokens = 4_000;
+            request
+                .install_chat_execution_preparation(
+                    ModelVariant::Qwen306B,
+                    (1..=8).collect(),
+                    None,
+                    8_192,
+                )
+                .expect("prepare prompt");
+            request.bind_model_instance(model).expect("model instance");
+            bind_managed_test_runtime_with_batch(
+                &mut request,
+                model,
+                contract.clone(),
+                physical.clone(),
+                PrefillMode::Full,
+                NativeBatchMode::Continuous,
+                rows,
+            );
+            core.add_request(request).expect("add");
+        }
+        // Full prefill admits one row per starvation window of nine steps.
+        for _ in 0..rows * 12 {
+            for output in core.step().await.expect("warmup step") {
+                assert!(output.error.is_none(), "{:?}", output.error);
+            }
+            if last_decode_rows.load(Ordering::Relaxed) == rows {
+                break;
+            }
+        }
+        assert_eq!(last_decode_rows.load(Ordering::Relaxed), rows);
+
+        let mut prepare = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        for _ in 0..steps {
+            last_decode_rows.store(0, Ordering::Relaxed);
+            let started = Instant::now();
+            let prepared = core
+                .prepare_step()
+                .await
+                .expect("prepare")
+                .expect("decode work");
+            prepare += started.elapsed();
+            core.execute_and_commit_prepared_with_progress(prepared)
+                .await
+                .expect("execute and commit");
+            total += started.elapsed();
+            assert_eq!(last_decode_rows.load(Ordering::Relaxed), rows);
+        }
+        let per_step = |elapsed: Duration| elapsed.as_secs_f64() * 1e6 / steps as f64;
+        (per_step(prepare), per_step(total))
+    }
+
+    /// SCH-F9 microbenchmark: engine host time per decode step at 64 and 256
+    /// rows with a no-op executor. Run in release:
+    /// `cargo test --release -p izwi-core --lib step_host_overhead_bench -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "host-overhead microbenchmark; run explicitly in release"]
+    async fn step_host_overhead_bench() {
+        use std::io::Write;
+        let steps = std::env::var("IZWI_STEP_BENCH_STEPS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(200);
+        for rows in [64, 256] {
+            let (prepare, total) = measure_step_host_overhead(rows, steps).await;
+            let _ = writeln!(
+                std::io::stderr(),
+                "step_host_overhead rows={rows} steps={steps} prepare_us={prepare:.1} \
+                 step_us={total:.1} per_row_us={:.2}",
+                total / rows as f64
+            );
         }
     }
 
