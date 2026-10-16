@@ -18,6 +18,14 @@ max_parallel_model_loads = 1
 startup_timeout_ms = 120000
 poll_interval_ms = 200
 
+# A ready worker's status endpoint must answer within timeout_ms, from the
+# same incarnation, without reporting a failed runtime. failure_threshold
+# consecutive failures (a wedged device, a deadlock) restart it like a crash.
+[liveness]
+period_ms = 5000
+timeout_ms = 3000
+failure_threshold = 3
+
 [restart]
 initial_backoff_ms = 250
 maximum_backoff_ms = 30000

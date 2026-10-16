@@ -43,6 +43,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub readiness: ReadinessPolicy,
     #[serde(default)]
+    pub liveness: LivenessPolicy,
+    #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default)]
     pub shutdown: ShutdownPolicy,
@@ -106,6 +108,7 @@ impl NodeConfig {
         }
         validate_directory("working_directory", &self.working_directory)?;
         self.readiness.validate()?;
+        self.liveness.validate()?;
         self.restart.validate()?;
         self.shutdown.validate()?;
         if let Some(autoscaling) = self.autoscaling.as_ref() {
@@ -673,6 +676,41 @@ impl ReadinessPolicy {
     }
 }
 
+/// How a ready worker is checked for liveness: its status endpoint must
+/// answer within `timeout_ms`, from the same incarnation, without reporting
+/// a failed runtime. `failure_threshold` consecutive failures (a wedged
+/// device or a deadlock) restart it like a crash.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LivenessPolicy {
+    pub period_ms: u64,
+    pub timeout_ms: u64,
+    pub failure_threshold: u32,
+}
+
+impl Default for LivenessPolicy {
+    fn default() -> Self {
+        Self {
+            period_ms: 5_000,
+            timeout_ms: 3_000,
+            failure_threshold: 3,
+        }
+    }
+}
+
+impl LivenessPolicy {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_duration("liveness.period_ms", self.period_ms)?;
+        validate_duration("liveness.timeout_ms", self.timeout_ms)?;
+        if !(1..=100).contains(&self.failure_threshold) {
+            return Err(ConfigError::InvalidPolicy(
+                "liveness failure threshold must be between one and 100",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RestartPolicy {
@@ -1230,6 +1268,8 @@ fn validate_duration(name: &'static str, value: u64) -> Result<(), ConfigError> 
         return Err(ConfigError::InvalidPolicy(match name {
             "readiness.startup_timeout_ms" => "readiness startup timeout is out of range",
             "readiness.poll_interval_ms" => "readiness poll interval is out of range",
+            "liveness.period_ms" => "liveness probe period is out of range",
+            "liveness.timeout_ms" => "liveness probe timeout is out of range",
             "restart.initial_backoff_ms" => "initial restart backoff is out of range",
             "restart.maximum_backoff_ms" => "maximum restart backoff is out of range",
             "restart.restart_window_ms" => "restart window is out of range",
@@ -1435,6 +1475,7 @@ mod tests {
                 streaming: true,
             }],
             readiness: ReadinessPolicy::default(),
+            liveness: Default::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             max_parallel_model_loads: DEFAULT_MODEL_LOAD_SLOTS,

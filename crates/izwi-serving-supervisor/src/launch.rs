@@ -574,6 +574,7 @@ mod tests {
                 environment: Default::default(),
             }],
             readiness: ReadinessPolicy::default(),
+            liveness: Default::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             autoscaling: None,

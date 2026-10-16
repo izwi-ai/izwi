@@ -1126,7 +1126,7 @@ fn render_runtime_diagnostic<'a>(
         slots.iter().filter(|slot| predicate(slot.view)).count()
     };
     output.push_line(&format!(
-        "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} stop_failures_total={} autoscale_ups_total={} autoscale_downs_total={}",
+        "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} liveness_restarts_total={} stop_failures_total={} autoscale_ups_total={} autoscale_downs_total={}",
         env!("CARGO_PKG_VERSION"),
         node.config().node_id,
         started_at.elapsed().as_millis(),
@@ -1141,6 +1141,7 @@ fn render_runtime_diagnostic<'a>(
         count(&metrics.quarantines),
         count(&metrics.unexpected_exits),
         count(&metrics.exit_observation_failures),
+        count(&metrics.liveness_restarts),
         count(&metrics.stop_failures),
         count(&metrics.autoscale_ups),
         count(&metrics.autoscale_downs),
@@ -1249,6 +1250,11 @@ fn supervisor_prometheus(slots: &[WorkerSlot], metrics: &SupervisorMetrics) -> S
             "izwi_supervisor_unexpected_exits_total",
             "Workers that exited unexpectedly.",
             &metrics.unexpected_exits,
+        ),
+        (
+            "izwi_supervisor_liveness_restarts_total",
+            "Workers restarted after failing their liveness probes.",
+            &metrics.liveness_restarts,
         ),
         (
             "izwi_supervisor_stop_failures_total",
@@ -2092,6 +2098,7 @@ mod tests {
                 environment: Default::default(),
             }],
             readiness: ReadinessPolicy::default(),
+            liveness: Default::default(),
             restart: RestartPolicy::default(),
             shutdown: ShutdownPolicy::default(),
             autoscaling: None,

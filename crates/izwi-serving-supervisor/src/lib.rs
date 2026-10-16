@@ -13,6 +13,7 @@ pub mod env;
 mod launch;
 mod lifecycle;
 mod locks;
+pub mod probe;
 mod quarantine;
 pub mod rollout;
 pub mod signals;

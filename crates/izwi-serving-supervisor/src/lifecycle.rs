@@ -454,6 +454,38 @@ impl SupervisedWorker {
         }
     }
 
+    /// Stops a worker that no longer answers: closes the pipe, sends TERM at
+    /// once, waits the termination grace, then kills it. There is no
+    /// cooperative drain, since the worker cannot be asked anything.
+    pub async fn terminate(
+        mut self,
+        policy: &ShutdownPolicy,
+    ) -> Result<StopReport, LifecycleError> {
+        drop(self.ownership_stdin.take());
+        request_termination(&mut self.child)?;
+        let deadline = Instant::now() + Duration::from_millis(policy.termination_grace_ms);
+        while Instant::now() < deadline {
+            if let Some(exit_status) = self.child.try_wait().map_err(LifecycleError::ProcessIo)? {
+                return Ok(StopReport {
+                    outcome: StopOutcome::Terminated,
+                    exit_status,
+                    last_process_state: None,
+                    identity_violation: None,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(STOP_POLL_INTERVAL.min(remaining)).await;
+        }
+        self.child.kill().await.map_err(LifecycleError::ProcessIo)?;
+        let exit_status = self.child.wait().await.map_err(LifecycleError::ProcessIo)?;
+        Ok(StopReport {
+            outcome: StopOutcome::Killed,
+            exit_status,
+            last_process_state: None,
+            identity_violation: None,
+        })
+    }
+
     /// Closes the parent-owned pipe, waits for cooperative drain/cancellation,
     /// then escalates to TERM and finally KILL according to the validated policy.
     pub async fn drain_and_stop(
@@ -733,6 +765,33 @@ mod tests {
                 outstanding_cost_units: 0,
             },
         }
+    }
+
+    #[test]
+    fn liveness_judges_identity_timeouts_and_failed_runtimes() {
+        use crate::probe::{judge, ProbeVerdict};
+        let expected = expected();
+        assert_eq!(
+            judge(&expected, Some(Ok(status(&expected, 9)))),
+            ProbeVerdict::Alive
+        );
+        assert!(matches!(judge(&expected, None), ProbeVerdict::Failed(_)));
+        let mut replaced = status(&expected, 9);
+        replaced.incarnation_id = id("incarnation-b");
+        assert!(matches!(
+            judge(&expected, Some(Ok(replaced))),
+            ProbeVerdict::Failed(_)
+        ));
+        let mut failed = status(&expected, 9);
+        failed.process_state = WorkerProcessState::Failed;
+        assert!(matches!(
+            judge(&expected, Some(Ok(failed))),
+            ProbeVerdict::Failed(_)
+        ));
+        // A deployment that is merely not ready is a readiness matter.
+        let mut degraded = status(&expected, 9);
+        degraded.deployments[0].readiness = ModelReadiness::Failed;
+        assert_eq!(judge(&expected, Some(Ok(degraded))), ProbeVerdict::Alive);
     }
 
     #[test]

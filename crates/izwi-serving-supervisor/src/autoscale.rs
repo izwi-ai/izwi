@@ -949,6 +949,7 @@ mod tests {
             host_memory_budget_bytes: 2048,
             workers: vec![worker("cpu-1", 9471), worker("cpu-2", 9472)],
             readiness: Default::default(),
+            liveness: Default::default(),
             restart: Default::default(),
             shutdown: Default::default(),
             max_parallel_model_loads: crate::DEFAULT_MODEL_LOAD_SLOTS,

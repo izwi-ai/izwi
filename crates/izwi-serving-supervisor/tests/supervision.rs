@@ -371,3 +371,39 @@ fn one_load_slot_serializes_loads() {
     );
     assert_eq!(rig.launches("worker-b"), 1);
 }
+
+/// A worker that stops answering (a wedged device or a deadlock) keeps its
+/// process and listener; the liveness probe restarts it.
+#[test]
+fn a_worker_that_stops_answering_is_restarted() {
+    let rig = Rig::build(
+        &[(
+            "worker-a",
+            Behavior {
+                hang_status_after_secs: Some(1.5),
+                ..Behavior::default()
+            },
+        )],
+        "\n[readiness]\nstartup_timeout_ms = 5000\npoll_interval_ms = 50\n\n[liveness]\nperiod_ms = 300\ntimeout_ms = 200\nfailure_threshold = 2\n\n[restart]\ninitial_backoff_ms = 100\nmaximum_backoff_ms = 100\n",
+    );
+    let _supervisor = rig.spawn_supervisor();
+    assert!(
+        wait_until(Duration::from_secs(20), || rig.launches("worker-a") >= 2),
+        "the hung worker must be restarted; stderr:\n{}",
+        rig.stderr_text()
+    );
+    let stderr = rig.stderr_text();
+    assert!(
+        stderr.contains("worker worker-a failed 2 consecutive liveness probes"),
+        "{stderr}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .matches("worker-a ready as incarnation")
+            .count()
+            >= 2),
+        "the replacement incarnation must come back ready; stderr:\n{}",
+        rig.stderr_text()
+    );
+}

@@ -2,12 +2,12 @@
 //!
 //! Each worker gets an actor task that owns its process: it waits for a
 //! model-load permit, launches the worker and waits for readiness, watches
-//! for its exit, and restarts it under the bounded restart policy. The
-//! supervisor's main loop only sends commands and reads the view each actor
-//! publishes, so one worker's slow load or crash loop never stalls exit
-//! handling, restarts, diagnostics or autoscaling for the others. The
-//! node's `max_parallel_model_loads` bounds how many actors are between
-//! spawn and readiness at once.
+//! for its exit and probes its liveness, and restarts it under the bounded
+//! restart policy. The supervisor's main loop only sends commands and reads
+//! the view each actor publishes, so one worker's slow load or crash loop
+//! never stalls exit handling, restarts, diagnostics or autoscaling for the
+//! others. The node's `max_parallel_model_loads` bounds how many actors are
+//! between spawn and readiness at once.
 
 use std::{
     collections::BTreeMap,
@@ -28,6 +28,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::probe::{self, Liveness, LivenessTracker};
 use crate::{
     build_child_launch_spec, ExpectedWorkerIdentity, LifecycleError, LockNamespace,
     ResolvedWorkerSecret, RestartController, RestartDecision, SupervisedWorker,
@@ -48,6 +49,7 @@ pub struct SupervisorMetrics {
     pub quarantines: AtomicU64,
     pub unexpected_exits: AtomicU64,
     pub exit_observation_failures: AtomicU64,
+    pub liveness_restarts: AtomicU64,
     pub stop_failures: AtomicU64,
     pub autoscale_ups: AtomicU64,
     pub autoscale_downs: AtomicU64,
@@ -485,13 +487,44 @@ impl Actor {
 
     /// Watches a ready process until it exits or is stopped.
     async fn supervise(&mut self, mut process: SupervisedWorker, started_at: Instant) -> Next {
+        let liveness = self.node.config().liveness.clone();
+        let period = Duration::from_millis(liveness.period_ms);
+        let mut probe_timer = tokio::time::interval_at(Instant::now() + period, period);
+        probe_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tracker = LivenessTracker::new(&liveness);
         let mut draining = false;
         loop {
             let event = tokio::select! {
                 exit = process.wait_for_exit() => Event::Exited(exit),
                 command = self.commands.recv() => Event::Command(command),
+                _ = probe_timer.tick(), if !draining => Event::Probe,
             };
             match event {
+                Event::Probe => {
+                    let answer = tokio::time::timeout(
+                        Duration::from_millis(liveness.timeout_ms),
+                        process.client().status(),
+                    )
+                    .await
+                    .ok();
+                    let verdict = probe::judge(process.readiness().expected(), answer);
+                    match tracker.observe(verdict) {
+                        Liveness::Alive => {}
+                        Liveness::Suspect { failures, reason } => warn!(
+                            "worker {} liveness probe failed ({failures} of {}): {reason}",
+                            self.worker_id, liveness.failure_threshold
+                        ),
+                        Liveness::Dead { reason } => {
+                            bump(&self.metrics().liveness_restarts);
+                            warn!(
+                                "worker {} failed {} consecutive liveness probes ({reason}); restarting it",
+                                self.worker_id, liveness.failure_threshold
+                            );
+                            self.terminate_process(process).await;
+                            return self.failed(started_at.elapsed());
+                        }
+                    }
+                }
                 Event::Exited(Ok(status)) if draining => {
                     info!(
                         "worker {} exited after its drain ({status})",
@@ -533,6 +566,20 @@ impl Actor {
                     self.stop_process(process).await;
                     return Next::Exit;
                 }
+            }
+        }
+    }
+
+    /// Stops a worker that stopped answering, without a cooperative drain.
+    async fn terminate_process(&self, process: SupervisedWorker) {
+        match process.terminate(&self.node.config().shutdown).await {
+            Ok(report) => info!(
+                "worker {} stopped with {:?} ({})",
+                self.worker_id, report.outcome, report.exit_status
+            ),
+            Err(error) => {
+                bump(&self.metrics().stop_failures);
+                warn!("worker {} stop failed: {error}", self.worker_id);
             }
         }
     }
@@ -586,4 +633,5 @@ impl Actor {
 enum Event {
     Exited(Result<std::process::ExitStatus, LifecycleError>),
     Command(Option<Command>),
+    Probe,
 }
