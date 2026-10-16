@@ -1,3 +1,4 @@
+use izwi_serving_fence::{DEFAULT_MODEL_LOAD_SLOTS, MAX_MODEL_LOAD_SLOTS};
 use izwi_serving_protocol::{
     ArtifactRevision, BackendKind, CancellationBehavior, Capability, CredentialId, DeploymentId,
     DeviceAssignment, DeviceId, InputFormat, ModelAlias, ModelGeneration, NodeId, OutputFormat,
@@ -22,8 +23,6 @@ pub const MAX_ACTIVE_INVOCATIONS_PER_WORKER: u32 = 1024;
 pub const MAX_REQUEST_BYTES_PER_WORKER: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_ATTEMPTS_PER_WORKER: usize = 65_536;
 pub const MAX_EXECUTION_PROFILE_LABEL_BYTES: usize = 128;
-pub const DEFAULT_MODEL_LOAD_SLOTS: u32 = 1;
-pub const MAX_MODEL_LOAD_SLOTS: u32 = 64;
 pub const MIN_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 100;
 pub const MAX_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 60_000;
 pub const DEFAULT_AUTOSCALING_EVALUATION_INTERVAL_MS: u64 = 1_000;

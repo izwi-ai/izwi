@@ -10,6 +10,7 @@ repository.workspace = true
 fs2 = "0.4.3"
 serde_json = { workspace = true }
 izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-fence = { path = "../izwi-serving-fence" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
 reqwest = { workspace = true }
 serde = { workspace = true }

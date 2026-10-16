@@ -26,8 +26,8 @@ dirs = { workspace = true }
 futures = { workspace = true }
 izwi-core = { path = "../izwi-core", default-features = false }
 izwi-serving-client = { path = "../izwi-serving-client" }
+izwi-serving-fence = { path = "../izwi-serving-fence" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
-izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
 rustls-pemfile = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -44,6 +44,7 @@ sha2 = { workspace = true }
 izwi-serving-worker = { path = ".", features = ["test-support"] }
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-server = { path = "../izwi-server" }
+izwi-serving-supervisor = { path = "../izwi-serving-supervisor" }
 izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
 safetensors = { workspace = true }

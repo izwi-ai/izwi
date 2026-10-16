@@ -6,7 +6,8 @@
 # probe a device, or link accelerator code, on CPU, Metal, or CUDA alike.
 # Only izwi-serving-worker (which hosts RuntimeService) may depend on
 # izwi-core. This gate fails closed if any boundary crate gains a backend
-# dependency.
+# dependency. Only linked (normal and build) dependencies count: test-only
+# dev-dependencies never reach a shipped binary.
 
 set -euo pipefail
 
@@ -16,13 +17,17 @@ cd "${repo_root}"
 boundary_crates=(
     izwi-serving-protocol
     izwi-serving-client
+    izwi-serving-fence
     izwi-serving-supervisor
 )
+tree_of() {
+    cargo tree --offline -p "$1" --edges normal,build --prefix none 2>/dev/null || true
+}
 forbidden_pattern='(izwi-core|candle-core|candle-nn|candle-transformers|metal |/metal-|cuda|cudnn|accelerate)'
 
 failures=0
 for crate in "${boundary_crates[@]}"; do
-    tree="$(cargo tree --offline -p "${crate}" --prefix none 2>/dev/null || true)"
+    tree="$(tree_of "${crate}")"
     if [ -z "${tree}" ]; then
         echo "error: could not resolve dependency tree for ${crate}" >&2
         failures=$((failures + 1))
@@ -38,12 +43,20 @@ for crate in "${boundary_crates[@]}"; do
     fi
 done
 
-worker_tree="$(cargo tree --offline -p izwi-serving-worker --prefix none 2>/dev/null || true)"
+worker_tree="$(tree_of izwi-serving-worker)"
 if ! printf '%s\n' "${worker_tree}" | grep -Eq 'izwi-core v'; then
     echo "error: izwi-serving-worker must own its runtime via izwi-core" >&2
     failures=$((failures + 1))
 else
     echo "ok: izwi-serving-worker owns its runtime via izwi-core"
+fi
+# The worker shares only the launch contract (izwi-serving-fence) with its
+# supervisor; linking the supervisor would drag its control plane in.
+if printf '%s\n' "${worker_tree}" | grep -Eq 'izwi-serving-supervisor v'; then
+    echo "error: izwi-serving-worker must not link izwi-serving-supervisor" >&2
+    failures=$((failures + 1))
+else
+    echo "ok: izwi-serving-worker does not link izwi-serving-supervisor"
 fi
 
 if [ "${failures}" -ne 0 ]; then

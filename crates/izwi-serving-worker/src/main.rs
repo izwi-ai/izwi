@@ -2,13 +2,13 @@ use anyhow::{bail, Context};
 use izwi_core::{
     backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeHealth, RuntimeService,
 };
-use izwi_serving_protocol::*;
-use izwi_serving_supervisor::{
+use izwi_serving_fence::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
     WORKER_EXECUTION_REPRESENTATION_ENV, WORKER_GENERATION_FENCE_ENV,
     WORKER_MAX_CONTEXT_TOKENS_ENV, WORKER_MAX_OUTPUT_TOKENS_ENV, WORKER_MODEL_LOAD_LOCK_ENV,
     WORKER_MODEL_LOAD_SLOTS_ENV, WORKER_OWNERSHIP_LOCK_ENV, WORKER_PRECISION_ENV, WORKER_TASK_ENV,
 };
+use izwi_serving_protocol::*;
 use izwi_serving_worker::{
     warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
     RuntimeRealtimeAsrExecutor, RuntimeRealtimeTtsExecutor, WorkerConfig, WorkerService,
@@ -355,9 +355,9 @@ struct ManagedLockContext {
 /// historical single-slot node; values outside the supervisor's validated
 /// range are rejected rather than clamped so a misconfigured node fails loudly.
 fn model_load_slots_from(raw: Option<&str>) -> anyhow::Result<u32> {
-    const MAX_SLOTS: u32 = izwi_serving_supervisor::MAX_MODEL_LOAD_SLOTS;
+    const MAX_SLOTS: u32 = izwi_serving_fence::MAX_MODEL_LOAD_SLOTS;
     let Some(raw) = raw else {
-        return Ok(izwi_serving_supervisor::DEFAULT_MODEL_LOAD_SLOTS);
+        return Ok(izwi_serving_fence::DEFAULT_MODEL_LOAD_SLOTS);
     };
     let slots: u32 = raw
         .trim()
@@ -1334,7 +1334,7 @@ mod tests {
         assert_eq!(model_load_slots_from(Some(" 4 ")).unwrap(), 4);
         assert_eq!(
             model_load_slots_from(Some("64")).unwrap(),
-            izwi_serving_supervisor::MAX_MODEL_LOAD_SLOTS
+            izwi_serving_fence::MAX_MODEL_LOAD_SLOTS
         );
         assert!(model_load_slots_from(Some("0")).is_err());
         assert!(model_load_slots_from(Some("65")).is_err());

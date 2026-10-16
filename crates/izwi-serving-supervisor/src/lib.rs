@@ -13,14 +13,13 @@ pub mod env;
 pub mod gateway_ack;
 mod launch;
 mod lifecycle;
-mod locks;
 pub mod probe;
 mod quarantine;
 pub mod rollout;
 pub mod signals;
 
 pub use config::*;
+pub use izwi_serving_fence::*;
 pub use launch::*;
 pub use lifecycle::*;
-pub use locks::*;
 pub use quarantine::*;

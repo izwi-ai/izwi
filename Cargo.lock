@@ -3860,6 +3860,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-serving-fence"
+version = "0.1.0-beta-18"
+dependencies = [
+ "fs2",
+ "izwi-serving-protocol",
+ "libc",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "izwi-serving-protocol"
 version = "0.1.0-beta-18"
 dependencies = [
@@ -3877,6 +3889,7 @@ version = "0.1.0-beta-18"
 dependencies = [
  "fs2",
  "izwi-serving-client",
+ "izwi-serving-fence",
  "izwi-serving-protocol",
  "izwi-test-process",
  "libc",
@@ -3910,6 +3923,7 @@ dependencies = [
  "izwi-hooks",
  "izwi-server",
  "izwi-serving-client",
+ "izwi-serving-fence",
  "izwi-serving-protocol",
  "izwi-serving-supervisor",
  "izwi-serving-worker",

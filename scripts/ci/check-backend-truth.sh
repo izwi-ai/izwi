@@ -389,6 +389,7 @@ run_cargo_serving() {
         -p izwi-test-process \
         -p izwi-serving-protocol \
         -p izwi-serving-client \
+        -p izwi-serving-fence \
         -p izwi-serving-supervisor \
         -p izwi-serving-worker
     cargo test --locked --no-fail-fast -p izwi-server \
