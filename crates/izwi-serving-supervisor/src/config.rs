@@ -321,7 +321,7 @@ impl NodeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     pub worker_id: WorkerId,
@@ -465,7 +465,7 @@ impl WorkerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentConfig {
     pub deployment_id: DeploymentId,
@@ -580,7 +580,7 @@ impl DeploymentConfig {
 }
 
 /// Exact invocation-shape contract that a deployment must advertise before it is ready.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityProfileConfig {
     pub streaming: bool,

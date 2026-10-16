@@ -380,7 +380,7 @@ impl RolloutPlan {
                             worker.worker_id
                         )));
                     };
-                    if format!("{current_worker:?}") != format!("{worker:?}") {
+                    if current_worker != worker {
                         return Err(RolloutError::InvalidPlan(format!(
                             "worker {} of non-rolling deployment {deployment_id} differs between current and target configs; rollouts only advance generations",
                             worker.worker_id
