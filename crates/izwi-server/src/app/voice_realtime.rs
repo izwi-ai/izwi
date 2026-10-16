@@ -791,6 +791,73 @@ impl VoiceTurnConfig {
     }
 }
 
+/// The models a turn config runs, in pipeline order: (stage, model id,
+/// variant).
+fn turn_config_models(
+    config: &VoiceTurnConfig,
+) -> Result<Vec<(&'static str, String, izwi_core::ModelVariant)>, String> {
+    Ok(match config {
+        VoiceTurnConfig::Modular(config) => vec![
+            (
+                "asr",
+                config.asr_model_id.clone(),
+                resolve_asr_model_variant(Some(&config.asr_model_id)),
+            ),
+            (
+                "text",
+                config.text_model_id.clone(),
+                parse_chat_model_variant(Some(&config.text_model_id))
+                    .map_err(|err| format!("Invalid chat model: {err}"))?,
+            ),
+            (
+                "tts",
+                config.tts_model_id.clone(),
+                parse_tts_model_variant(&config.tts_model_id)
+                    .map_err(|err| format!("Unsupported TTS model: {err}"))?,
+            ),
+        ],
+        VoiceTurnConfig::Unified(config) => vec![(
+            "s2s",
+            config.s2s_model_id.clone(),
+            parse_model_variant(&config.s2s_model_id)
+                .map_err(|err| format!("Unsupported unified audio model: {err}"))?,
+        )],
+    })
+}
+
+/// Load and lease an input stream's models when the stream starts, so its
+/// first turn does not pay the cold load (SPK-F21), then report which are
+/// ready in a `models_ready` event. A model that fails to load is reported
+/// here; its turns fail with the same error.
+async fn warm_session_models(
+    runtime: Arc<RuntimeService>,
+    leases: SessionModelLeases,
+    models: Vec<(&'static str, String, izwi_core::ModelVariant)>,
+    out_tx: OutboundTx,
+) {
+    let started = Instant::now();
+    let mut statuses = Vec::with_capacity(models.len());
+    for (stage, model_id, variant) in models {
+        statuses.push(match leases.hold(&runtime, variant).await {
+            Ok(()) => json!({ "stage": stage, "model_id": model_id, "ready": true }),
+            Err(err) => json!({
+                "stage": stage,
+                "model_id": model_id,
+                "ready": false,
+                "error": err.to_string(),
+            }),
+        });
+    }
+    send_json(
+        &out_tx,
+        json!({
+            "type": "models_ready",
+            "models": statuses,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+}
+
 #[derive(Debug, Clone)]
 struct VoiceTurnModelIds {
     asr_model_id: Option<String>,
@@ -808,6 +875,8 @@ struct ConnectionState {
     /// Keeps the input stream's models resident between turns without
     /// pinning them; turns in flight hold their own clone.
     model_leases: SessionModelLeases,
+    /// Loads the input stream's models at its start (SPK-F21).
+    model_warmup: Option<AbortOnDropTask<()>>,
     active_turn: Option<ActiveTurn>,
     voice_session: VoiceSession,
     voice_session_started_at: Option<Instant>,
@@ -829,6 +898,7 @@ impl Default for ConnectionState {
             agent_session: Arc::default(),
             streaming_input: None,
             model_leases: SessionModelLeases::default(),
+            model_warmup: None,
             active_turn: None,
             voice_session: VoiceSession::default(),
             voice_session_started_at: None,
@@ -1624,6 +1694,7 @@ async fn handle_text_message(
                 state.runtime.record_voice_session_started();
             }
 
+            let warm_models = turn_config_models(&turn_config)?;
             conn.model_leases = SessionModelLeases::default();
             conn.streaming_input = Some(StreamingInputState::new(StreamingInputConfig {
                 turn_config,
@@ -1663,6 +1734,12 @@ async fn handle_text_message(
                     }
                 }),
             );
+            conn.model_warmup = Some(AbortOnDropTask::new(tokio::spawn(warm_session_models(
+                state.runtime.clone(),
+                conn.model_leases.clone(),
+                warm_models,
+                out_tx.clone(),
+            ))));
         }
         ClientEvent::InputStreamStop => {
             if let Some(mut streaming) = conn.streaming_input.take() {
@@ -1688,6 +1765,7 @@ async fn handle_text_message(
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
+            conn.model_warmup = None;
             conn.model_leases = SessionModelLeases::default();
             if let Some(session_id) = conn.close_voice_session_if_idle() {
                 conn.record_session_closed(&state.runtime);
@@ -3298,6 +3376,7 @@ fn map_typed_voice_event(
         // These legacy-only state markers either have no typed equivalent or would encode
         // append-only deltas. Typed clients reconstruct state from full snapshots/finals.
         "input_stream_stopped"
+        | "models_ready"
         | "turn_processing"
         | "user_transcript_start"
         | "user_transcript_delta"
@@ -3725,6 +3804,52 @@ mod tests {
             .map(|event| event["type"].as_str().unwrap_or_default().to_string())
             .collect();
         assert_eq!(types, ["turn_interrupted", "turn_done"]);
+    }
+
+    /// SPK-F21: starting an input stream loads and leases its models in the
+    /// background and reports their readiness, before any turn.
+    #[tokio::test]
+    async fn input_stream_start_warms_the_session_models() {
+        let (_dir, state) = test_app_state(1);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let mut conn = ConnectionState::default();
+        for message in [
+            json!({ "type": "session_start" }),
+            json!({
+                "type": "input_stream_start",
+                "asr_model_id": "Parakeet-TDT-0.6B-v3",
+                "text_model_id": "LFM2.5-1.2B-Instruct-GGUF",
+                "tts_model_id": "Kokoro-82M",
+            }),
+        ] {
+            handle_text_message(&state, "corr", &out_tx, &mut conn, &message.to_string())
+                .await
+                .expect("message");
+        }
+        conn.model_warmup
+            .take()
+            .expect("the stream warms its models")
+            .join()
+            .await
+            .expect("warm-up");
+        let events = drain_text(&out_tx).await;
+        let ready = events
+            .iter()
+            .find(|event| event["type"] == "models_ready")
+            .expect("readiness is reported");
+        let stages: Vec<&str> = ready["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .map(|model| model["stage"].as_str().expect("stage"))
+            .collect();
+        assert_eq!(stages, ["asr", "text", "tts"]);
+        // The test models directory is empty, so none can load; each says why.
+        assert!(ready["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .all(|model| model["ready"] == false && model["error"].is_string()));
     }
 
     fn test_streaming_input() -> StreamingInputState {
