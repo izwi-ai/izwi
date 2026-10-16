@@ -3807,6 +3807,7 @@ dependencies = [
  "hmac",
  "hound",
  "http-body 1.0.1",
+ "http-body-util",
  "izwi-agent",
  "izwi-core",
  "izwi-hooks",

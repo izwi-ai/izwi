@@ -46,6 +46,8 @@ use crate::state::ServerLifecycle;
 
 const CHAT_COMPLETIONS_RESOURCE: &str = "/v1/chat/completions";
 const MAX_GATEWAY_QUOTA_HOOK_TIME: Duration = Duration::from_secs(2);
+/// Default deadline for reading a chat request body.
+pub(crate) const DEFAULT_GATEWAY_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct GatewayState {
@@ -60,6 +62,9 @@ pub struct GatewayState {
     rate_quota: GatewayRateQuota,
     tenant_concurrency: GatewayTenantConcurrency,
     max_output_tokens: u32,
+    /// Deadline for reading a request body, so a slow upload cannot hold a
+    /// global admission permit for long.
+    body_read_timeout: Duration,
     metrics: GatewayMetrics,
     /// Realtime relay surface (DS3.6). `None` keeps the gateway
     /// byte-identical to the pre-realtime shape.
@@ -93,10 +98,63 @@ impl GatewayState {
             rate_quota: GatewayRateQuota::new(GatewayRateQuotaConfig::default()),
             tenant_concurrency: GatewayTenantConcurrency::new(tenant_concurrency_config),
             max_output_tokens,
+            body_read_timeout: DEFAULT_GATEWAY_BODY_READ_TIMEOUT,
             metrics: GatewayMetrics::default(),
             realtime_relay: None,
             approvals: None,
         }
+    }
+
+    pub(crate) fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
+        self.body_read_timeout = timeout;
+        self
+    }
+
+    /// Reads and decodes a chat request body within the body-read deadline
+    /// and the configured size limit.
+    pub(crate) async fn read_chat_body(
+        &self,
+        headers: &HeaderMap,
+        body: axum::body::Body,
+    ) -> Result<crate::api::openai::chat::completions::ChatCompletionRequest, ApiError> {
+        let not_json = || ApiError::bad_request("Gateway chat request body is not valid JSON");
+        let is_json = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| {
+                let mime = mime.trim();
+                mime.eq_ignore_ascii_case("application/json")
+                    || mime.to_ascii_lowercase().ends_with("+json")
+            });
+        if !is_json {
+            return Err(not_json());
+        }
+        let limit = self.perimeter.max_chat_body_bytes();
+        let bytes = tokio::time::timeout(self.body_read_timeout, axum::body::to_bytes(body, limit))
+            .await
+            .map_err(|_| {
+                self.metrics
+                    .inner
+                    .body_timeout_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                ApiError::of(
+                    crate::error::ErrorClass::Timeout,
+                    "Gateway chat request body was not received in time",
+                )
+            })?
+            .map_err(|error| {
+                let too_large = std::error::Error::source(&error)
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+                if too_large {
+                    ApiError::payload_too_large(
+                        "Gateway chat request body exceeds the configured limit",
+                    )
+                } else {
+                    not_json()
+                }
+            })?;
+        serde_json::from_slice(&bytes).map_err(|_| not_json())
     }
 
     /// Serve one more public chat model. Requests route by their `model`.
@@ -277,6 +335,21 @@ impl GatewayState {
     }
 }
 
+/// The tenant concurrent-work lease taken before global admission, handed
+/// to the chat handler through the request extensions.
+#[derive(Clone)]
+pub(crate) struct PreAdmittedTenantWork(Arc<std::sync::Mutex<Option<UnboundTenantWorkLease>>>);
+
+impl PreAdmittedTenantWork {
+    pub(crate) fn take(&self) -> Result<UnboundTenantWorkLease, ApiError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| ApiError::service_unavailable("Gateway tenant admission is unavailable"))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct GatewayAdmissionGuard {
     _permit: Arc<OwnedSemaphorePermit>,
@@ -415,6 +488,7 @@ struct GatewayMetricCounters {
     quota_rejections: AtomicU64,
     tenant_concurrency_rejections: AtomicU64,
     body_limit_rejections: AtomicU64,
+    body_timeout_rejections: AtomicU64,
     routing_dispatch_failures: AtomicU64,
     dispatch_calls: AtomicU64,
     dispatch_latency_micros: AtomicU64,
@@ -714,6 +788,12 @@ impl GatewayMetrics {
             snapshot.body_limit_rejections
         );
         metric!(
+            "izwi_gateway_body_timeout_rejections_total",
+            "counter",
+            "Public requests whose body was not received within the body-read deadline.",
+            snapshot.body_timeout_rejections
+        );
+        metric!(
             "izwi_gateway_routing_dispatch_failures_total",
             "counter",
             "Worker routing, dispatch, or accepted-stream failures.",
@@ -772,6 +852,7 @@ impl GatewayMetrics {
                 .tenant_concurrency_rejections
                 .load(Ordering::Relaxed),
             body_limit_rejections: self.inner.body_limit_rejections.load(Ordering::Relaxed),
+            body_timeout_rejections: self.inner.body_timeout_rejections.load(Ordering::Relaxed),
             routing_dispatch_failures: self.inner.routing_dispatch_failures.load(Ordering::Relaxed),
             dispatch_calls: self.inner.dispatch_calls.load(Ordering::Relaxed),
             dispatch_latency_micros: self.inner.dispatch_latency_micros.load(Ordering::Relaxed),
@@ -792,6 +873,7 @@ struct GatewayMetricsSnapshot {
     quota_rejections: u64,
     tenant_concurrency_rejections: u64,
     body_limit_rejections: u64,
+    body_timeout_rejections: u64,
     routing_dispatch_failures: u64,
     dispatch_calls: u64,
     dispatch_latency_micros: u64,
@@ -1032,6 +1114,57 @@ async fn observe_gateway_v1_rejections(
     response
 }
 
+/// Per-tenant admission ahead of the global permit: a tenant over its
+/// request rate or concurrent-work limit is refused before it can take one
+/// of the gateway's global permits, so one tenant's slow or abundant
+/// requests cannot exhaust admission for every other tenant. The rate token
+/// itself is spent only after the body validates.
+async fn tenant_pre_admission(
+    State(state): State<GatewayState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let lifecycle = state.lifecycle.snapshot();
+    if !lifecycle.ready || lifecycle.draining {
+        return ApiError::service_unavailable("Gateway is not accepting new requests")
+            .into_response();
+    }
+    let Some(context) = request.extensions().get::<RequestContext>().cloned() else {
+        return ApiError::service_unavailable("Gateway tenant identity is unavailable")
+            .into_response();
+    };
+    let Some(tenant_key) = context.tenant_key() else {
+        return ApiError::service_unavailable("Gateway tenant identity is unavailable")
+            .into_response();
+    };
+    match state.rate_quota.peek(tenant_key) {
+        Ok(GatewayRateDecision::Allowed) => {}
+        Ok(GatewayRateDecision::Limited) => {
+            state
+                .metrics
+                .inner
+                .quota_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return ApiError::too_many_requests("Gateway tenant rate limit exceeded")
+                .into_response();
+        }
+        Err(_) => {
+            return ApiError::service_unavailable("Gateway tenant rate limiter unavailable")
+                .into_response()
+        }
+    }
+    let lease = match state.begin_tenant_work(&context) {
+        Ok(lease) => lease,
+        Err(error) => return error.into_response(),
+    };
+    request
+        .extensions_mut()
+        .insert(PreAdmittedTenantWork(Arc::new(std::sync::Mutex::new(
+            Some(lease),
+        ))));
+    next.run(request).await
+}
+
 async fn bounded_gateway_admission(
     State(state): State<GatewayState>,
     mut request: Request,
@@ -1111,30 +1244,44 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             },
         );
 
-    let mut inference_routes = Router::new().route(
-        "/chat/completions",
-        post(crate::api::openai::chat::completions::gateway_completions),
-    );
-    if state.realtime_relay.is_some() {
-        inference_routes = inference_routes
-            .route(
-                "/realtime/ws",
-                get(crate::app::realtime_relay::relay_socket),
-            )
-            // Alias of the single-node transcription socket path so a public
-            // realtime client can repoint at the gateway without changing its
-            // URL; dispatch still keys off the subprotocol offer.
-            .route(
-                "/speech-to-text/realtime/ws",
-                get(crate::app::realtime_relay::relay_socket),
-            );
-    }
-    let inference_routes = inference_routes
+    // Chat takes its tenant lease before global admission; realtime sessions
+    // take theirs per stage once upgraded.
+    let mut inference_routes = Router::new()
+        .route(
+            "/chat/completions",
+            post(crate::api::openai::chat::completions::gateway_completions),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             bounded_gateway_admission,
         ))
-        .layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            tenant_pre_admission,
+        ));
+    if state.realtime_relay.is_some() {
+        inference_routes = inference_routes.merge(
+            Router::new()
+                .route(
+                    "/realtime/ws",
+                    get(crate::app::realtime_relay::relay_socket),
+                )
+                // Alias of the single-node transcription socket path so a
+                // public realtime client can repoint at the gateway without
+                // changing its URL; dispatch still keys off the subprotocol
+                // offer.
+                .route(
+                    "/speech-to-text/realtime/ws",
+                    get(crate::app::realtime_relay::relay_socket),
+                )
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    bounded_gateway_admission,
+                )),
+        );
+    }
+    let inference_routes =
+        inference_routes.layer(DefaultBodyLimit::max(state.perimeter.max_chat_body_bytes()));
     // The model listing is authenticated like inference but takes no
     // inference capacity.
     let v1_routes = Router::new()
@@ -3074,7 +3221,7 @@ mod tests {
         assert!(body.contains("izwi_gateway_active_requests 0"));
         assert!(body.contains("izwi_gateway_active_tenant_work 0"));
         assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
-        assert_eq!(body.matches("# TYPE ").count(), 22);
+        assert_eq!(body.matches("# TYPE ").count(), 23);
         // Labels are the gateway's own fixed vocabulary, never caller text.
         let samples =
             izwi_core::runtime::prometheus::parse_exposition(&body).expect("valid exposition");
@@ -3888,6 +4035,14 @@ mod tests {
         perimeter: GatewayPerimeterConfig,
         hooks: EnterpriseHooks,
     ) -> GatewayState {
+        unreachable_gateway_state_sized(perimeter, hooks, 1)
+    }
+
+    fn unreachable_gateway_state_sized(
+        perimeter: GatewayPerimeterConfig,
+        hooks: EnterpriseHooks,
+        max_in_flight: usize,
+    ) -> GatewayState {
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
             .expect("registry should initialize");
         let dispatcher = RemoteChatDispatcher::new(
@@ -3905,8 +4060,70 @@ mod tests {
             },
         )
         .expect("dispatcher should initialize");
-        let state = GatewayState::new(dispatcher, hooks, perimeter, 2, 1);
+        let state = GatewayState::new(dispatcher, hooks, perimeter, 2, max_in_flight);
         state.lifecycle.mark_ready();
         state
+    }
+
+    /// A chat request whose headers arrive but whose body never does.
+    fn stalled_body_chat_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {TEST_API_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from_stream(futures::stream::pending::<
+                Result<bytes::Bytes, std::io::Error>,
+            >()))
+            .unwrap()
+    }
+
+    async fn wait_for_permits(state: &GatewayState, available: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.request_admission.available_permits() != available {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("global admission permits settle");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_at_its_limit_is_refused_before_taking_a_global_permit() {
+        let state = unreachable_gateway_state_sized(test_perimeter(), EnterpriseHooks::noop(), 2)
+            .with_tenant_concurrency_config(GatewayTenantConcurrencyConfig::new(1, 2).unwrap());
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let first = tokio::spawn(send_raw(app.clone(), stalled_body_chat_request()));
+        wait_for_permits(&state, 1).await;
+        // The same tenant's second slow upload is refused at once and never
+        // holds the gateway's last global permit.
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_raw(app.clone(), stalled_body_chat_request()),
+        )
+        .await
+        .expect("a tenant over its limit is refused without reading its body");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state.request_admission.available_permits(), 1);
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn a_body_that_does_not_arrive_in_time_is_refused_and_frees_admission() {
+        let state = unreachable_gateway_state_sized(test_perimeter(), EnterpriseHooks::noop(), 2)
+            .with_body_read_timeout(Duration::from_millis(100));
+        let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_raw(app, stalled_body_chat_request()),
+        )
+        .await
+        .expect("the body-read deadline ends the request");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        wait_for_permits(&state, 2).await;
+        assert_eq!(state.tenant_concurrency.active_owned_work(), 0);
+        assert_eq!(state.metrics.snapshot().body_timeout_rejections, 1);
     }
 }

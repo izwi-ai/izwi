@@ -111,12 +111,11 @@ where
             && value.len() <= MAX_ENV_VALUE_BYTES
             && value.bytes().all(|byte| byte.is_ascii_digit())
     });
-    raw.and_then(|value| value.parse().ok())
-        .ok_or(match name {
-            REQUESTS_PER_MINUTE_ENV => GatewayRateQuotaConfigError::RequestsPerMinute,
-            BURST_REQUESTS_ENV => GatewayRateQuotaConfigError::BurstRequests,
-            _ => GatewayRateQuotaConfigError::TrackedTenants,
-        })
+    raw.and_then(|value| value.parse().ok()).ok_or(match name {
+        REQUESTS_PER_MINUTE_ENV => GatewayRateQuotaConfigError::RequestsPerMinute,
+        BURST_REQUESTS_ENV => GatewayRateQuotaConfigError::BurstRequests,
+        _ => GatewayRateQuotaConfigError::TrackedTenants,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +169,30 @@ impl GatewayRateQuota {
         tenant_key: [u8; 32],
     ) -> Result<GatewayRateDecision, GatewayRateQuotaError> {
         self.check_at(tenant_key, self.inner.started_at.elapsed())
+    }
+
+    /// Whether `check` would allow the tenant now, without spending a token.
+    pub(crate) fn peek(
+        &self,
+        tenant_key: [u8; 32],
+    ) -> Result<GatewayRateDecision, GatewayRateQuotaError> {
+        let now = self.inner.started_at.elapsed();
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| GatewayRateQuotaError::StateUnavailable)?;
+        let Some(bucket) = state.tenants.get(&tenant_key) else {
+            return Ok(GatewayRateDecision::Allowed);
+        };
+        let capacity = u128::from(self.inner.config.burst_requests) * NANOS_PER_MINUTE;
+        let available =
+            replenished_units(bucket, now, self.inner.config.requests_per_minute).min(capacity);
+        Ok(if available < NANOS_PER_MINUTE {
+            GatewayRateDecision::Limited
+        } else {
+            GatewayRateDecision::Allowed
+        })
     }
 
     fn check_at(

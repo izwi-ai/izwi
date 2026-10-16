@@ -293,6 +293,15 @@ struct ServerArgs {
     )]
     gateway_worker_progress_idle_timeout_ms: u64,
 
+    /// Deadline for receiving a public request body. A slow upload holds a
+    /// global admission permit at most this long.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_BODY_READ_TIMEOUT_MS",
+        default_value_t = 10_000
+    )]
+    gateway_body_read_timeout_ms: u64,
+
     /// Maximum wait while relaying an event to a connected slow consumer.
     #[arg(
         long,
@@ -782,7 +791,8 @@ async fn run_gateway(
     let state = state
         .with_rate_quota_config(rate_quota)
         .with_tenant_concurrency_config(tenant_concurrency)
-        .with_principal_keys(principal_keys);
+        .with_principal_keys(principal_keys)
+        .with_body_read_timeout(Duration::from_millis(args.gateway_body_read_timeout_ms));
     state.lifecycle.mark_ready();
 
     info!(
@@ -1964,6 +1974,13 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
                 MAX_GATEWAY_STREAM_PHASE_TIMEOUT.as_millis()
             );
         }
+    }
+    let body_read_timeout = Duration::from_millis(args.gateway_body_read_timeout_ms);
+    if body_read_timeout.is_zero() || body_read_timeout > MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT {
+        anyhow::bail!(
+            "--gateway-body-read-timeout-ms must be between 1 and {}",
+            MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT.as_millis()
+        );
     }
     if Duration::from_millis(args.gateway_worker_first_output_timeout_per_kib_ms)
         > MAX_GATEWAY_STREAM_PHASE_TIMEOUT

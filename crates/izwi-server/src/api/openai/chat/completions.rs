@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{rejection::JsonRejection, Extension, State},
+    extract::{Extension, State},
     response::{sse::Event, IntoResponse, Response, Sse},
     Json,
 };
@@ -28,7 +28,7 @@ use crate::app::chat::{
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
 use crate::error::{ApiError, ApiJson, ErrorScope};
-use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState};
+use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmittedTenantWork};
 use crate::ids::new_prefixed_id;
 use crate::state::AppState;
 use izwi_core::{
@@ -502,22 +502,18 @@ pub async fn gateway_completions(
     State(state): State<GatewayState>,
     Extension(ctx): Extension<RequestContext>,
     Extension(admission): Extension<GatewayAdmissionGuard>,
-    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+    Extension(tenant_work): Extension<PreAdmittedTenantWork>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let Json(req) = payload.map_err(|rejection| {
-        if rejection.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::payload_too_large("Gateway chat request body exceeds the configured limit")
-        } else {
-            ApiError::bad_request("Gateway chat request body is not valid JSON")
-        }
-    })?;
+    let req = state.read_chat_body(&headers, body).await?;
     let dispatcher = state.chat_dispatcher_for(&req.model)?;
     validate_chat_request_compatibility(&req, compatibility_profile())?;
     let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
     state
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
-    let tenant_work = state.begin_tenant_work(&ctx)?;
+    let tenant_work = tenant_work.take()?;
     let backend = GatewayChat {
         state: &state,
         dispatcher,
