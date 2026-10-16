@@ -54,7 +54,7 @@ use crate::app::realtime_transport::{
 };
 use crate::chat_store::ChatStore;
 use crate::ids::new_uuid;
-use crate::state::{AppState, StoredAgentSessionRecord};
+use crate::state::{AppState, OwnedAdmissionPermit, StoredAgentSessionRecord};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_ID, DEFAULT_VOICE_AGENT_NAME, DEFAULT_VOICE_AGENT_SYSTEM_PROMPT,
 };
@@ -1863,12 +1863,6 @@ fn spawn_turn_task(
         let timeout = Duration::from_secs(timeout_secs);
 
         let turn_future = async {
-            let permit = state
-                .acquire_owned_workload_permit(WorkloadClass::Realtime)
-                .await
-                .map_err(|_| "Server is shutting down".to_string())?;
-            let runtime_context = permit.runtime_context();
-
             send_turn_json(
                 &out_tx,
                 output_generation,
@@ -1891,14 +1885,14 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    model_leases
-                        .hold(
-                            &state.runtime,
-                            resolve_asr_model_variant(Some(&config.asr_model_id)),
-                        )
-                        .await
-                        .map_err(|err| format!("Failed to load ASR model: {err}"))?;
-                    let transcript = {
+                    let transcript = with_stage_permit(&state, async |runtime_context| {
+                        model_leases
+                            .hold(
+                                &state.runtime,
+                                resolve_asr_model_variant(Some(&config.asr_model_id)),
+                            )
+                            .await
+                            .map_err(|err| format!("Failed to load ASR model: {err}"))?;
                         let tx = out_tx.clone();
                         let utt_id = commit.utterance_id.clone();
                         let utt_seq = commit.utterance_seq;
@@ -1942,8 +1936,9 @@ fn spawn_turn_task(
                                 },
                             )
                             .await
-                            .map_err(|err| format!("ASR failed: {err}"))?
-                    };
+                            .map_err(|err| format!("ASR failed: {err}"))
+                    })
+                    .await?;
                     let transcript_final_at = Instant::now();
                     state.runtime.record_voice_latency(
                         VoiceLatency::AsrFinal,
@@ -2008,20 +2003,23 @@ fn spawn_turn_task(
                     };
                     let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
                         .map_err(|err| format!("Invalid chat model: {err}"))?;
-                    model_leases
-                        .hold(&state.runtime, text_variant)
+                    let assistant_raw = with_stage_permit(&state, async |runtime_context| {
+                        model_leases
+                            .hold(&state.runtime, text_variant)
+                            .await
+                            .map_err(|err| format!("Failed to load chat model: {err}"))?;
+                        run_agent_turn(
+                            &state,
+                            agent_session_id,
+                            &user_text,
+                            &config.text_model_id,
+                            config.max_output_tokens,
+                            voice_profile_id.as_deref(),
+                            &correlation_id,
+                            runtime_context,
+                        )
                         .await
-                        .map_err(|err| format!("Failed to load chat model: {err}"))?;
-                    let assistant_raw = run_agent_turn(
-                        &state,
-                        agent_session_id,
-                        &user_text,
-                        &config.text_model_id,
-                        config.max_output_tokens,
-                        voice_profile_id.as_deref(),
-                        &correlation_id,
-                        runtime_context,
-                    )
+                    })
                     .await?;
                     // The reply is generated whole, so its first speakable
                     // text arrives with the last.
@@ -2080,7 +2078,6 @@ fn spawn_turn_task(
                         &config.tts_model_id,
                         config.speaker.clone(),
                         assistant_text.as_str(),
-                        runtime_context,
                         &control,
                         output_generation,
                         &model_leases,
@@ -2137,23 +2134,26 @@ fn spawn_turn_task(
 
                     let history_messages =
                         build_unified_history(&state, &voice_session_id, &turn_record_id).await?;
-                    let generation = stream_unified_s2s_to_socket(
-                        &state,
-                        &out_tx,
-                        &correlation_id,
-                        &commit.utterance_id,
-                        commit.utterance_seq,
-                        &config.s2s_model_id,
-                        config.speaker.clone(),
-                        &system_prompt,
-                        history_messages,
-                        config.max_output_tokens,
-                        audio_bytes.as_slice(),
-                        runtime_context,
-                        &control,
-                        output_generation,
-                        &model_leases,
-                    )
+                    let generation = with_stage_permit(&state, async |runtime_context| {
+                        stream_unified_s2s_to_socket(
+                            &state,
+                            &out_tx,
+                            &correlation_id,
+                            &commit.utterance_id,
+                            commit.utterance_seq,
+                            &config.s2s_model_id,
+                            config.speaker.clone(),
+                            &system_prompt,
+                            history_messages,
+                            config.max_output_tokens,
+                            audio_bytes.as_slice(),
+                            runtime_context,
+                            &control,
+                            output_generation,
+                            &model_leases,
+                        )
+                        .await
+                    })
                     .await?;
 
                     let user_text = generation
@@ -2346,6 +2346,27 @@ fn spawn_turn_task(
     })
 }
 
+/// A realtime admission permit for one stage of a turn. A turn takes one per
+/// stage (ASR, the reply, each TTS segment) instead of one for its whole
+/// life, so the time it spends waiting between stages, or on the client,
+/// does not hold a slot other traffic could use (SPK-F22).
+async fn acquire_stage_permit(state: &AppState) -> Result<OwnedAdmissionPermit, String> {
+    state
+        .acquire_owned_workload_permit(WorkloadClass::Realtime)
+        .await
+        .map_err(|_| "Server is shutting down".to_string())
+}
+
+/// Run one turn stage under its own admission permit, released when the
+/// stage ends.
+async fn with_stage_permit<T>(
+    state: &AppState,
+    stage: impl AsyncFnOnce(RuntimeRequestContext) -> Result<T, String>,
+) -> Result<T, String> {
+    let permit = acquire_stage_permit(state).await?;
+    stage(permit.runtime_context()).await
+}
+
 async fn stream_tts_to_socket(
     state: &AppState,
     out_tx: &OutboundTx,
@@ -2355,7 +2376,6 @@ async fn stream_tts_to_socket(
     tts_model_id: &str,
     speaker: Option<String>,
     text: &str,
-    runtime_context: RuntimeRequestContext,
     control: &TurnControl,
     output_generation: u64,
     model_leases: &SessionModelLeases,
@@ -2409,11 +2429,13 @@ async fn stream_tts_to_socket(
             },
         };
 
+        // Each segment holds its own admission permit while it synthesizes.
+        let permit = acquire_stage_permit(state).await?;
         let gen_request = GenerationRequest {
             id: uuid::Uuid::new_v4().to_string(),
             model_variant: Some(tts_variant),
             correlation_id: Some(correlation_id.to_string()),
-            runtime_context,
+            runtime_context: permit.runtime_context(),
             text: segment,
             config: gen_config,
             language: None,
@@ -2490,6 +2512,7 @@ async fn stream_tts_to_socket(
             Ok(Err(err)) => return Err(format!("TTS failed: {err}")),
             Err(err) => return Err(format!("TTS streaming task failed: {err}")),
         }
+        drop(permit);
     }
 
     if announced_rate.is_none() {
@@ -3490,6 +3513,79 @@ impl ModelBackend for IzwiRuntimeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app state on a temporary database with `realtime` realtime
+    /// admission permits.
+    fn test_app_state(realtime: usize) -> (tempfile::TempDir, AppState) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let models_dir = temp_dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let _env = crate::test_support::env_lock();
+        std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("izwi.sqlite3"));
+        std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+        std::env::set_var("IZWI_MAX_REALTIME_REQUESTS", realtime.to_string());
+        let serve_config = izwi_core::ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            models_dir,
+            ..izwi_core::ServeRuntimeConfig::default()
+        };
+        let runtime = RuntimeService::new(serve_config.engine_config()).expect("runtime");
+        let state = AppState::new(runtime, &serve_config).expect("state");
+        for key in [
+            "IZWI_DB_PATH",
+            "IZWI_MEDIA_DIR",
+            "IZWI_MAX_REALTIME_REQUESTS",
+        ] {
+            std::env::remove_var(key);
+        }
+        (temp_dir, state)
+    }
+
+    fn realtime_permits_available(state: &AppState) -> usize {
+        state.request_admission_snapshot().realtime.available
+    }
+
+    /// SPK-F22: a turn stage holds a realtime permit only while it runs, so
+    /// a turn idle between stages holds none, and a stage waiting for one
+    /// starts as soon as another stage ends.
+    #[tokio::test]
+    async fn turn_stages_hold_a_permit_only_while_they_run() {
+        let (_dir, state) = test_app_state(1);
+        assert_eq!(realtime_permits_available(&state), 1);
+        let inside = with_stage_permit(&state, async |_| Ok(realtime_permits_available(&state)))
+            .await
+            .expect("stage");
+        assert_eq!(inside, 0, "the stage holds the permit");
+        assert_eq!(
+            realtime_permits_available(&state),
+            1,
+            "the turn holds no permit between stages"
+        );
+
+        // With one permit, a second stage waits for the first to end.
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first = with_stage_permit(&state, async |_| {
+            released.await.ok();
+            Ok(())
+        });
+        let second = async {
+            tokio::task::yield_now().await;
+            with_stage_permit(&state, async |_| Ok(())).await
+        };
+        let second_waits = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release.send(()).ok();
+        };
+        let (first, second, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second, second_waits)
+        })
+        .await
+        .expect("the second stage runs once the first ends");
+        first.expect("first stage");
+        second.expect("second stage");
+        assert_eq!(realtime_permits_available(&state), 1);
+    }
 
     fn test_streaming_input() -> StreamingInputState {
         StreamingInputState::new(StreamingInputConfig {
