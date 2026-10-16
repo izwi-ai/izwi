@@ -1851,7 +1851,7 @@ mod tests {
             [(&registry_a, &coordinator_a), (&registry_b, &coordinator_b)]
         {
             registry.observe_status(status.clone()).unwrap();
-            coordinator.publish_and_refresh(&status).await;
+            coordinator.refresh_peer_claims(&status).await;
         }
 
         for (name, dispatcher) in [

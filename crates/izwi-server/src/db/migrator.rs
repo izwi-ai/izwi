@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Migrator;
 
 /// A database's schema: the application's, or the fleet coordination
-/// store's two tables. Each has its own numbered migrations.
+/// store's claims table. Each has its own numbered migrations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Schema {
     App,
@@ -33,7 +33,10 @@ impl Schema {
             // created. Its statements are idempotent, so a database those
             // releases left behind upgrades by running it once.
             Self::App => &[(1, "baseline"), (2, "stage claim columns")],
-            Self::Fleet => &[(1, "fleet coordination")],
+            Self::Fleet => &[
+                (1, "fleet coordination"),
+                (2, "drop the write-only worker observations"),
+            ],
         }
     }
 }
@@ -153,6 +156,11 @@ async fn apply_migration<C: ConnectionTrait>(
                 db.execute_unprepared(&dialect_ddl(backend, statement))
                     .await?;
             }
+        }
+        // Gateways wrote every polled status here and nothing ever read it.
+        (Schema::Fleet, 2) => {
+            db.execute_unprepared("DROP TABLE IF EXISTS fleet_worker_observations")
+                .await?;
         }
         _ => anyhow::bail!("Unknown {} migration {version}", schema.component()),
     }
@@ -850,9 +858,10 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created ON idempotency_keys(created_at ASC);",
 ];
 
-/// The fleet coordination store: worker observations and capacity claims
-/// shared by the gateways of one fleet. Releases before versioned migrations
-/// created these tables in every application database too.
+/// The fleet coordination store as migration 1 created it: worker
+/// observations (dropped by migration 2) and capacity claims shared by the
+/// gateways of one fleet. Releases before versioned migrations created
+/// these tables in every application database too.
 const FLEET_SCHEMA: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS fleet_worker_observations (
@@ -1486,11 +1495,14 @@ mod tests {
         let fleet = fleet_database.database().for_fleet();
         let db = fleet.connection().await.expect("fleet schema migrates");
         assert!(has_table(db, "fleet_capacity_claims").await);
-        assert!(has_table(db, "fleet_worker_observations").await);
+        assert!(
+            !has_table(db, "fleet_worker_observations").await,
+            "migration 2 drops the write-only observation table"
+        );
         assert!(!has_table(db, "runtime_jobs").await);
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'fleet'").await,
-            1
+            2
         );
     }
 

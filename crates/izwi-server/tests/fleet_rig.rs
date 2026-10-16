@@ -9,9 +9,7 @@
 //! - T20 — partitioned tenant quotas keep the combined fleet admission
 //!   within the configured budget (limits are not multiplied by gateway
 //!   count).
-//! - P8.1 — shared approvals are adopted by both gateways and both
-//!   gateways' status pollers merge observations monotonically into the
-//!   shared registry.
+//! - P8.1 — shared approvals are adopted by both gateways.
 //! - Claim steering — a held cluster claim steers peer dispatch away from
 //!   the claimed worker and back once it is released.
 //! - Crash + TTL recovery — a claim held by a gateway identity that dies
@@ -482,7 +480,7 @@ async fn fleet_partition_keeps_combined_quota_within_the_configured_budget() {
 }
 
 #[tokio::test]
-async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
+async fn fleet_gateways_share_the_approvals_file() {
     let root = tempfile::tempdir().expect("temp dir");
     let fleet_db = root.path().join("p81-fleet.sqlite3");
     let worker_one = TestWorker::spawn(worker_config(WORKER_ONE_ID, WORKER_ONE_MARKER))
@@ -535,53 +533,6 @@ async fn fleet_gateways_share_the_approvals_file_and_observation_registry() {
         assert!(
             marker.contains(WORKER_ONE_MARKER) || marker.contains(WORKER_TWO_MARKER),
             "response must come from an approved fleet worker, got {marker:?}"
-        );
-    }
-
-    // Both gateways' pollers publish observations for the same workers into
-    // the shared registry; the merged view holds one fresh row per worker
-    // and every worker's sequence advances monotonically under concurrent
-    // publishers. Publishing is poller-cadence asynchronous, so wait for
-    // both workers to appear before comparing samples.
-    let claims = FleetStore::from_path(fleet_db.clone());
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let first = loop {
-        let view = claims
-            .read_fresh_fleet_workers(60_000)
-            .await
-            .expect("fresh view");
-        let complete = [WORKER_ONE_ID, WORKER_TWO_ID]
-            .iter()
-            .all(|worker_id| view.iter().any(|candidate| candidate.worker_id == *worker_id));
-        if complete || Instant::now() >= deadline {
-            break view;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    for worker_id in [WORKER_ONE_ID, WORKER_TWO_ID] {
-        assert!(
-            first.iter().any(|view| view.worker_id == worker_id),
-            "{worker_id} must be observed by a fleet publisher; saw {} worker(s)",
-            first.len()
-        );
-    }
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let second = claims
-        .read_fresh_fleet_workers(60_000)
-        .await
-        .expect("fresh view");
-    for worker_id in [WORKER_ONE_ID, WORKER_TWO_ID] {
-        let before = first
-            .iter()
-            .find(|view| view.worker_id == worker_id)
-            .unwrap_or_else(|| panic!("{worker_id} observed in the first sample"));
-        let after = second
-            .iter()
-            .find(|view| view.worker_id == worker_id)
-            .unwrap_or_else(|| panic!("{worker_id} observed in the second sample"));
-        assert!(
-            after.status_sequence >= before.status_sequence,
-            "observations must merge monotonically across gateway publishers"
         );
     }
 }

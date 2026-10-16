@@ -18,7 +18,7 @@ mod fleet;
 
 #[cfg(test)]
 pub(crate) use fleet::FleetFaults;
-pub use fleet::{FleetStore, FleetWorkerObservation};
+pub use fleet::FleetStore;
 
 const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";
 const FLEET_SIZE_ENV: &str = "IZWI_GATEWAY_FLEET_SIZE";

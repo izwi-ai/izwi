@@ -10,7 +10,7 @@
 //! tables in the target schema and re-runs the migrations, so the database
 //! must not hold state anyone cares about.
 
-use crate::gateway_fleet::{FleetStore, FleetWorkerObservation};
+use crate::gateway_fleet::FleetStore;
 use crate::db::migrator::{Migrator, Schema};
 use crate::db::raw;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
@@ -63,19 +63,6 @@ async fn drop_all_tables(db: &DatabaseConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn observation(sequence: u64, incarnation: &str) -> FleetWorkerObservation {
-    FleetWorkerObservation {
-        worker_id: "worker-a".to_string(),
-        node_id: "node-1".to_string(),
-        incarnation_id: incarnation.to_string(),
-        status_sequence: sequence,
-        process_state: "running".to_string(),
-        available_admission_credits: 2,
-        active_invocations: 0,
-        deployments_json: "{}".to_string(),
-    }
-}
-
 async fn column_type(db: &DatabaseConnection, table: &str, column: &str) -> String {
     let row = db
         .query_one_raw(
@@ -109,7 +96,6 @@ async fn postgres_migrations_create_the_full_schema() {
         "runtime_worker_heartbeats",
         "durable_idempotency_keys_v2",
         "gateway_principal_keys",
-        "fleet_worker_observations",
         "fleet_capacity_claims",
     ] {
         let exists = db
@@ -157,45 +143,6 @@ async fn postgres_migrations_create_the_full_schema() {
         .await
         .expect("profile query runs");
     assert!(profile.is_some(), "default voice profile is seeded");
-}
-
-#[tokio::test]
-async fn postgres_fleet_observations_are_monotonic_per_incarnation() {
-    let Some((store, _guard)) = fresh_store().await else {
-        return;
-    };
-    assert!(store
-        .observe_fleet_worker(&observation(1, "inc-1"))
-        .await
-        .unwrap());
-    assert!(store
-        .observe_fleet_worker(&observation(2, "inc-1"))
-        .await
-        .unwrap());
-    assert!(
-        !store
-            .observe_fleet_worker(&observation(1, "inc-1"))
-            .await
-            .unwrap(),
-        "stale sequence must not overwrite a newer view"
-    );
-    assert!(
-        store
-            .observe_fleet_worker(&observation(2, "inc-1"))
-            .await
-            .unwrap(),
-        "same-sequence re-publication refreshes the view"
-    );
-
-    // A replacement incarnation restarts its sequence counter and wins.
-    assert!(store
-        .observe_fleet_worker(&observation(1, "inc-2"))
-        .await
-        .unwrap());
-    let views = store.read_fresh_fleet_workers(60_000).await.unwrap();
-    assert_eq!(views.len(), 1);
-    assert_eq!(views[0].incarnation_id, "inc-2");
-    assert_eq!(views[0].status_sequence, 1);
 }
 
 #[tokio::test]

@@ -37,15 +37,8 @@ use crate::{
     worker_registry::{FleetCapacityView, WorkerInstanceKey},
 };
 
-/// How long stale observation rows are retained before the maintenance sweep
-/// prunes them. Observations are one row per worker (upserted, not appended),
-/// so retention only bounds rows from workers that stopped reporting; 24h is
-/// far beyond any plausible freshness window a reader would use while still
-/// keeping the table tight on a long-lived fleet.
-pub(crate) const FLEET_OBSERVATION_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
-
 /// Bounded batch size for one maintenance-sweep pass, matching the store's
-/// bounded reap/prune helpers.
+/// bounded reap helper.
 pub(crate) const FLEET_MAINTENANCE_BATCH: usize = 1024;
 
 /// Cadence of the background maintenance sweep. Slow by design: the reader
@@ -247,10 +240,10 @@ impl FleetCoordinator {
             .ok()
     }
 
-    /// Start the background publisher for one worker's polled statuses. The
-    /// status poller records each observation locally first and then hands
-    /// it over here, so a slow or hung coordination store can never delay
-    /// the observation that keeps the worker fresh.
+    /// Start the background refresher of one worker's peer-claim count. The
+    /// status poller records each status locally first and then hands it
+    /// over here, so a slow or hung coordination store can never delay the
+    /// observation that keeps the worker fresh.
     pub fn spawn_status_publisher(self: &Arc<Self>) -> FleetStatusPublisher {
         let (latest, mut pending) = tokio::sync::watch::channel(None::<WorkerStatus>);
         let coordinator = Arc::clone(self);
@@ -261,7 +254,7 @@ impl FleetCoordinator {
                 };
                 if tokio::time::timeout(
                     FLEET_PUBLISH_TIMEOUT,
-                    coordinator.publish_and_refresh(&status),
+                    coordinator.refresh_peer_claims(&status),
                 )
                 .await
                 .is_err()
@@ -290,23 +283,10 @@ impl FleetCoordinator {
             .unwrap_or(false)
     }
 
-    /// Publish one polled worker status to the shared store and refresh the
-    /// local snapshot entry for that worker. A failed count clears the
-    /// worker's peer claims: the worker's direct observations remain
-    /// authoritative, and claims only ever steer.
-    pub async fn publish_and_refresh(&self, status: &WorkerStatus) {
-        let deployments = serde_json::to_string(&status.deployments).unwrap_or_default();
-        let observation = crate::gateway_fleet::FleetWorkerObservation {
-            worker_id: status.worker_id.as_str().to_string(),
-            node_id: status.node_id.as_str().to_string(),
-            incarnation_id: status.incarnation_id.as_str().to_string(),
-            status_sequence: status.status_sequence,
-            process_state: format!("{:?}", status.process_state),
-            available_admission_credits: status.capacity.available_admission_credits,
-            active_invocations: status.capacity.active_invocations,
-            deployments_json: deployments,
-        };
-        let _ = self.store.observe_fleet_worker(&observation).await;
+    /// Refresh the local snapshot of peer gateways' claims on one polled
+    /// worker. A failed count clears the worker's peer claims: the worker's
+    /// direct observations remain authoritative, and claims only ever steer.
+    pub async fn refresh_peer_claims(&self, status: &WorkerStatus) {
         match self
             .store
             .count_live_peer_fleet_claims(status.worker_id.as_str(), &self.gateway_id)
@@ -322,26 +302,15 @@ impl FleetCoordinator {
     }
 
     /// One bounded maintenance pass: physically remove expired claims (the
-    /// reader-side TTL already stopped counting them) and prune observation
-    /// rows for workers that stopped reporting. DS5.3 wires this onto a
-    /// slow production cadence so a validated fleet profile does not leak
-    /// rows; failures are swallowed by the caller, consistent with the
-    /// store-outage degradation contract.
-    pub async fn maintenance_sweep(&self) -> (u64, u64) {
-        let reaped = self
-            .store
+    /// reader-side TTL already stopped counting them). DS5.3 wires this onto
+    /// a slow production cadence so a validated fleet profile does not leak
+    /// rows; failures are swallowed, consistent with the store-outage
+    /// degradation contract. Returns the claims removed.
+    pub async fn maintenance_sweep(&self) -> u64 {
+        self.store
             .reap_expired_fleet_claims(FLEET_MAINTENANCE_BATCH)
             .await
-            .unwrap_or(0);
-        let pruned = self
-            .store
-            .prune_stale_fleet_observations(
-                u64::try_from(FLEET_OBSERVATION_RETENTION_MS).unwrap_or(u64::MAX),
-                FLEET_MAINTENANCE_BATCH,
-            )
-            .await
-            .unwrap_or(0);
-        (reaped, pruned)
+            .unwrap_or(0)
     }
 }
 
@@ -506,7 +475,7 @@ mod tests {
                 outstanding_cost_units: 0,
             },
         };
-        own.publish_and_refresh(&status).await;
+        own.refresh_peer_claims(&status).await;
         assert_eq!(own.snapshot_view().cluster_claims(&key), 1);
     }
 
@@ -608,33 +577,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_sweep_reaps_expired_claims_and_prunes_stale_observations() {
+    async fn maintenance_sweep_reaps_expired_claims() {
         let (coordinator, clock, _root) = coordinator_with(Duration::from_millis(500)).await;
         let key = worker_key();
         let _guard = coordinator.claim(&key, 2).await.expect("claim");
-        let observation = crate::gateway_fleet::FleetWorkerObservation {
-            worker_id: "worker-a".to_string(),
-            node_id: "node-1".to_string(),
-            incarnation_id: "inc-a".to_string(),
-            status_sequence: 1,
-            process_state: "running".to_string(),
-            available_admission_credits: 2,
-            active_invocations: 0,
-            deployments_json: "{}".to_string(),
-        };
-        assert!(coordinator
-            .store()
-            .observe_fleet_worker(&observation)
-            .await
-            .unwrap());
-        // Advance past both the claim TTL and the observation retention.
-        clock.store(
-            1_000 + FLEET_OBSERVATION_RETENTION_MS + 1,
-            std::sync::atomic::Ordering::SeqCst,
+        // Advance past the claim TTL.
+        clock.store(2_000, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            coordinator.maintenance_sweep().await,
+            1,
+            "the sweep physically removes the expired claim"
         );
-        let (reaped, pruned) = coordinator.maintenance_sweep().await;
-        assert_eq!(reaped, 1, "the sweep physically removes the expired claim");
-        assert_eq!(pruned, 1, "the sweep prunes the stale observation row");
         assert_eq!(
             coordinator
                 .store()

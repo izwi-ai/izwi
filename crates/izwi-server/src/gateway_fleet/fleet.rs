@@ -2,17 +2,14 @@
 //!
 //! Single-gateway deployments never touch this module. When operators run
 //! several gateways against one worker fleet, each gateway publishes its
-//! worker observations and capacity claims here so peers get a shared view
-//! of cluster state with bounded staleness.
+//! in-transit capacity claims here so peers steer away from workers that
+//! are already spoken for. Each gateway polls every worker's status itself;
+//! nothing about worker state is shared through the store.
 //!
 //! Design rules, matching the rest of the runtime store:
 //!
 //! - Every mutation is one SQL statement or one short transaction, so it is
 //!   atomic across gateway processes sharing the database file.
-//! - Observation acceptance is monotonic: a higher status sequence wins for
-//!   one incarnation, and any incarnation change wins outright. Replacement
-//!   incarnations restart their sequence counters, so sequence alone cannot
-//!   fence them. Stale resurrections are bounded by the reader-side TTL.
 //! - Capacity claims are advisory load signals, never authority. The worker
 //!   remains the atomic admission arbiter; a claim that loses the worker
 //!   race is simply released. Claims expire by TTL, so a crashed gateway
@@ -29,7 +26,6 @@ use std::sync::{
 };
 
 const MAX_FLEET_ID_BYTES: usize = 256;
-const MAX_FLEET_DEPLOYMENTS_JSON_BYTES: usize = 64 * 1024;
 const MAX_FLEET_BATCH: usize = 512;
 
 fn bounded_maintenance_batch(limit: usize) -> usize {
@@ -44,34 +40,8 @@ fn validate_fleet_id(name: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One worker-status publication from a gateway's poll loop.
-pub struct FleetWorkerObservation {
-    pub worker_id: String,
-    pub node_id: String,
-    pub incarnation_id: String,
-    pub status_sequence: u64,
-    pub process_state: String,
-    pub available_admission_credits: u32,
-    pub active_invocations: u32,
-    pub deployments_json: String,
-}
-
-/// A fresh cluster-wide view of one worker.
-pub struct FleetWorkerView {
-    pub worker_id: String,
-    pub node_id: String,
-    pub incarnation_id: String,
-    pub status_sequence: u64,
-    pub process_state: String,
-    pub available_admission_credits: u32,
-    pub active_invocations: u32,
-    pub deployments_json: String,
-    pub observed_at: i64,
-    pub observer_gateway_id: String,
-}
-
 /// The shared coordination database the gateways of one fleet publish
-/// worker observations and capacity claims to. It holds no job state.
+/// capacity claims to. It holds no job state.
 #[derive(Debug, Clone)]
 pub struct FleetStore {
     db: StoreDatabase,
@@ -164,147 +134,6 @@ impl FleetStore {
             return clock.load(Ordering::SeqCst);
         }
         self.db.now_millis()
-    }
-
-    /// Publish one worker observation. Returns true when the row was created
-    /// or advanced; false when the stored view is already newer and the
-    /// publication was ignored.
-    pub async fn observe_fleet_worker(
-        &self,
-        input: &FleetWorkerObservation,
-    ) -> anyhow::Result<bool> {
-        #[cfg(test)]
-        self.fleet_call_fault().await;
-        validate_fleet_id("worker ID", &input.worker_id)?;
-        validate_fleet_id("node ID", &input.node_id)?;
-        validate_fleet_id("incarnation ID", &input.incarnation_id)?;
-        anyhow::ensure!(
-            input.deployments_json.len() <= MAX_FLEET_DEPLOYMENTS_JSON_BYTES,
-            "fleet deployments document exceeds bounds"
-        );
-        let now = self.fleet_now();
-        let db = self.connection().await?;
-        let updated = db
-            .execute_raw(raw::statement(
-                db,
-                r#"
-                UPDATE fleet_worker_observations
-                SET node_id = ?1, incarnation_id = ?2, status_sequence = ?3,
-                    process_state = ?4, available_admission_credits = ?5,
-                    active_invocations = ?6, deployments_json = ?7,
-                    observed_at = ?8, observer_gateway_id = ?9
-                WHERE worker_id = ?10
-                  AND (
-                    incarnation_id != ?2
-                    OR status_sequence < ?3
-                    OR (status_sequence = ?3 AND observed_at <= ?8)
-                  )
-                "#,
-                vec![
-                    input.node_id.clone().into(),
-                    input.incarnation_id.clone().into(),
-                    i64::try_from(input.status_sequence)?.into(),
-                    input.process_state.clone().into(),
-                    i64::from(input.available_admission_credits).into(),
-                    i64::from(input.active_invocations).into(),
-                    input.deployments_json.clone().into(),
-                    now.into(),
-                    fleet_observer_gateway_id().into(),
-                    input.worker_id.clone().into(),
-                ],
-            )?)
-            .await
-            .context("Failed to publish fleet worker observation")?;
-        if updated.rows_affected() == 1 {
-            return Ok(true);
-        }
-        let inserted = db
-            .execute_raw(raw::statement(
-                db,
-                fleet_insert_observation_sql(db.get_database_backend())?,
-                vec![
-                    input.worker_id.clone().into(),
-                    input.node_id.clone().into(),
-                    input.incarnation_id.clone().into(),
-                    i64::try_from(input.status_sequence)?.into(),
-                    input.process_state.clone().into(),
-                    i64::from(input.available_admission_credits).into(),
-                    i64::from(input.active_invocations).into(),
-                    input.deployments_json.clone().into(),
-                    now.into(),
-                    fleet_observer_gateway_id().into(),
-                ],
-            )?)
-            .await
-            .context("Failed to insert fleet worker observation")?;
-        Ok(inserted.rows_affected() == 1)
-    }
-
-    /// Read the cluster-wide fresh view: rows observed within `ttl_ms`.
-    pub async fn read_fresh_fleet_workers(
-        &self,
-        ttl_ms: u64,
-    ) -> anyhow::Result<Vec<FleetWorkerView>> {
-        let now = self.fleet_now();
-        let db = self.connection().await?;
-        let rows = db
-            .query_all_raw(raw::statement(
-                db,
-                r#"
-                SELECT worker_id, node_id, incarnation_id, status_sequence,
-                       process_state, available_admission_credits,
-                       active_invocations, deployments_json, observed_at,
-                       observer_gateway_id
-                FROM fleet_worker_observations
-                WHERE observed_at > ?1
-                ORDER BY worker_id ASC
-                LIMIT ?2
-                "#,
-                vec![
-                    now.saturating_sub(i64::try_from(ttl_ms)?).into(),
-                    i64::try_from(MAX_FLEET_BATCH)?.into(),
-                ],
-            )?)
-            .await
-            .context("Failed to read fleet worker observations")?;
-        let mut views = Vec::with_capacity(rows.len());
-        for row in rows {
-            views.push(FleetWorkerView {
-                worker_id: row.try_get_by_index(0)?,
-                node_id: row.try_get_by_index(1)?,
-                incarnation_id: row.try_get_by_index(2)?,
-                status_sequence: u64::try_from(row.try_get_by_index::<i64>(3)?)?,
-                process_state: row.try_get_by_index(4)?,
-                available_admission_credits: u32::try_from(row.try_get_by_index::<i64>(5)?)?,
-                active_invocations: u32::try_from(row.try_get_by_index::<i64>(6)?)?,
-                deployments_json: row.try_get_by_index(7)?,
-                observed_at: row.try_get_by_index(8)?,
-                observer_gateway_id: row.try_get_by_index(9)?,
-            });
-        }
-        Ok(views)
-    }
-
-    /// Delete observations older than `max_age_ms`, bounded to `limit` rows.
-    pub async fn prune_stale_fleet_observations(
-        &self,
-        max_age_ms: u64,
-        limit: usize,
-    ) -> anyhow::Result<u64> {
-        let now = self.fleet_now();
-        let db = self.connection().await?;
-        let deleted = db
-            .execute_raw(raw::statement(
-                db,
-                fleet_prune_observations_sql(db.get_database_backend())?,
-                vec![
-                    now.saturating_sub(i64::try_from(max_age_ms)?).into(),
-                    i64::try_from(bounded_maintenance_batch(limit))?.into(),
-                ],
-            )?)
-            .await
-            .context("Failed to prune fleet worker observations")?;
-        Ok(deleted.rows_affected())
     }
 
     /// Atomically claim one unit of cluster capacity for a worker when fewer
@@ -497,45 +326,9 @@ impl FleetStore {
     }
 }
 
-fn fleet_observer_gateway_id() -> String {
-    std::env::var("IZWI_GATEWAY_ID").unwrap_or_else(|_| "gateway".to_string())
-}
-
-/// Backend-conditional SQL for fleet coordination.
-///
-/// SQLite (a shared file with WAL) and PostgreSQL share these forms; the
-/// PostgreSQL lane (`fleet_postgres_execution`) executes them for real.
-fn fleet_insert_observation_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
-    match backend {
-        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
-            INSERT INTO fleet_worker_observations (
-                worker_id, node_id, incarnation_id, status_sequence,
-                process_state, available_admission_credits,
-                active_invocations, deployments_json, observed_at,
-                observer_gateway_id
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(worker_id) DO NOTHING
-        "#),
-        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
-    }
-}
-
-fn fleet_prune_observations_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
-    match backend {
-        DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
-            DELETE FROM fleet_worker_observations
-            WHERE worker_id IN (
-                SELECT worker_id FROM fleet_worker_observations
-                WHERE observed_at <= ?1
-                ORDER BY observed_at ASC
-                LIMIT ?2
-            )
-        "#),
-        backend => anyhow::bail!("Unsupported fleet coordination database backend: {backend:?}"),
-    }
-}
-
+/// Backend-conditional SQL for fleet coordination. SQLite (a shared file
+/// with WAL) and PostgreSQL share these forms; the PostgreSQL lane
+/// (`fleet_postgres_execution`) executes them for real.
 fn fleet_claim_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
     match backend {
         DbBackend::Sqlite | DbBackend::Postgres => Ok(r#"
@@ -577,101 +370,6 @@ mod tests {
         let mut store = FleetStore::from_path(root.path().join("fleet.sqlite3"));
         store.set_test_clock(Arc::new(AtomicI64::new(clock_ms)));
         (store, root)
-    }
-
-    fn observation(sequence: u64, incarnation: &str) -> FleetWorkerObservation {
-        FleetWorkerObservation {
-            worker_id: "worker-a".to_string(),
-            node_id: "node-1".to_string(),
-            incarnation_id: incarnation.to_string(),
-            status_sequence: sequence,
-            process_state: "running".to_string(),
-            available_admission_credits: 2,
-            active_invocations: 0,
-            deployments_json: "{}".to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn fleet_observation_is_monotonic_within_one_incarnation() {
-        let (store, _root) = test_store_at(1_000);
-        assert!(store
-            .observe_fleet_worker(&observation(1, "inc-1"))
-            .await
-            .unwrap());
-        assert!(store
-            .observe_fleet_worker(&observation(2, "inc-1"))
-            .await
-            .unwrap());
-        assert!(
-            !store
-                .observe_fleet_worker(&observation(1, "inc-1"))
-                .await
-                .unwrap(),
-            "stale sequence must not overwrite a newer view"
-        );
-        assert!(
-            store.observe_fleet_worker(&observation(2, "inc-1")).await.unwrap(),
-            "same-sequence re-publication refreshes the observation timestamp without regressing the view"
-        );
-        let views = store.read_fresh_fleet_workers(60_000).await.unwrap();
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].status_sequence, 2);
-        assert_eq!(views[0].incarnation_id, "inc-1");
-    }
-
-    #[tokio::test]
-    async fn fleet_observation_incarnation_change_always_wins() {
-        let (store, _root) = test_store_at(1_000);
-        assert!(store
-            .observe_fleet_worker(&observation(90, "inc-1"))
-            .await
-            .unwrap());
-        assert!(
-            store
-                .observe_fleet_worker(&observation(1, "inc-2"))
-                .await
-                .unwrap(),
-            "replacement incarnations restart their sequence counters"
-        );
-        let views = store.read_fresh_fleet_workers(60_000).await.unwrap();
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].incarnation_id, "inc-2");
-        assert_eq!(views[0].status_sequence, 1);
-    }
-
-    #[tokio::test]
-    async fn fleet_fresh_read_applies_reader_side_ttl() {
-        let (mut store, _root) = test_store_at(1_000);
-        assert!(store
-            .observe_fleet_worker(&observation(1, "inc-1"))
-            .await
-            .unwrap());
-        assert_eq!(
-            store.read_fresh_fleet_workers(60_000).await.unwrap().len(),
-            1
-        );
-        store.set_test_clock(Arc::new(AtomicI64::new(61_001)));
-        assert_eq!(
-            store.read_fresh_fleet_workers(60_000).await.unwrap().len(),
-            0,
-            "observations older than the TTL are not part of the fresh view"
-        );
-        assert_eq!(
-            store
-                .prune_stale_fleet_observations(60_000, 64)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            store
-                .read_fresh_fleet_workers(u64::try_from(i64::MAX).unwrap())
-                .await
-                .unwrap()
-                .len(),
-            0
-        );
     }
 
     #[tokio::test]
@@ -872,9 +570,10 @@ mod tests {
     #[tokio::test]
     async fn fleet_inputs_are_bounded() {
         let (store, _root) = test_store_at(1_000);
-        let mut oversized = observation(1, "inc-1");
-        oversized.worker_id = "w".repeat(257);
-        assert!(store.observe_fleet_worker(&oversized).await.is_err());
+        assert!(store
+            .try_claim_fleet_capacity(&"w".repeat(257), "inc-1", "gateway-a", 1, 60_000)
+            .await
+            .is_err());
         assert!(store
             .try_claim_fleet_capacity("worker-a", "inc-1", &"g".repeat(257), 1, 60_000)
             .await

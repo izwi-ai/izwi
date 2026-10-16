@@ -1025,7 +1025,7 @@ async fn gateway_state(
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
 
-    // Multi-gateway fleets share worker observations and capacity claims
+    // Multi-gateway fleets share in-transit capacity claims
     // through one coordination database — a SQLite file by default, or a
     // server-backed database URL for shared fleets (DS5). Unset means
     // single-gateway operation with purely process-local state. When the
@@ -1088,7 +1088,7 @@ async fn gateway_state(
                 } else {
                     "worker_authoritative"
                 },
-                "Fleet coordination enabled: worker observations and capacity claims are shared"
+                "Fleet coordination enabled: capacity claims are shared"
             );
             let maintenance_coordinator = coordinator.clone();
             fleet_maintenance = Some(tokio::spawn(async move {
@@ -1100,12 +1100,11 @@ async fn gateway_state(
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let (reaped, pruned) = maintenance_coordinator.maintenance_sweep().await;
-                    if reaped > 0 || pruned > 0 {
+                    let reaped = maintenance_coordinator.maintenance_sweep().await;
+                    if reaped > 0 {
                         debug!(
                             service = SERVICE_NAME,
                             reaped_claims = reaped,
-                            pruned_observations = pruned,
                             "Fleet coordination maintenance sweep"
                         );
                     }
