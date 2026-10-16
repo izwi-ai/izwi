@@ -795,10 +795,11 @@ pub fn replacement_approvals(
     spec: &RolloutSpec,
     target: &ValidatedNodeConfig,
 ) -> Result<Vec<GatewayWorkerApproval>, RolloutError> {
-    let node_id = target.config().node_id.clone();
-    let mut lines = Vec::new();
-    for deployment in &spec.rolling {
-        for worker_id in &deployment.new_worker_ids {
+    let node_id = &target.config().node_id;
+    spec.rolling
+        .iter()
+        .flat_map(|deployment| &deployment.new_worker_ids)
+        .map(|worker_id| {
             let worker: &WorkerConfig = target
                 .config()
                 .workers
@@ -809,20 +810,9 @@ pub fn replacement_approvals(
                         "replacement worker {worker_id} is missing from the target config"
                     ))
                 })?;
-            lines.push(GatewayWorkerApproval {
-                endpoint: format!("http://{}", worker.bind),
-                identity: GatewayWorkerApprovalIdentity::V1 {
-                    node_id: node_id.clone(),
-                    worker_id: worker.worker_id.clone(),
-                },
-                task: deployment.task,
-                public_model: worker.deployment.public_model.clone(),
-                deployment_id: worker.deployment.deployment_id.clone(),
-                model_generation: deployment.new_generation,
-            });
-        }
-    }
-    Ok(lines)
+            Ok(approvals_file::pinned_approval(node_id, worker))
+        })
+        .collect()
 }
 
 /// The window view: every existing line stays (the old generation remains

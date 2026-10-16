@@ -19,9 +19,12 @@ use std::path::Path;
 
 use fs2::FileExt;
 use izwi_serving_protocol::{
-    GatewayWorkerApproval, MAX_APPROVALS_FILE_BYTES, MAX_APPROVALS_FILE_ENTRIES,
+    GatewayWorkerApproval, GatewayWorkerApprovalIdentity, NodeId, MAX_APPROVALS_FILE_BYTES,
+    MAX_APPROVALS_FILE_ENTRIES,
 };
 use sha2::{Digest, Sha256};
+
+use crate::WorkerConfig;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SharedApprovalsError {
@@ -140,6 +143,23 @@ impl ApprovalsDocument {
 
     pub fn render(&self) -> String {
         self.lines.iter().map(|line| line.text.as_str()).collect()
+    }
+}
+
+/// The v1 line pinning one of this node's workers: its loopback endpoint,
+/// identity and deployment generation. Autoscaling and rollout both add
+/// exactly these lines, so both recognize the lines they own.
+pub fn pinned_approval(node_id: &NodeId, worker: &WorkerConfig) -> GatewayWorkerApproval {
+    GatewayWorkerApproval {
+        endpoint: format!("http://{}", worker.bind),
+        identity: GatewayWorkerApprovalIdentity::V1 {
+            node_id: node_id.clone(),
+            worker_id: worker.worker_id.clone(),
+        },
+        task: worker.deployment.task,
+        public_model: worker.deployment.public_model.clone(),
+        deployment_id: worker.deployment.deployment_id.clone(),
+        model_generation: worker.deployment.model_generation,
     }
 }
 

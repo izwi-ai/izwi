@@ -379,20 +379,6 @@ pub enum AutoscaleError {
     CollidingStandaloneLine { endpoint: String, worker: WorkerId },
 }
 
-fn worker_approval(node_id: &NodeId, worker: &WorkerConfig) -> GatewayWorkerApproval {
-    GatewayWorkerApproval {
-        endpoint: format!("http://{}", worker.bind),
-        identity: GatewayWorkerApprovalIdentity::V1 {
-            node_id: node_id.clone(),
-            worker_id: worker.worker_id.clone(),
-        },
-        task: worker.deployment.task,
-        public_model: worker.deployment.public_model.clone(),
-        deployment_id: worker.deployment.deployment_id.clone(),
-        model_generation: worker.deployment.model_generation,
-    }
-}
-
 /// The autoscaled workers declared on this node, keyed for line ownership.
 struct AutoscaledWorkers<'a> {
     node_id: &'a NodeId,
@@ -491,7 +477,7 @@ pub fn reconcile_min_set(
     let own = AutoscaledWorkers::from_node(node)?;
     let desired: Vec<GatewayWorkerApproval> = desired
         .iter()
-        .map(|worker| worker_approval(own.node_id, worker))
+        .map(|worker| approvals_file::pinned_approval(own.node_id, worker))
         .collect();
     approvals_file::edit(path, |document| {
         own.reject_standalone_collisions(document)?;
@@ -512,7 +498,7 @@ pub fn add_worker(
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
     let worker = own.worker(worker_id)?;
-    let line = worker_approval(own.node_id, worker);
+    let line = approvals_file::pinned_approval(own.node_id, worker);
     approvals_file::edit(path, |document| {
         own.reject_standalone_collisions(document)?;
         document.ensure(&line);
