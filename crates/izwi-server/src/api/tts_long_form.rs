@@ -563,11 +563,32 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let mut segment_tokens = 0;
         let mut segment_ms = 0.0;
         let mut segment_stop = None;
-        while let Some(mut chunk) = tokio::select! {
-            chunk = receiver.recv() => chunk,
-            _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::Timeout("Speech segment made no progress".into())),
-            _ = output.closed() => return Err(izwi_core::Error::InferenceError("Speech consumer disconnected".into())),
-        } {
+        loop {
+            // Buffered durable audio is published by its deadline even when
+            // the model is between chunks.
+            let flush_at = progress.as_deref().and_then(|p| p.flush_deadline());
+            let flush_due = async {
+                match flush_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let mut chunk = tokio::select! {
+                chunk = receiver.recv() => match chunk {
+                    Some(chunk) => chunk,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => return Err(izwi_core::Error::Timeout("Speech segment made no progress".into())),
+                _ = output.closed() => return Err(izwi_core::Error::InferenceError("Speech consumer disconnected".into())),
+                _ = flush_due => {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        if let Some(published) = progress.flush().await.map_err(progress_error)? {
+                            send_published(&output, &mut sequence, published).await?;
+                        }
+                    }
+                    continue;
+                }
+            };
             deadline = tokio::time::Instant::now() + stall_timeout;
             if let Some(stats) = &chunk.stats {
                 if chunk.is_final {
@@ -594,25 +615,25 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             rate = Some(actual);
             segment_duration += chunk.samples.len() as f32 / actual as f32;
             chunk.request_id = base.id.clone();
-            chunk.sequence = sequence;
             chunk.is_final = false;
             chunk.stats = None;
-            if let Some(progress) = progress.as_deref_mut() {
-                progress
-                    .publish_chunk(&chunk)
-                    .await
-                    .map_err(progress_error)?;
-            }
-            if output.send(chunk).await.is_err() {
-                drop(receiver);
-                task.abort();
-                let _ = task.await;
-                return Err(izwi_core::Error::InferenceError(
-                    "Speech consumer disconnected".into(),
-                ));
-            }
             emitted = true;
-            sequence += 1;
+            // Durable audio reaches listeners only once it is published.
+            let ready = match progress.as_deref_mut() {
+                Some(progress) => progress
+                    .publish_chunk(chunk)
+                    .await
+                    .map_err(progress_error)?,
+                None => vec![chunk],
+            };
+            for chunk in ready {
+                if let Err(error) = send_published(&output, &mut sequence, chunk).await {
+                    drop(receiver);
+                    task.abort();
+                    let _ = task.await;
+                    return Err(error);
+                }
+            }
         }
         let result = task
             .await
@@ -639,6 +660,9 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
             ));
         }
         if let Some(progress) = progress.as_deref_mut() {
+            if let Some(published) = progress.flush().await.map_err(progress_error)? {
+                send_published(&output, &mut sequence, published).await?;
+            }
             progress
                 .complete_segment(range.end, segment_tokens, segment_ms, segment_duration)
                 .await
@@ -667,6 +691,21 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         .send(terminal)
         .await
         .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))
+}
+
+/// Send one published chunk under the next output sequence.
+async fn send_published(
+    output: &tokio::sync::mpsc::Sender<izwi_core::AudioChunk>,
+    sequence: &mut usize,
+    mut chunk: izwi_core::AudioChunk,
+) -> Result<(), izwi_core::Error> {
+    chunk.sequence = *sequence;
+    output
+        .send(chunk)
+        .await
+        .map_err(|_| izwi_core::Error::InferenceError("Speech consumer disconnected".into()))?;
+    *sequence += 1;
+    Ok(())
 }
 
 /// Dropping a timed-out/cancelled job also cancels its current inference future.

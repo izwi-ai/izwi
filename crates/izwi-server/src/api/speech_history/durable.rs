@@ -1,7 +1,9 @@
 use super::*;
 use crate::api::tts_long_form::{generate_speech_plan_stream_with_progress, SpeechTextPlan};
 use crate::artifact_store::{ArtifactFileWrite, ArtifactRetention};
-use crate::batch_runtime::speech_progress::{SpeechCheckpoint, SpeechPcmBatch};
+use crate::batch_runtime::speech_progress::{
+    PcmPublicationBuffer, SpeechCheckpoint, SpeechPcmBatch,
+};
 use crate::batch_runtime::store::SpeechHistoryFinalization;
 
 pub(crate) struct DurableSpeechProgress {
@@ -9,6 +11,7 @@ pub(crate) struct DurableSpeechProgress {
     attempt: StageExecutionContext,
     artifact_tenant: crate::artifact_store::ArtifactTenant,
     checkpoint: SpeechCheckpoint,
+    publications: PcmPublicationBuffer,
 }
 
 fn opaque_final_audio_enabled() -> bool {
@@ -48,6 +51,7 @@ impl DurableSpeechProgress {
             attempt: attempt.clone(),
             artifact_tenant: crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key),
             checkpoint,
+            publications: PcmPublicationBuffer::from_env(),
         })
     }
     pub(crate) fn artifact_fingerprint(&self) -> Option<&str> {
@@ -90,7 +94,37 @@ impl DurableSpeechProgress {
         self.checkpoint.begin_segment(&self.attempt).await?;
         Ok(())
     }
-    pub(crate) async fn publish_chunk(&mut self, chunk: &AudioChunk) -> anyhow::Result<()> {
+    /// Buffer one generated chunk. Returns the merged chunks that are now
+    /// durably published, in order; only those may reach listeners.
+    pub(crate) async fn publish_chunk(
+        &mut self,
+        chunk: AudioChunk,
+    ) -> anyhow::Result<Vec<AudioChunk>> {
+        let mut published = Vec::new();
+        if let Some(batch) = self.publications.push(chunk) {
+            published.push(self.publish_batch(batch).await?);
+        }
+        if let Some(batch) = self.publications.take_due(tokio::time::Instant::now()) {
+            published.push(self.publish_batch(batch).await?);
+        }
+        Ok(published)
+    }
+
+    /// Publish whatever is buffered: at a segment end, or when the buffered
+    /// audio reached `flush_deadline`.
+    pub(crate) async fn flush(&mut self) -> anyhow::Result<Option<AudioChunk>> {
+        match self.publications.take(tokio::time::Instant::now()) {
+            Some(batch) => Ok(Some(self.publish_batch(batch).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// When buffered audio must be published even if no chunk follows.
+    pub(crate) fn flush_deadline(&self) -> Option<tokio::time::Instant> {
+        self.publications.deadline()
+    }
+
+    async fn publish_batch(&mut self, chunk: AudioChunk) -> anyhow::Result<AudioChunk> {
         self.attempt.ensure_active().await?;
         let rate = chunk.sample_rate_or(self.state.runtime.sample_rate().await);
         let bytes: Vec<u8> = chunk
@@ -112,7 +146,7 @@ impl DurableSpeechProgress {
                 rate,
             )
             .await?;
-        Ok(())
+        Ok(chunk)
     }
     pub(crate) async fn complete_segment(
         &mut self,
@@ -121,6 +155,10 @@ impl DurableSpeechProgress {
         execution_ms: f32,
         duration_secs: f32,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.publications.is_empty(),
+            "Speech segment completed with unpublished audio"
+        );
         self.checkpoint.completed_tokens += tokens;
         self.checkpoint.completed_execution_ms += execution_ms;
         self.checkpoint.completed_duration_secs += duration_secs;

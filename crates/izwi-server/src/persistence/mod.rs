@@ -762,9 +762,12 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     }
 }
 
+/// The artifact store, the only caller, digests these exact bytes to build the
+/// request, so the digest is not computed a second time here; reads verify it
+/// while streaming.
 fn validate_reserved_write(request: &MediaReservedWriteRequest, bytes: &[u8]) -> HookResult<()> {
     validate_reserved_write_request(request)?;
-    if request.content_length != bytes.len() as u64 || sha256_hex_bytes(bytes) != request.sha256 {
+    if request.content_length != bytes.len() as u64 {
         return Err(HookError::Failed(
             "Invalid reserved media write identity".into(),
         ));
@@ -850,11 +853,6 @@ fn with_reserved_write_lock<T>(
     let unlock = lock.unlock();
     drop(lock);
     result.and_then(|value| unlock.map(|_| value).map_err(Into::into))
-}
-
-fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn reserved_write_fingerprint(
@@ -1217,6 +1215,11 @@ mod tests {
     use sea_orm::DbBackend;
     use std::io::{Read, Write};
     use std::time::Duration;
+
+    fn sha256_hex_bytes(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
 
     #[test]
     fn reserved_file_copy_uses_a_fixed_buffer_and_checks_in_flight_expiry() {

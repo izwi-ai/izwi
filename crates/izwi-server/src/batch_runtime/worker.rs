@@ -387,6 +387,20 @@ pub struct StageExecutionContext {
 }
 
 impl StageExecutionContext {
+    /// A context for a stage claimed outside a worker loop.
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Arc<BatchRuntimeStore>, claimed: ClaimedStage) -> Self {
+        Self {
+            lease: claimed.lease().expect("claimed stage has a lease"),
+            claimed,
+            cancellation: StageCancellationSignal::new(),
+            deadline: None,
+            started_at: Instant::now(),
+            store,
+            runtime_observer: None,
+        }
+    }
+
     pub fn claimed(&self) -> &ClaimedStage {
         &self.claimed
     }
