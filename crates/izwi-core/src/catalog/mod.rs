@@ -8,6 +8,7 @@
 mod batch_width;
 mod cuda_support;
 mod metadata;
+mod mixed_step;
 mod prefix_reuse;
 mod variant;
 
@@ -23,6 +24,7 @@ pub use metadata::{
     ChatModelCapabilities, ChatReasoningEffort, ModelInfo, ModelStatus, ModelVariant,
     SpeechModelCapabilities,
 };
+pub(crate) use mixed_step::mixed_step_enabled;
 pub use prefix_reuse::{
     prefix_reuse_engages, PrefixReuseEvidenceLevel, PrefixReuseMode, PrefixReuseSupport,
     PrefixReuseSupportLevel,

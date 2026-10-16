@@ -2790,15 +2790,7 @@ impl NativeExecutor {
             requests,
             scheduled,
             outputs,
-            match mode {
-                NativeBatchMode::Static => {
-                    BatchDispatch::new(super::BatchDispatchKind::TensorStatic, scheduled.len())
-                }
-                NativeBatchMode::Continuous => {
-                    BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, scheduled.len())
-                }
-                NativeBatchMode::None => BatchDispatch::serial(),
-            },
+            BatchDispatch::for_batch(mode, scheduled.len()),
             Some(rows),
         )
     }

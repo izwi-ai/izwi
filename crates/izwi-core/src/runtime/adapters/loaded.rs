@@ -251,6 +251,15 @@ pub(crate) trait LoadedExecutionAdapter: fmt::Debug + Send + Sync {
         ))
     }
 
+    /// Publish one mixed prefill+decode stage of `token_budget` tokens in
+    /// place of the split stages. Sealed only for a loaded model that runs
+    /// mixed steps on a backend where its family is certified.
+    fn seal_chat_mixed_step(&self, _token_budget: u64) -> Result<()> {
+        Err(Error::ModelLoadError(
+            "loaded adapter does not support mixed chat steps".into(),
+        ))
+    }
+
     fn seal_qwen3_asr_audio_preparation(
         &self,
         _model: &crate::models::architectures::qwen3::asr::Qwen3AsrModel,
@@ -4508,6 +4517,8 @@ struct ContinuousChatExecutionAdapter {
     prefill_workspace: OnceLock<(u64, u64)>,
     /// The loaded model's preferred decode quantum.
     decode_quantum: OnceLock<u64>,
+    /// The token budget of a sealed mixed prefill+decode stage.
+    mixed_step_budget: OnceLock<u64>,
 }
 
 impl ContinuousChatExecutionAdapter {
@@ -4531,6 +4542,7 @@ impl ContinuousChatExecutionAdapter {
             workspace_per_row_bytes: OnceLock::new(),
             prefill_workspace: OnceLock::new(),
             decode_quantum: OnceLock::new(),
+            mixed_step_budget: OnceLock::new(),
         }
     }
 }
@@ -4611,6 +4623,26 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
         self.decode_quantum.set(tokens).map_err(|_| {
             Error::ModelLoadError("chat decode quantum seal raced publication".into())
         })
+    }
+
+    fn seal_chat_mixed_step(&self, token_budget: u64) -> Result<()> {
+        if token_budget == 0 {
+            return Err(Error::ModelLoadError(
+                "chat mixed step budget must be positive".into(),
+            ));
+        }
+        if let Some(existing) = self.mixed_step_budget.get() {
+            return if *existing == token_budget {
+                Ok(())
+            } else {
+                Err(Error::ModelLoadError(
+                    "chat mixed step was resealed with a different budget".into(),
+                ))
+            };
+        }
+        self.mixed_step_budget
+            .set(token_budget)
+            .map_err(|_| Error::ModelLoadError("chat mixed step seal raced publication".into()))
     }
 
     #[cfg(test)]
@@ -4703,6 +4735,36 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
                 })?;
         prefill.validate()?;
         decode.validate()?;
+        let stages = match self.mixed_step_budget.get().copied() {
+            // One mixed stage replaces both: with the split stages beside it
+            // the exact selectors would be ambiguous.
+            Some(token_budget) => {
+                execution_profile.mixed_step = true;
+                let mut mixed = StageDescriptor::from_execution_profile(
+                    StageId::new(3),
+                    "chat.step.mixed",
+                    &execution_profile,
+                    NativeBatchMode::Mixed,
+                );
+                mixed.selector = StageWorkSelector::SequenceStep;
+                mixed.max_work_units = token_budget;
+                // Every token is priced like a prefill token and every row
+                // like a decode row; the ragged batch sums them.
+                mixed.workspace_per_work_unit_bytes = prefill.workspace_per_work_unit_bytes;
+                mixed.workspace_per_row_bytes = workspace_per_row;
+                mixed.max_workspace_bytes = prefill
+                    .workspace_per_work_unit_bytes
+                    .checked_mul(token_budget)
+                    .and_then(|bytes| bytes.checked_add(decode.max_workspace_bytes))
+                    .ok_or_else(|| {
+                        Error::Overloaded("chat mixed step workspace estimate overflow".into())
+                    })?;
+                mixed.output_visibility = decode.output_visibility;
+                mixed.validate()?;
+                Arc::from([mixed])
+            }
+            None => Arc::from([prefill, decode]),
+        };
 
         Ok(LoadedExecutionContract {
             execution_group_id: self.execution_group_id,
@@ -4711,7 +4773,7 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
             adapter_abi_revision: self.adapter_abi_revision(),
             metadata,
             execution_profile,
-            stages: Arc::from([prefill, decode]),
+            stages,
         })
     }
 }
@@ -4919,6 +4981,15 @@ impl LoadedModelBundleDraft {
                 Error::ModelLoadError("loaded bundle has no chat capability to seal".into())
             })?
             .seal_chat_prefill_workspace(per_token_bytes, max_span_tokens)
+    }
+
+    pub(crate) fn seal_chat_mixed_step(&self, token_budget: u64) -> Result<()> {
+        self.capabilities
+            .get(&CapabilityKind::Chat)
+            .ok_or_else(|| {
+                Error::ModelLoadError("loaded bundle has no chat capability to seal".into())
+            })?
+            .seal_chat_mixed_step(token_budget)
     }
 
     pub(crate) fn seal_qwen3_asr_audio_preparation(

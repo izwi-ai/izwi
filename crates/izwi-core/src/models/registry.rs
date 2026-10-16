@@ -4843,6 +4843,34 @@ pub struct NativeChatDecodeStep {
     pub logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
+/// What one row of a mixed step feeds the model.
+pub(crate) enum MixedInput<'a> {
+    /// One decode token: the row's pending sampled token.
+    Decode,
+    /// The prompt span `[span_start, span_end)` of a resumable prefill.
+    Prefill {
+        prompt: &'a [u32],
+        prepared: Option<&'a NativeChatPreparedPrompt>,
+        span_start: usize,
+        span_end: usize,
+    },
+}
+
+/// One row of a mixed step: decode rows come before prefill rows.
+pub(crate) struct MixedRow<'a> {
+    pub(crate) state: &'a mut NativeChatDecodeState,
+    pub(crate) input: MixedInput<'a>,
+}
+
+/// What one row of a mixed step produced.
+#[derive(Debug)]
+pub(crate) enum MixedRowStep {
+    /// A non-final prefill span committed `input_tokens` prompt tokens.
+    Progress { input_tokens: usize },
+    /// A decode row's token, or a final prefill span's bootstrap token.
+    Token(NativeChatDecodeStep),
+}
+
 impl NativeChatModel {
     /// Prepare the exact prompt consumed by execution. Hybrid Qwen families
     /// return their independently typed reusable artifacts.
@@ -4985,6 +5013,21 @@ impl NativeChatModel {
             Self::Gemma3(model) => model.supports_incremental_decode(),
             Self::Lfm2(model) => model.supports_incremental_decode(),
         }
+    }
+
+    /// Whether this loaded model runs prefill spans and one-token decode rows
+    /// in one model call ([`Self::step_mixed`]). No family does yet; each
+    /// joins in its own trunk once its mixed forward matches the split path.
+    pub fn supports_mixed_step(&self) -> bool {
+        false
+    }
+
+    /// Run `rows` (decode rows first, then prefill spans) in one forward and
+    /// one sampling readback.
+    pub(crate) fn step_mixed(&self, _rows: &mut [MixedRow<'_>]) -> Result<Vec<MixedRowStep>> {
+        Err(Error::InvalidInput(
+            "loaded chat model does not run mixed prefill and decode steps".into(),
+        ))
     }
 
     pub fn supports_continuous_decode_batch(&self) -> bool {

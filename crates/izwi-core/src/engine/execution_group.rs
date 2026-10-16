@@ -91,7 +91,7 @@ impl PreparedPhysicalDispatch {
                         .to_string(),
                 ));
             }
-            if scheduled.is_prefill != (phase == ExecutionPhase::Prefill) {
+            if !phase.admits_row(scheduled.is_prefill) {
                 return Err(crate::error::Error::InvalidInput(
                     "physical dispatch ticket phase disagrees with its scheduled row".to_string(),
                 ));
@@ -439,6 +439,9 @@ impl ExecutedEngineStep {
 pub(super) enum ExecutionPhase {
     Decode,
     Prefill,
+    /// Decode and prefill rows in one mixed physical batch; per-row facts
+    /// come from each row's scheduled phase.
+    Mixed,
 }
 
 impl ExecutionPhase {
@@ -446,6 +449,16 @@ impl ExecutionPhase {
         match self {
             Self::Decode => "decode",
             Self::Prefill => "prefill",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// Whether a row scheduled as `prefill` may run in a batch of this phase.
+    pub(super) fn admits_row(self, prefill: bool) -> bool {
+        match self {
+            Self::Decode => !prefill,
+            Self::Prefill => prefill,
+            Self::Mixed => true,
         }
     }
 }

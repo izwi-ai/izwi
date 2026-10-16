@@ -866,7 +866,7 @@ pub struct EngineCore {
     /// Phase preferred when decode and prefill compete for a single physical
     /// candidate slot. It advances only after the preferred phase actually
     /// owns a ticket, so blocked work does not waste the device opportunity.
-    next_single_candidate_phase: ExecutionPhase,
+    next_single_candidate_phase: SequencePhase,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
@@ -890,7 +890,7 @@ impl EngineCore {
         capacity: usize,
         decode_work: usize,
         prefill_work: usize,
-        single_slot_preference: ExecutionPhase,
+        single_slot_preference: SequencePhase,
     ) -> (usize, usize) {
         let capacity = capacity.max(1);
         match (decode_work > 0, prefill_work > 0) {
@@ -898,8 +898,8 @@ impl EngineCore {
             (true, false) => (capacity, 0),
             (false, true) => (0, capacity),
             (true, true) if capacity == 1 => match single_slot_preference {
-                ExecutionPhase::Decode => (1, 0),
-                ExecutionPhase::Prefill => (0, 1),
+                SequencePhase::Decode => (1, 0),
+                SequencePhase::Prefill => (0, 1),
             },
             (true, true) => {
                 // Reserve enough candidate slots for the scheduler's decode
@@ -913,22 +913,22 @@ impl EngineCore {
         }
     }
 
-    fn alternate_candidate_phase(phase: ExecutionPhase) -> ExecutionPhase {
+    fn alternate_candidate_phase(phase: SequencePhase) -> SequencePhase {
         match phase {
-            ExecutionPhase::Decode => ExecutionPhase::Prefill,
-            ExecutionPhase::Prefill => ExecutionPhase::Decode,
+            SequencePhase::Decode => SequencePhase::Prefill,
+            SequencePhase::Prefill => SequencePhase::Decode,
         }
     }
 
     fn next_candidate_preference(
-        current: ExecutionPhase,
+        current: SequencePhase,
         both_phases: bool,
         decode_admitted: bool,
         prefill_admitted: bool,
-    ) -> ExecutionPhase {
+    ) -> SequencePhase {
         let preferred_admitted = match current {
-            ExecutionPhase::Decode => decode_admitted,
-            ExecutionPhase::Prefill => prefill_admitted,
+            SequencePhase::Decode => decode_admitted,
+            SequencePhase::Prefill => prefill_admitted,
         };
         if both_phases && preferred_admitted {
             Self::alternate_candidate_phase(current)
@@ -995,8 +995,29 @@ impl EngineCore {
             Ok(stage.batch_mode)
         };
 
-        profile.prefill_batch = verify_mode("prefill", profile.prefill_batch, prefill_stage)?;
-        profile.decode_batch = verify_mode("decode", profile.decode_batch, decode_stage)?;
+        // One mixed stage serving both phases runs resumable prefill spans
+        // beside continuous decode rows in one model call; the executor keeps
+        // declaring those, and the profile records the mixed step.
+        profile.mixed_step = match (prefill_stage, decode_stage) {
+            (Some(prefill), Some(decode))
+                if prefill.batch_mode == NativeBatchMode::Mixed && prefill.id == decode.id =>
+            {
+                if profile.prefill != PrefillMode::Incremental
+                    || profile.decode_batch != NativeBatchMode::Continuous
+                {
+                    return Err(Error::InferenceError(format!(
+                        "loaded adapter stage {} runs mixed steps, but the executor declared {:?} prefill and {:?} decode batching",
+                        prefill.name, profile.prefill, profile.decode_batch
+                    )));
+                }
+                true
+            }
+            _ => false,
+        };
+        if !profile.mixed_step {
+            profile.prefill_batch = verify_mode("prefill", profile.prefill_batch, prefill_stage)?;
+            profile.decode_batch = verify_mode("decode", profile.decode_batch, decode_stage)?;
+        }
         let max_batch_size = [prefill_stage, decode_stage]
             .into_iter()
             .flatten()
@@ -1978,18 +1999,7 @@ impl EngineCore {
                 DispatchState::NotStarted,
             );
         }
-        let dispatch = match plan.batch_mode {
-            NativeBatchMode::Static => {
-                BatchDispatch::new(super::BatchDispatchKind::TensorStatic, width)
-            }
-            NativeBatchMode::Continuous => {
-                BatchDispatch::new(super::BatchDispatchKind::TensorContinuous, width)
-            }
-            NativeBatchMode::None if width > 1 => {
-                BatchDispatch::new(super::BatchDispatchKind::RequestParallel, width)
-            }
-            NativeBatchMode::None => BatchDispatch::serial(),
-        };
+        let dispatch = BatchDispatch::for_batch(plan.batch_mode, width);
         let dispatch_state = match result.provenance.dispatch_state {
             DispatchState::NotStarted | DispatchState::Started => DispatchState::Started,
             DispatchState::ProducedOutput => DispatchState::ProducedOutput,
@@ -3691,7 +3701,7 @@ impl EngineCore {
             restart_after_reset_hook: None,
             #[cfg(test)]
             step_model_calls: Vec::new(),
-            next_single_candidate_phase: ExecutionPhase::Decode,
+            next_single_candidate_phase: SequencePhase::Decode,
             initialized: false,
             next_batch_id: 1,
         })
@@ -5026,12 +5036,12 @@ impl EngineCore {
         // slot to its peer rather than idling the physical lane.
         if candidate_capacity == 1 {
             let preferred_admitted = match self.next_single_candidate_phase {
-                ExecutionPhase::Decode => !decode_batches.is_empty(),
-                ExecutionPhase::Prefill => !prefill_batches.is_empty(),
+                SequencePhase::Decode => !decode_batches.is_empty(),
+                SequencePhase::Prefill => !prefill_batches.is_empty(),
             };
             if both_phases && !preferred_admitted && self.in_flight_dispatches.is_empty() {
                 match self.next_single_candidate_phase {
-                    ExecutionPhase::Decode => {
+                    SequencePhase::Decode => {
                         prefill_batches = match self.form_physical_batches(
                             ExecutionPhase::Prefill,
                             &prefill_requests,
@@ -5053,7 +5063,7 @@ impl EngineCore {
                             }
                         };
                     }
-                    ExecutionPhase::Prefill => {
+                    SequencePhase::Prefill => {
                         decode_batches = match self.form_physical_batches(
                             ExecutionPhase::Decode,
                             &decode_requests,
@@ -5242,6 +5252,13 @@ impl EngineCore {
             let mut committed_decode_work = Vec::new();
             for result in batch.results {
                 let plan_id = result.plan_id;
+                // Per-row facts key on the row's scheduled phase: a mixed
+                // batch holds rows of both.
+                let prefill_row = in_flight
+                    .scheduled
+                    .iter()
+                    .find(|row| row.plan_id == plan_id)
+                    .is_some_and(|row| row.is_prefill);
                 let provenance = result.provenance;
                 let entered_model = result.provenance.dispatch_state != DispatchState::NotStarted;
                 let step_time_ms = if entered_model {
@@ -5254,20 +5271,17 @@ impl EngineCore {
                         .request_phase_timings
                         .get_mut(&result.session.request_id)
                     {
-                        match batch.phase {
-                            ExecutionPhase::Decode => {
-                                // Use an explicit monotonic pre-execution boundary, not
-                                // elapsed service time subtracted from a later timestamp.
-                                timing
-                                    .decode_started_at
-                                    .get_or_insert(in_flight.registered_at);
-                                timing.decode_ms += step_time_ms;
-                                timing.decode_steps = timing.decode_steps.saturating_add(1);
-                            }
-                            ExecutionPhase::Prefill => {
-                                timing.prefill_ms += step_time_ms;
-                                timing.prefill_steps = timing.prefill_steps.saturating_add(1);
-                            }
+                        if prefill_row {
+                            timing.prefill_ms += step_time_ms;
+                            timing.prefill_steps = timing.prefill_steps.saturating_add(1);
+                        } else {
+                            // Use an explicit monotonic pre-execution boundary, not
+                            // elapsed service time subtracted from a later timestamp.
+                            timing
+                                .decode_started_at
+                                .get_or_insert(in_flight.registered_at);
+                            timing.decode_ms += step_time_ms;
+                            timing.decode_steps = timing.decode_steps.saturating_add(1);
                         }
                     }
                 }
@@ -6741,34 +6755,34 @@ mod tests {
 
     #[test]
     fn single_candidate_admission_alternates_under_sustained_decode_and_prefill() {
-        let mut preference = ExecutionPhase::Decode;
+        let mut preference = SequencePhase::Decode;
         let mut admitted = Vec::new();
 
         for _ in 0..6 {
             let (decode, prefill) = EngineCore::candidate_phase_quotas(1, 32, 32, preference);
             let phase = match (decode, prefill) {
-                (1, 0) => ExecutionPhase::Decode,
-                (0, 1) => ExecutionPhase::Prefill,
+                (1, 0) => SequencePhase::Decode,
+                (0, 1) => SequencePhase::Prefill,
                 other => panic!("single candidate produced invalid phase quotas {other:?}"),
             };
             admitted.push(phase);
             preference = EngineCore::next_candidate_preference(
                 preference,
                 true,
-                phase == ExecutionPhase::Decode,
-                phase == ExecutionPhase::Prefill,
+                phase == SequencePhase::Decode,
+                phase == SequencePhase::Prefill,
             );
         }
 
         assert_eq!(
             admitted,
             vec![
-                ExecutionPhase::Decode,
-                ExecutionPhase::Prefill,
-                ExecutionPhase::Decode,
-                ExecutionPhase::Prefill,
-                ExecutionPhase::Decode,
-                ExecutionPhase::Prefill,
+                SequencePhase::Decode,
+                SequencePhase::Prefill,
+                SequencePhase::Decode,
+                SequencePhase::Prefill,
+                SequencePhase::Decode,
+                SequencePhase::Prefill,
             ]
         );
     }
@@ -6782,7 +6796,7 @@ mod tests {
                 4,
                 decode_work,
                 prefill_work,
-                ExecutionPhase::Decode,
+                SequencePhase::Decode,
             );
             assert_eq!(quotas, expected);
             assert!(quotas.0 > 0, "decode lost reserved service");
@@ -6793,14 +6807,14 @@ mod tests {
 
     #[test]
     fn blocked_single_slot_preference_does_not_advance_or_idle_its_peer() {
-        let preference = ExecutionPhase::Decode;
+        let preference = SequencePhase::Decode;
         assert_eq!(
             EngineCore::next_candidate_preference(preference, true, false, true),
-            ExecutionPhase::Decode,
+            SequencePhase::Decode,
             "a blocked preferred phase must retain its next service opportunity"
         );
         assert_eq!(
-            EngineCore::candidate_phase_quotas(1, 8, 8, ExecutionPhase::Prefill),
+            EngineCore::candidate_phase_quotas(1, 8, 8, SequencePhase::Prefill),
             (0, 1),
             "the peer phase must remain eligible for the current physical slot"
         );
@@ -7676,7 +7690,7 @@ mod tests {
 
         // The previous step served decode, so the single slot prefers prefill
         // and defers the realtime decode-phase row.
-        core.next_single_candidate_phase = ExecutionPhase::Prefill;
+        core.next_single_candidate_phase = SequencePhase::Prefill;
         core.step().await.expect("prefill step");
         assert!(core.active_plans.is_empty());
 
@@ -8432,6 +8446,78 @@ mod tests {
         assert_eq!(effective.decode_batch, NativeBatchMode::None);
         assert_eq!(effective.max_batch_size, 8);
         assert_eq!(effective.concurrency, ConcurrencyClass::Batchable);
+    }
+
+    /// A chat request bound to one stage of `batch_mode` selected by
+    /// `selector`, for adapter-contract tests.
+    fn chat_request_with_one_stage(
+        selector: super::super::StageWorkSelector,
+        batch_mode: NativeBatchMode,
+    ) -> (EngineCoreRequest, ExecutionProfile) {
+        let variant = ModelVariant::Qwen306B;
+        let model_instance = super::super::ModelInstanceId::new(2);
+        let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+            role: ChatRole::User,
+            content: "contract".into(),
+        }])
+        .with_model_variant(variant);
+        request.bind_model_instance(model_instance).unwrap();
+        let mut declared =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        declared.prefill = PrefillMode::Incremental;
+        declared.incremental_decode = true;
+        declared.decode_batch = NativeBatchMode::Continuous;
+        declared.max_batch_size = 8;
+        declared.concurrency = ConcurrencyClass::Batchable;
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            super::super::StageId::new(3),
+            "chat.step.mixed",
+            &declared,
+            batch_mode,
+        );
+        stage.selector = selector;
+        request
+            .bind_execution_adapter(super::super::ExecutionAdapterBinding {
+                execution_group_id: super::super::ExecutionGroupId::new(1),
+                model_instance_id: model_instance,
+                adapter_instance_id: super::super::AdapterInstanceId::new(3),
+                adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "chat".to_string(),
+                stages: Arc::from([stage]),
+            })
+            .unwrap();
+        (request, declared)
+    }
+
+    #[test]
+    fn one_mixed_stage_for_both_phases_marks_the_profile_mixed() {
+        let (request, declared) = chat_request_with_one_stage(
+            super::super::StageWorkSelector::SequenceStep,
+            NativeBatchMode::Mixed,
+        );
+        let effective =
+            EngineCore::apply_adapter_execution_contract(&request, declared.clone()).unwrap();
+        assert!(effective.mixed_step);
+        assert!(effective.capabilities().mixed_phase_batch);
+        // The executor's declared phases are kept: decode rows stay one-token
+        // continuous rows and prefill stays resumable.
+        assert_eq!(effective.prefill, PrefillMode::Incremental);
+        assert_eq!(effective.decode_batch, NativeBatchMode::Continuous);
+        assert_eq!(effective.max_batch_size, 8);
+
+        // A mixed stage needs resumable prefill from the executor.
+        let mut full = declared;
+        full.prefill = PrefillMode::Full;
+        assert!(EngineCore::apply_adapter_execution_contract(&request, full).is_err());
+
+        // A split contract never marks the profile mixed.
+        let (request, declared) = chat_request_with_one_stage(
+            super::super::StageWorkSelector::Any,
+            NativeBatchMode::None,
+        );
+        let effective = EngineCore::apply_adapter_execution_contract(&request, declared).unwrap();
+        assert!(!effective.mixed_step);
     }
 
     #[test]

@@ -2576,6 +2576,15 @@ impl ModelLifecycleController {
                 if let Some((per_token_bytes, max_span_tokens)) = loaded.prefill_workspace()? {
                     bundle_draft.seal_chat_prefill_workspace(per_token_bytes, max_span_tokens)?;
                 }
+                if loaded.supports_mixed_step()
+                    && crate::catalog::mixed_step_enabled(variant.family(), backend)
+                {
+                    let token_budget = match self.config.max_tokens_per_step {
+                        0 => crate::engine::backend_step_sizes(backend).max_tokens_per_step,
+                        tokens => tokens,
+                    };
+                    bundle_draft.seal_chat_mixed_step(token_budget as u64)?;
+                }
                 let decode_workspace_reserve_bytes = bundle_draft
                     .execution_contracts(CapabilityKind::Chat)?
                     .iter()

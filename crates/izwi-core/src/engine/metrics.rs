@@ -1247,7 +1247,8 @@ pub(crate) fn model_calls_for_dispatch(dispatch: BatchDispatch) -> usize {
         BatchDispatchKind::RequestParallel => dispatch.width,
         BatchDispatchKind::Serial
         | BatchDispatchKind::TensorStatic
-        | BatchDispatchKind::TensorContinuous => 1,
+        | BatchDispatchKind::TensorContinuous
+        | BatchDispatchKind::TensorMixed => 1,
     }
 }
 
@@ -1383,6 +1384,10 @@ pub(crate) fn record_engine_batch_dispatch(dispatch: BatchDispatch) {
             ENGINE_TENSOR_CONTINUOUS_BATCHES.fetch_add(1, Ordering::Relaxed);
             ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
         }
+        BatchDispatchKind::TensorMixed => {
+            ENGINE_TENSOR_BATCHES.fetch_add(1, Ordering::Relaxed);
+            ENGINE_TENSOR_BATCH_MAX_WIDTH.fetch_max(dispatch.width as u64, Ordering::Relaxed);
+        }
         BatchDispatchKind::RequestParallel => {
             ENGINE_REQUEST_PARALLEL_BATCHES.fetch_add(1, Ordering::Relaxed);
         }
@@ -1472,7 +1477,9 @@ pub(crate) fn record_engine_physical_batch(batch: &PhysicalBatch, dispatch: Batc
     }
     if !matches!(
         dispatch.kind,
-        BatchDispatchKind::TensorStatic | BatchDispatchKind::TensorContinuous
+        BatchDispatchKind::TensorStatic
+            | BatchDispatchKind::TensorContinuous
+            | BatchDispatchKind::TensorMixed
     ) {
         record_engine_batch_dispatch(dispatch);
         return;

@@ -431,6 +431,9 @@ pub enum NativeBatchMode {
     None,
     Static,
     Continuous,
+    /// Ragged rows of both sequence phases in one model call: one-token
+    /// decode rows first, then prefill spans, under one token budget.
+    Mixed,
 }
 
 /// Where one model stage is executed. Host stages remain part of the same
@@ -461,6 +464,9 @@ pub enum StageWorkSelector {
     PreSequencePreparation,
     SequencePrefill,
     SequenceDecode,
+    /// Both sequence phases: a stage that runs prefill and decode rows in
+    /// one mixed model call.
+    SequenceStep,
     SequenceFinalize,
     SequenceAudioDecode,
     RealtimePush,
@@ -478,7 +484,8 @@ impl StageWorkSelector {
         match (self, work) {
             (Self::Any, _) => true,
             (Self::PreSequencePreparation, WorkUnit::PreSequencePreparation { .. }) => true,
-            (
+            (Self::SequenceStep, WorkUnit::SequenceStep { .. })
+            | (
                 Self::SequencePrefill,
                 WorkUnit::SequenceStep {
                     phase: SequencePhase::Prefill,
@@ -612,7 +619,7 @@ impl StageDescriptor {
             (NativeBatchMode::None, ConcurrencyClass::Batchable) => StageShapePolicy::Independent,
             (NativeBatchMode::None, ConcurrencyClass::Exclusive) => StageShapePolicy::Exact,
             (NativeBatchMode::Static, _) => StageShapePolicy::Padded,
-            (NativeBatchMode::Continuous, _) => StageShapePolicy::Ragged,
+            (NativeBatchMode::Continuous | NativeBatchMode::Mixed, _) => StageShapePolicy::Ragged,
         };
         Self {
             id,
@@ -724,9 +731,11 @@ impl StageDescriptor {
                 "only padded execution stages may declare padding overhead".to_string(),
             ));
         }
-        if self.batch_mode == NativeBatchMode::Continuous
-            && (self.progress == StageProgressKind::Atomic
-                || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
+        if matches!(
+            self.batch_mode,
+            NativeBatchMode::Continuous | NativeBatchMode::Mixed
+        ) && (self.progress == StageProgressKind::Atomic
+            || self.membership_safe_point == MembershipSafePoint::OperationBoundary)
         {
             return Err(Error::InvalidInput(
                 "continuous batching requires a repeatable membership safe point".to_string(),
@@ -1009,6 +1018,7 @@ pub enum BatchDispatchKind {
     RequestParallel,
     TensorStatic,
     TensorContinuous,
+    TensorMixed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1034,6 +1044,18 @@ impl BatchDispatch {
             kind: BatchDispatchKind::NotDispatched,
             width,
         }
+    }
+
+    /// How a physical batch of `width` rows in `mode` dispatches.
+    pub const fn for_batch(mode: NativeBatchMode, width: usize) -> Self {
+        let kind = match mode {
+            NativeBatchMode::Static => BatchDispatchKind::TensorStatic,
+            NativeBatchMode::Continuous => BatchDispatchKind::TensorContinuous,
+            NativeBatchMode::Mixed => BatchDispatchKind::TensorMixed,
+            NativeBatchMode::None if width > 1 => BatchDispatchKind::RequestParallel,
+            NativeBatchMode::None => return Self::serial(),
+        };
+        Self::new(kind, width)
     }
 }
 
@@ -1243,6 +1265,10 @@ pub struct ExecutionProfile {
     /// multi-token quanta inside continuous batches (not just solo rows).
     #[serde(default)]
     pub speculative_decode_batch: bool,
+    /// Phase 3a: the loaded adapter runs this request's prefill spans and
+    /// one-token decode rows in one mixed stage, under one token budget.
+    #[serde(default)]
+    pub mixed_step: bool,
     /// Model-preferred prefill span for an isolated request (nothing else
     /// decoding or waiting); 0 keeps the engine's chunk threshold. Kernels
     /// whose per-call cost amortizes over the span (expert weights read once
@@ -1294,6 +1320,7 @@ impl ExecutionProfile {
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
+            mixed_step: false,
             preferred_prefill_tokens: 0,
             resolved_from_loaded_model: false,
             compute_dtype: "unknown".to_string(),
@@ -1310,7 +1337,7 @@ impl ExecutionProfile {
             incremental_prefill: self.prefill == PrefillMode::Incremental,
             incremental_decode: self.incremental_decode,
             native_batch,
-            mixed_phase_batch: false,
+            mixed_phase_batch: self.mixed_step,
             cancellable_between_steps: !matches!(
                 self.cancellation,
                 CancellationGranularity::OperationBoundary
@@ -2179,17 +2206,7 @@ pub struct PhysicalBatch {
 
 impl PhysicalBatch {
     pub fn expected_dispatch(&self) -> BatchDispatch {
-        let width = self.rows.len().max(1);
-        match self.mode {
-            NativeBatchMode::Static => BatchDispatch::new(BatchDispatchKind::TensorStatic, width),
-            NativeBatchMode::Continuous => {
-                BatchDispatch::new(BatchDispatchKind::TensorContinuous, width)
-            }
-            NativeBatchMode::None if width > 1 => {
-                BatchDispatch::new(BatchDispatchKind::RequestParallel, width)
-            }
-            NativeBatchMode::None => BatchDispatch::serial(),
-        }
+        BatchDispatch::for_batch(self.mode, self.rows.len().max(1))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -2444,6 +2461,11 @@ impl PhysicalBatchReport {
             BatchDispatchKind::TensorContinuous if batch.mode != NativeBatchMode::Continuous => {
                 return Err(Error::InferenceError(
                     "physical batch reported undeclared continuous tensor execution".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorMixed if batch.mode != NativeBatchMode::Mixed => {
+                return Err(Error::InferenceError(
+                    "physical batch reported undeclared mixed tensor execution".to_string(),
                 ));
             }
             BatchDispatchKind::RequestParallel
@@ -2820,6 +2842,11 @@ impl ExecutionReport {
             {
                 return Err(Error::InferenceError(
                     "executor reported an undeclared continuous tensor batch".to_string(),
+                ));
+            }
+            BatchDispatchKind::TensorMixed if plan.batch_mode != NativeBatchMode::Mixed => {
+                return Err(Error::InferenceError(
+                    "executor reported an undeclared mixed tensor batch".to_string(),
                 ));
             }
             _ => {}
