@@ -1020,6 +1020,7 @@ impl KvBackendRuntime for CpuKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CpuKvArena::new(config)?))
     }
 }

@@ -12,7 +12,7 @@ use tokio::sync::{Notify, OnceCell, RwLock};
 use tracing::info;
 
 use crate::backends::state::PhysicalStateTransactionId;
-use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile};
+use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile, DeviceThread};
 use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
 use crate::engine::{
     InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
@@ -6784,7 +6784,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeAsrModel, Error>(model)
                     })
@@ -6845,7 +6845,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeAudioChatModel, Error>(model)
                     })
@@ -6909,7 +6909,7 @@ impl ModelRegistry {
                 let performance = self.performance.clone();
                 let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model =
                             loader(&model_dir, variant, device, &performance, prefix_reuse)?;
                         Ok::<NativeChatModel, Error>(model)
@@ -6968,7 +6968,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         let model = loader(&model_dir, variant, device)?;
                         Ok::<NativeDiarizationModel, Error>(model)
                     })
@@ -7018,7 +7018,7 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 let prefix_reuse = self.prefix_reuse;
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         loader(&model_dir, variant, device, prefix_reuse)
                     })
                     .await
@@ -7081,7 +7081,7 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 let kv_cache_dtype = kv_cache_dtype.to_string();
                 move || async move {
-                    tokio::task::spawn_blocking(move || {
+                    DeviceThread::for_device(&device.device)?.submit(move || {
                         loader(
                             &model_dir,
                             variant,
@@ -7147,7 +7147,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7206,7 +7206,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7263,7 +7263,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7320,7 +7320,7 @@ impl ModelRegistry {
                 let device = self.device.clone();
                 let loader = registration.loader;
                 move || async move {
-                    tokio::task::spawn_blocking(move || loader(&model_dir, variant, device))
+                    DeviceThread::for_device(&device.device)?.submit(move || loader(&model_dir, variant, device))
                         .await
                         .map_err(|e| Error::ModelLoadError(e.to_string()))?
                         .map(Arc::new)
@@ -7759,6 +7759,22 @@ impl ModelRegistry {
         entry.publish_ready()
     }
 
+    /// The thread that loads, runs and frees this registry's models.
+    pub(crate) fn device_thread(&self) -> Result<Arc<DeviceThread>> {
+        DeviceThread::for_device(&self.device.device)
+    }
+
+    /// Free a retired model's weights on the device thread. A lease that
+    /// outlives the unload frees them where it is dropped.
+    async fn drop_on_device<T: Send + 'static>(&self, retired: T) {
+        match self.device_thread() {
+            Ok(device) => {
+                let _ = device.submit(move || drop(retired)).await;
+            }
+            Err(_) => drop(retired),
+        }
+    }
+
     pub async fn unload_asr(&self, variant: ModelVariant) {
         let entry = {
             let mut guard = self.asr_models.write().await;
@@ -7770,12 +7786,15 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
     pub async fn unload_diarization(&self, variant: ModelVariant) {
-        let mut guard = self.diarization_models.write().await;
-        guard.remove(&variant);
+        let entry = self.diarization_models.write().await.remove(&variant);
+        if let Some(entry) = entry {
+            self.drop_on_device(entry).await;
+        }
     }
 
     pub async fn unload_chat(&self, variant: ModelVariant) {
@@ -7785,6 +7804,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7799,6 +7819,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7810,6 +7831,7 @@ impl ModelRegistry {
         if let Some(entry) = entry {
             entry.reset_ready();
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7824,6 +7846,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7838,6 +7861,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7852,6 +7876,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7862,6 +7887,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 
@@ -7876,6 +7902,7 @@ impl ModelRegistry {
         };
         if let Some(entry) = entry {
             entry.uses.wait_until_idle().await;
+            self.drop_on_device(entry).await;
         }
     }
 }

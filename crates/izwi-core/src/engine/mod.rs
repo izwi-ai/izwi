@@ -3246,6 +3246,24 @@ impl Engine {
         aborted
     }
 
+    /// Run synchronous state work that allocates, zeroes, synchronizes or
+    /// frees device memory (model load and unload) under the step gate, on
+    /// the device thread. The caller's tokio worker waits for it, as it did
+    /// when the work ran inline; device jobs never take the core lock, so
+    /// holding it here cannot deadlock.
+    async fn with_core_on_device<T: Send>(
+        &self,
+        work: impl FnOnce(&mut EngineCore) -> Result<T> + Send,
+    ) -> Result<T> {
+        let _step = self.step_gate.lock().await;
+        let mut core = self.core.write().await;
+        let core: &mut EngineCore = &mut core;
+        match core.device_thread() {
+            Some(device) => device.run_sync(|| work(core))?,
+            None => work(core),
+        }
+    }
+
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
         let _step = self.step_gate.lock().await;
@@ -3253,8 +3271,8 @@ impl Engine {
     }
 
     pub(crate) async fn synchronize_worker_device(&self) -> Result<()> {
-        let _step = self.step_gate.lock().await;
-        self.core.read().await.synchronize_worker_device()
+        self.with_core_on_device(|core| core.synchronize_worker_device())
+            .await
     }
 
     /// Admit and allocate managed physical state before the model generation
@@ -3285,11 +3303,8 @@ impl Engine {
         cuda_resident_pool: core::CudaResidentPool,
         decode_workspace_reserve_bytes: u64,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .load_managed_model_cache_with_capacity_policy(
+        self.with_core_on_device(|core| {
+            core.load_managed_model_cache_with_capacity_policy(
                 model_instance,
                 capability,
                 logical_context_tokens,
@@ -3297,6 +3312,8 @@ impl Engine {
                 cuda_resident_pool,
                 decode_workspace_reserve_bytes,
             )
+        })
+        .await
     }
 
     pub(crate) async fn load_managed_model_state(
@@ -3307,14 +3324,16 @@ impl Engine {
         minimum_tokens: u64,
         reserve: StateFitReserve,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        let _step = self.step_gate.lock().await;
-        self.core.write().await.load_managed_model_state(
-            model_instance,
-            retained_state,
-            logical_context_tokens,
-            minimum_tokens,
-            reserve,
-        )
+        self.with_core_on_device(|core| {
+            core.load_managed_model_state(
+                model_instance,
+                retained_state,
+                logical_context_tokens,
+                minimum_tokens,
+                reserve,
+            )
+        })
+        .await
     }
 
     pub(crate) async fn price_tensor_rows_with_requests(
@@ -3336,17 +3355,16 @@ impl Engine {
         retained_rows: usize,
         staged_rows: usize,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .load_managed_model_state_with_row_limits(
+        self.with_core_on_device(|core| {
+            core.load_managed_model_state_with_row_limits(
                 model_instance,
                 retained_state,
                 logical_context_tokens,
                 retained_rows,
                 staged_rows,
             )
+        })
+        .await
     }
 
     pub(crate) async fn load_managed_model_state_with_portable_copies(
@@ -3358,11 +3376,8 @@ impl Engine {
         rows: (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .load_managed_model_state_with_portable_copies_and_rows(
+        self.with_core_on_device(|core| {
+            core.load_managed_model_state_with_portable_copies_and_rows(
                 model_instance,
                 retained_state,
                 logical_context_tokens,
@@ -3372,6 +3387,8 @@ impl Engine {
                 // ASR loads reconcile their observed weight growth.
                 StateFitReserve::MeasuredUntracked,
             )
+        })
+        .await
     }
 
     pub(crate) async fn load_composite_retained_state(
@@ -3382,14 +3399,16 @@ impl Engine {
         logical_context_tokens: Option<usize>,
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
-        let _step = self.step_gate.lock().await;
-        self.core.write().await.load_composite_retained_state(
-            model_instance,
-            contract,
-            static_domain,
-            logical_context_tokens,
-            minimum_tokens,
-        )
+        self.with_core_on_device(|core| {
+            core.load_composite_retained_state(
+                model_instance,
+                contract,
+                static_domain,
+                logical_context_tokens,
+                minimum_tokens,
+            )
+        })
+        .await
     }
 
     pub(crate) async fn load_retained_tensor_state(
@@ -3398,12 +3417,10 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         sequence_capacity: u32,
     ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
-        let _step = self.step_gate.lock().await;
-        self.core.write().await.load_retained_tensor_state(
-            model_instance,
-            contract,
-            sequence_capacity,
-        )
+        self.with_core_on_device(|core| {
+            core.load_retained_tensor_state(model_instance, contract, sequence_capacity)
+        })
+        .await
     }
 
     pub(crate) async fn resolve_and_load_invocation_workspace(
@@ -3416,11 +3433,8 @@ impl Engine {
         domain: &crate::kv::v2::InvocationWorkspaceDomain,
         slot_count: u32,
     ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .resolve_and_load_invocation_workspace(
+        self.with_core_on_device(|core| {
+            core.resolve_and_load_invocation_workspace(
                 model_instance,
                 adapter_instance,
                 stage_graph,
@@ -3429,6 +3443,8 @@ impl Engine {
                 domain,
                 slot_count,
             )
+        })
+        .await
     }
 
     /// Retire the managed KV arenas for one exact loaded-model generation.
@@ -3436,11 +3452,8 @@ impl Engine {
         &self,
         model_instance: ModelInstanceId,
     ) -> Result<bool> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
+        self.with_core_on_device(|core| core.unload_managed_model_cache(model_instance))
             .await
-            .unload_managed_model_cache(model_instance)
     }
 
     /// Abort every request currently tracked by the engine.
@@ -5919,6 +5932,36 @@ mod tests {
     fn asr_streaming_queue_default_handles_character_level_deltas() {
         let asr_request = EngineCoreRequest::asr("audio");
         assert_eq!(Engine::streaming_queue_capacity(&asr_request), 4096);
+    }
+
+    /// B4: allocating a model's managed KV state at load and its unload
+    /// drain and free run on the device thread, not on the lifecycle task.
+    #[tokio::test]
+    async fn managed_state_load_and_unload_run_on_the_device_thread() {
+        let engine = Engine::new(EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let model_instance = ModelInstanceId::new(4401);
+        let capability = crate::kv::InferenceStateCapability::Managed(crate::kv::test_contract());
+        let watch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::backends::device_thread::watch_off_thread_ops(Some(watch.clone()));
+
+        engine.synchronize_worker_device().await.expect("synchronize");
+        let runtime = engine
+            .load_managed_model_cache(model_instance, &capability, None)
+            .await
+            .expect("load managed state")
+            .expect("managed runtime");
+        drop(runtime);
+        assert!(engine
+            .unload_managed_model_cache(model_instance)
+            .await
+            .expect("unload managed state"));
+
+        crate::backends::device_thread::watch_off_thread_ops(None);
+        assert_eq!(watch.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

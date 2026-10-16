@@ -28,7 +28,6 @@ use crate::model::ModelVariant;
 use crate::models::architectures::fish_s2::FishS2PhysicalStateSpec;
 use crate::models::architectures::qwen3::asr::Qwen3AsrContextBound;
 use crate::models::registry::NativeAsrModel;
-use crate::models::shared::memory::metal::MetalPoolManager;
 use crate::models::shared::weights::gguf::TensorStorageInventory;
 use crate::runtime::adapters::{
     CapabilityKind, LoadedExecutionContract, LoadedModelBundleDraft, LoadedStatePublication,
@@ -2172,7 +2171,7 @@ impl ModelLifecycleController {
     /// stops tracking it, and releases its pool only after a clean wait, so a
     /// failed synchronization is retried once.
     async fn flush_metal_pools(&self) {
-        MetalPoolManager::global().clear_all();
+        self.clear_metal_pools_on_device();
         for attempt in 1..=2 {
             match self.core_engine.synchronize_worker_device().await {
                 Ok(()) => return,

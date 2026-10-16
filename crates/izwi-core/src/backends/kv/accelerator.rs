@@ -2812,6 +2812,7 @@ impl super::KvBackendRuntime for MetalKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CandleAcceleratorKvArena::new_mutation_only(
             config,
             self.device.clone(),
@@ -2838,6 +2839,7 @@ impl KvBackendRuntime for CudaKvBackendRuntime {
     }
 
     fn allocate_arena(&self, config: KvArenaConfig) -> Result<Arc<dyn KvArena>> {
+        probe_device_op("kv.allocate_arena");
         Ok(Arc::new(CandleAcceleratorKvArena::new_mutation_only(
             config,
             self.device.clone(),

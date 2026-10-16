@@ -891,6 +891,12 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    /// The thread that runs this engine's device work (model calls, KV page
+    /// operations, state allocation and frees), if its executor has a device.
+    pub(crate) fn device_thread(&self) -> Option<Arc<crate::backends::DeviceThread>> {
+        self.executor.device_thread().cloned()
+    }
+
     pub(crate) fn synchronize_worker_device(&self) -> Result<()> {
         self.managed_kv_cache.synchronize_worker()
     }

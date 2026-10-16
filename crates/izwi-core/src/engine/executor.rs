@@ -4313,6 +4313,11 @@ impl UnifiedExecutor {
         }
     }
 
+    /// The thread that runs this executor's device work, if it has a device.
+    pub(crate) fn device_thread(&self) -> Option<&Arc<DeviceThread>> {
+        self.device.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn with_device_for_test(mut self, device: Arc<DeviceThread>) -> Self {
         self.device = Some(device);
@@ -4828,30 +4833,52 @@ impl UnifiedExecutor {
         executor.shutdown()
     }
 
+    /// Run `work` against the executor on the device thread: executor state
+    /// holds device tensors, so releasing or suspending it frees device
+    /// memory. Device-less test executors run it inline.
+    async fn on_device<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn ModelExecutor) -> T + Send + 'static,
+    ) -> Result<T> {
+        match &self.device {
+            Some(device) => {
+                let executor = self.inner.clone();
+                device
+                    .submit(move || work(executor.blocking_read().as_ref()))
+                    .await
+            }
+            None => Ok(work(self.inner.read().await.as_ref())),
+        }
+    }
+
     /// Cleanup transient backend state for a completed/aborted request.
     pub async fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.cleanup_request(request_id)
+        let request_id = request_id.to_string();
+        self.on_device(move |executor| executor.cleanup_request(&request_id))
+            .await
+            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 
     pub(crate) async fn suspend_session_for_capacity(
         &self,
         session: &SessionKey,
     ) -> Result<Option<usize>> {
-        self.inner
-            .read()
-            .await
-            .suspend_session_for_capacity(session)
+        let session = session.clone();
+        self.on_device(move |executor| executor.suspend_session_for_capacity(&session))
+            .await?
     }
 
     pub async fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.cleanup_session(session)
+        let session = session.clone();
+        self.on_device(move |executor| executor.cleanup_session(&session))
+            .await
+            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
-        let executor = self.inner.read().await;
-        executor.purge_model_cache(variant)
+        self.on_device(move |executor| executor.purge_model_cache(variant))
+            .await
+            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 }
 

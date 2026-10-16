@@ -1442,6 +1442,100 @@ mod stream_tests {
         assert_streams_on(&device);
     }
 
+    /// Two request streams on one Metal device, run concurrently, read back
+    /// exactly what they read back alone, on every iteration: a tiny model
+    /// decoding through the accelerator KV arena, and greedy sampling of
+    /// uploaded logits (Phase 2.2 saw this sampler read back token 0 while a
+    /// model decoded on another thread). Each stream's device work runs on
+    /// the device thread, interleaved step by step as the engine interleaves
+    /// requests. Ignored soak:
+    /// `cargo test -p izwi-core --features metal --lib concurrent_streams_on_one_metal_device -- --ignored`
+    /// (`IZWI_DEVICE_SOAK_ITERATIONS`, default 50).
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "Metal soak; run explicitly"]
+    fn concurrent_streams_on_one_metal_device_match_a_serial_run() {
+        use crate::models::shared::sampling::ChatSampler;
+
+        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+            "qwen3 concurrent_streams_on_one_metal_device_match_a_serial_run",
+        ) else {
+            return;
+        };
+        let iterations = std::env::var("IZWI_DEVICE_SOAK_ITERATIONS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(50);
+        let device_thread =
+            crate::backends::DeviceThread::for_device(&device).expect("device thread");
+        let on_device = |work: &mut (dyn FnMut() + Send)| {
+            device_thread.run_sync(work).expect("device job");
+        };
+        let model = tiny_chat_model(&device, ASCII_PIECES);
+        let configs = [ChatGenerationConfig::default()];
+        let decode_stream = || {
+            let mut state = None;
+            on_device(&mut || state = prefilled_rows(&model, &device, &configs, 40).pop());
+            let mut state = state.expect("prefilled row");
+            for _ in 0..32 {
+                on_device(&mut || {
+                    model.decode_step(&mut state).expect("decode step");
+                });
+            }
+            state.generated_ids.clone()
+        };
+        // Unstructured logits whose greedy pick the host knows exactly.
+        const WIDTH: usize = 1_500;
+        let logits = |step: u64| {
+            let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ step.wrapping_mul(0x2545_F491);
+            (0..WIDTH)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 40) as f32 / (1u64 << 24) as f32 * 8.0 - 4.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let sampler_stream = || {
+            let mut sampler = ChatSampler::new(ChatGenerationConfig::default(), &[]);
+            (0..64)
+                .map(|step| {
+                    let mut token = None;
+                    let values = logits(step);
+                    on_device(&mut || {
+                        let logits = Tensor::from_vec(values.clone(), WIDTH, &device).unwrap();
+                        token = Some(sampler.sample(&logits, WIDTH).expect("sample"));
+                    });
+                    token.expect("sampled token")
+                })
+                .collect::<Vec<_>>()
+        };
+        let greedy = (0..64)
+            .map(|step| {
+                let values = logits(step);
+                (0..WIDTH)
+                    .max_by(|&left, &right| values[left].total_cmp(&values[right]))
+                    .expect("non-empty logits") as u32
+            })
+            .collect::<Vec<_>>();
+        let expected_decode = decode_stream();
+        assert_eq!(expected_decode.len(), 32);
+        assert_eq!(sampler_stream(), greedy);
+        for iteration in 0..iterations {
+            let (decoded, sampled) = std::thread::scope(|scope| {
+                let decode = scope.spawn(decode_stream);
+                let sample = scope.spawn(sampler_stream);
+                (
+                    decode.join().expect("decode stream"),
+                    sample.join().expect("sampler stream"),
+                )
+            });
+            assert_eq!(decoded, expected_decode, "iteration {iteration}: decode stream");
+            assert_eq!(sampled, greedy, "iteration {iteration}: sampler stream");
+        }
+    }
+
     /// A step of a multi-row batch reads the device back once, whatever mix
     /// of greedy, sampled and logprob rows it holds.
     fn assert_one_readback_per_batch_step(device: &Device) {
