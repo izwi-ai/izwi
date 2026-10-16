@@ -494,3 +494,30 @@ the terminal SSE event, and the peak footprint per model. With `--asr-base`,
 every WAV is transcribed by a separately started ASR server (Nemotron on CPU
 by default) and scored by WER. The deterministic checks live in
 `test-score-tts-matrix.py`.
+
+## Realtime voice and transcription load
+
+`run-voice-realtime-load.py` opens N concurrent realtime sessions against a
+running `izwi-server` and reports latency percentiles across every turn of
+every session. In `voice` mode each session speaks a WAV utterance in real
+time (20 ms frames plus trailing silence) to `/v1/voice/realtime/ws` for
+`--turns` turns and records, from the server's `user_speech_end`, the time to
+the first assistant audio frame, to the final transcript and to `turn_done`.
+In `transcription` mode it streams the WAV to `/v1/speech-to-text/realtime/ws`
+and records the first partial and the final after `session_stop`.
+
+```bash
+cargo build --release -p izwi-server --features izwi-server/metal
+scripts/bench/run-voice-realtime-load.py --base-url http://127.0.0.1:8080 \
+    --sessions 2 --turns 4 --audio data/fox.wav \
+    --asr-model Parakeet-TDT-0.6B-v3 --text-model LFM2.5-1.2B-Instruct-GGUF \
+    --tts-model Kokoro-82M \
+    --metrics-url http://127.0.0.1:8080/v1/metrics/prometheus --json-out target/voice-load.json
+```
+
+With `--metrics-url` the report also carries the server's voice latency
+histograms (`izwi_voice_turn_first_audio_seconds` and the ASR, reply and TTS
+stages) as p50/p95 of their bucket deltas over the run. Run one warm-up
+session first so model loads are not measured. It is standard-library Python
+(a minimal RFC 6455 client); its tests are `test-voice-realtime-load.py`, run
+in the hygiene lane.

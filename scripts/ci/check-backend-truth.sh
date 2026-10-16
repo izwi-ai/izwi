@@ -542,6 +542,7 @@ run_hygiene() {
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-asr-matrix.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-score-tts-matrix.py
     PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-serving-benchmark.py
+    PYTHONDONTWRITEBYTECODE=1 python3 scripts/bench/test-voice-realtime-load.py
 }
 
 run_cargo_cuda_compile() {
