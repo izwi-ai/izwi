@@ -41,9 +41,9 @@ use crate::app::realtime_protocol::{
     RealtimeServerEvent, TRANSCRIPTION_REALTIME_VERSION,
 };
 use crate::app::realtime_relay::{
-    attested_caller, close_client, dial_worker_session, realtime_selection_request, reject_client,
-    GatewayRealtimeRelay, RelayStage, SessionGuard, SessionRegistration, SessionRegistryError,
-    WorkerSide, REGISTRATION_TTL,
+    attested_caller, close_client, realtime_selection_request, reject_client, GatewayRealtimeRelay,
+    RelayStage, SessionGuard, SessionRegistration, SessionRegistryError, WorkerSide,
+    REGISTRATION_TTL,
 };
 use crate::app::transcription_realtime::{
     negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
@@ -1185,13 +1185,9 @@ async fn dial_asr_worker(
         ));
     }
 
-    let mut worker = match dial_worker_session(
-        &selected.client.endpoint(),
-        relay.worker_credentials(),
-        &admit,
-        &context.trace,
-    )
-    .await
+    let mut worker = match relay
+        .dial_worker(&selected.client.endpoint(), &admit, &context.trace)
+        .await
     {
         Ok(worker) => worker,
         Err(_) => {

@@ -173,6 +173,55 @@ fn parse_pem_items(
         .map_err(|_| WorkerClientError::InvalidConfiguration(error))
 }
 
+/// The DER certificates of validated PEM material.
+fn pem_certificates(pem: &[u8]) -> Result<Vec<Vec<u8>>, WorkerClientError> {
+    Ok(parse_pem_items(pem, "certificate PEM is invalid")?
+        .into_iter()
+        .filter_map(|item| match item {
+            rustls_pemfile::Item::X509Certificate(der) => Some(der),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The certificate chain and private key of a validated mTLS identity.
+fn pem_identity(
+    pem: &[u8],
+) -> Result<
+    (
+        Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    WorkerClientError,
+> {
+    use tokio_rustls::rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    };
+    let mut certificates = Vec::new();
+    let mut key = None;
+    for item in parse_pem_items(pem, "mTLS identity is not valid PEM")? {
+        match item {
+            rustls_pemfile::Item::X509Certificate(der) => {
+                certificates.push(CertificateDer::from(der));
+            }
+            rustls_pemfile::Item::PKCS8Key(der) => {
+                key = Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)));
+            }
+            rustls_pemfile::Item::RSAKey(der) => {
+                key = Some(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)));
+            }
+            rustls_pemfile::Item::ECKey(der) => {
+                key = Some(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)));
+            }
+            _ => {}
+        }
+    }
+    let key = key.ok_or(WorkerClientError::InvalidConfiguration(
+        "mTLS identity has no private key",
+    ))?;
+    Ok((certificates, key))
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerClientConfig {
     pub max_in_flight: usize,

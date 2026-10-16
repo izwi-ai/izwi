@@ -2151,6 +2151,140 @@ mod tests {
         status
     }
 
+    /// A realtime client that stops reading its socket must not stall the
+    /// relay's client-to-worker direction: its cancel still reaches the
+    /// worker, which ends the session at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn realtime_relay_forwards_a_cancel_while_the_client_is_not_reading() {
+        use crate::app::realtime_relay::{GatewayRealtimeRelay, RealtimeRelayConfig};
+        use futures::SinkExt;
+        use izwi_serving_protocol::{
+            GatewayAttestedCallerContext, ModelGeneration, PermittedAction, RealtimeClientFrame,
+            RealtimeSessionAdmit, RealtimeStageInput, ServiceClass, TaskKind, PROTOCOL_V1,
+            REALTIME_SUBPROTOCOL,
+        };
+        use izwi_serving_worker::test_support::TestTtsStage;
+        use tokio_tungstenite::tungstenite::{
+            client::IntoClientRequest, http::HeaderValue, Message,
+        };
+
+        let model = ModelVariant::Qwen354BGguf;
+        let alias = ModelAlias::new(model.dir_name()).expect("static model alias");
+        let (state, _chat_worker) = registry_gateway_state(model).await;
+        // A long synthesis that outruns any socket buffer, and a worker that
+        // queues frames rather than dropping a slow gateway, so only a cancel
+        // can end the session early.
+        let tts_worker = TestWorker::spawn(TestWorkerConfig {
+            worker_id: "test-tts-worker".try_into().expect("test id valid"),
+            deployment_id: "test-tts-v1".try_into().expect("test id valid"),
+            public_model: alias.clone(),
+            realtime_tts: Some(TestTtsStage {
+                chunk_bytes: 4096,
+                chunk_count: 1_000_000,
+                push_cadence: Duration::from_millis(1),
+                output_sample_rate: 24_000,
+                disconnect_after_frames: None,
+            }),
+            realtime_max_outbound_queue: 1_000_000,
+            ..TestWorkerConfig::default()
+        })
+        .await
+        .expect("tts worker binds");
+        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        approve_worker(&registry, &tts_worker).await;
+        let relay = GatewayRealtimeRelay::new(
+            registry,
+            RealtimeRelayConfig {
+                deployment_id: None,
+                tts_deployment_id: Some("test-tts-v1".try_into().expect("test id valid")),
+                public_model: alias,
+                policy_revision: PolicyRevision::new("policy-v1").unwrap(),
+                backend_policy: BackendPolicy::ANY,
+                max_sessions: 4,
+                session_budget: Duration::from_secs(60),
+            },
+            tts_worker.config().credentials.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        let app = create_gateway_router(
+            state.with_realtime_relay(relay),
+            &ServeRuntimeConfig::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut request = format!("ws://127.0.0.1:{port}/v1/realtime/ws")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static(REALTIME_SUBPROTOCOL),
+        );
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let control = |frame: &RealtimeClientFrame| {
+            Message::Text(serde_json::to_string(frame).unwrap().into())
+        };
+        let admit = RealtimeSessionAdmit {
+            schema_version: PROTOCOL_V1,
+            session_id: "relay-cancel-session".try_into().unwrap(),
+            request_id: "relay-cancel-request".try_into().unwrap(),
+            attempt_id: "relay-cancel-attempt".try_into().unwrap(),
+            expected_worker_incarnation: "ignored".try_into().unwrap(),
+            deployment_id: "test-tts-v1".try_into().unwrap(),
+            expected_model_generation: ModelGeneration::new(1).unwrap(),
+            caller: GatewayAttestedCallerContext {
+                tenant_id: "client-tenant".try_into().unwrap(),
+                caller_id: "client-caller".try_into().unwrap(),
+                policy_revision: "client-policy".try_into().unwrap(),
+                permitted_actions: [PermittedAction::Invoke].into_iter().collect(),
+                allowed_data_regions: vec![],
+            },
+            task: TaskKind::TextToSpeech,
+            service_class: ServiceClass::Realtime,
+            remaining_time_ms: 60_000,
+            input: RealtimeStageInput::TextStream,
+        };
+        ws.send(control(&RealtimeClientFrame::Admit {
+            admit: Box::new(admit),
+        }))
+        .await
+        .unwrap();
+        ws.send(control(&RealtimeClientFrame::Input {
+            text: "a long utterance".into(),
+        }))
+        .await
+        .unwrap();
+        ws.send(control(&RealtimeClientFrame::Finish))
+            .await
+            .unwrap();
+
+        // The client reads nothing while about 12 MB of audio is synthesized,
+        // far more than the sockets between it and the relay can hold.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(tts_worker.active_invocations(), 1, "synthesis is running");
+        ws.send(control(&RealtimeClientFrame::Cancel))
+            .await
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+            while tts_worker.active_invocations() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the cancel must reach the worker while the client is not reading"
+        );
+        drop(ws);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
         let model = ModelVariant::Qwen354BGguf;

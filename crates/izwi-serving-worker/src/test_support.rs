@@ -11,9 +11,9 @@
 use crate::{
     AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
     ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
-    RealtimeTtsStageStream, WorkerConfig, WorkerService, DEFAULT_ATTEMPT_RETENTION,
-    DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_EVENT_BYTES, DEFAULT_SLOW_CONSUMER_TIMEOUT,
-    REALTIME_SESSION_DEFAULT_LIMITS,
+    RealtimeTtsStageStream, RuntimeRealtimeSessionLimits, WorkerConfig, WorkerService,
+    DEFAULT_ATTEMPT_RETENTION, DEFAULT_EVENT_CHANNEL_CAPACITY, DEFAULT_MAX_EVENT_BYTES,
+    DEFAULT_SLOW_CONSUMER_TIMEOUT, REALTIME_SESSION_DEFAULT_LIMITS,
 };
 use async_trait::async_trait;
 use izwi_core::{AudioChunk, RuntimeAsrRealtimeEvent};
@@ -158,6 +158,9 @@ pub struct TestWorkerConfig {
     /// Serve a realtime text_to_speech deployment instead of chat. Exclusive
     /// with `realtime`.
     pub realtime_tts: Option<TestTtsStage>,
+    /// Realtime frames queued toward the gateway before the worker treats it
+    /// as gone.
+    pub realtime_max_outbound_queue: usize,
     /// Input tokens served from the prefix cache, reported on completion.
     pub usage_cached_input_tokens: Option<u64>,
     /// Logprob entries the runtime attaches to every text delta.
@@ -202,6 +205,7 @@ impl Default for TestWorkerConfig {
             ready: true,
             realtime: None,
             realtime_tts: None,
+            realtime_max_outbound_queue: REALTIME_SESSION_DEFAULT_LIMITS.max_outbound_queue,
             usage_cached_input_tokens: None,
             delta_logprobs: None,
             protocol_version: PROTOCOL_V1,
@@ -312,7 +316,10 @@ impl TestWorkerConfig {
             event_channel_capacity: self.event_channel_capacity,
             max_event_bytes: DEFAULT_MAX_EVENT_BYTES,
             slow_consumer_timeout: DEFAULT_SLOW_CONSUMER_TIMEOUT,
-            realtime_session_limits: REALTIME_SESSION_DEFAULT_LIMITS,
+            realtime_session_limits: RuntimeRealtimeSessionLimits {
+                max_outbound_queue: self.realtime_max_outbound_queue,
+                ..REALTIME_SESSION_DEFAULT_LIMITS
+            },
         };
         config.validate().map_err(std::io::Error::other)?;
         Ok(config)

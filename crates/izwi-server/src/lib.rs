@@ -1307,6 +1307,7 @@ async fn gateway_state(
                 session_budget: Duration::from_millis(args.gateway_realtime_session_budget_ms),
             },
             credentials,
+            client_config.tls.clone(),
         )
         .map_err(|error| anyhow::anyhow!(error))?;
         info!(

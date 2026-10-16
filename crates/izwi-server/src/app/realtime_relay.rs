@@ -24,15 +24,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::{SinkExt, StreamExt};
+use izwi_serving_client::realtime::{RealtimeClientConfig, RealtimeClientError, WorkerSocket};
+use izwi_serving_client::WorkerClientTlsConfig;
 use izwi_serving_protocol::{
     decode_realtime_audio_frame, AttemptId, CallerId, CancellationBehavior, DeploymentId,
     GatewayAttestedCallerContext, InputFormat, InvocationErrorCode, InvocationEvent,
     InvocationEventKind, ModelAlias, ModelGeneration, OutputFormat, PermittedAction,
     PolicyRevision, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
     RealtimeSessionCloseCode, RequestId, ServiceClass, ServiceCredentials, SessionId, TaskKind,
-    TenantId, TraceContext, WorkerId, PROTOCOL_V1, REALTIME_SUBPROTOCOL, REALTIME_WS_PATH,
-    SERVICE_AUTHORIZATION_HEADER, SERVICE_AUTH_SCHEME, SERVICE_CREDENTIAL_ID_HEADER,
-    TRACEPARENT_HEADER,
+    TenantId, TraceContext, WorkerId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -41,21 +41,17 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    tungstenite::{
-        client::IntoClientRequest, http::HeaderValue, Error as WsError, Message as WireMessage,
-    },
-    MaybeTlsStream, WebSocketStream,
-};
-
-type WorkerWire = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use tokio_tungstenite::tungstenite::Message as WireMessage;
 
 /// How long the relay waits for the client's first admit frame.
 const CLIENT_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the relay waits for the worker's admitted echo.
-const WORKER_ADMIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for one frame write toward either peer. A peer that cannot take
+/// a frame for this long ends the session; it never stalls the other
+/// direction.
+const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Frames queued toward one peer while its writer is busy.
+const RELAY_QUEUE_FRAMES: usize = 64;
 /// How long an unused registration slot is held before TTL eviction.
 pub(crate) const REGISTRATION_TTL: Duration = Duration::from_secs(3600);
 /// Client control frames are tiny; anything larger is refused before parse.
@@ -206,6 +202,8 @@ pub struct GatewayRealtimeRelay {
     sessions: RealtimeSessionRegistry,
     config: RealtimeRelayConfig,
     worker_credentials: ServiceCredentials,
+    /// Worker socket dial deadlines and TLS (private CA, mTLS identity).
+    dial: RealtimeClientConfig,
 }
 
 impl fmt::Debug for GatewayRealtimeRelay {
@@ -222,6 +220,7 @@ impl GatewayRealtimeRelay {
         registry: WorkerRegistry,
         config: RealtimeRelayConfig,
         worker_credentials: ServiceCredentials,
+        worker_tls: WorkerClientTlsConfig,
     ) -> Result<Self, String> {
         if config.max_sessions == 0 {
             return Err("realtime relay max_sessions must be non-zero".into());
@@ -234,6 +233,10 @@ impl GatewayRealtimeRelay {
             sessions: RealtimeSessionRegistry::new(config.max_sessions),
             config,
             worker_credentials,
+            dial: RealtimeClientConfig {
+                tls: worker_tls,
+                ..RealtimeClientConfig::default()
+            },
         })
     }
 
@@ -249,8 +252,28 @@ impl GatewayRealtimeRelay {
         &self.registry
     }
 
-    pub(crate) fn worker_credentials(&self) -> &ServiceCredentials {
-        &self.worker_credentials
+    /// Dials an admitted worker session over the shared serving-client
+    /// dialer, with the gateway's worker TLS.
+    pub(crate) async fn dial_worker(
+        &self,
+        endpoint: &str,
+        admit: &RealtimeSessionAdmit,
+        trace: &TraceContext,
+    ) -> Result<WorkerSide, RealtimeClientError> {
+        let dialed = izwi_serving_client::realtime::dial(
+            endpoint,
+            &self.worker_credentials,
+            admit,
+            Some(trace),
+            &self.dial,
+        )
+        .await?;
+        let (sink, source) = dialed.stream.split();
+        Ok(WorkerSide {
+            sink,
+            source,
+            admitted_message: Message::Text(Utf8Bytes::from(dialed.admitted_frame)),
+        })
     }
 }
 
@@ -459,13 +482,9 @@ async fn run_relay_session(
         remaining_time_ms: relay.config().session_budget.as_millis() as u64,
         input: requested.input.clone(),
     };
-    let mut worker = match dial_worker_session(
-        &selected.client.endpoint(),
-        relay.worker_credentials(),
-        &admit,
-        &context.trace,
-    )
-    .await
+    let worker = match relay
+        .dial_worker(&selected.client.endpoint(), &admit, &context.trace)
+        .await
     {
         Ok(worker) => worker,
         Err(_) => {
@@ -511,156 +530,213 @@ async fn run_relay_session(
         REGISTRATION_TTL,
     );
 
-    // The client reader forwards actions; the pump below owns every write.
-    let (action_tx, mut action_rx) = mpsc::channel::<ClientAction>(16);
+    // Three tasks, so neither direction can stall the other: the client
+    // writer owns the client socket's sink, client actions go straight to
+    // the worker, and worker frames go to the client writer's queue. A slow
+    // client therefore never delays a cancel or barge-in toward the worker.
+    let (action_tx, action_rx) = mpsc::channel::<ClientAction>(16);
     let reader = tokio::spawn(read_client_actions(client_source, action_tx));
-
-    // Announce the negotiated contract verbatim, then relay. Sink and source
-    // are disjoint after the worker split, so both directions race here.
-    if client_sink.send(worker.admitted_message).await.is_err() {
-        let _ = worker.sink.send(WireMessage::Close(None)).await;
+    let (client_tx, client_rx) = mpsc::channel::<Message>(RELAY_QUEUE_FRAMES);
+    let client_writer = tokio::spawn(write_client(client_sink, client_rx));
+    if client_tx.send(worker.admitted_message).await.is_err() {
         reader.abort();
         return;
     }
-
-    let mut terminal_seen = false;
-    loop {
-        tokio::select! {
-            biased;
-            action = action_rx.recv() => {
-                match action {
-                    Some(ClientAction::Audio(frame)) => {
-                        // Passthrough: the client's framed sequence numbers
-                        // reach the worker unchanged, so worker-side
-                        // monotonicity enforcement sees exactly what a
-                        // direct client would send.
-                        if worker.sink.send(WireMessage::Binary(frame.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(ClientAction::Text(text)) => {
-                        if worker
-                            .sink
-                            .send(control_wire(&RealtimeClientFrame::Input { text }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some(ClientAction::Finish) => {
-                        if worker
-                            .sink
-                            .send(control_wire(&RealtimeClientFrame::Finish))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some(ClientAction::Cancel) => {
-                        if worker
-                            .sink
-                            .send(control_wire(&RealtimeClientFrame::Cancel))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some(ClientAction::Ping) => {
-                        let pong =
-                            serde_json::to_string(&RealtimeServerFrame::Pong).expect("pong encodes");
-                        let _ = client_sink.send(Message::Text(pong.into())).await;
-                    }
-                    Some(ClientAction::Violation(reason)) => {
-                        let error = error_message(
-                            &admit.request_id,
-                            &admit.attempt_id,
-                            InvocationErrorCode::InvalidInput,
-                            reason,
-                        );
-                        let _ = client_sink.send(Message::Text(error.into())).await;
-                        close_client(
-                            &mut client_sink,
-                            Some(RealtimeSessionCloseCode::ProtocolViolation),
-                        )
-                        .await;
-                        break;
-                    }
-                    // Client left: request cooperative teardown toward the
-                    // worker; its session ends on its own cancellation ladder.
-                    Some(ClientAction::Gone) | None => {
-                        let _ = worker
-                            .sink
-                            .send(control_wire(&RealtimeClientFrame::Cancel))
-                            .await;
-                        break;
-                    }
-                }
-            }
-            wire = worker.source.next() => {
-                match wire {
-                    Some(Ok(WireMessage::Text(text))) => {
-                        // Relay verbatim; decode only to track the terminal
-                        // outcome for owner-loss classification.
-                        if let Ok(RealtimeServerFrame::Event { event }) =
-                            serde_json::from_str::<RealtimeServerFrame>(&text)
-                        {
-                            if matches!(
-                                event.event,
-                                InvocationEventKind::Completed { .. }
-                                    | InvocationEventKind::Error { .. }
-                                    | InvocationEventKind::Cancelled { .. }
-                            ) {
-                                terminal_seen = true;
-                            }
-                        }
-                        let relayed = Utf8Bytes::from(text.as_str());
-                        if client_sink.send(Message::Text(relayed)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WireMessage::Close(frame))) => {
-                        let code = frame.as_ref().map(|frame| u16::from(frame.code)).unwrap_or(1000);
-                        let reason = frame
-                            .as_ref()
-                            .map(|frame| Utf8Bytes::from(frame.reason.as_str()))
-                            .unwrap_or_else(|| Utf8Bytes::from_static("session complete"));
-                        let _ = client_sink
-                            .send(Message::Close(Some(CloseFrame { code, reason })))
-                            .await;
-                        break;
-                    }
-                    Some(Ok(WireMessage::Binary(data))) => {
-                        // Passthrough (TTS-stream audio): the worker's framed
-                        // sequence numbers reach the client unchanged.
-                        if client_sink.send(Message::Binary(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(_)) | Some(Err(_)) | None => {
-                        // Owner loss: no terminal event, no close frame. The
-                        // client gets an explicit interruption event and a
-                        // close; reconnecting is always a new session.
-                        if !terminal_seen {
-                            let error = error_message(
-                                &admit.request_id,
-                                &admit.attempt_id,
-                                InvocationErrorCode::Internal,
-                                "realtime worker session was lost",
-                            );
-                            let _ = client_sink.send(Message::Text(error.into())).await;
-                        }
-                        close_client(&mut client_sink, Some(RealtimeSessionCloseCode::Internal))
-                            .await;
-                        break;
-                    }
-                }
-            }
-        }
+    let ids = (admit.request_id.clone(), admit.attempt_id.clone());
+    let mut to_worker = tokio::spawn(forward_client_actions(
+        action_rx,
+        worker.sink,
+        client_tx.clone(),
+        ids.clone(),
+    ));
+    let mut to_client = tokio::spawn(forward_worker_frames(worker.source, client_tx, ids));
+    // Either direction ending ends the session: the client left or broke the
+    // protocol, or the worker finished, closed, or was lost. Dropping the
+    // other direction's half closes the worker socket.
+    tokio::select! {
+        _ = &mut to_worker => to_client.abort(),
+        _ = &mut to_client => to_worker.abort(),
     }
     reader.abort();
+    // The client writer drains what is queued (terminal events, the close
+    // frame) and exits once every sender is gone.
+    let _ = tokio::time::timeout(RELAY_SEND_TIMEOUT, client_writer).await;
+}
+
+/// Writes queued frames to the client, each within the send deadline. Ends
+/// when the queue closes or the client cannot take a frame in time.
+async fn write_client(
+    mut client_sink: futures::stream::SplitSink<WebSocket, Message>,
+    mut frames: mpsc::Receiver<Message>,
+) {
+    while let Some(frame) = frames.recv().await {
+        let closing = matches!(frame, Message::Close(_));
+        match tokio::time::timeout(RELAY_SEND_TIMEOUT, client_sink.send(frame)).await {
+            Ok(Ok(())) if !closing => {}
+            _ => return,
+        }
+    }
+    let _ = tokio::time::timeout(RELAY_SEND_TIMEOUT, client_sink.close()).await;
+}
+
+/// Queues a frame for the client writer. False when the client is gone or
+/// has not drained a frame within the send deadline.
+async fn queue_for_client(client_tx: &mpsc::Sender<Message>, frame: Message) -> bool {
+    matches!(
+        tokio::time::timeout(RELAY_SEND_TIMEOUT, client_tx.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
+fn close_message(code: Option<RealtimeSessionCloseCode>) -> Message {
+    let frame = code
+        .map(|code| CloseFrame {
+            code: code.code(),
+            reason: Utf8Bytes::from_static(code.reason()),
+        })
+        .unwrap_or(CloseFrame {
+            code: 1000,
+            reason: Utf8Bytes::from_static("session complete"),
+        });
+    Message::Close(Some(frame))
+}
+
+/// Client to worker: forwards each client action with a send deadline.
+/// Pings are answered through the client writer, never inline.
+async fn forward_client_actions(
+    mut actions: mpsc::Receiver<ClientAction>,
+    mut worker_sink: futures::stream::SplitSink<WorkerSocket, WireMessage>,
+    client_tx: mpsc::Sender<Message>,
+    (request_id, attempt_id): (RequestId, AttemptId),
+) {
+    while let Some(action) = actions.recv().await {
+        // Passthrough: the client's framed sequence numbers reach the worker
+        // unchanged, so worker-side monotonicity enforcement sees exactly
+        // what a direct client would send.
+        let frame = match action {
+            ClientAction::Audio(frame) => WireMessage::Binary(frame.into()),
+            ClientAction::Text(text) => control_wire(&RealtimeClientFrame::Input { text }),
+            ClientAction::Finish => control_wire(&RealtimeClientFrame::Finish),
+            ClientAction::Cancel => control_wire(&RealtimeClientFrame::Cancel),
+            ClientAction::Ping => {
+                let pong = serde_json::to_string(&RealtimeServerFrame::Pong).expect("pong encodes");
+                // A pong that does not fit is dropped; the client retries.
+                let _ = client_tx.try_send(Message::Text(pong.into()));
+                continue;
+            }
+            ClientAction::Violation(reason) => {
+                let error = error_message(
+                    &request_id,
+                    &attempt_id,
+                    InvocationErrorCode::InvalidInput,
+                    reason,
+                );
+                let _ = queue_for_client(&client_tx, Message::Text(error.into())).await;
+                let _ = queue_for_client(
+                    &client_tx,
+                    close_message(Some(RealtimeSessionCloseCode::ProtocolViolation)),
+                )
+                .await;
+                return;
+            }
+            // Client left: request cooperative teardown toward the worker;
+            // its session ends on its own cancellation ladder.
+            ClientAction::Gone => {
+                send_to_worker(&mut worker_sink, control_wire(&RealtimeClientFrame::Cancel)).await;
+                return;
+            }
+        };
+        if !send_to_worker(&mut worker_sink, frame).await {
+            return;
+        }
+    }
+    send_to_worker(&mut worker_sink, control_wire(&RealtimeClientFrame::Cancel)).await;
+}
+
+async fn send_to_worker(
+    worker_sink: &mut futures::stream::SplitSink<WorkerSocket, WireMessage>,
+    frame: WireMessage,
+) -> bool {
+    matches!(
+        tokio::time::timeout(RELAY_SEND_TIMEOUT, worker_sink.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Worker to client: relays every worker frame verbatim through the client
+/// writer, and surfaces owner loss as an explicit error event.
+async fn forward_worker_frames(
+    mut worker_source: futures::stream::SplitStream<WorkerSocket>,
+    client_tx: mpsc::Sender<Message>,
+    (request_id, attempt_id): (RequestId, AttemptId),
+) {
+    let mut terminal_seen = false;
+    loop {
+        let frame = match worker_source.next().await {
+            Some(Ok(WireMessage::Text(text))) => {
+                // Relay verbatim; decode only to track the terminal outcome
+                // for owner-loss classification.
+                if let Ok(RealtimeServerFrame::Event { event }) =
+                    serde_json::from_str::<RealtimeServerFrame>(&text)
+                {
+                    if matches!(
+                        event.event,
+                        InvocationEventKind::Completed { .. }
+                            | InvocationEventKind::Error { .. }
+                            | InvocationEventKind::Cancelled { .. }
+                    ) {
+                        terminal_seen = true;
+                    }
+                }
+                Message::Text(Utf8Bytes::from(text.as_str()))
+            }
+            // Passthrough (TTS-stream audio): the worker's framed sequence
+            // numbers reach the client unchanged.
+            Some(Ok(WireMessage::Binary(data))) => Message::Binary(data),
+            Some(Ok(WireMessage::Close(frame))) => {
+                let code = frame
+                    .as_ref()
+                    .map(|frame| u16::from(frame.code))
+                    .unwrap_or(1000);
+                let reason = frame
+                    .as_ref()
+                    .map(|frame| Utf8Bytes::from(frame.reason.as_str()))
+                    .unwrap_or_else(|| Utf8Bytes::from_static("session complete"));
+                let _ = queue_for_client(
+                    &client_tx,
+                    Message::Close(Some(CloseFrame { code, reason })),
+                )
+                .await;
+                return;
+            }
+            Some(Ok(WireMessage::Ping(_) | WireMessage::Pong(_) | WireMessage::Frame(_))) => {
+                continue;
+            }
+            Some(Err(_)) | None => {
+                // Owner loss: no terminal event, no close frame. The client
+                // gets an explicit interruption event and a close;
+                // reconnecting is always a new session.
+                if !terminal_seen {
+                    let error = error_message(
+                        &request_id,
+                        &attempt_id,
+                        InvocationErrorCode::Internal,
+                        "realtime worker session was lost",
+                    );
+                    let _ = queue_for_client(&client_tx, Message::Text(error.into())).await;
+                }
+                let _ = queue_for_client(
+                    &client_tx,
+                    close_message(Some(RealtimeSessionCloseCode::Internal)),
+                )
+                .await;
+                return;
+            }
+        };
+        if !queue_for_client(&client_tx, frame).await {
+            return;
+        }
+    }
 }
 
 /// Holds the registry entry until the session ends on any path.
@@ -811,16 +887,7 @@ pub(crate) async fn close_client(
     client_sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     code: Option<RealtimeSessionCloseCode>,
 ) {
-    let frame = code
-        .map(|code| CloseFrame {
-            code: code.code(),
-            reason: Utf8Bytes::from_static(code.reason()),
-        })
-        .unwrap_or(CloseFrame {
-            code: 1000,
-            reason: Utf8Bytes::from_static("session complete"),
-        });
-    let _ = client_sink.send(Message::Close(Some(frame))).await;
+    let _ = client_sink.send(close_message(code)).await;
 }
 
 pub(crate) async fn reject_client(
@@ -844,138 +911,9 @@ pub(crate) async fn reject_client(
 
 /// Worker-side session transport with the admitted echo already consumed.
 pub(crate) struct WorkerSide {
-    pub sink: futures::stream::SplitSink<WorkerWire, WireMessage>,
-    pub source: futures::stream::SplitStream<WorkerWire>,
+    pub sink: futures::stream::SplitSink<WorkerSocket, WireMessage>,
+    pub source: futures::stream::SplitStream<WorkerSocket>,
     pub admitted_message: Message,
-}
-
-/// Dial failures keep their own vocabulary: the client only learns the
-/// gateway could not establish the worker session.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum WorkerDialError {
-    #[error("worker endpoint is not a supported websocket origin")]
-    UnsupportedOrigin,
-    #[error(transparent)]
-    Handshake(#[from] WsError),
-    #[error("{0}")]
-    Protocol(&'static str),
-}
-
-pub(crate) async fn dial_worker_session(
-    endpoint: &str,
-    credentials: &ServiceCredentials,
-    admit: &RealtimeSessionAdmit,
-    trace: &TraceContext,
-) -> Result<WorkerSide, WorkerDialError> {
-    let base = endpoint.trim_end_matches('/');
-    let ws_url = if let Some(rest) = base.strip_prefix("https://") {
-        format!("wss://{rest}{REALTIME_WS_PATH}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}{REALTIME_WS_PATH}")
-    } else {
-        return Err(WorkerDialError::UnsupportedOrigin);
-    };
-    let mut request: tokio_tungstenite::tungstenite::http::Request<()> = ws_url
-        .into_client_request()
-        .map_err(|_| WorkerDialError::UnsupportedOrigin)?;
-    let headers = request.headers_mut();
-    headers.insert(
-        "sec-websocket-protocol",
-        HeaderValue::from_static(REALTIME_SUBPROTOCOL),
-    );
-    let authorization = HeaderValue::from_str(&format!(
-        "{SERVICE_AUTH_SCHEME} {}",
-        credentials.bearer_token.expose_secret()
-    ))
-    .map_err(|_| WorkerDialError::Protocol("worker bearer token is not a valid header value"))?;
-    headers.insert(SERVICE_AUTHORIZATION_HEADER, authorization);
-    let credential = HeaderValue::from_str(credentials.credential_id.as_str()).map_err(|_| {
-        WorkerDialError::Protocol("worker credential id is not a valid header value")
-    })?;
-    headers.insert(SERVICE_CREDENTIAL_ID_HEADER, credential);
-    let traceparent = HeaderValue::from_str(&trace.header_value())
-        .map_err(|_| WorkerDialError::Protocol("traceparent is not a valid header value"))?;
-    headers.insert(TRACEPARENT_HEADER, traceparent);
-
-    let handshake = tokio_tungstenite::connect_async(request);
-    let (mut stream, response) = tokio::time::timeout(WORKER_ADMIT_TIMEOUT, handshake)
-        .await
-        .map_err(|_| WorkerDialError::Protocol("worker dial timed out"))??;
-    let selected = response
-        .headers()
-        .get("sec-websocket-protocol")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().eq_ignore_ascii_case(REALTIME_SUBPROTOCOL));
-    if selected != Some(true) {
-        return Err(WorkerDialError::Protocol(
-            "worker did not select the izwi-realtime-v1 subprotocol",
-        ));
-    }
-
-    stream
-        .send(control_wire(&RealtimeClientFrame::Admit {
-            admit: Box::new(admit.clone()),
-        }))
-        .await
-        .map_err(|_| WorkerDialError::Protocol("admit send failed"))?;
-
-    // The admitted echo must arrive first and echo the identity.
-    loop {
-        let message = tokio::time::timeout(WORKER_ADMIT_TIMEOUT, stream.next())
-            .await
-            .map_err(|_| WorkerDialError::Protocol("worker admitted echo timed out"))?
-            .ok_or(WsError::ConnectionClosed)??;
-        match message {
-            WireMessage::Text(text) => {
-                let frame: RealtimeServerFrame = serde_json::from_str(&text)
-                    .map_err(|_| WorkerDialError::Protocol("admitted frame did not decode"))?;
-                match frame {
-                    RealtimeServerFrame::Admitted {
-                        session_id,
-                        attempt_id,
-                        bounds,
-                        ..
-                    } => {
-                        if session_id.as_str() != admit.session_id.as_str()
-                            || attempt_id.as_str() != admit.attempt_id.as_str()
-                        {
-                            return Err(WorkerDialError::Protocol(
-                                "admitted frame does not echo the admit identity",
-                            ));
-                        }
-                        if bounds.validate().is_err() {
-                            return Err(WorkerDialError::Protocol(
-                                "admitted bounds exceed the protocol caps",
-                            ));
-                        }
-                        let admitted_message = Message::Text(Utf8Bytes::from(text.as_str()));
-                        let (sink, source) = stream.split();
-                        return Ok(WorkerSide {
-                            sink,
-                            source,
-                            admitted_message,
-                        });
-                    }
-                    RealtimeServerFrame::Event { .. }
-                    | RealtimeServerFrame::Pong
-                    | RealtimeServerFrame::Unknown => {
-                        return Err(WorkerDialError::Protocol(
-                            "admitted frame must be the first server frame",
-                        ));
-                    }
-                }
-            }
-            WireMessage::Close(_) => {
-                return Err(WorkerDialError::Protocol("worker closed before admission"))
-            }
-            WireMessage::Ping(_) | WireMessage::Pong(_) => continue,
-            WireMessage::Binary(_) | WireMessage::Frame(_) => {
-                return Err(WorkerDialError::Protocol(
-                    "worker sent a binary frame before admission",
-                ));
-            }
-        }
-    }
 }
 
 #[cfg(test)]
