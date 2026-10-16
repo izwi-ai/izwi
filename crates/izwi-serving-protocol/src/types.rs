@@ -273,6 +273,9 @@ pub enum WorkerFeature {
     /// Minor 4: renders `ChatParameters::tools` into the prompt with the
     /// model family's tool-calling template.
     ChatTools,
+    /// Minor 4 (additive): a TTS realtime session honours the text-stream
+    /// admission's `speaker`, `language` and `incremental` fields.
+    RealtimeTtsTextStream,
     /// A feature from a newer protocol minor; it satisfies no requirement.
     #[serde(other)]
     Unknown,
@@ -293,7 +296,8 @@ impl WorkerFeature {
             | Self::ChatLogprobs
             | Self::ChatJsonObject
             | Self::ChatContextPolicy
-            | Self::ChatTools => 4,
+            | Self::ChatTools
+            | Self::RealtimeTtsTextStream => 4,
             Self::Unknown => u16::MAX,
         }
     }

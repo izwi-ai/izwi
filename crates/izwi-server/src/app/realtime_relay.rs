@@ -452,10 +452,12 @@ async fn run_relay_session(
         }
     };
 
-    let mut selected = match relay
-        .registry
-        .select_and_reserve(&realtime_selection_request(relay.config(), &stage))
-    {
+    let mut selected = match relay.registry.select_and_reserve(&WorkerSelectionRequest {
+        // A text stream that names a voice or streams its text needs a
+        // worker that honours it; an older worker would ignore it.
+        required_features: requested.input.required_features(),
+        ..realtime_selection_request(relay.config(), &stage)
+    }) {
         Ok(selected) => selected,
         Err(_) => {
             reject_client(

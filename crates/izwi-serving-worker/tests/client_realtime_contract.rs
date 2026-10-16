@@ -453,7 +453,7 @@ fn tts_admission(session: &'static str, attempt: &'static str) -> RealtimeSessio
         task: TaskKind::TextToSpeech,
         service_class: ServiceClass::Realtime,
         remaining_time_ms: 10_000,
-        input: RealtimeStageInput::TextStream,
+        input: RealtimeStageInput::text_stream(),
     }
 }
 

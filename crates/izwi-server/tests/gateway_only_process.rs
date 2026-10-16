@@ -828,7 +828,7 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
         task: TaskKind::TextToSpeech,
         service_class: ServiceClass::Realtime,
         remaining_time_ms: 60_000,
-        input: RealtimeStageInput::TextStream,
+        input: RealtimeStageInput::text_stream(),
     };
     ws.send(Message::Text(
         serde_json::to_string(&RealtimeClientFrame::Admit {

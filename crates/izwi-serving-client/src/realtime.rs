@@ -213,7 +213,7 @@ pub async fn connect(
         stream, admission, ..
     } = dial(endpoint, credentials, &admit, None, &config).await?;
     Ok(RealtimeSession {
-        stage_emits_audio: matches!(admit.input, RealtimeStageInput::TextStream),
+        stage_emits_audio: matches!(admit.input, RealtimeStageInput::TextStream { .. }),
         stream,
         admission,
         expected_request_id: admit.request_id.to_string(),
@@ -361,7 +361,8 @@ pub async fn dial(
                             "admitted bounds exceed the protocol caps".into(),
                         )
                     })?;
-                    let stage_emits_audio = matches!(admit.input, RealtimeStageInput::TextStream);
+                    let stage_emits_audio =
+                        matches!(admit.input, RealtimeStageInput::TextStream { .. });
                     if stage_emits_audio && output_audio.is_none() {
                         return Err(RealtimeClientError::Protocol(
                             "text-stream sessions must announce an output audio spec".into(),

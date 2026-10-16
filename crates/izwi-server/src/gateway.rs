@@ -2655,7 +2655,7 @@ mod tests {
             task: TaskKind::TextToSpeech,
             service_class: ServiceClass::Realtime,
             remaining_time_ms: 60_000,
-            input: RealtimeStageInput::TextStream,
+            input: RealtimeStageInput::text_stream(),
         };
         ws.send(control(&RealtimeClientFrame::Admit {
             admit: Box::new(admit),

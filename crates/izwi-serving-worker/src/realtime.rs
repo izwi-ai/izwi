@@ -11,7 +11,7 @@
 //! bounds on the stream itself).
 
 use super::{
-    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsStageStream,
+    InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner, RealtimeTtsOptions,
     WorkerState, EVENT_ENVELOPE_ALLOWANCE,
 };
 use crate::runtime::map_execution_error;
@@ -780,24 +780,33 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
         runner: &Arc<dyn RealtimeStageRunner>,
         mut control_rx: mpsc::Receiver<ClientControl>,
     ) {
-        if !matches!(self.admit.input, RealtimeStageInput::TextStream) {
+        let RealtimeStageInput::TextStream {
+            speaker,
+            language,
+            incremental,
+        } = self.admit.input.clone()
+        else {
             self.terminate_failed(
                 InvocationErrorCode::InvalidInput,
                 "text_to_speech sessions require a text-stream admission",
             );
             return;
-        }
+        };
+        let options = RealtimeTtsOptions { speaker, language };
         let limits = self.state.config.realtime_session_limits;
         let max_frame_bytes = limits.max_frame_bytes;
         let session_budget = limits.max_session_audio_bytes;
 
-        // The sender moves into the synthesis forwarder on Finish, so the
-        // receiver below returns `None` exactly when synthesis ends. Before
-        // that, the open channel keeps this arm parked.
+        // The sender moves into the synthesis driver with the first text
+        // piece, so the receiver below returns `None` exactly when synthesis
+        // ends. Before that, the open channel keeps this arm parked.
         let (chunks_tx, mut chunks_rx) =
             mpsc::channel::<Result<izwi_core::AudioChunk, izwi_core::Error>>(8);
         let mut chunks_tx = Some(chunks_tx);
+        let mut pieces_tx: Option<mpsc::UnboundedSender<String>> = None;
         let mut synthesis: Option<tokio::task::JoinHandle<()>> = None;
+        let deadline_at =
+            (tokio::time::Instant::from_std(self.started_at) + self.remaining_time).into_std();
         let mut text = String::new();
         let mut text_bytes = 0u64;
         let mut finish_submitted = false;
@@ -843,42 +852,25 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                                 });
                             } else {
                                 finish_submitted = true;
-                                let utterance = std::mem::take(&mut text);
-                                if utterance.is_empty() {
-                                    // Mirror the ASR stage: finishing without
-                                    // input is a successful empty result.
-                                    terminal = Some(StageTerminal::Completed { text: None });
-                                } else {
-                                    self.state.update_attempt(
-                                        &self.admit.attempt_id,
-                                        AttemptState::Running,
-                                        Some(0),
+                                let rest = std::mem::take(&mut text).trim().to_string();
+                                if !rest.is_empty() {
+                                    self.synthesize_piece(
+                                        runner,
+                                        &options,
+                                        deadline_at,
+                                        rest,
+                                        &mut pieces_tx,
+                                        &mut chunks_tx,
+                                        &mut synthesis,
                                     );
-                                    let deadline_at = tokio::time::Instant::from_std(
-                                        self.started_at,
-                                    ) + self.remaining_time;
-                                    match runner
-                                        .start_tts_stream(utterance, deadline_at.into_std())
-                                        .await
-                                    {
-                                        Ok(stream) => {
-                                            // Finish is processed at most once;
-                                            // the take makes that hold for the
-                                            // sender too.
-                                            if let Some(chunks_tx) = chunks_tx.take() {
-                                                synthesis = Some(tokio::spawn(
-                                                    forward_synthesis(stream, chunks_tx),
-                                                ));
-                                            }
-                                        }
-                                        Err(error) => {
-                                            let failure = map_execution_error(error);
-                                            terminal = Some(StageTerminal::Failed {
-                                                code: failure.code,
-                                                message: failure.message,
-                                            });
-                                        }
-                                    }
+                                }
+                                match pieces_tx.take() {
+                                    // Closing the piece channel lets the
+                                    // driver end after the last piece.
+                                    Some(pieces) => drop(pieces),
+                                    // Finishing without input is a
+                                    // successful empty result, as for ASR.
+                                    None => terminal = Some(StageTerminal::Completed { text: None }),
                                 }
                             }
                         }
@@ -904,6 +896,20 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
                                     });
                                 } else {
                                     text.push_str(&incoming);
+                                    while let Some(piece) = incremental
+                                        .then(|| take_complete_sentences(&mut text))
+                                        .flatten()
+                                    {
+                                        self.synthesize_piece(
+                                            runner,
+                                            &options,
+                                            deadline_at,
+                                            piece,
+                                            &mut pieces_tx,
+                                            &mut chunks_tx,
+                                            &mut synthesis,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1021,6 +1027,40 @@ impl<E: InvocationExecutor> RealtimeSession<E> {
             StageTerminal::Disconnected => {
                 self.terminate_cancelled();
             }
+        }
+    }
+
+    /// Queue one text piece for synthesis, starting the session's synthesis
+    /// driver with the first.
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_piece(
+        &self,
+        runner: &Arc<dyn RealtimeStageRunner>,
+        options: &RealtimeTtsOptions,
+        deadline: Instant,
+        piece: String,
+        pieces_tx: &mut Option<mpsc::UnboundedSender<String>>,
+        chunks_tx: &mut Option<mpsc::Sender<Result<izwi_core::AudioChunk, izwi_core::Error>>>,
+        synthesis: &mut Option<tokio::task::JoinHandle<()>>,
+    ) {
+        if pieces_tx.is_none() {
+            let Some(chunks) = chunks_tx.take() else {
+                return;
+            };
+            self.state
+                .update_attempt(&self.admit.attempt_id, AttemptState::Running, Some(0));
+            let (pieces, piece_rx) = mpsc::unbounded_channel();
+            *pieces_tx = Some(pieces);
+            *synthesis = Some(tokio::spawn(drive_synthesis(
+                Arc::clone(runner),
+                options.clone(),
+                deadline,
+                piece_rx,
+                chunks,
+            )));
+        }
+        if let Some(pieces) = pieces_tx.as_ref() {
+            let _ = pieces.send(piece);
         }
     }
 
@@ -1165,24 +1205,65 @@ enum StageTerminal {
 /// selected alongside control frames. The forwarder ends when the stream ends
 /// or the session drops its receiver; the stream drop releases the runtime's
 /// request leases in both cases.
-async fn forward_synthesis(
-    mut stream: Box<dyn RealtimeTtsStageStream>,
+/// Synthesizes a session's text pieces in order into `chunks_tx`, ending
+/// once the piece channel closes and is drained. Only the last piece's
+/// chunks may carry the final flag; while more text can follow, the session
+/// adds the final frame itself when synthesis ends.
+async fn drive_synthesis(
+    runner: Arc<dyn RealtimeStageRunner>,
+    options: RealtimeTtsOptions,
+    deadline: Instant,
+    mut pieces: mpsc::UnboundedReceiver<String>,
     chunks_tx: mpsc::Sender<Result<izwi_core::AudioChunk, izwi_core::Error>>,
 ) {
-    loop {
-        match stream.next_chunk().await {
-            Ok(Some(chunk)) => {
-                if chunks_tx.send(Ok(chunk)).await.is_err() {
-                    break;
-                }
-            }
-            Ok(None) => break,
+    while let Some(text) = pieces.recv().await {
+        let mut stream = match runner.start_tts_stream(text, &options, deadline).await {
+            Ok(stream) => stream,
             Err(error) => {
                 let _ = chunks_tx.send(Err(error)).await;
-                break;
+                return;
+            }
+        };
+        loop {
+            match stream.next_chunk().await {
+                Ok(Some(mut chunk)) => {
+                    let last_piece = pieces.is_closed() && pieces.is_empty();
+                    chunk.is_final &= last_piece;
+                    if chunks_tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = chunks_tx.send(Err(error)).await;
+                    return;
+                }
             }
         }
     }
+}
+
+/// Takes the complete sentences off the front of `text`: everything up to
+/// its last sentence end (`.`, `!` or `?` before whitespace, a CJK full stop,
+/// or a line break). `None` while no sentence is complete.
+fn take_complete_sentences(text: &mut String) -> Option<String> {
+    let mut chars = text.char_indices().peekable();
+    let mut end = None;
+    while let Some((index, ch)) = chars.next() {
+        let after = index + ch.len_utf8();
+        let ends = match ch {
+            '\n' | '。' | '！' | '？' => true,
+            '.' | '!' | '?' => chars.peek().is_some_and(|(_, next)| next.is_whitespace()),
+            _ => false,
+        };
+        if ends {
+            end = Some(after);
+        }
+    }
+    let end = end?;
+    let piece: String = text.drain(..end).collect();
+    let piece = piece.trim().to_string();
+    (!piece.is_empty()).then_some(piece)
 }
 
 fn language_arg(admit: &RealtimeSessionAdmit) -> Option<&str> {

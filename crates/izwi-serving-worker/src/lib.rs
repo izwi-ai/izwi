@@ -366,6 +366,13 @@ pub trait RealtimeTtsStageStream: Send {
     async fn next_chunk(&mut self) -> Result<Option<izwi_core::AudioChunk>, izwi_core::Error>;
 }
 
+/// How a realtime TTS session speaks: the text-stream admission's voice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealtimeTtsOptions {
+    pub speaker: Option<String>,
+    pub language: Option<String>,
+}
+
 /// Execution surface for one realtime stage on this worker's runtime.
 #[async_trait::async_trait]
 pub trait RealtimeStageRunner: Send + Sync + 'static {
@@ -384,15 +391,16 @@ pub trait RealtimeStageRunner: Send + Sync + 'static {
         None
     }
 
-    /// Starts realtime TTS synthesis of the committed utterance text.
-    /// Synthesis must stop by the given deadline; the session's own
-    /// cancellation ladder remains authoritative.
+    /// Starts realtime TTS synthesis of one piece of the session's text,
+    /// spoken with `options`. Synthesis must stop by the given deadline; the
+    /// session's own cancellation ladder remains authoritative.
     async fn start_tts_stream(
         &self,
         text: String,
+        options: &RealtimeTtsOptions,
         deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, izwi_core::Error> {
-        let _ = (text, deadline);
+        let _ = (text, options, deadline);
         Err(izwi_core::Error::ConfigError(
             "stage does not serve realtime TTS sessions".into(),
         ))

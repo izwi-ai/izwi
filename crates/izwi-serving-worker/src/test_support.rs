@@ -849,6 +849,7 @@ impl RealtimeStageRunner for ScriptedTtsRunner {
     async fn start_tts_stream(
         &self,
         _text: String,
+        _options: &crate::RealtimeTtsOptions,
         _deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, izwi_core::Error> {
         Ok(Box::new(ScriptedTtsStream {

@@ -203,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
     ) {
         features.insert(WorkerFeature::RealtimeSocket);
     }
+    if process.task == TaskKind::TextToSpeech {
+        // The TTS stage honours the text stream's voice and incremental text.
+        features.insert(WorkerFeature::RealtimeTtsTextStream);
+    }
     if process.task == TaskKind::Chat {
         // `RuntimeChatExecutor` maps every minor-4 chat control the way the
         // local server does.

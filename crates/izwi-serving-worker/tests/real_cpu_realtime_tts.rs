@@ -162,7 +162,7 @@ async fn real_worker_streams_tts_through_the_realtime_subprotocol() {
         task: TaskKind::TextToSpeech,
         service_class: ServiceClass::Realtime,
         remaining_time_ms: 300_000,
-        input: RealtimeStageInput::TextStream,
+        input: RealtimeStageInput::text_stream(),
     };
 
     let mut session = connect(

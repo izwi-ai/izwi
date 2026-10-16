@@ -1,7 +1,7 @@
 use super::{
     AdmissionFailure, AdmittedExecution, AdmittedInvocation, ExecutionEvent, ExecutionFailure,
     ExecutionTeardown, InvocationExecutor, RealtimeAsrStageStream, RealtimeStageRunner,
-    RealtimeTtsStageStream,
+    RealtimeTtsOptions, RealtimeTtsStageStream,
 };
 use async_trait::async_trait;
 use izwi_core::{
@@ -743,22 +743,26 @@ impl RealtimeStageRunner for RuntimeRealtimeTtsRunner {
     async fn start_tts_stream(
         &self,
         text: String,
+        options: &RealtimeTtsOptions,
         deadline: std::time::Instant,
     ) -> Result<Box<dyn RealtimeTtsStageStream>, CoreError> {
         let runtime_context =
             RuntimeRequestContext::new(WorkloadClass::Realtime).with_deadline(deadline);
-        let request = GenerationRequest::new(text)
+        let mut request = GenerationRequest::new(text)
             .with_config(GenerationConfig {
                 streaming: true,
                 // Zero mirrors the single-node realtime voice route: audio
                 // token generation is bounded by the model, not a text ceiling.
                 options: GenerationParams {
                     max_tokens: 0,
+                    speaker: options.speaker.clone(),
+                    voice: options.speaker.clone(),
                     ..GenerationParams::default()
                 },
             })
             .with_model_variant(self.variant)
             .with_runtime_context(runtime_context);
+        request.language = options.language.clone();
         // A dropped receiver is the natural cancellation signal: the
         // generation task observes the closed channel and unwinds. The abort
         // handle only backstops a task wedged outside a send.
