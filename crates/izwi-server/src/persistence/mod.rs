@@ -222,7 +222,6 @@ async fn provider_database_context(
     let actual_backend = actual_database_backend(&decision.connection)?;
     validate_declared_backend(&decision.backend, &actual_backend)?;
     validate_supported_database_backend(&actual_backend)?;
-    validate_migration_mode_for_backend(&actual_backend, &decision.migration_mode)?;
 
     if matches!(decision.migration_mode, DatabaseMigrationMode::IzwiManaged) {
         Migrator::up(&decision.connection)
@@ -280,21 +279,6 @@ fn validate_supported_database_backend(backend: &DatabaseBackend) -> anyhow::Res
             bail!("Enterprise database backend {name:?} is not supported by this runtime")
         }
     }
-}
-
-fn validate_migration_mode_for_backend(
-    backend: &DatabaseBackend,
-    migration_mode: &DatabaseMigrationMode,
-) -> anyhow::Result<()> {
-    if matches!(migration_mode, DatabaseMigrationMode::IzwiManaged)
-        && !matches!(backend, DatabaseBackend::Sqlite)
-    {
-        bail!(
-            "Izwi-managed migrations currently require the local SQLite backend; enterprise database providers must use provider-managed or disabled migrations for {backend:?}"
-        );
-    }
-
-    Ok(())
 }
 
 struct ResolvedMediaStorage {
@@ -1744,39 +1728,6 @@ mod tests {
                 .contains("declared backend Postgres, but the SeaORM connection reports Sqlite"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn izwi_managed_migrations_are_restricted_to_sqlite() {
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Sqlite,
-            &DatabaseMigrationMode::IzwiManaged,
-        )
-        .is_ok());
-
-        let error = validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::IzwiManaged,
-        )
-        .expect_err("managed migrations should reject non-sqlite backends");
-
-        assert!(
-            error
-                .to_string()
-                .contains("Izwi-managed migrations currently require the local SQLite backend"),
-            "{error}"
-        );
-
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::ProviderManaged,
-        )
-        .is_ok());
-        assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Postgres,
-            &DatabaseMigrationMode::Disabled,
-        )
-        .is_ok());
     }
 
     #[test]

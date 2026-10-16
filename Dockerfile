@@ -38,8 +38,9 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build CPU release binaries (server, supervisor, worker)
-RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker
+# Build CPU release binaries (server, supervisor, worker); izwi-server ships
+# with PostgreSQL support
+RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features izwi-server/db-postgres
 
 # -----------------------------------------------------------------------------
 # Stage 3: Build the Rust backend (CUDA)
@@ -73,7 +74,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
 # Build CUDA release binaries (server, supervisor, worker)
-RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features "${IZWI_CUDA_FEATURES}"
+RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features "${IZWI_CUDA_FEATURES},izwi-server/db-postgres"
 
 # -----------------------------------------------------------------------------
 # Stage 4: Production runtime (CPU)
