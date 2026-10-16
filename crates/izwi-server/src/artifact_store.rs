@@ -1929,9 +1929,15 @@ mod tests {
     async fn attempt_publication_atomically_hides_provider_keys_and_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("attempt.sqlite3")),
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("attempt.sqlite3"),
         ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -1966,9 +1972,13 @@ mod tests {
             Err(ArtifactStoreError::NotFound)
         ));
         let reopened = ArtifactStore::new(
-            Arc::new(BatchRuntimeStore::initialize_with_database(
-                StoreDatabase::new(root.path().join("attempt.sqlite3")),
-            )),
+            {
+                let mut reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+                    root.path().join("attempt.sqlite3"),
+                ));
+                reopened.set_test_clock(clock.clone());
+                Arc::new(reopened)
+            },
             provider.clone(),
             ArtifactStoreLimits::default(),
         )
@@ -2000,7 +2010,8 @@ mod tests {
             Err(ArtifactStoreError::Metadata(_))
         ));
         assert_eq!(provider.object_count(), 3);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        clock.store(1_100, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_100);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 2);
         assert_eq!(provider.object_count(), 1);
     }
@@ -2427,9 +2438,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
         let db_path = root.path().join("speech-provider-fail.sqlite3");
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(db_path),
-        ));
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -2518,8 +2533,8 @@ mod tests {
             "abandoned reservation should be cleanup_pending"
         );
 
-        provider.set_now_unix_ms(0);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        clock.store(1_100, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_100);
         let report = store.cleanup_due(64).await.unwrap();
         assert_eq!(
             report.completed, 1,
@@ -2548,9 +2563,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
         let db_path = root.path().join("speech-crash-reopen.sqlite3");
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(db_path.clone()),
-        ));
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata =
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -2587,9 +2607,10 @@ mod tests {
         drop(store);
         drop(metadata);
 
-        let reopened_metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(db_path),
-        ));
+        let mut reopened_metadata =
+            BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+        reopened_metadata.set_test_clock(clock.clone());
+        let reopened_metadata = Arc::new(reopened_metadata);
         let reopened_store = ArtifactStore::new(
             reopened_metadata.clone(),
             provider.clone(),
@@ -2640,7 +2661,9 @@ mod tests {
             "history record should still be processing"
         );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        clock.store(1_100, Ordering::SeqCst);
+
+        provider.set_now_unix_ms(1_100);
         let report = reopened_store.cleanup_due(64).await.unwrap();
         assert_eq!(
             report.completed, 1,
@@ -2660,9 +2683,15 @@ mod tests {
     {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("speech-stale-reclaim.sqlite3")),
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("speech-stale-reclaim.sqlite3"),
         ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -2889,7 +2918,9 @@ mod tests {
             .unwrap();
         assert_eq!(stage.status, RuntimeStageStatus::Completed);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        clock.store(1_100, Ordering::SeqCst);
+
+        provider.set_now_unix_ms(1_100);
         let report = store.cleanup_due(64).await.unwrap();
         assert!(
             report.completed >= 1,
@@ -2931,9 +2962,15 @@ mod tests {
     async fn reserved_file_capability_and_source_identity_fail_before_publication() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("attempt-file-errors.sqlite3")),
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("attempt-file-errors.sqlite3"),
         ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -2983,7 +3020,8 @@ mod tests {
             Err(ArtifactStoreError::Provider)
         ));
         assert_eq!(provider.object_count(), 0);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        clock.store(1_100, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_100);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
     }
 
@@ -3089,9 +3127,15 @@ mod tests {
     async fn stale_attempt_keeps_written_provider_object_recoverable() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("stale-attempt.sqlite3")),
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("stale-attempt.sqlite3"),
         ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -3126,7 +3170,8 @@ mod tests {
             Err(ArtifactStoreError::Metadata(_))
         ));
         assert_eq!(provider.object_count(), 1);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        clock.store(1_100, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_100);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
         assert_eq!(provider.object_count(), 0);
         assert!(metadata
@@ -3149,9 +3194,15 @@ mod tests {
     async fn attempt_publication_rejects_a_different_scheduling_tenant() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(MemoryMediaProvider::default());
-        let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("tenant-fence.sqlite3")),
+        // Both clocks are fixed so the 10 ms reservations expire only when the
+        // test advances them, however slowly it runs.
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("tenant-fence.sqlite3"),
         ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        provider.set_now_unix_ms(1_000);
         let mut store = ArtifactStore::new(
             metadata.clone(),
             provider.clone(),
@@ -3185,7 +3236,8 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(provider.object_count(), 1);
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        clock.store(1_100, Ordering::SeqCst);
+        provider.set_now_unix_ms(1_100);
         assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
         assert_eq!(provider.object_count(), 0);
     }
