@@ -3827,7 +3827,21 @@ impl NativeChatModel {
             Self::Qwen35(model) => model.preferred_prefill_tokens(),
             Self::Qwen36Moe(model) => model.preferred_prefill_tokens(),
             Self::Qwen38(model) => model.preferred_prefill_tokens(),
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => 0,
+            Self::Lfm2(model) => model.preferred_prefill_tokens(),
+            Self::Qwen3(_) | Self::Gemma3(_) => 0,
+        }
+    }
+
+    /// `(per_token_bytes, max_span_tokens)` for a model that bounds and
+    /// prices its prefill activations; `None` keeps the chat adapter's
+    /// unbounded, unpriced prefill stage.
+    pub fn prefill_workspace(&self) -> Result<Option<(u64, u64)>> {
+        match self {
+            Self::Lfm2(model) => Ok(Some((
+                model.prefill_workspace_per_token_bytes()?,
+                model.preferred_prefill_tokens() as u64,
+            ))),
+            _ => Ok(None),
         }
     }
 
@@ -3862,7 +3876,12 @@ impl NativeChatModel {
                 model.sustained_decode_quantum(),
                 false,
             ),
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Lfm2(_) => (1, false, false),
+            Self::Lfm2(model) => (
+                model.preferred_decode_tokens(),
+                model.sustained_decode_quantum(),
+                false,
+            ),
+            Self::Qwen3(_) | Self::Gemma3(_) => (1, false, false),
         }
     }
 }
@@ -4570,6 +4589,21 @@ impl NativeChatPreparedPrompt {
         }
     }
 
+    /// The end of the prompt's first turn (the system turn, with any tools,
+    /// when there is one): what requests sharing a system prompt share. The
+    /// history boundary opens the final turn on an `<|im_start|>`, so the
+    /// first turn ends at that token's first later occurrence. `None` when no
+    /// turn ends before the history boundary.
+    pub fn managed_preamble_boundary(&self) -> Option<usize> {
+        let history = self.managed_snapshot_boundary()?;
+        let ids = self.prompt_ids();
+        let turn_start = *ids.get(history)?;
+        ids.get(1..history)?
+            .iter()
+            .position(|id| *id == turn_start)
+            .map(|offset| offset + 1)
+    }
+
     pub(crate) fn as_qwen35(&self) -> Option<&Qwen35PreparedPrompt> {
         match self {
             Self::Qwen35(prepared) => Some(prepared),
@@ -4895,7 +4929,7 @@ impl NativeChatModel {
             Self::Qwen36Moe(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Qwen38(model) => model.prompt_token_ids_with_config(messages, config),
             Self::Gemma3(model) => model.prompt_token_ids(messages),
-            Self::Lfm2(model) => model.prompt_token_ids(messages),
+            Self::Lfm2(model) => model.prompt_token_ids_with_tools(messages, &config.request.tools),
         }
     }
 

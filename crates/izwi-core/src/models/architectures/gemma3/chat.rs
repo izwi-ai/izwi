@@ -943,7 +943,7 @@ impl Gemma3ChatModel {
         for (role, content) in &turns {
             let role_name = match role {
                 ChatRole::Assistant => "model",
-                ChatRole::User | ChatRole::System => "user",
+                ChatRole::User | ChatRole::System | ChatRole::Tool => "user",
             };
 
             ids.push(self.tokenizer.specials.start_of_turn);

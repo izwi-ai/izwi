@@ -187,7 +187,7 @@ Supported request fields:
 | `max_tokens`, `max_completion_tokens` | Optional output budgets. |
 | `stream` | `true` returns SSE chat chunks. |
 | `stream_options.include_usage` | Adds usage to the terminal stream chunk. |
-| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. Explicit values override model profiles. Qwen3.5, Qwen3.6 and Qwen3.8 default to Qwen's published profile for the active thinking mode. LFM2.5 1.2B defaults to Liquid's model-card profile: temperature 0.1 (Instruct) or 0.05 (Thinking), top-k 50, repetition penalty 1.05. On Qwen3.5 the presence penalty counts generated tokens only, and the repetition penalty counts the prompt and generated tokens. |
 | `frequency_penalty`, `stop` | Rejected in strict OpenAI compatibility mode when non-default. |
 | `n` | Only `1` is supported. |
 | `tools`, `tool_choice` | Accepted for tool-call prompting. Strict mode only allows `tool_choice` as `auto`, `none`, or `null`. |
@@ -195,6 +195,7 @@ Supported request fields:
 | `reasoning_effort` | Qwen3.8 reasoning level: `xhigh` (default), `medium`, or `low`. Unknown values are rejected. |
 | `preserve_thinking` | Preserve prior assistant reasoning in Qwen3.8 history; defaults to `true`. Qwen3.5 history behavior is unchanged. |
 | `chat_template_kwargs` | Compatibility object accepting `enable_thinking`, `reasoning_effort`, and `preserve_thinking`. A conflicting direct field is rejected. |
+| `reasoning_format` | Izwi extension. `none` (default) leaves `<think>…</think>` reasoning in `content`; `parsed` returns it in `reasoning_content` (message and stream deltas) and keeps only the answer in `content`. |
 | `user` | Accepted for compatibility; not used for local auth. |
 
 Compatibility profile:
@@ -218,6 +219,12 @@ Tool behavior:
 - Assistant messages may include `tool_calls`.
 - Tool responses can be sent with role `tool`.
 - Model-emitted tool calls are returned with `finish_reason: "tool_calls"` when detected.
+- LFM2.5 models use their own format: tools are listed in the system turn,
+  `tool` messages become native tool turns, and calls the model writes as
+  `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>` are returned as
+  `tool_calls`. Other chat models use the Qwen XML tool format.
+- LFM2.5 1.2B supports 32,768 tokens of context, the length on Liquid's model
+  cards, on every backend.
 
 Multimodal content parts:
 

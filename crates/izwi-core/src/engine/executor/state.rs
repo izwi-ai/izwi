@@ -66,6 +66,33 @@ pub(super) struct ActiveChatDecode {
     pub(super) logprobs: Vec<crate::engine::TokenLogprob>,
 }
 
+impl ActiveChatDecode {
+    /// DS9.3: record one committed step's logprob entries and, on the
+    /// terminal step, hand back the request's whole list. Streaming does not
+    /// change this: SSE deltas carry their own entries, and the terminal
+    /// output always carries the complete list.
+    pub(super) fn record_step_logprobs(
+        &mut self,
+        step: &[crate::engine::TokenLogprob],
+        finished: bool,
+    ) -> Vec<crate::engine::TokenLogprob> {
+        accumulate_step_logprobs(&mut self.logprobs, step, finished)
+    }
+}
+
+pub(super) fn accumulate_step_logprobs(
+    accumulated: &mut Vec<crate::engine::TokenLogprob>,
+    step: &[crate::engine::TokenLogprob],
+    finished: bool,
+) -> Vec<crate::engine::TokenLogprob> {
+    accumulated.extend_from_slice(step);
+    if finished {
+        std::mem::take(accumulated)
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) struct ActiveAsrDecode {
     pub(super) variant: ModelVariant,
     pub(super) model: Arc<NativeAsrModel>,
@@ -219,4 +246,30 @@ pub(super) struct ActiveQwenTtsDecode {
     pub(super) first_output_ms_since_start: Option<f64>,
     pub(super) prefill_steps: u32,
     pub(super) decode_steps: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accumulate_step_logprobs;
+    use crate::engine::TokenLogprob;
+
+    fn entry(token: &str) -> TokenLogprob {
+        TokenLogprob {
+            token: token.to_string(),
+            logprob: -0.5,
+            bytes: token.as_bytes().to_vec(),
+            top_logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_step_publishes_every_committed_logprob_entry() {
+        let mut accumulated = Vec::new();
+        assert!(accumulate_step_logprobs(&mut accumulated, &[entry("a")], false).is_empty());
+        assert!(accumulate_step_logprobs(&mut accumulated, &[entry("b")], false).is_empty());
+        let terminal = accumulate_step_logprobs(&mut accumulated, &[entry("c")], true);
+        let tokens: Vec<&str> = terminal.iter().map(|entry| entry.token.as_str()).collect();
+        assert_eq!(tokens, ["a", "b", "c"]);
+        assert!(accumulated.is_empty());
+    }
 }

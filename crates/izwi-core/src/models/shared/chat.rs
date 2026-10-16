@@ -11,6 +11,10 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
+    /// A tool result. Families whose template has a tool turn (LFM2.5)
+    /// render it natively; the Qwen and Gemma prompt builders render it as
+    /// the user turn their templates use.
+    Tool,
 }
 
 impl ChatRole {
@@ -19,6 +23,7 @@ impl ChatRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }

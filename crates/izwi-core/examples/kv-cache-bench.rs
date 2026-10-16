@@ -88,6 +88,7 @@ struct Options {
     head_dim: usize,
     batch_size: usize,
     context_len: Option<u32>,
+    decode_repeats: usize,
 }
 
 impl Default for Options {
@@ -109,6 +110,7 @@ impl Default for Options {
             head_dim: DEFAULT_HEAD_DIM,
             batch_size: 0,
             context_len: None,
+            decode_repeats: 1,
         }
     }
 }
@@ -229,6 +231,9 @@ fn parse_options() -> Result<Option<Options>, String> {
             "--context-len" => {
                 options.context_len = Some(parse_positive(&value(&mut args, &arg)?, &arg)?)
             }
+            "--decode-repeats" => {
+                options.decode_repeats = parse_positive(&value(&mut args, &arg)?, &arg)?
+            }
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
@@ -281,6 +286,8 @@ Options:\n  \
   --iterations N            Measured iterations (default: 10)\n  \
   --warmup N                Unmeasured iterations (default: 2)\n  \
   --long-context N          Long-profile maximum context (default: 1024)\n  \
+  --decode-repeats N        paged_decode calls queued per drained iteration, so\n  \
+                            the drain cost amortizes (default: 1)\n  \
   -h, --help                Show this help\n\n\
 Output is JSON Lines. Latencies include an explicit arena drain after each\n\
 operation, making asynchronous accelerator submissions comparable. They do\n\
@@ -362,19 +369,21 @@ fn run(options: &Options) -> Result<(), String> {
         "paged_decode",
         decode_error,
         || {
-            let output = runtime
-                .arena
-                .paged_decode(
-                    LAYER,
-                    PagedKvDecodeArgs {
-                        queries: &decode_queries,
-                        batch: &workload.decode,
-                        softmax_scale: scale,
-                        softcap: options.softcap,
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            std::hint::black_box(output);
+            for _ in 0..options.decode_repeats {
+                let output = runtime
+                    .arena
+                    .paged_decode(
+                        LAYER,
+                        PagedKvDecodeArgs {
+                            queries: &decode_queries,
+                            batch: &workload.decode,
+                            softmax_scale: scale,
+                            softcap: options.softcap,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                std::hint::black_box(output);
+            }
             runtime.arena.drain().map_err(|error| error.to_string())
         },
     )?;

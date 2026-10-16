@@ -429,25 +429,30 @@ kernel void izwi_paged_decode_gqa(
             key[i] = d < head_dim ? float(k[base + d]) : 0.0f;
             value[i] = d < head_dim ? float(v[base + d]) : 0.0f;
         }
+        // A constant trip count unrolls, so `query`, `acc` and the running
+        // state stay in registers. An early `break` on the runtime group size
+        // kept this loop rolled, with those arrays indexed in thread memory on
+        // every key: decode took 1.8x as long (1.0 ms against 0.55 ms for
+        // 32 query / 8 KV heads of 64 dims over 16K tokens).
         for (uint g = 0; g < GMAX; g++) {
-            if (g >= group_size) {
-                break;
-            }
-            float dot = 0.0f;
-            for (uint i = 0; i < DPL; i++) {
-                dot += query[g][i] * key[i];
-            }
-            float score = simd_sum(dot);
-            if (softcap > 0.0f) {
-                score = softcap * tanh(score / softcap);
-            }
-            const float next_max = max(running_max[g], score);
-            const float alpha = running_sum[g] == 0.0f ? 0.0f : exp(running_max[g] - next_max);
-            const float beta = exp(score - next_max);
-            running_sum[g] = running_sum[g] * alpha + beta;
-            running_max[g] = next_max;
-            for (uint i = 0; i < DPL; i++) {
-                acc[g][i] = acc[g][i] * alpha + value[i] * beta;
+            if (g < group_size) {
+                float dot = 0.0f;
+                for (uint i = 0; i < DPL; i++) {
+                    dot += query[g][i] * key[i];
+                }
+                float score = simd_sum(dot);
+                if (softcap > 0.0f) {
+                    score = softcap * tanh(score / softcap);
+                }
+                const float next_max = max(running_max[g], score);
+                const float alpha =
+                    running_sum[g] == 0.0f ? 0.0f : exp(running_max[g] - next_max);
+                const float beta = exp(score - next_max);
+                running_sum[g] = running_sum[g] * alpha + beta;
+                running_max[g] = next_max;
+                for (uint i = 0; i < DPL; i++) {
+                    acc[g][i] = acc[g][i] * alpha + value[i] * beta;
+                }
             }
         }
     }

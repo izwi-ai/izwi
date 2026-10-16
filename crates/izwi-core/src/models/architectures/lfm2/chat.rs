@@ -4,8 +4,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::OnceLock;
-use std::time::Instant;
 
 use candle_core::{DType, IndexOp, Tensor, D};
 use serde::Deserialize;
@@ -17,7 +15,6 @@ use crate::backends::state::{
 };
 use crate::backends::BackendKind;
 use crate::backends::DeviceProfile;
-use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
@@ -30,9 +27,7 @@ use crate::tokenizer::{IncrementalDecoder, Tokenizer};
 
 use super::backbone::{Lfm2ShortConvRuntimeState, QuantizedLfm2Backbone};
 use super::config::{parse_lfm2_backbone_config, Lfm2BackboneConfig};
-use super::physical::{
-    lfm2_managed_cache_contract, lfm2_physical_state_spec, Lfm2PhysicalStateSpec,
-};
+use super::physical::lfm2_managed_cache_contract;
 
 pub struct ChatDecodeState {
     shortconv: Lfm2ShortConvRuntimeState,
@@ -189,12 +184,6 @@ impl ChatDecodeState {
 }
 
 #[derive(Debug, Clone)]
-pub struct ChatGenerationOutput {
-    pub text: String,
-    pub tokens_generated: usize,
-}
-
-#[derive(Debug, Clone)]
 struct SpecialTokenIds {
     bos: Option<u32>,
     im_start: u32,
@@ -228,210 +217,27 @@ struct ChatTokenizer {
 }
 
 struct PromptScaffoldTokens {
-    system_header: Vec<u32>,
-    user_header: Vec<u32>,
+    /// The generation prompt's text after `<|im_start|>`.
     assistant_header: Vec<u32>,
+    /// The separator after each turn's `<|im_end|>`.
     newline: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PrefillMode {
-    Auto,
-    Full,
-    Token,
-}
-
-impl Lfm2PrefillMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Full => "full",
-            Self::Token => "token",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PrefillExecution {
-    Full,
-}
-
-impl Lfm2PrefillExecution {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Lfm2PrefillConfig {
-    mode: Lfm2PrefillMode,
-    token_prompt_threshold: usize,
-}
-
-impl Lfm2PrefillConfig {
-    const DEFAULT_TOKEN_THRESHOLD: usize = 64;
-
-    fn resolve(self, _prompt_tokens: usize) -> Lfm2PrefillExecution {
-        // Candle's quantized LFM2 ShortConv cache ignores `index_pos` for
-        // one-token calls, so token prefill can reuse state from a previous
-        // request. A full prompt pass replaces both attention and ShortConv
-        // state deterministically at the request boundary.
-        Lfm2PrefillExecution::Full
-    }
-}
-
-fn parse_lfm2_prefill_mode(raw: Option<&str>) -> Lfm2PrefillMode {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("full" | "sequence") => Lfm2PrefillMode::Full,
-        Some("token" | "token_mode") => Lfm2PrefillMode::Token,
-        _ => Lfm2PrefillMode::Auto,
-    }
-}
-
-fn parse_lfm2_prefill_threshold(raw: Option<&str>) -> usize {
-    raw.map(str::trim)
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD)
-}
-
-fn lfm2_prefill_config() -> &'static Lfm2PrefillConfig {
-    static CONFIG: OnceLock<Lfm2PrefillConfig> = OnceLock::new();
-    CONFIG.get_or_init(|| Lfm2PrefillConfig {
-        mode: parse_lfm2_prefill_mode(std::env::var("IZWI_LFM2_PREFILL_MODE").ok().as_deref()),
-        token_prompt_threshold: parse_lfm2_prefill_threshold(
-            std::env::var("IZWI_LFM2_PREFILL_TOKEN_THRESHOLD")
-                .ok()
-                .as_deref(),
-        ),
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2DefaultSystemPolicy {
-    Auto,
-    Always,
-    Never,
-}
-
-impl Lfm2DefaultSystemPolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Always => "always",
-            Self::Never => "never",
-        }
-    }
-}
-
-fn parse_lfm2_default_system_policy(raw: Option<&str>) -> Lfm2DefaultSystemPolicy {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("always" | "on" | "true" | "1") => Lfm2DefaultSystemPolicy::Always,
-        Some("never" | "off" | "false" | "0") => Lfm2DefaultSystemPolicy::Never,
-        _ => Lfm2DefaultSystemPolicy::Auto,
-    }
-}
-
-fn lfm2_default_system_policy() -> &'static Lfm2DefaultSystemPolicy {
-    static POLICY: OnceLock<Lfm2DefaultSystemPolicy> = OnceLock::new();
-    POLICY.get_or_init(|| {
-        parse_lfm2_default_system_policy(
-            std::env::var("IZWI_LFM2_DEFAULT_SYSTEM_POLICY")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-fn should_prepend_default_system(
-    messages: &[ChatMessage],
-    policy: Lfm2DefaultSystemPolicy,
-) -> bool {
-    if matches!(
-        messages.first().map(|message| &message.role),
-        Some(ChatRole::System)
-    ) {
-        return false;
-    }
-    match policy {
-        Lfm2DefaultSystemPolicy::Always => true,
-        Lfm2DefaultSystemPolicy::Never => false,
-        // The checkpoint template adds only an explicitly supplied system
-        // message. Do not change instructions when a second user turn arrives.
-        Lfm2DefaultSystemPolicy::Auto => false,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lfm2PromptStylePolicy {
-    Standard,
-    Aggressive,
-}
-
-impl Lfm2PromptStylePolicy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Aggressive => "aggressive",
-        }
-    }
-}
-
-fn parse_lfm2_prompt_style_policy(raw: Option<&str>) -> Lfm2PromptStylePolicy {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("aggressive" | "compact" | "lean") => Lfm2PromptStylePolicy::Aggressive,
-        _ => Lfm2PromptStylePolicy::Standard,
-    }
-}
-
-fn lfm2_prompt_style_policy() -> &'static Lfm2PromptStylePolicy {
-    static POLICY: OnceLock<Lfm2PromptStylePolicy> = OnceLock::new();
-    POLICY.get_or_init(|| {
-        parse_lfm2_prompt_style_policy(
-            std::env::var("IZWI_LFM2_PROMPT_STYLE_POLICY")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-fn should_use_aggressive_single_turn_prompt(
-    messages: &[ChatMessage],
-    prepend_default_system: bool,
-    style_policy: Lfm2PromptStylePolicy,
-) -> bool {
-    if prepend_default_system {
-        return false;
-    }
-    let single_user_turn = messages.len() == 1
-        && matches!(
-            messages.first().map(|message| &message.role),
-            Some(ChatRole::User)
-        );
-    if !single_user_turn {
-        return false;
-    }
-    matches!(style_policy, Lfm2PromptStylePolicy::Aggressive)
 }
 
 impl PromptScaffoldTokens {
     fn load(tokenizer: &ChatTokenizer) -> Result<Self> {
         Ok(Self {
-            system_header: tokenizer.encode_text("system\n")?,
-            user_header: tokenizer.encode_text("user\n")?,
             assistant_header: tokenizer.encode_text("assistant\n")?,
             newline: tokenizer.encode_text("\n")?,
         })
     }
+}
 
-    fn role_header(&self, role: &ChatRole) -> &[u32] {
-        match role {
-            ChatRole::System => &self.system_header,
-            ChatRole::User => &self.user_header,
-            ChatRole::Assistant => &self.assistant_header,
-        }
+fn template_role(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
     }
 }
 
@@ -511,15 +317,6 @@ impl ChatTokenizer {
         self.inner.encode(text)
     }
 
-    fn decode_text(&self, ids: &[u32]) -> Result<String> {
-        let filtered: Vec<u32> = ids
-            .iter()
-            .copied()
-            .filter(|id| (*id as usize) < self.vocab_size)
-            .collect();
-        self.inner.decode(&filtered)
-    }
-
     fn validate_selection(&self, token: u32) -> Result<()> {
         if token as usize >= self.vocab_size || self.non_generatable.contains(&token) {
             return Err(Error::InferenceError(format!(
@@ -530,12 +327,11 @@ impl ChatTokenizer {
     }
 
     fn validate_logits(&self, logits: &Tensor) -> Result<()> {
-        let stage = if diagnostics::enabled() {
-            "LFM2 raw logits before sampling (activation diagnostics enabled)"
-        } else {
-            "LFM2 raw logits before sampling (activation diagnostics disabled; set IZWI_LFM2_DIAGNOSTICS=1 in the server process)"
-        };
-        diagnostics::validate_finite(logits, stage)?;
+        diagnostics::validate_finite(logits, logits_stage())?;
+        self.validate_logits_width(logits)
+    }
+
+    fn validate_logits_width(&self, logits: &Tensor) -> Result<()> {
         if logits.dim(D::Minus1)? < self.vocab_size {
             return Err(Error::InferenceError(
                 "LFM2 logits are smaller than tokenizer vocabulary".into(),
@@ -548,6 +344,11 @@ impl ChatTokenizer {
 pub struct Lfm2ChatModel {
     device: DeviceProfile,
     tokenizer: ChatTokenizer,
+    /// Additive logits mask: 0 for generatable ids, -inf for control tokens
+    /// and ids past the tokenizer vocabulary. Applied before greedy argmax
+    /// and before sampling, so neither path can select an id the decoder
+    /// must reject.
+    generation_mask: Tensor,
     prompt_scaffold: PromptScaffoldTokens,
     config: Lfm2BackboneConfig,
     text_model: QuantizedLfm2Backbone,
@@ -564,16 +365,7 @@ impl Lfm2ChatModel {
     }
 
     pub fn load(model_dir: &Path, variant: ModelVariant, device: DeviceProfile) -> Result<Self> {
-        let gguf_name = match variant {
-            ModelVariant::Lfm2512BInstructGguf => "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
-            ModelVariant::Lfm2512BThinkingGguf => "LFM2.5-1.2B-Thinking-Q4_K_M.gguf",
-            _ => {
-                return Err(Error::ModelLoadError(format!(
-                    "Unsupported LFM2 GGUF chat variant: {variant}"
-                )));
-            }
-        };
-        let gguf_path = model_dir.join(gguf_name);
+        let gguf_path = model_dir.join(lfm2_chat_gguf_name(variant)?);
         if !gguf_path.exists() {
             return Err(Error::ModelLoadError(format!(
                 "GGUF checkpoint not found: {}",
@@ -584,7 +376,8 @@ impl Lfm2ChatModel {
         let tokenizer = ChatTokenizer::load(model_dir)?;
         let loader =
             GgufLoader::from_path_with_backend(&gguf_path, BackendKind::from(device.kind))?;
-        let config = parse_lfm2_backbone_config(&loader)?;
+        let mut config = parse_lfm2_backbone_config(&loader)?;
+        config.context_length = lfm25_chat_context_limit(config.context_length);
         let text_model = QuantizedLfm2Backbone::load(&loader, config.clone(), &device.device)?;
         if tokenizer.vocab_size == 0 || tokenizer.vocab_size > text_model.vocab_size() {
             return Err(Error::ModelLoadError(
@@ -592,30 +385,22 @@ impl Lfm2ChatModel {
             ));
         }
         let prompt_scaffold = PromptScaffoldTokens::load(&tokenizer)?;
+        let generation_mask = generation_mask(
+            text_model.vocab_size(),
+            tokenizer.vocab_size,
+            &tokenizer.non_generatable,
+            &device.device,
+        )?;
 
         info!(
             "Loaded LFM2 GGUF chat model on {:?} from {}",
             device.kind,
             gguf_path.display()
         );
-        let prefill = lfm2_prefill_config();
-        info!(
-            "LFM2 prefill policy: mode={}, token_prompt_threshold={}",
-            prefill.mode.as_str(),
-            prefill.token_prompt_threshold
-        );
-        info!(
-            "LFM2 default system policy: {}",
-            lfm2_default_system_policy().as_str()
-        );
-        info!(
-            "LFM2 prompt style policy: {}",
-            lfm2_prompt_style_policy().as_str()
-        );
-
         Ok(Self {
             device,
             tokenizer,
+            generation_mask,
             prompt_scaffold,
             config,
             text_model,
@@ -630,11 +415,61 @@ impl Lfm2ChatModel {
         true
     }
 
+    /// One decode row's live F32 activations: the token's per-layer
+    /// activations plus its full-vocabulary logits row.
     pub fn continuous_decode_batch_workspace_per_row_bytes(&self) -> Result<u64> {
-        u64::try_from(self.config.embedding_length)
-            .ok()
-            .and_then(|hidden| hidden.checked_mul(4))
-            .ok_or_else(|| Error::InvalidInput("LFM2 decode workspace overflow".into()))
+        let vocab = u64::try_from(self.text_model.vocab_size())
+            .map_err(|_| Error::InvalidInput("LFM2 vocabulary exceeds u64".into()))?;
+        self.prefill_workspace_per_token_bytes()?
+            .checked_add(vocab.checked_mul(4).ok_or_else(workspace_overflow)?)
+            .ok_or_else(workspace_overflow)
+    }
+
+    /// Live F32 activations of one prefill token in the widest block: the
+    /// residual, its norm and the mixer output (3 x hidden), the ShortConv
+    /// in-projection (3 x hidden), and the MLP gate, up and gated product
+    /// (3 x ffn). Attention scratch is the KV arena's own workspace.
+    pub(crate) fn prefill_workspace_per_token_bytes(&self) -> Result<u64> {
+        let hidden = self.config.embedding_length as u64;
+        let ffn = self
+            .config
+            .feed_forward_length
+            .unwrap_or(self.config.embedding_length * 4) as u64;
+        hidden
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(ffn.checked_mul(3)?))
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(workspace_overflow)
+    }
+
+    /// Decode tokens per engine step for an isolated row: each token still
+    /// commits on its own, but scheduling, state staging and stream delivery
+    /// are paid once per quantum. Streams deliver in bursts of this size.
+    pub fn preferred_decode_tokens(&self) -> usize {
+        match self.device_kind() {
+            BackendKind::Cpu => 4,
+            BackendKind::Metal | BackendKind::Cuda => 8,
+        }
+    }
+
+    /// The quantum outlives the request's soft scheduling SLA (about 0.7 s
+    /// for interactive and streaming chat), after which the scheduler would
+    /// otherwise grant one token per step. It still yields to waiting or
+    /// co-batched work and to hard deadlines.
+    pub fn sustained_decode_quantum(&self) -> bool {
+        self.preferred_decode_tokens() > 1
+    }
+
+    /// Prefill span: long prompts run in spans of this many tokens on every
+    /// backend, bounding activation memory (a 32K prompt in one pass held
+    /// ~4.6 GB), and an isolated request uses the whole span rather than the
+    /// engine's 192-token chunk. CPU spans are shorter because CPU prefill is
+    /// matrix-vector bound and long spans only add latency spikes.
+    pub fn preferred_prefill_tokens(&self) -> usize {
+        match self.device_kind() {
+            BackendKind::Cpu => 512,
+            BackendKind::Metal | BackendKind::Cuda => 1024,
+        }
     }
 
     pub fn device_kind(&self) -> BackendKind {
@@ -681,7 +516,9 @@ impl Lfm2ChatModel {
                 .flatten()
                 .collect(),
             ),
-            greedy: is_plain_greedy(config),
+            // A JSON-constrained row must sample through the grammar, so it
+            // never takes the batched argmax shortcut.
+            greedy: is_plain_greedy(config) && !config.constrain_json_object,
             decoder: IncrementalDecoder::new(true),
             stop_reason: None,
             assembled: String::new(),
@@ -755,6 +592,14 @@ impl Lfm2ChatModel {
                 finished: true,
             });
         }
+        // Steady-state decode (a pending token, no prefill output) takes the
+        // one-synchronization batched step with a single row.
+        if state.pending_token.is_some() && state.unconsumed_output.is_none() {
+            let mut steps = self.decode_step_batch(&mut [state])?;
+            return steps.pop().ok_or_else(|| {
+                Error::InferenceError("LFM2 single-row decode produced no step".into())
+            });
+        }
         let mut committed = 0usize;
         if let Some(pending) = state.pending_token.take() {
             let input = Tensor::from_slice(&[pending], (1, 1), &self.device.device)?;
@@ -772,8 +617,21 @@ impl Lfm2ChatModel {
             Error::InferenceError("LFM2 decode state has no sampleable output".into())
         })?;
         self.tokenizer.validate_logits(&logits)?;
+        let logits = self.mask_non_generatable(&logits)?;
         let (next, entry) = self.sample_token(state, &logits)?;
         self.accept_token(state, next, committed, entry)
+    }
+
+    /// Mask control tokens out of finite, validated logits (`[V]` or `[B, V]`).
+    fn mask_non_generatable(&self, logits: &Tensor) -> Result<Tensor> {
+        if logits.dim(D::Minus1)? != self.generation_mask.dim(0)? {
+            return Err(Error::InferenceError(
+                "LFM2 logits width does not match the generation mask".into(),
+            ));
+        }
+        logits
+            .broadcast_add(&self.generation_mask)
+            .map_err(Error::from)
     }
 
     /// DS9.3: sample one token, resolving raw logprobs into the public
@@ -901,39 +759,40 @@ impl Lfm2ChatModel {
         }
         let mut tokens = Vec::with_capacity(states.len());
         let mut positions = Vec::with_capacity(states.len());
-        let mut shortconv = Vec::with_capacity(states.len());
-        let mut caches = Vec::with_capacity(states.len());
         for state in states.iter_mut() {
             tokens.push(state.pending_token.take().expect("pending token checked"));
             positions.push(state.position);
-            shortconv.push(&mut state.shortconv);
-            caches.push(&mut state.physical_kv);
         }
-        let logits = self.text_model.forward_token_ids_retained_batch(
-            &tokens,
-            &positions,
-            &mut shortconv,
-            &mut caches,
-        )?;
-        drop(shortconv);
-        drop(caches);
-        self.tokenizer.validate_logits(&logits)?;
-        // DS9.3: rows collecting logprobs must sample through the resolving
-        // path, which forfeits the batched argmax for the whole envelope.
-        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
-        let next_tokens = if states.iter().all(|state| state.greedy) && !wants_logprobs {
-            argmax_batch(&logits.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?)?
-                .into_iter()
-                .map(|token| (token, None))
-                .collect::<Vec<_>>()
-        } else {
-            let mut sampled = Vec::with_capacity(states.len());
-            for (row, state) in states.iter_mut().enumerate() {
-                let row_logits = logits.i(row)?;
-                sampled.push(self.sample_token(state, &row_logits)?);
-            }
-            sampled
+        // The step's KV writes and ShortConv states are committed only after
+        // the next tokens are read back: by then the device has drained, so
+        // the whole step costs one synchronization.
+        let (logits, pending) = {
+            let shortconv = states
+                .iter()
+                .map(|state| &state.shortconv)
+                .collect::<Vec<_>>();
+            let caches = states
+                .iter()
+                .map(|state| &state.physical_kv)
+                .collect::<Vec<_>>();
+            self.text_model.forward_token_ids_retained_batch_deferred(
+                &tokens, &positions, &shortconv, &caches,
+            )?
         };
+        let next_tokens = match self.select_batch_tokens(states, &logits) {
+            Ok(next_tokens) => next_tokens,
+            Err(error) => return Err(pending.abort_with(error)),
+        };
+        {
+            let mut shortconv = Vec::with_capacity(states.len());
+            let mut caches = Vec::with_capacity(states.len());
+            for state in states.iter_mut() {
+                let state = &mut **state;
+                shortconv.push(&mut state.shortconv);
+                caches.push(&mut state.physical_kv);
+            }
+            pending.commit(&mut shortconv, &mut caches)?;
+        }
         let mut steps = Vec::with_capacity(states.len());
         for (state, (next, logprob_entry)) in states.iter_mut().zip(next_tokens) {
             state.position = state.position.saturating_add(1);
@@ -942,144 +801,81 @@ impl Lfm2ChatModel {
         Ok(steps)
     }
 
-    pub(crate) fn physical_state_spec(
+    /// Next token per row from finite, width-checked logits. Plain greedy
+    /// rows read their argmax and the finite flag back in one transfer;
+    /// sampled rows sample first and then read the flag from an idle device,
+    /// so either way the step synchronizes once. No token is accepted from
+    /// non-finite logits.
+    fn select_batch_tokens(
         &self,
-        stage_graphs: &[&[StageDescriptor]],
-    ) -> Result<Lfm2PhysicalStateSpec> {
-        lfm2_physical_state_spec(&self.config, stage_graphs)
-    }
-
-    pub(crate) fn generate_with_callback_physical(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<ChatGenerationOutput> {
-        self.generate_with_callback_state(messages, max_new_tokens, on_delta, cache, shortconv)
-    }
-
-    fn generate_with_callback_state(
-        &self,
-        messages: &[ChatMessage],
-        max_new_tokens: usize,
-        on_delta: &mut dyn FnMut(&str),
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-    ) -> Result<ChatGenerationOutput> {
-        let total_started = Instant::now();
-        let prompt_build_started = Instant::now();
-        let prompt_ids = self.build_prompt(messages)?;
-        let prompt_build_ms = prompt_build_started.elapsed().as_secs_f64() * 1000.0;
-        let model = &self.text_model;
-
-        let prompt_len = prompt_ids.len();
-        let prefill_started = Instant::now();
-        let prefill_cfg = *lfm2_prefill_config();
-        let prefill_exec = prefill_cfg.resolve(prompt_len);
-        let (mut logits, mut position, prefill_steps) =
-            self.prefill_prompt(model, prompt_ids.as_slice(), prefill_exec, cache, shortconv)?;
-        let prefill_forward_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
-
-        let max_new_tokens = max_new_tokens.max(1);
-        let mut generated_ids = Vec::with_capacity(max_new_tokens);
-        let mut assembled = String::with_capacity(max_new_tokens.saturating_mul(4));
-        let mut decoder = IncrementalDecoder::new(true);
-        let mut stop_reason = "length";
-        let decode_started = Instant::now();
-        let mut first_delta_ms: Option<f64> = None;
-
-        while generated_ids.len() < max_new_tokens {
-            self.tokenizer.validate_logits(&logits)?;
-            let next = argmax(&logits.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?)?;
-            self.tokenizer.validate_selection(next)?;
-            if next == self.tokenizer.specials.im_end
-                || next == self.tokenizer.specials.eos
-                || self.tokenizer.specials.eos_alt == Some(next)
-            {
-                stop_reason = "eos";
-                break;
+        states: &mut [&mut ChatDecodeState],
+        logits: &Tensor,
+    ) -> Result<Vec<(u32, Option<crate::engine::TokenLogprob>)>> {
+        self.tokenizer.validate_logits_width(logits)?;
+        let finite = diagnostics::finite_flag(logits)?;
+        let masked = self.mask_non_generatable(logits)?;
+        // DS9.3: rows collecting logprobs must sample through the resolving
+        // path, which forfeits the batched argmax for the whole envelope.
+        let wants_logprobs = states.iter().any(|state| state.sampler.wants_logprobs());
+        if states.iter().all(|state| state.greedy) && !wants_logprobs {
+            let (ids, all_finite) = packed_greedy_selection(
+                &masked.narrow(D::Minus1, 0, self.tokenizer.vocab_size)?,
+                &finite,
+            )?;
+            if !all_finite {
+                return Err(diagnostics::non_finite_error(logits, logits_stage()));
             }
-
-            let delta = self
-                .tokenizer
-                .inner
-                .decode_incrementally(&mut decoder, next)?;
-            generated_ids.push(next);
-            if !delta.is_empty() {
-                if first_delta_ms.is_none() {
-                    first_delta_ms = Some(total_started.elapsed().as_secs_f64() * 1000.0);
-                }
-                on_delta(&delta);
-            }
-            assembled.push_str(&delta);
-
-            if should_check_repetition_loop(generated_ids.len())
-                && has_token_repetition_loop(&generated_ids)
-            {
-                stop_reason = "repetition";
-                break;
-            }
-
-            let next_tensor = Tensor::from_slice(&[next], (1, 1), &self.device.device)?;
-            logits = model
-                .forward_tokens_physical(&next_tensor, position, cache, shortconv)
-                .map_err(|e| Error::InferenceError(format!("LFM2 GGUF decode failed: {e}")))?;
-            position += 1;
+            return Ok(ids.into_iter().map(|id| (id, None)).collect());
         }
-
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
-            let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-            tracing::debug!(
-                target: "izwi::lfm2::timing",
-                prompt_tokens = prompt_len,
-                prefill_policy = prefill_cfg.mode.as_str(),
-                prefill_execution = prefill_exec.as_str(),
-                prefill_steps,
-                prompt_build_ms,
-                prefill_forward_ms,
-                first_delta_ms = first_delta_ms.unwrap_or(total_ms),
-                decode_ms,
-                total_ms,
-                generated_tokens = generated_ids.len(),
-                "LFM2 chat timing breakdown"
-            );
+        let mut sampled = Vec::with_capacity(states.len());
+        for (row, state) in states.iter_mut().enumerate() {
+            let row_logits = masked.i(row)?;
+            sampled.push(self.sample_token(state, &row_logits)?);
         }
-
-        let suffix = self
-            .tokenizer
-            .inner
-            .finish_incremental_decode(&mut decoder)?;
-        assembled.push_str(&suffix);
-        validate_terminal_text(&assembled, stop_reason, generated_ids.len())?;
-        if !suffix.is_empty() {
-            on_delta(&suffix);
+        if finite.to_vec1::<f32>()?[0] == 0.0 {
+            return Err(diagnostics::non_finite_error(logits, logits_stage()));
         }
-        Ok(ChatGenerationOutput {
-            text: assembled.trim().to_string(),
-            tokens_generated: generated_ids.len(),
-        })
+        Ok(sampled)
     }
 
     pub fn prompt_token_ids(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
-        self.build_prompt(messages)
+        self.build_prompt(messages, &[])
     }
 
-    fn build_prompt(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
+    /// Prompt ids with the request's tool definitions in the system turn.
+    pub fn prompt_token_ids_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<Vec<u32>> {
+        self.build_prompt(messages, tools)
+    }
+
+    /// Render `messages` exactly like the checkpoint's chat template:
+    ///
+    /// * one BOS;
+    /// * a leading system message becomes the system turn; tools append
+    ///   `List of tools: [...]` to it (after a newline when it has text), each
+    ///   tool serialized like Python's `json.dumps`; the turn is emitted only
+    ///   when non-empty;
+    /// * every other turn is `<|im_start|>{role}\n{content}<|im_end|>\n` with
+    ///   its content verbatim (empty turns included), except that an
+    ///   assistant turn before the last one keeps only the text after its
+    ///   final `</think>`, trimmed;
+    /// * the generation prompt `<|im_start|>assistant\n`.
+    ///
+    /// The text between two special tokens is tokenized as one string, as
+    /// the template's rendering is, so a content's leading characters merge
+    /// with its role header exactly as they would there.
+    fn build_prompt(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> Result<Vec<u32>> {
         if messages.is_empty() {
             return Err(Error::InvalidInput(
                 "Chat request must include at least one message".to_string(),
             ));
-        }
-
-        let prepend_default_system =
-            should_prepend_default_system(messages, *lfm2_default_system_policy());
-        let prompt_style = *lfm2_prompt_style_policy();
-        if should_use_aggressive_single_turn_prompt(messages, prepend_default_system, prompt_style)
-        {
-            return self.build_aggressive_single_turn_prompt(messages[0].content.as_str());
         }
 
         let mut ids = Vec::new();
@@ -1087,32 +883,45 @@ impl Lfm2ChatModel {
             ids.push(bos);
         }
 
-        let last_assistant_index = messages
-            .iter()
-            .rposition(|message| matches!(message.role, ChatRole::Assistant))
-            .map(|index| index + usize::from(prepend_default_system));
-
-        let mut prompt_index = 0usize;
-        if prepend_default_system {
-            self.append_prompt_message(
-                &mut ids,
-                prompt_index,
-                &ChatRole::System,
-                "You are a helpful assistant.",
-                last_assistant_index,
-            )?;
-            prompt_index += 1;
+        let (system, turns) = match messages.split_first() {
+            Some((first, rest)) if matches!(first.role, ChatRole::System) => {
+                (Some(first.content.as_str()), rest)
+            }
+            _ => (None, messages),
+        };
+        let mut system = system.unwrap_or_default().to_string();
+        if !tools.is_empty() {
+            if !system.is_empty() {
+                system.push('\n');
+            }
+            system.push_str("List of tools: [");
+            for (index, tool) in tools.iter().enumerate() {
+                if index > 0 {
+                    system.push_str(", ");
+                }
+                match tool {
+                    serde_json::Value::String(text) => system.push_str(text),
+                    other => write_python_json(other, &mut system),
+                }
+            }
+            system.push(']');
+        }
+        if !system.is_empty() {
+            self.append_prompt_turn(&mut ids, "system", &system)?;
         }
 
-        for message in messages {
-            self.append_prompt_message(
-                &mut ids,
-                prompt_index,
-                &message.role,
-                message.content.as_str(),
-                last_assistant_index,
-            )?;
-            prompt_index += 1;
+        let last_assistant_index = turns
+            .iter()
+            .rposition(|message| matches!(message.role, ChatRole::Assistant));
+        for (index, message) in turns.iter().enumerate() {
+            let content = if matches!(message.role, ChatRole::Assistant)
+                && Some(index) != last_assistant_index
+            {
+                strip_past_assistant_thinking(&message.content)
+            } else {
+                Cow::Borrowed(message.content.as_str())
+            };
+            self.append_prompt_turn(&mut ids, template_role(&message.role), &content)?;
         }
 
         ids.push(self.tokenizer.specials.im_start);
@@ -1121,87 +930,32 @@ impl Lfm2ChatModel {
         Ok(ids)
     }
 
-    fn append_prompt_message(
-        &self,
-        ids: &mut Vec<u32>,
-        prompt_index: usize,
-        role: &ChatRole,
-        content: &str,
-        last_assistant_index: Option<usize>,
-    ) -> Result<()> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Ok(());
-        }
-
-        let normalized =
-            if matches!(role, ChatRole::Assistant) && Some(prompt_index) != last_assistant_index {
-                strip_past_assistant_thinking(trimmed)
-            } else {
-                Cow::Borrowed(trimmed)
-            };
-        if normalized.is_empty() {
-            return Ok(());
-        }
-
+    fn append_prompt_turn(&self, ids: &mut Vec<u32>, role: &str, content: &str) -> Result<()> {
         ids.push(self.tokenizer.specials.im_start);
-        ids.extend_from_slice(self.prompt_scaffold.role_header(role));
-        ids.extend(self.tokenizer.encode_text(normalized.as_ref())?);
+        ids.extend(self.tokenizer.encode_text(&format!("{role}\n{content}"))?);
         ids.push(self.tokenizer.specials.im_end);
         ids.extend_from_slice(&self.prompt_scaffold.newline);
         Ok(())
-    }
-
-    fn build_aggressive_single_turn_prompt(&self, content: &str) -> Result<Vec<u32>> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return Err(Error::InvalidInput(
-                "Chat request must include at least one tokenizable message".to_string(),
-            ));
-        }
-
-        // Aggressive TTFT mode intentionally uses a leaner single-turn prompt to
-        // reduce prefill token count for common benchmark traffic.
-        let mut ids = self.tokenizer.encode_text(trimmed)?;
-        ids.extend_from_slice(&self.prompt_scaffold.newline);
-        ids.push(self.tokenizer.specials.im_start);
-        ids.extend_from_slice(&self.prompt_scaffold.assistant_header);
-        Ok(ids)
-    }
-
-    fn prefill_prompt(
-        &self,
-        model: &QuantizedLfm2Backbone,
-        prompt_ids: &[u32],
-        exec: Lfm2PrefillExecution,
-        cache: &mut PhysicalPagedKvCache,
-        shortconv: &mut InvocationTensorLease,
-    ) -> Result<(Tensor, usize, usize)> {
-        if prompt_ids.is_empty() {
-            return Err(Error::InvalidInput(
-                "LFM2 chat prompt must include at least one token".to_string(),
-            ));
-        }
-
-        match exec {
-            Lfm2PrefillExecution::Full => {
-                record_prefill_sequence_span(prompt_ids.len());
-                let input_ids =
-                    Tensor::from_slice(prompt_ids, (1, prompt_ids.len()), &self.device.device)?;
-                let logits = model
-                    .forward_tokens_physical(&input_ids, 0, cache, shortconv)
-                    .map_err(|e| Error::InferenceError(format!("LFM2 GGUF forward failed: {e}")))?;
-                Ok((logits, prompt_ids.len(), 1))
-            }
-        }
     }
 }
 
 impl InferenceStateContractProvider for Lfm2ChatModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
         Ok(InferenceStateCapability::Managed(
-            lfm2_managed_cache_contract(&self.config)?,
+            lfm2_managed_cache_contract(&self.config, lfm2_chat_kv_dtype(self.device_kind()))?,
         ))
+    }
+}
+
+/// Paged KV storage for LFM2 chat. Metal and CUDA store F16, which halves
+/// the KV bytes and their read bandwidth; queries and the attention output
+/// are cast at the call sites and scores accumulate in F32 in every kernel.
+/// CPU keeps F32: its decode is bound by the weights, and F16 would add a
+/// conversion on each read.
+pub(crate) fn lfm2_chat_kv_dtype(backend: BackendKind) -> crate::kv::v2::StateDType {
+    match backend {
+        BackendKind::Cpu => crate::kv::v2::StateDType::F32,
+        BackendKind::Metal | BackendKind::Cuda => crate::kv::v2::StateDType::F16,
     }
 }
 
@@ -1230,8 +984,111 @@ fn is_plain_greedy(config: &ChatGenerationConfig) -> bool {
         && config.presence_penalty.abs() <= f32::EPSILON
 }
 
+/// Serialize like Python's `json.dumps(value, ensure_ascii=False)`, which the
+/// chat template's `tojson` uses: `", "` and `": "` separators, non-ASCII
+/// kept. Object keys follow `serde_json`'s map order.
+fn write_python_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&serde_json::Value::String(key.clone()).to_string());
+                out.push_str(": ");
+                write_python_json(item, out);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+fn lfm2_chat_gguf_name(variant: ModelVariant) -> Result<&'static str> {
+    match variant {
+        ModelVariant::Lfm2512BInstructGguf => Ok("LFM2.5-1.2B-Instruct-Q4_K_M.gguf"),
+        ModelVariant::Lfm2512BThinkingGguf => Ok("LFM2.5-1.2B-Thinking-Q4_K_M.gguf"),
+        _ => Err(Error::ModelLoadError(format!(
+            "Unsupported LFM2 GGUF chat variant: {variant}"
+        ))),
+    }
+}
+
+/// What a chat load reads and builds, for load admission.
+pub(crate) struct Lfm2ChatLoadLayout {
+    pub(crate) gguf: std::path::PathBuf,
+    /// (positions, head dim) of the backbone's RoPE tables.
+    pub(crate) rope_table: (usize, usize),
+}
+
+pub(crate) fn lfm2_chat_load_layout(
+    model_dir: &Path,
+    variant: ModelVariant,
+) -> Result<Lfm2ChatLoadLayout> {
+    let gguf = model_dir.join(lfm2_chat_gguf_name(variant)?);
+    let mut config = parse_lfm2_backbone_config(&GgufLoader::from_path(&gguf)?)?;
+    config.context_length = lfm25_chat_context_limit(config.context_length);
+    Ok(Lfm2ChatLoadLayout {
+        rope_table: super::backbone::rope_table_geometry(&config)?,
+        gguf,
+    })
+}
+
+fn logits_stage() -> &'static str {
+    if diagnostics::enabled() {
+        "LFM2 raw logits before sampling (activation diagnostics enabled)"
+    } else {
+        "LFM2 raw logits before sampling (activation diagnostics disabled; set IZWI_LFM2_DIAGNOSTICS=1 in the server process)"
+    }
+}
+
+fn workspace_overflow() -> Error {
+    Error::InvalidInput("LFM2 workspace estimate overflow".into())
+}
+
+/// Context the LFM2.5-1.2B chat checkpoints support.
+///
+/// The GGUF metadata says 128,000, but Liquid's model cards and docs give
+/// 32,768, and vLLM's recipe caps the model there; quality past it is
+/// unverified. Capping at load also bounds the RoPE tables and every
+/// backend's KV reservation (CUDA otherwise reserved a 128K arena).
+const LFM25_CHAT_CONTEXT_TOKENS: usize = 32_768;
+
+fn lfm25_chat_context_limit(checkpoint_context: usize) -> usize {
+    checkpoint_context.min(LFM25_CHAT_CONTEXT_TOKENS)
+}
+
+fn generation_mask(
+    logits_width: usize,
+    tokenizer_vocab: usize,
+    non_generatable: &[u32],
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let mut mask = vec![0f32; logits_width];
+    for value in mask.iter_mut().skip(tokenizer_vocab) {
+        *value = f32::NEG_INFINITY;
+    }
+    for &id in non_generatable {
+        if let Some(value) = mask.get_mut(id as usize) {
+            *value = f32::NEG_INFINITY;
+        }
+    }
+    Tensor::from_vec(mask, logits_width, device).map_err(Error::from)
+}
+
 fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<()> {
-    if text.trim().is_empty() || reason == "repetition" {
+    if text.trim().is_empty() {
         return Err(Error::InferenceError(format!(
             "LFM2 generation did not produce a valid answer: stop_reason={reason}, generated_tokens={generated}, raw_chars={}", text.chars().count()
         )));
@@ -1239,108 +1096,108 @@ fn validate_terminal_text(text: &str, reason: &str, generated: usize) -> Result<
     Ok(())
 }
 
-fn argmax_batch(logits: &Tensor) -> Result<Vec<u32>> {
-    logits.dims2()?;
-    logits
-        .argmax(D::Minus1)?
-        .to_dtype(DType::U32)?
-        .to_vec1::<u32>()
-        .map_err(Error::from)
+/// Per-row argmax of `[B, V]` logits read back with a device-side `[1]`
+/// finite flag in one transfer: `(tokens, all_finite)`. Ties pick the first
+/// maximum. Token ids are below 2^24, so the F32 round trip is exact.
+fn packed_greedy_selection(logits: &Tensor, finite: &Tensor) -> Result<(Vec<u32>, bool)> {
+    let (rows, _) = logits.dims2()?;
+    let ids = logits.argmax(D::Minus1)?.to_dtype(DType::F32)?;
+    let packed = Tensor::cat(&[&ids, finite], 0)?.to_vec1::<f32>()?;
+    if packed.len() != rows + 1 {
+        return Err(Error::InferenceError(
+            "LFM2 packed greedy readback has the wrong length".into(),
+        ));
+    }
+    Ok((
+        packed[..rows].iter().map(|id| *id as u32).collect(),
+        packed[rows] != 0.0,
+    ))
 }
 
-fn argmax(logits: &Tensor) -> Result<u32> {
-    let logits = match logits.rank() {
-        1 => logits.clone(),
-        2 => {
-            let (batch, _vocab) = logits.dims2()?;
-            if batch != 1 {
-                return Err(Error::InferenceError(format!(
-                    "Unexpected batched logits for argmax: expected batch=1, got {batch}"
-                )));
-            }
-            logits.i(0)?
-        }
-        rank => {
-            return Err(Error::InferenceError(format!(
-                "Unexpected logits rank for argmax: {rank}"
-            )));
-        }
-    };
-    let idx = logits.argmax(D::Minus1)?;
-    let idx = if idx.rank() == 0 {
-        idx
-    } else {
-        idx.squeeze(0)?
-    };
-    idx.to_dtype(DType::U32)?
-        .to_scalar::<u32>()
-        .map_err(Error::from)
-}
-
+/// The template's `content.split("</think>")[-1] | trim` for past assistant
+/// turns; content without `</think>` is kept verbatim.
 fn strip_past_assistant_thinking(input: &str) -> Cow<'_, str> {
     if let Some((_reasoning, tail)) = input.rsplit_once("</think>") {
         Cow::Owned(tail.trim().to_string())
     } else {
-        Cow::Borrowed(input.trim())
+        Cow::Borrowed(input)
     }
 }
 
-fn has_suffix_repeat(ids: &[u32], span: usize, repeats: usize) -> bool {
-    if span == 0 || repeats < 2 || ids.len() < span * repeats {
-        return false;
-    }
-    let tail_start = ids.len() - span;
-    let tail = &ids[tail_start..];
-    (2..=repeats).all(|rep| {
-        let start = ids.len() - (span * rep);
-        &ids[start..start + span] == tail
-    })
-}
+/// Tokens of exactly periodic output that count as a degenerate loop.
+///
+/// The guard exists because a looping reply (most often a reasoning model's
+/// `<think>` block) would otherwise run to `max_tokens`, which defaults to the
+/// remaining context. It must never cut legitimate repetitive output short,
+/// so it fires only when the whole recent window repeats one short span.
+const REPETITION_WINDOW: usize = 256;
+/// Longest repeating span the guard looks for.
+const REPETITION_MAX_PERIOD: usize = 64;
+const REPETITION_CHECK_INTERVAL: usize = 16;
 
 fn should_check_repetition_loop(len: usize) -> bool {
-    len >= 48 && len.is_multiple_of(4)
+    len >= REPETITION_WINDOW && len.is_multiple_of(REPETITION_CHECK_INTERVAL)
 }
 
+/// True when the last [`REPETITION_WINDOW`] ids repeat with a period of at
+/// most [`REPETITION_MAX_PERIOD`].
 fn has_token_repetition_loop(ids: &[u32]) -> bool {
-    // Catch common degenerate loops from greedy decode where the same token span
-    // is emitted repeatedly (frequent in tiny reasoning models).
-    if ids.len() < 48 {
+    if ids.len() < REPETITION_WINDOW {
         return false;
     }
-    const PATTERNS: &[(usize, usize)] = &[(24, 3), (16, 3), (12, 3), (8, 4), (6, 5)];
-    PATTERNS
-        .iter()
-        .any(|(span, repeats)| has_suffix_repeat(ids, *span, *repeats))
+    let window = &ids[ids.len() - REPETITION_WINDOW..];
+    (1..=REPETITION_MAX_PERIOD)
+        .any(|period| (period..window.len()).all(|i| window[i] == window[i - period]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        has_token_repetition_loop, parse_lfm2_default_system_policy, parse_lfm2_prefill_mode,
-        parse_lfm2_prefill_threshold, parse_lfm2_prompt_style_policy, should_check_repetition_loop,
-        should_prepend_default_system, should_use_aggressive_single_turn_prompt,
-        strip_past_assistant_thinking, Lfm2DefaultSystemPolicy, Lfm2PrefillConfig,
-        Lfm2PrefillExecution, Lfm2PrefillMode, Lfm2PromptStylePolicy,
+        has_token_repetition_loop, should_check_repetition_loop, strip_past_assistant_thinking,
     };
-    use crate::models::shared::chat::{ChatMessage, ChatRole};
 
     #[test]
-    fn lfm2_packed_greedy_tokens_match_scalar_rows_including_ties() {
-        use candle_core::{Device, IndexOp, Tensor};
+    fn lfm2_packed_greedy_tokens_pick_the_first_maximum_per_row() {
+        use candle_core::{Device, Tensor};
         let logits = Tensor::from_vec(
             vec![1f32, 4., 2., 4., -3., -2., -1., -4., 9., 2., 1., 0.],
             (3, 4),
             &Device::Cpu,
         )
         .unwrap();
-        let expected = (0..3)
-            .map(|row| super::argmax(&logits.i(row).unwrap()).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(super::argmax_batch(&logits).unwrap(), expected);
+        let finite = super::diagnostics::finite_flag(&logits).unwrap();
         assert_eq!(
-            super::argmax_batch(&logits.narrow(0, 1, 1).unwrap()).unwrap(),
-            vec![2]
+            super::packed_greedy_selection(&logits, &finite).unwrap(),
+            (vec![1, 2, 0], true)
         );
+        assert_eq!(
+            super::packed_greedy_selection(&logits.narrow(0, 1, 1).unwrap(), &finite).unwrap(),
+            (vec![2], true)
+        );
+        let bad = Tensor::from_vec(vec![1f32, f32::NAN], (1, 2), &Device::Cpu).unwrap();
+        let bad_finite = super::diagnostics::finite_flag(&bad).unwrap();
+        assert!(!super::packed_greedy_selection(&bad, &bad_finite).unwrap().1);
+    }
+
+    #[test]
+    fn tool_json_uses_python_json_dumps_spacing() {
+        let tool = serde_json::json!({
+            "function": {"name": "get_weather", "parameters": {"required": ["city"], "x": [1, 2.5, true, null]}},
+            "type": "function",
+            "u": "é\n\"q\""
+        });
+        let mut out = String::new();
+        super::write_python_json(&tool, &mut out);
+        assert_eq!(
+            out,
+            r#"{"function": {"name": "get_weather", "parameters": {"required": ["city"], "x": [1, 2.5, true, null]}}, "type": "function", "u": "é\n\"q\""}"#
+        );
+    }
+
+    #[test]
+    fn lfm25_chat_context_is_capped_at_the_model_card_length() {
+        assert_eq!(super::lfm25_chat_context_limit(128_000), 32_768);
+        assert_eq!(super::lfm25_chat_context_limit(32), 32);
     }
 
     #[test]
@@ -1350,190 +1207,57 @@ mod tests {
     }
 
     #[test]
-    fn strip_past_assistant_thinking_keeps_unclosed_content() {
-        let input = "<think>still reasoning";
-        assert_eq!(
-            strip_past_assistant_thinking(input),
-            "<think>still reasoning"
-        );
+    fn strip_past_assistant_thinking_keeps_unclosed_content_verbatim() {
+        let input = "  <think>still reasoning\n";
+        assert_eq!(strip_past_assistant_thinking(input), input);
     }
 
     #[test]
-    fn detects_token_repetition_loop() {
-        let mut ids = Vec::new();
-        let phrase = [1, 2, 3, 4, 5, 6, 7, 8];
-        for _ in 0..5 {
+    fn detects_a_window_of_periodic_output() {
+        let phrase: Vec<u32> = (1..=40).collect();
+        let mut ids = vec![42; 16];
+        while ids.len() < 16 + 256 {
             ids.extend(phrase.iter().copied());
         }
-        ids.splice(0..0, vec![42; 16]);
         assert!(has_token_repetition_loop(&ids));
     }
 
     #[test]
-    fn does_not_flag_short_sequences_as_loop() {
-        let ids: Vec<u32> = (1..30).collect();
+    fn legitimate_repetitive_lists_are_not_loops() {
+        // "list 40 zeros": a period-2 run of 80 tokens after a preamble.
+        let mut ids: Vec<u32> = (100..300).collect();
+        for _ in 0..40 {
+            ids.extend([7_u32, 8]);
+        }
         assert!(!has_token_repetition_loop(&ids));
+        // A table whose rows share a 6-token separator but differ in content.
+        let mut table = Vec::new();
+        for row in 0..60_u32 {
+            table.extend([1, 2, 3, 1000 + row, 4, 5]);
+        }
+        assert!(!has_token_repetition_loop(&table));
+        // A period longer than the guard looks for.
+        let long: Vec<u32> = (0..300).map(|i| i % 65).collect();
+        assert!(!has_token_repetition_loop(&long));
     }
 
     #[test]
     fn repetition_loop_check_interval_skips_between_boundaries() {
-        assert!(!should_check_repetition_loop(47));
-        assert!(should_check_repetition_loop(48));
-        assert!(!should_check_repetition_loop(49));
-        assert!(should_check_repetition_loop(52));
-    }
-
-    #[test]
-    fn parse_prefill_mode_defaults_to_auto_for_unknown_values() {
-        assert_eq!(parse_lfm2_prefill_mode(None), Lfm2PrefillMode::Auto);
-        assert_eq!(
-            parse_lfm2_prefill_mode(Some("unsupported")),
-            Lfm2PrefillMode::Auto
-        );
-        assert_eq!(parse_lfm2_prefill_mode(Some("FULL")), Lfm2PrefillMode::Full);
-        assert_eq!(
-            parse_lfm2_prefill_mode(Some("token_mode")),
-            Lfm2PrefillMode::Token
-        );
-    }
-
-    #[test]
-    fn parse_prefill_threshold_defaults_when_missing_or_invalid() {
-        assert_eq!(
-            parse_lfm2_prefill_threshold(None),
-            Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD
-        );
-        assert_eq!(
-            parse_lfm2_prefill_threshold(Some("0")),
-            Lfm2PrefillConfig::DEFAULT_TOKEN_THRESHOLD
-        );
-        assert_eq!(parse_lfm2_prefill_threshold(Some("96")), 96);
-    }
-
-    #[test]
-    fn prefill_policy_forces_request_isolated_full_passes() {
-        let config = Lfm2PrefillConfig {
-            mode: Lfm2PrefillMode::Auto,
-            token_prompt_threshold: 64,
-        };
-        assert_eq!(config.resolve(16), Lfm2PrefillExecution::Full);
-        assert_eq!(config.resolve(64), Lfm2PrefillExecution::Full);
-        assert_eq!(config.resolve(65), Lfm2PrefillExecution::Full);
-
-        let explicitly_unsafe = Lfm2PrefillConfig {
-            mode: Lfm2PrefillMode::Token,
-            token_prompt_threshold: usize::MAX,
-        };
-        assert_eq!(explicitly_unsafe.resolve(1), Lfm2PrefillExecution::Full);
-    }
-
-    #[test]
-    fn parse_default_system_policy_defaults_to_auto_for_unknown_values() {
-        assert_eq!(
-            parse_lfm2_default_system_policy(None),
-            Lfm2DefaultSystemPolicy::Auto
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("unsupported")),
-            Lfm2DefaultSystemPolicy::Auto
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("always")),
-            Lfm2DefaultSystemPolicy::Always
-        );
-        assert_eq!(
-            parse_lfm2_default_system_policy(Some("never")),
-            Lfm2DefaultSystemPolicy::Never
-        );
-    }
-
-    #[test]
-    fn auto_default_system_policy_preserves_instructions_across_turns() {
-        let single_turn = vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hello".to_string(),
-        }];
-        assert!(!should_prepend_default_system(
-            &single_turn,
-            Lfm2DefaultSystemPolicy::Auto
-        ));
-
-        let multi_turn = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: "hi".to_string(),
-            },
-        ];
-        assert!(!should_prepend_default_system(
-            &multi_turn,
-            Lfm2DefaultSystemPolicy::Auto
-        ));
-    }
-
-    #[test]
-    fn parse_prompt_style_policy_defaults_to_standard_for_unknown_values() {
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(None),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("unsupported")),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("standard")),
-            Lfm2PromptStylePolicy::Standard
-        );
-        assert_eq!(
-            parse_lfm2_prompt_style_policy(Some("aggressive")),
-            Lfm2PromptStylePolicy::Aggressive
-        );
-    }
-
-    #[test]
-    fn aggressive_single_turn_prompt_only_applies_to_single_user_turns() {
-        let single_user_turn = vec![ChatMessage {
-            role: ChatRole::User,
-            content: "hello".to_string(),
-        }];
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Standard
-        ));
-        assert!(should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            false,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &single_user_turn,
-            true,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
-
-        let multi_turn = vec![
-            ChatMessage {
-                role: ChatRole::User,
-                content: "hello".to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: "hi".to_string(),
-            },
-        ];
-        assert!(!should_use_aggressive_single_turn_prompt(
-            &multi_turn,
-            false,
-            Lfm2PromptStylePolicy::Aggressive
-        ));
+        assert!(!should_check_repetition_loop(255));
+        assert!(should_check_repetition_loop(256));
+        assert!(!should_check_repetition_loop(257));
+        assert!(should_check_repetition_loop(272));
     }
 }
 
 #[cfg(test)]
 #[path = "chat_integrity_tests.rs"]
 mod integrity_tests;
+
+#[cfg(test)]
+#[path = "chat_reference_tests.rs"]
+mod reference_tests;
+
+#[cfg(test)]
+#[path = "chat_bench_tests.rs"]
+mod bench_tests;

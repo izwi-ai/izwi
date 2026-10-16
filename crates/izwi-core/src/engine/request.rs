@@ -1225,6 +1225,11 @@ pub struct EngineCoreRequest {
     /// clip and the manager's snapshot publication). `None` keeps the
     /// first-chunk-only publication.
     pub(super) managed_snapshot_boundary: Option<u32>,
+    /// The end of the prompt's first turn (its system prompt, when it has
+    /// one), declared alongside the history boundary. Requests sharing a
+    /// system prompt but not their user turns share exactly these tokens, so
+    /// a hybrid model also snapshots at its interval floor.
+    pub(super) managed_preamble_boundary: Option<u32>,
     /// Request-specific shape/workspace facts produced by the exact loaded
     /// model. The engine remains model-neutral and keys these facts by the
     /// opaque stage identity from the loaded adapter contract.
@@ -2382,6 +2387,11 @@ impl EngineCoreRequest {
         self.managed_snapshot_boundary = prepared_chat_prompt
             .as_ref()
             .and_then(NativeChatPreparedPrompt::managed_snapshot_boundary)
+            .filter(|boundary| *boundary <= prompt_tokens.len())
+            .and_then(|boundary| u32::try_from(boundary).ok());
+        self.managed_preamble_boundary = prepared_chat_prompt
+            .as_ref()
+            .and_then(NativeChatPreparedPrompt::managed_preamble_boundary)
             .filter(|boundary| *boundary <= prompt_tokens.len())
             .and_then(|boundary| u32::try_from(boundary).ok());
         self.prompt_tokens = prompt_tokens;
@@ -4725,6 +4735,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4790,6 +4801,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4855,6 +4867,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4917,6 +4930,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -4980,6 +4994,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -5043,6 +5058,7 @@ impl EngineCoreRequest {
             managed_cache_runtime: None,
             managed_prefix_cursor: None,
             managed_snapshot_boundary: None,
+            managed_preamble_boundary: None,
             prepared_stage_costs: Vec::new(),
             prepared_sequence_input_tokens: None,
             prepared_asr_execution_shape: None,
@@ -5406,6 +5422,10 @@ impl EngineCoreRequest {
     /// Phase 5a: the prepared prompt's stable-history boundary (tokens).
     pub(crate) fn managed_snapshot_boundary(&self) -> Option<u32> {
         self.managed_snapshot_boundary
+    }
+
+    pub(crate) fn managed_preamble_boundary(&self) -> Option<u32> {
+        self.managed_preamble_boundary
     }
 
     #[cfg(test)]

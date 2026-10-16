@@ -14,10 +14,13 @@ pub mod cpu_q8;
 pub mod cuda;
 pub mod depthwise_conv;
 pub mod f16_weight_linear;
+pub(crate) mod lfm_shortconv_step;
 pub mod metal;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_encoder;
 pub mod metal_fp8;
+#[cfg(feature = "metal")]
+pub(crate) mod metal_kquant_mv;
 #[cfg(feature = "metal")]
 pub(crate) mod metal_paged_gqa;
 #[cfg(feature = "metal")]
@@ -70,6 +73,12 @@ pub fn use_fused_kernels() -> bool {
 
 /// Whether fused kernels are enabled and available for a specific device.
 pub fn use_fused_kernels_for_device(device: &Device) -> bool {
+    fused_kernels_enabled_by_env() && fused_kernels_available_for_device(device)
+}
+
+/// `IZWI_FUSED_KERNELS` (default on). Fused ops with a plain-Rust CPU
+/// implementation honour it on CPU too.
+pub fn fused_kernels_enabled_by_env() -> bool {
     std::env::var("IZWI_FUSED_KERNELS")
         .ok()
         .map(|value| {
@@ -79,7 +88,6 @@ pub fn use_fused_kernels_for_device(device: &Device) -> bool {
             )
         })
         .unwrap_or(true)
-        && fused_kernels_available_for_device(device)
 }
 
 /// Whether backend-specific block fusion is enabled for a specific device.

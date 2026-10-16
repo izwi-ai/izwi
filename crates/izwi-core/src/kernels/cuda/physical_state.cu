@@ -1286,3 +1286,39 @@ extern "C" __global__ void physical_ring_shortconv_f32(
   }
   output[gid] = value;
 }
+
+// Fused LFM2 ShortConv decode step (see kernels/lfm_shortconv_step.rs):
+// output rows 0..capacity are the next ring, row capacity is y = c * conv.
+extern "C" __global__ void lfm_shortconv_gated_ring_step_f32(
+    const float* __restrict__ projected,
+    const float* __restrict__ ring,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int hidden,
+    int capacity,
+    unsigned long long cursor,
+    unsigned long long valid) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= hidden) {
+    return;
+  }
+  const float bx = projected[h] * projected[2 * hidden + h];
+  const unsigned long long slot = cursor % static_cast<unsigned long long>(capacity);
+  const unsigned long long oldest = cursor - valid;
+  float conv = bx * weight[h * capacity + capacity - 1];
+  for (int tap = 0; tap + 1 < capacity; ++tap) {
+    const long long source =
+        static_cast<long long>(cursor) + 1 - capacity + tap;
+    if (source < 0 || static_cast<unsigned long long>(source) < oldest) {
+      continue;
+    }
+    const unsigned long long physical =
+        static_cast<unsigned long long>(source) % static_cast<unsigned long long>(capacity);
+    conv += ring[physical * hidden + h] * weight[h * capacity + tap];
+  }
+  for (int s = 0; s < capacity; ++s) {
+    output[s * hidden + h] =
+        (static_cast<unsigned long long>(s) == slot) ? bx : ring[s * hidden + h];
+  }
+  output[capacity * hidden + h] = projected[hidden + h] * conv;
+}

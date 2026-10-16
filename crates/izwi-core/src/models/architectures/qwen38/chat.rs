@@ -3822,6 +3822,12 @@ fn render_prompt(
                 prompt.push_str(message.content.trim());
                 prompt.push_str("<|im_end|>\n");
             }
+            // The template's tool turn: a user turn wrapping the result.
+            ChatRole::Tool => {
+                prompt.push_str("<|im_start|>user\n<tool_response>\n");
+                prompt.push_str(message.content.trim());
+                prompt.push_str("\n</tool_response><|im_end|>\n");
+            }
             ChatRole::Assistant => {
                 let (reasoning_content, content) = split_assistant_reasoning(&message.content);
                 prompt.push_str("<|im_start|>assistant\n");
@@ -4592,6 +4598,35 @@ mod tests {
                 content: "Follow-up".to_string(),
             },
         ]
+    }
+
+    /// The first-turn boundary is where requests sharing only a system
+    /// prompt diverge: the second `<|im_start|>`, before the history boundary.
+    #[test]
+    fn preamble_boundary_ends_the_first_turn() {
+        let tokenizer = byte_level_tokenizer();
+        let im_start = tokenizer.specials.im_start;
+        let prepared = |ids: Vec<u32>| {
+            let positions = build_text_positions(ids.len());
+            let boundary = history_boundary(&ids, im_start);
+            crate::models::registry::NativeChatPreparedPrompt::Qwen38(Qwen38PreparedPrompt {
+                next_text_position: ids.len(),
+                prompt_positions: positions,
+                prompt_ids: ids,
+                history_boundary: boundary,
+            })
+        };
+        // System turn, user turn, assistant header.
+        let shared = prepared(vec![im_start, 1, 2, im_start, 3, 4, im_start, 5]);
+        assert_eq!(shared.managed_snapshot_boundary(), Some(6));
+        assert_eq!(shared.managed_preamble_boundary(), Some(3));
+        // A single user turn has nothing before its history boundary.
+        let single = prepared(vec![im_start, 3, 4, im_start, 5]);
+        assert_eq!(single.managed_snapshot_boundary(), Some(3));
+        assert_eq!(single.managed_preamble_boundary(), None);
+        // No declared history: no first-turn boundary either.
+        let bare = prepared(vec![1, 2, 3]);
+        assert_eq!(bare.managed_preamble_boundary(), None);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use super::diagnostics;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, Embedding, Module};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_nn::{Conv1d, Conv1dConfig, Module};
 use candle_transformers::models::with_tracing::QMatMul;
 
 use crate::backends::kv::{
@@ -14,7 +14,7 @@ use crate::backends::state::{
     InvocationRingDepthwiseConvTransaction, PhysicalStateSequenceId, PhysicalStateTransactionId,
     StateComponentValue, TensorStateArena,
 };
-use crate::engine::{InvocationTensorLease, StageDescriptor};
+use crate::engine::InvocationTensorLease;
 use crate::error::{Error, Result};
 use crate::kernels::{
     try_fused_qk_rms_norm, try_fused_rms_norm, try_fused_rope_pair_bshd,
@@ -34,7 +34,7 @@ use crate::models::shared::weights::gguf::GgufLoader;
 
 use super::config::Lfm2BackboneConfig;
 use super::physical::LFM2_SHORTCONV_STATE_DOMAIN;
-use super::physical::{lfm2_physical_state_spec, Lfm2PhysicalStateSpec, Lfm2StateLayout};
+use super::physical::Lfm2StateLayout;
 
 #[derive(Clone)]
 pub(crate) struct Lfm2ShortConvRuntimeState {
@@ -226,7 +226,13 @@ impl Lfm2ShortConvRuntimeState {
             self.cursor,
             valid,
         );
-        if (input.device().is_cuda() || input.device().is_metal()) && output.is_none() {
+        // With fused kernels enabled, an accelerator kernel that declines is
+        // a defect, not a reason to fall back silently to many small ops.
+        // `IZWI_FUSED_KERNELS=0` asks for the device-agnostic op path.
+        if (input.device().is_cuda() || input.device().is_metal())
+            && output.is_none()
+            && crate::kernels::use_fused_kernels_for_device(input.device())
+        {
             return Err(Error::InferenceError(
                 "LFM2 accelerator ShortConv ring kernel is unavailable".into(),
             ));
@@ -255,6 +261,62 @@ impl Lfm2ShortConvRuntimeState {
         let refs = slots.iter().collect::<Vec<_>>();
         *ring = Some(Tensor::stack(&refs, 0)?.contiguous()?);
         Ok(output)
+    }
+
+    /// One decode token through the fused ShortConv step
+    /// (`kernels::lfm_shortconv_step`): `projected` is the token's
+    /// in-projection output `[1, 1, 3 * hidden]`; returns the gated
+    /// convolution `[1, 1, hidden]` and installs the next ring. `None` when
+    /// fused kernels are switched off, so the caller runs the op-by-op path.
+    /// Like [`Self::apply`], the cursor advances only through
+    /// [`Self::advance`].
+    fn apply_fused_step(
+        &mut self,
+        component: crate::kv::v2::StateComponentId,
+        projected: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(test)]
+        if FORCE_UNFUSED_SHORTCONV.with(std::cell::Cell::get) {
+            return Ok(None);
+        }
+        let device = projected.device();
+        let enabled = if device.is_cpu() {
+            crate::kernels::fused_kernels_enabled_by_env()
+        } else {
+            crate::kernels::use_fused_kernels_for_device(device)
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        if weight.dims2()? != (self.hidden, self.capacity) {
+            return Err(Error::InvalidInput(
+                "LFM2 retained ShortConv geometry mismatch".into(),
+            ));
+        }
+        let cursor = self.cursor;
+        let capacity = self.capacity;
+        let hidden = self.hidden;
+        let (_, ring) = self
+            .components
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == component)
+            .ok_or_else(|| Error::InferenceError("LFM2 ShortConv component is absent".into()))?;
+        let current = match ring.as_ref() {
+            Some(ring) => ring.clone(),
+            None if cursor == 0 => Tensor::zeros((capacity, 1, hidden), DType::F32, device)?,
+            None => {
+                return Err(Error::InferenceError(
+                    "LFM2 ShortConv state is absent after cursor zero".into(),
+                ))
+            }
+        };
+        let valid = cursor.min(capacity as u64);
+        let (y, next) = crate::kernels::lfm_shortconv_step::lfm_shortconv_gated_ring_step(
+            projected, &current, weight, cursor, valid,
+        )?;
+        *ring = Some(next);
+        Ok(Some(y))
     }
 
     fn advance(&mut self, steps: usize) -> Result<()> {
@@ -319,19 +381,76 @@ fn direct_shortconv_ring(
     Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 2).map_err(Error::from)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch that sends this thread's ShortConv decode steps down
+    /// the op-by-op path, for parity and A/B timing against the fused step.
+    pub(crate) static FORCE_UNFUSED_SHORTCONV: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Test-only switch that sends this thread's projections to Candle's
+    /// `QMatMul`, for A/B timing against the small-batch mat-vec.
+    pub(crate) static FORCE_CANDLE_MATVEC: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// One decode step's KV writes and next ShortConv states, not yet
+/// committed. Dropping it without [`Self::commit`] or [`Self::abort_with`]
+/// would orphan in-flight writes, so both consume it.
+#[must_use = "a pending decode step must be committed or aborted"]
+pub(crate) struct Lfm2PendingDecodeCommit {
+    completions: KvWriteCompletionCollector,
+    working: Vec<Lfm2ShortConvRuntimeState>,
+    positions: Vec<usize>,
+}
+
+impl Lfm2PendingDecodeCommit {
+    /// Wait for the step's KV writes (already done when the caller has read
+    /// the logits back), then advance every row's cache and ShortConv state.
+    pub(crate) fn commit(
+        self,
+        states: &mut [&mut Lfm2ShortConvRuntimeState],
+        caches: &mut [&mut PhysicalPagedKvCache],
+    ) -> Result<()> {
+        if states.len() != self.working.len() || caches.len() != self.positions.len() {
+            return Err(self.abort_with(Error::InvalidInput(
+                "LFM2 pending decode commit rows do not match".into(),
+            )));
+        }
+        let completion = Arc::new(self.completions.seal()?);
+        for (row, cache) in caches.iter_mut().enumerate() {
+            cache.commit_shared_completion(self.positions[row], 1, completion.clone())?;
+        }
+        for (state, working) in states.iter_mut().zip(self.working) {
+            **state = working;
+        }
+        Ok(())
+    }
+
+    /// Drain the step's writes without committing them, returning `error`
+    /// (annotated if the drain also fails).
+    pub(crate) fn abort_with(self, error: Error) -> Error {
+        match self.completions.drain() {
+            Ok(()) => error,
+            Err(drain) => Error::InferenceError(format!(
+                "LFM2 decode step failed: {error}; fence drain failed: {drain}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Mlp {
-    gate: QMatMul,
-    down: QMatMul,
-    up: QMatMul,
+    gate: Lfm2Linear,
+    down: Lfm2Linear,
+    up: Lfm2Linear,
 }
 
 #[derive(Debug)]
 struct AttentionLayer {
-    wq: QMatMul,
-    wk: QMatMul,
-    wv: QMatMul,
-    wo: QMatMul,
+    wq: Lfm2Linear,
+    wk: Lfm2Linear,
+    wv: Lfm2Linear,
+    wo: Lfm2Linear,
     q_norm: LfmRmsNorm,
     k_norm: LfmRmsNorm,
     qk_norm_weight: Tensor,
@@ -349,8 +468,8 @@ struct AttentionLayer {
 
 #[derive(Debug)]
 struct ShortConvLayer {
-    in_proj: QMatMul,
-    out_proj: QMatMul,
+    in_proj: Lfm2Linear,
+    out_proj: Lfm2Linear,
     conv: Tensor,
     l_cache: usize,
     component: crate::kv::v2::StateComponentId,
@@ -372,14 +491,14 @@ struct LayerWeights {
 
 #[derive(Debug)]
 struct ProjectionHead {
-    weight: QMatMul,
+    weight: Lfm2Linear,
     bias: Option<Tensor>,
 }
 
 pub struct QuantizedLfm2Backbone {
     cfg: Lfm2BackboneConfig,
     /// `None` for a backbone that only runs on supplied embeddings.
-    token_embeddings: Option<Embedding>,
+    token_embeddings: Option<Arc<candle_core::quantized::QTensor>>,
     output_head: ProjectionHead,
     layers: Vec<LayerWeights>,
     norm: LfmRmsNorm,
@@ -454,9 +573,9 @@ impl Mlp {
         }
 
         Ok(Self {
-            gate: load_qmatmul_any(loader, device, &gate_names)?,
-            down: load_qmatmul_any(loader, device, &down_names)?,
-            up: load_qmatmul_any(loader, device, &up_names)?,
+            gate: load_linear_any(loader, device, &gate_names)?,
+            down: load_linear_any(loader, device, &down_names)?,
+            up: load_linear_any(loader, device, &up_names)?,
         })
     }
 
@@ -482,24 +601,64 @@ fn rotary_decode_batch(
     sin: &Tensor,
     positions: &[usize],
 ) -> Result<(Tensor, Tensor)> {
-    let table_len = cos.dim(0)?.min(sin.dim(0)?);
-    if positions.len() != query.dim(0)? || positions.iter().any(|&position| position >= table_len) {
-        return Err(Error::InvalidInput(
-            "LFM2 rotary batch positions exceed the available tables".into(),
-        ));
+    RotaryDecodeRows::gather(cos, sin, positions, query.dim(0)?)?.rotate(query, key)
+}
+
+/// The rotary rows of one decode step. Every attention layer shares the same
+/// tables, so a step gathers them once (one position upload) instead of once
+/// per layer.
+struct RotaryDecodeRows {
+    table: candle_core::TensorId,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl RotaryDecodeRows {
+    fn gather(cos: &Tensor, sin: &Tensor, positions: &[usize], batch: usize) -> Result<Self> {
+        let table_len = cos.dim(0)?.min(sin.dim(0)?);
+        if positions.len() != batch || positions.iter().any(|&position| position >= table_len) {
+            return Err(Error::InvalidInput(
+                "LFM2 rotary batch positions exceed the available tables".into(),
+            ));
+        }
+        let positions = positions
+            .iter()
+            .map(|&position| u32::try_from(position))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::InvalidInput("LFM2 rotary position exceeds u32".into()))?;
+        let indices = Tensor::from_vec(positions, batch, cos.device())?;
+        Ok(Self {
+            table: cos.id(),
+            cos: cos.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?,
+            sin: sin.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?,
+        })
     }
-    let positions = positions
-        .iter()
-        .map(|&position| u32::try_from(position))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| Error::InvalidInput("LFM2 rotary position exceeds u32".into()))?;
-    let indices = Tensor::from_vec(positions, query.dim(0)?, query.device())?;
-    let cos = cos.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?;
-    let sin = sin.index_select(&indices, 0)?.unsqueeze(1)?.contiguous()?;
-    Ok((
-        candle_nn::rotary_emb::rope_thd(&query.contiguous()?, &cos, &sin)?,
-        candle_nn::rotary_emb::rope_thd(&key.contiguous()?, &cos, &sin)?,
-    ))
+
+    /// This step's rows of `cos`/`sin`, gathered on first use.
+    fn for_step<'a>(
+        rows: &'a mut Option<Self>,
+        cos: &Tensor,
+        sin: &Tensor,
+        positions: &[usize],
+        batch: usize,
+    ) -> Result<&'a Self> {
+        if rows.as_ref().is_some_and(|rows| rows.table == cos.id()) {
+            return Ok(rows.as_ref().expect("checked above"));
+        }
+        Ok(rows.insert(Self::gather(cos, sin, positions, batch)?))
+    }
+
+    fn rotate(&self, query: &Tensor, key: &Tensor) -> Result<(Tensor, Tensor)> {
+        if query.dim(0)? != self.cos.dim(0)? {
+            return Err(Error::InvalidInput(
+                "LFM2 rotary rows do not match the decode batch".into(),
+            ));
+        }
+        Ok((
+            candle_nn::rotary_emb::rope_thd(&query.contiguous()?, &self.cos, &self.sin)?,
+            candle_nn::rotary_emb::rope_thd(&key.contiguous()?, &self.cos, &self.sin)?,
+        ))
+    }
 }
 
 impl AttentionLayer {
@@ -727,9 +886,15 @@ impl AttentionLayer {
             ));
         }
         let (queries, keys, values) = self.project_qkv(hidden_states, index_pos)?;
-        let queries = queries.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let keys = keys.squeeze(0)?.transpose(0, 1)?.contiguous()?;
-        let values = values.squeeze(0)?.transpose(0, 1)?.contiguous()?;
+        let kv_dtype = cache.arena().config().dtype;
+        let [queries, keys, values] = [queries, keys, values].map(|tensor| {
+            tensor
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .to_dtype(kv_dtype)
+        });
+        let (queries, keys, values) = (queries?, keys?, values?);
         let softmax_scale = (1.0f64 / (self.head_dim as f64).sqrt()) as f32;
         let output = match self.sliding_window {
             Some(window_tokens) => cache.write_and_attend_with_window(
@@ -750,6 +915,7 @@ impl AttentionLayer {
                 softmax_scale,
             )?,
         };
+        let output = output.to_dtype(hidden_states.dtype())?;
         diagnostics::check_layer(
             &output,
             "paged attention output",
@@ -767,6 +933,7 @@ impl AttentionLayer {
         caches: &[&PhysicalPagedKvCache],
         slots: &dyn KvSlotMap,
         completions: &mut KvWriteCompletionCollector,
+        rotary_rows: &mut Option<RotaryDecodeRows>,
     ) -> Result<Tensor> {
         let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
         if batch == 0 || seq_len != 1 || positions.len() != batch || caches.len() != batch {
@@ -805,7 +972,9 @@ impl AttentionLayer {
         diagnostics::check_batch_layer(&query, "normalized Q", self.model_layer, positions)?;
         diagnostics::check_batch_layer(&key, "normalized K", self.model_layer, positions)?;
         let (queries, keys) = if query.device().is_cuda() {
-            let (query, key) = rotary_decode_batch(&query, &key, &self.cos, &self.sin, positions)?;
+            let (query, key) =
+                RotaryDecodeRows::for_step(rotary_rows, &self.cos, &self.sin, positions, batch)?
+                    .rotate(&query, &key)?;
             record_rope_kernel();
             record_rope_kernel();
             (
@@ -855,6 +1024,11 @@ impl AttentionLayer {
                 })
                 .collect::<Result<Vec<_>>>()?,
         };
+        // The arena may store KV narrower than the F32 activations.
+        let kv_dtype = first.arena().config().dtype;
+        let queries = queries.to_dtype(kv_dtype)?;
+        let keys = keys.to_dtype(kv_dtype)?;
+        let values = values.to_dtype(kv_dtype)?;
         let binding = first.layer_binding(self.physical_layer)?;
         let completion = first.arena().write_slots(
             binding,
@@ -876,6 +1050,7 @@ impl AttentionLayer {
             )
         })?;
         completions.collect(completion)?;
+        let output = output.to_dtype(hidden_states.dtype())?;
         diagnostics::check_batch_layer(
             &output,
             "paged attention output",
@@ -975,8 +1150,25 @@ impl ShortConvLayer {
         hidden_states: &Tensor,
         state: &mut Lfm2ShortConvRuntimeState,
     ) -> Result<Tensor> {
-        let (_, _, hidden_size) = hidden_states.dims3()?;
-        let projected = self.in_proj.forward(hidden_states)?.transpose(1, 2)?;
+        let (batch, seq_len, hidden_size) = hidden_states.dims3()?;
+        if batch == 1 && seq_len == 1 {
+            let projected = self.in_proj.forward(hidden_states)?;
+            if let Some(y) = state.apply_fused_step(self.component, &projected, &self.conv)? {
+                return self.out_proj.forward(&y).map_err(Error::from);
+            }
+            return self.forward_retained_unfused(projected, hidden_size, state);
+        }
+        let projected = self.in_proj.forward(hidden_states)?;
+        self.forward_retained_unfused(projected, hidden_size, state)
+    }
+
+    fn forward_retained_unfused(
+        &self,
+        projected: Tensor,
+        hidden_size: usize,
+        state: &mut Lfm2ShortConvRuntimeState,
+    ) -> Result<Tensor> {
+        let projected = projected.transpose(1, 2)?;
         let b = projected.narrow(1, 0, hidden_size)?;
         let c = projected.narrow(1, hidden_size, hidden_size)?;
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
@@ -997,7 +1189,32 @@ impl ShortConvLayer {
                 "LFM2 ShortConv decode batch dimensions do not match".into(),
             ));
         }
-        let projected = self.in_proj.forward(hidden_states)?.transpose(1, 2)?;
+        let projected = self.in_proj.forward(hidden_states)?;
+        let mut fused = Vec::with_capacity(batch);
+        for row in 0..batch {
+            match states[row].apply_fused_step(
+                self.component,
+                &projected.narrow(0, row, 1)?,
+                &self.conv,
+            )? {
+                Some(y) => fused.push(y),
+                None => break,
+            }
+        }
+        if fused.len() == batch {
+            let y = if batch == 1 {
+                fused.pop().expect("one fused row")
+            } else {
+                Tensor::cat(&fused.iter().collect::<Vec<_>>(), 0)?
+            };
+            return self.out_proj.forward(&y).map_err(Error::from);
+        }
+        if !fused.is_empty() {
+            return Err(Error::InferenceError(
+                "LFM2 fused ShortConv switched off mid-batch".into(),
+            ));
+        }
+        let projected = projected.transpose(1, 2)?;
         let b = projected.narrow(1, 0, hidden_size)?;
         let c = projected.narrow(1, hidden_size, hidden_size)?;
         let x = projected.narrow(1, hidden_size * 2, hidden_size)?;
@@ -1013,24 +1230,36 @@ impl ShortConvLayer {
 }
 
 impl ProjectionHead {
-    fn load(loader: &GgufLoader, device: &Device) -> Result<Self> {
-        let weight = load_qmatmul_any(
-            loader,
-            device,
-            &[
-                "output.weight".to_string(),
-                "lm_head.weight".to_string(),
-                "model.output.weight".to_string(),
-                "model.lm_head.weight".to_string(),
-                "lfm.output.weight".to_string(),
-                "lfm.lm_head.weight".to_string(),
-                "dense_2_out.weight".to_string(),
-                "dense_2.weight".to_string(),
-                "lin.weight".to_string(),
-                "token_embd.weight".to_string(),
-                "tok_embeddings.weight".to_string(),
-            ],
-        )?;
+    /// The output projection, or for a checkpoint without one the tied token
+    /// table: `token_embeddings` when the backbone already holds it, else a
+    /// fresh read.
+    fn load(
+        loader: &GgufLoader,
+        device: &Device,
+        token_embeddings: Option<&Lfm2QuantizedWeight>,
+    ) -> Result<Self> {
+        let untied = [
+            "output.weight",
+            "lm_head.weight",
+            "model.output.weight",
+            "model.lm_head.weight",
+            "lfm.output.weight",
+            "lfm.lm_head.weight",
+            "dense_2_out.weight",
+            "dense_2.weight",
+            "lin.weight",
+        ]
+        .map(String::from);
+        let weight = match token_embeddings {
+            Some(tied) if !untied.iter().any(|name| loader.has_tensor(name)) => {
+                Lfm2Linear::new(tied.clone())?
+            }
+            _ => {
+                let mut names = untied.to_vec();
+                names.extend(["token_embd.weight", "tok_embeddings.weight"].map(String::from));
+                load_linear_any(loader, device, &names)?
+            }
+        };
         let bias = load_optional_bias_any(
             loader,
             device,
@@ -1074,8 +1303,8 @@ impl QuantizedLfm2Backbone {
     }
 
     /// A backbone that only ever runs on supplied embeddings, such as the
-    /// LFM2.5-Audio detokenizer: its token-embedding table (dequantized to
-    /// F32 by [`Self::load`]) is never read, so it is not loaded.
+    /// LFM2.5-Audio detokenizer: its token-embedding table is never read, so
+    /// it is not loaded.
     pub fn load_for_embeds(
         loader: &GgufLoader,
         cfg: Lfm2BackboneConfig,
@@ -1092,8 +1321,7 @@ impl QuantizedLfm2Backbone {
     ) -> Result<Self> {
         let state_layout = Lfm2StateLayout::from_config(&cfg)?;
         let (context_length, head_dim) = rope_table_geometry(&cfg)?;
-        let (cos, sin) =
-            precompute_freqs(head_dim, cfg.rope_freq_base as f32, context_length, device)?;
+        let (cos, sin) = precompute_freqs(head_dim, cfg.rope_freq_base, context_length, device)?;
         let cos_sin = Tensor::cat(&[&cos, &sin], 1)?.contiguous()?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -1105,15 +1333,14 @@ impl QuantizedLfm2Backbone {
             "emb.emb.weight".to_string(),
             "emb.weight".to_string(),
         ];
+        // Token rows are gathered straight from the quantized table
+        // (`QTensor::embedding`, all backends), which a tied LM head shares:
+        // no dequantized copy (512 MiB F32 for LFM2.5's 65,536 x 2,048
+        // vocabulary) and no second quantized read for the head.
         let (token_embeddings, vocab_size, hidden_size) = if with_token_embeddings {
-            let token_embedding_q = load_qtensor_any(loader, device, &embedding_names)?;
-            let weight = token_embedding_q.dequantize(device).map_err(Error::from)?;
-            let (vocab_size, hidden_size) = weight.dims2()?;
-            (
-                Some(Embedding::new(weight, hidden_size)),
-                vocab_size,
-                hidden_size,
-            )
+            let token_embedding_q = load_weight_any(loader, device, &embedding_names)?;
+            let (vocab_size, hidden_size) = token_embedding_q.tensor.shape().dims2()?;
+            (Some(token_embedding_q), vocab_size, hidden_size)
         } else {
             let shape = embedding_names
                 .iter()
@@ -1149,7 +1376,7 @@ impl QuantizedLfm2Backbone {
             )?,
             cfg.attention_layer_norm_rms_epsilon,
         )?;
-        let output_head = ProjectionHead::load(loader, device)?;
+        let output_head = ProjectionHead::load(loader, device, token_embeddings.as_ref())?;
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
@@ -1229,7 +1456,7 @@ impl QuantizedLfm2Backbone {
                 let qk_norm_weight =
                     Tensor::cat(&[q_norm.weight(), k_norm.weight()], 0)?.contiguous()?;
                 LayerKind::Attention(AttentionLayer {
-                    wq: load_qmatmul_any(
+                    wq: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1238,7 +1465,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.q_proj.weight"),
                         ],
                     )?,
-                    wk: load_qmatmul_any(
+                    wk: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1247,7 +1474,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.k_proj.weight"),
                         ],
                     )?,
-                    wv: load_qmatmul_any(
+                    wv: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1256,7 +1483,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.self_attn.v_proj.weight"),
                         ],
                     )?,
-                    wo: load_qmatmul_any(
+                    wo: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1281,7 +1508,7 @@ impl QuantizedLfm2Backbone {
                 })
             } else {
                 LayerKind::ShortConv(ShortConvLayer {
-                    in_proj: load_qmatmul_any(
+                    in_proj: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1290,7 +1517,7 @@ impl QuantizedLfm2Backbone {
                             format!("{legacy_prefix}.conv.in_proj.weight"),
                         ],
                     )?,
-                    out_proj: load_qmatmul_any(
+                    out_proj: load_linear_any(
                         loader,
                         device,
                         &[
@@ -1329,7 +1556,7 @@ impl QuantizedLfm2Backbone {
 
         Ok(Self {
             cfg,
-            token_embeddings,
+            token_embeddings: token_embeddings.map(|weight| weight.tensor),
             output_head,
             layers,
             norm,
@@ -1350,20 +1577,13 @@ impl QuantizedLfm2Backbone {
         self.cfg.embedding_length
     }
 
-    pub(crate) fn physical_state_spec(
-        &self,
-        stage_graphs: &[&[StageDescriptor]],
-    ) -> Result<Lfm2PhysicalStateSpec> {
-        lfm2_physical_state_spec(&self.cfg, stage_graphs)
-    }
-
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
         self.token_embeddings
             .as_ref()
             .ok_or_else(|| {
                 Error::InferenceError("LFM2 backbone was loaded without token embeddings".into())
             })?
-            .forward(token_ids)
+            .embedding(token_ids)
             .map_err(Error::from)
     }
 
@@ -1431,6 +1651,36 @@ impl QuantizedLfm2Backbone {
         self.project_last_hidden(&hidden)
     }
 
+    /// [`Self::forward_token_ids_retained_batch`] without waiting for the
+    /// step's KV writes: the logits are returned with the step's pending
+    /// commit, and the rows' caches and ShortConv states stay unchanged until
+    /// [`Lfm2PendingDecodeCommit::commit`]. A caller that reads the logits back
+    /// first commits after the device has already drained, so the step pays
+    /// one synchronization instead of a fence wait before the LM head plus a
+    /// readback after it.
+    pub(crate) fn forward_token_ids_retained_batch_deferred(
+        &self,
+        token_ids: &[u32],
+        positions: &[usize],
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+    ) -> Result<(Tensor, Lfm2PendingDecodeCommit)> {
+        let batch = token_ids.len();
+        if batch == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 retained decode batch is empty".into(),
+            ));
+        }
+        let input = Tensor::from_slice(token_ids, (batch, 1), self.norm.weight.device())?;
+        let embeds = self.embed_tokens(&input)?;
+        let (hidden, pending) =
+            self.forward_embeds_retained_step_batch_deferred(&embeds, positions, states, caches)?;
+        match self.project_last_hidden(&hidden) {
+            Ok(logits) => Ok((logits, pending)),
+            Err(error) => Err(pending.abort_with(error)),
+        }
+    }
+
     fn forward_embeds_retained_step_batch(
         &self,
         input_embeds: &Tensor,
@@ -1438,6 +1688,27 @@ impl QuantizedLfm2Backbone {
         states: &mut [&mut Lfm2ShortConvRuntimeState],
         caches: &mut [&mut PhysicalPagedKvCache],
     ) -> Result<Tensor> {
+        let (hidden, pending) = {
+            let state_refs = states.iter().map(|state| &**state).collect::<Vec<_>>();
+            let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
+            self.forward_embeds_retained_step_batch_deferred(
+                input_embeds,
+                positions,
+                &state_refs,
+                &cache_refs,
+            )?
+        };
+        pending.commit(states, caches)?;
+        Ok(hidden)
+    }
+
+    fn forward_embeds_retained_step_batch_deferred(
+        &self,
+        input_embeds: &Tensor,
+        positions: &[usize],
+        states: &[&Lfm2ShortConvRuntimeState],
+        caches: &[&PhysicalPagedKvCache],
+    ) -> Result<(Tensor, Lfm2PendingDecodeCommit)> {
         let (batch, seq_len, hidden_size) = input_embeds.dims3()?;
         if batch == 0
             || seq_len != 1
@@ -1459,7 +1730,7 @@ impl QuantizedLfm2Backbone {
                 ));
             }
         }
-        let first = &*caches[0];
+        let first = caches[0];
         let slots = caches
             .iter()
             .enumerate()
@@ -1478,22 +1749,21 @@ impl QuantizedLfm2Backbone {
             .collect::<Vec<_>>();
         let execution = (|| -> Result<Tensor> {
             let mut hidden_states = input_embeds.clone();
+            let mut rotary_rows = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 diagnostics::check_batch_layer(&hidden_states, "input", layer_idx, positions)?;
                 let residual = hidden_states.clone();
                 let hidden = layer.operator_norm.forward(&hidden_states)?;
                 diagnostics::check_batch_layer(&hidden, "operator norm", layer_idx, positions)?;
                 let hidden = match &layer.kind {
-                    LayerKind::Attention(attention) => {
-                        let cache_refs = caches.iter().map(|cache| &**cache).collect::<Vec<_>>();
-                        attention.forward_retained_decode_batch(
-                            &hidden,
-                            positions,
-                            &cache_refs,
-                            lowered.as_ref(),
-                            &mut completions,
-                        )?
-                    }
+                    LayerKind::Attention(attention) => attention.forward_retained_decode_batch(
+                        &hidden,
+                        positions,
+                        caches,
+                        lowered.as_ref(),
+                        &mut completions,
+                        &mut rotary_rows,
+                    )?,
                     LayerKind::ShortConv(shortconv) => {
                         let mut refs = working.iter_mut().collect::<Vec<_>>();
                         shortconv.forward_retained_decode_batch(&hidden, &mut refs)?
@@ -1539,14 +1809,23 @@ impl QuantizedLfm2Backbone {
             }
         };
         for state in &mut working {
-            state.advance(1)?;
+            if let Err(error) = state.advance(1) {
+                return Err(Lfm2PendingDecodeCommit {
+                    completions,
+                    working: Vec::new(),
+                    positions: Vec::new(),
+                }
+                .abort_with(error));
+            }
         }
-        let completion = Arc::new(completions.seal()?);
-        for (row, cache) in caches.iter_mut().enumerate() {
-            cache.commit_shared_completion(positions[row], 1, completion.clone())?;
-            **states.get_mut(row).expect("state row exists") = working[row].clone();
-        }
-        Ok(hidden)
+        Ok((
+            hidden,
+            Lfm2PendingDecodeCommit {
+                completions,
+                working,
+                positions: positions.to_vec(),
+            },
+        ))
     }
 
     pub(crate) fn forward_embeds_retained_batch(
@@ -2064,27 +2343,141 @@ pub(crate) fn rope_table_geometry(cfg: &Lfm2BackboneConfig) -> Result<(usize, us
     Ok((cfg.context_length, head_dim))
 }
 
+/// NEOX RoPE `cos`/`sin` tables, `[context_length, head_dim / 2]` F32.
+///
+/// Angles and their cosines are computed on the host in F64 and uploaded
+/// once. On the device, an F32 `position × inv_freq` loses about 0.008 rad at
+/// position 128K before `cos` runs, and Candle's Metal kernels evaluate
+/// `cos`/`sin` with fast math, so device tables drift with position on every
+/// backend.
 fn precompute_freqs(
     head_dim: usize,
-    freq_base: f32,
+    freq_base: f64,
     context_length: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<f32> = (0..head_dim)
-        .step_by(2)
-        .map(|idx| 1.0f32 / freq_base.powf(idx as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let angles = Tensor::arange(0u32, context_length as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    Ok((angles.cos()?, angles.sin()?))
+    let (cos, sin) = rope_tables_f64(head_dim, freq_base, context_length);
+    let half = head_dim / 2;
+    Ok((
+        Tensor::from_vec(cos, (context_length, half), device)?,
+        Tensor::from_vec(sin, (context_length, half), device)?,
+    ))
 }
 
-fn load_qmatmul_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<QMatMul> {
-    let weights = Arc::new(load_qtensor_any(loader, device, names)?);
-    QMatMul::from_weights(weights).map_err(Error::from)
+fn rope_tables_f64(head_dim: usize, freq_base: f64, context_length: usize) -> (Vec<f32>, Vec<f32>) {
+    let inv_freq: Vec<f64> = (0..head_dim)
+        .step_by(2)
+        .map(|index| 1.0 / freq_base.powf(index as f64 / head_dim as f64))
+        .collect();
+    let mut cos = Vec::with_capacity(context_length * inv_freq.len());
+    let mut sin = Vec::with_capacity(context_length * inv_freq.len());
+    for position in 0..context_length {
+        for frequency in &inv_freq {
+            let (s, c) = (position as f64 * frequency).sin_cos();
+            cos.push(c as f32);
+            sin.push(s as f32);
+        }
+    }
+    (cos, sin)
+}
+
+/// A quantized weight and, on Metal, the small-batch k-quant mat-vec over
+/// the same buffer.
+#[derive(Clone)]
+struct Lfm2QuantizedWeight {
+    tensor: Arc<candle_core::quantized::QTensor>,
+    small_batch: Option<SmallBatchMatVec>,
+}
+
+/// A quantized projection. Candle runs a `[rows, 1, k]` input (a decode
+/// step) as one mat-vec dispatch per row, each streaming the whole weight.
+/// On Metal, 2..=8 such rows take izwi's k-quant mat-vec instead
+/// (`kernels::metal_kquant_mv`): one dispatch that reads the weight once.
+/// Every other input (one row, prefill spans, CPU, CUDA) takes Candle's
+/// `QMatMul` unchanged.
+#[derive(Debug, Clone)]
+struct Lfm2Linear {
+    matmul: QMatMul,
+    small_batch: Option<SmallBatchMatVec>,
+}
+
+impl Lfm2Linear {
+    fn new(weight: Lfm2QuantizedWeight) -> Result<Self> {
+        Ok(Self {
+            matmul: QMatMul::from_weights(weight.tensor)?,
+            small_batch: weight.small_batch,
+        })
+    }
+
+    fn forward(&self, input: &Tensor) -> candle_core::Result<Tensor> {
+        let per_row_mat_vec = input.rank() >= 2 && input.dim(D::Minus2)? == 1;
+        #[cfg(test)]
+        let per_row_mat_vec = per_row_mat_vec && !FORCE_CANDLE_MATVEC.with(std::cell::Cell::get);
+        match &self.small_batch {
+            Some(small_batch) if per_row_mat_vec && small_batch.accepts(input) => {
+                small_batch.forward(input)
+            }
+            _ => self.matmul.forward(input),
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+type SmallBatchMatVec = crate::kernels::metal_kquant_mv::MetalKQuantMatVec;
+
+/// Without Metal there is no small-batch kernel.
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Clone)]
+enum SmallBatchMatVec {}
+
+#[cfg(not(feature = "metal"))]
+impl SmallBatchMatVec {
+    fn accepts(&self, _: &Tensor) -> bool {
+        match *self {}
+    }
+
+    fn forward(&self, _: &Tensor) -> candle_core::Result<Tensor> {
+        match *self {}
+    }
+}
+
+fn load_linear_any(loader: &GgufLoader, device: &Device, names: &[String]) -> Result<Lfm2Linear> {
+    Lfm2Linear::new(load_weight_any(loader, device, names)?)
+}
+
+/// On Metal with fused kernels on, the weight is read on the host and
+/// uploaded here (as Candle's GGUF load does) so the small-batch mat-vec can
+/// share its buffer; elsewhere it loads as usual.
+fn load_weight_any(
+    loader: &GgufLoader,
+    device: &Device,
+    names: &[String],
+) -> Result<Lfm2QuantizedWeight> {
+    #[cfg(feature = "metal")]
+    if device.is_metal() && crate::kernels::use_fused_kernels_for_device(device) {
+        use candle_core::quantized::{QStorage, QTensor};
+        let host = load_qtensor_any(loader, &Device::Cpu, names)?;
+        let dtype = host.dtype();
+        let (rows, cols) = host.shape().dims2()?;
+        let storage = QStorage::from_data(host.data()?, device, dtype)?;
+        let small_batch = match &storage {
+            QStorage::Metal(metal) => crate::kernels::metal_kquant_mv::MetalKQuantMatVec::new(
+                metal.buffer().clone(),
+                dtype,
+                rows,
+                cols,
+            ),
+            _ => None,
+        };
+        return Ok(Lfm2QuantizedWeight {
+            tensor: Arc::new(QTensor::new(storage, (rows, cols))?),
+            small_batch,
+        });
+    }
+    Ok(Lfm2QuantizedWeight {
+        tensor: Arc::new(load_qtensor_any(loader, device, names)?),
+        small_batch: None,
+    })
 }
 
 fn load_qtensor_any(
@@ -2143,11 +2536,55 @@ fn load_optional_bias_any(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        lfm25_cuda_flash_attention_options, lfm2_attention_position_masked,
+        lfm25_cuda_flash_attention_options, lfm2_attention_position_masked, precompute_freqs,
         Lfm2ShortConvRuntimeState,
     };
     use crate::kv::v2::StateComponentId;
     use candle_core::{DType, Device, Tensor};
+
+    /// The tables on `device` match F64 `cos`/`sin` at far positions.
+    fn assert_rope_tables_exact(device: &Device) {
+        const HEAD_DIM: usize = 64;
+        const BASE: f64 = 1_000_000.0;
+        const CONTEXT: usize = 128_000;
+        let (cos, sin) = precompute_freqs(HEAD_DIM, BASE, CONTEXT, device).unwrap();
+        for position in [4_095_usize, 65_535, 127_999] {
+            let cos_row: Vec<f32> = cos.get(position).unwrap().to_vec1().unwrap();
+            let sin_row: Vec<f32> = sin.get(position).unwrap().to_vec1().unwrap();
+            for (index, (c, s)) in cos_row.iter().zip(&sin_row).enumerate() {
+                let inv = 1.0 / BASE.powf((2 * index) as f64 / HEAD_DIM as f64);
+                let angle = position as f64 * inv;
+                let cos_err = (f64::from(*c) - angle.cos()).abs();
+                let sin_err = (f64::from(*s) - angle.sin()).abs();
+                // `<` is false for NaN, so a non-finite entry fails.
+                assert!(
+                    cos_err < 1e-6 && sin_err < 1e-6,
+                    "position {position} frequency {index}: cos {cos_err} sin {sin_err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rope_tables_match_f64_at_far_positions_on_cpu() {
+        assert_rope_tables_exact(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn rope_tables_match_f64_at_far_positions_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        assert_rope_tables_exact(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
+    fn rope_tables_match_f64_at_far_positions_on_cuda() {
+        assert_rope_tables_exact(&Device::new_cuda(0).expect("CUDA device required"));
+    }
 
     #[test]
     fn embeds_only_backbone_skips_the_token_table_and_matches_the_full_load() {
@@ -2599,6 +3036,30 @@ pub(crate) mod tests {
                 }
             }
         }
+
+        // One gather serves every layer of a step; another table regathers.
+        let mut rows = None;
+        let first = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        let reused = super::RotaryDecodeRows::for_step(&mut rows, &cos, &sin, &positions, 3)
+            .unwrap()
+            .cos
+            .id();
+        assert_eq!(first, reused);
+        let (cos2, sin2) = (cos.copy().unwrap(), sin.copy().unwrap());
+        let other =
+            super::RotaryDecodeRows::for_step(&mut rows, &cos2, &sin2, &positions, 3).unwrap();
+        assert_ne!(other.cos.id(), first);
+        let (q2, k2) = other.rotate(&query, &key).unwrap();
+        for (left, right) in [(&q, &q2), (&k, &k2)] {
+            assert_eq!(
+                left.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                right.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            );
+        }
+        assert!(other.rotate(&query.narrow(0, 0, 2).unwrap(), &key).is_err());
     }
 
     #[test]
@@ -2681,6 +3142,69 @@ pub(crate) mod tests {
                 .unwrap()
         );
         assert_eq!(full_ring.dtype(), DType::F32);
+    }
+
+    /// `IZWI_FUSED_KERNELS=0` falls back to the op path on an accelerator
+    /// and matches the CPU ring across a chunk boundary.
+    fn assert_unfused_ring_matches_cpu(device: &Device) {
+        let _env = crate::env_test_lock().lock().unwrap();
+        let previous = std::env::var_os("IZWI_FUSED_KERNELS");
+        std::env::set_var("IZWI_FUSED_KERNELS", "0");
+        let run = |device: &Device| {
+            let component = StateComponentId::new(1);
+            let mut state = Lfm2ShortConvRuntimeState {
+                cursor: 0,
+                capacity: 3,
+                hidden: 2,
+                components: vec![(component, None)],
+            };
+            let input = Tensor::from_vec(
+                vec![0.1f32, 0.2, 0.3, 0.4, 0.5, -0.2, 0.1, 0.6, -0.1, 0.2],
+                (1, 2, 5),
+                device,
+            )
+            .unwrap();
+            let weight =
+                Tensor::from_vec(vec![0.2f32, 0.3, 0.5, -0.1, 0.4, 0.7], (2, 3), device).unwrap();
+            let first = state
+                .apply(component, &input.narrow(2, 0, 2).unwrap(), &weight)
+                .unwrap();
+            state.advance(2).unwrap();
+            let second = state
+                .apply(component, &input.narrow(2, 2, 3).unwrap(), &weight)
+                .unwrap();
+            Tensor::cat(&[&first, &second], 2)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let result = (run(device), run(&Device::Cpu));
+        match previous {
+            Some(value) => std::env::set_var("IZWI_FUSED_KERNELS", value),
+            None => std::env::remove_var("IZWI_FUSED_KERNELS"),
+        }
+        let (accelerated, cpu) = result;
+        for (lhs, rhs) in accelerated.iter().zip(&cpu) {
+            assert!((lhs - rhs).abs() < 1e-6, "{lhs} != {rhs}");
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn unfused_shortconv_ring_falls_back_on_metal() {
+        let Some(device) = crate::backends::metal_device_if_available(0) else {
+            return;
+        };
+        assert_unfused_ring_matches_cpu(&device);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an NVIDIA GPU; run explicitly with --ignored"]
+    fn unfused_shortconv_ring_falls_back_on_cuda() {
+        assert_unfused_ring_matches_cpu(&Device::new_cuda(0).expect("CUDA device required"));
     }
 
     #[test]

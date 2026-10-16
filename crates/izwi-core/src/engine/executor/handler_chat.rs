@@ -779,7 +779,7 @@ impl NativeExecutor {
                     .stage_hybrid_tensor_state(arena, scheduled.plan_id)?;
             }
 
-            active_state.logprobs.extend(step.logprobs.clone());
+            let terminal_logprobs = active_state.record_step_logprobs(&step.logprobs, finished);
             if let Some(tx) = stream_tx.as_ref() {
                 if !step.delta.is_empty() {
                     Self::stream_chat_text_with_policy(
@@ -804,11 +804,6 @@ impl NativeExecutor {
                 }
             }
             let managed_cache_completions = active_state.state.take_managed_write_completions();
-            let terminal_logprobs = if finished {
-                std::mem::take(&mut active_state.logprobs)
-            } else {
-                Vec::new()
-            };
             (
                 step,
                 final_text,
@@ -1132,11 +1127,13 @@ impl NativeExecutor {
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
             active_state.last_tokens_generated = step.tokens_generated;
+            // Recorded before the stream branch: a non-streamed row has no
+            // sender, and its terminal output must still carry every entry.
+            let terminal_logprobs = active_state.record_step_logprobs(&step.logprobs, step.finished);
             let stream_result = (|| -> Result<()> {
                 let Some(tx) = Self::stream_sender(request) else {
                     return Ok(());
                 };
-                active_state.logprobs.extend(step.logprobs.clone());
                 if !step.delta.is_empty() {
                     Self::stream_chat_text_with_policy(
                         &tx,
@@ -1183,11 +1180,7 @@ impl NativeExecutor {
                     phase_timing_override: None,
                     asr_diagnostics: None,
                     error: None,
-                    logprobs: if step.finished {
-                        std::mem::take(&mut active_state.logprobs)
-                    } else {
-                        Vec::new()
-                    },
+                    logprobs: terminal_logprobs,
                 })
                 .with_managed_cache_completions(managed_cache_completions),
             );

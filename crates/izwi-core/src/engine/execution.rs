@@ -1337,9 +1337,11 @@ impl ExecutionProfile {
         }
     }
 
+    /// A loaded model's multi-token decode quantum outlives the request's
+    /// soft SLA on any backend once the model opts in. The scheduler still
+    /// collapses it to one token while other work waits or rows co-batch.
     pub fn effective_sustained_decode_quantum(&self) -> bool {
         self.resolved_from_loaded_model
-            && self.backend == BackendKind::Cuda
             && self.incremental_decode
             && self.preferred_decode_tokens > 1
             && self.sustained_decode_quantum

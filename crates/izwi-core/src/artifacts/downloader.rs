@@ -1919,10 +1919,20 @@ impl ModelDownloader {
         }
 
         if variant.is_lfm2_chat_gguf() {
-            let tokenizer_repo = match variant {
-                ModelVariant::Lfm2512BInstructGguf => "LiquidAI/LFM2.5-1.2B-Instruct",
-                ModelVariant::Lfm2512BThinkingGguf => "LiquidAI/LFM2.5-1.2B-Thinking",
-                _ => variant.repo_id(),
+            // The GGUF repos ship no tokenizer, so the companion files come
+            // from the safetensors repos at a pinned revision: upstream
+            // replaced their chat template on 2026-08-05, and an unpinned
+            // download would follow any later tokenizer change too.
+            let (tokenizer_repo, companion_revision) = match variant {
+                ModelVariant::Lfm2512BInstructGguf => (
+                    "LiquidAI/LFM2.5-1.2B-Instruct",
+                    "0f604ada3f766f9f257460c4c9f0b5d6f69d431b",
+                ),
+                ModelVariant::Lfm2512BThinkingGguf => (
+                    "LiquidAI/LFM2.5-1.2B-Thinking",
+                    "f313478934a7612d22991f752959d7a1a8756fec",
+                ),
+                _ => (variant.repo_id(), "main"),
             };
 
             return self
@@ -1939,7 +1949,7 @@ impl ModelDownloader {
                         source_revision: if source_repo == default_repo {
                             default_revision.clone()
                         } else {
-                            "main".to_string()
+                            companion_revision.to_string()
                         },
                         source_repo,
                         source_file: file.clone(),
@@ -3014,6 +3024,41 @@ mod tests {
             .expect("shard spec");
         assert_eq!(shard_spec.source_repo, "microsoft/VibeVoice-1.5B");
 
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    #[test]
+    fn lfm25_chat_companion_files_come_from_pinned_safetensors_revisions() {
+        let (downloader, temp_dir) = test_downloader();
+        for (variant, repo, revision) in [
+            (
+                ModelVariant::Lfm2512BInstructGguf,
+                "LiquidAI/LFM2.5-1.2B-Instruct",
+                "0f604ada3f766f9f257460c4c9f0b5d6f69d431b",
+            ),
+            (
+                ModelVariant::Lfm2512BThinkingGguf,
+                "LiquidAI/LFM2.5-1.2B-Thinking",
+                "f313478934a7612d22991f752959d7a1a8756fec",
+            ),
+        ] {
+            let specs = downloader.get_model_file_specs(variant);
+            let tokenizer = specs
+                .iter()
+                .find(|spec| spec.local_file == "tokenizer.json")
+                .expect("tokenizer spec");
+            assert_eq!(tokenizer.source_repo, repo);
+            assert_eq!(tokenizer.source_revision, revision);
+            let gguf = specs
+                .iter()
+                .find(|spec| spec.local_file.ends_with(".gguf"))
+                .expect("gguf spec");
+            assert_eq!(gguf.source_repo, variant.repo_id());
+            assert!(specs
+                .iter()
+                .filter(|spec| !spec.local_file.ends_with(".gguf"))
+                .all(|spec| spec.source_revision == revision));
+        }
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

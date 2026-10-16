@@ -168,12 +168,8 @@ impl InvocationExecutor for RuntimeChatExecutor {
                     ChatRole::System => CoreChatRole::System,
                     ChatRole::User => CoreChatRole::User,
                     ChatRole::Assistant => CoreChatRole::Assistant,
-                    ChatRole::Tool => {
-                        return Err(AdmissionFailure::new(
-                            RejectionCode::InvalidRequest,
-                            "tool-role messages are not supported by the selected CPU model",
-                        ))
-                    }
+                    // Every family's prompt builder renders a tool turn.
+                    ChatRole::Tool => CoreChatRole::Tool,
                 };
                 Ok(CoreChatMessage {
                     role,

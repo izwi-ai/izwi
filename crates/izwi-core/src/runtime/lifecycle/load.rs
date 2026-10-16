@@ -266,9 +266,11 @@ struct ManagedChatCapacityPolicy {
     /// `None` delegates staged transaction width to the engine-wide
     /// `max_staged_transactions` setting.
     staged_transaction_rows: Option<u32>,
-    /// CUDA Qwen3.8 and Qwen3.5/3.6-MoE fit logical context against resident
-    /// device headroom; this is independent of staged transaction width.
-    fit_cuda_resident_context: bool,
+    /// How the CUDA KV pool is sized: Qwen3.8 and Qwen3.5/3.6-MoE fit every
+    /// retained row's context against resident device headroom; LFM2.5 chat
+    /// fits one context, so a small model does not take the GPU's free memory.
+    /// Independent of staged transaction width.
+    cuda_resident_pool: crate::engine::CudaResidentPool,
 }
 
 fn qwen36moe_state_geometry(
@@ -289,13 +291,19 @@ fn managed_chat_capacity_policy(
     variant: ModelVariant,
     backend: BackendKind,
 ) -> ManagedChatCapacityPolicy {
-    let family = variant.family();
+    use crate::catalog::ModelFamily;
+    use crate::engine::CudaResidentPool;
+    let cuda_resident_pool = match variant.family() {
+        _ if backend != BackendKind::Cuda => CudaResidentPool::Disabled,
+        ModelFamily::Qwen38Chat | ModelFamily::Qwen35MoeChat => CudaResidentPool::RetainedRows,
+        // Without a fit LFM2.5 grew a 128K-token arena on demand, with a
+        // replacement-copy peak and no CUDA context reserve (A1).
+        ModelFamily::Lfm2Chat => CudaResidentPool::OneContext,
+        _ => CudaResidentPool::Disabled,
+    };
     ManagedChatCapacityPolicy {
         staged_transaction_rows: None,
-        fit_cuda_resident_context: matches!(
-            family,
-            crate::catalog::ModelFamily::Qwen38Chat | crate::catalog::ModelFamily::Qwen35MoeChat
-        ) && backend == BackendKind::Cuda,
+        cuda_resident_pool,
     }
 }
 
@@ -593,11 +601,14 @@ fn admit_asr_request_floor(
 
 /// Whether a load of `variant` on `backend` is reconciled against the device
 /// observer: the families whose admission is a residency plan (ASR, the
-/// forced aligner, the Sortformer diarizers and TTS), so an observed excess
-/// means the plan under-prices the loader, as long as the weights land where
-/// the observer looks (Sortformer on Metal loads into host memory).
+/// forced aligner, the Sortformer diarizers, TTS and LFM2 chat), so an
+/// observed excess means the plan under-prices the loader, as long as the
+/// weights land where the observer looks (Sortformer on Metal loads into host
+/// memory).
 fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
-    (asr_memory::has_plan(variant) || tts_memory::has_plan(variant))
+    (asr_memory::has_plan(variant)
+        || tts_memory::has_plan(variant)
+        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat)
         && asr_memory::weights_on_backend_device(variant, backend)
 }
 
@@ -696,7 +707,7 @@ fn reconcile_observed_growth(
 }
 
 /// The residency plan first admission prices for a checkpoint-planned
-/// family (Fish, ASR, TTS), or `None` for one without a plan. The Metal OOM
+/// family (Fish, ASR, TTS, LFM2.5 chat), or `None` for one without a plan. The Metal OOM
 /// retry judges futility by the same plan.
 fn checkpoint_resource_plan(
     variant: ModelVariant,
@@ -709,10 +720,17 @@ fn checkpoint_resource_plan(
         )?;
         return fish_s2_resource_plan(BackendKind::from(device.kind), memory).map(Some);
     }
-    // ASR and TTS families price what their loader allocates on every
+    // ASR, TTS and LFM2.5 chat price what their loader allocates on every
     // backend; the catalog figure stays a display value for them.
     if let Some(plan) = asr_memory::resource_plan(variant, model_path, device)? {
         return Ok(Some(plan));
+    }
+    if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
+        return asr_memory::lfm2_chat_resource_plan(
+            variant,
+            model_path,
+            BackendKind::from(device.kind),
+        );
     }
     tts_memory::resource_plan(variant, model_path, device)
 }
@@ -1882,7 +1900,7 @@ impl ModelLifecycleController {
     ) -> Result<Option<CudaStateFloor>> {
         let policy =
             managed_chat_capacity_policy(variant, self.backend_router.context().backend_kind);
-        if !policy.fit_cuda_resident_context {
+        if policy.cuda_resident_pool == crate::engine::CudaResidentPool::Disabled {
             return Ok(None);
         }
         let per_sequence_bytes = match variant {
@@ -2669,6 +2687,12 @@ impl ModelLifecycleController {
                 bundle_draft.seal_chat_workspace(
                     loaded.continuous_decode_batch_workspace_per_row_bytes()?,
                 )?;
+                bundle_draft.seal_chat_decode_quantum(
+                    loaded.speculative_decode_profile().0.max(1) as u64,
+                )?;
+                if let Some((per_token_bytes, max_span_tokens)) = loaded.prefill_workspace()? {
+                    bundle_draft.seal_chat_prefill_workspace(per_token_bytes, max_span_tokens)?;
+                }
                 let decode_workspace_reserve_bytes = bundle_draft
                     .execution_contracts(CapabilityKind::Chat)?
                     .iter()
@@ -2693,7 +2717,7 @@ impl ModelLifecycleController {
                                 &loaded_cache,
                                 Some(loaded.max_context_tokens()?),
                                 capacity_policy.staged_transaction_rows,
-                                capacity_policy.fit_cuda_resident_context,
+                                capacity_policy.cuda_resident_pool,
                                 decode_workspace_reserve_bytes,
                             )
                             .await?;
@@ -4530,20 +4554,21 @@ mod tests {
 
     #[test]
     fn qwen38_uses_engine_staged_width_while_cuda_retains_context_fitting() {
+        use crate::engine::CudaResidentPool;
         let cuda_qwen38 =
             managed_chat_capacity_policy(ModelVariant::Qwen3827BFp8, BackendKind::Cuda);
         assert_eq!(cuda_qwen38.staged_transaction_rows, None);
-        assert!(cuda_qwen38.fit_cuda_resident_context);
+        assert_eq!(cuda_qwen38.cuda_resident_pool, CudaResidentPool::RetainedRows);
 
         let metal_qwen38 =
             managed_chat_capacity_policy(ModelVariant::Qwen3827BFp8, BackendKind::Metal);
         assert_eq!(metal_qwen38.staged_transaction_rows, None);
-        assert!(!metal_qwen38.fit_cuda_resident_context);
+        assert_eq!(metal_qwen38.cuda_resident_pool, CudaResidentPool::Disabled);
 
         let cuda_qwen35 =
             managed_chat_capacity_policy(ModelVariant::Qwen359BGguf, BackendKind::Cuda);
         assert_eq!(cuda_qwen35.staged_transaction_rows, None);
-        assert!(!cuda_qwen35.fit_cuda_resident_context);
+        assert_eq!(cuda_qwen35.cuda_resident_pool, CudaResidentPool::Disabled);
 
         // The Qwen3.5/3.6 MoE family fits its invocation-state arena against
         // CUDA resident headroom like Qwen3.8: its authored-context arena
@@ -4552,11 +4577,29 @@ mod tests {
         let cuda_qwen36_moe =
             managed_chat_capacity_policy(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Cuda);
         assert_eq!(cuda_qwen36_moe.staged_transaction_rows, None);
-        assert!(cuda_qwen36_moe.fit_cuda_resident_context);
+        assert_eq!(cuda_qwen36_moe.cuda_resident_pool, CudaResidentPool::RetainedRows);
 
         let metal_qwen36_moe =
             managed_chat_capacity_policy(ModelVariant::Qwen36Moe35BA3BFp8, BackendKind::Metal);
-        assert!(!metal_qwen36_moe.fit_cuda_resident_context);
+        assert_eq!(metal_qwen36_moe.cuda_resident_pool, CudaResidentPool::Disabled);
+
+        // LFM2.5 chat fits one materialized context on CUDA and keeps the
+        // portable fit elsewhere; families without a resident fit stay off.
+        for variant in [
+            ModelVariant::Lfm2512BInstructGguf,
+            ModelVariant::Lfm2512BThinkingGguf,
+        ] {
+            assert_eq!(
+                managed_chat_capacity_policy(variant, BackendKind::Cuda).cuda_resident_pool,
+                CudaResidentPool::OneContext
+            );
+            for backend in [BackendKind::Cpu, BackendKind::Metal] {
+                assert_eq!(
+                    managed_chat_capacity_policy(variant, backend).cuda_resident_pool,
+                    CudaResidentPool::Disabled
+                );
+            }
+        }
     }
 
     #[test]
