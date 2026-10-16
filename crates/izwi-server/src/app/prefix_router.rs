@@ -170,7 +170,11 @@ impl PrefixRouter {
     }
 
     /// Leading blocks of `blocks` that `worker` was recently routed.
-    pub(crate) fn matched_blocks(&self, worker: &WorkerInstanceKey, blocks: &PromptBlocks) -> usize {
+    pub(crate) fn matched_blocks(
+        &self,
+        worker: &WorkerInstanceKey,
+        blocks: &PromptBlocks,
+    ) -> usize {
         let workers = self.lock();
         let Some((_, history)) = workers.by_worker.get(worker) else {
             return 0;

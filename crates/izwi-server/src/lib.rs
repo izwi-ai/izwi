@@ -3262,7 +3262,10 @@ mod tests {
         for (flag, value) in [
             ("--gateway-worker-admission-timeout-ms", "60001"),
             ("--gateway-worker-first-output-timeout-ms", "3600001"),
-            ("--gateway-worker-first-output-timeout-per-kib-ms", "3600001"),
+            (
+                "--gateway-worker-first-output-timeout-per-kib-ms",
+                "3600001",
+            ),
             ("--gateway-worker-progress-idle-timeout-ms", "3600001"),
             ("--gateway-slow-consumer-timeout-ms", "60001"),
         ] {

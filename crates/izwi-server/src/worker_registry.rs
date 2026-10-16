@@ -2166,7 +2166,10 @@ mod tests {
         // Without affinity the idle worker wins; holding the prefix, worker-b
         // wins while it is at most two requests busier.
         assert_eq!(routed(&registry, None, now), "worker-a");
-        assert_eq!(routed(&registry, Some(&HeldBy("worker-b", 3)), now), "worker-b");
+        assert_eq!(
+            routed(&registry, Some(&HeldBy("worker-b", 3)), now),
+            "worker-b"
+        );
 
         // A third outstanding request on worker-b crosses the threshold.
         let held = registry
@@ -2179,9 +2182,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(held.key.worker_id.as_str(), "worker-b");
-        assert_eq!(routed(&registry, Some(&HeldBy("worker-b", 3)), now), "worker-a");
+        assert_eq!(
+            routed(&registry, Some(&HeldBy("worker-b", 3)), now),
+            "worker-a"
+        );
         drop(held);
-        assert_eq!(routed(&registry, Some(&HeldBy("worker-b", 3)), now), "worker-b");
+        assert_eq!(
+            routed(&registry, Some(&HeldBy("worker-b", 3)), now),
+            "worker-b"
+        );
     }
 
     #[test]
@@ -2227,7 +2236,10 @@ mod tests {
         // worker-a is idle but nearly full; worker-b is busier with headroom.
         // A prefix held on the pressured worker does not pull work onto it.
         assert_eq!(routed(&registry, None, now), "worker-b");
-        assert_eq!(routed(&registry, Some(&HeldBy("worker-a", 9)), now), "worker-b");
+        assert_eq!(
+            routed(&registry, Some(&HeldBy("worker-a", 9)), now),
+            "worker-b"
+        );
 
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
         let now = two_workers(

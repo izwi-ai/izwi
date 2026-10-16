@@ -1449,11 +1449,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_draining_public_stream_cannot_retain_registry_dispatch() {
-        let worker = ScriptedWorker::spawn(
-            ScriptedResponse::ManyDeltas(BURST_DELTAS),
-            Duration::ZERO,
-        )
-        .await;
+        let worker =
+            ScriptedWorker::spawn(ScriptedResponse::ManyDeltas(BURST_DELTAS), Duration::ZERO).await;
         let registry = WorkerRegistry::new(WorkerRegistryConfig {
             max_local_dispatches: 1,
             ..WorkerRegistryConfig::default()
@@ -1912,9 +1909,10 @@ mod tests {
             ..WorkerRegistryConfig::default()
         })
         .unwrap();
-        for (name, incarnation, worker) in
-            [("worker-a", "inc-a", &worker_a), ("worker-b", "inc-b", &worker_b)]
-        {
+        for (name, incarnation, worker) in [
+            ("worker-a", "inc-a", &worker_a),
+            ("worker-b", "inc-b", &worker_b),
+        ] {
             register_with_credits(
                 &registry,
                 name,
@@ -1941,7 +1939,9 @@ mod tests {
         let context = RequestContext::new("prefix-request".into(), Principal::local_anonymous());
 
         // worker-a is busy, so turn one goes to the idle worker-b.
-        let busy_a = registry.select_and_reserve(&dispatcher.selection_request(&turn_one(), false).unwrap()).unwrap();
+        let busy_a = registry
+            .select_and_reserve(&dispatcher.selection_request(&turn_one(), false).unwrap())
+            .unwrap();
         assert_eq!(busy_a.key.worker_id.as_str(), "worker-a");
         dispatcher
             .generate(2, &context, turn_one(), tenant_work())
