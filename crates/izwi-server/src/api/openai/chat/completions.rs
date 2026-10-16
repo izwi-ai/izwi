@@ -511,6 +511,7 @@ pub async fn gateway_completions(
             ApiError::bad_request("Gateway chat request body is not valid JSON")
         }
     })?;
+    let dispatcher = state.chat_dispatcher_for(&req.model)?;
     validate_chat_request_compatibility(&req, compatibility_profile())?;
     let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
     state
@@ -519,6 +520,7 @@ pub async fn gateway_completions(
     let tenant_work = state.begin_tenant_work(&ctx)?;
     let backend = GatewayChat {
         state: &state,
+        dispatcher,
         context: &ctx,
         admission,
         tenant_work,

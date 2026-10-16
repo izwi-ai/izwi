@@ -1008,37 +1008,56 @@ async fn gateway_state(
         .with_context(|| format!("invalid approved worker {}", approval.endpoint.trim()))?;
     }
 
-    let chat_deployment = {
+    // Every chat model the approvals view names is served, the primary
+    // `--public-model` first; requests route by their `model`.
+    let chat_models = {
         let table = deployment_table
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        table
-            .select(TaskKind::Chat, &public_model)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "configured gateway worker approvals do not include chat model {}",
-                    public_model
-                )
-            })?
-            .deployment_id()
-            .clone()
+        let mut aliases = vec![public_model.clone()];
+        for approval in &worker_approvals {
+            if approval.task == TaskKind::Chat && !aliases.contains(&approval.public_model) {
+                aliases.push(approval.public_model.clone());
+            }
+        }
+        aliases
+            .into_iter()
+            .map(|alias| {
+                let deployment = table.select(TaskKind::Chat, &alias).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "configured gateway worker approvals do not include chat model {alias}"
+                    )
+                })?;
+                let variant = parse_model_variant(alias.as_str()).with_context(|| {
+                    format!("approved chat model {alias} is not a model this gateway knows")
+                })?;
+                Ok((variant, deployment.deployment_id().clone()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
     };
-
-    let dispatcher = app::remote_chat_dispatch::RemoteChatDispatcher::new(
-        registry.clone(),
-        app::remote_chat_dispatch::RemoteChatDispatchConfig {
-            public_model_variant,
-            deployment_id: chat_deployment.clone(),
-            policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
-            backend_policy: gateway_backend_policy(args.backend.as_ref()),
-            max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
-            max_output_tokens: 4096,
-            max_output_bytes: 512 * 1024,
-            slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
-            prefix_affinity: prefix_affinity_config(args),
-        },
-    )
-    .map_err(|error| anyhow::anyhow!(error.message))?;
+    let policy_revision = PolicyRevision::new(args.gateway_policy_revision.trim())?;
+    let dispatchers = chat_models
+        .into_iter()
+        .map(|(public_model_variant, deployment_id)| {
+            app::remote_chat_dispatch::RemoteChatDispatcher::new(
+                registry.clone(),
+                app::remote_chat_dispatch::RemoteChatDispatchConfig {
+                    public_model_variant,
+                    deployment_id,
+                    policy_revision: policy_revision.clone(),
+                    backend_policy: gateway_backend_policy(args.backend.as_ref()),
+                    max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
+                    max_output_tokens: 4096,
+                    max_output_bytes: 512 * 1024,
+                    slow_consumer_timeout: Duration::from_millis(
+                        args.gateway_slow_consumer_timeout_ms,
+                    ),
+                    prefix_affinity: prefix_affinity_config(args),
+                },
+            )
+            .map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Multi-gateway fleets share in-transit capacity claims
     // through one coordination database — a SQLite file by default, or a
@@ -1129,10 +1148,12 @@ async fn gateway_state(
         }
         None => None,
     };
-    let mut dispatcher = dispatcher;
-    if let Some(coordinator) = fleet.clone() {
-        dispatcher = dispatcher.with_fleet_coordinator(coordinator);
-    }
+    let mut dispatchers = dispatchers
+        .into_iter()
+        .map(|dispatcher| match fleet.clone() {
+            Some(coordinator) => dispatcher.with_fleet_coordinator(coordinator),
+            None => dispatcher,
+        });
     let polling_interval = Duration::from_millis(args.gateway_worker_status_poll_ms);
     // `tasks` collects the maintenance and approvals reconcile tasks that
     // GatewayWorkerStatusPoller aborts on drop. Status pollers live in the
@@ -1261,14 +1282,20 @@ async fn gateway_state(
         }));
     }
 
-    let state = gateway::GatewayState::new(
-        dispatcher,
-        enterprise_hooks,
-        perimeter,
-        serve_config.request_timeout_secs,
-        args.gateway_max_in_flight,
-    )
-    .with_approvals_reporter(approvals_reporter);
+    let primary = dispatchers
+        .next()
+        .expect("the primary chat model always has a dispatcher");
+    let state = dispatchers.fold(
+        gateway::GatewayState::new(
+            primary,
+            enterprise_hooks,
+            perimeter,
+            serve_config.request_timeout_secs,
+            args.gateway_max_in_flight,
+        ),
+        gateway::GatewayState::with_chat_model,
+    );
+    let state = state.with_approvals_reporter(approvals_reporter);
     let state = if args.gateway_realtime == "on" {
         // Stage pools resolve per approved task for the public model; boot
         // fails closed only when no realtime stage can be served at all. A
@@ -1301,7 +1328,7 @@ async fn gateway_state(
                 deployment_id: asr_deployment_id,
                 tts_deployment_id,
                 public_model: public_model.clone(),
-                policy_revision: PolicyRevision::new(args.gateway_policy_revision.trim())?,
+                policy_revision: policy_revision.clone(),
                 backend_policy: gateway_backend_policy(args.backend.as_ref()),
                 max_sessions: args.gateway_realtime_max_sessions,
                 session_budget: Duration::from_millis(args.gateway_realtime_session_budget_ms),
@@ -3438,7 +3465,76 @@ mod tests {
         .await
         .expect("registry gateway configuration should build");
         assert_eq!(poller.poller_count, 1);
-        assert!(state.chat_dispatcher.readiness_check().is_ok());
+        assert!(state.chat_dispatchers[0].readiness_check().is_ok());
+    }
+
+    #[tokio::test]
+    async fn gateway_serves_every_approved_chat_model_primary_first() {
+        let models = [ModelVariant::Qwen359BGguf, ModelVariant::Qwen354BGguf];
+        let mut workers = Vec::new();
+        for (index, model) in models.into_iter().enumerate() {
+            workers.push(
+                TestWorker::spawn(TestWorkerConfig {
+                    worker_id: WorkerId::new(format!("multi-model-worker-{index}")).unwrap(),
+                    incarnation_id: IncarnationId::new(format!("multi-model-inc-{index}")).unwrap(),
+                    deployment_id: DeploymentId::new(format!("multi-model-chat-{index}")).unwrap(),
+                    public_model: ModelAlias::new(model.dir_name()).unwrap(),
+                    ..TestWorkerConfig::default()
+                })
+                .await
+                .expect("test worker should bind"),
+            );
+        }
+        let credentials = workers[0].config().credentials.clone();
+        let approvals: Vec<String> = workers
+            .iter()
+            .zip(models)
+            .map(|(worker, model)| {
+                format!(
+                    "{}|chat|{}|{}|1",
+                    worker.endpoint(),
+                    model.dir_name(),
+                    worker.config().deployment_id
+                )
+            })
+            .collect();
+        let env = crate::test_support::env_lock();
+        // The second approval names the primary model.
+        let args = parse(&[
+            "izwi-server",
+            "--role",
+            "gateway",
+            "--worker-credential-id",
+            credentials.credential_id.as_str(),
+            "--worker-bearer-token",
+            credentials.bearer_token.expose_secret(),
+            "--public-model",
+            models[1].dir_name(),
+            "--gateway-worker-approval",
+            &approvals[0],
+            "--gateway-worker-approval",
+            &approvals[1],
+        ]);
+        drop(env);
+        let (state, _poller) = gateway_state(
+            &args,
+            &ServeRuntimeConfig::default(),
+            EnterpriseHooks::noop(),
+            GatewayPerimeterConfig::new_for_test("registry-test-api-key", 1024 * 1024)
+                .expect("test perimeter should be valid"),
+        )
+        .await
+        .expect("multi-model gateway configuration should build");
+        let served: Vec<ModelVariant> = state
+            .chat_dispatchers
+            .iter()
+            .map(|dispatcher| dispatcher.public_model())
+            .collect();
+        assert_eq!(served, vec![models[1], models[0]]);
+        assert!(state
+            .chat_dispatchers
+            .iter()
+            .all(|dispatcher| dispatcher.readiness_check().is_ok()));
     }
 
     #[tokio::test]
@@ -3494,8 +3590,8 @@ mod tests {
         .await
         .expect("one unavailable approved worker must not fail gateway boot");
         assert_eq!(poller.poller_count, 1);
-        assert!(state.chat_dispatcher.readiness_check().is_ok());
-        let dispatcher = &state.chat_dispatcher;
+        assert!(state.chat_dispatchers[0].readiness_check().is_ok());
+        let dispatcher = &state.chat_dispatchers[0];
         let deployment_id = first.config().deployment_id.clone();
         assert_eq!(
             dispatcher

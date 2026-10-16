@@ -49,7 +49,8 @@ const MAX_GATEWAY_QUOTA_HOOK_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct GatewayState {
-    pub(crate) chat_dispatcher: RemoteChatDispatcher,
+    /// One dispatcher per public chat model, the primary model first.
+    pub(crate) chat_dispatchers: Vec<RemoteChatDispatcher>,
     pub(crate) enterprise_hooks: EnterpriseHooks,
     pub(crate) lifecycle: ServerLifecycle,
     pub(crate) perimeter: GatewayPerimeterConfig,
@@ -82,7 +83,7 @@ impl GatewayState {
             GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
                 .expect("validated gateway admission limit supports tenant ownership");
         Self {
-            chat_dispatcher: dispatcher,
+            chat_dispatchers: vec![dispatcher],
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             perimeter,
@@ -96,6 +97,25 @@ impl GatewayState {
             realtime_relay: None,
             approvals: None,
         }
+    }
+
+    /// Serve one more public chat model. Requests route by their `model`.
+    pub(crate) fn with_chat_model(mut self, dispatcher: RemoteChatDispatcher) -> Self {
+        self.chat_dispatchers.push(dispatcher);
+        self
+    }
+
+    /// The dispatcher serving public model `model`, or the OpenAI 404 for a
+    /// model this gateway does not serve.
+    pub(crate) fn chat_dispatcher_for(
+        &self,
+        model: &str,
+    ) -> Result<&RemoteChatDispatcher, ApiError> {
+        let variant = crate::app::chat::parse_chat_model(model).ok();
+        self.chat_dispatchers
+            .iter()
+            .find(|dispatcher| Some(dispatcher.public_model()) == variant)
+            .ok_or_else(|| ApiError::model_not_found(format!("The model `{model}` does not exist")))
     }
 
     /// Install the adopted-approvals reporter behind
@@ -268,6 +288,7 @@ pub(crate) struct GatewayAdmissionGuard {
 /// its dispatch in the gateway metrics.
 pub(crate) struct GatewayChat<'a> {
     pub(crate) state: &'a GatewayState,
+    pub(crate) dispatcher: &'a RemoteChatDispatcher,
     pub(crate) context: &'a RequestContext,
     pub(crate) admission: GatewayAdmissionGuard,
     pub(crate) tenant_work: UnboundTenantWorkLease,
@@ -301,8 +322,7 @@ impl ChatBackend for GatewayChat<'_> {
         let started = Instant::now();
         let model = request.variant.dir_name();
         let generation = self
-            .state
-            .chat_dispatcher
+            .dispatcher
             .generate(
                 self.state.request_timeout_secs,
                 self.context,
@@ -334,8 +354,7 @@ impl ChatBackend for GatewayChat<'_> {
         let started = Instant::now();
         let model = request.variant.dir_name();
         let events = self
-            .state
-            .chat_dispatcher
+            .dispatcher
             .stream(
                 self.state.request_timeout_secs,
                 self.context,
@@ -820,7 +839,18 @@ async fn live_check(State(state): State<GatewayState>) -> Json<GatewayLiveRespon
 
 async fn ready_check(State(state): State<GatewayState>) -> Response {
     let lifecycle = state.lifecycle.snapshot();
-    let worker_result = state.chat_dispatcher.readiness_check();
+    // Ready while any served model has a ready worker; the message names the
+    // models that have none.
+    let unready: Vec<String> = state
+        .chat_dispatchers
+        .iter()
+        .filter_map(|dispatcher| dispatcher.readiness_check().err())
+        .collect();
+    let worker_result = if unready.len() < state.chat_dispatchers.len() {
+        Ok(())
+    } else {
+        Err(unready.join("; "))
+    };
     let checks = vec![
         GatewayProbeCheck {
             name: "lifecycle_ready",
@@ -1766,23 +1796,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_chat_rejects_an_incompatible_model_without_worker_dispatch() {
+    async fn public_chat_answers_404_for_a_model_it_does_not_serve() {
         let (state, worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
         let app = create_gateway_router(state, &ServeRuntimeConfig::default());
-        let response = send(
-            app,
-            chat_request(json!({
-                "model": ModelVariant::Qwen359BGguf.dir_name(),
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 32
-            })),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(json_body(response).await["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("incompatible with remote deployment")));
+        for model in [ModelVariant::Qwen359BGguf.dir_name(), "no-such-model"] {
+            let response = send(
+                app.clone(),
+                chat_request(json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 32
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{model}");
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "model_not_found",
+                "{model}"
+            );
+        }
         assert_eq!(worker.served_invocations(), 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_routes_each_request_to_its_models_workers() {
+        let models = [ModelVariant::Qwen354BGguf, ModelVariant::Qwen359BGguf];
+        let mut workers = Vec::new();
+        let mut state: Option<GatewayState> = None;
+        for (index, model) in models.into_iter().enumerate() {
+            let worker = TestWorker::spawn(TestWorkerConfig {
+                worker_id: format!("test-worker-{index}").try_into().unwrap(),
+                deployment_id: format!("test-chat-{index}").try_into().unwrap(),
+                public_model: ModelAlias::new(model.dir_name()).unwrap(),
+                ..TestWorkerConfig::default()
+            })
+            .await
+            .unwrap();
+            let dispatcher = single_worker_dispatcher(
+                model,
+                &worker.endpoint(),
+                worker.config().credentials.clone(),
+            )
+            .await;
+            state = Some(match state {
+                None => {
+                    GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
+                }
+                Some(state) => state.with_chat_model(dispatcher),
+            });
+            workers.push(worker);
+        }
+        let state = state.unwrap();
+        state.lifecycle.mark_ready();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let listed = json_body(send(app.clone(), get("/v1/models")).await).await;
+        let ids: Vec<&str> = listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, models.map(|model| model.dir_name()));
+        for model in models {
+            let path = format!("/v1/models/{}", model.dir_name());
+            assert_eq!(send(app.clone(), get(&path)).await.status(), StatusCode::OK);
+        }
+
+        for (index, model) in models.into_iter().enumerate() {
+            let response = send(
+                app.clone(),
+                chat_request(json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 8
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model:?}");
+            let served: Vec<u64> = workers.iter().map(TestWorker::served_invocations).collect();
+            let mut expected = vec![0; models.len()];
+            expected[..=index].fill(1);
+            assert_eq!(served, expected, "{model:?}");
+        }
     }
 
     /// EDGE-F19: out-of-range sampling values are OpenAI-shaped 400s that
@@ -3128,9 +3225,10 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // This gateway serves another model: a 404 before any execution.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = error_envelope(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "model_not_found");
         let msg = body["error"]["message"].as_str().unwrap_or_default();
         // Assert no server directories or local path leaks
         assert!(!msg.contains("/var/lib/izwi"));

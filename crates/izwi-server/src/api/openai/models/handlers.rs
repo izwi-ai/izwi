@@ -103,7 +103,11 @@ pub async fn get_model_openai(
 pub async fn gateway_list_models(State(state): State<GatewayState>) -> Json<OpenAiModelsResponse> {
     Json(OpenAiModelsResponse {
         object: "list",
-        data: vec![OpenAiModel::new(state.chat_dispatcher.public_model(), 0)],
+        data: state
+            .chat_dispatchers
+            .iter()
+            .map(|dispatcher| OpenAiModel::new(dispatcher.public_model(), 0))
+            .collect(),
     })
 }
 
@@ -111,9 +115,14 @@ pub async fn gateway_get_model(
     State(state): State<GatewayState>,
     Path(model): Path<String>,
 ) -> Result<Json<OpenAiModel>, ApiError> {
-    let public = state.chat_dispatcher.public_model();
+    let served = state
+        .chat_dispatchers
+        .iter()
+        .map(|dispatcher| dispatcher.public_model());
     match izwi_core::parse_model_variant(&model) {
-        Ok(variant) if variant == public => Ok(Json(OpenAiModel::new(public, 0))),
+        Ok(variant) if served.into_iter().any(|public| public == variant) => {
+            Ok(Json(OpenAiModel::new(variant, 0)))
+        }
         _ => Err(model_not_found(&model)),
     }
 }
