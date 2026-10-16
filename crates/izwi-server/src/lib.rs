@@ -2827,6 +2827,8 @@ mod tests {
 
     #[test]
     fn local_server_role_remains_the_default() {
+        // IZWI_GATEWAY_TOPOLOGY is set by a sibling test under this lock.
+        let _guard = env_lock();
         let args = parse(&["izwi-server"]);
         assert_eq!(args.role, ServerRole::Local);
         assert_eq!(args.gateway_topology, GatewayTopology::Standalone);
