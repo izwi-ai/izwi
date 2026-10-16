@@ -690,6 +690,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start opaque stage artifact publication transaction")?;
+        lock_stage_job_with(&tx, &lease.stage_id).await?;
         let now = self.now_millis();
         let row = get_provider_write_with(&tx, &reservation.write_id).await?;
         if row.as_ref() != Some(reservation) {

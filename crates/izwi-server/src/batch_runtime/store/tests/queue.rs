@@ -939,6 +939,59 @@ async fn abandoned_cancellation_ignores_a_restarted_incarnation_reusing_the_work
     );
 }
 
+/// Stage writers (claim, complete) and job writers (cancel) race on separate
+/// connections. On PostgreSQL they must lock the job row in one order, or
+/// the database aborts one of them as a deadlock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_claim_completion_and_cancellation_never_deadlock() {
+    let (store, _root) = build_store().await;
+    for round in 0..16 {
+        let (running_job, _) =
+            create_test_job_and_stage(&store, 1, &format!("running_{round}"), 1).await;
+        let lease = store
+            .claim_next_stage("worker-1", 60_000)
+            .await
+            .expect("claim")
+            .expect("active attempt")
+            .lease()
+            .expect("lease");
+        let (queued_job, _) =
+            create_test_job_and_stage(&store, 0, &format!("queued_{round}"), 1).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let spawn = |work: futures::future::BoxFuture<'static, anyhow::Result<()>>| {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                work.await
+            })
+        };
+        let tasks = [
+            spawn(Box::pin({
+                let store = store.clone();
+                async move { store.complete_stage(&lease, vec![]).await.map(|_| ()) }
+            })),
+            spawn(Box::pin({
+                let (store, job_id) = (store.clone(), running_job.id.clone());
+                async move { store.cancel_job(&job_id, None).await.map(|_| ()) }
+            })),
+            spawn(Box::pin({
+                let store = store.clone();
+                async move { store.claim_next_stage("worker-2", 60_000).await.map(|_| ()) }
+            })),
+            spawn(Box::pin({
+                let (store, job_id) = (store.clone(), queued_job.id.clone());
+                async move { store.cancel_job(&job_id, None).await.map(|_| ()) }
+            })),
+        ];
+        barrier.wait().await;
+        for task in tasks {
+            task.await
+                .expect("race task joins")
+                .unwrap_or_else(|error| panic!("round {round}: {error:#}"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn completion_and_cancellation_race_has_one_authoritative_winner() {
     let (store, _root) = build_store().await;

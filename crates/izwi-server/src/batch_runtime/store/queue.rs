@@ -246,6 +246,34 @@ pub(super) fn abandoned_cancellation_predicate(stale_before_param: usize) -> Str
     )
 }
 
+/// Row-lock a stage's parent job on PostgreSQL. Every transaction that
+/// writes a stage and then its job takes the job lock first, the order
+/// cancellation and manual retry already use, so a stage writer and a job
+/// writer cannot deadlock each other. SQLite's single writer lock already
+/// serializes them.
+pub(super) async fn lock_stage_job_with<C: ConnectionTrait>(
+    db: &C,
+    stage_id: &str,
+) -> anyhow::Result<()> {
+    if db.get_database_backend() != DbBackend::Postgres {
+        return Ok(());
+    }
+    db.query_one_raw(raw::statement(
+        db,
+        r#"
+        SELECT j.id
+        FROM runtime_jobs j
+        JOIN job_stages s ON s.job_id = j.id
+        WHERE s.id = ?1
+        FOR UPDATE OF j
+        "#,
+        vec![stage_id.into()],
+    )?)
+    .await
+    .context("Failed to lock the stage's runtime job")?;
+    Ok(())
+}
+
 pub(super) async fn get_stage_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow::Result<Option<JobStage>> {
     let row = db
         .query_one_raw(raw::statement(db, JOB_STAGE_COLUMNS_SQL, vec![id.into()])?)
@@ -538,6 +566,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage claim transaction")?;
+        lock_stage_job_with(&tx, &candidate.stage_id).await?;
         let attempt_token = new_uuid();
         let result = tx
             .execute_raw(raw::statement(
@@ -650,6 +679,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage completion transaction")?;
+        lock_stage_job_with(&tx, &lease.stage_id).await?;
         let now = self.now_millis();
         let output_json = json_to_db_string(&json!(output_artifact_ids), "[]")?;
         let result = tx
@@ -968,6 +998,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start runtime stage failure transaction")?;
+        lock_stage_job_with(&tx, &lease.stage_id).await?;
         let Some(stage) = get_stage_with(&tx, &lease.stage_id).await? else {
             tx.rollback().await?;
             return Ok(None);
@@ -1034,6 +1065,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start execution-stopping transaction")?;
+        lock_stage_job_with(&tx, &lease.stage_id).await?;
         let now = self.now_millis();
         let result = tx
             .execute_raw(raw::statement(
@@ -1094,6 +1126,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start stage cancellation finalization transaction")?;
+        lock_stage_job_with(&tx, &lease.stage_id).await?;
         let now = self.now_millis();
         let finalized = self
             .finalize_stage_cancellation_with(
@@ -1158,6 +1191,7 @@ impl BatchRuntimeStore {
                 .begin_with_options(write_transaction_options())
                 .await
                 .context("Failed to start expired lease recovery transaction")?;
+            lock_stage_job_with(&tx, &lease.stage_id).await?;
             let Some(stage) = get_stage_with(&tx, &lease.stage_id).await? else {
                 tx.rollback().await?;
                 continue;
@@ -1260,6 +1294,7 @@ impl BatchRuntimeStore {
                 .begin_with_options(write_transaction_options())
                 .await
                 .context("Failed to start abandoned cancellation settlement transaction")?;
+            lock_stage_job_with(&tx, &lease.stage_id).await?;
             if self
                 .finalize_stage_cancellation_with(&tx, &lease, now, settlement)
                 .await?
