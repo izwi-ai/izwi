@@ -34,14 +34,17 @@ EnvironmentFile=/etc/izwi/gateway.env
 Environment=IZWI_LOG_FORMAT=json
 Environment=IZWI_GATEWAY_SHARED_APPROVALS_PATH=/var/lib/izwi/shared-approvals
 Environment=IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS=5000
-Environment=IZWI_HTTP_SHUTDOWN_GRACE_SECS=20
+# A loopback gateway has no load balancer to drain from: no pre-stop window.
+Environment=IZWI_GATEWAY_PRESTOP_SECS=0
+Environment=IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
 ExecStart=/usr/local/bin/izwi-server \
     --role gateway \
     --host 127.0.0.1 \
     --port 8080 \
     --public-model LFM2.5-1.2B-Instruct-GGUF
-# SIGTERM closes admission and lets accepted responses finish for
-# IZWI_HTTP_SHUTDOWN_GRACE_SECS.
+# SIGTERM closes admission and lets accepted responses finish within
+# IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS; streams still open near its end get a
+# terminal "shutting down" event.
 KillSignal=SIGTERM
 TimeoutStopSec=45
 Restart=on-failure

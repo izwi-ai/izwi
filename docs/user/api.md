@@ -183,8 +183,17 @@ Returns one of those models in the same object shape. An unknown, disabled or
 not-downloaded model is a `404` with `code: model_not_found` and `param:
 model`.
 
-The gateway serves both routes for the one public model of its deployment
-(with `created: 0`), behind the same API key as chat completions.
+The gateway serves both routes for every chat model its worker approvals
+name (with `created: 0`), behind the same API key as chat completions. A chat
+request names its model in `model` and is routed to that model's workers; a
+model the gateway does not serve is a `404` with `code: model_not_found`.
+Models added to a shared approvals file after the gateway started are served
+after a restart.
+
+The gateway serves chat completions only: `/v1/audio/*` and `/v1/responses`
+answer `404` there, because the worker protocol has no unary speech or
+Responses invocation. Use a local-role server for those routes (realtime
+speech goes through the gateway's realtime socket).
 
 Use `/v1/admin/models` when you need download, load, unload, local path, status, or speech-capability details.
 
@@ -242,6 +251,23 @@ when none is ready it returns a `400` with `code: unsupported_parameter` and
 advertises tool support; the gateway parses the calls in the worker's text
 exactly as the local server does. The reasoning controls are not yet
 supported through the gateway (400).
+
+Gateway limits and headers:
+
+- Every gateway chat response carries OpenAI's rate-limit headers for the
+  caller's tenant: `x-ratelimit-limit-requests`,
+  `x-ratelimit-remaining-requests` and `x-ratelimit-reset-requests` (for
+  example `30s`), plus the `-tokens` set when the operator configured a
+  tokens-per-minute limit. A `429` or `503` carries `Retry-After` in seconds.
+- With a token limit, a request is admitted against an estimate (its output
+  budget plus about one token per four prompt bytes) and charged what the
+  worker reports it used. A request whose estimate exceeds the remaining
+  budget is a `429` with message `Gateway tenant token rate limit exceeded`.
+- A request body that does not arrive within the gateway's body-read deadline
+  (10 seconds by default) is a `408` with `code: timeout`.
+- During a gateway shutdown, a stream that has not finished by the end of the
+  drain receives a `503` error event (`code: service_unavailable`) and
+  `data: [DONE]`. Retry it; nothing was replayed.
 
 Compatibility profile:
 

@@ -376,7 +376,13 @@ policy must migrate explicitly to `fleet-one-gateway`, v1 approvals, and client
 certificate/key references; there is no legacy remote-HTTPS compatibility mode.
 
 Repeat `--gateway-worker-approval` for replicas. A pool is keyed by task and
-public model. All replicas in a pool must agree on deployment ID, generation,
+public model. Approvals may name several chat models: the gateway serves each
+one (`--public-model` stays the primary model, listed first, and names the
+realtime stages and the legacy endpoint forms' model), lists them all on
+`/v1/models`, and routes each request by its `model`; an unserved model is a
+404. `/readyz` stays ready while any served model has a ready worker, and its
+check message names the models without one. A chat model added to the shared
+approvals file after boot needs a gateway restart. All replicas in a pool must agree on deployment ID, generation,
 artifact revision, execution representation, tokenizer revision, and exact
 capability; backend and precision may differ and remain worker properties. The
 CLI pins task/model/deployment/generation, while the gateway freezes the rest of
@@ -399,8 +405,34 @@ strictly increasing status sequence numbers rather than trusting remote clocks.
 Admission/header timeout is configurable from 1 ms to 60 seconds, first-output
 and inter-output idle timeouts from 1 ms to one hour, and slow-consumer relay
 timeout from 1 ms to 60 seconds. Queue wait cannot exceed admission timeout.
-Every phase remains capped by the original request's total remaining deadline;
-transport or metadata trickles do not extend it.
+The first-output deadline grows with the prompt:
+`--gateway-worker-first-output-timeout-per-kib-ms` (default 1000) is added for
+every KiB of invocation, so a long prompt's CPU prefill is not cancelled by the
+deadline sized for short prompts. Every phase remains capped by the original
+request's total remaining deadline; transport or metadata trickles do not
+extend it.
+
+Routing among a pool's eligible workers:
+
+- `--gateway-router-kv-pressure-pct` (default 90): a worker whose managed-KV
+  usage is at or above this is chosen only when every eligible worker is.
+- `--gateway-router-prefix-affinity` (default `on`): the gateway hashes each
+  prompt's message stream in `--gateway-router-prefix-block-bytes` (256)
+  blocks, up to `--gateway-router-prefix-max-blocks` (128), and remembers per
+  worker the last `--gateway-router-prefix-entries` (16,384) block hashes it
+  routed there. The worker holding the longest prefix of the prompt wins
+  unless it carries more than `--gateway-router-balance-threshold` (4)
+  outstanding requests beyond the least-loaded worker; then load decides.
+  Only hashes are kept. A wrong guess costs one prefill, never a request.
+- Otherwise the capacity-weighted least-loaded worker wins; equal load
+  prefers the higher observed output rate.
+
+The earlier `--gateway-router-cache-*` and `--gateway-session-pin*` flags are
+removed; delete them from service definitions.
+
+HTTPS workers serve HTTP/2 (negotiated by ALPN), so a gateway multiplexes its
+invocations and status polls over one connection per worker. Plaintext
+loopback workers stay on HTTP/1.1 keep-alive.
 
 ### 3. Check probes and one public request
 
@@ -510,6 +542,27 @@ has finished.
   for at most `IZWI_GATEWAY_MAX_TRACKED_TENANTS` (default 16,384) tenants. An
   over-rate request is 429. The limits are per process: with several
   gateways, use the fleet partition (below) or the totals multiply.
+- `IZWI_GATEWAY_TENANT_TOKENS_PER_MINUTE` (default 0: off) adds a per-tenant
+  token budget (prompt plus completion tokens, one minute's worth as burst).
+  A request reserves its output budget plus prompt bytes / 4 at admission
+  and is settled to the worker's reported usage when it completes; a request
+  that fails before streaming is refunded, and one that started streaming
+  keeps its estimate. The fleet partition divides it like the request rate.
+- The tenant checks run before the global permit: a tenant over its request
+  rate or concurrent-work limit is refused before it takes one of the
+  gateway's `--gateway-max-in-flight` permits or sends its body, so one
+  tenant's slow uploads cannot exhaust admission for others. The body must
+  arrive within `--gateway-body-read-timeout-ms` (default 10000, at most
+  60000); a late body is 408 and is counted in
+  `izwi_gateway_body_timeout_rejections_total`. The rate token itself is
+  spent only after the body validates, and the local limits run before the
+  enterprise quota hook, so a request they refuse is never charged by it.
+- Chat responses carry `x-ratelimit-{limit,remaining,reset}-requests` (and
+  `-tokens` with a token budget); 429 and 503 answers carry `Retry-After`.
+- An enterprise `QuotaLimiter` receives `commit(QuotaUsage)` after each
+  completed chat with the admitted estimate and the actual input and output
+  tokens, for metering. It is best effort (2 s, logged on failure); the
+  default implementation does nothing.
 - Once an exact worker attempt is bound, tenant ownership survives a response
   timeout, dropped JSON response, or SSE disconnect. It is released only by an
   authenticated terminal worker event, a cancellation disposition that proves
@@ -756,6 +809,13 @@ close at session time. Knobs:
 | `IZWI_GATEWAY_REALTIME_MAX_SESSIONS` | Bounded concurrent relayed sessions per gateway | `64` |
 | `IZWI_GATEWAY_REALTIME_SESSION_BUDGET_MS` | End-to-end worker session budget minted into each admit | `600000` |
 
+The relay dials HTTPS workers with the same trust as the HTTP client: the
+public web roots plus the configured private CA roots, presenting the mTLS
+client identity when one is configured. Each direction of a session is its
+own task with a 5 s write deadline, so a client that stops reading cannot
+delay its own cancel or audio toward the worker; a peer that misses the
+deadline ends the session.
+
 Worker side: ASR workers are configured with `IZWI_WORKER_TASK=speech_to_text`
 and `IZWI_WORKER_MODEL=Nemotron-3.5-ASR-Streaming-0.6B` (or a Voxtral
 realtime variant). TTS workers use `IZWI_WORKER_TASK=text_to_speech` with a
@@ -832,13 +892,20 @@ completion, demotion, promotion, and budget containment).
 
 For planned maintenance, drain the gateway before stopping the supervisor:
 
-1. Remove the gateway from external ingress/load-balancer rotation.
-2. Send SIGTERM (or Ctrl+C) to the gateway. It marks itself draining and closes
-   admission before beginning HTTP graceful shutdown. `/readyz` becomes 503.
-3. Allow accepted responses to finish. `IZWI_HTTP_SHUTDOWN_GRACE_SECS` bounds
-   this wait to 1-300 seconds (default 20). At expiry, remaining HTTP
-   connections are dropped and their exact private attempts request
-   cancellation; completion is still worker-authoritative.
+1. Remove the gateway from external ingress/load-balancer rotation, or let
+   the pre-stop window do it.
+2. Send SIGTERM (or Ctrl+C) to the gateway. Shutdown takes at most
+   `--gateway-shutdown-budget-secs` (default 25, inside Kubernetes' default
+   30 s grace period). For the first `--gateway-prestop-secs` (default 5)
+   `/readyz` is 503 while the listener stays open and requests are still
+   served, so endpoints are withdrawn before anything is refused.
+3. Then admission closes and the listener stops accepting; accepted
+   responses finish on their own. Shortly before the budget ends (a quarter
+   of the drain, at most 2 s, before it) streams still open receive a 503
+   `service_unavailable` error event and `[DONE]`, and their exact private
+   attempts request cancellation; anything left at the end of the budget is
+   dropped. Completion is still worker-authoritative.
+   `IZWI_HTTP_SHUTDOWN_GRACE_SECS` applies to the local role only.
 4. Send SIGTERM (or Ctrl+C) to the supervisor. Closing each parent-owned control
    pipe makes the worker stop admission. The worker waits `drain_grace_ms`,
    requests cancellation for remaining attempts, then waits

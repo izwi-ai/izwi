@@ -77,8 +77,10 @@ spec:
       labels:
         app.kubernetes.io/name: izwi-gateway
     spec:
-      # SIGTERM closes admission and lets accepted responses finish for
-      # IZWI_HTTP_SHUTDOWN_GRACE_SECS; /readyz turns 503 at once.
+      # On SIGTERM /readyz turns 503 at once while requests are still served
+      # for IZWI_GATEWAY_PRESTOP_SECS (endpoint removal propagates); then
+      # admission closes and accepted responses finish, all within
+      # IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS, below this grace period.
       terminationGracePeriodSeconds: 40
       containers:
         - name: gateway
@@ -141,8 +143,10 @@ spec:
               value: "10000"
             - name: IZWI_GATEWAY_TRUSTED_INGRESS_TLS
               value: "1"
-            - name: IZWI_HTTP_SHUTDOWN_GRACE_SECS
-              value: "30"
+            - name: IZWI_GATEWAY_PRESTOP_SECS
+              value: "5"
+            - name: IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS
+              value: "35"
             - name: IZWI_LOG_FORMAT
               value: json
             # Optional shared capacity claims across gateways:
