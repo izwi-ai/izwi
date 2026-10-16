@@ -1385,43 +1385,68 @@ impl Scheduler {
                     .then_with(|| a.5.cmp(&b.5))
             });
         } else if self.config.policy == SchedulingPolicy::WeightedFair {
-            let mut simulated_service = self.class_service.clone();
-            let mut simulated_tenants = self.tenant_service.clone();
-            let mut fair_order = Vec::with_capacity(decode_candidates.len());
-            while !decode_candidates.is_empty() {
-                let next_index = (0..decode_candidates.len())
-                    .min_by(|left, right| {
-                        let a = &decode_candidates[*left];
-                        let b = &decode_candidates[*right];
-                        Self::compare_class_service_with(&simulated_service, a.7, b.7)
-                            .then_with(|| {
-                                self.compare_tenant_service_with(&simulated_tenants, &a.0, &b.0)
-                            })
-                            .then_with(|| b.2.cmp(&a.2))
-                            .then_with(|| a.13.cmp(&b.13))
-                            .then_with(|| {
-                                b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .then_with(|| a.1.cmp(&b.1))
-                    })
-                    .unwrap_or(0);
-                let candidate = decode_candidates.remove(next_index);
-                let next_service = simulated_service
-                    .get(&candidate.7)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(1);
-                simulated_service.insert(candidate.7, next_service);
-                if let Some(metadata) = self.requests.get(&candidate.0) {
-                    let service = simulated_tenants
-                        .entry((metadata.workload_class, metadata.tenant_key))
-                        .or_default();
-                    service.units = service.units.saturating_add(1);
-                    service.last_selected = self.next_plan_id;
-                }
-                fair_order.push(candidate);
+            // Repeatedly take the row whose workload class, then tenant, has
+            // the least simulated service, and charge that group one unit.
+            // Rows of one (class, tenant) group always compare by their own
+            // keys, so the rows are sorted once and only each group's head
+            // competes: O(R log R + R*G) for R rows in G groups, instead of
+            // a selection sort over every row (SCH-F9).
+            decode_candidates.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| a.13.cmp(&b.13))
+                    .then_with(|| b.8.partial_cmp(&a.8).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let mut groups: Vec<(TenantServiceKey, TenantService, VecDeque<usize>)> = Vec::new();
+            let mut group_of = HashMap::<TenantServiceKey, usize>::new();
+            for (row, candidate) in decode_candidates.iter().enumerate() {
+                let key = self
+                    .requests
+                    .get(&candidate.0)
+                    .map_or((candidate.7, None), |metadata| {
+                        (metadata.workload_class, metadata.tenant_key)
+                    });
+                let group = *group_of.entry(key).or_insert_with(|| {
+                    groups.push((
+                        key,
+                        self.tenant_service.get(&key).copied().unwrap_or_default(),
+                        VecDeque::new(),
+                    ));
+                    groups.len() - 1
+                });
+                groups[group].2.push_back(row);
             }
-            decode_candidates = fair_order;
+            let mut simulated_service = groups
+                .iter()
+                .map(|(key, _, _)| {
+                    (
+                        key.0,
+                        self.class_service.get(&key.0).copied().unwrap_or_default(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut fair_order = Vec::with_capacity(decode_candidates.len());
+            while let Some(next) = (0..groups.len())
+                .filter(|group| !groups[*group].2.is_empty())
+                .min_by(|left, right| {
+                    let (a, b) = (&groups[*left], &groups[*right]);
+                    Self::compare_class_service_with(&simulated_service, a.0 .0, b.0 .0)
+                        .then_with(|| self.compare_tenant_entries(a.1, b.1))
+                        .then_with(|| a.2[0].cmp(&b.2[0]))
+                })
+            {
+                let (key, service, rows) = &mut groups[next];
+                fair_order.push(rows.pop_front().expect("only non-empty groups compete"));
+                let class_service = simulated_service.entry(key.0).or_default();
+                *class_service = class_service.saturating_add(1);
+                service.units = service.units.saturating_add(1);
+                service.last_selected = self.next_plan_id;
+            }
+            let mut rows = decode_candidates.into_iter().map(Some).collect::<Vec<_>>();
+            decode_candidates = fair_order
+                .into_iter()
+                .map(|row| rows[row].take().expect("each row is ordered once"))
+                .collect();
         } else {
             decode_candidates.sort_by(|a, b| match self.config.policy {
                 SchedulingPolicy::FCFS => a.13.cmp(&b.13).then_with(|| a.1.cmp(&b.1)),
@@ -3327,8 +3352,15 @@ impl Scheduler {
         if key_a.0 != key_b.0 {
             return self.compare_class_service(key_a.0, key_b.0);
         }
-        let a = service.get(&key_a).copied().unwrap_or_default();
-        let b = service.get(&key_b).copied().unwrap_or_default();
+        self.compare_tenant_entries(
+            service.get(&key_a).copied().unwrap_or_default(),
+            service.get(&key_b).copied().unwrap_or_default(),
+        )
+    }
+
+    /// Order two tenants of one workload class: a tenant unselected for
+    /// eight plans first (oldest first), then the least served.
+    fn compare_tenant_entries(&self, a: TenantService, b: TenantService) -> Ordering {
         let aged_a = self.next_plan_id.saturating_sub(a.last_selected) >= 8;
         let aged_b = self.next_plan_id.saturating_sub(b.last_selected) >= 8;
         aged_b
