@@ -56,77 +56,198 @@ pub fn current_timestamp_millis() -> i64 {
         .as_millis() as i64
 }
 
-pub(super) const MEDIA_ASSET_COLUMNS_SQL: &str =
-    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE id = ?1";
+/// `SELECT <every column> FROM <table>` for each mapped row type, to
+/// `concat!` into complete statements.
+macro_rules! select_media_assets {
+    () => {
+        concat!(
+            "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, ",
+            "content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, ",
+            "channel_count, peak_amplitude, rms_amplitude, source_asset_id, ",
+            "canonical_profile_version, scan_status, retention_policy, deleted_at, ",
+            "metadata_json",
+            " FROM media_assets"
+        )
+    };
+}
 
-pub(super) const PROVIDER_WRITE_COLUMNS_SQL: &str = "SELECT write_id, reservation_token, created_at, expires_at, tenant_scope, storage_namespace, content_type, filename, expected_size_bytes, expected_sha256, provider_request_json, storage_key, cleanup_claim_token, cleanup_attempt_count FROM provider_write_reservations WHERE write_id = ?1";
+macro_rules! select_provider_write_reservations {
+    () => {
+        concat!(
+            "SELECT write_id, reservation_token, created_at, expires_at, tenant_scope, ",
+            "storage_namespace, content_type, filename, expected_size_bytes, expected_sha256, ",
+            "provider_request_json, storage_key, cleanup_claim_token, cleanup_attempt_count",
+            " FROM provider_write_reservations"
+        )
+    };
+}
+pub(super) use select_provider_write_reservations;
 
-pub(super) const MEDIA_ASSET_BY_STORAGE_KEY_SQL: &str =
-    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE storage_key = ?1 AND deleted_at IS NULL";
+macro_rules! select_text_assets {
+    () => {
+        concat!(
+            "SELECT id, created_at, updated_at, raw_text, normalized_text, language_hint, ",
+            "character_count, sha256, safety_status, retention_policy, structure_json",
+            " FROM text_assets"
+        )
+    };
+}
 
-pub(super) const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str =
-    "SELECT id, created_at, updated_at, asset_kind, storage_namespace, storage_key, content_type, filename, size_bytes, sha256, duration_secs, sample_rate_hz, channel_count, peak_amplitude, rms_amplitude, source_asset_id, canonical_profile_version, scan_status, retention_policy, deleted_at, metadata_json FROM media_assets WHERE source_asset_id = ?1 AND canonical_profile_version = ?2 AND deleted_at IS NULL";
+macro_rules! select_runtime_jobs {
+    () => {
+        concat!(
+            "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, ",
+            "priority, model_id, capability, route_record_kind, route_record_id, ",
+            "input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, ",
+            "progress_json, error_code, error_message, attempt_count, max_attempts, ",
+            "retry_policy_json, idempotency_key, correlation_id, cancellation_reason, ",
+            "cancellation_state",
+            " FROM runtime_jobs"
+        )
+    };
+}
+pub(super) use select_runtime_jobs;
 
-pub(super) const TEXT_ASSET_COLUMNS_SQL: &str =
-    "SELECT id, created_at, updated_at, raw_text, normalized_text, language_hint, character_count, sha256, safety_status, retention_policy, structure_json FROM text_assets WHERE id = ?1";
+macro_rules! select_job_stages {
+    () => {
+        concat!(
+            "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, ",
+            "resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, ",
+            "available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, ",
+            "output_artifact_ids_json, progress_json, started_at, finished_at, error_code, ",
+            "error_message, cancellation_state",
+            " FROM job_stages"
+        )
+    };
+}
 
-pub(super) const RUNTIME_JOB_COLUMNS_SQL: &str =
-    "SELECT id, created_at, updated_at, queued_at, started_at, finished_at, job_kind, status, priority, model_id, capability, route_record_kind, route_record_id, input_media_asset_id, input_text_asset_id, request_json, model_snapshot_json, progress_json, error_code, error_message, attempt_count, max_attempts, retry_policy_json, idempotency_key, correlation_id, cancellation_reason, cancellation_state FROM runtime_jobs WHERE id = ?1";
+macro_rules! select_runtime_artifacts {
+    () => {
+        concat!(
+            "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, ",
+            "publication_key, created_at, artifact_kind, artifact_role, media_asset_id, ",
+            "text_asset_id, storage_key, content_type, filename, size_bytes, sha256, ",
+            "metadata_json, retention_policy",
+            " FROM runtime_artifacts"
+        )
+    };
+}
+pub(super) use select_runtime_artifacts;
 
-pub(super) const JOB_STAGE_COLUMNS_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message, cancellation_state FROM job_stages WHERE id = ?1";
+macro_rules! select_worker_heartbeats {
+    () => {
+        concat!(
+            "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, ",
+            "registration_version, registration_json, heartbeat_version, available_slots, ",
+            "heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json",
+            " FROM runtime_worker_heartbeats"
+        )
+    };
+}
 
-pub(super) const JOB_STAGE_LIST_FOR_JOB_SQL: &str =
-    "SELECT id, job_id, created_at, updated_at, sequence, stage_kind, queue_class, resource_hints_json, status, capability, model_id, worker_id, lease_expires_at, available_at, attempt_token, attempt_count, max_attempts, input_artifact_ids_json, output_artifact_ids_json, progress_json, started_at, finished_at, error_code, error_message, cancellation_state FROM job_stages WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC";
+pub(super) const MEDIA_ASSET_BY_ID_SQL: &str = concat!(select_media_assets!(), " WHERE id = ?1");
 
-pub(super) const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
-    "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
+pub(super) const MEDIA_ASSET_BY_STORAGE_KEY_SQL: &str = concat!(
+    select_media_assets!(),
+    " WHERE storage_key = ?1 AND deleted_at IS NULL"
+);
 
-pub(super) const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
-    "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE job_id = ?1 ORDER BY created_at ASC, id ASC";
+pub(super) const MEDIA_ASSET_BY_SOURCE_PROFILE_SQL: &str = concat!(
+    select_media_assets!(),
+    " WHERE source_asset_id = ?1 AND canonical_profile_version = ?2 AND deleted_at IS NULL"
+);
 
-pub(super) const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
-    "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats WHERE worker_id = ?1";
+pub(super) const TEXT_ASSET_BY_ID_SQL: &str = concat!(select_text_assets!(), " WHERE id = ?1");
+
+pub(super) const RUNTIME_JOB_BY_ID_SQL: &str = concat!(select_runtime_jobs!(), " WHERE id = ?1");
+
+pub(super) const JOB_STAGE_BY_ID_SQL: &str = concat!(select_job_stages!(), " WHERE id = ?1");
+
+pub(super) const JOB_STAGE_LIST_FOR_JOB_SQL: &str = concat!(
+    select_job_stages!(),
+    " WHERE job_id = ?1 ORDER BY sequence ASC, created_at ASC, id ASC"
+);
+
+pub(super) const RUNTIME_ARTIFACT_BY_ID_SQL: &str =
+    concat!(select_runtime_artifacts!(), " WHERE id = ?1");
+
+pub(super) const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str = concat!(
+    select_runtime_artifacts!(),
+    " WHERE job_id = ?1 ORDER BY created_at ASC, id ASC"
+);
+
+pub(super) const WORKER_HEARTBEAT_BY_ID_SQL: &str =
+    concat!(select_worker_heartbeats!(), " WHERE worker_id = ?1");
 
 pub(super) const RUNTIME_WORKER_HEARTBEATS_SQL: &str =
-    "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats ORDER BY worker_id";
+    concat!(select_worker_heartbeats!(), " ORDER BY worker_id");
+
+/// One column of a raw query row, by name. Rows map by name rather than by
+/// position, so a statement may list its columns in any order.
+pub(super) fn col<T: sea_orm::TryGetable>(row: &QueryResult, name: &str) -> anyhow::Result<T> {
+    row.try_get::<T>("", name)
+        .with_context(|| format!("Failed to read column {name}"))
+}
+
+/// Serialize one capacity check across processes: SQLite through its writer
+/// lock, PostgreSQL through the row lock the no-op update holds until the
+/// transaction ends.
+pub(super) async fn lock_named<C: ConnectionTrait>(db: &C, name: &str) -> anyhow::Result<()> {
+    db.execute_raw(raw::statement(
+        db,
+        "INSERT INTO runtime_admission_locks (id, lock_value) VALUES (?1, 1) ON CONFLICT (id) DO NOTHING",
+        vec![name.into()],
+    )?)
+    .await
+    .with_context(|| format!("Failed to initialize the {name} admission lock"))?;
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = ?1",
+        vec![name.into()],
+    )?)
+    .await
+    .with_context(|| format!("Failed to take the {name} admission lock"))?;
+    Ok(())
+}
+
+pub(super) const TTS_ADMISSION_LOCK: &str = "tts";
+
+pub(super) const ARTIFACT_CLEANUP_LOCK: &str = "artifact_cleanup";
 
 pub(super) fn map_media_asset(row: &QueryResult) -> anyhow::Result<MediaAsset> {
     Ok(MediaAsset {
-        id: row.try_get_by_index(0)?,
-        created_at: i64_to_u64(row.try_get_by_index(1)?)?,
-        updated_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        asset_kind: row.try_get_by_index(3)?,
-        storage_namespace: row.try_get_by_index(4)?,
-        storage_key: row.try_get_by_index(5)?,
-        content_type: row.try_get_by_index(6)?,
-        filename: row.try_get_by_index(7)?,
-        size_bytes: i64_to_u64(row.try_get_by_index(8)?)?,
-        sha256: row.try_get_by_index(9)?,
-        duration_secs: row.try_get_by_index(10)?,
-        sample_rate_hz: opt_i64_to_u32(row.try_get_by_index(11)?)?,
-        channel_count: opt_i64_to_u16(row.try_get_by_index(12)?)?,
-        peak_amplitude: row
-            .try_get_by_index::<Option<f64>>(13)?
+        id: col(row, "id")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        updated_at: i64_to_u64(col(row, "updated_at")?)?,
+        asset_kind: col(row, "asset_kind")?,
+        storage_namespace: col(row, "storage_namespace")?,
+        storage_key: col(row, "storage_key")?,
+        content_type: col(row, "content_type")?,
+        filename: col(row, "filename")?,
+        size_bytes: i64_to_u64(col(row, "size_bytes")?)?,
+        sha256: col(row, "sha256")?,
+        duration_secs: col(row, "duration_secs")?,
+        sample_rate_hz: opt_i64_to_u32(col(row, "sample_rate_hz")?)?,
+        channel_count: opt_i64_to_u16(col(row, "channel_count")?)?,
+        peak_amplitude: col::<Option<f64>>(row, "peak_amplitude")?
             .map(|value| value as f32),
-        rms_amplitude: row
-            .try_get_by_index::<Option<f64>>(14)?
+        rms_amplitude: col::<Option<f64>>(row, "rms_amplitude")?
             .map(|value| value as f32),
-        source_asset_id: row.try_get_by_index(15)?,
-        canonical_profile_version: row.try_get_by_index(16)?,
-        scan_status: row.try_get_by_index(17)?,
-        retention_policy: row.try_get_by_index(18)?,
-        deleted_at: opt_i64_to_u64(row.try_get_by_index(19)?)?,
-        metadata_json: parse_json_value(row.try_get_by_index::<String>(20)?, json!({})),
+        source_asset_id: col(row, "source_asset_id")?,
+        canonical_profile_version: col(row, "canonical_profile_version")?,
+        scan_status: col(row, "scan_status")?,
+        retention_policy: col(row, "retention_policy")?,
+        deleted_at: opt_i64_to_u64(col(row, "deleted_at")?)?,
+        metadata_json: parse_json_value(col::<String>(row, "metadata_json")?, json!({})),
     })
 }
 
 pub(super) fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<ArtifactCleanupIntent> {
-    let storage_key: String = row.try_get_by_index(4)?;
-    let tenant_scope: String = row.try_get_by_index(5)?;
+    let storage_key: String = col(row, "storage_key")?;
+    let tenant_scope: String = col(row, "tenant_scope")?;
     validate_artifact_cleanup_storage_key(&storage_key)?;
     validate_artifact_cleanup_tenant(&tenant_scope)?;
-    let last_error: Option<String> = row.try_get_by_index(8)?;
+    let last_error: Option<String> = col(row, "last_error")?;
     anyhow::ensure!(
         last_error
             .as_ref()
@@ -134,25 +255,25 @@ pub(super) fn map_artifact_cleanup_intent(row: &QueryResult) -> anyhow::Result<A
         "Stored artifact cleanup error exceeds its bound"
     );
     Ok(ArtifactCleanupIntent {
-        id: row.try_get_by_index(0)?,
-        created_at: i64_to_u64(row.try_get_by_index(1)?)?,
-        updated_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        available_at: i64_to_u64(row.try_get_by_index(3)?)?,
+        id: col(row, "id")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        updated_at: i64_to_u64(col(row, "updated_at")?)?,
+        available_at: i64_to_u64(col(row, "available_at")?)?,
         storage_key,
         tenant_scope,
-        reason: ArtifactCleanupReason::from_db_value(&row.try_get_by_index::<String>(6)?)?,
-        attempt_count: i64_to_u32(row.try_get_by_index(7)?)?,
+        reason: ArtifactCleanupReason::from_db_value(&col::<String>(row, "reason")?)?,
+        attempt_count: i64_to_u32(col(row, "attempt_count")?)?,
         last_error,
     })
 }
 
 pub(super) fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWriteReservation> {
-    let write_id: String = row.try_get_by_index(0)?;
-    let tenant_scope: String = row.try_get_by_index(4)?;
-    let storage_namespace: String = row.try_get_by_index(5)?;
-    let content_type: String = row.try_get_by_index(6)?;
-    let filename: Option<String> = row.try_get_by_index(7)?;
-    let provider_request = match row.try_get_by_index::<Option<String>>(10)? {
+    let write_id: String = col(row, "write_id")?;
+    let tenant_scope: String = col(row, "tenant_scope")?;
+    let storage_namespace: String = col(row, "storage_namespace")?;
+    let content_type: String = col(row, "content_type")?;
+    let filename: Option<String> = col(row, "filename")?;
+    let provider_request = match col::<Option<String>>(row, "provider_request_json")? {
         Some(raw) => deserialize_provider_write_request(&raw)?,
         None => legacy_provider_write_request(
             &write_id,
@@ -164,19 +285,19 @@ pub(super) fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWr
     };
     let reservation = ProviderWriteReservation {
         write_id,
-        reservation_token: row.try_get_by_index(1)?,
-        created_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        expires_at: i64_to_u64(row.try_get_by_index(3)?)?,
+        reservation_token: col(row, "reservation_token")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        expires_at: i64_to_u64(col(row, "expires_at")?)?,
         tenant_scope,
         storage_namespace,
         content_type,
         filename,
-        expected_size_bytes: i64_to_u64(row.try_get_by_index(8)?)?,
-        expected_sha256: row.try_get_by_index(9)?,
+        expected_size_bytes: i64_to_u64(col(row, "expected_size_bytes")?)?,
+        expected_sha256: col(row, "expected_sha256")?,
         provider_request,
-        storage_key: row.try_get_by_index(11)?,
-        cleanup_claim_token: row.try_get_by_index(12)?,
-        cleanup_attempt_count: i64_to_u32(row.try_get_by_index(13)?)?,
+        storage_key: col(row, "storage_key")?,
+        cleanup_claim_token: col(row, "cleanup_claim_token")?,
+        cleanup_attempt_count: i64_to_u32(col(row, "cleanup_attempt_count")?)?,
     };
     anyhow::ensure!(
         uuid::Uuid::parse_str(&reservation.write_id).is_ok()
@@ -208,93 +329,91 @@ pub(super) fn map_provider_write(row: &QueryResult) -> anyhow::Result<ProviderWr
 
 pub(super) fn map_text_asset(row: &QueryResult) -> anyhow::Result<TextAsset> {
     Ok(TextAsset {
-        id: row.try_get_by_index(0)?,
-        created_at: i64_to_u64(row.try_get_by_index(1)?)?,
-        updated_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        raw_text: row.try_get_by_index(3)?,
-        normalized_text: row.try_get_by_index(4)?,
-        language_hint: row.try_get_by_index(5)?,
-        character_count: i64_to_u64(row.try_get_by_index(6)?)?,
-        sha256: row.try_get_by_index(7)?,
-        safety_status: row.try_get_by_index(8)?,
-        retention_policy: row.try_get_by_index(9)?,
-        structure_json: parse_json_value(row.try_get_by_index::<String>(10)?, json!({})),
+        id: col(row, "id")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        updated_at: i64_to_u64(col(row, "updated_at")?)?,
+        raw_text: col(row, "raw_text")?,
+        normalized_text: col(row, "normalized_text")?,
+        language_hint: col(row, "language_hint")?,
+        character_count: i64_to_u64(col(row, "character_count")?)?,
+        sha256: col(row, "sha256")?,
+        safety_status: col(row, "safety_status")?,
+        retention_policy: col(row, "retention_policy")?,
+        structure_json: parse_json_value(col::<String>(row, "structure_json")?, json!({})),
     })
 }
 
 pub(super) fn map_runtime_job(row: &QueryResult) -> anyhow::Result<RuntimeJob> {
-    let kind_raw: String = row.try_get_by_index(6)?;
-    let status_raw: String = row.try_get_by_index(7)?;
+    let kind_raw: String = col(row, "job_kind")?;
+    let status_raw: String = col(row, "status")?;
 
     Ok(RuntimeJob {
-        id: row.try_get_by_index(0)?,
-        created_at: i64_to_u64(row.try_get_by_index(1)?)?,
-        updated_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        queued_at: opt_i64_to_u64(row.try_get_by_index(3)?)?,
-        started_at: opt_i64_to_u64(row.try_get_by_index(4)?)?,
-        finished_at: opt_i64_to_u64(row.try_get_by_index(5)?)?,
+        id: col(row, "id")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        updated_at: i64_to_u64(col(row, "updated_at")?)?,
+        queued_at: opt_i64_to_u64(col(row, "queued_at")?)?,
+        started_at: opt_i64_to_u64(col(row, "started_at")?)?,
+        finished_at: opt_i64_to_u64(col(row, "finished_at")?)?,
         job_kind: RuntimeJobKind::from_db_value(kind_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime job kind: {kind_raw}"))?,
         status: RuntimeJobStatus::from_db_value(status_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime job status: {status_raw}"))?,
-        priority: i64_to_i32(row.try_get_by_index(8)?)?,
-        model_id: row.try_get_by_index(9)?,
-        capability: row.try_get_by_index(10)?,
-        route_record_kind: row.try_get_by_index(11)?,
-        route_record_id: row.try_get_by_index(12)?,
-        input_media_asset_id: row.try_get_by_index(13)?,
-        input_text_asset_id: row.try_get_by_index(14)?,
-        request_json: parse_json_value(row.try_get_by_index::<String>(15)?, json!({})),
-        model_snapshot_json: parse_json_value(row.try_get_by_index::<String>(16)?, json!({})),
-        progress_json: row
-            .try_get_by_index::<Option<String>>(17)?
+        priority: i64_to_i32(col(row, "priority")?)?,
+        model_id: col(row, "model_id")?,
+        capability: col(row, "capability")?,
+        route_record_kind: col(row, "route_record_kind")?,
+        route_record_id: col(row, "route_record_id")?,
+        input_media_asset_id: col(row, "input_media_asset_id")?,
+        input_text_asset_id: col(row, "input_text_asset_id")?,
+        request_json: parse_json_value(col::<String>(row, "request_json")?, json!({})),
+        model_snapshot_json: parse_json_value(col::<String>(row, "model_snapshot_json")?, json!({})),
+        progress_json: col::<Option<String>>(row, "progress_json")?
             .map(|raw| parse_json_value(raw, json!({}))),
-        error_code: row.try_get_by_index(18)?,
-        error_message: row.try_get_by_index(19)?,
-        attempt_count: i64_to_u32(row.try_get_by_index(20)?)?,
-        max_attempts: i64_to_u32(row.try_get_by_index(21)?)?,
-        retry_policy_json: parse_json_value(row.try_get_by_index::<String>(22)?, json!({})),
-        idempotency_key: row.try_get_by_index(23)?,
-        correlation_id: row.try_get_by_index(24)?,
-        cancellation_reason: row.try_get_by_index(25)?,
-        cancellation_state: parse_cancellation_state(row.try_get_by_index(26)?)?,
+        error_code: col(row, "error_code")?,
+        error_message: col(row, "error_message")?,
+        attempt_count: i64_to_u32(col(row, "attempt_count")?)?,
+        max_attempts: i64_to_u32(col(row, "max_attempts")?)?,
+        retry_policy_json: parse_json_value(col::<String>(row, "retry_policy_json")?, json!({})),
+        idempotency_key: col(row, "idempotency_key")?,
+        correlation_id: col(row, "correlation_id")?,
+        cancellation_reason: col(row, "cancellation_reason")?,
+        cancellation_state: parse_cancellation_state(col(row, "cancellation_state")?)?,
     })
 }
 
 pub(super) fn map_job_stage(row: &QueryResult) -> anyhow::Result<JobStage> {
-    let queue_class_raw: String = row.try_get_by_index(6)?;
-    let status_raw: String = row.try_get_by_index(8)?;
+    let queue_class_raw: String = col(row, "queue_class")?;
+    let status_raw: String = col(row, "status")?;
 
     Ok(JobStage {
-        id: row.try_get_by_index(0)?,
-        job_id: row.try_get_by_index(1)?,
-        created_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        updated_at: i64_to_u64(row.try_get_by_index(3)?)?,
-        sequence: i64_to_u32(row.try_get_by_index(4)?)?,
-        stage_kind: row.try_get_by_index(5)?,
+        id: col(row, "id")?,
+        job_id: col(row, "job_id")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
+        updated_at: i64_to_u64(col(row, "updated_at")?)?,
+        sequence: i64_to_u32(col(row, "sequence")?)?,
+        stage_kind: col(row, "stage_kind")?,
         queue_class: QueueClass::from_db_value(&queue_class_raw)
             .ok_or_else(|| anyhow!("Unknown runtime queue class: {queue_class_raw}"))?,
-        resource_hints: parse_resource_hints(row.try_get_by_index(7)?),
+        resource_hints: parse_resource_hints(col(row, "resource_hints_json")?),
         status: RuntimeStageStatus::from_db_value(status_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime stage status: {status_raw}"))?,
-        capability: row.try_get_by_index(9)?,
-        model_id: row.try_get_by_index(10)?,
-        worker_id: row.try_get_by_index(11)?,
-        lease_expires_at: opt_i64_to_u64(row.try_get_by_index(12)?)?,
-        available_at: opt_i64_to_u64(row.try_get_by_index(13)?)?,
-        attempt_token: row.try_get_by_index(14)?,
-        attempt_count: i64_to_u32(row.try_get_by_index(15)?)?,
-        max_attempts: i64_to_u32(row.try_get_by_index(16)?)?,
-        input_artifact_ids: parse_string_array(row.try_get_by_index::<String>(17)?),
-        output_artifact_ids: parse_string_array(row.try_get_by_index::<String>(18)?),
-        progress_json: row
-            .try_get_by_index::<Option<String>>(19)?
+        capability: col(row, "capability")?,
+        model_id: col(row, "model_id")?,
+        worker_id: col(row, "worker_id")?,
+        lease_expires_at: opt_i64_to_u64(col(row, "lease_expires_at")?)?,
+        available_at: opt_i64_to_u64(col(row, "available_at")?)?,
+        attempt_token: col(row, "attempt_token")?,
+        attempt_count: i64_to_u32(col(row, "attempt_count")?)?,
+        max_attempts: i64_to_u32(col(row, "max_attempts")?)?,
+        input_artifact_ids: parse_string_array(col::<String>(row, "input_artifact_ids_json")?),
+        output_artifact_ids: parse_string_array(col::<String>(row, "output_artifact_ids_json")?),
+        progress_json: col::<Option<String>>(row, "progress_json")?
             .map(|raw| parse_json_value(raw, json!({}))),
-        started_at: opt_i64_to_u64(row.try_get_by_index(20)?)?,
-        finished_at: opt_i64_to_u64(row.try_get_by_index(21)?)?,
-        error_code: row.try_get_by_index(22)?,
-        error_message: row.try_get_by_index(23)?,
-        cancellation_state: parse_cancellation_state(row.try_get_by_index(24)?)?,
+        started_at: opt_i64_to_u64(col(row, "started_at")?)?,
+        finished_at: opt_i64_to_u64(col(row, "finished_at")?)?,
+        error_code: col(row, "error_code")?,
+        error_message: col(row, "error_message")?,
+        cancellation_state: parse_cancellation_state(col(row, "cancellation_state")?)?,
     })
 }
 
@@ -310,62 +429,62 @@ pub(super) fn parse_cancellation_state(
 }
 
 pub(super) fn map_stage_claim_candidate(row: &QueryResult) -> anyhow::Result<StageClaimCandidate> {
-    let job_kind_raw: String = row.try_get_by_index(2)?;
-    let queue_class_raw: String = row.try_get_by_index(5)?;
+    let job_kind_raw: String = col(row, "job_kind")?;
+    let queue_class_raw: String = col(row, "queue_class")?;
 
     Ok(StageClaimCandidate {
-        stage_id: row.try_get_by_index(0)?,
-        stage_kind: row.try_get_by_index(1)?,
+        stage_id: col(row, "id")?,
+        stage_kind: col(row, "stage_kind")?,
         job_kind: RuntimeJobKind::from_db_value(job_kind_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime job kind: {job_kind_raw}"))?,
         queue_class: QueueClass::from_db_value(&queue_class_raw)
             .ok_or_else(|| anyhow!("Unknown runtime queue class: {queue_class_raw}"))?,
-        resource_hints: parse_resource_hints(row.try_get_by_index(6)?),
-        capability: row.try_get_by_index(3)?,
-        model_id: row.try_get_by_index(4)?,
+        resource_hints: parse_resource_hints(col(row, "resource_hints_json")?),
+        capability: col(row, "capability")?,
+        model_id: col(row, "model_id")?,
     })
 }
 
 pub(super) fn map_runtime_artifact(row: &QueryResult) -> anyhow::Result<RuntimeArtifact> {
-    let kind_raw: String = row.try_get_by_index(7)?;
-    let role_raw: String = row.try_get_by_index(8)?;
+    let kind_raw: String = col(row, "artifact_kind")?;
+    let role_raw: String = col(row, "artifact_role")?;
 
     Ok(RuntimeArtifact {
-        id: row.try_get_by_index(0)?,
-        job_id: row.try_get_by_index(1)?,
-        stage_id: row.try_get_by_index(2)?,
-        producer_attempt_count: opt_i64_to_u32(row.try_get_by_index(3)?)?,
-        producer_attempt_token: row.try_get_by_index(4)?,
-        publication_key: row.try_get_by_index(5)?,
-        created_at: i64_to_u64(row.try_get_by_index(6)?)?,
+        id: col(row, "id")?,
+        job_id: col(row, "job_id")?,
+        stage_id: col(row, "stage_id")?,
+        producer_attempt_count: opt_i64_to_u32(col(row, "producer_attempt_count")?)?,
+        producer_attempt_token: col(row, "producer_attempt_token")?,
+        publication_key: col(row, "publication_key")?,
+        created_at: i64_to_u64(col(row, "created_at")?)?,
         artifact_kind: RuntimeArtifactKind::from_db_value(kind_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime artifact kind: {kind_raw}"))?,
         artifact_role: RuntimeArtifactRole::from_db_value(role_raw.as_str())
             .ok_or_else(|| anyhow!("Unknown runtime artifact role: {role_raw}"))?,
-        media_asset_id: row.try_get_by_index(9)?,
-        text_asset_id: row.try_get_by_index(10)?,
-        storage_key: row.try_get_by_index(11)?,
-        content_type: row.try_get_by_index(12)?,
-        filename: row.try_get_by_index(13)?,
-        size_bytes: opt_i64_to_u64(row.try_get_by_index(14)?)?,
-        sha256: row.try_get_by_index(15)?,
-        metadata_json: parse_json_value(row.try_get_by_index::<String>(16)?, json!({})),
-        retention_policy: row.try_get_by_index(17)?,
+        media_asset_id: col(row, "media_asset_id")?,
+        text_asset_id: col(row, "text_asset_id")?,
+        storage_key: col(row, "storage_key")?,
+        content_type: col(row, "content_type")?,
+        filename: col(row, "filename")?,
+        size_bytes: opt_i64_to_u64(col(row, "size_bytes")?)?,
+        sha256: col(row, "sha256")?,
+        metadata_json: parse_json_value(col::<String>(row, "metadata_json")?, json!({})),
+        retention_policy: col(row, "retention_policy")?,
     })
 }
 
 pub(super) fn map_worker_heartbeat(row: &QueryResult) -> anyhow::Result<RuntimeWorkerHeartbeat> {
-    let worker_id: String = row.try_get_by_index(0)?;
-    let queue_names = parse_string_array(row.try_get_by_index::<String>(4)?);
-    let stored_instance_id: String = row.try_get_by_index(5)?;
+    let worker_id: String = col(row, "worker_id")?;
+    let queue_names = parse_string_array(col::<String>(row, "queue_names_json")?);
+    let stored_instance_id: String = col(row, "instance_id")?;
     let instance_id = if stored_instance_id.is_empty() {
         worker_id.clone()
     } else {
         stored_instance_id
     };
-    let registration_version = i64_to_u32(row.try_get_by_index(6)?)? as u16;
+    let registration_version = i64_to_u32(col(row, "registration_version")?)? as u16;
     let registration =
-        serde_json::from_str::<RuntimeWorkerRegistration>(&row.try_get_by_index::<String>(7)?)
+        serde_json::from_str::<RuntimeWorkerRegistration>(&col::<String>(row, "registration_json")?)
             .unwrap_or_else(|_| RuntimeWorkerRegistration {
                 version: registration_version,
                 worker_id: worker_id.clone(),
@@ -380,10 +499,10 @@ pub(super) fn map_worker_heartbeat(row: &QueryResult) -> anyhow::Result<RuntimeW
                 resources: WorkerResourceCapacity::default(),
                 software_version: "legacy".to_string(),
             });
-    let heartbeat_version = i64_to_u32(row.try_get_by_index(8)?)? as u16;
-    let available_slots = i64_to_u32(row.try_get_by_index(9)?)?;
+    let heartbeat_version = i64_to_u32(col(row, "heartbeat_version")?)? as u16;
+    let available_slots = i64_to_u32(col(row, "available_slots")?)?;
     let details =
-        serde_json::from_str::<RuntimeWorkerHeartbeatDetails>(&row.try_get_by_index::<String>(10)?)
+        serde_json::from_str::<RuntimeWorkerHeartbeatDetails>(&col::<String>(row, "heartbeat_details_json")?)
             .unwrap_or_else(|_| RuntimeWorkerHeartbeatDetails {
                 version: heartbeat_version,
                 available_slots,
@@ -394,16 +513,16 @@ pub(super) fn map_worker_heartbeat(row: &QueryResult) -> anyhow::Result<RuntimeW
 
     Ok(RuntimeWorkerHeartbeat {
         worker_id,
-        started_at: i64_to_u64(row.try_get_by_index(1)?)?,
-        last_heartbeat_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        status: row.try_get_by_index(3)?,
+        started_at: i64_to_u64(col(row, "started_at")?)?,
+        last_heartbeat_at: i64_to_u64(col(row, "last_heartbeat_at")?)?,
+        status: col(row, "status")?,
         queue_names,
         instance_id,
         registration,
         details,
-        current_job_id: row.try_get_by_index(11)?,
-        current_stage_id: row.try_get_by_index(12)?,
-        diagnostic_json: parse_json_value(row.try_get_by_index::<String>(13)?, json!({})),
+        current_job_id: col(row, "current_job_id")?,
+        current_stage_id: col(row, "current_stage_id")?,
+        diagnostic_json: parse_json_value(col::<String>(row, "diagnostic_json")?, json!({})),
     })
 }
 

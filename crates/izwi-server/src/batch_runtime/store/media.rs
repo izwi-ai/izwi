@@ -80,26 +80,6 @@ pub(super) const MAX_ARTIFACT_CLEANUP_ERROR_BYTES: usize = 512;
 
 pub(super) const MAX_ARTIFACT_CLEANUP_BACKOFF_MS: u64 = 60 * 60 * 1000;
 
-pub(super) async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
-    let insert_sql = match db.get_database_backend() {
-        DbBackend::Sqlite | DbBackend::Postgres => {
-            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('artifact_cleanup', 1) ON CONFLICT (id) DO NOTHING"
-        }
-        backend => bail!("Unsupported artifact cleanup database backend: {backend:?}"),
-    };
-    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
-        .await
-        .context("Failed to initialize artifact cleanup lock")?;
-    db.execute_raw(raw::statement(
-        db,
-        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'artifact_cleanup'",
-        vec![],
-    )?)
-    .await
-    .context("Failed to lock artifact cleanup capacity")?;
-    Ok(())
-}
-
 pub(crate) fn validate_artifact_cleanup_storage_key(storage_key: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !storage_key.is_empty()
@@ -140,7 +120,7 @@ pub(super) async fn get_media_asset_with<C: ConnectionTrait>(
     let row = db
         .query_one_raw(raw::statement(
             db,
-            MEDIA_ASSET_COLUMNS_SQL,
+            MEDIA_ASSET_BY_ID_SQL,
             vec![id.into()],
         )?)
         .await?;
@@ -354,7 +334,7 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                MEDIA_ASSET_COLUMNS_SQL,
+                MEDIA_ASSET_BY_ID_SQL,
                 vec![id.into()],
             )?)
             .await
@@ -402,7 +382,7 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start artifact cleanup transaction")?;
-        lock_artifact_cleanup_capacity(&tx).await?;
+        lock_named(&tx, ARTIFACT_CLEANUP_LOCK).await?;
         let Some((newly_deleted, _)) = tombstone_media_asset_with_cleanup_in(
             &tx,
             id,
@@ -632,7 +612,7 @@ impl BatchRuntimeStore {
     pub async fn get_text_asset(&self, id: &str) -> anyhow::Result<Option<TextAsset>> {
         let db = self.db.connection().await?;
         let row = db
-            .query_one_raw(raw::statement(db, TEXT_ASSET_COLUMNS_SQL, vec![id.into()])?)
+            .query_one_raw(raw::statement(db, TEXT_ASSET_BY_ID_SQL, vec![id.into()])?)
             .await
             .context("Failed to load text asset")?;
 

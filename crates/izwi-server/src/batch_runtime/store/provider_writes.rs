@@ -382,7 +382,8 @@ pub(super) async fn get_provider_write_with<C: ConnectionTrait>(
 ) -> anyhow::Result<Option<ProviderWriteReservation>> {
     let request_length = provider_write_request_length_sql(db.get_database_backend())?;
     let sql = format!(
-        "{PROVIDER_WRITE_COLUMNS_SQL} AND (provider_request_json IS NULL OR {request_length} <= ?2)"
+        "{} WHERE write_id = ?1 AND (provider_request_json IS NULL OR {request_length} <= ?2)",
+        select_provider_write_reservations!()
     );
     let row = db
         .query_one_raw(raw::statement(

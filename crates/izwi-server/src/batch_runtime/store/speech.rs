@@ -29,26 +29,6 @@ pub(crate) struct SpeechHistoryFinalization {
     pub progress: serde_json::Value,
 }
 
-pub(super) async fn lock_tts_admission_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
-    let insert_sql = match db.get_database_backend() {
-        DbBackend::Sqlite | DbBackend::Postgres => {
-            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1) ON CONFLICT (id) DO NOTHING"
-        }
-        backend => bail!("Unsupported TTS admission database backend: {backend:?}"),
-    };
-    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
-        .await
-        .context("Failed to initialize TTS admission lock")?;
-    db.execute_raw(raw::statement(
-        db,
-        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'tts'",
-        vec![],
-    )?)
-    .await
-    .context("Failed to lock TTS admission capacity")?;
-    Ok(())
-}
-
 pub(super) fn speech_admission_tenant(request: &serde_json::Value) -> anyhow::Result<String> {
     match request.get("tenant_key").filter(|value| !value.is_null()) {
         Some(value) => {
@@ -76,8 +56,8 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start opaque speech-history deletion transaction")?;
-        lock_tts_admission_capacity(&tx).await?;
-        lock_artifact_cleanup_capacity(&tx).await?;
+        lock_named(&tx, TTS_ADMISSION_LOCK).await?;
+        lock_named(&tx, ARTIFACT_CLEANUP_LOCK).await?;
         let lock_clause = match tx.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => " FOR UPDATE OF h, m",
@@ -736,15 +716,7 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<()> {
         // The unique insert and row update serialize admission across processes and
         // PostgreSQL connections; a read/count alone would allow concurrent overflow.
-        tx.execute_raw(raw::statement(tx,
-            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1) ON CONFLICT (id) DO NOTHING", vec![])?)
-            .await?;
-        tx.execute_raw(raw::statement(
-            tx,
-            "UPDATE runtime_admission_locks SET lock_value = 1 WHERE id = 'tts'",
-            vec![],
-        )?)
-        .await?;
+        lock_named(tx, TTS_ADMISSION_LOCK).await?;
         let row = tx.query_one_raw(raw::statement(tx,
             "SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(admission_tenant, 'anonymous') = ?1 THEN 1 ELSE 0 END), 0) FROM runtime_jobs WHERE job_kind = 'tts_speech' AND status IN ('created','queued','running','paused','retrying','postprocessing')",
             vec![tenant.into()],
@@ -799,9 +771,10 @@ impl BatchRuntimeStore {
                 vec![cutoff.into(), MAX_JOBS.into()],
             )?)
             .await?;
-        let page_sql = RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL.replace(
-            "ORDER BY created_at ASC, id ASC",
-            "AND publication_key >= 'speech-pcm/' AND publication_key < 'speech-pcm0' ORDER BY publication_key ASC LIMIT ?2",
+        let page_sql = concat!(
+            select_runtime_artifacts!(),
+            " WHERE job_id = ?1 AND publication_key >= 'speech-pcm/'",
+            " AND publication_key < 'speech-pcm0' ORDER BY publication_key ASC LIMIT ?2"
         );
         let mut artifacts = Vec::new();
         for row in jobs {
@@ -813,7 +786,7 @@ impl BatchRuntimeStore {
             let page = tx
                 .query_all_raw(raw::statement(
                     &tx,
-                    page_sql.as_str(),
+                    page_sql,
                     vec![job_id.clone().into(), i64::try_from(remaining)?.into()],
                 )?)
                 .await?
@@ -874,9 +847,10 @@ impl BatchRuntimeStore {
         let after_key = after_sequence
             .map(crate::batch_runtime::speech_progress::pcm_publication_key)
             .unwrap_or_else(|| "speech-pcm/".to_string());
-        let sql = RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL.replace(
-            "ORDER BY created_at ASC, id ASC",
-            "AND publication_key > ?2 AND publication_key < 'speech-pcm0' ORDER BY publication_key ASC LIMIT ?3",
+        let sql = concat!(
+            select_runtime_artifacts!(),
+            " WHERE job_id = ?1 AND publication_key > ?2",
+            " AND publication_key < 'speech-pcm0' ORDER BY publication_key ASC LIMIT ?3"
         );
         let rows = db
             .query_all_raw(raw::statement(

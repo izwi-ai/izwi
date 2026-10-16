@@ -330,7 +330,7 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                WORKER_HEARTBEAT_COLUMNS_SQL,
+                WORKER_HEARTBEAT_BY_ID_SQL,
                 vec![worker_id.into()],
             )?)
             .await

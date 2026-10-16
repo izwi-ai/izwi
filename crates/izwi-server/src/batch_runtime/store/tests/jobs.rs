@@ -524,3 +524,48 @@ async fn manual_retry_requeues_failed_job_and_stage() {
         .expect("retry budget check")
         .is_none());
 }
+
+#[tokio::test]
+async fn rows_map_by_column_name_in_any_statement_order() {
+    let (store, _root) = build_store().await;
+    let (job, stage) = create_test_job_and_stage(&store, 3, "mapping_stage", 2).await;
+    let db = store.connection().await.expect("connection");
+    let reversed = |by_id: &str, table: &str| {
+        let mut columns = by_id
+            .trim_start_matches("SELECT ")
+            .trim_end_matches(&format!(" FROM {table} WHERE id = ?1"))
+            .split(", ")
+            .collect::<Vec<_>>();
+        columns.reverse();
+        let columns = columns.join(", ");
+        format!("SELECT {columns} FROM {table} WHERE id = ?1")
+    };
+
+    let job_row = db
+        .query_one_raw(
+            raw::statement(
+                db,
+                reversed(RUNTIME_JOB_BY_ID_SQL, "runtime_jobs"),
+                vec![job.id.clone().into()],
+            )
+            .expect("job statement"),
+        )
+        .await
+        .expect("job query")
+        .expect("job row");
+    assert_eq!(map_runtime_job(&job_row).expect("job maps"), job);
+
+    let stage_row = db
+        .query_one_raw(
+            raw::statement(
+                db,
+                reversed(JOB_STAGE_BY_ID_SQL, "job_stages"),
+                vec![stage.id.clone().into()],
+            )
+            .expect("stage statement"),
+        )
+        .await
+        .expect("stage query")
+        .expect("stage row");
+    assert_eq!(map_job_stage(&stage_row).expect("stage maps"), stage);
+}

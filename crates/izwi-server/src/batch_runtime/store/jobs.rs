@@ -25,7 +25,7 @@ pub(super) async fn get_job_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow
     let row = db
         .query_one_raw(raw::statement(
             db,
-            RUNTIME_JOB_COLUMNS_SQL,
+            RUNTIME_JOB_BY_ID_SQL,
             vec![id.into()],
         )?)
         .await
@@ -148,7 +148,7 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                RUNTIME_JOB_COLUMNS_SQL,
+                RUNTIME_JOB_BY_ID_SQL,
                 vec![id.into()],
             )?)
             .await
@@ -165,19 +165,14 @@ impl BatchRuntimeStore {
         let rows = db
             .query_all_raw(raw::statement(
                 db,
-                r#"
-                SELECT id, created_at, updated_at, queued_at, started_at, finished_at,
-                       job_kind, status, priority, model_id, capability,
-                       route_record_kind, route_record_id, input_media_asset_id,
-                       input_text_asset_id, request_json, model_snapshot_json,
-                       progress_json, error_code, error_message, attempt_count,
-                       max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason, cancellation_state
-                FROM runtime_jobs
-                WHERE job_kind = ?1
-                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                ORDER BY created_at ASC, id ASC
-                "#,
+                concat!(
+                    select_runtime_jobs!(),
+                    r#"
+                    WHERE job_kind = ?1
+                      AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                    ORDER BY created_at ASC, id ASC
+                    "#
+                ),
                 vec![job_kind.as_db_value().into()],
             )?)
             .await
@@ -196,22 +191,17 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                r#"
-                SELECT id, created_at, updated_at, queued_at, started_at, finished_at,
-                       job_kind, status, priority, model_id, capability,
-                       route_record_kind, route_record_id, input_media_asset_id,
-                       input_text_asset_id, request_json, model_snapshot_json,
-                       progress_json, error_code, error_message, attempt_count,
-                       max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason, cancellation_state
-                FROM runtime_jobs
-                WHERE job_kind = ?1
-                  AND route_record_kind = ?2
-                  AND route_record_id = ?3
-                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                "#,
+                concat!(
+                    select_runtime_jobs!(),
+                    r#"
+                    WHERE job_kind = ?1
+                      AND route_record_kind = ?2
+                      AND route_record_id = ?3
+                      AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    "#
+                ),
                 vec![
                     job_kind.as_db_value().into(),
                     route_record_kind.into(),
@@ -234,21 +224,16 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                r#"
-                SELECT id, created_at, updated_at, queued_at, started_at, finished_at,
-                       job_kind, status, priority, model_id, capability,
-                       route_record_kind, route_record_id, input_media_asset_id,
-                       input_text_asset_id, request_json, model_snapshot_json,
-                       progress_json, error_code, error_message, attempt_count,
-                       max_attempts, retry_policy_json, idempotency_key,
-                       correlation_id, cancellation_reason, cancellation_state
-                FROM runtime_jobs
-                WHERE job_kind = ?1
-                  AND route_record_kind = ?2
-                  AND route_record_id = ?3
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                "#,
+                concat!(
+                    select_runtime_jobs!(),
+                    r#"
+                    WHERE job_kind = ?1
+                      AND route_record_kind = ?2
+                      AND route_record_id = ?3
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    "#
+                ),
                 vec![
                     job_kind.as_db_value().into(),
                     route_record_kind.into(),

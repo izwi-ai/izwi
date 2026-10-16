@@ -276,7 +276,7 @@ pub(super) async fn lock_stage_job_with<C: ConnectionTrait>(
 
 pub(super) async fn get_stage_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow::Result<Option<JobStage>> {
     let row = db
-        .query_one_raw(raw::statement(db, JOB_STAGE_COLUMNS_SQL, vec![id.into()])?)
+        .query_one_raw(raw::statement(db, JOB_STAGE_BY_ID_SQL, vec![id.into()])?)
         .await
         .context("Failed to load runtime job stage")?;
     row.as_ref().map(map_job_stage).transpose()
@@ -508,8 +508,8 @@ impl BatchRuntimeStore {
                     s.id,
                     s.stage_kind,
                     j.job_kind,
-                    COALESCE(s.capability, j.capability),
-                    COALESCE(s.model_id, j.model_id),
+                    COALESCE(s.capability, j.capability) AS capability,
+                    COALESCE(s.model_id, j.model_id) AS model_id,
                     s.queue_class,
                     s.resource_hints_json
                 FROM job_stages s
@@ -1408,7 +1408,7 @@ impl BatchRuntimeStore {
     pub async fn get_stage(&self, id: &str) -> anyhow::Result<Option<JobStage>> {
         let db = self.db.connection().await?;
         let row = db
-            .query_one_raw(raw::statement(db, JOB_STAGE_COLUMNS_SQL, vec![id.into()])?)
+            .query_one_raw(raw::statement(db, JOB_STAGE_BY_ID_SQL, vec![id.into()])?)
             .await
             .context("Failed to load runtime job stage")?;
 

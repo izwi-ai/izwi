@@ -55,7 +55,7 @@ pub(super) async fn get_artifact_with<C: ConnectionTrait>(
     let row = db
         .query_one_raw(raw::statement(
             db,
-            RUNTIME_ARTIFACT_COLUMNS_SQL,
+            RUNTIME_ARTIFACT_BY_ID_SQL,
             vec![id.into()],
         )?)
         .await
@@ -69,9 +69,10 @@ pub(super) async fn stage_output_for_key_with<C: ConnectionTrait>(
     attempt_token: &str,
     publication_key: &str,
 ) -> anyhow::Result<Option<RuntimeArtifact>> {
-    let sql = RUNTIME_ARTIFACT_COLUMNS_SQL.replace(
-        "WHERE id = ?1",
-        "WHERE stage_id = ?1 AND producer_attempt_count = ?2 AND producer_attempt_token = ?3 AND publication_key = ?4",
+    let sql = concat!(
+        select_runtime_artifacts!(),
+        " WHERE stage_id = ?1 AND producer_attempt_count = ?2",
+        " AND producer_attempt_token = ?3 AND publication_key = ?4"
     );
     let row = db
         .query_one_raw(raw::statement(
@@ -462,7 +463,7 @@ impl BatchRuntimeStore {
         let row = db
             .query_one_raw(raw::statement(
                 db,
-                RUNTIME_ARTIFACT_COLUMNS_SQL,
+                RUNTIME_ARTIFACT_BY_ID_SQL,
                 vec![id.into()],
             )?)
             .await
@@ -494,9 +495,9 @@ impl BatchRuntimeStore {
         key: &str,
     ) -> anyhow::Result<Option<RuntimeArtifact>> {
         let db = self.db.connection().await?;
-        let sql = RUNTIME_ARTIFACT_COLUMNS_SQL.replace(
-            "WHERE id = ?1",
-            "WHERE stage_id = ?1 AND producer_attempt_token = ?2 AND publication_key = ?3",
+        let sql = concat!(
+            select_runtime_artifacts!(),
+            " WHERE stage_id = ?1 AND producer_attempt_token = ?2 AND publication_key = ?3"
         );
         let row = db
             .query_one_raw(raw::statement(
