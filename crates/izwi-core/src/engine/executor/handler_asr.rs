@@ -3774,10 +3774,19 @@ impl NativeExecutor {
             .ok_or_else(|| {
                 Error::InferenceError("LFM2.5 Audio long-form ASR lost model residency".into())
             })?;
-        let (execution_audio, sample_rate, audio_decode_ms) =
-            resolve_asr_execution_audio(request, ModelFamily::Lfm25Audio, || {
+        // One chunk per dispatch: resume the run the committed chunks left.
+        let session = scheduled.session_key();
+        let resumed = self.long_form_asr.committed(&session);
+        let (execution_audio, sample_rate, audio_decode_ms) = match resumed.as_ref() {
+            Some(resumed) => (
+                AsrExecutionAudio::Prepared(resumed.samples.clone()),
+                resumed.sample_rate,
+                resumed.audio_decode_ms,
+            ),
+            None => resolve_asr_execution_audio(request, ModelFamily::Lfm25Audio, || {
                 Self::run_blocking(|| decode_request_audio_with_rate(request))
-            })?;
+            })?,
+        };
         let samples = execution_audio.samples();
         let max_tokens = lfm25_audio_asr_long_form_max_tokens(request);
         let stream_tx = Self::stream_sender(request);
@@ -3788,19 +3797,11 @@ impl NativeExecutor {
             Ok(model.asr_route_capabilities())
         })?;
         let transcription = Self::run_blocking(|| {
-            let mut sequence = 0usize;
-            let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
-                &request.id,
-                &|| request.is_cancelled(),
-                stream_tx.as_ref(),
-                stream_policy,
-                &mut sequence,
-                samples,
-                sample_rate,
-                &chunk_plan.chunks,
-                &chunk_plan.config,
-                Self::asr_chunk_stream_options(),
-                |chunk_audio, sr, _prefix_text, partial| {
+            let transcribe_chunk =
+                |chunk_audio: &[f32],
+                 sr: u32,
+                 _prefix_text: &str,
+                 partial: Option<&mut dyn FnMut(&str)>| {
                     let chunk_secs = chunk_audio.len() as f32 / sr.max(1) as f32;
                     let options = NativeAsrGenerationOptions {
                         max_new_tokens: model
@@ -3824,14 +3825,35 @@ impl NativeExecutor {
                         text: output.text,
                         diagnostics: output.diagnostics,
                     })
-                },
+                };
+            if !chunk_plan.chunks.is_empty() {
+                return Self::run_long_form_chunk(
+                    request,
+                    resumed,
+                    &execution_audio,
+                    sample_rate,
+                    audio_decode_ms,
+                    stream_tx.as_ref(),
+                    stream_policy,
+                    &chunk_plan,
+                    transcribe_chunk,
+                );
+            }
+            let mut sequence = 0usize;
+            let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                &request.id,
+                &|| request.is_cancelled(),
+                stream_tx.as_ref(),
+                stream_policy,
+                &mut sequence,
+                samples,
+                sample_rate,
+                &chunk_plan.chunks,
+                &chunk_plan.config,
+                Self::asr_chunk_stream_options(),
+                transcribe_chunk,
             )?;
-            let (text, diagnostics) = Self::chunked_asr_result(&chunk_plan, chunked);
-            Ok(crate::models::registry::NativeAsrTranscription {
-                text,
-                language: None,
-                diagnostics,
-            })
+            Ok(Self::complete_chunked_asr(&chunk_plan, chunked))
         });
         let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
@@ -3845,6 +3867,12 @@ impl NativeExecutor {
                     .into(),
             ));
         }
+        let (text, diagnostics) = match transcription {
+            AsrTranscriptionStep::Complete(text, diagnostics) => (text, diagnostics),
+            AsrTranscriptionStep::Yielded(state) => {
+                return self.yield_long_form_chunk(request, scheduled, session, *state);
+            }
+        };
         let samples_len = samples.len();
 
         Ok(ModelSessionResult::atomic(ExecutorOutput {
@@ -3855,16 +3883,13 @@ impl NativeExecutor {
                 sample_rate,
                 duration_secs: samples_len as f32 / sample_rate as f32,
             }),
-            text: Some(transcription.text),
+            text: Some(text),
             input_transcription: None,
             tokens_processed: request.num_prompt_tokens(),
             tokens_generated: (samples_len / 256).max(1),
             finished: true,
             phase_timing_override: Some(ExecutorPhaseTiming::with_media_decode_ms(audio_decode_ms)),
-            asr_diagnostics: Self::with_audio_decode_timing(
-                transcription.diagnostics,
-                audio_decode_ms,
-            ),
+            asr_diagnostics: Self::with_audio_decode_timing(diagnostics, audio_decode_ms),
             error: None,
             logprobs: Vec::new(),
         }))
@@ -7518,27 +7543,7 @@ impl NativeExecutor {
         let (text, asr_diagnostics) = match transcription {
             AsrTranscriptionStep::Complete(text, diagnostics) => (text, diagnostics),
             AsrTranscriptionStep::Yielded(state) => {
-                // The next chunk runs in a later dispatch; this one's state
-                // and staged stream output publish only if the core commits it.
-                self.long_form_asr
-                    .stage(scheduled.plan_id, session, *state)?;
-                return Ok(ModelSessionResult::yielded(
-                    ExecutorOutput {
-                        request_id: request.id.clone(),
-                        audio: None,
-                        text: None,
-                        input_transcription: None,
-                        tokens_processed: 0,
-                        tokens_generated: 0,
-                        finished: false,
-                        phase_timing_override: None,
-                        asr_diagnostics: None,
-                        error: None,
-                        logprobs: Vec::new(),
-                    },
-                    crate::engine::YieldReason::QuantumExhausted,
-                )
-                .requiring_pending_quantum());
+                return self.yield_long_form_chunk(request, scheduled, session, *state);
             }
         };
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
@@ -7561,6 +7566,37 @@ impl NativeExecutor {
             error: None,
             logprobs: Vec::new(),
         }))
+    }
+
+    /// Stage one long-form chunk's run until the core commits its dispatch
+    /// (with this dispatch's staged stream output), and yield: the next
+    /// chunk runs in a later dispatch.
+    fn yield_long_form_chunk(
+        &self,
+        request: &EngineCoreRequest,
+        scheduled: &ScheduledRequest,
+        session: SessionKey,
+        state: LongFormAsrState,
+    ) -> Result<ModelSessionResult> {
+        self.long_form_asr
+            .stage(scheduled.plan_id, session, state)?;
+        Ok(ModelSessionResult::yielded(
+            ExecutorOutput {
+                request_id: request.id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 0,
+                tokens_generated: 0,
+                finished: false,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+                logprobs: Vec::new(),
+            },
+            crate::engine::YieldReason::QuantumExhausted,
+        )
+        .requiring_pending_quantum())
     }
 
     fn complete_chunked_asr(

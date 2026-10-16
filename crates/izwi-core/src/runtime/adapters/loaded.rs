@@ -116,46 +116,26 @@ fn output_visibility_for(
     }
 }
 
-/// The one stage of an atomic long-form ASR contract. A family that
-/// dispatches its long-form chunks one at a time (see
-/// `ModelFamily::dispatches_long_form_asr_by_chunk`) declares iterative
-/// progress with a safe point between chunks: the job yields after each
-/// chunk and the scheduler dispatches the next, so other work runs on the
-/// device between the chunks of one file. Other families keep `atomic_name`,
-/// one dispatch for the whole file.
-fn long_form_asr_stage(
+/// Make an atomic long-form ASR stage dispatch one chunk at a time when its
+/// family does (`ModelFamily::dispatches_long_form_asr_by_chunk`): it is
+/// renamed `chunked_name` and declares iterative progress with a safe point
+/// between chunks, so the job yields after each chunk and the scheduler
+/// dispatches the next one, and other work runs on the device between the
+/// chunks of one file. Other families keep one dispatch for the whole file.
+fn dispatch_long_form_asr_by_chunk(
+    stage: &mut StageDescriptor,
     metadata: &AdapterMetadata,
-    atomic_name: &str,
-    execution_profile: &ExecutionProfile,
-    transport_output: bool,
-) -> Result<StageDescriptor> {
-    let chunked = metadata
+    chunked_name: &str,
+) {
+    if metadata
         .model_variant
         .family()
-        .dispatches_long_form_asr_by_chunk();
-    let mut stage = StageDescriptor::from_execution_profile(
-        StageId::new(3),
-        if chunked {
-            "asr.long_form.chunked"
-        } else {
-            atomic_name
-        },
-        execution_profile,
-        NativeBatchMode::None,
-    );
-    stage.selector = StageWorkSelector::Atomic;
-    stage.shape_policy = StageShapePolicy::Exact;
-    if chunked {
+        .dispatches_long_form_asr_by_chunk()
+    {
+        stage.name = chunked_name.to_string();
         stage.progress = StageProgressKind::Iterative;
         stage.membership_safe_point = MembershipSafePoint::QuantumBoundary;
     }
-    stage.output_visibility = output_visibility_for(
-        transport_output,
-        execution_profile.mode,
-        NativeBatchMode::None,
-    );
-    stage.validate()?;
-    Ok(stage)
 }
 
 fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
@@ -2449,6 +2429,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
                 execution_profile.mode,
                 NativeBatchMode::None,
             );
+            dispatch_long_form_asr_by_chunk(&mut stage, &metadata, "asr.long_form.chunked");
             stage.validate()?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
@@ -3547,6 +3528,11 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
             stage.selector = StageWorkSelector::Atomic;
             stage.shape_policy = StageShapePolicy::Exact;
             stage.output_visibility = OutputVisibility::AfterQuantumCommit;
+            dispatch_long_form_asr_by_chunk(
+                &mut stage,
+                &metadata,
+                "asr.long_form.lfm25_audio.chunked",
+            );
             stage.validate()?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
@@ -3875,6 +3861,7 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
                 profile.mode,
                 NativeBatchMode::None,
             );
+            dispatch_long_form_asr_by_chunk(&mut stage, &metadata, "asr.granite.long_form.chunked");
             stage.validate()?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
@@ -4432,12 +4419,21 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
             execution_profile.concurrency = ConcurrencyClass::Exclusive;
             execution_profile.max_batch_size = 1;
             execution_profile.resolved_from_loaded_model = true;
-            let stage = long_form_asr_stage(
-                &metadata,
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
                 "asr.long_form.atomic",
                 &execution_profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
                 streaming.transport_output,
-            )?;
+                execution_profile.mode,
+                NativeBatchMode::None,
+            );
+            dispatch_long_form_asr_by_chunk(&mut stage, &metadata, "asr.long_form.chunked");
+            stage.validate()?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
                 model_instance_id: self.model_instance_id,
@@ -7453,7 +7449,8 @@ mod tests {
                 .contract(StreamingRequirements::NONE.with_asr_long_form(true))
                 .unwrap();
             assert_eq!(long_form.stages.len(), 1);
-            assert_eq!(long_form.stages[0].name, "asr.long_form.atomic");
+            assert_eq!(long_form.stages[0].name, "asr.long_form.chunked");
+            assert_eq!(long_form.stages[0].progress, StageProgressKind::Iterative);
             adapter
                 .install_audio_preparation_seal(
                     crate::models::architectures::qwen3::asr::Qwen3AsrAudioPreparationStageSeal {
@@ -7622,8 +7619,12 @@ mod tests {
                 .contract(StreamingRequirements::NONE.with_asr_long_form(true))
                 .unwrap();
             assert_eq!(long.stages.len(), 1);
-            assert_eq!(long.stages[0].name, "asr.long_form.lfm25_audio.atomic");
-            assert_eq!(long.stages[0].progress, StageProgressKind::Atomic);
+            assert_eq!(long.stages[0].name, "asr.long_form.lfm25_audio.chunked");
+            assert_eq!(long.stages[0].progress, StageProgressKind::Iterative);
+            assert_eq!(
+                long.stages[0].membership_safe_point,
+                MembershipSafePoint::QuantumBoundary
+            );
             assert_eq!(long.stages[0].shape_policy, StageShapePolicy::Exact);
             assert_eq!(
                 long.stages[0].output_visibility,
@@ -7885,6 +7886,13 @@ mod tests {
             let decode_workspace = continuous_asr_workspace_per_row_bytes(8_192).unwrap();
             assert_eq!(contract.stages[2].workspace_per_row_bytes, decode_workspace);
             assert_eq!(contract.stages[2].max_workspace_bytes, 8 * decode_workspace);
+
+            // Long-form runs one chunk per dispatch.
+            let long = adapter
+                .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+                .unwrap();
+            assert_eq!(long.stages[0].name, "asr.granite.long_form.chunked");
+            assert_eq!(long.stages[0].progress, StageProgressKind::Iterative);
         }
     }
 
