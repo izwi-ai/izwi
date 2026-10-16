@@ -1539,6 +1539,48 @@ pub struct PhysicalBatchExecution<'a> {
     pub scheduled: &'a [ScheduledRequest],
 }
 
+/// When the device last finished a model step while the engine stayed busy.
+/// The next step's start records the gap as device idle time
+/// (`izwi_engine_device_idle_seconds`); an engine going idle clears it.
+#[derive(Default)]
+struct DeviceIdleClock {
+    last_step_end: Mutex<Option<std::time::Instant>>,
+}
+
+/// Marks the end of a device step when dropped.
+struct DeviceStep<'a>(&'a DeviceIdleClock);
+
+impl DeviceIdleClock {
+    fn begin_step(&self, device: &str) -> DeviceStep<'_> {
+        let last = self
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(ended) = last {
+            super::metrics::record_engine_device_idle(device, ended.elapsed());
+        }
+        DeviceStep(self)
+    }
+
+    fn end_busy_period(&self) {
+        *self
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+impl Drop for DeviceStep<'_> {
+    fn drop(&mut self) {
+        *self
+            .0
+            .last_step_end
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(std::time::Instant::now());
+    }
+}
+
 /// Owned inputs of one physical batch: they move to the device thread for
 /// the batch's execution and come back with its result.
 pub(super) trait PhysicalExecutionInputs: Send + 'static {
@@ -4241,6 +4283,7 @@ pub struct UnifiedExecutor {
     /// Runs every model call and executor-state drop; `None` only for
     /// device-less test executors, which run inline.
     device: Option<Arc<DeviceThread>>,
+    device_idle: Arc<DeviceIdleClock>,
     batch_workspace: Option<BatchWorkspaceContext>,
     physical_execution_admission: Option<PhysicalExecutionAdmission>,
     pending_quantum_finalizer: Option<Arc<dyn PendingQuantumFinalizer>>,
@@ -4284,6 +4327,7 @@ impl UnifiedExecutor {
         };
         Self {
             device,
+            device_idle: Arc::default(),
             inner: Arc::new(RwLock::new(Box::new(
                 NativeExecutor::with_realtime_coordinators(
                     config,
@@ -4307,10 +4351,17 @@ impl UnifiedExecutor {
         Self {
             inner: Arc::new(RwLock::new(executor)),
             device: None,
+            device_idle: Arc::default(),
             batch_workspace: None,
             physical_execution_admission: None,
             pending_quantum_finalizer: None,
         }
+    }
+
+    /// The engine has no more work: the device's next step does not follow
+    /// this one, so the wait until it is not device idle time.
+    pub(crate) fn end_device_busy_period(&self) {
+        self.device_idle.end_busy_period();
     }
 
     /// The thread that runs this executor's device work, if it has a device.
@@ -4343,6 +4394,7 @@ impl UnifiedExecutor {
         Self {
             inner: Arc::new(RwLock::new(executor)),
             device: None,
+            device_idle: Arc::default(),
             batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
             physical_execution_admission: Some(admission),
             pending_quantum_finalizer: None,
@@ -4638,7 +4690,12 @@ impl UnifiedExecutor {
             });
         let slot = Arc::new(Mutex::new(Some(inputs)));
         let job_slot = slot.clone();
+        let idle = self
+            .device
+            .as_ref()
+            .map(|device| (self.device_idle.clone(), device.key().label()));
         let run = move |executor: &dyn ModelExecutor| {
+            let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
             let _physical_dispatch = begin_engine_physical_dispatch();
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
             let result = inputs
@@ -6593,6 +6650,24 @@ mod tests {
         fn shutdown(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// The idle histogram counts the gap between back-to-back device steps,
+    /// not the wait after the engine ran out of work.
+    #[test]
+    fn device_idle_clock_records_gaps_only_inside_a_busy_period() {
+        let clock = DeviceIdleClock::default();
+        let label = "test-device-idle-clock";
+        drop(clock.begin_step(label));
+        std::thread::sleep(Duration::from_millis(2));
+        drop(clock.begin_step(label));
+        clock.end_busy_period();
+        std::thread::sleep(Duration::from_millis(2));
+        drop(clock.begin_step(label));
+
+        let (count, idle) = super::super::metrics::engine_device_idle_totals(label);
+        assert_eq!(count, 1);
+        assert!(idle >= 0.002, "{idle}");
     }
 
     /// B2: model calls run on the device thread, never on the tokio thread

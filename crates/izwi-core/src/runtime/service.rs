@@ -10465,6 +10465,7 @@ mod tests {
             "izwi_engine_model_calls_per_step",
             "izwi_engine_mixed_rows",
             "izwi_engine_mixed_tokens",
+            "izwi_engine_device_idle_seconds",
             "izwi_request_duration_seconds",
             "izwi_request_ttft_seconds",
             "izwi_request_queue_wait_seconds",
@@ -10497,6 +10498,7 @@ mod tests {
             .contains("Resident managed KV pages plus authorized retained tensor-state bytes"));
         assert!(!payload.contains("izwi_engine_kv_cache_soft_max_blocks"));
         assert!(!payload.contains("izwi_engine_kv_cache_copy_on_write_splits_total"));
+        assert!(payload.contains("# TYPE izwi_engine_device_ops_off_thread_total counter"));
         assert!(payload.contains("izwi_engine_stream_backpressure_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoints_committed_total"));
         assert!(payload.contains("izwi_engine_stream_checkpoint_rejections_total"));

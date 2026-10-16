@@ -52,6 +52,15 @@ impl DeviceThreadKey {
         }
     }
 
+    /// The metric label of this device: `cpu`, `metal:0`, `cuda:1`.
+    pub fn label(self) -> String {
+        match self {
+            Self::Cpu => "cpu".to_string(),
+            Self::Metal(ordinal) => format!("metal:{ordinal}"),
+            Self::Cuda(ordinal) => format!("cuda:{ordinal}"),
+        }
+    }
+
     fn thread_name(self) -> String {
         match self {
             Self::Cpu => "izwi-device-cpu-0".to_string(),

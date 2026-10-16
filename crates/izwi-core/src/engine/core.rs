@@ -891,6 +891,11 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
+    /// The engine is about to wait for work: end the device's busy period.
+    pub(crate) fn end_device_busy_period(&self) {
+        self.executor.end_device_busy_period();
+    }
+
     /// The thread that runs this engine's device work (model calls, KV page
     /// operations, state allocation and frees), if its executor has a device.
     pub(crate) fn device_thread(&self) -> Option<Arc<crate::backends::DeviceThread>> {
@@ -11888,6 +11893,8 @@ mod tests {
         width: usize,
         prefill: PrefillMode,
         last_decode_rows: Arc<AtomicUsize>,
+        /// Simulated device time of every model call.
+        device_time: Duration,
     }
 
     impl ModelExecutor for BatchedDecodeExecutor {
@@ -11918,6 +11925,7 @@ mod tests {
                 self.last_decode_rows
                     .store(execution.scheduled.len(), Ordering::Relaxed);
             }
+            std::thread::sleep(self.device_time);
             ManagedDecodeExecutor::default().execute_physical_batch(execution)
         }
 
@@ -11971,6 +11979,17 @@ mod tests {
         /// Room for `rows` requests in one native batch of `rows` rows. A
         /// mixed core binds one mixed stage, which runs resumable prefill.
         fn new(rows: usize, prefill: PrefillMode, mixed: bool) -> Self {
+            Self::with_device(rows, prefill, mixed, None)
+        }
+
+        /// A bench core whose model calls run on `device` and take
+        /// `device_time` there.
+        fn with_device(
+            rows: usize,
+            prefill: PrefillMode,
+            mixed: bool,
+            device: Option<(Arc<crate::backends::DeviceThread>, Duration)>,
+        ) -> Self {
             let prefill = if mixed {
                 PrefillMode::Incremental
             } else {
@@ -11978,11 +11997,15 @@ mod tests {
             };
             let model = ModelInstanceId::new(101);
             let last_decode_rows = Arc::new(AtomicUsize::new(0));
-            let executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
+            let mut executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
                 width: rows,
                 prefill,
                 last_decode_rows: last_decode_rows.clone(),
+                device_time: device.as_ref().map_or(Duration::ZERO, |(_, time)| *time),
             }));
+            if let Some((device, _)) = device {
+                executor = executor.with_device_for_test(device);
+            }
             let mut core = EngineCore::new_with_unified_executor(
                 EngineCoreConfig {
                     enable_chunked_prefill: prefill == PrefillMode::Incremental && !mixed,
@@ -12095,6 +12118,38 @@ mod tests {
         elapsed.as_secs_f64() * 1e6 / steps as f64
     }
 
+    /// The production step driver (`Engine::step`) over `rows` decoding
+    /// requests whose model calls take `device_time` on the CPU device
+    /// thread: the mean device idle gap between steps and the mean step wall
+    /// time, both in microseconds, over `steps` steps.
+    async fn measure_device_idle(rows: usize, steps: usize, device_time: Duration) -> (f64, f64) {
+        let device = crate::backends::DeviceThread::for_location(candle_core::DeviceLocation::Cpu)
+            .expect("device thread");
+        let mut bench =
+            BenchCore::with_device(rows, PrefillMode::Full, false, Some((device, device_time)));
+        for index in 0..rows {
+            bench.add(format!("idle-{index}"));
+        }
+        bench.warm(rows).await;
+        let engine = super::super::tests::engine_around_core(bench.core);
+        // The first measured step follows the warm-up's last step.
+        engine.step().await.expect("step");
+        let (count_before, idle_before) = super::super::metrics::engine_device_idle_totals("cpu");
+        let started = Instant::now();
+        for _ in 0..steps {
+            for output in engine.step().await.expect("step") {
+                assert!(output.error.is_none(), "{:?}", output.error);
+            }
+        }
+        let wall = started.elapsed();
+        let (count, idle) = super::super::metrics::engine_device_idle_totals("cpu");
+        assert_eq!(count - count_before, steps as u64, "one idle gap per step");
+        (
+            (idle - idle_before) * 1e6 / steps as f64,
+            mean_us(wall, steps),
+        )
+    }
+
     /// Mean host microseconds per decode step (prepare, then execute and
     /// commit) with `rows` running requests in one native batch and a
     /// no-op executor, measured over `steps` steps after every row decodes.
@@ -12178,6 +12233,16 @@ mod tests {
                 "step_host_overhead rows={rows} steps={steps} prepare_us={prepare:.1} \
                  step_us={total:.1} per_row_us={:.2}",
                 total / rows as f64
+            );
+        }
+        for rows in [64, 256] {
+            let device_time = Duration::from_millis(2);
+            let (idle, step) = measure_device_idle(rows, steps, device_time).await;
+            let _ = writeln!(
+                std::io::stderr(),
+                "device_idle rows={rows} steps={steps} device_us={} idle_us={idle:.1} \
+                 step_us={step:.1}",
+                device_time.as_micros()
             );
         }
         for (prefill, mixed) in [

@@ -1240,6 +1240,26 @@ static ENGINE_MODEL_CALLS_PER_STEP: HistogramFamily = HistogramFamily::new(
     buckets::BATCH_ROWS,
 );
 
+static ENGINE_DEVICE_IDLE_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_device_idle_seconds",
+    "Time a device waited between the end of one model step and the start of the next while the engine had work: the host gap (commit, delivery, prepare, dispatch) between steps.",
+    &["device"],
+    buckets::STEP_SECONDS,
+);
+
+/// Record the device idle gap before a model step that followed another
+/// step without the engine going idle in between.
+pub(crate) fn record_engine_device_idle(device: &str, idle: Duration) {
+    ENGINE_DEVICE_IDLE_SECONDS.observe_duration(&[device], idle);
+}
+
+/// Observations and total seconds of one device's idle histogram.
+#[cfg(test)]
+pub(crate) fn engine_device_idle_totals(device: &str) -> (u64, f64) {
+    let snapshot = ENGINE_DEVICE_IDLE_SECONDS.series(&[device]).snapshot();
+    (snapshot.count, snapshot.sum)
+}
+
 /// Model entries one dispatched physical batch made.
 pub(crate) fn model_calls_for_dispatch(dispatch: BatchDispatch) -> usize {
     match dispatch.kind {
@@ -1325,6 +1345,15 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_MODEL_CALLS_PER_STEP.render(payload);
     ENGINE_MIXED_ROWS.render(payload);
     ENGINE_MIXED_TOKENS.render(payload);
+    ENGINE_DEVICE_IDLE_SECONDS.render(payload);
+    payload.push_str(
+        "# HELP izwi_engine_device_ops_off_thread_total Device operations (model calls, KV page operations, state allocation and frees) that ran off their device thread. Zero in a healthy process.\n\
+         # TYPE izwi_engine_device_ops_off_thread_total counter\n",
+    );
+    payload.push_str(&format!(
+        "izwi_engine_device_ops_off_thread_total {}\n",
+        crate::backends::device_ops_off_thread_total()
+    ));
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {

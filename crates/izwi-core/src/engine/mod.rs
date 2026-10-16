@@ -2716,7 +2716,11 @@ impl Engine {
     /// holds, and only until the engine or `external` is woken (SCH-F11).
     pub async fn idle_wait(&self, backoff: std::time::Duration, external: Option<&Notify>) {
         let now = Instant::now();
-        let wake_at = self.core.read().await.next_wakeup(now);
+        let wake_at = {
+            let core = self.core.read().await;
+            core.end_device_busy_period();
+            core.next_wakeup(now)
+        };
         let sleep_for = wake_at.map_or(backoff, |at| backoff.min(at.duration_since(now)));
         let external = async {
             match external {
@@ -2770,6 +2774,7 @@ impl Engine {
                     }
                 }
             } else {
+                self.core.read().await.end_device_busy_period();
                 // Event-driven wait to avoid hot polling on local/edge devices.
                 tokio::select! {
                     _ = self.wake_notify.notified() => {},
@@ -4259,12 +4264,17 @@ mod tests {
     }
 
     fn engine_with_test_executor(executor: Box<dyn ModelExecutor>) -> Engine {
-        let config = EngineCoreConfig::default();
         let core = EngineCore::new_with_unified_executor(
-            config.clone(),
+            EngineCoreConfig::default(),
             executor::UnifiedExecutor::new_for_test(executor),
         )
         .unwrap();
+        engine_around_core(core)
+    }
+
+    /// An engine driving `core` through the production step driver.
+    pub(super) fn engine_around_core(core: EngineCore) -> Engine {
+        let config = core.config().clone();
         Engine {
             core: Arc::new(RwLock::new(core)),
             step_gate: Arc::new(Mutex::new(())),
