@@ -2188,7 +2188,7 @@ mod tests {
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
-                session_pin: None,
+                prefix_affinity: None,
             },
         )
         .expect("dispatcher should initialize");
@@ -2332,7 +2332,7 @@ mod tests {
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
-                session_pin: None,
+                prefix_affinity: None,
             },
         )
         .expect("dispatcher should initialize");
@@ -2569,7 +2569,7 @@ mod tests {
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
-                session_pin: None,
+                prefix_affinity: None,
             },
         )
         .expect("dispatcher should initialize");
@@ -3669,7 +3669,7 @@ mod tests {
                 max_output_tokens: 16,
                 max_output_bytes: 1024,
                 slow_consumer_timeout: Duration::from_millis(100),
-                session_pin: None,
+                prefix_affinity: None,
             },
         )
         .expect("dispatcher should initialize");

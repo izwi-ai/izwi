@@ -5,17 +5,16 @@
 //! one alternate attempt only when the first attempt is provably unaccepted;
 //! uncertain acceptance and accepted execution never fail over.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use izwi_core::{ChatGeneration, ChatMessage, ChatRole, ModelVariant};
+use izwi_core::{ChatGeneration, ModelVariant};
 use izwi_serving_client::{DeadlinePhase, InvocationStream, WorkerClientError};
 use izwi_serving_protocol::{
     CancellationBehavior, DeploymentId, InputFormat, ModelAlias, OutputFormat, PolicyRevision,
     TaskKind, PROTOCOL_V1,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use super::chat::{
@@ -25,12 +24,13 @@ use super::chat::{
     RemoteChatExecution, RemoteChatExecutionConfig, RemoteWorkerContract,
 };
 use super::fleet_coordinator::{FleetClaimGuard, FleetCoordinator};
+use super::prefix_router::{PrefixAffinityConfig, PrefixRouter, PromptBlocks, RequestPrefix};
 use crate::api::request_context::RequestContext;
 use crate::error::ApiError;
 use crate::gateway_tenant_concurrency::{BoundTenantWorkLease, UnboundTenantWorkLease};
 use crate::worker_registry::{
-    BackendPolicy, SelectedWorker, WorkerInstanceKey, WorkerRegistry, WorkerRegistryError,
-    WorkerSelectionRequest,
+    BackendPolicy, FleetCapacityView, NoFleetCapacity, PrefixAffinity, SelectedWorker,
+    WorkerInstanceKey, WorkerRegistry, WorkerRegistryError, WorkerSelectionRequest,
 };
 
 const FORWARDED_CHAT_STREAM_CAPACITY: usize = 64;
@@ -39,40 +39,6 @@ const FORWARDED_CHAT_SLOW_CONSUMER_ERROR: &str =
 const RETRY_BACKOFF_BASE_MS: u64 = 10;
 const RETRY_BACKOFF_JITTER_MS: u64 = 10;
 const RETRY_BACKOFF_MAX_MS: u64 = 100;
-/// Prefix depth of the normalized system-plus-history conversation used for
-/// the stable pin key. The first N tokens of a growing conversation stay
-/// stable across its turns, which is exactly the stickiness pinning needs.
-const CONVERSATION_KEY_PREFIX_TOKENS: usize = 256;
-
-/// Best-effort conversation pinning (DS2.4). A conversation's turns are
-/// routed to the worker that served its earlier turns so the engine's
-/// committed prefix reuse stays warm. Off by default until measured DS2.5
-/// evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionPinConfig {
-    pub max_entries: usize,
-    pub ttl: Duration,
-}
-
-impl SessionPinConfig {
-    fn validate(&self) -> Result<(), ApiError> {
-        if self.max_entries == 0 || self.max_entries > MAX_SESSION_PIN_ENTRIES {
-            return Err(ApiError::internal(
-                "Session pin table entry bound is outside the supported range",
-            ));
-        }
-        if self.ttl.is_zero() || self.ttl > MAX_SESSION_PIN_TTL {
-            return Err(ApiError::internal(
-                "Session pin TTL is outside the supported range",
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) const MAX_SESSION_PIN_ENTRIES: usize = 1_048_576;
-pub(crate) const MAX_SESSION_PIN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
 #[derive(Debug, Clone)]
 pub struct RemoteChatDispatchConfig {
     pub public_model_variant: ModelVariant,
@@ -83,7 +49,9 @@ pub struct RemoteChatDispatchConfig {
     pub max_output_tokens: u32,
     pub max_output_bytes: u64,
     pub slow_consumer_timeout: Duration,
-    pub session_pin: Option<SessionPinConfig>,
+    /// Prefix-aware routing: prefer the worker that was recently routed the
+    /// longest leading part of this prompt. `None` routes on load alone.
+    pub prefix_affinity: Option<PrefixAffinityConfig>,
 }
 
 impl RemoteChatDispatchConfig {
@@ -96,122 +64,14 @@ impl RemoteChatDispatchConfig {
                 "Remote chat dispatch output limits and slow-consumer timeout must be non-zero",
             ));
         }
-        if let Some(session_pin) = self.session_pin.as_ref() {
-            session_pin.validate()?;
+        if let Some(prefix_affinity) = self.prefix_affinity.as_ref() {
+            prefix_affinity.validate()?;
         }
         ModelAlias::new(self.public_model_variant.dir_name()).map_err(|error| {
             ApiError::internal(format!("Invalid public chat model alias: {error}"))
         })?;
         Ok(())
     }
-}
-
-/// One conversation's pinned worker instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PinnedWorker {
-    worker: WorkerInstanceKey,
-    pinned_at: Instant,
-}
-
-/// Bounded LRU pin table keyed by the hashed conversation prefix. Only the
-/// 64-bit hash lives here - raw conversation content never leaves the
-/// request context.
-#[derive(Debug)]
-struct ConversationPins {
-    max_entries: usize,
-    ttl: Duration,
-    entries: Mutex<ConversationPinTable>,
-}
-
-#[derive(Debug, Default)]
-struct ConversationPinTable {
-    map: HashMap<u64, PinnedWorker>,
-    order: VecDeque<u64>,
-}
-
-impl ConversationPins {
-    fn new(config: SessionPinConfig) -> Self {
-        Self {
-            max_entries: config.max_entries,
-            ttl: config.ttl,
-            entries: Mutex::new(ConversationPinTable::default()),
-        }
-    }
-
-    fn lookup(&self, key: u64, now: Instant) -> Option<WorkerInstanceKey> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let pinned = entries.map.get(&key).cloned()?;
-        if now.duration_since(pinned.pinned_at) >= self.ttl {
-            entries.map.remove(&key);
-            entries.order.retain(|ordered| *ordered != key);
-            return None;
-        }
-        refresh_order(&mut entries.order, key);
-        Some(pinned.worker)
-    }
-
-    fn record(&self, key: u64, worker: WorkerInstanceKey, now: Instant) {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        refresh_order(&mut entries.order, key);
-        entries.map.insert(
-            key,
-            PinnedWorker {
-                worker,
-                pinned_at: now,
-            },
-        );
-        while entries.order.len() > self.max_entries {
-            let Some(evicted) = entries.order.pop_back() else {
-                break;
-            };
-            entries.map.remove(&evicted);
-        }
-    }
-}
-
-/// Moves `key` to the most-recently-used position of the LRU order.
-fn refresh_order(order: &mut VecDeque<u64>, key: u64) {
-    order.retain(|ordered| *ordered != key);
-    order.push_front(key);
-}
-
-/// Derives the stable conversation pin key from a fixed region that never
-/// changes as an append-only conversation grows: the tokens of the system
-/// prompt and the first user message, capped at
-/// `CONVERSATION_KEY_PREFIX_TOKENS` tokens. Each hashed unit is a
-/// (role, token) pair, so messages appended after the first user turn -
-/// or tokens beyond the cap - never move the key. Normalization collapses
-/// whitespace and lowercases so trivial client reformatting does not split a
-/// conversation; the raw content stays inside the gateway process.
-fn conversation_key(messages: &[ChatMessage]) -> u64 {
-    let mut hasher = Sha256::new();
-    let mut consumed = 0usize;
-    for message in messages {
-        for token in message.content.split_whitespace() {
-            if consumed >= CONVERSATION_KEY_PREFIX_TOKENS {
-                return key_from_digest(hasher.finalize().into());
-            }
-            hasher.update(message.role.as_prompt_role().as_bytes());
-            hasher.update([0]);
-            hasher.update(token.to_lowercase().as_bytes());
-            hasher.update([0]);
-            consumed += 1;
-        }
-        if message.role == ChatRole::User {
-            break;
-        }
-    }
-    key_from_digest(hasher.finalize().into())
-}
-
-fn key_from_digest(digest: [u8; 32]) -> u64 {
-    u64::from_be_bytes(digest[..8].try_into().expect("sha256 digest is 32 bytes"))
 }
 
 /// Bounded, hardware-independent dispatcher for one migrated public chat
@@ -221,7 +81,7 @@ pub struct RemoteChatDispatcher {
     registry: WorkerRegistry,
     config: RemoteChatDispatchConfig,
     fleet: Option<Arc<FleetCoordinator>>,
-    pins: Option<Arc<ConversationPins>>,
+    prefix: Option<Arc<PrefixRouter>>,
 }
 
 impl RemoteChatDispatcher {
@@ -230,14 +90,14 @@ impl RemoteChatDispatcher {
         config: RemoteChatDispatchConfig,
     ) -> Result<Self, ApiError> {
         config.validate()?;
-        let pins = config
-            .session_pin
-            .map(|session_pin| Arc::new(ConversationPins::new(session_pin)));
+        let prefix = config
+            .prefix_affinity
+            .map(|prefix_affinity| Arc::new(PrefixRouter::new(prefix_affinity)));
         Ok(Self {
             registry,
             config,
             fleet: None,
-            pins,
+            prefix,
         })
     }
 
@@ -401,40 +261,15 @@ impl RemoteChatDispatcher {
         tenant_work: UnboundTenantWorkLease,
     ) -> Result<StartedDispatch, ApiError> {
         let selection = self.selection_request(&request, streaming)?;
-        // Best-effort conversation pinning: a conversation's turns prefer the
-        // worker that served its earlier turns so the engine's committed
-        // prefix reuse stays warm. Pinned-but-uneligible workers degrade to
-        // normal admission; a lost pin never fails a request.
-        let pin_key = self
-            .pins
-            .as_ref()
-            .map(|pins| (Arc::clone(pins), conversation_key(&request.messages)));
-        let preferred = match pin_key.as_ref() {
-            Some((pins, key)) => pins.lookup(*key, Instant::now()),
-            None => None,
-        };
-        let mut selected = match (&self.fleet, preferred.as_ref()) {
-            (Some(fleet), Some(worker)) => {
-                self.registry.select_and_reserve_preferring_with_fleet_at(
-                    &selection,
-                    worker,
-                    None,
-                    &fleet.snapshot_view(),
-                    Instant::now(),
-                )
-            }
-            (Some(fleet), None) => self.registry.select_and_reserve_with_fleet_at(
-                &selection,
-                None,
-                &fleet.snapshot_view(),
-                Instant::now(),
-            ),
-            (None, Some(worker)) => self
-                .registry
-                .select_and_reserve_preferring(&selection, worker),
-            (None, None) => self.registry.select_and_reserve(&selection),
-        }
-        .map_err(|error| self.selection_error(error, &selection, &request))?;
+        // Prefix-aware routing: prefer a worker that recently served this
+        // prompt's leading blocks, within the registry's load bound.
+        let prefix = self
+            .prefix
+            .as_deref()
+            .map(|router| (router, router.blocks(&request.messages)));
+        let mut selected = self
+            .select(&selection, prefix.as_ref(), None)
+            .map_err(|error| self.selection_error(error, &selection, &request))?;
         // Best-effort cluster visibility: publish this dispatch to peer
         // gateways when coordinated, but never gate on it. A lost race only
         // costs one worker-arbitrated attempt through the existing alternate
@@ -460,8 +295,8 @@ impl RemoteChatDispatcher {
                     .mark_accepted()
                     .map_err(map_registry_error)?;
                 drop(fleet_claim);
-                if let Some((pins, key)) = pin_key.as_ref() {
-                    pins.record(*key, selected.key.clone(), Instant::now());
+                if let Some((router, blocks)) = prefix.as_ref() {
+                    router.record(&selected.key, blocks);
                 }
                 return Ok(StartedDispatch {
                     remote,
@@ -497,18 +332,9 @@ impl RemoteChatDispatcher {
             return Err(alternate_deadline_error());
         }
         tokio::time::sleep(retry_delay.0).await;
-        let mut alternate = match &self.fleet {
-            Some(fleet) => self.registry.select_and_reserve_with_fleet_at(
-                &selection,
-                Some(&excluded),
-                &fleet.snapshot_view(),
-                Instant::now(),
-            ),
-            None => self
-                .registry
-                .select_and_reserve_excluding(&selection, Some(&excluded)),
-        }
-        .map_err(map_registry_error)?;
+        let mut alternate = self
+            .select(&selection, prefix.as_ref(), Some(&excluded))
+            .map_err(map_registry_error)?;
         let alternate_fleet_claim = self.claim_for(&alternate).await;
         let alternate_remote = self.execution_for(&alternate)?;
         let remaining = context
@@ -531,8 +357,8 @@ impl RemoteChatDispatcher {
                     .mark_accepted()
                     .map_err(map_registry_error)?;
                 drop(alternate_fleet_claim);
-                if let Some((pins, key)) = pin_key.as_ref() {
-                    pins.record(*key, alternate.key.clone(), Instant::now());
+                if let Some((router, blocks)) = prefix.as_ref() {
+                    router.record(&alternate.key, blocks);
                 }
                 Ok(StartedDispatch {
                     remote: alternate_remote,
@@ -547,6 +373,29 @@ impl RemoteChatDispatcher {
                 Err(map_worker_client_error(failure.error))
             }
         }
+    }
+
+    fn select(
+        &self,
+        selection: &WorkerSelectionRequest,
+        prefix: Option<&(&PrefixRouter, PromptBlocks)>,
+        excluded: Option<&WorkerInstanceKey>,
+    ) -> Result<SelectedWorker, WorkerRegistryError> {
+        let affinity = prefix.map(|(router, blocks)| RequestPrefix { router, blocks });
+        let fleet = self.fleet.as_ref().map(|fleet| fleet.snapshot_view());
+        let fleet: &dyn FleetCapacityView = match fleet.as_ref() {
+            Some(fleet) => fleet,
+            None => &NoFleetCapacity,
+        };
+        self.registry.select_and_reserve_routed(
+            selection,
+            excluded,
+            affinity
+                .as_ref()
+                .map(|affinity| affinity as &dyn PrefixAffinity),
+            fleet,
+            Instant::now(),
+        )
     }
 
     /// Publish one cluster capacity claim for a selected worker. Returns None
@@ -792,7 +641,9 @@ mod tests {
     use crate::gateway_fleet::FleetStore;
     use crate::db::StoreDatabase;
 
-    use crate::worker_registry::{ApprovedDeployment, ApprovedWorker, WorkerRegistryConfig};
+    use crate::worker_registry::{
+        ApprovedDeployment, ApprovedWorker, RoutingConfig, WorkerRegistryConfig,
+    };
 
     fn id<T>(value: &str) -> T
     where
@@ -1185,12 +1036,12 @@ mod tests {
     }
 
     fn dispatcher(registry: WorkerRegistry) -> RemoteChatDispatcher {
-        dispatcher_with_pins(registry, None)
+        dispatcher_with_prefix(registry, None)
     }
 
-    fn dispatcher_with_pins(
+    fn dispatcher_with_prefix(
         registry: WorkerRegistry,
-        session_pin: Option<SessionPinConfig>,
+        prefix_affinity: Option<PrefixAffinityConfig>,
     ) -> RemoteChatDispatcher {
         RemoteChatDispatcher::new(
             registry,
@@ -1203,7 +1054,7 @@ mod tests {
                 max_output_tokens: 128,
                 max_output_bytes: 4096,
                 slow_consumer_timeout: Duration::from_millis(100),
-                session_pin,
+                prefix_affinity,
             },
         )
         .unwrap()
@@ -2082,12 +1933,125 @@ mod tests {
         )
     }
 
-    async fn two_ready_workers() -> (ScriptedWorker, ScriptedWorker, WorkerRegistry) {
+    async fn two_ready_workers(
+        routing: RoutingConfig,
+    ) -> (ScriptedWorker, ScriptedWorker, WorkerRegistry) {
         let worker_a =
             ScriptedWorker::spawn(ScriptedResponse::Success("from-a".into()), Duration::ZERO).await;
         let worker_b =
             ScriptedWorker::spawn(ScriptedResponse::Success("from-b".into()), Duration::ZERO).await;
+        let registry = WorkerRegistry::new(WorkerRegistryConfig {
+            routing,
+            ..WorkerRegistryConfig::default()
+        })
+        .unwrap();
+        for (name, incarnation, worker) in
+            [("worker-a", "inc-a", &worker_a), ("worker-b", "inc-b", &worker_b)]
+        {
+            register_with_credits(
+                &registry,
+                name,
+                incarnation,
+                client(&worker.endpoint()),
+                1,
+                4,
+            );
+        }
+        (worker_a, worker_b, registry)
+    }
+
+    fn small_blocks() -> Option<PrefixAffinityConfig> {
+        Some(PrefixAffinityConfig {
+            block_bytes: 16,
+            ..PrefixAffinityConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn conversation_turns_follow_the_worker_holding_their_prefix() {
+        let (worker_a, worker_b, registry) = two_ready_workers(RoutingConfig::default()).await;
+        let dispatcher = dispatcher_with_prefix(registry.clone(), small_blocks());
+        let context = RequestContext::new("prefix-request".into(), Principal::local_anonymous());
+
+        // worker-a is busy, so turn one goes to the idle worker-b.
+        let busy_a = registry.select_and_reserve(&dispatcher.selection_request(&turn_one(), false).unwrap()).unwrap();
+        assert_eq!(busy_a.key.worker_id.as_str(), "worker-a");
+        dispatcher
+            .generate(2, &context, turn_one(), tenant_work())
+            .await
+            .unwrap();
+        assert_eq!(worker_b.requests().len(), 1);
+        drop(busy_a);
+
+        // Both are idle again and worker-a holds the identity tie-break, but
+        // turn two shares turn one's prefix, which worker-b holds.
+        dispatcher
+            .generate(2, &context, turn_two(), tenant_work())
+            .await
+            .unwrap();
+        assert_eq!(worker_b.requests().len(), 2);
+        assert!(worker_a.requests().is_empty());
+
+        // A different conversation has no held prefix: load decides.
+        dispatcher
+            .generate(
+                2,
+                &context,
+                conversation_turn("Ornithologist on duty.", &[("Owls?", None)]),
+                tenant_work(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(worker_a.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prefix_affinity_spills_to_the_least_loaded_worker_past_the_balance_threshold() {
+        for (threshold, expected) in [(1, "worker-a"), (0, "worker-b")] {
+            let (worker_a, worker_b, registry) = two_ready_workers(RoutingConfig {
+                prefix_balance_threshold: threshold,
+                ..RoutingConfig::default()
+            })
+            .await;
+            let dispatcher = dispatcher_with_prefix(registry.clone(), small_blocks());
+            let context = RequestContext::new("prefix-spill".into(), Principal::local_anonymous());
+            dispatcher
+                .generate(2, &context, turn_one(), tenant_work())
+                .await
+                .unwrap();
+            assert_eq!(worker_a.requests().len(), 1);
+
+            // One more request in flight on the prefix holder.
+            let busy_a = registry
+                .select_and_reserve(&dispatcher.selection_request(&turn_one(), false).unwrap())
+                .unwrap();
+            assert_eq!(busy_a.key.worker_id.as_str(), "worker-a");
+            dispatcher
+                .generate(2, &context, turn_two(), tenant_work())
+                .await
+                .unwrap();
+            let served_by = if worker_a.requests().len() == 2 {
+                "worker-a"
+            } else {
+                assert_eq!(worker_b.requests().len(), 1);
+                "worker-b"
+            };
+            assert_eq!(served_by, expected, "threshold {threshold}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_recorded_through_failover_steers_the_next_turn() {
+        let worker_a = ScriptedWorker::spawn(
+            ScriptedResponse::Reject(RejectionCode::CapacityExhausted),
+            Duration::ZERO,
+        )
+        .await;
+        let worker_b =
+            ScriptedWorker::spawn(ScriptedResponse::Success("from-b".into()), Duration::ZERO).await;
         let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
+        // worker-a refuses for capacity, so turn one fails over to worker-b,
+        // which must record the prefix through the alternate-dispatch path.
         register(
             &registry,
             "worker-a",
@@ -2102,154 +2066,23 @@ mod tests {
             client(&worker_b.endpoint()),
             1,
         );
-        (worker_a, worker_b, registry)
-    }
-
-    #[tokio::test]
-    async fn conversation_pin_sticks_turns_to_the_same_worker() {
-        let (worker_a, worker_b, registry) = two_ready_workers().await;
-        let dispatcher = dispatcher_with_pins(
-            registry,
-            Some(SessionPinConfig {
-                max_entries: 64,
-                ttl: Duration::from_secs(60),
-            }),
-        );
-        let context = RequestContext::new("pin-request".into(), Principal::local_anonymous());
+        let dispatcher = dispatcher_with_prefix(registry, small_blocks());
+        let context = RequestContext::new("prefix-failover".into(), Principal::local_anonymous());
 
         dispatcher
             .generate(2, &context, turn_one(), tenant_work())
             .await
             .unwrap();
-        dispatcher
-            .generate(2, &context, turn_two(), tenant_work())
-            .await
-            .unwrap();
-
-        // Turn one tie-breaks to worker-a; turn two must follow the pin even
-        // though the plain score is tied again after the first dispatch
-        // reservation was released.
-        assert_eq!(worker_a.requests().len(), 2);
-        assert!(worker_b.requests().is_empty());
-    }
-
-    #[tokio::test]
-    async fn conversation_pin_recorded_through_failover_sticks_the_next_turn() {
-        let worker_a =
-            ScriptedWorker::spawn(ScriptedResponse::Success("from-a".into()), Duration::ZERO).await;
-        let worker_b =
-            ScriptedWorker::spawn(ScriptedResponse::Success("from-b".into()), Duration::ZERO).await;
-        let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
-        // worker-a is unreachable, so turn one fails over to worker-b, which
-        // must be pinned through the alternate-dispatch path.
-        register(
-            &registry,
-            "worker-a",
-            "inc-a",
-            client(&refused_endpoint().await),
-            1,
-        );
-        register(
-            &registry,
-            "worker-b",
-            "inc-b",
-            client(&worker_b.endpoint()),
-            1,
-        );
-        let dispatcher = dispatcher_with_pins(
-            registry,
-            Some(SessionPinConfig {
-                max_entries: 64,
-                ttl: Duration::from_secs(60),
-            }),
-        );
-        let context = RequestContext::new("pin-degrade".into(), Principal::local_anonymous());
-
-        dispatcher
-            .generate(2, &context, turn_one(), tenant_work())
-            .await
-            .unwrap();
-        assert!(worker_a.requests().is_empty());
+        assert_eq!(worker_a.requests().len(), 1);
         assert_eq!(worker_b.requests().len(), 1);
 
-        // The second turn follows the pin straight to worker-b instead of
-        // retrying through the unreachable identity-preferred worker-a.
+        // The second turn goes straight to worker-b instead of first trying
+        // the identity-preferred worker-a again.
         dispatcher
             .generate(2, &context, turn_two(), tenant_work())
             .await
             .unwrap();
-        assert!(worker_a.requests().is_empty());
+        assert_eq!(worker_a.requests().len(), 1);
         assert_eq!(worker_b.requests().len(), 2);
-        drop(worker_a);
-        drop(worker_b);
-    }
-
-    #[test]
-    fn conversation_key_is_prefix_stable_and_normalization_tolerant() {
-        let short = conversation_turn("System prompt one.", &[("Hello world", None)]);
-        let grown = conversation_turn(
-            "System prompt one.",
-            &[
-                ("Hello world", Some("assistant reply")),
-                ("Second turn", None),
-            ],
-        );
-        // Growing the history keeps the first-tokens prefix, hence the key.
-        assert_eq!(
-            conversation_key(&short.messages),
-            conversation_key(&grown.messages)
-        );
-
-        let different = conversation_turn("System prompt one.", &[("Hello brave world", None)]);
-        assert_ne!(
-            conversation_key(&short.messages),
-            conversation_key(&different.messages)
-        );
-
-        // Whitespace and case normalization: trivial reformatting of the same
-        // conversation does not split the pin.
-        let reformatted =
-            conversation_turn("  System   prompt\tone.  ", &[("Hello   WORLD", None)]);
-        assert_eq!(
-            conversation_key(&short.messages),
-            conversation_key(&reformatted.messages)
-        );
-    }
-
-    #[test]
-    fn conversation_key_caps_at_the_prefix_depth() {
-        let filler = "token ".repeat(CONVERSATION_KEY_PREFIX_TOKENS + 50);
-        let a = conversation_turn(&filler, &[("alpha", None)]);
-        let b = conversation_turn(&filler, &[("beta", None)]);
-        // Divergence beyond the prefix depth is invisible to the pin by
-        // design; the first N tokens decide the key.
-        assert_eq!(conversation_key(&a.messages), conversation_key(&b.messages));
-    }
-
-    #[test]
-    fn conversation_pins_are_bounded_lru_with_ttl() {
-        let pins = ConversationPins::new(SessionPinConfig {
-            max_entries: 2,
-            ttl: Duration::from_millis(50),
-        });
-        let now = Instant::now();
-        let worker = |suffix: u8| WorkerInstanceKey {
-            worker_id: id::<WorkerId>(&format!("worker-{suffix}")),
-            incarnation_id: id::<IncarnationId>("inc"),
-        };
-
-        pins.record(1001, worker(1), now);
-        pins.record(1002, worker(2), now);
-        assert_eq!(pins.lookup(1001, now), Some(worker(1)));
-        // 1001 is now most-recently used, so recording 1003 evicts 1002.
-        pins.record(1003, worker(3), now);
-        assert_eq!(pins.lookup(1002, now), None);
-        assert_eq!(pins.lookup(1003, now), Some(worker(3)));
-        assert_eq!(pins.lookup(1001, now), Some(worker(1)));
-
-        // Everything expires past the TTL.
-        let later = now + Duration::from_millis(51);
-        assert_eq!(pins.lookup(1001, later), None);
-        assert_eq!(pins.lookup(1003, later), None);
     }
 }

@@ -308,49 +308,56 @@ struct ServerArgs {
     )]
     gateway_worker_status_poll_ms: u64,
 
-    /// Cache-affinity routing (DS2.3): prefer workers whose same-deployment
-    /// prefix-hit ratio and KV headroom exceed the thresholds below. Off by
-    /// default until measured evidence (DS2.5) supports the default flip.
+    /// Prefix-aware routing: prefer the worker recently routed the longest
+    /// leading part of a chat prompt, within the balance threshold below.
     #[arg(
         long,
-        env = "IZWI_GATEWAY_ROUTER_CACHE_AFFINITY",
-        default_value = "off"
+        env = "IZWI_GATEWAY_ROUTER_PREFIX_AFFINITY",
+        default_value = "on"
     )]
-    gateway_router_cache_affinity: String,
+    gateway_router_prefix_affinity: String,
 
-    /// Minimum prefix hit ratio for a worker to count as warm (0.0-1.0).
+    /// Bytes of message stream per hashed prefix block.
     #[arg(
         long,
-        env = "IZWI_GATEWAY_ROUTER_CACHE_MIN_HIT_RATIO",
-        default_value_t = 0.25
+        env = "IZWI_GATEWAY_ROUTER_PREFIX_BLOCK_BYTES",
+        default_value_t = 256
     )]
-    gateway_router_cache_min_hit_ratio: f64,
+    gateway_router_prefix_block_bytes: usize,
 
-    /// Maximum managed-KV utilization percent still considered headroom (0-100].
+    /// Leading prefix blocks considered per prompt.
     #[arg(
         long,
-        env = "IZWI_GATEWAY_ROUTER_CACHE_MAX_KV_USAGE_PCT",
-        default_value_t = 85.0
+        env = "IZWI_GATEWAY_ROUTER_PREFIX_MAX_BLOCKS",
+        default_value_t = 128
     )]
-    gateway_router_cache_max_kv_usage_pct: f64,
+    gateway_router_prefix_max_blocks: usize,
 
-    /// Conversation pinning (DS2.4): route a conversation's turns to the
-    /// worker that served its earlier turns. Off by default until measured
-    /// evidence (DS2.5) supports the default flip.
-    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN", default_value = "off")]
-    gateway_session_pin: String,
-
-    /// Bounded size of the conversation pin table.
+    /// Prefix block hashes remembered per worker (LRU).
     #[arg(
         long,
-        env = "IZWI_GATEWAY_SESSION_PIN_MAX_ENTRIES",
-        default_value_t = 4_096
+        env = "IZWI_GATEWAY_ROUTER_PREFIX_ENTRIES",
+        default_value_t = 16_384
     )]
-    gateway_session_pin_max_entries: usize,
+    gateway_router_prefix_entries: usize,
 
-    /// Lifetime of a conversation pin.
-    #[arg(long, env = "IZWI_GATEWAY_SESSION_PIN_TTL_SECS", default_value_t = 600)]
-    gateway_session_pin_ttl_secs: u64,
+    /// Outstanding requests a prefix-holding worker may carry beyond the
+    /// least-loaded worker and still be preferred.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_BALANCE_THRESHOLD",
+        default_value_t = 4
+    )]
+    gateway_router_balance_threshold: u32,
+
+    /// Managed-KV utilization percent at which a worker is avoided while any
+    /// eligible worker has headroom (0-100].
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_ROUTER_KV_PRESSURE_PCT",
+        default_value_t = 90.0
+    )]
+    gateway_router_kv_pressure_pct: f64,
 
     /// Realtime relay (DS3.6): expose /v1/realtime/ws and forward
     /// izwi-realtime-v1 sessions to eligible speech_to_text workers.
@@ -925,10 +932,9 @@ async fn gateway_state(
         max_deployments_per_worker: 32,
         max_local_dispatches: args.gateway_max_in_flight,
         status_ttl: Duration::from_millis(args.gateway_worker_status_ttl_ms),
-        cache_affinity: worker_registry::CacheAffinityConfig {
-            enabled: args.gateway_router_cache_affinity == "on",
-            min_prefix_hit_ratio: args.gateway_router_cache_min_hit_ratio,
-            max_kv_usage_pct: args.gateway_router_cache_max_kv_usage_pct,
+        routing: worker_registry::RoutingConfig {
+            prefix_balance_threshold: args.gateway_router_balance_threshold,
+            kv_pressure_pct: args.gateway_router_kv_pressure_pct,
         },
         ..worker_registry::WorkerRegistryConfig::default()
     };
@@ -1020,7 +1026,7 @@ async fn gateway_state(
             max_output_tokens: 4096,
             max_output_bytes: 512 * 1024,
             slow_consumer_timeout: Duration::from_millis(args.gateway_slow_consumer_timeout_ms),
-            session_pin: session_pin_config(args),
+            prefix_affinity: prefix_affinity_config(args),
         },
     )
     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -1946,52 +1952,37 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
         anyhow::bail!("--gateway-worker-status-ttl-ms is outside the supported range");
     }
     validate_status_cadence(ttl, poll)?;
-    validate_router_cache_affinity_args(args)?;
-    validate_session_pin_args(args)?;
+    validate_router_args(args)?;
     validate_realtime_relay_args(args)?;
     Ok(())
 }
 
-/// Parses and bounds-checks the cache-affinity routing knobs. Fail-closed on
-/// any out-of-range or non-`on|off` value so typos never silently disable or
-/// enable locality routing.
-fn validate_router_cache_affinity_args(args: &ServerArgs) -> anyhow::Result<()> {
-    match args.gateway_router_cache_affinity.as_str() {
+/// Parses and bounds-checks the routing knobs. Fail-closed on any
+/// out-of-range or non-`on|off` value so typos never silently change routing.
+fn validate_router_args(args: &ServerArgs) -> anyhow::Result<()> {
+    match args.gateway_router_prefix_affinity.as_str() {
         "on" | "off" => {}
         other => {
-            anyhow::bail!("--gateway-router-cache-affinity must be `on` or `off`, got `{other}`")
+            anyhow::bail!("--gateway-router-prefix-affinity must be `on` or `off`, got `{other}`")
         }
     }
-    let ratio = args.gateway_router_cache_min_hit_ratio;
-    if ratio.is_nan() || !(0.0..=1.0).contains(&ratio) {
-        anyhow::bail!("--gateway-router-cache-min-hit-ratio must be between 0.0 and 1.0");
+    let usage = args.gateway_router_kv_pressure_pct;
+    if usage.is_nan() || usage <= 0.0 || usage > 100.0 {
+        anyhow::bail!("--gateway-router-kv-pressure-pct must be greater than 0 and at most 100");
     }
-    let usage = args.gateway_router_cache_max_kv_usage_pct;
-    if usage.is_nan() || !(0.0..=100.0).contains(&usage) || usage == 0.0 {
-        anyhow::bail!("--gateway-router-cache-max-kv-usage-pct must be between 0 and 100");
+    worker_registry::RoutingConfig {
+        prefix_balance_threshold: args.gateway_router_balance_threshold,
+        kv_pressure_pct: usage,
     }
-    Ok(())
-}
-
-/// Parses and bounds-checks the conversation-pinning knobs, mirroring the
-/// dispatcher-side `SessionPinConfig` bounds.
-fn validate_session_pin_args(args: &ServerArgs) -> anyhow::Result<()> {
-    match args.gateway_session_pin.as_str() {
-        "on" | "off" => {}
-        other => anyhow::bail!("--gateway-session-pin must be `on` or `off`, got `{other}`"),
+    .validate()
+    .map_err(|error| anyhow::anyhow!("--gateway-router-balance-threshold: {error}"))?;
+    app::prefix_router::PrefixAffinityConfig {
+        block_bytes: args.gateway_router_prefix_block_bytes,
+        max_blocks: args.gateway_router_prefix_max_blocks,
+        max_entries_per_worker: args.gateway_router_prefix_entries,
     }
-    if args.gateway_session_pin_max_entries == 0
-        || args.gateway_session_pin_max_entries > app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
-    {
-        anyhow::bail!(
-            "--gateway-session-pin-max-entries must be between 1 and {}",
-            app::remote_chat_dispatch::MAX_SESSION_PIN_ENTRIES
-        );
-    }
-    let ttl = Duration::from_secs(args.gateway_session_pin_ttl_secs);
-    if ttl.is_zero() || ttl > app::remote_chat_dispatch::MAX_SESSION_PIN_TTL {
-        anyhow::bail!("--gateway-session-pin-ttl-secs is outside the supported range");
-    }
+    .validate()
+    .map_err(|error| anyhow::anyhow!(error.message))?;
     Ok(())
 }
 
@@ -2021,11 +2012,14 @@ fn validate_realtime_relay_args(args: &ServerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn session_pin_config(args: &ServerArgs) -> Option<app::remote_chat_dispatch::SessionPinConfig> {
-    (args.gateway_session_pin == "on").then_some(app::remote_chat_dispatch::SessionPinConfig {
-        max_entries: args.gateway_session_pin_max_entries,
-        ttl: Duration::from_secs(args.gateway_session_pin_ttl_secs),
-    })
+fn prefix_affinity_config(args: &ServerArgs) -> Option<app::prefix_router::PrefixAffinityConfig> {
+    (args.gateway_router_prefix_affinity == "on").then_some(
+        app::prefix_router::PrefixAffinityConfig {
+            block_bytes: args.gateway_router_prefix_block_bytes,
+            max_blocks: args.gateway_router_prefix_max_blocks,
+            max_entries_per_worker: args.gateway_router_prefix_entries,
+        },
+    )
 }
 
 fn gateway_worker_client_config(

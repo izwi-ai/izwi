@@ -232,7 +232,7 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
             max_output_tokens: 1,
             max_output_bytes: 1024,
             slow_consumer_timeout: Duration::from_secs(5),
-            session_pin: None,
+            prefix_affinity: None,
         },
     )
     .await;

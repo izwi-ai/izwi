@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod chat_content;
 pub mod fleet_coordinator;
+pub mod prefix_router;
 pub mod realtime_protocol;
 pub mod realtime_relay;
 pub mod realtime_translate;

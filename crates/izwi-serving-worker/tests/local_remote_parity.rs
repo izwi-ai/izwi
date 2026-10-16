@@ -165,7 +165,7 @@ async fn gateway_to_worker(
             max_output_tokens: CONTEXT_TOKENS,
             max_output_bytes: 64 * 1024,
             slow_consumer_timeout: Duration::from_secs(5),
-            session_pin: None,
+            prefix_affinity: None,
         },
     )
     .await;
