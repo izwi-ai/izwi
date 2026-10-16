@@ -543,6 +543,51 @@ fn replacement_exit_during_window_aborts_and_restores() {
 }
 
 #[test]
+fn abort_keeps_a_peer_edit_made_during_the_window() {
+    let rig = Rig::build(8, 1);
+    // The replacement serves readiness, then dies inside the window.
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(
+        &std::fs::read(rig.root.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest[REPLACEMENT.worker_id]["die_after_secs"] = serde_json::json!(4);
+    std::fs::write(
+        rig.root.join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let script = FAKE_WORKER_SCRIPT.replace(
+        "{manifest}",
+        &rig.root.join("manifest.json").display().to_string(),
+    );
+    std::fs::write(&rig.worker_binary, script).unwrap();
+    make_executable(&rig.worker_binary);
+
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must land first");
+
+    // Another writer (an operator, or a second supervisor's autoscaler)
+    // approves its own worker while the window is open.
+    let peer = "v1|http://127.0.0.1:9700|node-b|worker-p|chat|chat-model|chat-prod|1\n";
+    let window = read_file(&rig.approvals);
+    std::fs::write(&rig.approvals, format!("{window}{peer}")).unwrap();
+
+    let expected = format!("{}{peer}", rig.original_approvals);
+    let restored = wait_until(Duration::from_secs(60), || {
+        !rig.state_file().exists() && read_file(&rig.approvals) == expected
+    });
+    assert!(
+        restored,
+        "the abort removes only the rollout's lines and keeps the peer's: {}",
+        read_file(&rig.approvals)
+    );
+    terminate(&mut supervisor);
+}
+
+#[test]
 fn resume_after_crash_commits_and_fresh_start_fails_closed() {
     let rig = Rig::build(4, 1);
     let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
@@ -599,31 +644,22 @@ fn resume_after_crash_commits_and_fresh_start_fails_closed() {
 #[test]
 fn rollout_status_and_abort_commands_manage_persisted_state() {
     let rig = Rig::build(2, 1);
-    // Stage a hand-written non-terminal state with a matching approvals
-    // backup, exactly as the coordinator would.
-    let backup = rig.original_approvals.clone();
-    std::fs::write(
-        rig.runtime_directory().join("rollout-approvals-backup"),
-        &backup,
-    )
-    .unwrap();
-    let digest = {
-        use sha2::{Digest, Sha256};
-        format!("sha256:{:x}", Sha256::digest(backup.as_bytes()))
-    };
+    // Stage a hand-written non-terminal state, exactly as the coordinator
+    // would after writing its window view.
+    let added = "v1|http://127.0.0.1:9999|node-a|worker-x|chat|chat-model|chat-prod|2";
     std::fs::write(
         rig.state_file(),
         format!(
-            r#"{{"schema_version":1,"plan_digest":"sha256:placeholder","phase":"window_open","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approvals_backup_digest":"{digest}"}}"#,
+            r#"{{"schema_version":2,"plan_digest":"sha256:placeholder","phase":"window_open","started_at_ms":1,"updated_at_ms":2,"window_deadline_ms":null,"replacement_workers":[],"shared_approvals_path":"{}","target_node_config":"{}","target_config_digest":"sha256:placeholder","approval_lines":["{added}"]}}"#,
             rig.approvals.display(),
             rig.target_config.display(),
         ),
     )
     .unwrap();
-    // The rollout rewrote the approvals; abort must restore them.
+    // The rollout appended its line; abort must remove it.
     std::fs::write(
         &rig.approvals,
-        "v1|http://127.0.0.1:9999|node-a|worker-x|chat|chat-model|chat-prod|2\n",
+        format!("{}{added}\n", rig.original_approvals),
     )
     .unwrap();
 
@@ -642,12 +678,6 @@ fn rollout_status_and_abort_commands_manage_persisted_state() {
         "abort restores the pre-rollout approvals byte-identically"
     );
     assert!(!rig.state_file().exists(), "abort clears the state");
-    assert!(
-        !rig.runtime_directory()
-            .join("rollout-approvals-backup")
-            .exists(),
-        "abort clears the backup"
-    );
 
     let repeat = rig.spawn_supervisor_captured(&["--rollout-abort"]);
     let output = repeat.wait_with_output().unwrap();

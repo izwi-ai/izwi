@@ -12,21 +12,20 @@
 //!    with a diagnostic instead of launched into overcommit.
 //! 3. The shared approvals view editor: this node's autoscaled workers are
 //!    approved through v1 pinned lines that the supervisor alone adds and
-//!    removes, preserving every unrelated line verbatim.
+//!    removes, under the shared file lock and preserving every unrelated
+//!    line verbatim (see [`crate::approvals_file`]).
 //!
 //! Scale state is intentionally in-memory: a supervisor restart relaunches
 //! the declared min set and reconciles the view to it, which is the fail-closed
 //! posture (a crashed supervisor never leaves phantom capacity behind).
 
+use crate::approvals_file::{self, ApprovalsDocument, SharedApprovalsError};
 use crate::{DeploymentAutoscalingPolicy, HostInventory, ValidatedNodeConfig, WorkerConfig};
-use fs2::FileExt;
 use izwi_serving_protocol::{
-    ApprovalsFileError, DeploymentId, DeviceAssignment, DeviceId, GatewayWorkerApproval,
-    GatewayWorkerApprovalError, GatewayWorkerApprovalIdentity, NodeId, WorkerId,
-    MAX_APPROVALS_FILE_BYTES,
+    DeploymentId, DeviceAssignment, DeviceId, GatewayWorkerApproval, GatewayWorkerApprovalIdentity,
+    NodeId, WorkerId,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -579,24 +578,12 @@ impl ResourceLedger {
 pub enum AutoscaleError {
     #[error("shared approvals view is unusable: {0}")]
     View(String),
-    #[error("shared approvals view write failed: {0}")]
-    Io(#[source] std::io::Error),
+    #[error(transparent)]
+    File(#[from] SharedApprovalsError),
     #[error(
         "standalone approval line for {endpoint} collides with this node's autoscaled worker {worker}; the fleet profile requires v1 pinned lines"
     )]
     CollidingStandaloneLine { endpoint: String, worker: WorkerId },
-}
-
-impl From<ApprovalsFileError> for AutoscaleError {
-    fn from(error: ApprovalsFileError) -> Self {
-        AutoscaleError::View(error.to_string())
-    }
-}
-
-impl From<GatewayWorkerApprovalError> for AutoscaleError {
-    fn from(error: GatewayWorkerApprovalError) -> Self {
-        AutoscaleError::View(error.to_string())
-    }
 }
 
 fn worker_approval(node_id: &NodeId, worker: &WorkerConfig) -> GatewayWorkerApproval {
@@ -611,91 +598,6 @@ fn worker_approval(node_id: &NodeId, worker: &WorkerConfig) -> GatewayWorkerAppr
         deployment_id: worker.deployment.deployment_id.clone(),
         model_generation: worker.deployment.model_generation,
     }
-}
-
-/// One classified approvals entry: the raw entry line plus its parsed
-/// approval. Unrelated entries pass through `raw` verbatim.
-#[derive(Debug, Clone)]
-struct ClassifiedLine {
-    raw: String,
-    approval: GatewayWorkerApproval,
-}
-
-/// Reads the shared approvals view; a missing file is an empty view (first
-/// boot owns its creation). Any invalid entry fails the whole view.
-fn read_classified(path: &Path) -> Result<Vec<ClassifiedLine>, AutoscaleError> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => {
-            if text.len() as u64 > MAX_APPROVALS_FILE_BYTES {
-                return Err(AutoscaleError::View(format!(
-                    "{} exceeds the {MAX_APPROVALS_FILE_BYTES} byte approvals size limit",
-                    path.display()
-                )));
-            }
-            text
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(AutoscaleError::Io(error)),
-    };
-    let mut classified = Vec::new();
-    for line in text.lines() {
-        let entry = line.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
-        }
-        classified.push(ClassifiedLine {
-            raw: entry.to_string(),
-            approval: entry.parse::<GatewayWorkerApproval>()?,
-        });
-    }
-    Ok(classified)
-}
-
-/// Atomically rewrites the shared approvals view, serialized against
-/// concurrent supervisor-side writers by an exclusive sidecar lock (temp
-/// file in the target directory plus rename).
-fn write_view(path: &Path, text: &str) -> Result<(), AutoscaleError> {
-    let directory = path.parent().ok_or_else(|| {
-        AutoscaleError::View(format!("{} has no parent directory", path.display()))
-    })?;
-    std::fs::create_dir_all(directory).map_err(AutoscaleError::Io)?;
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "shared-approvals".to_string());
-    let lock_path = directory.join(format!(".{file_name}.autoscale-lock"));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(AutoscaleError::Io)?;
-    lock.lock_exclusive()
-        .map_err(|error| AutoscaleError::Io(std::io::Error::other(error.to_string())))?;
-    let temp_path = directory.join(format!(
-        ".{file_name}.autoscale-temp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).write(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp_path).map_err(AutoscaleError::Io)?;
-            file.write_all(text.as_bytes())
-                .map_err(AutoscaleError::Io)?;
-            file.sync_all().map_err(AutoscaleError::Io)?;
-        }
-        std::fs::rename(&temp_path, path).map_err(AutoscaleError::Io)
-    })();
-    let _ = fs2::FileExt::unlock(&lock);
-    drop(lock);
-    let _ = std::fs::remove_file(&lock_path);
-    result
 }
 
 /// The autoscaled workers declared on this node, keyed for line ownership.
@@ -744,19 +646,19 @@ impl<'a> AutoscaledWorkers<'a> {
     /// pin, so the operator must migrate it to the v1 fleet form.
     fn reject_standalone_collisions(
         &self,
-        classified: &[ClassifiedLine],
+        document: &ApprovalsDocument,
     ) -> Result<(), AutoscaleError> {
-        for line in classified {
+        for approval in document.approvals() {
             if let GatewayWorkerApprovalIdentity::DiscoverFromAuthenticatedEndpoint =
-                line.approval.identity
+                approval.identity
             {
                 if let Some(worker) = self
                     .workers
                     .iter()
-                    .find(|worker| line.approval.endpoint == format!("http://{}", worker.bind))
+                    .find(|worker| approval.endpoint == format!("http://{}", worker.bind))
                 {
                     return Err(AutoscaleError::CollidingStandaloneLine {
-                        endpoint: line.approval.endpoint.clone(),
+                        endpoint: approval.endpoint.clone(),
                         worker: worker.worker_id.clone(),
                     });
                 }
@@ -794,25 +696,19 @@ pub fn reconcile_min_set(
     desired: &[&WorkerConfig],
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    let desired_lines: Vec<GatewayWorkerApproval> = desired
+    let desired: Vec<GatewayWorkerApproval> = desired
         .iter()
         .map(|worker| worker_approval(own.node_id, worker))
         .collect();
-    let mut text = String::new();
-    for line in &classified {
-        if own.is_own_line(&line.approval, None) {
-            continue;
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.retain(|approval| !own.is_own_line(approval, None) || desired.contains(approval));
+        for approval in &desired {
+            document.ensure(approval);
         }
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    for approval in desired_lines {
-        text.push_str(&approval.render_line());
-        text.push('\n');
-    }
-    write_view(path, &text)
+        Ok(())
+    })
+    .map(drop)
 }
 
 /// Scale-up: appends one worker's pinned line if it is not already present.
@@ -824,22 +720,12 @@ pub fn add_worker(
     let own = AutoscaledWorkers::from_node(node)?;
     let worker = own.worker(worker_id)?;
     let line = worker_approval(own.node_id, worker);
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    if classified
-        .iter()
-        .any(|line| own.is_own_line(&line.approval, Some(&worker.worker_id)))
-    {
-        return Ok(());
-    }
-    let mut text = String::new();
-    for line in &classified {
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    text.push_str(&line.render_line());
-    text.push('\n');
-    write_view(path, &text)
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.ensure(&line);
+        Ok(())
+    })
+    .map(drop)
 }
 
 /// Scale-down: removes one worker's pinned line (idempotent).
@@ -850,17 +736,12 @@ pub fn remove_worker(
 ) -> Result<(), AutoscaleError> {
     let own = AutoscaledWorkers::from_node(node)?;
     own.worker(worker_id)?;
-    let classified = read_classified(path)?;
-    own.reject_standalone_collisions(&classified)?;
-    let mut text = String::new();
-    for line in &classified {
-        if own.is_own_line(&line.approval, Some(worker_id)) {
-            continue;
-        }
-        text.push_str(&line.raw);
-        text.push('\n');
-    }
-    write_view(path, &text)
+    approvals_file::edit(path, |document| {
+        own.reject_standalone_collisions(document)?;
+        document.retain(|approval| !own.is_own_line(approval, Some(worker_id)));
+        Ok(())
+    })
+    .map(drop)
 }
 
 #[cfg(test)]

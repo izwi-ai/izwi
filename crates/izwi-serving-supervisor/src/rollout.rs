@@ -7,33 +7,32 @@
 //!
 //! `launching replacement (canary first) → window open (both generations
 //! approved; the gateway cuts over when the successor first observes Ready)
-//! → draining old → committed`, with an abort path that restores the
-//! pre-rollout approvals byte-identically and stops only the replacement
-//! workers — the current generation never stops serving, and the drain step
-//! is the single point of no return (worker drain closes the ownership pipe
-//! irreversibly).
+//! → draining old → committed`, with an abort path that removes exactly the
+//! approval lines the rollout added (so the file is byte-identical to the
+//! pre-rollout file unless a peer edited it meanwhile, and a peer's edit is
+//! kept) and stops only the replacement workers — the current generation
+//! never stops serving, and the drain step is the single point of no return
+//! (worker drain closes the ownership pipe irreversibly).
 //!
 //! Rollout state persists in the supervisor's runtime directory so a
 //! crashed supervisor resumes or aborts explicitly instead of silently
 //! relaunching the old generation mid-rollout. The shared approvals file
-//! stays the only supervisor-to-gateway coupling: the coordinator writes
-//! whole approval views atomically (temp file plus rename under a sidecar
-//! lock), and the gateway adopts changed views through the DINV-07
+//! stays the only supervisor-to-gateway coupling: the coordinator edits it
+//! through [`crate::approvals_file`] (read, change and atomic replace under
+//! one lock), and the gateway adopts changed views through the DINV-07
 //! eligibility rule.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fs2::FileExt;
 use izwi_serving_protocol::{
-    GatewayWorkerApproval, GatewayWorkerApprovalIdentity, ModelGeneration, TaskKind,
-    MAX_APPROVALS_FILE_BYTES,
+    GatewayWorkerApproval, GatewayWorkerApprovalIdentity, ModelGeneration, NodeId, TaskKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::approvals_file::{self, ApprovalsDocument, SharedApprovalsError};
 use crate::config::{ValidatedNodeConfig, WorkerConfig};
 
 /// Hard ceiling on the rollout plan file.
@@ -47,8 +46,9 @@ pub const MAX_ROLLOUT_ABORT_GRACE_SECS: u64 = 300;
 pub const MAX_GATEWAY_APPROVALS_REFRESH_SECS: u64 = 3600;
 /// Rollout state file name inside the supervisor's runtime directory.
 pub const ROLLOUT_STATE_FILE: &str = "rollout-state.json";
-/// Pre-rollout approvals backup file name inside the runtime directory.
-pub const ROLLOUT_APPROVALS_BACKUP_FILE: &str = "rollout-approvals-backup";
+/// Version 2 records the replacement approval lines instead of a backup of
+/// the whole approvals file.
+pub const ROLLOUT_STATE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RolloutError {
@@ -64,6 +64,8 @@ pub enum RolloutError {
     Io(#[from] std::io::Error),
     #[error("approvals file {0}")]
     InvalidApprovals(String),
+    #[error(transparent)]
+    Approvals(#[from] SharedApprovalsError),
     #[error("a rollout is already recorded in state {phase}; resume with --rollout-plan or abort with --rollout-abort")]
     RolloutAlreadyInProgress { phase: String },
 }
@@ -121,12 +123,15 @@ pub struct RollingDeployment {
     pub old_generation: ModelGeneration,
     pub new_generation: ModelGeneration,
     pub old_worker_ids: Vec<String>,
+    /// The old workers' endpoints, which match their standalone-form lines.
+    pub old_endpoints: Vec<String>,
     pub new_worker_ids: Vec<String>,
 }
 
 /// The validated rollout: what rolls, in what order, and with what policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutSpec {
+    pub node_id: NodeId,
     pub rolling: Vec<RollingDeployment>,
     pub canary_worker_id: String,
     pub window: Duration,
@@ -152,6 +157,28 @@ impl RolloutSpec {
         self.rolling
             .iter()
             .any(|deployment| deployment.old_worker_ids.iter().any(|id| id == worker_id))
+    }
+
+    /// Whether an approval line is this node's line for an old worker of a
+    /// rolling deployment: the lines the commit view removes.
+    pub fn is_old_line(&self, approval: &GatewayWorkerApproval) -> bool {
+        self.rolling.iter().any(|deployment| {
+            approval.deployment_id.as_str() == deployment.deployment_id
+                && approval.model_generation == deployment.old_generation
+                && match &approval.identity {
+                    GatewayWorkerApprovalIdentity::V1 { node_id, worker_id } => {
+                        node_id == &self.node_id
+                            && deployment
+                                .old_worker_ids
+                                .iter()
+                                .any(|id| id == worker_id.as_str())
+                    }
+                    _ => deployment
+                        .old_endpoints
+                        .iter()
+                        .any(|endpoint| endpoint == &approval.endpoint),
+                }
+        })
     }
 }
 
@@ -362,13 +389,18 @@ impl RolloutPlan {
                 }
                 continue;
             }
-            let old_worker_ids = current
+            let (old_worker_ids, old_endpoints) = current
                 .config()
                 .workers
                 .iter()
                 .filter(|worker| worker.deployment.deployment_id.to_string() == *deployment_id)
-                .map(|worker| worker.worker_id.to_string())
-                .collect();
+                .map(|worker| {
+                    (
+                        worker.worker_id.to_string(),
+                        format!("http://{}", worker.bind),
+                    )
+                })
+                .unzip();
             let new_worker_ids: Vec<String> = target
                 .config()
                 .workers
@@ -404,6 +436,7 @@ impl RolloutPlan {
                 old_generation,
                 new_generation,
                 old_worker_ids,
+                old_endpoints,
                 new_worker_ids,
             });
         }
@@ -424,6 +457,7 @@ impl RolloutPlan {
         }
 
         Ok(RolloutSpec {
+            node_id: current.config().node_id.clone(),
             rolling,
             canary_worker_id: self.canary_worker_id.clone(),
             window: Duration::from_secs(self.window_secs()),
@@ -448,7 +482,9 @@ pub struct RolloutState {
     pub shared_approvals_path: String,
     pub target_node_config: String,
     pub target_config_digest: String,
-    pub approvals_backup_digest: String,
+    /// The replacement lines this rollout adds to the shared approvals
+    /// file; an abort removes exactly these.
+    pub approval_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,20 +539,22 @@ pub fn load_state(runtime_directory: &Path) -> Result<Option<RolloutState>, Roll
     }
     let state: RolloutState = serde_json::from_slice(&bytes)
         .map_err(|error| RolloutError::InvalidState(error.to_string()))?;
-    if state.schema_version != 1 {
+    if state.schema_version != ROLLOUT_STATE_SCHEMA_VERSION {
         return Err(RolloutError::InvalidState(format!(
-            "unsupported rollout state schema_version {}",
+            "unsupported rollout state schema_version {}; finish or abort it with the supervisor that started it",
             state.schema_version
         )));
     }
     Ok(Some(state))
 }
 
-/// Persists rollout state atomically (temp file plus rename, 0600).
+/// Persists rollout state atomically and durably (temp file, fsync,
+/// rename, directory fsync; owner-only). The node lease serializes writers.
 pub fn persist_state(runtime_directory: &Path, state: &RolloutState) -> Result<(), RolloutError> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| RolloutError::InvalidState(error.to_string()))?;
-    write_atomic(&state_path(runtime_directory), &bytes)
+    approvals_file::replace_file(&state_path(runtime_directory), &bytes)?;
+    Ok(())
 }
 
 /// Removes persisted rollout state.
@@ -528,47 +566,18 @@ pub fn clear_state(runtime_directory: &Path) -> Result<(), RolloutError> {
     }
 }
 
-/// One approvals line with its parsed meaning, preserving the operator's
-/// raw text for verbatim pass-through in generated views.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClassifiedApproval {
-    pub raw: String,
-    pub approval: GatewayWorkerApproval,
-}
-
-/// Parses an approvals file into classified lines. Any invalid entry fails
-/// the whole file — the coordinator never rewrites a file it cannot fully
-/// understand.
-pub fn classify_approvals(text: &str) -> Result<Vec<ClassifiedApproval>, RolloutError> {
-    let mut classified = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let entry = line.split('#').next().unwrap_or("").trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let approval = entry.parse::<GatewayWorkerApproval>().map_err(|error| {
-            RolloutError::InvalidApprovals(format!("line {}: {error}", index + 1))
-        })?;
-        classified.push(ClassifiedApproval {
-            raw: entry.to_string(),
-            approval,
-        });
-    }
-    Ok(classified)
-}
-
 /// Verifies the rollout precondition: the approvals file currently approves
 /// the old generation of every rolling deployment. A rollout that rewrites
 /// a file the gateway is not actually serving from would silently strand
 /// admission.
 pub fn verify_approvals_precondition(
-    classified: &[ClassifiedApproval],
+    document: &ApprovalsDocument,
     spec: &RolloutSpec,
 ) -> Result<(), RolloutError> {
     for deployment in &spec.rolling {
-        let approved = classified.iter().any(|entry| {
-            entry.approval.deployment_id.as_str() == deployment.deployment_id
-                && entry.approval.model_generation == deployment.old_generation
+        let approved = document.approvals().any(|approval| {
+            approval.deployment_id.as_str() == deployment.deployment_id
+                && approval.model_generation == deployment.old_generation
         });
         if !approved {
             return Err(RolloutError::InvalidApprovals(format!(
@@ -581,7 +590,9 @@ pub fn verify_approvals_precondition(
     Ok(())
 }
 
-fn replacement_lines(
+/// The pinned approval of every replacement worker: the lines a rollout
+/// adds to the shared view, and the only lines its abort removes.
+pub fn replacement_approvals(
     spec: &RolloutSpec,
     target: &ValidatedNodeConfig,
 ) -> Result<Vec<GatewayWorkerApproval>, RolloutError> {
@@ -615,186 +626,61 @@ fn replacement_lines(
     Ok(lines)
 }
 
-/// Builds the window view: the old generation's operator lines stay
-/// verbatim (it remains approved and admission-eligible until the gateway
-/// observes the successor Ready), and one pinned line per replacement
-/// worker is appended. Regenerating this view from an already-written
-/// window file yields identical content, so resume rewrites are safe.
-pub fn build_window_view(
-    classified: &[ClassifiedApproval],
+/// The window view: every existing line stays (the old generation remains
+/// approved and admission-eligible until the gateway observes the successor
+/// Ready) and the replacement lines are appended. Applying it again changes
+/// nothing, so a resumed rollout rewrites it safely.
+pub fn apply_window_view(document: &mut ApprovalsDocument, replacements: &[GatewayWorkerApproval]) {
+    for approval in replacements {
+        document.ensure(approval);
+    }
+}
+
+/// The commit view: this node's old-generation lines of the rolling
+/// deployments are removed and the replacement lines are kept. Lines of
+/// other nodes and other deployments are untouched. Returns the removed
+/// lines.
+pub fn apply_commit_view(
+    document: &mut ApprovalsDocument,
     spec: &RolloutSpec,
-    target: &ValidatedNodeConfig,
-) -> Result<String, RolloutError> {
-    let mut text = String::new();
-    for entry in classified {
-        if is_rolling_new_line(entry, spec) {
-            continue;
-        }
-        text.push_str(&entry.raw);
-        text.push('\n');
+    replacements: &[GatewayWorkerApproval],
+) -> Vec<String> {
+    let removed = document.retain(|approval| !spec.is_old_line(approval));
+    for approval in replacements {
+        document.ensure(approval);
     }
-    for approval in replacement_lines(spec, target)? {
-        text.push_str(&approval.render_line());
-        text.push('\n');
-    }
-    Ok(text)
+    removed
 }
 
-/// Builds the commit view: every line of the rolling deployments' old
-/// generation is removed and the replacement lines stay. Adopting this view
-/// makes the new generation the only approved one.
-pub fn build_commit_view(
-    classified: &[ClassifiedApproval],
-    spec: &RolloutSpec,
-    target: &ValidatedNodeConfig,
-) -> Result<String, RolloutError> {
-    let mut text = String::new();
-    for entry in classified {
-        if is_rolling_line(entry, spec) {
-            continue;
-        }
-        text.push_str(&entry.raw);
-        text.push('\n');
+/// Undoes a rollout's view edits: removes exactly the replacement lines it
+/// added and puts back the lines it removed. Every other line, including a
+/// peer's change made since, stays as it is; with no peer change the file
+/// is byte-identical to the pre-rollout file.
+pub fn restore_view(
+    document: &mut ApprovalsDocument,
+    added: &[GatewayWorkerApproval],
+    removed: &[String],
+) {
+    document.retain(|approval| !added.contains(approval));
+    for line in removed {
+        document.append_line(line);
     }
-    for approval in replacement_lines(spec, target)? {
-        text.push_str(&approval.render_line());
-        text.push('\n');
-    }
-    Ok(text)
 }
 
-/// Whether one classified line is a replacement line of a rolling
-/// deployment (regenerated by the views, never passed through).
-fn is_rolling_new_line(entry: &ClassifiedApproval, spec: &RolloutSpec) -> bool {
-    spec.rolling.iter().any(|deployment| {
-        entry.approval.deployment_id.as_str() == deployment.deployment_id
-            && entry.approval.model_generation == deployment.new_generation
-    })
-}
-
-/// Whether one classified line belongs to a rolling deployment at either
-/// generation (the commit view drops both and regenerates replacements).
-fn is_rolling_line(entry: &ClassifiedApproval, spec: &RolloutSpec) -> bool {
-    spec.rolling.iter().any(|deployment| {
-        entry.approval.deployment_id.as_str() == deployment.deployment_id
-            && (entry.approval.model_generation == deployment.old_generation
-                || entry.approval.model_generation == deployment.new_generation)
-    })
-}
-
-/// Reads a bounded approvals file.
-pub fn read_approvals_file(path: &Path) -> Result<String, RolloutError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|error| RolloutError::InvalidApprovals(format!("{}: {error}", path.display())))?;
-    if !metadata.is_file() {
-        return Err(RolloutError::InvalidApprovals(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_APPROVALS_FILE_BYTES {
-        return Err(RolloutError::InvalidApprovals(format!(
-            "{} exceeds the {} byte approvals size limit",
-            path.display(),
-            MAX_APPROVALS_FILE_BYTES
-        )));
-    }
-    std::fs::read_to_string(path)
-        .map_err(|error| RolloutError::InvalidApprovals(format!("{}: {error}", path.display())))
-}
-
-/// Writes bytes atomically: temp file in the target directory (0600) plus
-/// rename, serialized by an exclusive sidecar lock so a concurrent writer
-/// can never interleave.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RolloutError> {
-    let directory = path.parent().ok_or_else(|| {
-        RolloutError::Io(std::io::Error::other(format!(
-            "{} has no parent directory",
-            path.display()
-        )))
-    })?;
-    std::fs::create_dir_all(directory)?;
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "rollout-file".to_string());
-    let lock_path = directory.join(format!(".{file_name}.rollout-lock"));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)?;
-    lock.lock_exclusive()
-        .map_err(|error| RolloutError::Io(std::io::Error::other(error.to_string())))?;
-    let temp_path = directory.join(format!(
-        ".{file_name}.rollout-temp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).write(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&temp_path, path)
-    })();
-    let _ = fs2::FileExt::unlock(&lock);
-    drop(lock);
-    let _ = std::fs::remove_file(&lock_path);
-    result.map_err(|error| {
-        let _ = std::fs::remove_file(&temp_path);
-        RolloutError::Io(error)
-    })
-}
-
-/// Saves the pre-rollout approvals bytes and returns their digest.
-pub fn backup_approvals(runtime_directory: &Path, text: &str) -> Result<String, RolloutError> {
-    let path = runtime_directory.join(ROLLOUT_APPROVALS_BACKUP_FILE);
-    write_atomic(&path, text.as_bytes())?;
-    Ok(digest_bytes(text.as_bytes()))
-}
-
-/// Restores the pre-rollout approvals bytes, refusing a backup whose digest
-/// no longer matches the recorded one.
-pub fn restore_approvals(
-    runtime_directory: &Path,
-    approvals_path: &Path,
-    expected_digest: &str,
-) -> Result<(), RolloutError> {
-    let backup_path = runtime_directory.join(ROLLOUT_APPROVALS_BACKUP_FILE);
-    let bytes = std::fs::read(&backup_path).map_err(|error| {
-        RolloutError::InvalidApprovals(format!(
-            "pre-rollout approvals backup {} is unreadable: {error}",
-            backup_path.display()
-        ))
-    })?;
-    let digest = digest_bytes(&bytes);
-    if digest != expected_digest {
-        return Err(RolloutError::InvalidApprovals(format!(
-            "pre-rollout approvals backup digest {digest} does not match the recorded {expected_digest}"
-        )));
-    }
-    write_atomic(approvals_path, &bytes)
-}
-
-/// Removes the approvals backup after a terminal phase.
-pub fn clear_approvals_backup(runtime_directory: &Path) -> Result<(), RolloutError> {
-    match std::fs::remove_file(runtime_directory.join(ROLLOUT_APPROVALS_BACKUP_FILE)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+/// Parses the replacement lines a persisted state recorded.
+pub fn parse_approval_lines(lines: &[String]) -> Result<Vec<GatewayWorkerApproval>, RolloutError> {
+    lines
+        .iter()
+        .map(|line| {
+            line.parse::<GatewayWorkerApproval>().map_err(|error| {
+                RolloutError::InvalidState(format!("recorded approval line {line:?}: {error}"))
+            })
+        })
+        .collect()
 }
 
 pub fn digest_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    approvals_file::digest(bytes)
 }
 
 #[cfg(test)]
@@ -1021,18 +907,15 @@ mod tests {
         ));
     }
 
-    fn classified(text: &str) -> Vec<ClassifiedApproval> {
-        classify_approvals(text).unwrap()
-    }
+    const ORIGINAL: &str = "# fleet\nv1|http://127.0.0.1:9470|node-a|worker-a|chat|chat-model|chat-prod|1\nv1|http://127.0.0.1:9600|node-a|asr-worker|speech_to_text|asr-model|asr-prod|4\n";
 
-    fn sample_classified() -> Vec<ClassifiedApproval> {
-        classified(
-            "# fleet\nv1|http://127.0.0.1:9470|node-a|worker-a|chat|chat-model|chat-prod|1\nv1|http://127.0.0.1:9600|node-a|asr-worker|speech_to_text|asr-model|asr-prod|4\n",
-        )
+    fn document(text: &str) -> ApprovalsDocument {
+        ApprovalsDocument::parse(text).unwrap()
     }
 
     fn sample_spec() -> RolloutSpec {
         RolloutSpec {
+            node_id: NodeId::new("node-a").unwrap(),
             rolling: vec![RollingDeployment {
                 deployment_id: "chat-prod".to_string(),
                 task: TaskKind::Chat,
@@ -1040,6 +923,7 @@ mod tests {
                 old_generation: ModelGeneration::new(1).unwrap(),
                 new_generation: ModelGeneration::new(2).unwrap(),
                 old_worker_ids: vec!["worker-a".to_string()],
+                old_endpoints: vec!["http://127.0.0.1:9470".to_string()],
                 new_worker_ids: vec!["worker-b".to_string()],
             }],
             canary_worker_id: "worker-b".to_string(),
@@ -1049,18 +933,21 @@ mod tests {
         }
     }
 
-    fn sample_target() -> ValidatedNodeConfig {
-        validated(&target_toml(2))
+    fn replacements() -> Vec<GatewayWorkerApproval> {
+        replacement_approvals(&sample_spec(), &validated(&target_toml(2))).unwrap()
     }
 
     #[test]
-    fn window_view_keeps_old_lines_and_appends_pinned_replacements() {
-        let classified = sample_classified();
-        let spec = sample_spec();
-        let window = build_window_view(&classified, &spec, &sample_target()).unwrap();
+    fn window_view_keeps_every_line_and_appends_pinned_replacements() {
+        let mut view = document(ORIGINAL);
+        apply_window_view(&mut view, &replacements());
+        let window = view.render();
+        assert!(
+            window.starts_with(ORIGINAL),
+            "existing lines pass through: {window}"
+        );
         let parsed = izwi_serving_protocol::parse_approvals_text(&window).unwrap();
         assert_eq!(parsed.len(), 3);
-        assert!(window.contains("worker-a|chat|chat-model|chat-prod|1"));
         let replacement = parsed
             .iter()
             .find(|approval| approval.endpoint == "http://127.0.0.1:9480")
@@ -1076,61 +963,79 @@ mod tests {
             replacement.model_generation,
             ModelGeneration::new(2).unwrap()
         );
+
+        apply_window_view(&mut view, &replacements());
+        assert_eq!(view.render(), window, "the window view is idempotent");
     }
 
     #[test]
-    fn views_are_idempotent_over_an_already_written_window_file() {
-        let spec = sample_spec();
-        let window_once = build_window_view(&sample_classified(), &spec, &sample_target()).unwrap();
-        let window_twice = build_window_view(
-            &classify_approvals(&window_once).unwrap(),
-            &spec,
-            &sample_target(),
-        )
-        .unwrap();
-        assert_eq!(window_once, window_twice);
-        let commit = build_commit_view(
-            &classify_approvals(&window_once).unwrap(),
-            &spec,
-            &sample_target(),
-        )
-        .unwrap();
-        let commit_twice = build_commit_view(
-            &classify_approvals(&commit).unwrap(),
-            &spec,
-            &sample_target(),
-        )
-        .unwrap();
-        assert_eq!(commit, commit_twice);
-    }
-
-    #[test]
-    fn commit_view_drops_the_old_generation_and_keeps_the_rest() {
-        let classified = sample_classified();
-        let spec = sample_spec();
-        let commit = build_commit_view(&classified, &spec, &sample_target()).unwrap();
-        let parsed = izwi_serving_protocol::parse_approvals_text(&commit).unwrap();
-        assert_eq!(parsed.len(), 2);
+    fn commit_view_drops_only_this_nodes_old_lines() {
+        let foreign = "v1|http://10.0.0.9:9470|node-z|worker-z|chat|chat-model|chat-prod|1\n";
+        let standalone = "http://127.0.0.1:9470|chat|chat-model|chat-prod|1\n";
+        let mut view = document(&format!("{ORIGINAL}{foreign}{standalone}"));
+        apply_window_view(&mut view, &replacements());
+        let removed = apply_commit_view(&mut view, &sample_spec(), &replacements());
+        assert_eq!(
+            removed.len(),
+            2,
+            "the v1 and standalone old lines: {removed:?}"
+        );
+        let commit = view.render();
         assert!(!commit.contains("worker-a|chat|chat-model|chat-prod|1"));
+        assert!(!commit.contains(standalone));
+        assert!(commit.contains(foreign), "another node's line stays");
         assert!(commit.contains("asr-prod|4"));
         assert!(commit.contains("worker-b|chat|chat-model|chat-prod|2"));
+
+        assert!(
+            apply_commit_view(&mut view, &sample_spec(), &replacements()).is_empty(),
+            "the commit view is idempotent"
+        );
+        assert_eq!(view.render(), commit);
+    }
+
+    #[test]
+    fn restore_removes_only_the_rollouts_lines() {
+        let mut view = document(ORIGINAL);
+        apply_window_view(&mut view, &replacements());
+        let mut untouched = view.clone();
+        restore_view(&mut untouched, &replacements(), &[]);
+        assert_eq!(
+            untouched.render(),
+            ORIGINAL,
+            "with no peer change the abort restores the file byte-identically"
+        );
+
+        // A peer adds a line while the window is open; the abort keeps it.
+        let peer = "v1|http://127.0.0.1:9700|node-b|worker-p|chat|chat-model|chat-prod|1";
+        view.ensure(&peer.parse().unwrap());
+        restore_view(&mut view, &replacements(), &[]);
+        assert_eq!(view.render(), format!("{ORIGINAL}{peer}\n"));
     }
 
     #[test]
     fn approvals_precondition_requires_the_current_generation() {
         let spec = sample_spec();
-        verify_approvals_precondition(&sample_classified(), &spec).unwrap();
+        verify_approvals_precondition(&document(ORIGINAL), &spec).unwrap();
 
         let stale =
-            classified("v1|http://127.0.0.1:9470|node-a|worker-a|chat|chat-model|chat-prod|9\n");
+            document("v1|http://127.0.0.1:9470|node-a|worker-a|chat|chat-model|chat-prod|9\n");
         assert!(matches!(
             verify_approvals_precondition(&stale, &spec).unwrap_err(),
             RolloutError::InvalidApprovals(_)
         ));
+    }
 
+    #[test]
+    fn recorded_approval_lines_parse_back() {
+        let lines: Vec<String> = replacements()
+            .iter()
+            .map(|line| line.render_line())
+            .collect();
+        assert_eq!(parse_approval_lines(&lines).unwrap(), replacements());
         assert!(matches!(
-            classify_approvals("http://bad|line\n").unwrap_err(),
-            RolloutError::InvalidApprovals(_)
+            parse_approval_lines(&["http://bad|line".to_string()]).unwrap_err(),
+            RolloutError::InvalidState(_)
         ));
     }
 
@@ -1138,7 +1043,7 @@ mod tests {
     fn state_round_trips_and_persists_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let state = RolloutState {
-            schema_version: 1,
+            schema_version: ROLLOUT_STATE_SCHEMA_VERSION,
             plan_digest: "sha256:abc".to_string(),
             phase: RolloutPhase::WindowOpen,
             started_at_ms: 1,
@@ -1151,11 +1056,22 @@ mod tests {
             shared_approvals_path: "/tmp/approvals".to_string(),
             target_node_config: "/tmp/target.toml".to_string(),
             target_config_digest: "sha256:def".to_string(),
-            approvals_backup_digest: "sha256:123".to_string(),
+            approval_lines: vec![
+                "v1|http://127.0.0.1:9480|node-a|worker-b|chat|chat-model|chat-prod|2".to_string(),
+            ],
         };
         persist_state(dir.path(), &state).unwrap();
         assert_eq!(load_state(dir.path()).unwrap().as_ref(), Some(&state));
         assert!(state_path(dir.path()).extension().is_some());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(state_path(dir.path()))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "rollout state is owner-only");
+        }
         clear_state(dir.path()).unwrap();
         assert_eq!(load_state(dir.path()).unwrap(), None);
         clear_state(dir.path()).unwrap(); // idempotent
@@ -1163,75 +1079,5 @@ mod tests {
         assert!(!RolloutPhase::WindowOpen.is_terminal());
         assert!(RolloutPhase::Committed.is_terminal());
         assert!(RolloutPhase::Aborted.is_terminal());
-    }
-
-    #[test]
-    fn approvals_backup_restore_is_digest_guarded() {
-        let dir = tempfile::tempdir().unwrap();
-        let approvals = dir.path().join("approvals.txt");
-        std::fs::write(
-            &approvals,
-            "http://127.0.0.1:9470|chat|chat-model|chat-prod|1\n",
-        )
-        .unwrap();
-
-        let original = read_approvals_file(&approvals).unwrap();
-        assert_eq!(classify_approvals(&original).unwrap().len(), 1);
-        let digest = backup_approvals(dir.path(), &original).unwrap();
-
-        // The rollout rewrites the file; the abort restores it byte-identically.
-        write_atomic(
-            &approvals,
-            b"v1|http://127.0.0.1:9471|node-a|worker-b|chat|chat-model|chat-prod|2\n",
-        )
-        .unwrap();
-        restore_approvals(dir.path(), &approvals, &digest).unwrap();
-        assert_eq!(read_approvals_file(&approvals).unwrap(), original);
-
-        // A tampered backup is refused.
-        std::fs::write(dir.path().join(ROLLOUT_APPROVALS_BACKUP_FILE), b"tampered").unwrap();
-        assert!(matches!(
-            restore_approvals(dir.path(), &approvals, &digest).unwrap_err(),
-            RolloutError::InvalidApprovals(_)
-        ));
-
-        // The window view actually replaces the file through the atomic path.
-        let window = build_window_view(
-            &classify_approvals(&original).unwrap(),
-            &sample_spec(),
-            &sample_target(),
-        )
-        .unwrap();
-        write_atomic(&approvals, window.as_bytes()).unwrap();
-        assert_eq!(parse_len(&approvals), 2);
-        clear_approvals_backup(dir.path()).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_writes_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let approvals = dir.path().join("approvals.txt");
-        write_atomic(&approvals, b"# empty view\n").unwrap();
-        let mode = std::fs::metadata(&approvals).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "approvals views are owner-only");
-    }
-
-    fn parse_len(path: &Path) -> usize {
-        izwi_serving_protocol::parse_approvals_text(&read_approvals_file(path).unwrap())
-            .unwrap()
-            .len()
-    }
-
-    #[test]
-    fn oversized_approvals_are_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("approvals.txt");
-        std::fs::write(&path, vec![b'a'; MAX_APPROVALS_FILE_BYTES as usize + 1]).unwrap();
-        assert!(matches!(
-            read_approvals_file(&path).unwrap_err(),
-            RolloutError::InvalidApprovals(_)
-        ));
     }
 }

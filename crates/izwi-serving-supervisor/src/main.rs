@@ -1,8 +1,9 @@
 use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
-    BackendKind, DeploymentId, DeviceId, IncarnationId, ServiceBearerToken, ServiceCredentials,
-    WorkerId,
+    BackendKind, DeploymentId, DeviceId, GatewayWorkerApproval, IncarnationId, ServiceBearerToken,
+    ServiceCredentials, WorkerId,
 };
+use izwi_serving_supervisor::approvals_file;
 use izwi_serving_supervisor::autoscale::{
     self, Autoscaler, DeploymentObservation, ResourceLedger, ScaleDecision, WorkerSignals,
 };
@@ -508,7 +509,8 @@ struct PreparedRollout {
     state: rollout::RolloutState,
     target: ValidatedNodeConfig,
     approvals_path: PathBuf,
-    classified: Vec<rollout::ClassifiedApproval>,
+    /// The replacement lines the rollout adds to the shared approvals file.
+    approval_lines: Vec<GatewayWorkerApproval>,
     replacements: Vec<WorkerSlot>,
 }
 
@@ -562,7 +564,6 @@ fn prepare_rollout(
         }
         Some(state) => {
             rollout::clear_state(runtime_directory)?;
-            rollout::clear_approvals_backup(runtime_directory)?;
             info!(
                 "cleared terminal rollout state ({}) before staging the new rollout",
                 state.phase.as_str()
@@ -572,19 +573,18 @@ fn prepare_rollout(
         None => None,
     };
 
-    let approvals_text = rollout::read_approvals_file(plan.shared_approvals_path())?;
-    let classified = rollout::classify_approvals(&approvals_text)?;
-    rollout::verify_approvals_precondition(&classified, &spec)?;
+    let approvals =
+        approvals_file::read(plan.shared_approvals_path()).map_err(rollout::RolloutError::from)?;
+    rollout::verify_approvals_precondition(&approvals, &spec)?;
+    let approval_lines = rollout::replacement_approvals(&spec, &target)?;
     let replacements = resolve_replacement_slots(&target, &spec)?;
 
     let state = match state {
         Some(state) => state,
         None => {
             let now = now_ms();
-            let approvals_backup_digest =
-                rollout::backup_approvals(runtime_directory, &approvals_text)?;
             rollout::RolloutState {
-                schema_version: 1,
+                schema_version: rollout::ROLLOUT_STATE_SCHEMA_VERSION,
                 plan_digest,
                 phase: rollout::RolloutPhase::LaunchingReplacement,
                 started_at_ms: now,
@@ -594,7 +594,10 @@ fn prepare_rollout(
                 shared_approvals_path: plan.shared_approvals_path().to_string_lossy().into_owned(),
                 target_node_config: plan.target_node_config().to_string_lossy().into_owned(),
                 target_config_digest: rollout::digest_bytes(&target_bytes),
-                approvals_backup_digest,
+                approval_lines: approval_lines
+                    .iter()
+                    .map(GatewayWorkerApproval::render_line)
+                    .collect(),
             }
         }
     };
@@ -612,7 +615,7 @@ fn prepare_rollout(
         state,
         target,
         approvals_path: plan.shared_approvals_path().to_path_buf(),
-        classified,
+        approval_lines,
         replacements,
     })
 }
@@ -642,7 +645,6 @@ fn reconcile_fresh_start_state(
         });
     }
     rollout::clear_state(runtime_directory)?;
-    rollout::clear_approvals_backup(runtime_directory)?;
     info!("cleared terminal rollout state ({})", state.phase.as_str());
     Ok(())
 }
@@ -746,13 +748,10 @@ async fn execute_rollout(
     // Open (or re-open on resume) the window: both generations are approved,
     // the gateway cuts over atomically when the successor first observes
     // Ready. The old generation never stops serving during the window.
-    if let Err(error) =
-        rollout::build_window_view(&prepared.classified, &prepared.spec, &prepared.target)
-            .and_then(|view| {
-                rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
-                Ok(view)
-            })
-    {
+    if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
+        rollout::apply_window_view(document, &prepared.approval_lines);
+        Ok::<_, rollout::RolloutError>(())
+    }) {
         warn!("rollout window view failed to write: {error}; nothing changed");
         return RolloutOutcome::DegradedAbort;
     }
@@ -840,13 +839,10 @@ async fn execute_rollout(
     info!(
         "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
     );
-    if let Err(error) =
-        rollout::build_commit_view(&prepared.classified, &prepared.spec, &prepared.target)
-            .and_then(|view| {
-                rollout::write_atomic(&prepared.approvals_path, view.as_bytes())?;
-                Ok(view)
-            })
-    {
+    if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
+        rollout::apply_commit_view(document, &prepared.spec, &prepared.approval_lines);
+        Ok::<_, rollout::RolloutError>(())
+    }) {
         warn!("rollout commit view failed to write: {error}; the window view stays in place");
         return RolloutOutcome::DegradedAbort;
     }
@@ -882,9 +878,9 @@ async fn execute_rollout(
     RolloutOutcome::Committed
 }
 
-/// Aborts a reversible rollout: restore the pre-rollout approvals first so
-/// the gateway stops routing to the replacements within one refresh TTL,
-/// wait the abort grace, then drain the replacement workers. The previous
+/// Aborts a reversible rollout: remove the replacement lines first so the
+/// gateway stops routing to the replacements within one refresh TTL, wait
+/// the abort grace, then drain the replacement workers. The previous
 /// generation never stopped serving. Returns whether the approvals were
 /// restored.
 async fn abort_rollout(
@@ -896,11 +892,10 @@ async fn abort_rollout(
     reason: &str,
 ) -> bool {
     warn!("rollout aborted ({reason}): restoring the previous approval view");
-    if let Err(error) = rollout::restore_approvals(
-        runtime_directory,
-        &prepared.approvals_path,
-        &prepared.state.approvals_backup_digest,
-    ) {
+    if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
+        rollout::restore_view(document, &prepared.approval_lines, &[]);
+        Ok::<_, rollout::RolloutError>(())
+    }) {
         warn!(
             "rollout abort could not restore approvals: {error}; workers keep running and the state stays resumable"
         );
@@ -943,7 +938,6 @@ async fn abort_rollout(
         warn!("rollout state persist failed: {error}");
     }
     let _ = rollout::clear_state(runtime_directory);
-    let _ = rollout::clear_approvals_backup(runtime_directory);
     info!(
         "rollout abort complete: the previous approval view is restored and the replacement workers are stopped"
     );
@@ -1004,7 +998,6 @@ fn rollout_abort_command(node: &ValidatedNodeConfig) -> Result<(), SupervisorErr
     };
     if state.phase.is_terminal() {
         rollout::clear_state(runtime_directory)?;
-        rollout::clear_approvals_backup(runtime_directory)?;
         eprintln!("cleared terminal rollout state ({})", state.phase.as_str());
         return Ok(());
     }
@@ -1022,15 +1015,14 @@ fn rollout_abort_command(node: &ValidatedNodeConfig) -> Result<(), SupervisorErr
     {
         return Err(SupervisorError::RolloutFenceContended);
     }
-    rollout::restore_approvals(
-        runtime_directory,
-        Path::new(&state.shared_approvals_path),
-        &state.approvals_backup_digest,
-    )?;
-    rollout::clear_approvals_backup(runtime_directory)?;
+    let added = rollout::parse_approval_lines(&state.approval_lines)?;
+    approvals_file::edit(Path::new(&state.shared_approvals_path), |document| {
+        rollout::restore_view(document, &added, &[]);
+        Ok::<_, rollout::RolloutError>(())
+    })?;
     rollout::clear_state(runtime_directory)?;
     eprintln!(
-        "rollout aborted: the previous approval view is restored byte-identically; the previous generation never stopped serving"
+        "rollout aborted: the replacement approval lines are removed; the previous generation never stopped serving"
     );
     Ok(())
 }
