@@ -110,6 +110,10 @@ async fn main() -> anyhow::Result<()> {
             "IZWI_CHUNKED_PREFILL_THRESHOLD",
             engine_defaults.chunked_prefill_threshold,
         )?,
+        max_tokens_per_step: parse_env(
+            izwi_core::serve_runtime::ENV_MAX_TOKENS_PER_STEP,
+            engine_defaults.max_tokens_per_step,
+        )?,
         // DS4 hierarchical offload: explicit opt-in via a positive host pool
         // budget; the kill switch forces it off even when a budget is set.
         kv_host_pool_budget_bytes: if env_flag_value(izwi_core::serve_runtime::ENV_KV_HOST_OFFLOAD)

@@ -63,6 +63,25 @@ This is an evidence statement, not a performance certificate: reuse on the
 fixture lanes is counter-proven (counters + output equivalence), not
 wall-clock-proven.
 
+## Scheduler step sizes by backend (SCH-F3)
+
+| Backend | Token budget per step | Prefill chunk | Chunked prefill |
+|---|---|---|---|
+| CUDA | 2,048 | 512, kept while other rows decode | Always on (incremental chat) |
+| CPU, Metal | 384 | 192 | Off: prompts prefill whole, so neither size bounds a step |
+
+`IZWI_MAX_TOKENS_PER_STEP` and `IZWI_CHUNKED_PREFILL_THRESHOLD` override both
+sizes; `0` or unset takes the backend's. The CUDA sizes are unmeasured: no
+NVIDIA device was available. The chunk no longer halves under decode load on
+any backend. CPU and Metal keep the historical sizes, for two reasons.
+Measured on Metal with LFM2.5 (1,000-word prompts at 2 req/s), the budget
+does not bound a whole-prompt prefill, and decode needs at most 64 tokens a
+step. Enabling chunked prefill (`IZWI_ENABLE_CHUNKED_PREFILL=1`) also fails
+requests under concurrent long prompts on CPU and Metal. The managed KV
+coordinator rejects decode rows with "transaction N is active or has already
+reached a terminal state" after a prefill row is withheld for tensor-state
+capacity. This happens with the old sizes too: it is a known open defect.
+
 ## Hierarchical KV offload by lane (DS4)
 
 Offload is explicit opt-in (`host_kv_pool_budget_bytes` on the assignment or

@@ -1439,8 +1439,7 @@ impl Scheduler {
             .iter()
             .filter_map(|request_id| self.requests.get(request_id).map(|m| m.priority))
             .max();
-        let effective_prefill_chunk_threshold =
-            self.effective_prefill_chunk_threshold(has_decode_demand);
+        let effective_prefill_chunk_threshold = self.effective_prefill_chunk_threshold();
         // The core launches at most `physical_dispatch_limit` dispatches per
         // step, each holding one model's rows up to its dispatch width. A row
         // that would need a further dispatch waits for a later step instead
@@ -3666,23 +3665,15 @@ impl Scheduler {
         }
     }
 
-    fn effective_prefill_chunk_threshold(&self, has_decode_demand: bool) -> usize {
-        let base = if self.config.enable_adaptive_batching {
+    /// The prefill chunk this step. It does not shrink under decode load:
+    /// prefill and decode take whole steps in turn, so a smaller chunk only
+    /// multiplies a prompt's prefill steps (SCH-F3).
+    fn effective_prefill_chunk_threshold(&self) -> usize {
+        let mut threshold = if self.config.enable_adaptive_batching {
             self.telemetry.dynamic_prefill_chunk_threshold.max(32)
         } else {
             self.config.chunked_prefill_threshold.max(32)
         };
-        let mut threshold = base;
-
-        // If decode is already active, avoid over-investing in prefill this step.
-        if has_decode_demand {
-            threshold = threshold.min((base / 2).max(64));
-        }
-
-        // Favor throughput for single-request execution.
-        if self.waiting_count() <= 1 && self.running.len() <= 1 {
-            threshold = threshold.max(base).min(base.saturating_mul(2));
-        }
 
         if self.config.enable_power_adaptive {
             threshold = ((threshold as f64) * self.thermal_budget_scale()) as usize;
@@ -4944,6 +4935,36 @@ mod tests {
         let first = scheduler.schedule().prefill_requests.remove(0);
         assert_eq!(first.num_computed_tokens, 0);
         assert_eq!(first.num_tokens, 4);
+    }
+
+    /// A prefill chunk keeps its configured size while other rows decode
+    /// (SCH-F3): halving it under decode load only doubled a prompt's steps.
+    #[test]
+    fn prefill_chunk_keeps_its_size_while_rows_decode() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 2_048,
+            enable_chunked_prefill: true,
+            chunked_prefill_threshold: 512,
+            ..Default::default()
+        });
+        let mut decoding = build_request(TaskType::Chat, "decoding", Priority::Normal);
+        decoding.prompt_tokens = vec![7; 8];
+        assert!(scheduler.add_request(&decoding));
+        allow_incremental_prefill(&mut scheduler, &decoding.id);
+        let prefill = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!(prefill.num_tokens, 8);
+        scheduler.update_after_step(&decoding.id, 8, 1, 1.0);
+
+        let mut long = build_request(TaskType::Chat, "long", Priority::Normal);
+        long.prompt_tokens = vec![7; 2_000];
+        assert!(scheduler.add_request(&long));
+        allow_incremental_prefill(&mut scheduler, &long.id);
+        let step = scheduler.schedule();
+        assert_eq!(step.decode_requests.len(), 1, "{step:?}");
+        assert_eq!(step.decode_requests[0].request_id, decoding.id);
+        assert_eq!(step.prefill_requests.len(), 1, "{step:?}");
+        assert_eq!(step.prefill_requests[0].num_tokens, 512);
     }
 
     #[test]

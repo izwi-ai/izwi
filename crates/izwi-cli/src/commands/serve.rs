@@ -296,6 +296,10 @@ fn configure_server_command(cmd: &mut Command, args: &ServeArgs) -> Result<()> {
         "IZWI_CHUNKED_PREFILL_THRESHOLD",
         args.runtime.chunked_prefill_threshold.to_string(),
     );
+    cmd.env(
+        "IZWI_MAX_TOKENS_PER_STEP",
+        args.runtime.max_tokens_per_step.to_string(),
+    );
     if let Some(salt) = &args.runtime.managed_prefix_cache_salt {
         cmd.env("IZWI_MANAGED_PREFIX_CACHE_SALT", salt);
     } else {
@@ -709,6 +713,7 @@ mod tests {
                 max_prefix_cache_pages: None,
                 enable_chunked_prefill: false,
                 chunked_prefill_threshold: 192,
+                max_tokens_per_step: 0,
                 max_retained_sequences: 8,
                 max_staged_transactions: 8,
                 max_queued_requests: 128,

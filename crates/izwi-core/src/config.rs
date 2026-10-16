@@ -744,9 +744,15 @@ pub struct EngineConfig {
     #[serde(default = "default_enable_chunked_prefill")]
     pub enable_chunked_prefill: bool,
 
-    /// Prompt length (tokens) above which chunked prefill applies.
+    /// Prompt length (tokens) above which chunked prefill applies; zero takes
+    /// the backend's automatic chunk (512 on CUDA).
     #[serde(default = "default_chunked_prefill_threshold")]
     pub chunked_prefill_threshold: usize,
+
+    /// Token budget of one scheduler step; zero takes the backend's automatic
+    /// budget (2,048 on CUDA).
+    #[serde(default)]
+    pub max_tokens_per_step: usize,
 
     /// Host KV pool budget in bytes for hierarchical offload (DS4). A positive
     /// budget opts this engine into demoting committed prefix pages to a host
@@ -800,6 +806,7 @@ impl Default for EngineConfig {
             prefix_reuse_catalog_auto: false,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            max_tokens_per_step: 0,
             kv_host_pool_budget_bytes: 0,
             kv_offload_high_watermark: default_kv_offload_high_watermark(),
             kv_offload_low_watermark: default_kv_offload_low_watermark(),
@@ -826,7 +833,7 @@ fn default_enable_chunked_prefill() -> bool {
 }
 
 fn default_chunked_prefill_threshold() -> usize {
-    192
+    0 // The backend's automatic chunk.
 }
 
 fn default_kv_offload_high_watermark() -> f32 {

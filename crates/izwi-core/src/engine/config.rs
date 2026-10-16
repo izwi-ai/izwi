@@ -343,6 +343,41 @@ fn default_max_seq_len() -> usize {
 fn default_max_tokens_per_step() -> usize {
     384
 }
+
+/// Scheduler step sizes a backend uses when the operator leaves them
+/// automatic (zero), SCH-F3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendStepSizes {
+    pub(crate) max_tokens_per_step: usize,
+    pub(crate) chunked_prefill_threshold: usize,
+}
+
+/// Automatic step sizes per backend. An engine step launches one physical
+/// dispatch in the default serial mode and prefill is one request per
+/// dispatch, so with chunked prefill on, a step's prefill span is the chunk
+/// threshold (or the model's preferred span for an isolated request).
+///
+/// - CUDA always chunks (incremental chat turns it on). A 512-token chunk
+///   keeps the GPU's prefill matmuls wide; the 2,048-token budget covers a
+///   chunk beside a full decode batch. A larger budget would not widen a
+///   step until prefill rows batch across requests.
+/// - CPU and Metal leave chunked prefill off, so prefill runs whole prompts
+///   (full prefill ignores the chunk and the budget) and the budget only
+///   bounds decode, which needs at most 64 tokens (8 rows of 8-token quanta).
+///   The sizes apply when an operator turns chunking on, and stay at the
+///   historical 384 and 192.
+pub(crate) const fn backend_step_sizes(backend: BackendKind) -> BackendStepSizes {
+    match backend {
+        BackendKind::Cuda => BackendStepSizes {
+            max_tokens_per_step: 2_048,
+            chunked_prefill_threshold: 512,
+        },
+        BackendKind::Metal | BackendKind::Cpu => BackendStepSizes {
+            max_tokens_per_step: 384,
+            chunked_prefill_threshold: 192,
+        },
+    }
+}
 fn default_block_size() -> usize {
     64
 }
@@ -666,6 +701,24 @@ impl EngineCoreConfig {
         self.enable_chunked_prefill || self.cuda_incremental_chat_enabled()
     }
 
+    /// Set the step token budget and prefill chunk threshold from the
+    /// operator's values, where zero takes this backend's automatic size.
+    pub(crate) fn resolve_step_sizes(
+        &mut self,
+        max_tokens_per_step: usize,
+        chunked_prefill_threshold: usize,
+    ) {
+        let automatic = backend_step_sizes(self.backend);
+        self.max_tokens_per_step = match max_tokens_per_step {
+            0 => automatic.max_tokens_per_step,
+            tokens => tokens,
+        };
+        self.chunked_prefill_threshold = match chunked_prefill_threshold {
+            0 => automatic.chunked_prefill_threshold,
+            tokens => tokens,
+        };
+    }
+
     /// Resolve rollout-aware dispatch and physical-launch capacity axes.
     pub fn resolved_physical_execution_capacity(&self) -> PhysicalExecutionCapacity {
         self.physical_execution_mode
@@ -831,6 +884,32 @@ mod managed_kv_default_tests {
             assert!(!config.effective_chunked_prefill());
             config.enable_chunked_prefill = true;
             assert!(config.effective_chunked_prefill());
+        }
+    }
+
+    #[test]
+    fn automatic_step_sizes_are_per_backend() {
+        use super::backend_step_sizes;
+        let cuda = backend_step_sizes(BackendKind::Cuda);
+        assert_eq!(cuda.max_tokens_per_step, 2_048);
+        assert_eq!(cuda.chunked_prefill_threshold, 512);
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            let automatic = backend_step_sizes(backend);
+            // A chunk always fits the budget beside a full CUDA decode batch.
+            assert!(automatic.chunked_prefill_threshold + 32 <= automatic.max_tokens_per_step);
+            let mut config = EngineCoreConfig {
+                backend,
+                ..Default::default()
+            };
+            config.resolve_step_sizes(0, 0);
+            assert_eq!(config.max_tokens_per_step, automatic.max_tokens_per_step);
+            assert_eq!(
+                config.chunked_prefill_threshold,
+                automatic.chunked_prefill_threshold
+            );
+            config.resolve_step_sizes(4_096, 256);
+            assert_eq!(config.max_tokens_per_step, 4_096);
+            assert_eq!(config.chunked_prefill_threshold, 256);
         }
     }
 

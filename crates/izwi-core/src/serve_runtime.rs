@@ -29,6 +29,7 @@ pub const ENV_MANAGED_PREFIX_CACHE_SALT: &str = "IZWI_MANAGED_PREFIX_CACHE_SALT"
 pub const ENV_MAX_PREFIX_CACHE_PAGES: &str = "IZWI_MAX_PREFIX_CACHE_PAGES";
 pub const ENV_ENABLE_CHUNKED_PREFILL: &str = "IZWI_ENABLE_CHUNKED_PREFILL";
 pub const ENV_CHUNKED_PREFILL_THRESHOLD: &str = "IZWI_CHUNKED_PREFILL_THRESHOLD";
+pub const ENV_MAX_TOKENS_PER_STEP: &str = "IZWI_MAX_TOKENS_PER_STEP";
 /// Host KV pool budget for hierarchical offload (DS4). Positive values opt a
 /// worker into demoting committed prefix pages to a bounded host tier.
 pub const ENV_KV_HOST_POOL_BUDGET_BYTES: &str = "IZWI_KV_HOST_POOL_BUDGET_BYTES";
@@ -77,7 +78,11 @@ pub struct ServeRuntimeConfig {
     /// [`EngineConfig::max_prefix_cache_pages`]).
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: bool,
+    /// Zero takes the backend's automatic chunk.
     pub chunked_prefill_threshold: usize,
+    /// Scheduler step token budget; zero takes the backend's automatic budget.
+    #[serde(default)]
+    pub max_tokens_per_step: usize,
     pub max_retained_sequences: usize,
     pub max_staged_transactions: usize,
     pub max_queued_requests: usize,
@@ -118,6 +123,7 @@ impl Default for ServeRuntimeConfig {
             max_prefix_cache_pages: None,
             enable_chunked_prefill: default_enable_chunked_prefill(),
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
+            max_tokens_per_step: 0,
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
@@ -200,6 +206,9 @@ impl ServeRuntimeConfig {
         if let Some(chunked_prefill_threshold) = overrides.chunked_prefill_threshold {
             self.chunked_prefill_threshold = chunked_prefill_threshold;
         }
+        if let Some(max_tokens_per_step) = overrides.max_tokens_per_step {
+            self.max_tokens_per_step = max_tokens_per_step;
+        }
         if let Some(max_retained_sequences) = overrides.max_retained_sequences {
             self.max_retained_sequences = max_retained_sequences;
         }
@@ -252,7 +261,8 @@ impl ServeRuntimeConfig {
             managed_prefix_cache_salt: self.managed_prefix_cache_salt.clone(),
             max_prefix_cache_pages: self.max_prefix_cache_pages,
             enable_chunked_prefill: self.enable_chunked_prefill,
-            chunked_prefill_threshold: self.chunked_prefill_threshold.max(1),
+            chunked_prefill_threshold: self.chunked_prefill_threshold,
+            max_tokens_per_step: self.max_tokens_per_step,
             max_retained_sequences: self.max_retained_sequences,
             max_staged_transactions: self.max_staged_transactions,
             max_queued_requests: self.max_queued_requests.max(1),
@@ -287,6 +297,8 @@ pub struct ServeRuntimeConfigOverrides {
     pub max_prefix_cache_pages: Option<usize>,
     pub enable_chunked_prefill: Option<bool>,
     pub chunked_prefill_threshold: Option<usize>,
+    #[serde(default)]
+    pub max_tokens_per_step: Option<usize>,
     pub max_retained_sequences: Option<usize>,
     pub max_staged_transactions: Option<usize>,
     pub max_queued_requests: Option<usize>,
@@ -360,6 +372,7 @@ impl ServeRuntimeConfigOverrides {
             max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
             enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
             chunked_prefill_threshold: read_env_usize(ENV_CHUNKED_PREFILL_THRESHOLD, &[]),
+            max_tokens_per_step: read_env_usize(ENV_MAX_TOKENS_PER_STEP, &[]),
             max_retained_sequences: read_env_usize(ENV_MAX_RETAINED_SEQUENCES, &[]),
             max_staged_transactions: read_env_usize(ENV_MAX_STAGED_TRANSACTIONS, &[]),
             max_queued_requests: read_env_usize(ENV_MAX_QUEUED_REQUESTS, &[]),
@@ -418,7 +431,7 @@ fn default_enable_chunked_prefill() -> bool {
 }
 
 fn default_chunked_prefill_threshold() -> usize {
-    192
+    0 // The backend's automatic chunk.
 }
 
 fn default_max_retained_sequences() -> usize {
@@ -602,6 +615,7 @@ mod tests {
         ENV_MAX_PREFIX_CACHE_PAGES,
         ENV_ENABLE_CHUNKED_PREFILL,
         ENV_CHUNKED_PREFILL_THRESHOLD,
+        ENV_MAX_TOKENS_PER_STEP,
         ENV_MAX_RETAINED_SEQUENCES,
         ENV_MAX_STAGED_TRANSACTIONS,
         ENV_MAX_QUEUED_REQUESTS,
@@ -826,6 +840,7 @@ workers = 5
         std::env::set_var(ENV_MAX_PREFIX_CACHE_PAGES, "64");
         std::env::set_var(ENV_ENABLE_CHUNKED_PREFILL, "1");
         std::env::set_var(ENV_CHUNKED_PREFILL_THRESHOLD, "512");
+        std::env::set_var(ENV_MAX_TOKENS_PER_STEP, "1024");
 
         let resolved = ServeRuntimeConfig::from_sources(
             &ServeRuntimeConfigOverrides::default(),
@@ -850,7 +865,14 @@ workers = 5
         assert_eq!(engine.max_prefix_cache_pages, Some(64));
         assert!(engine.enable_chunked_prefill);
         assert_eq!(engine.chunked_prefill_threshold, 512);
+        assert_eq!(resolved.max_tokens_per_step, 1024);
+        assert_eq!(engine.max_tokens_per_step, 1024);
         clear_env();
+
+        // Unset, both stay automatic (zero) for the backend to size.
+        let engine = ServeRuntimeConfig::default().engine_config();
+        assert_eq!(engine.chunked_prefill_threshold, 0);
+        assert_eq!(engine.max_tokens_per_step, 0);
     }
 
     /// An unset prefix page budget reaches the engine unset (automatic, sized

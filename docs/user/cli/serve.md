@@ -154,6 +154,8 @@ izwi serve --mode web --no-ui
 | `IZWI_MODELS_DIR` | `--models-dir` |
 | `IZWI_BACKEND` | `--backend` |
 | `IZWI_MAX_BATCH_SIZE` | `--max-batch-size` |
+| `IZWI_MAX_TOKENS_PER_STEP` | Environment only: scheduler token budget per step (default `0`, the backend's: 2048 on CUDA, 384 on CPU/Metal) |
+| `IZWI_CHUNKED_PREFILL_THRESHOLD` | Environment only: prefill chunk in tokens when chunked prefill is on (default `0`, the backend's: 512 on CUDA, 192 on CPU/Metal) |
 | `IZWI_NUM_THREADS` | `--threads` |
 | `IZWI_MAX_CONCURRENT` | `--max-concurrent` |
 | `IZWI_TIMEOUT` | `--timeout` |

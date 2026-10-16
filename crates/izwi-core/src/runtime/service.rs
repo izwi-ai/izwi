@@ -3511,7 +3511,8 @@ impl RuntimeService {
         // length request plus the prefix budget.
         core_config.apply_backend_context_capacity(config.portable_context_ceiling());
         core_config.enable_chunked_prefill = config.enable_chunked_prefill;
-        core_config.chunked_prefill_threshold = config.chunked_prefill_threshold.max(1);
+        core_config
+            .resolve_step_sizes(config.max_tokens_per_step, config.chunked_prefill_threshold);
         // DS4 hierarchical offload: explicit opt-in through the host pool
         // budget; the manager materializes pools only where committed prefix
         // pages exist.
@@ -11316,6 +11317,39 @@ mod tests {
         let core = explicit.core_engine.config();
         assert_eq!(core.max_staged_transactions, 3);
         assert!(!core.automatic_row_limits.staged_transactions);
+    }
+
+    /// Unset step sizes take the backend's automatic budget and chunk; an
+    /// operator's values reach the engine core unchanged.
+    #[test]
+    fn step_budget_and_prefill_chunk_resolve_per_backend() {
+        let mut automatic = EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..Default::default()
+        };
+        automatic.resolve_step_sizes(0, 0);
+        let service = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let core = service.core_engine.config();
+        assert_eq!(core.max_tokens_per_step, automatic.max_tokens_per_step);
+        assert_eq!(
+            core.chunked_prefill_threshold,
+            automatic.chunked_prefill_threshold
+        );
+
+        let explicit = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_tokens_per_step: 640,
+            chunked_prefill_threshold: 96,
+            ..Default::default()
+        })
+        .unwrap();
+        let core = explicit.core_engine.config();
+        assert_eq!(core.max_tokens_per_step, 640);
+        assert_eq!(core.chunked_prefill_threshold, 96);
     }
 
     #[test]
