@@ -6,6 +6,7 @@ pub(crate) mod audio_payload;
 pub mod chat;
 pub mod diarization;
 pub mod docs;
+pub(crate) mod idempotency;
 pub mod internal;
 pub mod jobs;
 pub mod media;

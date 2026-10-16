@@ -1605,8 +1605,163 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    fn keyed_request(path: &str, body: &str, key: &str, tenant: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("idempotency-key", key)
+            .header("x-test-tenant", tenant)
+            .body(Body::from(body.to_string()))
+            .expect("request should build")
+    }
+
+    async fn count_rows(state: &AppState, sql: &str) -> i64 {
+        use sea_orm::ConnectionTrait;
+        let db = state.batch_runtime_store.connection().await.unwrap();
+        db.query_one_raw(crate::db::raw::statement(db, sql, vec![]).unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by_index::<i64>(0)
+            .unwrap()
+    }
+
+    /// DUR-F3: a keyed transcription retry replays the original job instead
+    /// of creating a second one, a different body is a conflict, and keys
+    /// are scoped per tenant. Nothing is written to the legacy table.
     #[tokio::test]
-    async fn keyed_streaming_and_reference_tts_reject_before_creating_records() {
+    async fn keyed_transcription_replays_conflicts_and_is_tenant_scoped() {
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.auth = Arc::new(HeaderTenantAuth);
+        let (state, _root) = test_state_with_hooks("keyed_transcription", false, hooks);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        let path = "/v1/speech-to-text/jobs?job_kind=transcription";
+        let body = tiny_audio_json_body();
+
+        let first = send_request(app.clone(), keyed_request(path, &body, "asr-1", "a")).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_id = read_json(first).await["id"].as_str().unwrap().to_string();
+
+        let retry = send_request(app.clone(), keyed_request(path, &body, "asr-1", "a")).await;
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            read_json(retry).await["id"].as_str(),
+            Some(first_id.as_str())
+        );
+
+        let changed = tiny_audio_json_body_with_fields(r#""language":"French""#);
+        let conflict = send_request(app.clone(), keyed_request(path, &changed, "asr-1", "a")).await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        let other = send_request(app.clone(), keyed_request(path, &body, "asr-1", "b")).await;
+        assert_eq!(other.status(), StatusCode::ACCEPTED);
+        assert_ne!(
+            read_json(other).await["id"].as_str(),
+            Some(first_id.as_str())
+        );
+
+        assert_eq!(
+            count_rows(
+                &state,
+                "SELECT COUNT(*) FROM runtime_jobs WHERE job_kind = 'asr_transcription'"
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            count_rows(&state, "SELECT COUNT(*) FROM transcription_records").await,
+            2
+        );
+        assert_eq!(
+            count_rows(&state, "SELECT COUNT(*) FROM idempotency_keys").await,
+            0
+        );
+    }
+
+    /// DUR-F3: reference-voice TTS takes the same keyed path as text-only TTS.
+    #[tokio::test]
+    async fn keyed_reference_tts_replays_without_duplicate_work() {
+        let mut hooks = EnterpriseHooks::noop();
+        hooks.auth = Arc::new(HeaderTenantAuth);
+        let (state, _root) = test_state_with_hooks("keyed_reference_tts", false, hooks);
+        state.lifecycle.mark_ready();
+        let config = ServeRuntimeConfig {
+            backend: izwi_core::backends::BackendPreference::Cpu,
+            ui_enabled: false,
+            ..ServeRuntimeConfig::default()
+        };
+        let app = create_router(state.clone(), &config);
+        let samples = (0..12_000)
+            .map(|index| ((index as f32) * 0.05).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let wav = AudioEncoder::new(24_000, 1)
+            .encode(&samples, AudioFormat::Wav)
+            .expect("reference wav should encode");
+        let reference = base64::engine::general_purpose::STANDARD.encode(wav);
+        let body = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-Base",
+            "text": "Clone this voice",
+            "reference_audio": reference,
+            "reference_text": "reference words"
+        })
+        .to_string();
+
+        let first = send_request(
+            app.clone(),
+            keyed_request("/v1/text-to-speech", &body, "ref-1", "a"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_id = read_json(first).await["id"].as_str().unwrap().to_string();
+
+        let retry = send_request(
+            app.clone(),
+            keyed_request("/v1/text-to-speech", &body, "ref-1", "a"),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            read_json(retry).await["id"].as_str(),
+            Some(first_id.as_str())
+        );
+
+        let changed = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-Base",
+            "text": "Clone this voice",
+            "reference_audio": reference,
+            "reference_text": "other reference words"
+        })
+        .to_string();
+        let conflict = send_request(
+            app,
+            keyed_request("/v1/text-to-speech", &changed, "ref-1", "a"),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+        assert_eq!(
+            count_rows(
+                &state,
+                "SELECT COUNT(*) FROM runtime_jobs WHERE job_kind = 'tts_speech'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count_rows(&state, "SELECT COUNT(*) FROM speech_history_records").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_streaming_tts_rejects_before_creating_records() {
         use crate::speech_history_store::SpeechRouteKind;
 
         let (state, _root) = test_state("keyed_tts_unsupported_shapes", false);
@@ -1617,28 +1772,18 @@ mod tests {
             ..ServeRuntimeConfig::default()
         };
         let app = create_router(state.clone(), &config);
-        for body in [
-            serde_json::json!({
-                "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
-                "text": "stream me",
-                "stream": true
-            })
-            .to_string(),
-            serde_json::json!({
-                "model_id": "Qwen3-TTS-12Hz-1.7B-Base",
-                "text": "clone me",
-                "reference_audio": "not-valid-base64",
-                "reference_text": "reference words"
-            })
-            .to_string(),
-        ] {
-            let response = send_request(
-                app.clone(),
-                build_request_with_idempotency(&body, "unsupported-key"),
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
+        let body = serde_json::json!({
+            "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            "text": "stream me",
+            "stream": true
+        })
+        .to_string();
+        let response = send_request(
+            app,
+            build_request_with_idempotency(&body, "unsupported-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let (records, _) = state
             .speech_history_store
             .list_records_page(SpeechRouteKind::TextToSpeech, 10, None)
@@ -3298,6 +3443,25 @@ mod tests {
     impl AuthProvider for FixedPrincipalAuth {
         async fn authenticate(&self, _request: &RequestEnvelope) -> HookResult<Principal> {
             Ok(self.0.clone())
+        }
+    }
+
+    /// Authenticates each request as the tenant its `x-test-tenant` names.
+    struct HeaderTenantAuth;
+
+    #[async_trait]
+    impl AuthProvider for HeaderTenantAuth {
+        async fn authenticate(&self, request: &RequestEnvelope) -> HookResult<Principal> {
+            let tenant = request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("x-test-tenant"))
+                .map(|header| header.value.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let mut principal = Principal::local_anonymous();
+            principal.id = format!("{tenant}-user");
+            principal.tenant_id = Some(tenant);
+            Ok(principal)
         }
     }
 

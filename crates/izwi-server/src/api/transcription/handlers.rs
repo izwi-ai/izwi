@@ -19,12 +19,17 @@ use crate::api::audio_payload::{
     decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
+use crate::api::idempotency::{
+    begin_durable_idempotency, extract_idempotency_key, release_durable_idempotency,
+    replay_record_id, reservation_lost, DurableIdempotencyStart, DURABLE_IDEMPOTENCY_RETENTION_MS,
+};
 use crate::api::request_context::RequestContext;
 use crate::batch_runtime::{
     store::{
-        sha256_hex, BatchRuntimeStore, DurableJobAcceptanceOutcome, NewDurableJobAcceptance,
-        NewDurableJobArtifact, NewDurableJobStage, NewIdempotencyRecord, NewRuntimeArtifact,
-        NewRuntimeJob, NewStageOutputArtifact, NewTextAsset,
+        canonical_request_digest, sha256_hex, BatchRuntimeStore, DurableIdempotencyRequest,
+        DurableIdempotencyReservation, DurableJobAcceptanceOutcome, NewDurableJobAcceptance,
+        NewDurableJobArtifact, NewDurableJobStage, NewRuntimeArtifact, NewRuntimeJob,
+        NewStageOutputArtifact, NewTextAsset, DURABLE_IDEMPOTENCY_DIGEST_VERSION,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifactKind, RuntimeArtifactRole, RuntimeJobKind,
@@ -67,6 +72,9 @@ const MIN_SENTENCE_BREAK_WORDS: usize = 5;
 const SEGMENT_GAP_BREAK_SECS: f32 = 0.85;
 pub(crate) const BATCH_ASR_STAGE_KIND: &str = "asr_transcribe";
 const LONG_FORM_ASR_THRESHOLD_SECS: f64 = 5.0 * 60.0;
+const DURABLE_ASR_IDEMPOTENCY_OPERATION: &str = "transcription.create";
+/// The upload is ingested and canonicalized while the key is reserved.
+const DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 5 * 60 * 1_000;
 #[cfg(not(test))]
 const TRANSCRIPTION_TERMINAL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -297,11 +305,56 @@ async fn create_record_for_mode(
     req: Request,
     record_mode: TranscriptionRecordMode,
 ) -> Result<Response, ApiError> {
-    let idempotency_key = extract_idempotency_key(&req);
+    let idempotency_key = extract_idempotency_key(req.headers())?;
     let mut parsed = parse_create_request(req).await?;
     parsed.record_mode = record_mode;
     prepare_create_request(&mut parsed)?;
-    let placeholder = create_pending_record(&state, &mut parsed).await?;
+    let reservation = match idempotency_key {
+        Some(_) if parsed.stream => {
+            return Err(ApiError::bad_request(
+                "Idempotency-Key is not supported for streaming transcription requests",
+            ));
+        }
+        Some(idempotency_key) => {
+            match begin_durable_idempotency(
+                &state.batch_runtime_store,
+                DurableIdempotencyRequest {
+                    tenant_scope: ctx.tenant_scope(),
+                    operation: DURABLE_ASR_IDEMPOTENCY_OPERATION.to_string(),
+                    idempotency_key,
+                    digest_version: DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+                    request_digest: transcription_request_digest(&parsed)?,
+                    reservation_ttl_ms: DURABLE_ASR_IDEMPOTENCY_RESERVATION_TTL_MS,
+                },
+                "transcription",
+            )
+            .await?
+            {
+                DurableIdempotencyStart::Reserved(reservation) => Some(reservation),
+                DurableIdempotencyStart::Replay(replay) => {
+                    let record = state
+                        .transcription_store
+                        .get_record(replay_record_id(&replay)?)
+                        .await
+                        .map_err(map_store_error)?
+                        .ok_or_else(|| {
+                            ApiError::internal(
+                                "Stored transcription idempotency record no longer exists",
+                            )
+                        })?;
+                    return Ok((StatusCode::ACCEPTED, Json(record)).into_response());
+                }
+            }
+        }
+        None => None,
+    };
+    let placeholder = match create_pending_record(&state, &mut parsed).await {
+        Ok(placeholder) => placeholder,
+        Err(err) => {
+            release_durable_idempotency(&state.batch_runtime_store, reservation.as_ref()).await;
+            return Err(err);
+        }
+    };
 
     if parsed.stream {
         return create_record_stream(state, parsed, placeholder, ctx.correlation_id).await;
@@ -312,10 +365,11 @@ async fn create_record_for_mode(
         &placeholder,
         &parsed,
         Some(ctx.correlation_id),
-        idempotency_key,
+        reservation.clone(),
     )
     .await
     {
+        release_durable_idempotency(&state.batch_runtime_store, reservation.as_ref()).await;
         let _ = state
             .transcription_store
             .update_processing_status(
@@ -421,14 +475,25 @@ async fn create_pending_record(
         .map_err(map_store_error)
 }
 
-fn extract_idempotency_key(req: &Request) -> Option<String> {
-    req.headers()
-        .get("idempotency-key")
-        .or_else(|| req.headers().get("x-idempotency-key"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+/// The keyed request's canonical digest: every field that changes the job,
+/// with the upload identified by its content hash.
+fn transcription_request_digest(
+    parsed: &ParsedTranscriptionCreateRequest,
+) -> Result<String, ApiError> {
+    let semantic_request = serde_json::json!({
+        "version": DURABLE_IDEMPOTENCY_DIGEST_VERSION,
+        "operation": DURABLE_ASR_IDEMPOTENCY_OPERATION,
+        "request": BatchTranscriptionRequest::from_parsed(parsed),
+        "audio_sha256": sha256_hex(&parsed.audio_bytes),
+        "audio_bytes": parsed.audio_bytes.len(),
+        "audio_mime_type": parsed.audio_mime_type,
+        "audio_filename": parsed.audio_filename,
+    });
+    canonical_request_digest(&semantic_request).map_err(|err| {
+        ApiError::payload_too_large(format!(
+            "Transcription idempotency request cannot be canonicalized: {err}"
+        ))
+    })
 }
 
 async fn enqueue_batch_transcription_job(
@@ -436,7 +501,7 @@ async fn enqueue_batch_transcription_job(
     placeholder: &TranscriptionRecord,
     parsed: &ParsedTranscriptionCreateRequest,
     correlation_id: Option<String>,
-    idempotency_key: Option<String>,
+    reservation: Option<DurableIdempotencyReservation>,
 ) -> Result<(), ApiError> {
     let audio = state
         .transcription_store
@@ -447,11 +512,6 @@ async fn enqueue_batch_transcription_job(
     let request_snapshot = BatchTranscriptionRequest::from_parsed(parsed);
     let request_json = serde_json::to_value(&request_snapshot)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let request_hash = sha256_hex(
-        serde_json::to_string(&request_json)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
 
     let ingested = state
         .media_ingest
@@ -497,7 +557,7 @@ async fn enqueue_batch_transcription_job(
                 model_snapshot_json: serde_json::json!({}),
                 retry_policy_json: serde_json::json!({"max_attempts": 2}),
                 max_attempts: 2,
-                idempotency_key: idempotency_key.clone(),
+                idempotency_key: None,
                 correlation_id,
             },
             text_input: None,
@@ -556,41 +616,17 @@ async fn enqueue_batch_transcription_job(
                     ..StageResourceHints::default()
                 },
             }],
-            reservation: None,
-            idempotency_response: serde_json::Value::Null,
-            idempotency_retention_ms: 0,
+            reservation,
+            idempotency_response: serde_json::json!({"record_id": placeholder.id}),
+            idempotency_retention_ms: DURABLE_IDEMPOTENCY_RETENTION_MS,
         })
         .await
         .map_err(map_store_error)?;
-    let job = match accepted {
-        DurableJobAcceptanceOutcome::Committed(accepted) => accepted.job,
-        DurableJobAcceptanceOutcome::ReservationLost => {
-            return Err(ApiError::internal(
-                "Unkeyed transcription acceptance reported a lost reservation",
-            ))
-        }
-    };
+    if let DurableJobAcceptanceOutcome::ReservationLost = accepted {
+        return Err(reservation_lost("Transcription"));
+    }
 
     state.runtime.record_batch_asr_pipeline_job();
-
-    if let Some(idempotency_key) = idempotency_key {
-        state
-            .batch_runtime_store
-            .record_idempotency(NewIdempotencyRecord {
-                operation: "transcription.create".to_string(),
-                idempotency_key,
-                expires_at: None,
-                request_hash,
-                response_json: Some(
-                    serde_json::json!({"record_id": placeholder.id, "job_id": job.id}),
-                ),
-                runtime_job_id: Some(job.id),
-                conflict_message: None,
-                metadata_json: serde_json::json!({}),
-            })
-            .await
-            .map_err(map_store_error)?;
-    }
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::types::{
-    ClaimedStage, IdempotencyRecord, JobStage, MediaAsset, QueueClass, RuntimeArtifact,
-    RuntimeArtifactKind, RuntimeArtifactRole, RuntimeCancellationState, RuntimeJob, RuntimeJobKind,
-    RuntimeJobStatus, RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
+    ClaimedStage, JobStage, MediaAsset, QueueClass, RuntimeArtifact, RuntimeArtifactKind,
+    RuntimeArtifactRole, RuntimeCancellationState, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
+    RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
     RuntimeWorkerRegistration, StageLease, StageResourceHints, TextAsset, WorkerResourceCapacity,
     WORKER_HEARTBEAT_DETAILS_VERSION, WORKER_REGISTRATION_VERSION,
 };
@@ -614,18 +614,6 @@ pub(crate) enum ReservedStageArtifactPublication {
         artifact: RuntimeArtifact,
     },
     Existing(RuntimeArtifact),
-}
-
-#[derive(Debug, Clone)]
-pub struct NewIdempotencyRecord {
-    pub operation: String,
-    pub idempotency_key: String,
-    pub expires_at: Option<u64>,
-    pub request_hash: String,
-    pub response_json: Option<serde_json::Value>,
-    pub runtime_job_id: Option<String>,
-    pub conflict_message: Option<String>,
-    pub metadata_json: serde_json::Value,
 }
 
 /// Versioned, bounded identity for one durable create-operation request.
@@ -5854,73 +5842,6 @@ impl BatchRuntimeStore {
         Ok(removed)
     }
 
-    pub async fn record_idempotency(
-        &self,
-        input: NewIdempotencyRecord,
-    ) -> anyhow::Result<IdempotencyRecord> {
-        let db = self.db.connection().await?;
-        let now = self.now_millis();
-        let response_json = input
-            .response_json
-            .as_ref()
-            .map(|value| json_to_db_string(value, "{}"))
-            .transpose()?;
-        let metadata_json = json_to_db_string(&input.metadata_json, "{}")?;
-
-        db.execute_raw(raw::statement(
-            db,
-            r#"
-            INSERT INTO idempotency_keys (
-                operation,
-                idempotency_key,
-                created_at,
-                expires_at,
-                request_hash,
-                response_json,
-                runtime_job_id,
-                conflict_message,
-                metadata_json
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            vec![
-                input.operation.clone().into(),
-                input.idempotency_key.clone().into(),
-                now.into(),
-                opt_u64(input.expires_at),
-                input.request_hash.into(),
-                opt_string(response_json),
-                opt_string(input.runtime_job_id),
-                opt_string(input.conflict_message),
-                metadata_json.into(),
-            ],
-        )?)
-        .await
-        .context("Failed to record idempotency key")?;
-
-        self.get_idempotency_record(&input.operation, &input.idempotency_key)
-            .await?
-            .ok_or_else(|| anyhow!("Created idempotency record was not found"))
-    }
-
-    pub async fn get_idempotency_record(
-        &self,
-        operation: &str,
-        idempotency_key: &str,
-    ) -> anyhow::Result<Option<IdempotencyRecord>> {
-        let db = self.db.connection().await?;
-        let row = db
-            .query_one_raw(raw::statement(
-                db,
-                IDEMPOTENCY_RECORD_COLUMNS_SQL,
-                vec![operation.into(), idempotency_key.into()],
-            )?)
-            .await
-            .context("Failed to load idempotency record")?;
-
-        row.as_ref().map(map_idempotency_record).transpose()
-    }
-
     pub async fn upsert_worker_heartbeat(
         &self,
         update: WorkerHeartbeatUpdate,
@@ -7763,8 +7684,6 @@ const RUNTIME_ARTIFACT_COLUMNS_SQL: &str =
     "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE id = ?1";
 const RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL: &str =
     "SELECT id, job_id, stage_id, producer_attempt_count, producer_attempt_token, publication_key, created_at, artifact_kind, artifact_role, media_asset_id, text_asset_id, storage_key, content_type, filename, size_bytes, sha256, metadata_json, retention_policy FROM runtime_artifacts WHERE job_id = ?1 ORDER BY created_at ASC, id ASC";
-const IDEMPOTENCY_RECORD_COLUMNS_SQL: &str =
-    "SELECT operation, idempotency_key, created_at, expires_at, request_hash, response_json, runtime_job_id, conflict_message, metadata_json FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2";
 const WORKER_HEARTBEAT_COLUMNS_SQL: &str =
     "SELECT worker_id, started_at, last_heartbeat_at, status, queue_names_json, instance_id, registration_version, registration_json, heartbeat_version, available_slots, heartbeat_details_json, current_job_id, current_stage_id, diagnostic_json FROM runtime_worker_heartbeats WHERE worker_id = ?1";
 const RUNTIME_WORKER_HEARTBEATS_SQL: &str =
@@ -8274,22 +8193,6 @@ fn map_runtime_artifact(row: &QueryResult) -> anyhow::Result<RuntimeArtifact> {
         sha256: row.try_get_by_index(15)?,
         metadata_json: parse_json_value(row.try_get_by_index::<String>(16)?, json!({})),
         retention_policy: row.try_get_by_index(17)?,
-    })
-}
-
-fn map_idempotency_record(row: &QueryResult) -> anyhow::Result<IdempotencyRecord> {
-    Ok(IdempotencyRecord {
-        operation: row.try_get_by_index(0)?,
-        idempotency_key: row.try_get_by_index(1)?,
-        created_at: i64_to_u64(row.try_get_by_index(2)?)?,
-        expires_at: opt_i64_to_u64(row.try_get_by_index(3)?)?,
-        request_hash: row.try_get_by_index(4)?,
-        response_json: row
-            .try_get_by_index::<Option<String>>(5)?
-            .map(|raw| parse_json_value(raw, json!({}))),
-        runtime_job_id: row.try_get_by_index(6)?,
-        conflict_message: row.try_get_by_index(7)?,
-        metadata_json: parse_json_value(row.try_get_by_index::<String>(8)?, json!({})),
     })
 }
 
@@ -9646,20 +9549,6 @@ mod tests {
             .await
             .expect("artifact");
 
-        let idempotency = store
-            .record_idempotency(NewIdempotencyRecord {
-                operation: "job.create".to_string(),
-                idempotency_key: "idem-1".to_string(),
-                expires_at: None,
-                request_hash: sha256_hex(br#"{"language":"en"}"#),
-                response_json: Some(json!({"job_id": job.id})),
-                runtime_job_id: Some(job.id.clone()),
-                conflict_message: None,
-                metadata_json: json!({}),
-            })
-            .await
-            .expect("idempotency");
-
         let heartbeat = store
             .upsert_worker_heartbeat(WorkerHeartbeatUpdate {
                 worker_id: "worker-1".to_string(),
@@ -9676,7 +9565,6 @@ mod tests {
         assert_eq!(artifact.producer_attempt_count, None);
         assert_eq!(artifact.producer_attempt_token, None);
         assert_eq!(artifact.publication_key, None);
-        assert_eq!(idempotency.runtime_job_id.as_deref(), Some(job.id.as_str()));
         assert_eq!(heartbeat.queue_names, vec!["batch"]);
         assert_eq!(heartbeat.instance_id, "worker-1");
         assert_eq!(

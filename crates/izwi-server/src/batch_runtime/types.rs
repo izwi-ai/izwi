@@ -572,19 +572,6 @@ pub struct RuntimeArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IdempotencyRecord {
-    pub operation: String,
-    pub idempotency_key: String,
-    pub created_at: u64,
-    pub expires_at: Option<u64>,
-    pub request_hash: String,
-    pub response_json: Option<serde_json::Value>,
-    pub runtime_job_id: Option<String>,
-    pub conflict_message: Option<String>,
-    pub metadata_json: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeWorkerHeartbeat {
     pub worker_id: String,
     pub started_at: u64,
