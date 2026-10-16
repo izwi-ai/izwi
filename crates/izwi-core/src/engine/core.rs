@@ -5401,9 +5401,12 @@ impl EngineCore {
                 }
             }
 
-            // Process output
+            // Process output. Only these two facts are read afterwards, so the
+            // output (audio, text, logprobs) moves instead of being copied.
+            let finished = exec_output.finished;
+            let user_visible = Self::has_user_visible_output(&exec_output);
             let mut engine_output = self.output_processor.process_execution(
-                exec_output.clone(),
+                exec_output,
                 &disposition,
                 sequence_id,
                 generation_time,
@@ -5425,7 +5428,7 @@ impl EngineCore {
             // when the probed prefix is lost and the row replans from zero.
             engine_output.token_stats.cached_prefix_tokens =
                 self.scheduler.managed_prefix_cursor(&request_id);
-            if exec_output.finished {
+            if finished {
                 if let Some((_, total_generated)) = self.scheduler.get_running_info(&request_id) {
                     let resolved_total = total_generated.max(engine_output.num_tokens);
                     engine_output.num_tokens = resolved_total;
@@ -5440,7 +5443,7 @@ impl EngineCore {
                     );
                 }
             }
-            if Self::has_user_visible_output(&exec_output) {
+            if user_visible {
                 if let Some(phase) = self.request_phase_timings.get_mut(&request_id) {
                     phase.first_output_ms.get_or_insert(generation_time_ms);
                 }
