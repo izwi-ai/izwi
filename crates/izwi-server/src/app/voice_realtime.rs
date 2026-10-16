@@ -2954,6 +2954,7 @@ async fn run_agent_turn(
             AgentTurnOptions {
                 max_output_tokens: max_output_tokens.clamp(1, 4096),
                 max_tool_calls: 1,
+                ..AgentTurnOptions::default()
             },
         )
         .await

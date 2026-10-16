@@ -3,6 +3,7 @@ use crate::errors::{AgentError, Result};
 use crate::memory::{MemoryMessage, MemoryMessageMeta, MemoryMessageRole, MemoryStore};
 use crate::model::{ModelBackend, ModelRequest};
 use crate::planner::{PlanSummary, Planner, PlannerContext, PlannerDecision};
+use crate::reasoning::strip_reasoning;
 use crate::session::{AgentEvent, AgentSession, AgentTurnResult, ToolCallRecord, TurnInput};
 use crate::tools::{ToolContext, ToolRegistry};
 
@@ -10,6 +11,13 @@ use crate::tools::{ToolContext, ToolRegistry};
 pub struct AgentTurnOptions {
     pub max_output_tokens: usize,
     pub max_tool_calls: usize,
+    /// How much of the thread's history the prompt carries.
+    pub history: HistoryBudget,
+    /// Whether the turn stores the assistant reply itself. A caller that
+    /// learns later how much of the reply reached the user (voice: an
+    /// interrupted reply was only partly heard) stores it with
+    /// [`AgentEngine::commit_assistant_reply`] instead.
+    pub persist_assistant_reply: bool,
 }
 
 impl Default for AgentTurnOptions {
@@ -17,8 +25,65 @@ impl Default for AgentTurnOptions {
         Self {
             max_output_tokens: 1536,
             max_tool_calls: 1,
+            history: HistoryBudget::default(),
+            persist_assistant_reply: true,
         }
     }
+}
+
+/// The most conversation history a prompt carries: the newest messages that
+/// fit both limits, starting at a user message. System messages at the head
+/// of the history (memory context) are always kept. The token count is an
+/// estimate (four characters a token); the model's own context check stays
+/// authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBudget {
+    pub max_messages: usize,
+    pub max_tokens: usize,
+}
+
+impl Default for HistoryBudget {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+impl HistoryBudget {
+    pub const UNBOUNDED: Self = Self {
+        max_messages: usize::MAX,
+        max_tokens: usize::MAX,
+    };
+
+    /// The part of `history` this budget keeps.
+    pub fn apply(self, mut history: Vec<MemoryMessage>) -> Vec<MemoryMessage> {
+        let pinned = history
+            .iter()
+            .take_while(|message| message.role == MemoryMessageRole::System)
+            .count();
+        let conversation = history.split_off(pinned);
+        let mut tokens = 0usize;
+        let mut start = conversation.len();
+        for (index, message) in conversation.iter().enumerate().rev() {
+            tokens = tokens.saturating_add(estimate_tokens(&message.content));
+            if conversation.len() - index > self.max_messages || tokens > self.max_tokens {
+                break;
+            }
+            start = index;
+        }
+        // A window never opens on the reply to a user message it dropped.
+        while conversation
+            .get(start)
+            .is_some_and(|message| message.role != MemoryMessageRole::User)
+        {
+            start += 1;
+        }
+        history.extend(conversation.into_iter().skip(start));
+        history
+    }
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(4).max(1)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,7 +121,9 @@ impl AgentEngine {
         }];
 
         let history = if agent.capabilities.memory {
-            memory.load_messages(&session.thread_id).await?
+            options
+                .history
+                .apply(memory.load_messages(&session.thread_id).await?)
         } else {
             Vec::new()
         };
@@ -154,11 +221,11 @@ impl AgentEngine {
             })
             .await?;
 
-        memory
-            .append_message(
-                &session.thread_id,
-                MemoryMessageRole::Assistant,
-                output.text.clone(),
+        if options.persist_assistant_reply {
+            self.commit_assistant_reply(
+                memory,
+                session,
+                &output.text,
                 MemoryMessageMeta {
                     model_id: Some(resolved_model_id.clone()),
                     tokens_generated: Some(output.tokens_generated),
@@ -166,6 +233,7 @@ impl AgentEngine {
                 },
             )
             .await?;
+        }
 
         events.push(AgentEvent::AssistantMessage {
             content: output.text.clone(),
@@ -183,6 +251,29 @@ impl AgentEngine {
             events,
         })
     }
+
+    /// Store an assistant reply in the session's thread, without its
+    /// reasoning. An empty reply is not stored.
+    pub async fn commit_assistant_reply<M: MemoryStore>(
+        &self,
+        memory: &M,
+        session: &AgentSession,
+        reply: &str,
+        meta: MemoryMessageMeta,
+    ) -> Result<()> {
+        let reply = strip_reasoning(reply);
+        if reply.is_empty() {
+            return Ok(());
+        }
+        memory
+            .append_message(
+                &session.thread_id,
+                MemoryMessageRole::Assistant,
+                reply,
+                meta,
+            )
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +283,7 @@ mod tests {
     use crate::errors::Result;
     use crate::model::{ModelBackend, ModelOutput, ModelRequest};
     use crate::planner::{PlanningMode, SimplePlanner};
+    use crate::session::AgentTurnResult;
     use crate::tools::{TimeTool, ToolRegistry};
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
@@ -223,7 +315,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TestModel;
+    struct TestModel {
+        /// Prefix every reply with a reasoning block.
+        thinks: bool,
+        prompts: Mutex<Vec<Vec<MemoryMessage>>>,
+    }
 
     #[async_trait]
     impl ModelBackend for TestModel {
@@ -231,15 +327,177 @@ mod tests {
             let prompt = request
                 .messages
                 .iter()
+                .rev()
                 .find(|m| m.role == MemoryMessageRole::User)
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
+            self.prompts.lock().expect("lock").push(request.messages);
+            let thinking = if self.thinks {
+                "<think>hmm</think>"
+            } else {
+                ""
+            };
             Ok(ModelOutput {
-                text: format!("Echo: {prompt}"),
+                text: format!("{thinking}Echo: {prompt}"),
                 tokens_generated: 5,
                 generation_time_ms: 1.0,
             })
         }
+    }
+
+    fn message(role: MemoryMessageRole, content: &str) -> MemoryMessage {
+        MemoryMessage {
+            role,
+            content: content.to_string(),
+        }
+    }
+
+    fn test_agent() -> (AgentDefinition, AgentSession) {
+        (
+            AgentDefinition {
+                id: "voice".to_string(),
+                name: "Voice Agent".to_string(),
+                system_prompt: "Be helpful".to_string(),
+                default_model: "Qwen3.5-4B".to_string(),
+                capabilities: AgentCapabilities {
+                    tools: false,
+                    ..AgentCapabilities::default()
+                },
+                planning_mode: PlanningMode::Auto,
+            },
+            AgentSession {
+                id: "sess_1".to_string(),
+                agent_id: "voice".to_string(),
+                thread_id: "thread_1".to_string(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+    }
+
+    async fn turn(
+        memory: &TestMemory,
+        model: &TestModel,
+        text: &str,
+        options: AgentTurnOptions,
+    ) -> AgentTurnResult {
+        let (agent, session) = test_agent();
+        AgentEngine
+            .run_turn(
+                &agent,
+                &session,
+                TurnInput {
+                    text: text.to_string(),
+                },
+                None,
+                memory,
+                model,
+                &SimplePlanner,
+                &ToolRegistry::new(),
+                options,
+            )
+            .await
+            .expect("turn")
+    }
+
+    /// SPK-F13: the budget keeps the newest whole turns that fit, never
+    /// opens on an orphaned reply, and always keeps the leading system
+    /// context.
+    #[test]
+    fn history_budget_keeps_the_newest_turns_and_the_system_context() {
+        use MemoryMessageRole::{Assistant, System, User};
+        let history = vec![
+            message(System, "memory context"),
+            message(User, "u1"),
+            message(Assistant, "a1"),
+            message(User, "u2"),
+            message(Assistant, "a2"),
+            message(User, "u3"),
+            message(Assistant, "a3"),
+        ];
+        let kept = |budget: HistoryBudget| -> Vec<String> {
+            budget
+                .apply(history.clone())
+                .into_iter()
+                .map(|message| message.content)
+                .collect()
+        };
+        let by_messages = |max_messages| HistoryBudget {
+            max_messages,
+            max_tokens: usize::MAX,
+        };
+        assert_eq!(
+            kept(by_messages(4)),
+            ["memory context", "u2", "a2", "u3", "a3"]
+        );
+        // Three messages would open on a2, a reply without its question.
+        assert_eq!(kept(by_messages(3)), ["memory context", "u3", "a3"]);
+        assert_eq!(kept(by_messages(0)), ["memory context"]);
+        // Each two-character message estimates at one token.
+        let by_tokens = HistoryBudget {
+            max_messages: usize::MAX,
+            max_tokens: 2,
+        };
+        assert_eq!(kept(by_tokens), ["memory context", "u3", "a3"]);
+        assert_eq!(kept(HistoryBudget::UNBOUNDED).len(), history.len());
+    }
+
+    /// SPK-F13: the prompt carries only the budgeted history, and the stored
+    /// reply has no reasoning.
+    #[tokio::test]
+    async fn turns_bound_the_prompt_history_and_store_replies_without_reasoning() {
+        let memory = TestMemory::default();
+        let model = TestModel {
+            thinks: true,
+            ..TestModel::default()
+        };
+        let options = AgentTurnOptions {
+            history: HistoryBudget {
+                max_messages: 2,
+                max_tokens: usize::MAX,
+            },
+            ..AgentTurnOptions::default()
+        };
+        for text in ["one", "two", "three"] {
+            let result = turn(&memory, &model, text, options).await;
+            assert!(result.assistant_text.starts_with("<think>"));
+        }
+        let stored = memory.messages.lock().expect("lock").clone();
+        assert_eq!(stored.len(), 6);
+        assert_eq!(stored[5].content, "Echo: three");
+        // System prompt, the previous turn and the new user message.
+        let prompts = model.prompts.lock().expect("lock");
+        let last: Vec<&str> = prompts[2].iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(last, ["Be helpful", "two", "Echo: two", "three"]);
+    }
+
+    /// SPK-F13: a caller that defers the reply stores it later, once it
+    /// knows how much of it the user heard.
+    #[tokio::test]
+    async fn a_deferred_reply_is_stored_only_when_committed() {
+        let memory = TestMemory::default();
+        let model = TestModel::default();
+        let options = AgentTurnOptions {
+            persist_assistant_reply: false,
+            ..AgentTurnOptions::default()
+        };
+        let result = turn(&memory, &model, "hello", options).await;
+        assert_eq!(memory.messages.lock().expect("lock").len(), 1);
+
+        let (_, session) = test_agent();
+        AgentEngine
+            .commit_assistant_reply(
+                &memory,
+                &session,
+                &format!("<think>x</think>{}", &result.assistant_text[..4]),
+                MemoryMessageMeta::default(),
+            )
+            .await
+            .expect("commit");
+        let stored = memory.messages.lock().expect("lock").clone();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1].role, MemoryMessageRole::Assistant);
+        assert_eq!(stored[1].content, "Echo");
     }
 
     #[tokio::test]
@@ -260,7 +518,7 @@ mod tests {
             updated_at: 0,
         };
         let memory = TestMemory::default();
-        let model = TestModel;
+        let model = TestModel::default();
         let planner = SimplePlanner;
         let mut tools = ToolRegistry::new();
         tools.register(TimeTool);

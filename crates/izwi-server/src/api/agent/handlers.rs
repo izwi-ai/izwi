@@ -196,6 +196,7 @@ pub async fn create_turn(
                     req.max_output_tokens,
                 )?,
                 max_tool_calls: 1,
+                ..AgentTurnOptions::default()
             },
         )
         .await
