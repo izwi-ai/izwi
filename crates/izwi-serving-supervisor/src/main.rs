@@ -1,5 +1,6 @@
 use izwi_serving_protocol::{
-    BackendKind, DeploymentId, DeviceId, GatewayWorkerApproval, ServiceBearerToken, WorkerId,
+    BackendKind, DeploymentId, DeviceId, GatewayApprovalsStatus, GatewayWorkerApproval,
+    ServiceBearerToken, WorkerId,
 };
 use izwi_serving_supervisor::actor::{
     bump, count, stop_all, LaunchCounts, LaunchOutcome, Supervision, SupervisorMetrics,
@@ -8,6 +9,7 @@ use izwi_serving_supervisor::actor::{
 use izwi_serving_supervisor::autoscale::{
     self, Autoscaler, DeploymentObservation, ScaleDecision, WorkerSignals,
 };
+use izwi_serving_supervisor::gateway_ack::GatewayAck;
 use izwi_serving_supervisor::rollout::{self, RolloutPhase, RolloutStrategy};
 use izwi_serving_supervisor::{approvals_file, signals};
 use izwi_serving_supervisor::{
@@ -534,6 +536,8 @@ struct PreparedRollout {
     replacements: Vec<WorkerActor>,
     /// Whether this run resumes persisted state rather than starting fresh.
     resumed: bool,
+    /// The gateways to ask before moving on, when the plan names them.
+    ack: Option<GatewayAck>,
 }
 
 enum RolloutOutcome {
@@ -620,6 +624,19 @@ fn prepare_rollout(
     }
     let approval_lines = rollout::replacement_approvals(&spec, &target)?;
     let replacement_secrets = resolve_replacement_secrets(&target, &spec)?;
+    let ack = match plan.gateway_ack() {
+        Some(config) => {
+            let admin_key = env::var(&config.admin_key_env).map_err(|_| {
+                SupervisorError::MissingGatewayAdminKey {
+                    environment: config.admin_key_env.clone(),
+                }
+            })?;
+            Some(GatewayAck::new(config, admin_key).map_err(|error| {
+                SupervisorError::InvalidOption(format!("gateway_ack client: {error}"))
+            })?)
+        }
+        None => None,
+    };
 
     let resumed = state.is_some();
     let state = match state {
@@ -652,13 +669,17 @@ fn prepare_rollout(
     };
     rollout::persist_state(runtime_directory, &state)?;
     info!(
-        "rollout prepared: strategy {}, {} rolling deployment(s), canary {}, window {}s, commit grace {}s, abort grace {}s",
+        "rollout prepared: strategy {}, {} rolling deployment(s), canary {}, window {}s, commit grace {}s, abort grace {}s, {}",
         state.strategy.as_str(),
         spec.rolling.len(),
         spec.canary_worker_id,
         spec.window.as_secs(),
         spec.commit_grace.as_secs(),
-        spec.abort_grace.as_secs()
+        spec.abort_grace.as_secs(),
+        match &ack {
+            Some(ack) => format!("waiting for {} gateway(s) to acknowledge each view", ack.gateways()),
+            None => "timed gateway refresh (no gateway_ack)".to_string(),
+        }
     );
     Ok(PreparedRollout {
         spec,
@@ -669,6 +690,7 @@ fn prepare_rollout(
         replacement_secrets,
         replacements: Vec::new(),
         resumed,
+        ack,
     })
 }
 
@@ -773,6 +795,23 @@ async fn launch_replacements(
     ReplacementLaunch::Ready
 }
 
+/// Waits until every gateway acknowledges a view; the error names why not.
+async fn await_ack(
+    ack: &GatewayAck,
+    adopted: impl Fn(&GatewayApprovalsStatus) -> bool,
+    shutdown: &mut watch::Receiver<bool>,
+    abort_requested: &mut watch::Receiver<bool>,
+) -> Result<(), &'static str> {
+    tokio::select! {
+        result = ack.wait_for(adopted) => result.map_err(|gateways| {
+            warn!("gateways {gateways:?} did not acknowledge the approvals view in time");
+            "the gateways did not acknowledge the approvals view"
+        }),
+        _ = shutdown.wait_for(|stop| *stop) => Err("shutdown requested"),
+        _ = abort_requested.wait_for(|abort| *abort) => Err("operator abort (SIGUSR2)"),
+    }
+}
+
 /// Persists rollout state, logging a failure.
 fn persist(runtime_directory: &Path, state: &rollout::RolloutState) -> bool {
     match rollout::persist_state(runtime_directory, state) {
@@ -836,19 +875,45 @@ async fn execute_blue_green(
         warn!("rollout window view failed to write: {error}; nothing changed");
         return RolloutOutcome::DegradedAbort;
     }
+    prepared.state.phase = RolloutPhase::WindowOpen;
+    prepared.state.updated_at_ms = now_ms();
+    persist(&runtime_directory, &prepared.state);
+    // With gateway acknowledgement the soak starts once every gateway
+    // reports the window view adopted and cut over to the successor.
+    if let Some(ack) = prepared.ack.as_ref() {
+        info!(
+            "rollout window open: waiting for {} gateway(s) to adopt the window view and cut over",
+            ack.gateways()
+        );
+        let (spec, lines) = (&prepared.spec, &prepared.approval_lines);
+        let acknowledged = await_ack(
+            ack,
+            |status| rollout::window_adopted(status, spec, lines),
+            shutdown,
+            abort_requested,
+        )
+        .await;
+        if let Err(reason) = acknowledged {
+            return abort_rollout(
+                prepared,
+                &runtime_directory,
+                current_slots,
+                AbortMode::KeepOldAfterGrace,
+                reason,
+            )
+            .await;
+        }
+        info!("rollout window: every gateway adopted the window view and cut over");
+    }
     // The window always runs in full from now on the monotonic clock: a
     // resumed rollout re-arms it, so the gateways adopt the window view
     // again before the commit view lands.
     let window_end = Instant::now() + prepared.spec.window;
-    prepared.state.phase = RolloutPhase::WindowOpen;
     prepared.state.window_deadline_ms =
         Some(now_ms().saturating_add(prepared.spec.window.as_millis() as u64));
-    prepared.state.updated_at_ms = now_ms();
-    if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        warn!("rollout state persist failed: {error}");
-    }
+    persist(&runtime_directory, &prepared.state);
     info!(
-        "rollout window open: both generations approved; cutover fires when the successor generation is observed Ready; drain starts in {}s",
+        "rollout window: both generations approved; cutover fires when the successor generation is observed Ready; commit in {}s",
         prepared.spec.window.as_secs()
     );
     let mut window_watch = tokio::time::interval(Duration::from_millis(500));
@@ -889,17 +954,71 @@ async fn execute_blue_green(
         }
     }
 
-    // DrainingOld is the point of no return: the commit view is written and
-    // the old generation's workers stop admitting. It is entered only once
-    // persisted, so a crash can never resume an earlier phase and relaunch
-    // the drained generation. On resume into this phase the old workers
-    // already exited (the generation barrier proved it), so the drain finds
-    // nothing to stop.
-    prepared.state.phase = RolloutPhase::DrainingOld;
+    // The commit view removes the old generation's lines; the lines it
+    // removed are recorded so an abort before the drain can put them back.
+    info!("rollout commit: writing the commit approval view");
+    let mut removed = Vec::new();
+    if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
+        removed = rollout::apply_commit_view(document, &prepared.spec, &prepared.approval_lines);
+        Ok::<_, rollout::RolloutError>(())
+    }) {
+        warn!("rollout commit view failed to write: {error}; the window view stays in place");
+        return RolloutOutcome::DegradedAbort;
+    }
+    if !removed.is_empty() {
+        prepared.state.removed_lines = removed;
+    }
     prepared.state.window_deadline_ms = None;
     prepared.state.updated_at_ms = now_ms();
-    if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        warn!("rollout state persist failed: {error}; aborting before the point of no return");
+    persist(&runtime_directory, &prepared.state);
+    // The old generation drains only once no gateway routes to it: with
+    // acknowledgement, once every gateway reports the commit view adopted
+    // (not in time, the rollout aborts and the old generation never stopped
+    // serving); otherwise after the commit grace. Shutdown drains everything
+    // anyway, so it ends the wait.
+    match prepared.ack.as_ref() {
+        Some(ack) => {
+            let spec = &prepared.spec;
+            let acknowledged = await_ack(
+                ack,
+                |status| rollout::old_generation_unapproved(status, spec),
+                shutdown,
+                abort_requested,
+            )
+            .await;
+            if let Err(reason) = acknowledged {
+                if !*shutdown.borrow() {
+                    return abort_rollout(
+                        prepared,
+                        &runtime_directory,
+                        current_slots,
+                        AbortMode::KeepOldAfterGrace,
+                        reason,
+                    )
+                    .await;
+                }
+            }
+        }
+        None if !prepared.spec.commit_grace.is_zero() => {
+            info!(
+                "waiting {}s for gateway approval refresh before draining the old generation",
+                prepared.spec.commit_grace.as_secs()
+            );
+            tokio::select! {
+                () = tokio::time::sleep(prepared.spec.commit_grace) => {}
+                _ = shutdown.wait_for(|stop| *stop) => {}
+            }
+        }
+        None => {}
+    }
+    // DrainingOld is the point of no return: the old generation's workers
+    // stop admitting. It is entered only once persisted, so a crash can
+    // never resume an earlier phase and relaunch the drained generation. On
+    // resume into this phase the old workers already exited (the
+    // generation barrier proved it), so the drain finds nothing to stop.
+    prepared.state.phase = RolloutPhase::DrainingOld;
+    prepared.state.updated_at_ms = now_ms();
+    if !persist(&runtime_directory, &prepared.state) {
         prepared.state.phase = RolloutPhase::WindowOpen;
         return abort_rollout(
             prepared,
@@ -910,30 +1029,7 @@ async fn execute_blue_green(
         )
         .await;
     }
-    info!(
-        "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
-    );
-    if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
-        rollout::apply_commit_view(document, &prepared.spec, &prepared.approval_lines);
-        Ok::<_, rollout::RolloutError>(())
-    }) {
-        warn!("rollout commit view failed to write: {error}; the window view stays in place");
-        return RolloutOutcome::DegradedAbort;
-    }
-    // Mirror the abort grace: the gateways adopt the commit view on their
-    // next approvals refresh and keep routing to the old generation until
-    // then, so draining it immediately would turn that interval into shed
-    // requests. Shutdown drains everything anyway, so it ends the wait.
-    if !prepared.spec.commit_grace.is_zero() {
-        info!(
-            "waiting {}s for gateway approval refresh before draining the old generation",
-            prepared.spec.commit_grace.as_secs()
-        );
-        tokio::select! {
-            () = tokio::time::sleep(prepared.spec.commit_grace) => {}
-            _ = shutdown.wait_for(|stop| *stop) => {}
-        }
-    }
+    info!("rollout drain: draining the old generation (point of no return)");
     let (old, kept): (Vec<WorkerSlot>, Vec<WorkerSlot>) = std::mem::take(current_slots)
         .into_iter()
         .partition(|slot| prepared.spec.is_old_worker(slot.worker_id().as_str()));
@@ -996,11 +1092,34 @@ async fn execute_recreate(
         info!(
             "rollout (recreate): commit view written; the old generation drains once the gateways stop routing to it, and the deployment is unavailable until the replacements are ready"
         );
-        if !prepared.spec.commit_grace.is_zero() {
-            tokio::select! {
-                () = tokio::time::sleep(prepared.spec.commit_grace) => {}
-                _ = shutdown.wait_for(|stop| *stop) => {}
+        match prepared.ack.as_ref() {
+            Some(ack) => {
+                let spec = &prepared.spec;
+                let acknowledged = await_ack(
+                    ack,
+                    |status| rollout::old_generation_unapproved(status, spec),
+                    shutdown,
+                    abort_requested,
+                )
+                .await;
+                if let Err(reason) = acknowledged {
+                    return abort_rollout(
+                        prepared,
+                        &runtime_directory,
+                        current_slots,
+                        AbortMode::KeepOld,
+                        reason,
+                    )
+                    .await;
+                }
             }
+            None if !prepared.spec.commit_grace.is_zero() => {
+                tokio::select! {
+                    () = tokio::time::sleep(prepared.spec.commit_grace) => {}
+                    _ = shutdown.wait_for(|stop| *stop) => {}
+                }
+            }
+            None => {}
         }
         stop_all(
             current_slots
@@ -2335,6 +2454,8 @@ enum SupervisorError {
     RolloutAutoscalingConflict,
     #[error("autoscaling: {0}")]
     Autoscale(String),
+    #[error("the rollout plan's gateway_ack.admin_key_env {environment} is not set")]
+    MissingGatewayAdminKey { environment: String },
 }
 
 #[cfg(test)]

@@ -100,6 +100,39 @@ if die_after is not None:
 exit_when_stdin_closes(server)
 "#;
 
+/// A gateway admin endpoint that reports whatever status file the test
+/// writes, so the test decides when "the gateway" adopted a view.
+const FAKE_GATEWAY_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATUS, KEY, PORT = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/internal/admin/approvals":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.headers.get("Authorization") != "Bearer " + KEY:
+            self.send_response(401)
+            self.end_headers()
+            return
+        body = open(STATUS, "rb").read()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"#;
+
+const GATEWAY_ADMIN_KEY: &str = "rollout-rig-gateway-admin-key";
+
 /// One fake worker the test renders configs and payloads for.
 struct FakeWorker {
     worker_id: &'static str,
@@ -336,6 +369,7 @@ impl Rig {
             .arg("8589934592")
             .env("TOKEN_OLD", "secret-old")
             .env("TOKEN_NEW", "secret-new")
+            .env("ROLLOUT_RIG_GATEWAY_ADMIN_KEY", GATEWAY_ADMIN_KEY)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -365,6 +399,76 @@ impl Rig {
             command.arg(arg);
         }
         command.spawn().expect("spawn supervisor")
+    }
+}
+
+/// A fake gateway admin endpoint plus the plan section that points the
+/// rollout at it.
+struct FakeGateway {
+    child: Child,
+    status: PathBuf,
+}
+
+impl FakeGateway {
+    fn start(rig: &Rig, timeout_secs: u64) -> Self {
+        let port = free_port();
+        let script = rig.root.join("fake-gateway.py");
+        std::fs::write(&script, FAKE_GATEWAY_SCRIPT).unwrap();
+        make_executable(&script);
+        let status = rig.root.join("gateway-status.json");
+        let gateway = Self {
+            child: Command::new(&script)
+                .arg(&status)
+                .arg(GATEWAY_ADMIN_KEY)
+                .arg(port.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+            status,
+        };
+        gateway.report(&rig.original_approvals, 1);
+        let mut plan = read_file(&rig.plan);
+        // With acknowledgement the timers are no longer needed.
+        plan = plan
+            .lines()
+            .filter(|line| {
+                !line.starts_with("window_secs") && !line.starts_with("commit_grace_secs")
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
+        plan.push_str(&format!(
+            "\n[gateway_ack]\nadmin_urls = [\"http://127.0.0.1:{port}\"]\nadmin_key_env = \"ROLLOUT_RIG_GATEWAY_ADMIN_KEY\"\ntimeout_secs = {timeout_secs}\n"
+        ));
+        std::fs::write(&rig.plan, plan).unwrap();
+        gateway
+    }
+
+    /// Reports the approvals of `view` adopted, with the chat pool routing
+    /// to `eligible`.
+    fn report(&self, view: &str, eligible: u64) {
+        let status = izwi_serving_protocol::GatewayApprovalsStatus {
+            file_digest: None,
+            adoptions: 1,
+            approvals: entries(view),
+            pools: vec![izwi_serving_protocol::GatewayPoolStatus {
+                task: TaskKind::Chat,
+                public_model: ModelAlias::new("chat-model").unwrap(),
+                deployment_id: DeploymentId::new("chat-prod").unwrap(),
+                eligible_generation: Some(ModelGeneration::new(eligible).unwrap()),
+                generations: vec![ModelGeneration::new(eligible).unwrap()],
+            }],
+        };
+        let temporary = self.status.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&status).unwrap()).unwrap();
+        std::fs::rename(&temporary, &self.status).unwrap();
+    }
+}
+
+impl Drop for FakeGateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -575,6 +679,74 @@ fn serving(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
+/// With gateway_ack the rollout commits only once the gateway reports the
+/// window view adopted and cut over, and drains the old generation only
+/// once it reports the commit view adopted, however long that takes.
+#[test]
+fn commit_waits_for_the_gateways_to_acknowledge_each_view() {
+    let rig = Rig::build(2, 1);
+    let gateway = FakeGateway::start(&rig, 60);
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must be written");
+    let window = read_file(&rig.approvals);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        read_file(&rig.approvals).contains("chat-prod|1"),
+        "no commit view before the gateway acknowledges the window"
+    );
+
+    gateway.report(&window, 2);
+    let commit_view = wait_until(Duration::from_secs(30), || {
+        !read_file(&rig.approvals).contains("chat-prod|1")
+    });
+    assert!(commit_view, "the acknowledged window must commit");
+    let commit = read_file(&rig.approvals);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation must not drain before the gateway acknowledges the commit view"
+    );
+
+    gateway.report(&commit, 2);
+    let drained = wait_until(Duration::from_secs(30), || {
+        rig.root.join("worker-old.exited").exists()
+            && read_file(&rig.state_file()).contains("committed")
+    });
+    assert!(
+        drained,
+        "the acknowledged commit view must drain the old generation"
+    );
+    terminate(&mut supervisor);
+}
+
+/// A gateway that never acknowledges the window view aborts the rollout.
+#[test]
+fn an_unacknowledged_window_aborts_the_rollout() {
+    let rig = Rig::build(2, 1);
+    let _gateway = FakeGateway::start(&rig, 2);
+    let mut supervisor = rig.spawn_supervisor(&["--rollout-plan", rig.plan.to_str().unwrap()]);
+    let window_open = wait_until(Duration::from_secs(30), || {
+        read_file(&rig.approvals).contains("chat-prod|2")
+    });
+    assert!(window_open, "the window view must be written");
+    let aborted = wait_until(Duration::from_secs(30), || {
+        !rig.state_file().exists() && read_file(&rig.approvals) == rig.original_approvals
+    });
+    assert!(
+        aborted,
+        "an unacknowledged window must abort and restore the view"
+    );
+    assert!(
+        !rig.root.join("worker-old.exited").exists(),
+        "the old generation never stopped serving"
+    );
+    terminate(&mut supervisor);
+}
+
 #[test]
 fn a_node_without_room_for_both_generations_recreates() {
     let rig = Rig::build_recreate();
@@ -593,7 +765,10 @@ fn a_node_without_room_for_both_generations_recreates() {
     assert!(approvals.contains("worker-new|chat|chat-model|chat-prod|2"));
     assert!(!approvals.contains("chat-prod|1"), "{approvals}");
     assert!(approvals.contains("asr-prod|4"), "{approvals}");
-    assert!(serving(rig.old_port), "the replacement serves on the shared bind");
+    assert!(
+        serving(rig.old_port),
+        "the replacement serves on the shared bind"
+    );
     terminate(&mut supervisor);
 }
 

@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use izwi_serving_protocol::{
-    GatewayWorkerApproval, GatewayWorkerApprovalIdentity, ModelGeneration, NodeId, TaskKind,
+    GatewayApprovalsStatus, GatewayWorkerApproval, GatewayWorkerApprovalIdentity, ModelGeneration,
+    NodeId, TaskKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -108,6 +109,32 @@ pub struct RolloutPlan {
     /// side by side when both fit the node, and otherwise recreates.
     #[serde(default)]
     strategy: StrategyChoice,
+    /// The gateways' admin endpoints. With them the rollout moves on only
+    /// once every gateway reports a view adopted, instead of waiting out
+    /// timers sized from `gateway_approvals_refresh_secs`.
+    gateway_ack: Option<GatewayAckConfig>,
+}
+
+/// Where and how to ask the gateways which approvals view they adopted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAckConfig {
+    /// Each gateway's base URL; the rollout polls
+    /// `GET <url>/internal/admin/approvals` on every one.
+    pub admin_urls: Vec<String>,
+    /// The supervisor environment variable holding the gateways' admin key.
+    pub admin_key_env: String,
+    /// How long every gateway has to acknowledge a view. A window view not
+    /// acknowledged in time aborts the rollout; so does a commit view,
+    /// before the old generation drains.
+    #[serde(default = "default_gateway_ack_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+pub const MAX_GATEWAY_ACK_URLS: usize = 16;
+
+fn default_gateway_ack_timeout_secs() -> u64 {
+    120
 }
 
 /// The rollout strategy a plan asks for.
@@ -140,6 +167,63 @@ impl RolloutStrategy {
             RolloutStrategy::Recreate => "recreate",
         }
     }
+}
+
+impl GatewayAckConfig {
+    fn validate(&self) -> Result<(), RolloutError> {
+        if self.admin_urls.is_empty() || self.admin_urls.len() > MAX_GATEWAY_ACK_URLS {
+            return Err(RolloutError::InvalidPlan(format!(
+                "gateway_ack.admin_urls must list 1 to {MAX_GATEWAY_ACK_URLS} gateways"
+            )));
+        }
+        for url in &self.admin_urls {
+            let scheme_ok = url.starts_with("http://") || url.starts_with("https://");
+            if !scheme_ok || url.len() > 2048 || url.chars().any(char::is_whitespace) {
+                return Err(RolloutError::InvalidPlan(format!(
+                    "gateway_ack.admin_urls entry {url:?} must be an http(s) URL"
+                )));
+            }
+        }
+        crate::config::validate_env_name(&self.admin_key_env).map_err(|_| {
+            RolloutError::InvalidPlan(
+                "gateway_ack.admin_key_env must name an environment variable".to_string(),
+            )
+        })?;
+        if !(1..=MAX_ROLLOUT_WINDOW_SECS).contains(&self.timeout_secs) {
+            return Err(RolloutError::InvalidPlan(format!(
+                "gateway_ack.timeout_secs must be between 1 and {MAX_ROLLOUT_WINDOW_SECS}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a gateway adopted the window view and cut every rolling
+/// deployment over: it approves every replacement and routes new work to
+/// the new generation (which needs it to have observed a replacement Ready).
+pub fn window_adopted(
+    status: &GatewayApprovalsStatus,
+    spec: &RolloutSpec,
+    replacements: &[GatewayWorkerApproval],
+) -> bool {
+    replacements
+        .iter()
+        .all(|approval| status.approvals.contains(&approval.render_line()))
+        && spec.rolling.iter().all(|deployment| {
+            status.pools.iter().any(|pool| {
+                pool.deployment_id.as_str() == deployment.deployment_id
+                    && pool.eligible_generation == Some(deployment.new_generation)
+            })
+        })
+}
+
+/// Whether a gateway adopted a view that no longer approves this node's old
+/// generation, so draining it sheds nothing.
+pub fn old_generation_unapproved(status: &GatewayApprovalsStatus, spec: &RolloutSpec) -> bool {
+    status.approvals.iter().all(|line| {
+        line.parse::<GatewayWorkerApproval>()
+            .map_or(true, |approval| !spec.is_old_line(&approval))
+    })
 }
 
 /// Picks the strategy for a validated rollout. Blue-green needs the
@@ -277,6 +361,10 @@ impl RolloutPlan {
         self.strategy
     }
 
+    pub fn gateway_ack(&self) -> Option<&GatewayAckConfig> {
+        self.gateway_ack.as_ref()
+    }
+
     pub fn shared_approvals_path(&self) -> &Path {
         &self.shared_approvals_path
     }
@@ -324,7 +412,12 @@ impl RolloutPlan {
                 "window_secs must be at most {MAX_ROLLOUT_WINDOW_SECS}"
             )));
         }
-        if self.window_secs() < refresh.saturating_mul(2) {
+        if let Some(ack) = &self.gateway_ack {
+            ack.validate()?;
+        }
+        // Acknowledged adoption replaces the refresh-sized timers.
+        let timed = self.gateway_ack.is_none();
+        if timed && self.window_secs() < refresh.saturating_mul(2) {
             return Err(RolloutError::InvalidPlan(format!(
                 "window_secs must be at least twice gateway_approvals_refresh_secs ({}s) so every gateway adopts the window view before the commit view",
                 refresh.saturating_mul(2)
@@ -340,7 +433,7 @@ impl RolloutPlan {
                 "commit_grace_secs must be at most {MAX_ROLLOUT_WINDOW_SECS}"
             )));
         }
-        if self.commit_grace_secs() < refresh {
+        if timed && self.commit_grace_secs() < refresh {
             return Err(RolloutError::InvalidPlan(format!(
                 "commit_grace_secs must be at least gateway_approvals_refresh_secs ({refresh}s) so every gateway stops routing to the old generation before it drains"
             )));
@@ -348,14 +441,23 @@ impl RolloutPlan {
         Ok(())
     }
 
+    /// The soak window. Without acknowledgement it must cover two gateway
+    /// refreshes; with it the window is a pure soak after the gateways
+    /// confirm the cutover, none by default.
     fn window_secs(&self) -> u64 {
-        self.window_secs
-            .unwrap_or_else(|| self.gateway_approvals_refresh_secs.saturating_mul(2))
+        self.window_secs.unwrap_or_else(|| match self.gateway_ack {
+            Some(_) => 0,
+            None => self.gateway_approvals_refresh_secs.saturating_mul(2),
+        })
     }
 
+    /// The wait before draining the old generation when no gateway can be
+    /// asked; with acknowledgement the drain waits for the gateways.
     fn commit_grace_secs(&self) -> u64 {
-        self.commit_grace_secs
-            .unwrap_or(self.gateway_approvals_refresh_secs)
+        self.commit_grace_secs.unwrap_or(match self.gateway_ack {
+            Some(_) => 0,
+            None => self.gateway_approvals_refresh_secs,
+        })
     }
 
     /// Digest binding the plan to its target config bytes; persisted rollout
@@ -947,6 +1049,78 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn gateway_ack_replaces_the_refresh_timers_and_is_validated() {
+        let header = "schema_version = 1\ntarget_node_config = \"/tmp/t.toml\"\nshared_approvals_path = \"/tmp/a.txt\"\ncanary_worker_id = \"w\"\n";
+        let ack = "[gateway_ack]\nadmin_urls = [\"http://127.0.0.1:8080\"]\nadmin_key_env = \"IZWI_GATEWAY_ADMIN_KEY\"\n";
+        let plan = RolloutPlan::parse_bounded(format!("{header}{ack}").as_bytes()).unwrap();
+        assert_eq!(plan.window_secs(), 0, "the soak starts after the ack");
+        assert_eq!(plan.commit_grace_secs(), 0, "the drain waits for the ack");
+        assert_eq!(plan.gateway_ack().unwrap().timeout_secs, 120);
+        // Short timers no longer need to cover the refresh interval.
+        RolloutPlan::parse_bounded(format!("{header}window_secs = 1\n{ack}").as_bytes()).unwrap();
+
+        for invalid in [
+            "[gateway_ack]\nadmin_urls = []\nadmin_key_env = \"KEY\"\n",
+            "[gateway_ack]\nadmin_urls = [\"ftp://gateway\"]\nadmin_key_env = \"KEY\"\n",
+            "[gateway_ack]\nadmin_urls = [\"http://gateway\"]\nadmin_key_env = \"lower\"\n",
+            "[gateway_ack]\nadmin_urls = [\"http://gateway\"]\nadmin_key_env = \"KEY\"\ntimeout_secs = 0\n",
+        ] {
+            assert!(
+                matches!(
+                    RolloutPlan::parse_bounded(format!("{header}{invalid}").as_bytes()).unwrap_err(),
+                    RolloutError::InvalidPlan(_)
+                ),
+                "{invalid} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_predicates_read_the_gateway_report() {
+        let spec = sample_spec();
+        let pool = |eligible: u64| izwi_serving_protocol::GatewayPoolStatus {
+            task: TaskKind::Chat,
+            public_model: izwi_serving_protocol::ModelAlias::new("chat-model").unwrap(),
+            deployment_id: izwi_serving_protocol::DeploymentId::new("chat-prod").unwrap(),
+            eligible_generation: Some(ModelGeneration::new(eligible).unwrap()),
+            generations: vec![
+                ModelGeneration::new(1).unwrap(),
+                ModelGeneration::new(2).unwrap(),
+            ],
+        };
+        let old_line = "v1|http://127.0.0.1:9470|node-a|worker-a|chat|chat-model|chat-prod|1";
+        let status = |approvals: Vec<String>, eligible: u64| GatewayApprovalsStatus {
+            file_digest: None,
+            adoptions: 1,
+            approvals,
+            pools: vec![pool(eligible)],
+        };
+        let new_lines: Vec<String> = replacements()
+            .iter()
+            .map(|line| line.render_line())
+            .collect();
+        let window = [vec![old_line.to_string()], new_lines.clone()].concat();
+
+        assert!(!window_adopted(
+            &status(vec![old_line.to_string()], 1),
+            &spec,
+            &replacements()
+        ));
+        assert!(
+            !window_adopted(&status(window.clone(), 1), &spec, &replacements()),
+            "adopted but not yet cut over"
+        );
+        assert!(window_adopted(
+            &status(window.clone(), 2),
+            &spec,
+            &replacements()
+        ));
+
+        assert!(!old_generation_unapproved(&status(window, 2), &spec));
+        assert!(old_generation_unapproved(&status(new_lines, 2), &spec));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod approvals_file;
 pub mod autoscale;
 mod config;
 pub mod env;
+pub mod gateway_ack;
 mod launch;
 mod lifecycle;
 mod locks;
