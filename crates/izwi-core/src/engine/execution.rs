@@ -2193,6 +2193,38 @@ impl PhysicalBatch {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_width()?;
+        let mut keys = HashSet::with_capacity(self.rows.len());
+        let mut cost = WorkCost::default();
+        for (row_count, row) in self.rows.iter().enumerate() {
+            cost = self.validate_row(row_count, row, cost, &mut keys)?;
+        }
+        self.validate_totals(cost)
+    }
+
+    /// Validate a batch whose rows before the last were validated by earlier
+    /// calls, which left their session plans in `keys` and their summed work
+    /// in `cost`. Checks only the new row and the batch totals, so assembling
+    /// a batch row by row is linear in its width. On success `keys` holds the
+    /// new row and the new summed work is returned; on failure `keys` is
+    /// unchanged.
+    pub(crate) fn validate_appended(
+        &self,
+        keys: &mut HashSet<(SessionKey, PlanId)>,
+        cost: WorkCost,
+    ) -> Result<WorkCost> {
+        self.validate_width()?;
+        let row_count = self.rows.len() - 1;
+        let row = &self.rows[row_count];
+        let cost = self.validate_row(row_count, row, cost, keys)?;
+        if let Err(error) = self.validate_totals(cost) {
+            keys.remove(&(row.session.clone(), row.plan_id));
+            return Err(error);
+        }
+        Ok(cost)
+    }
+
+    fn validate_width(&self) -> Result<()> {
         self.budget.validate()?;
         if self.rows.is_empty() {
             return Err(Error::InvalidInput(
@@ -2207,30 +2239,42 @@ impl PhysicalBatch {
                 "request-parallel physical dispatch exceeds its declared width".to_string(),
             ));
         }
+        Ok(())
+    }
 
-        let mut keys = HashSet::with_capacity(self.rows.len());
-        let mut cost = WorkCost::default();
-        for (row_count, row) in self.rows.iter().enumerate() {
-            if row.lane != self.lane {
-                return Err(Error::InvalidInput(
-                    "physical batch contains an incompatible lane".to_string(),
-                ));
-            }
-            if !keys.insert((row.session.clone(), row.plan_id)) {
-                return Err(Error::InvalidInput(
-                    "physical batch contains a duplicate session plan".to_string(),
-                ));
-            }
-            if !self.budget.admits(row_count, cost, row.cost) {
-                return Err(Error::InvalidInput(
-                    "physical batch exceeds its declared work budget".to_string(),
-                ));
-            }
-            cost = cost.checked_add(row.cost).ok_or_else(|| {
-                Error::InvalidInput("physical batch work accounting overflowed".to_string())
-            })?;
+    /// Validate row `row_count` after rows of summed work `cost`, recording
+    /// its session plan in `keys`. Returns the summed work including it.
+    fn validate_row(
+        &self,
+        row_count: usize,
+        row: &ReadyQuantum,
+        cost: WorkCost,
+        keys: &mut HashSet<(SessionKey, PlanId)>,
+    ) -> Result<WorkCost> {
+        if row.lane != self.lane {
+            return Err(Error::InvalidInput(
+                "physical batch contains an incompatible lane".to_string(),
+            ));
         }
+        let key = (row.session.clone(), row.plan_id);
+        if keys.contains(&key) {
+            return Err(Error::InvalidInput(
+                "physical batch contains a duplicate session plan".to_string(),
+            ));
+        }
+        if !self.budget.admits(row_count, cost, row.cost) {
+            return Err(Error::InvalidInput(
+                "physical batch exceeds its declared work budget".to_string(),
+            ));
+        }
+        let cost = cost.checked_add(row.cost).ok_or_else(|| {
+            Error::InvalidInput("physical batch work accounting overflowed".to_string())
+        })?;
+        keys.insert(key);
+        Ok(cost)
+    }
 
+    fn validate_totals(&self, cost: WorkCost) -> Result<()> {
         if self.materialized_tensor_elements < cost.tensor_elements {
             return Err(Error::InvalidInput(
                 "physical batch materialization is smaller than useful tensor work".to_string(),

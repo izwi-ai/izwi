@@ -249,7 +249,18 @@ struct PhysicalBatchAssembly {
     shape_policy: StageShapePolicy,
     workspace_base_bytes: u64,
     launch_policy: PhysicalLaunchPolicy,
+    /// Session plans and summed work of the validated rows, so a push
+    /// validates only its own row (SCH-F9).
+    row_keys: HashSet<(super::SessionKey, u64)>,
+    row_cost: WorkCost,
 }
+
+/// A row [`PhysicalBatchAssembly::try_push`] did not accept, handed back.
+type RefusedBatchRow = (
+    Arc<EngineCoreRequest>,
+    super::scheduler::ScheduledRequest,
+    ReadyQuantum,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveStreamBatch {
@@ -364,6 +375,32 @@ fn resolve_managed_token_reach(
 }
 
 impl PhysicalBatchAssembly {
+    /// An assembly holding the validated single-row `physical_batch`.
+    fn new(
+        physical_batch: PhysicalBatch,
+        request: Arc<EngineCoreRequest>,
+        scheduled: super::scheduler::ScheduledRequest,
+        output_visibility: super::OutputVisibility,
+        shape_policy: StageShapePolicy,
+        workspace_base_bytes: u64,
+        launch_policy: PhysicalLaunchPolicy,
+    ) -> Result<Self> {
+        debug_assert_eq!(physical_batch.rows.len(), 1);
+        let mut row_keys = HashSet::new();
+        let row_cost = physical_batch.validate_appended(&mut row_keys, WorkCost::default())?;
+        Ok(Self {
+            physical_batch,
+            requests: vec![request],
+            scheduled: vec![scheduled],
+            output_visibility,
+            shape_policy,
+            workspace_base_bytes,
+            launch_policy,
+            row_keys,
+            row_cost,
+        })
+    }
+
     fn materialized_tensor_elements(
         shape_policy: StageShapePolicy,
         rows: &[ReadyQuantum],
@@ -481,39 +518,57 @@ impl PhysicalBatchAssembly {
                     .any(|existing| existing.cost.logical_units > 1))
     }
 
+    /// Append `row` when the batch stays valid. The row is validated in
+    /// place against the rows already accepted; a refused row is returned
+    /// and the batch is left as it was.
     fn try_push(
         &mut self,
         request: Arc<EngineCoreRequest>,
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
-    ) -> bool {
+    ) -> std::result::Result<(), Box<RefusedBatchRow>> {
         if self.isolates_multi_token_quanta(&row.cost) {
-            return false;
+            return Err(Box::new((request, scheduled, row)));
         }
-        let mut candidate = self.physical_batch.clone();
-        candidate.rows.push(row);
-        let Some(materialized) =
-            Self::materialized_tensor_elements(self.shape_policy, &candidate.rows)
-        else {
-            return false;
-        };
-        let Some(workspace) = Self::workspace_resources(
-            candidate.lane.backend,
-            self.shape_policy,
-            self.workspace_base_bytes,
-            &candidate.rows,
-        ) else {
-            return false;
-        };
-        candidate.materialized_tensor_elements = materialized;
-        candidate.workspace = workspace;
-        if candidate.validate().is_err() {
-            return false;
+        let previous = (
+            self.physical_batch.materialized_tensor_elements,
+            self.physical_batch.workspace,
+        );
+        self.physical_batch.rows.push(row);
+        let accepted = (|| {
+            let batch = &mut self.physical_batch;
+            batch.materialized_tensor_elements =
+                Self::materialized_tensor_elements(self.shape_policy, &batch.rows)?;
+            batch.workspace = Self::workspace_resources(
+                batch.lane.backend,
+                self.shape_policy,
+                self.workspace_base_bytes,
+                &batch.rows,
+            )?;
+            batch
+                .validate_appended(&mut self.row_keys, self.row_cost)
+                .ok()
+        })();
+        match accepted {
+            Some(cost) => {
+                self.row_cost = cost;
+                self.requests.push(request);
+                self.scheduled.push(scheduled);
+                Ok(())
+            }
+            None => {
+                let row = self
+                    .physical_batch
+                    .rows
+                    .pop()
+                    .expect("the refused row was pushed above");
+                (
+                    self.physical_batch.materialized_tensor_elements,
+                    self.physical_batch.workspace,
+                ) = previous;
+                Err(Box::new((request, scheduled, row)))
+            }
         }
-        self.physical_batch = candidate;
-        self.requests.push(request);
-        self.scheduled.push(scheduled);
-        true
     }
 }
 
@@ -3335,10 +3390,10 @@ impl EngineCore {
                     let Some((request, scheduled, row)) = pending.take() else {
                         break;
                     };
-                    if assembly.try_push(request.clone(), scheduled.clone(), row.clone()) {
-                        break;
+                    match assembly.try_push(request, scheduled, row) {
+                        Ok(()) => break,
+                        Err(refused) => pending = Some(*refused),
                     }
-                    pending = Some((request, scheduled, row));
                 }
             }
 
@@ -3367,16 +3422,15 @@ impl EngineCore {
                     materialized_tensor_elements,
                     workspace,
                 };
-                physical_batch.validate()?;
-                assemblies.push(PhysicalBatchAssembly {
+                assemblies.push(PhysicalBatchAssembly::new(
                     physical_batch,
-                    requests: vec![request],
-                    scheduled: vec![scheduled],
+                    request,
+                    scheduled,
                     output_visibility,
                     shape_policy,
                     workspace_base_bytes,
                     launch_policy,
-                });
+                )?);
             }
         }
 
@@ -9275,8 +9329,8 @@ mod tests {
             managed_cache: None,
         };
         let first_request = Arc::new(EngineCoreRequest::tts("solo quantum"));
-        let mut assembly = PhysicalBatchAssembly {
-            physical_batch: PhysicalBatch {
+        let mut assembly = PhysicalBatchAssembly::new(
+            PhysicalBatch {
                 batch_id: BatchId::new(1),
                 lane: lane.clone(),
                 mode: NativeBatchMode::Continuous,
@@ -9292,13 +9346,14 @@ mod tests {
                 materialized_tensor_elements: 4,
                 workspace: ResourceVector::zero(),
             },
-            requests: vec![first_request],
-            scheduled: vec![first_scheduled],
-            output_visibility: OutputVisibility::AfterQuantumCommit,
-            shape_policy: StageShapePolicy::Ragged,
-            workspace_base_bytes: 0,
-            launch_policy: PhysicalLaunchPolicy::ExecutionGroupExclusive,
-        };
+            first_request,
+            first_scheduled,
+            OutputVisibility::AfterQuantumCommit,
+            StageShapePolicy::Ragged,
+            0,
+            PhysicalLaunchPolicy::ExecutionGroupExclusive,
+        )
+        .expect("one-row batch");
         let second_scheduled = scheduled_decode("shared-row", 2);
         let second_row = ReadyQuantum {
             plan_id: second_scheduled.plan_id,
@@ -9309,11 +9364,13 @@ mod tests {
             managed_cache: None,
         };
 
-        assert!(!assembly.try_push(
-            Arc::new(EngineCoreRequest::tts("shared row")),
-            second_scheduled,
-            second_row,
-        ));
+        assert!(assembly
+            .try_push(
+                Arc::new(EngineCoreRequest::tts("shared row")),
+                second_scheduled,
+                second_row,
+            )
+            .is_err());
         assert_eq!(assembly.physical_batch.rows.len(), 1);
     }
 
