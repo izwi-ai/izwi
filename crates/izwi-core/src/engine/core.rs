@@ -5247,8 +5247,7 @@ impl EngineCore {
                 }
             }
 
-            let decode_transaction = batch.phase == ExecutionPhase::Decode;
-            let mut committed_service_requests = Vec::new();
+            let mut committed_service_rows = Vec::new();
             let mut committed_decode_work = Vec::new();
             for result in batch.results {
                 let plan_id = result.plan_id;
@@ -5293,7 +5292,7 @@ impl EngineCore {
                                 | ExecutionDisposition::Yielded(_)
                                 | ExecutionDisposition::Finished(_)
                         );
-                        if decode_transaction && progressed {
+                        if !prefill_row && progressed {
                             committed_decode_work.extend(
                                 in_flight
                                     .scheduled
@@ -5313,7 +5312,7 @@ impl EngineCore {
                                     .get_mut(request_id)
                                     .and_then(|timing| {
                                         timing.record_token_commit(
-                                            decode_transaction,
+                                            !prefill_row,
                                             tokens,
                                             Instant::now(),
                                         )
@@ -5329,7 +5328,13 @@ impl EngineCore {
                                     tokens,
                                 );
                             }
-                            committed_service_requests.push(committed.session.request_id.clone());
+                            let phase = if prefill_row {
+                                SequencePhase::Prefill
+                            } else {
+                                SequencePhase::Decode
+                            };
+                            committed_service_rows
+                                .push((committed.session.request_id.clone(), phase));
                         }
                         executor_outputs.push(committed);
                     }
@@ -5337,7 +5342,7 @@ impl EngineCore {
                 }
             }
             self.scheduler
-                .record_committed_batch_service(&committed_service_requests, decode_transaction);
+                .record_committed_batch_service(&committed_service_rows);
             self.scheduler
                 .record_committed_decode_service(&committed_decode_work);
         }

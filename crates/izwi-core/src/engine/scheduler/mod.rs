@@ -616,6 +616,9 @@ struct RequestCachePolicy {
     /// Decode rows one physical dispatch of this model holds; `None` until
     /// the loaded profile is installed, which leaves selection unclamped.
     decode_dispatch_rows: Option<usize>,
+    /// Phase 3a: prefill spans run in the same mixed dispatch as decode rows
+    /// (always resumable), sharing its rows and one token budget.
+    mixed_step: bool,
 }
 
 impl Default for RequestCachePolicy {
@@ -633,6 +636,7 @@ impl Default for RequestCachePolicy {
             speculative_decode_batch: false,
             preferred_prefill_tokens: 0,
             decode_dispatch_rows: None,
+            mixed_step: false,
         }
     }
 }
@@ -1037,6 +1041,7 @@ impl Scheduler {
             speculative_decode_batch: profile.speculative_decode_batch,
             preferred_prefill_tokens: profile.preferred_prefill_tokens,
             decode_dispatch_rows: Some(decode_dispatch_rows.max(1)),
+            mixed_step: profile.mixed_step && profile.prefill == PrefillMode::Incremental,
         };
         metadata.managed_snapshot_prefill_interval = profile.managed_snapshot_prefill_interval;
         true
@@ -1141,7 +1146,12 @@ impl Scheduler {
             !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
-        if self.config.enable_adaptive_batching && total_budget > 0 {
+        // When every live request runs mixed steps, prefill spans share the
+        // decode dispatch: decode rows take their tokens first and prefill
+        // spans the rest of one budget, so no slice is reserved for a slot
+        // the phases no longer contend for.
+        let unified_budget = self.all_requests_mixed();
+        if !unified_budget && self.config.enable_adaptive_batching && total_budget > 0 {
             let target_ttft_ms = self.config.target_ttft_ms;
             let mut prefill_share: f64 = if self.telemetry.avg_ttft_ms > target_ttft_ms {
                 0.55
@@ -1162,7 +1172,8 @@ impl Scheduler {
             reserved_prefill_budget = ((total_budget as f64) * prefill_share) as usize;
             reserved_prefill_budget = reserved_prefill_budget.clamp(1, total_budget);
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
-        } else if self.config.policy == SchedulingPolicy::WeightedFair
+        } else if !unified_budget
+            && self.config.policy == SchedulingPolicy::WeightedFair
             && !self.waiting_members.is_empty()
             && total_budget > 0
         {
@@ -1559,6 +1570,16 @@ impl Scheduler {
                 }
                 None => None,
             };
+            // A mixed dispatch keeps its last row for a waiting prefill span,
+            // as the weighted-fair split keeps one row of the step.
+            if unified_budget && waiting_incremental_prefill {
+                if let (Some((_, rows)), Some(index)) = (&dispatch, dispatch_slot) {
+                    let used = decode_dispatches.get(index).map_or(0, |open| open.1);
+                    if *rows > 1 && used + 1 >= *rows {
+                        continue;
+                    }
+                }
+            }
 
             let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
@@ -1735,10 +1756,21 @@ impl Scheduler {
                 remaining_prefill_budget,
             );
             if !full_prefill
-                && self.config.enable_chunked_prefill
+                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
+            }
+            // A mixed span takes a row of its model's dispatch.
+            let mixed_dispatch = metadata
+                .cache_policy
+                .mixed_step
+                .then(|| Self::mixed_prefill_dispatch(&metadata, &decode_dispatches))
+                .flatten();
+            if mixed_dispatch
+                .is_some_and(|(index, _, _)| index >= self.config.physical_dispatch_limit)
+            {
+                continue;
             }
             if full_prefill {
                 if !result.decode_requests.is_empty()
@@ -1767,6 +1799,9 @@ impl Scheduler {
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.prefill_in_flight = true;
                 running.paused = false;
+            }
+            if let Some(dispatch) = mixed_dispatch {
+                Self::claim_dispatch_row(&mut decode_dispatches, dispatch);
             }
 
             let plan_id = self.next_plan_id;
@@ -1869,10 +1904,21 @@ impl Scheduler {
 
             // Apply chunked prefill if enabled and prompt is long
             if !full_prefill
-                && self.config.enable_chunked_prefill
+                && (self.config.enable_chunked_prefill || metadata.cache_policy.mixed_step)
                 && target_tokens > chunk_threshold
             {
                 target_tokens = chunk_threshold;
+            }
+            let mixed_dispatch = metadata
+                .cache_policy
+                .mixed_step
+                .then(|| Self::mixed_prefill_dispatch(&metadata, &decode_dispatches))
+                .flatten();
+            if mixed_dispatch
+                .is_some_and(|(index, _, _)| index >= self.config.physical_dispatch_limit)
+            {
+                deferred_waiting.push(request_id);
+                continue;
             }
 
             // Full-prefill executors cannot honor a scheduler chunk. Permit one
@@ -1950,6 +1996,9 @@ impl Scheduler {
             });
 
             self.running.insert(request_id.clone(), running);
+            if let Some(dispatch) = mixed_dispatch {
+                Self::claim_dispatch_row(&mut decode_dispatches, dispatch);
+            }
 
             if full_prefill {
                 remaining_batch -= 1;
@@ -1984,6 +2033,53 @@ impl Scheduler {
                         && metadata.retry_not_before.is_none_or(|until| until <= now)
                 })
         })
+    }
+
+    /// Whether every live non-realtime request runs mixed steps, so decode
+    /// rows and prefill spans share one token budget.
+    fn all_requests_mixed(&self) -> bool {
+        let mut live = self
+            .running
+            .keys()
+            .chain(self.waiting_members.iter())
+            .filter(|request_id| !self.realtime_sessions.contains_key(*request_id))
+            .peekable();
+        live.peek().is_some()
+            && live.all(|request_id| {
+                self.requests
+                    .get(request_id)
+                    .is_some_and(|metadata| metadata.cache_policy.mixed_step)
+            })
+    }
+
+    /// The dispatch a mixed prefill span would join, as `(index, key,
+    /// rows)`: its model's open dispatch with a free row, else the next one.
+    /// `None` until the model's dispatch width is installed.
+    fn mixed_prefill_dispatch(
+        metadata: &RequestMetadata,
+        dispatches: &[(DecodeDispatchKey, usize, usize)],
+    ) -> Option<(usize, DecodeDispatchKey, usize)> {
+        let rows = metadata.cache_policy.decode_dispatch_rows?;
+        let key = DecodeDispatchKey {
+            model_variant: metadata.model_variant,
+            task_type: metadata.task_type,
+            decode_batch: metadata.cache_policy.decode_batch,
+        };
+        let index = dispatches
+            .iter()
+            .position(|(open, used, rows)| *open == key && used < rows)
+            .unwrap_or(dispatches.len());
+        Some((index, key, rows))
+    }
+
+    fn claim_dispatch_row(
+        dispatches: &mut Vec<(DecodeDispatchKey, usize, usize)>,
+        (index, key, rows): (usize, DecodeDispatchKey, usize),
+    ) {
+        match dispatches.get_mut(index) {
+            Some((_, used, _)) => *used += 1,
+            None => dispatches.push((key, 1, rows)),
+        }
     }
 
     /// Update request state after a step.
@@ -2380,26 +2476,30 @@ impl Scheduler {
     /// Advance starvation debt once per successfully committed physical
     /// transaction. Scheduler polling, retry deferral, and rolled-back model
     /// work must not mutate this service clock.
+    /// Keyed on the phase each committed row ran: a mixed transaction that
+    /// served a prefill row is prefill service, and one with only decode rows
+    /// is decode-only.
     pub(crate) fn record_committed_batch_service(
         &mut self,
-        committed_requests: &[RequestId],
-        decode_transaction: bool,
+        committed_rows: &[(RequestId, SequencePhase)],
     ) {
-        if committed_requests.is_empty() {
+        if committed_rows.is_empty() {
             return;
         }
-        let served_full_prefill = !decode_transaction
-            && committed_requests.iter().any(|request_id| {
-                self.requests
-                    .get(request_id)
-                    .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
-            });
-        let served_incremental_prefill = !decode_transaction
-            && committed_requests.iter().any(|request_id| {
-                self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Incremental
-                })
-            });
+        let decode_transaction = committed_rows
+            .iter()
+            .all(|(_, phase)| *phase == SequencePhase::Decode);
+        let served_prefill = |mode: PrefillMode| {
+            committed_rows.iter().any(|(request_id, phase)| {
+                *phase == SequencePhase::Prefill
+                    && self
+                        .requests
+                        .get(request_id)
+                        .is_some_and(|metadata| metadata.cache_policy.prefill == mode)
+            })
+        };
+        let served_full_prefill = served_prefill(PrefillMode::Full);
+        let served_incremental_prefill = served_prefill(PrefillMode::Incremental);
         if served_full_prefill || !self.has_pending_full_prefill() {
             self.decode_only_steps_with_waiting_full_prefill = 0;
         } else if decode_transaction {
@@ -3922,6 +4022,7 @@ mod tests {
                 speculative_decode_batch: false,
                 preferred_prefill_tokens: 0,
                 decode_dispatch_rows: None,
+                mixed_step: false,
             },
             retry_not_before: None,
             replay_prompt_tokens: None,
@@ -4682,6 +4783,188 @@ mod tests {
         profile.prefill = PrefillMode::Incremental;
         assert!(scheduler
             .update_execution_profile(&SessionKey::new(request_id.to_string(), epoch), &profile,));
+    }
+
+    /// One physical dispatch of up to `max_batch_size` rows; chunked prefill
+    /// stays off, as on CPU and Metal.
+    fn mixed_scheduler(budget: usize, chunk: usize) -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            max_batch_size: 16,
+            max_tokens_per_step: budget,
+            chunked_prefill_threshold: chunk,
+            enable_chunked_prefill: false,
+            physical_dispatch_limit: 1,
+            ..Default::default()
+        })
+    }
+
+    /// Add a chat request with a `prompt`-token prompt whose loaded model
+    /// runs `width`-row dispatches, mixed or split.
+    fn add_chat(scheduler: &mut Scheduler, id: &str, prompt: usize, width: usize, mixed: bool) {
+        let mut request = build_request(TaskType::Chat, id, Priority::Normal);
+        request.prompt_tokens = (0..prompt as u32).collect();
+        request.params.max_tokens = 64;
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler
+            .get_sequence_id(&request.id)
+            .expect("request epoch");
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, None, ExecutionMode::Sequence);
+        profile.prefill = if mixed {
+            PrefillMode::Incremental
+        } else {
+            PrefillMode::Full
+        };
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = width;
+        profile.mixed_step = mixed;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+    }
+
+    /// Run `ids` through their one-span prefill so they decode next.
+    fn start_decoding(scheduler: &mut Scheduler, ids: &[&str]) {
+        let scheduled = scheduler.schedule();
+        for id in ids {
+            let row = scheduled
+                .prefill_requests
+                .iter()
+                .find(|row| row.request_id == *id)
+                .expect("prefill scheduled");
+            scheduler.update_after_step(&row.request_id, row.num_tokens, 1, 1.0);
+        }
+    }
+
+    #[test]
+    fn mixed_requests_share_one_budget_and_the_decode_dispatch() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b", "prompt-c"] {
+            add_chat(&mut scheduler, id, 40, 4, true);
+        }
+
+        let scheduled = scheduler.schedule();
+        // Decode rows first, one token each, then prefill spans fill the
+        // dispatch's remaining rows. Spans are chunked although the engine
+        // switch is off, and no slice of the budget was held back.
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert!(scheduled
+            .decode_requests
+            .iter()
+            .all(|row| row.num_tokens == 1));
+        let spans = scheduled
+            .prefill_requests
+            .iter()
+            .map(|row| row.num_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [32, 30], "two free rows of a four-row dispatch");
+        assert_eq!(scheduled.total_tokens, 64);
+
+        // A tight budget: decode takes its tokens first, prefill the rest.
+        let mut scheduler = mixed_scheduler(40, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b"] {
+            add_chat(&mut scheduler, id, 40, 4, true);
+        }
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        let spans = scheduled
+            .prefill_requests
+            .iter()
+            .map(|row| row.num_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [32, 6]);
+        assert_eq!(scheduled.total_tokens, 40);
+
+        // The weighted-fair split would hold the whole 8-token budget for
+        // the waiting prompt and decode nothing; one budget decodes first.
+        let mut scheduler = mixed_scheduler(8, 32);
+        let decoders = ["decode-a", "decode-b", "decode-c", "decode-d"];
+        for id in decoders {
+            add_chat(&mut scheduler, id, 1, 4, true);
+        }
+        start_decoding(&mut scheduler, &decoders);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, true);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 3);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests[0].num_tokens, 5);
+
+        // Rows, not the budget, bound short prompts: the dispatch has two
+        // free rows, so the third prompt waits.
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        for id in ["prompt-a", "prompt-b", "prompt-c"] {
+            add_chat(&mut scheduler, id, 10, 4, true);
+        }
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert_eq!(scheduled.prefill_requests.len(), 2);
+        assert_eq!(scheduled.total_tokens, 2 + 20);
+    }
+
+    #[test]
+    fn split_requests_keep_prefill_out_of_decode_steps() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 4, false);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, false);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2);
+        assert!(scheduled.prefill_requests.is_empty());
+    }
+
+    #[test]
+    fn mixed_decode_leaves_a_dispatch_row_for_a_waiting_prompt() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        for id in ["decode-a", "decode-b"] {
+            add_chat(&mut scheduler, id, 4, 2, true);
+        }
+        start_decoding(&mut scheduler, &["decode-a", "decode-b"]);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 2, "no prompt waits");
+        for row in &scheduled.decode_requests {
+            scheduler.update_after_step(&row.request_id, 1, 1, 1.0);
+        }
+
+        add_chat(&mut scheduler, "prompt-a", 40, 2, true);
+        let scheduled = scheduler.schedule();
+        assert_eq!(scheduled.decode_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests.len(), 1);
+        assert_eq!(scheduled.prefill_requests[0].num_tokens, 32);
+    }
+
+    #[test]
+    fn prefill_debt_keys_on_the_phase_each_committed_row_ran() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        add_chat(&mut scheduler, "decode-a", 4, 4, true);
+        start_decoding(&mut scheduler, &["decode-a"]);
+        add_chat(&mut scheduler, "prompt-a", 40, 4, true);
+        let decode = ("decode-a".to_string(), SequencePhase::Decode);
+        let prefill = ("prompt-a".to_string(), SequencePhase::Prefill);
+
+        scheduler.decode_only_steps_with_waiting_incremental_prefill = 5;
+        scheduler.record_committed_batch_service(std::slice::from_ref(&decode));
+        assert_eq!(
+            scheduler.decode_only_steps_with_waiting_incremental_prefill, 6,
+            "a batch of decode rows is decode-only"
+        );
+        scheduler.record_committed_batch_service(&[decode, prefill]);
+        assert_eq!(
+            scheduler.decode_only_steps_with_waiting_incremental_prefill, 0,
+            "a mixed batch that served a prefill row pays the prefill debt"
+        );
     }
 
     #[test]
@@ -5678,7 +5961,7 @@ mod tests {
                 "decode unexpectedly absent at bounded-service step {step}: {scheduled:?}"
             );
             scheduler.update_after_step(&decode_id, 1, 1, 1.0);
-            scheduler.record_committed_batch_service(std::slice::from_ref(&decode_id), true);
+            scheduler.record_committed_batch_service(&[(decode_id.clone(), SequencePhase::Decode)]);
         }
         panic!("full prefill was starved beyond the bounded decode-only window");
     }
@@ -5745,9 +6028,8 @@ mod tests {
             scheduler.record_committed_batch_service(
                 &decode_requests
                     .iter()
-                    .map(|request| request.id.clone())
+                    .map(|request| (request.id.clone(), SequencePhase::Decode))
                     .collect::<Vec<_>>(),
-                true,
             );
         }
         panic!("incremental prefill was starved beyond the bounded decode-only window");
@@ -5786,7 +6068,8 @@ mod tests {
             .retry_not_before = Some(Instant::now() + Duration::from_secs(60));
         scheduler.decode_only_steps_with_waiting_incremental_prefill =
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL - 1;
-        scheduler.record_committed_batch_service(&["decode-row".to_string()], true);
+        scheduler
+            .record_committed_batch_service(&[("decode-row".to_string(), SequencePhase::Decode)]);
 
         assert!(!scheduler.has_eligible_incremental_prefill(Instant::now()));
         assert_eq!(
