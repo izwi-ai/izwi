@@ -265,6 +265,43 @@ impl PrecisionLoad {
     }
 }
 
+/// Admits the memory of a precision fallback's reload before it allocates:
+/// called with the component's label and the dtype it reloads at, after the
+/// lower-precision component was dropped. A load priced for the lowered
+/// precision installs one for its loading thread
+/// ([`with_precision_reload_gate`]), so a failed probe grows the load's
+/// authorization (or refuses the reload) instead of being priced up front.
+pub type PrecisionReloadGate =
+    Box<dyn FnMut(&str, DType) -> crate::error::Result<()> + Send + 'static>;
+
+thread_local! {
+    static PRECISION_RELOAD_GATE: std::cell::RefCell<Option<PrecisionReloadGate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `load` with `gate` admitting every precision reload
+/// ([`admit_precision_reload`]) it makes on this thread.
+pub fn with_precision_reload_gate<R>(gate: PrecisionReloadGate, load: impl FnOnce() -> R) -> R {
+    struct Restore(Option<PrecisionReloadGate>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            PRECISION_RELOAD_GATE.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(PRECISION_RELOAD_GATE.with(|slot| slot.borrow_mut().replace(gate)));
+    load()
+}
+
+/// Asks this thread's [`PrecisionReloadGate`] to admit a reload of `label`
+/// at `dtype`. A load without a gate (outside the model lifecycle) admits it.
+pub fn admit_precision_reload(label: &str, dtype: DType) -> crate::error::Result<()> {
+    PRECISION_RELOAD_GATE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(gate) => gate(label, dtype),
+        None => Ok(()),
+    })
+}
+
 /// Loads a model at `selection.dtype` and, when `check` is set and that
 /// dtype is not `fallback`, keeps it only if `self_check` passes; otherwise
 /// the lower-precision model is dropped, the model reloads at `fallback`

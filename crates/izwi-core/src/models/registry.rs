@@ -19,6 +19,7 @@ use crate::engine::{
     RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{with_precision_reload_gate, PrecisionReloadGate};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
@@ -6578,10 +6579,14 @@ impl ModelRegistry {
         diagnostics
     }
 
+    /// Loads an ASR or forced-aligner model. With `reload_gate`, a component
+    /// whose lowered precision fails its load-time probe reloads only once
+    /// the gate admits it (the model lifecycle's load authorization).
     pub async fn load_asr(
         &self,
         variant: ModelVariant,
         model_dir: &Path,
+        reload_gate: Option<PrecisionReloadGate>,
     ) -> Result<Arc<NativeAsrModel>> {
         let registration = resolve_asr_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!(
@@ -6616,7 +6621,11 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant, device)?;
+                        let load = || loader(&model_dir, variant, device);
+                        let model = match reload_gate {
+                            Some(gate) => with_precision_reload_gate(gate, load),
+                            None => load(),
+                        }?;
                         Ok::<NativeAsrModel, Error>(model)
                     })
                     .await

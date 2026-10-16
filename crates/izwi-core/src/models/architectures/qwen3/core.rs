@@ -3146,6 +3146,17 @@ pub(crate) fn tiny_qwen3_model_for_test(device: &Device) -> Qwen3Model {
     tests::tiny_qwen3_model(device)
 }
 
+/// [`tiny_qwen3_model_for_test`] with non-finite embeddings, so its
+/// load-time numeric probe fails.
+#[cfg(test)]
+pub(crate) fn tiny_non_finite_qwen3_model_for_test(device: &Device) -> Qwen3Model {
+    let mut model = tests::tiny_qwen3_model(device);
+    let shape = model.embed_tokens.embeddings().shape().clone();
+    let hidden = model.cfg.hidden_size;
+    model.embed_tokens = Embedding::new(Tensor::full(f32::NAN, shape, device).unwrap(), hidden);
+    model
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1427,6 +1427,18 @@ fn aligner_plan(
     device: &DeviceProfile,
     backend: BackendKind,
 ) -> Result<Option<AsrResidencyPlan>> {
+    let Some((files, load)) = aligner_load(variant, model_path, device)? else {
+        return Ok(None);
+    };
+    price_qwen3_aligner(&files, backend, load).map(Some)
+}
+
+/// The aligner checkpoint's census and the load its loader resolves.
+fn aligner_load(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<(Vec<CensusFile>, AlignerLoad)>> {
     let Some(spec) = qwen3_asr_safetensors_load(model_path, variant, device)? else {
         return Ok(None);
     };
@@ -1439,33 +1451,49 @@ fn aligner_plan(
         mlx_bits: spec.mlx_bits,
         fused_projections: qwen3_dense_projection_fusion_enabled(&device.device),
     };
-    price_qwen3_aligner_as_loaded(&files, backend, load).map(Some)
+    Ok(Some((files, load)))
 }
 
-/// The aligner plan as loaded: on Metal a dtype below F32 is kept only if its
-/// load-time probe passes, else that component reloads at F32, so the load
-/// peak also fits that.
-fn price_qwen3_aligner_as_loaded(
-    files: &[CensusFile],
-    backend: BackendKind,
-    load: AlignerLoad,
-) -> Result<AsrResidencyPlan> {
-    let plan = price_qwen3_aligner(files, backend, load)?;
-    if backend == BackendKind::Metal
-        && (load.text_dtype != DType::F32 || load.audio_dtype != DType::F32)
-    {
-        let dense = price_qwen3_aligner(
-            files,
-            backend,
-            AlignerLoad {
-                text_dtype: DType::F32,
-                audio_dtype: DType::F32,
-                ..load
-            },
-        )?;
-        return Ok(plan.with_fallback_peak(&dense));
+/// What a Metal aligner load falls back to when a component loaded below F32
+/// fails its load-time probe: that component reloads at F32. `None` when no
+/// component is lowered (nothing to fall back from) and off Metal (no probe).
+fn aligner_precision_reload(backend: BackendKind, load: AlignerLoad) -> Option<AlignerLoad> {
+    let lowered = load.text_dtype != DType::F32 || load.audio_dtype != DType::F32;
+    (backend == BackendKind::Metal && lowered).then_some(AlignerLoad {
+        text_dtype: DType::F32,
+        audio_dtype: DType::F32,
+        ..load
+    })
+}
+
+/// Admission for a precision fallback's reload of `variant`, which
+/// [`resource_plan`] prices at its lowered dtypes: the plan with every
+/// component at F32 (a bound for one component reloading beside the other),
+/// or `None` for a load without such a fallback. The model lifecycle grows
+/// the loading authorization to it before the reload allocates.
+pub(super) fn precision_reload_plan(
+    variant: ModelVariant,
+    model_path: &Path,
+    device: &DeviceProfile,
+) -> Result<Option<ModelResourcePlan>> {
+    if variant.family() != ModelFamily::Qwen3ForcedAligner {
+        return Ok(None);
     }
-    Ok(plan)
+    let backend = BackendKind::from(device.kind);
+    let Some((files, load)) = aligner_load(variant, model_path, device)? else {
+        return Ok(None);
+    };
+    let Some(reload) = aligner_precision_reload(backend, load) else {
+        return Ok(None);
+    };
+    let plan = price_qwen3_aligner(&files, backend, reload)?;
+    tracing::info!(
+        model = %variant,
+        resident_bytes = plan.resident_bytes,
+        load_peak_bytes = plan.load_peak_bytes,
+        "Priced the F32 reload of a lowered-precision load whose probe failed"
+    );
+    plan.resource_plan().map(Some)
 }
 
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
@@ -2586,7 +2614,7 @@ pub(super) mod tests {
                 None,
             ),
         };
-        price_qwen3_aligner_as_loaded(files, backend, load).unwrap()
+        price_qwen3_aligner(files, backend, load).unwrap()
     }
 
     /// The published GGUF metadata: both LFM2 backbones precompute RoPE tables
@@ -3498,7 +3526,7 @@ pub(super) mod tests {
                     mlx_bits: None,
                     fused_projections: true,
                 };
-                price_qwen3_aligner_as_loaded(&files, BackendKind::Metal, f32_text).unwrap()
+                price_qwen3_aligner(&files, BackendKind::Metal, f32_text).unwrap()
             } else {
                 aligner(&files, BackendKind::Metal)
             };
@@ -3549,10 +3577,14 @@ pub(super) mod tests {
     }
 
     /// The aligner's Metal F16 text tier (4-bit, and dense per D8) runs a
-    /// load-time probe and reloads the text at F32 when it fails, so its load
-    /// peak covers that reload; residency stays the F16 tier's.
+    /// load-time probe and reloads the text at F32 when it fails. Admission
+    /// prices the F16 load only; the F32 reload is priced separately, for
+    /// the lifecycle to grow the load's authorization to when a probe fails
+    /// (a 6.37 GB worst case priced up front refused the dense aligner on a
+    /// 16 GB Mac with 4.6 GB of live headroom). CPU and F32 loads have no
+    /// reload.
     #[test]
-    fn aligner_metal_f16_tier_prices_the_f32_fallback_peak() {
+    fn aligner_metal_f16_tier_prices_its_f32_reload_separately() {
         let _env = env_lock();
         for (fixture, mlx_bits) in [
             (census!("qwen3_forced_aligner_0_6b_4bit.json"), Some(4)),
@@ -3567,9 +3599,18 @@ pub(super) mod tests {
             };
             let f16 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F16)).unwrap();
             let f32 = price_qwen3_aligner(&fixture, BackendKind::Metal, load(DType::F32)).unwrap();
-            assert_eq!(tiered.resident_bytes, f16.resident_bytes);
+            assert_eq!(tiered, f16);
             assert!(f32.load_peak_bytes > f16.load_peak_bytes);
-            assert_eq!(tiered.load_peak_bytes, f32.load_peak_bytes);
+            let reload = aligner_precision_reload(BackendKind::Metal, load(DType::F16));
+            assert_eq!(reload, Some(load(DType::F32)));
+            assert_eq!(
+                aligner_precision_reload(BackendKind::Metal, load(DType::F32)),
+                None
+            );
+            assert_eq!(
+                aligner_precision_reload(BackendKind::Cpu, load(DType::F16)),
+                None
+            );
         }
     }
 
@@ -3896,13 +3937,12 @@ mod metal_residency_tests {
     /// admission prices: Metal allocations never pass the planned load peak,
     /// and after the load fence the weights occupy the planned residency.
     /// Measured (2026-10-16, 16 GB M1 Pro; peak allocated / process footprint
-    /// with one checkpoint per process, resident; plan resident / peak, the
-    /// peak covering the F32 reload a failed F16 probe makes):
-    /// - dense: 2.73 / 2.79, 2.69 GiB; plan 2.69 / 4.77 GiB. Before: 4.95 /
+    /// with one checkpoint per process, resident; plan resident / peak):
+    /// - dense: 2.73 / 2.79, 2.69 GiB; plan 2.69 / 3.25 GiB. Before: 4.95 /
     ///   5.03, 3.24 GiB, over a 2.69 GiB resident plan.
-    /// - dense, F32 text (that reload): 4.24 peak, 4.19 GiB; plan 4.19 / 4.77
-    ///   GiB.
-    /// - 4-bit: 2.44 / 2.79, 2.42 GiB; plan 2.42 / 4.79 GiB. Before: 3.16 /
+    /// - dense, F32 text (the reload a failed F16 probe makes, admitted by
+    ///   `precision_reload_plan`): 4.24 peak, 4.19 GiB; plan 4.19 / 4.77 GiB.
+    /// - 4-bit: 2.44 / 2.79, 2.42 GiB; plan 2.42 / 3.27 GiB. Before: 3.16 /
     ///   3.83, 3.14 GiB over 2.69 GiB.
     ///
     /// The excess over the plan was Candle's Metal pool, which keeps a

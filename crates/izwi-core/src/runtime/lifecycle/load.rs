@@ -16,6 +16,7 @@ use crate::engine::{
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::PrecisionReloadGate;
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
     InvocationStateCapacity, InvocationWorkspaceBindingV2, InvocationWorkspaceDomain,
@@ -503,6 +504,42 @@ fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> Res
         BackendKind::Metal => authorization.unified_bytes,
         BackendKind::Cuda => authorization.device_bytes,
     }
+}
+
+/// A loading thread's request to admit a precision fallback's reload
+/// ([`PrecisionReloadGate`]): the lifecycle answers once it has grown the
+/// load's authorization, or refused.
+struct PrecisionReloadRequest {
+    component: String,
+    dtype: candle_core::DType,
+    reply: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+/// A [`PrecisionReloadGate`] for a loading thread, and the requests it sends
+/// to the load task, which owns admission. The gate blocks its thread until
+/// the reply, so the reload allocates only once it is authorized.
+fn precision_reload_gate() -> (
+    PrecisionReloadGate,
+    tokio::sync::mpsc::UnboundedReceiver<PrecisionReloadRequest>,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Box::new(move |component: &str, dtype| {
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let ended = || {
+            Error::ModelLoadError(format!(
+                "the load ended before admitting the {component} reload at {dtype:?}"
+            ))
+        };
+        requests
+            .send(PrecisionReloadRequest {
+                component: component.to_string(),
+                dtype,
+                reply,
+            })
+            .map_err(|_| ended())?;
+        outcome.blocking_recv().map_err(|_| ended())?
+    });
+    (gate, receiver)
 }
 
 /// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
@@ -2090,6 +2127,72 @@ impl ModelLifecycleController {
         }))
     }
 
+    /// Grows a loading slot's authorization to the precision reload plan
+    /// of `variant` before a component whose load-time probe failed reloads
+    /// at `request.dtype`, through the same live check as the load itself
+    /// (pooled-scratch flush and eviction included). Returns the reload plan
+    /// that now prices the load, or `None` when the load has none (its plan
+    /// already covers the reload). Refuses, with the shortfall, when the
+    /// reload cannot fit.
+    async fn admit_precision_reload(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+        current: &ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<Option<ModelResourcePlan>> {
+        let device = &self.backend_router.context().device;
+        let Some(reload) = asr_memory::precision_reload_plan(variant, model_path, device)? else {
+            return Ok(None);
+        };
+        self.grow_load_authorization_for_reload(variant, current, reload, request)
+            .await
+            .map(Some)
+    }
+
+    async fn grow_load_authorization_for_reload(
+        &self,
+        variant: ModelVariant,
+        current: &ModelResourcePlan,
+        reload: ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<ModelResourcePlan> {
+        let backend = self.backend_router.context().backend_kind;
+        let refused = |error: Error| {
+            Error::ModelLoadError(format!(
+                "Cannot reload {variant} {} at {:?} after its load-time probe failed: {error}",
+                request.component, request.dtype
+            ))
+        };
+        let growth = match (
+            load_domain_bytes(current.load_authorization, backend),
+            load_domain_bytes(reload.load_authorization, backend),
+        ) {
+            (ResourceAmount::Known(current), ResourceAmount::Known(reload)) => {
+                reload.saturating_sub(current)
+            }
+            _ => 0,
+        };
+        warn!(
+            model = %variant,
+            component = %request.component,
+            dtype = ?request.dtype,
+            growth_bytes = growth,
+            "A lowered-precision load failed its probe; admitting the reload"
+        );
+        // The loader synchronized the device after dropping the lowered
+        // component, so a fresh sample sees its memory free.
+        self.coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        self.ensure_portable_memory_before_load(variant, growth)
+            .await
+            .map_err(refused)?;
+        self.grow_loading_slot_authorization(variant, reload.load_authorization)
+            .map_err(refused)?;
+        Ok(reload)
+    }
+
     async fn reserve_model_resources(
         &self,
         requested_variant: ModelVariant,
@@ -2365,7 +2468,27 @@ impl ModelLifecycleController {
             // are both installed above.
             let weights_started = Instant::now();
             let usage_before_weights = self.sample_device_usage(variant);
-            let instantiated = self.instantiate_model(acquired).await?;
+            // Admission priced the selected precision. A component whose
+            // load-time probe fails reloads at F32 only once this task has
+            // grown the authorization for it.
+            let model_path = acquired.model_path.clone();
+            let (reload_gate, mut reload_requests) = precision_reload_gate();
+            let instantiate = self.instantiate_model(acquired, reload_gate);
+            tokio::pin!(instantiate);
+            let instantiated = loop {
+                tokio::select! {
+                    instantiated = &mut instantiate => break instantiated?,
+                    Some(request) = reload_requests.recv() => {
+                        let admitted = self
+                            .admit_precision_reload(variant, &model_path, &resource_plan, &request)
+                            .await;
+                        if let Ok(Some(reload)) = admitted {
+                            resource_plan = reload;
+                        }
+                        let _ = request.reply.send(admitted.map(|_| ()));
+                    }
+                }
+            };
             let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
             let preparation_started = Instant::now();
             if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
@@ -3906,13 +4029,13 @@ mod tests {
         kokoro_effective_context_tokens, loaded_asr_state_publication_route,
         managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
         model_resource_plan, now_unix_millis, plan_invocation_allocations,
-        portable_context_reserve_bytes, portable_invocation_context_intent,
+        portable_context_reserve_bytes, portable_invocation_context_intent, precision_reload_gate,
         qwen38_representation_memory_estimate, reconcile_observed_growth,
         residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
         validate_scratch_only_invocation_publication, DeviceUsageSample,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
-        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
-        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
+        PrecisionReloadRequest, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -5698,6 +5821,98 @@ mod tests {
             assert!(left >= envelope, "{variant}: {left} < {envelope}");
             assert!(fit > 0, "{variant}");
         }
+    }
+
+    /// A loading thread's precision reload waits on its gate until the load
+    /// task answers, and sees the task's refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
+        let (mut gate, mut requests) = precision_reload_gate();
+        let loader = tokio::task::spawn_blocking(move || {
+            let admitted = gate("text", candle_core::DType::F32);
+            let refused = gate("text", candle_core::DType::F32);
+            (admitted, refused)
+        });
+        for answer in [Ok(()), Err(Error::ModelLoadError("no room".into()))] {
+            let request = requests.recv().await.expect("reload request");
+            assert_eq!(
+                (request.component.as_str(), request.dtype),
+                ("text", candle_core::DType::F32)
+            );
+            request.reply.send(answer).unwrap();
+        }
+        let (admitted, refused) = loader.await.unwrap();
+        admitted.unwrap();
+        assert!(refused.unwrap_err().to_string().contains("no room"));
+        // A gate whose load task is gone refuses instead of blocking.
+        let (mut gate, requests) = precision_reload_gate();
+        drop(requests);
+        let orphaned = tokio::task::spawn_blocking(move || gate("text", candle_core::DType::F32));
+        assert!(orphaned.await.unwrap().is_err());
+    }
+
+    /// A failed probe's reload takes a second reservation: the loading
+    /// slot's authorization grows from the lowered load's peak to the reload
+    /// plan's before the reload allocates, and the reload plan then prices
+    /// the load. A reload that cannot fit is refused with the shortfall and
+    /// leaves the authorization as admitted.
+    #[tokio::test]
+    async fn a_failed_probe_grows_the_load_authorization_to_the_reload_plan() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-precision-reload-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = |load_peak_bytes, resident_bytes| {
+            model_resource_plan(
+                BackendKind::Cpu,
+                ModelMemoryEstimate {
+                    load_peak_bytes,
+                    resident_bytes,
+                },
+            )
+        };
+        let (lowered, reload, too_large) = (plan(256, 128), plan(512, 384), plan(2048, 1024));
+        let authority = vector_authority(all_memory_capacity(1024));
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "precision-reload"),
+                lowered.load_authorization,
+            )
+            .unwrap();
+        let lifecycle = &runtime.model_lifecycle;
+        lifecycle.install_loading_slot(variant, lease).unwrap();
+        let (reply, _) = oneshot::channel();
+        let request = PrecisionReloadRequest {
+            component: "text".into(),
+            dtype: candle_core::DType::F32,
+            reply,
+        };
+        let grown = lifecycle
+            .grow_load_authorization_for_reload(variant, &lowered, reload, &request)
+            .await
+            .unwrap();
+        assert_eq!(grown, reload);
+        assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+        let error = lifecycle
+            .grow_load_authorization_for_reload(variant, &reload, too_large, &request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "Cannot reload {variant} text at F32 after its load-time probe failed"
+            )),
+            "{error}"
+        );
+        assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+        assert!(lifecycle.remove_resident_slot(variant));
+        std::fs::remove_dir_all(models_dir).unwrap();
     }
 
     /// The weight lease records the smaller of the estimate and the observed

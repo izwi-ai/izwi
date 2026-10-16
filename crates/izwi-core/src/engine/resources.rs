@@ -165,7 +165,8 @@ impl ResourceVector {
         })
     }
 
-    fn positive_growth_over(self, current: Self) -> Result<Self> {
+    /// Per domain, how far `self` exceeds `current` (zero where it does not).
+    pub(crate) fn positive_growth_over(self, current: Self) -> Result<Self> {
         Ok(Self {
             host_bytes: self.host_bytes.positive_growth_over(current.host_bytes)?,
             device_bytes: self

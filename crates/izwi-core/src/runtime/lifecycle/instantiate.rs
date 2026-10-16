@@ -3,6 +3,7 @@ use tracing::info;
 use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::error::Result;
+use crate::kernels::numeric_check::PrecisionReloadGate;
 use crate::runtime::lifecycle::controller::ModelLifecycleController;
 use crate::runtime::lifecycle::phases::AcquiredModelLoad;
 use crate::tokenizer::Tokenizer;
@@ -20,9 +21,12 @@ pub(super) struct InstantiatedModelLoad {
 }
 
 impl ModelLifecycleController {
+    /// Loads the acquired model's weights. `reload_gate` admits the reload
+    /// of an ASR component whose lowered precision fails its load-time probe.
     pub(super) async fn instantiate_model(
         &self,
         acquired: AcquiredModelLoad,
+        reload_gate: PrecisionReloadGate,
     ) -> Result<InstantiatedModelLoad> {
         let AcquiredModelLoad {
             variant,
@@ -38,7 +42,9 @@ impl ModelLifecycleController {
             | ModelFamily::NemotronAsr
             | ModelFamily::GraniteSpeechAsr
             | ModelFamily::Qwen3ForcedAligner => {
-                self.model_registry.load_asr(variant, &model_path).await?;
+                self.model_registry
+                    .load_asr(variant, &model_path, Some(reload_gate))
+                    .await?;
                 InstantiatedPayload::None
             }
             ModelFamily::SortformerDiarization => {
