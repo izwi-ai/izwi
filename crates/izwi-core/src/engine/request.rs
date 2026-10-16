@@ -129,6 +129,19 @@ impl WorkloadClass {
         matches!(self, Self::Realtime | Self::Interactive | Self::Streaming)
     }
 
+    /// Relative share of service under weighted fair scheduling: of
+    /// scheduler quanta, and of device time between execution lanes.
+    pub(crate) fn service_weight(self) -> u64 {
+        match self {
+            Self::Realtime => 8,
+            Self::Interactive => 6,
+            Self::Streaming => 5,
+            Self::Online => 4,
+            Self::Batch => 2,
+            Self::Background => 1,
+        }
+    }
+
     pub fn prefers_single_token_decode(self) -> bool {
         self.is_latency_sensitive()
     }

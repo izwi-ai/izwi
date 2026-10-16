@@ -82,13 +82,13 @@ use super::metrics::{
     EnginePhysicalDeferReason, EnginePhysicalFallbackReason,
 };
 use super::output::StreamingOutput;
-use super::request::EngineCoreRequest;
+use super::request::{EngineCoreRequest, WorkloadClass};
 use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, TaskType};
 use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
-    BackendSelectionSource, DeviceThread,
+    BackendSelectionSource, DeviceJobTag, DeviceThread,
 };
 use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
@@ -1537,6 +1537,22 @@ pub struct PhysicalBatchExecution<'a> {
     pub batch: &'a PhysicalBatch,
     pub requests: &'a [&'a EngineCoreRequest],
     pub scheduled: &'a [ScheduledRequest],
+}
+
+/// A dispatch's place in device arbitration: its execution lane is the flow,
+/// weighted by the most latency-sensitive workload class among its rows.
+fn device_job_tag(execution: &PhysicalBatchExecution<'_>) -> (DeviceJobTag, WorkloadClass) {
+    let class = execution
+        .requests
+        .iter()
+        .map(|request| request.workload_class)
+        .max_by_key(|class| class.service_weight())
+        .unwrap_or_default();
+    let tag = DeviceJobTag {
+        flow: execution.batch.lane.model_instance.get(),
+        weight: class.service_weight(),
+    };
+    (tag, class)
 }
 
 /// When the device last finished a model step while the engine stayed busy.
@@ -4684,17 +4700,30 @@ impl UnifiedExecutor {
         {
             return (inputs, refusal);
         }
-        let (batch_id, expected_dispatch) =
-            inputs.with_execution(|execution| {
-                (execution.batch.batch_id, execution.batch.expected_dispatch())
-            });
+        let (batch_id, expected_dispatch, tag, class) = inputs.with_execution(|execution| {
+            let (tag, class) = device_job_tag(&execution);
+            (
+                execution.batch.batch_id,
+                execution.batch.expected_dispatch(),
+                tag,
+                class,
+            )
+        });
         let slot = Arc::new(Mutex::new(Some(inputs)));
         let job_slot = slot.clone();
         let idle = self
             .device
             .as_ref()
             .map(|device| (self.device_idle.clone(), device.key().label()));
+        let queued_at = std::time::Instant::now();
         let run = move |executor: &dyn ModelExecutor| {
+            if let Some((_, label)) = idle.as_ref() {
+                super::metrics::record_engine_device_queue_wait(
+                    label,
+                    class.as_str(),
+                    queued_at.elapsed(),
+                );
+            }
             let _device_step = idle.as_ref().map(|(clock, label)| clock.begin_step(label));
             let _physical_dispatch = begin_engine_physical_dispatch();
             let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -4715,7 +4744,7 @@ impl UnifiedExecutor {
             Some(device) => {
                 let executor = self.inner.clone();
                 device
-                    .submit(move || run(executor.blocking_read().as_ref()))
+                    .submit_tagged(tag, move || run(executor.blocking_read().as_ref()))
                     .await
             }
             None => Ok(run(self.inner.read().await.as_ref())),

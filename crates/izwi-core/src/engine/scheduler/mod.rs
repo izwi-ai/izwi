@@ -3555,14 +3555,7 @@ impl Scheduler {
     }
 
     fn workload_weight(workload_class: WorkloadClass) -> u64 {
-        match workload_class {
-            WorkloadClass::Realtime => 8,
-            WorkloadClass::Interactive => 6,
-            WorkloadClass::Streaming => 5,
-            WorkloadClass::Online => 4,
-            WorkloadClass::Batch => 2,
-            WorkloadClass::Background => 1,
-        }
+        workload_class.service_weight()
     }
 
     fn workload_order(workload_class: WorkloadClass) -> u8 {

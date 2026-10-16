@@ -14,18 +14,27 @@
 //! beside its replacement. [`DeviceThread::for_location`] returns it, started
 //! on first use.
 //!
+//! Jobs do not run in arrival order. Control jobs (KV page ops, loads,
+//! frees, cleanup: short leaf operations that callers wait on, often under
+//! the engine lock) run first, in order. Model dispatches carry a
+//! [`DeviceJobTag`]: each execution lane is a flow, and the flow with the
+//! least weighted device time served runs next, so one lane's long jobs
+//! cannot hold the device while another lane's short steps queue behind
+//! them. A running job is never preempted; arbitration happens between jobs.
+//!
 //! [`probe_device_op`] marks device-op entry points. A call that is not on a
 //! device thread counts in [`device_ops_off_thread_total`]: the deterministic
 //! check that replaces a racy corruption test.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use candle_core::{Device, DeviceLocation};
 use tokio::sync::oneshot;
@@ -72,11 +81,148 @@ impl DeviceThreadKey {
     }
 }
 
-/// An owned OS thread that runs every job for one device, in order.
+/// The flow a model dispatch belongs to (its execution lane) and that
+/// flow's share of device time relative to other flows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceJobTag {
+    pub flow: u64,
+    /// Relative share of device time; zero counts as one.
+    pub weight: u64,
+}
+
+/// Weighted device time is kept in nanoseconds scaled by this factor, so
+/// integer division by a weight keeps sub-nanosecond resolution.
+const VIRTUAL_TIME_SCALE: u128 = 840;
+
+struct QueuedJob {
+    job: Job,
+    order: u64,
+    weight: u64,
+}
+
+struct Flow {
+    /// Weighted device time this flow has been served.
+    served: u128,
+    jobs: VecDeque<QueuedJob>,
+}
+
+/// The device's job queue: control jobs first, then the backlogged flow
+/// with the least weighted device time served.
+#[derive(Default)]
+struct Arbiter {
+    control: VecDeque<Job>,
+    flows: HashMap<u64, Flow>,
+    /// Weighted time of the last flow that started a job. A flow that
+    /// becomes backlogged starts here, so idle time is not banked as credit.
+    virtual_time: u128,
+    next_order: u64,
+    stopped: bool,
+}
+
+impl Arbiter {
+    fn push(&mut self, job: Job, tag: Option<DeviceJobTag>) {
+        let Some(tag) = tag else {
+            self.control.push_back(job);
+            return;
+        };
+        let order = self.next_order;
+        self.next_order += 1;
+        let virtual_time = self.virtual_time;
+        let flow = self.flows.entry(tag.flow).or_insert_with(|| Flow {
+            served: virtual_time,
+            jobs: VecDeque::new(),
+        });
+        if flow.jobs.is_empty() {
+            flow.served = flow.served.max(virtual_time);
+        }
+        flow.jobs.push_back(QueuedJob {
+            job,
+            order,
+            weight: tag.weight.max(1),
+        });
+    }
+
+    /// The next job, and the flow and weight to charge for its device time.
+    fn pop(&mut self) -> Option<(Job, Option<(u64, u64)>)> {
+        if let Some(job) = self.control.pop_front() {
+            return Some((job, None));
+        }
+        let virtual_time = self.virtual_time;
+        // A drained flow with no debt left carries nothing a new flow at
+        // `virtual_time` would not.
+        self.flows
+            .retain(|_, flow| !flow.jobs.is_empty() || flow.served > virtual_time);
+        let (&id, flow) = self
+            .flows
+            .iter_mut()
+            .filter(|(_, flow)| !flow.jobs.is_empty())
+            .min_by_key(|(_, flow)| (flow.served, flow.jobs[0].order))?;
+        self.virtual_time = self.virtual_time.max(flow.served);
+        let queued = flow
+            .jobs
+            .pop_front()
+            .expect("only backlogged flows compete");
+        Some((queued.job, Some((id, queued.weight))))
+    }
+
+    fn charge(&mut self, flow: u64, weight: u64, elapsed: Duration) {
+        if let Some(flow) = self.flows.get_mut(&flow) {
+            flow.served = flow
+                .served
+                .saturating_add(elapsed.as_nanos() * VIRTUAL_TIME_SCALE / u128::from(weight));
+        }
+    }
+}
+
+#[derive(Default)]
+struct JobQueue {
+    arbiter: Mutex<Arbiter>,
+    ready: Condvar,
+}
+
+impl JobQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Arbiter> {
+        self.arbiter
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Serve jobs until the queue is stopped and drained.
+    fn serve(&self) {
+        loop {
+            let next = {
+                let mut arbiter = self.lock();
+                loop {
+                    if let Some(next) = arbiter.pop() {
+                        break Some(next);
+                    }
+                    if arbiter.stopped {
+                        break None;
+                    }
+                    arbiter = self
+                        .ready
+                        .wait(arbiter)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            };
+            let Some((job, charge)) = next else {
+                return;
+            };
+            let started = Instant::now();
+            // Jobs contain their own panics.
+            job();
+            if let Some((flow, weight)) = charge {
+                self.lock().charge(flow, weight, started.elapsed());
+            }
+        }
+    }
+}
+
+/// An owned OS thread that runs every job for one device.
 pub struct DeviceThread {
     key: DeviceThreadKey,
     id: u64,
-    queue: Mutex<Option<mpsc::Sender<Job>>>,
+    queue: Arc<JobQueue>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -118,15 +264,13 @@ impl DeviceThread {
 
     fn spawn(key: DeviceThreadKey) -> Result<Self> {
         let id = NEXT_DEVICE_THREAD_ID.fetch_add(1, Ordering::Relaxed);
-        let (queue, jobs) = mpsc::channel::<Job>();
+        let queue = Arc::new(JobQueue::default());
+        let jobs = queue.clone();
         let handle = std::thread::Builder::new()
             .name(key.thread_name())
             .spawn(move || {
                 CURRENT_DEVICE_THREAD.with(|current| current.set(Some(id)));
-                // Jobs contain their own panics; this only guards the loop.
-                while let Ok(job) = jobs.recv() {
-                    job();
-                }
+                jobs.serve();
             })
             .map_err(|error| {
                 Error::InferenceError(format!(
@@ -136,7 +280,7 @@ impl DeviceThread {
         Ok(Self {
             key,
             id,
-            queue: Mutex::new(Some(queue)),
+            queue,
             handle: Mutex::new(Some(handle)),
         })
     }
@@ -150,31 +294,60 @@ impl DeviceThread {
         CURRENT_DEVICE_THREAD.with(Cell::get) == Some(self.id)
     }
 
-    fn enqueue(&self, job: Job) -> Result<()> {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let stopped = || Error::InferenceError(format!("the {:?} device thread stopped", self.key));
-        queue
-            .as_ref()
-            .ok_or_else(stopped)?
-            .send(job)
-            .map_err(|_| stopped())
+    fn enqueue(&self, job: Job, tag: Option<DeviceJobTag>) -> Result<()> {
+        let mut arbiter = self.queue.lock();
+        if arbiter.stopped {
+            return Err(Error::InferenceError(format!(
+                "the {:?} device thread stopped",
+                self.key
+            )));
+        }
+        arbiter.push(job, tag);
+        drop(arbiter);
+        self.queue.ready.notify_one();
+        Ok(())
     }
 
-    /// Run `job` on the device thread and resolve with its result. A panic in
-    /// the job is contained and returned as an error; the thread keeps
-    /// serving later jobs.
+    /// Run `job` on the device thread as a control job and resolve with its
+    /// result. A panic in the job is contained and returned as an error; the
+    /// thread keeps serving later jobs.
     pub fn submit<T, F>(&self, job: F) -> impl Future<Output = Result<T>> + Send + 'static
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.submit_job(None, job)
+    }
+
+    /// [`Self::submit`] for a model dispatch of the flow `tag` names.
+    pub fn submit_tagged<T, F>(
+        &self,
+        tag: DeviceJobTag,
+        job: F,
+    ) -> impl Future<Output = Result<T>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        self.submit_job(Some(tag), job)
+    }
+
+    fn submit_job<T, F>(
+        &self,
+        tag: Option<DeviceJobTag>,
+        job: F,
+    ) -> impl Future<Output = Result<T>> + Send + 'static
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let (done, result) = oneshot::channel();
-        let enqueued = self.enqueue(Box::new(move || {
-            let _ = done.send(catch_unwind(AssertUnwindSafe(job)));
-        }));
+        let enqueued = self.enqueue(
+            Box::new(move || {
+                let _ = done.send(catch_unwind(AssertUnwindSafe(job)));
+            }),
+            tag,
+        );
         let key = self.key;
         async move {
             enqueued?;
@@ -188,8 +361,9 @@ impl DeviceThread {
         }
     }
 
-    /// Run `job` on the device thread and block the caller until it returns.
-    /// Runs inline when the caller already is the device thread. Only call it
+    /// Run `job` on the device thread as a control job and block the caller
+    /// until it returns. Runs inline when the caller already is the device
+    /// thread. Only call it
     /// from a blocking context or for short leaf operations (KV page ops);
     /// async code awaits [`Self::submit`] instead.
     pub fn run_sync<'env, T, F>(&self, job: F) -> Result<T>
@@ -211,12 +385,11 @@ impl DeviceThread {
         // function does not return before the device thread has finished
         // with it: `result.recv()` returns only once `done` has sent the
         // result or has been dropped, and `ScopedJob` drops `job` before
-        // `done` (field order). A job that is never run (the thread stopped)
-        // is dropped with its queue, which also drops `job` before `done`, or
-        // is handed back by `enqueue`'s error and dropped here.
+        // `done` (field order). The thread runs every accepted job before it
+        // exits; a job `enqueue` refuses is dropped there, before it returns.
         let boxed: Job =
             unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Job>(boxed) };
-        self.enqueue(boxed)?;
+        self.enqueue(boxed, None)?;
         match result.recv() {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(payload)) => Err(job_panicked(self.key, payload.as_ref())),
@@ -230,10 +403,8 @@ impl DeviceThread {
     /// Stop accepting jobs, let queued jobs finish and join the thread.
     /// Idempotent; a no-op join when called from the device thread itself.
     pub fn shutdown(&self) {
-        self.queue
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .take();
+        self.queue.lock().stopped = true;
+        self.queue.ready.notify_all();
         let handle = self
             .handle
             .lock()
@@ -428,6 +599,93 @@ mod tests {
         assert_eq!(queued.await.expect("queued job"), 2);
         assert!(thread.submit(|| 3).await.is_err());
         assert!(thread.run_sync(|| 3).is_err());
+    }
+
+    /// Hold `thread` busy until the returned sender fires, so later jobs
+    /// queue behind it.
+    fn block(thread: &DeviceThread) -> std::sync::mpsc::Sender<()> {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        drop(thread.submit(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv().unwrap();
+        release_tx
+    }
+
+    /// Queue `count` jobs of `flow` that each record the flow and then
+    /// sleep for `busy`.
+    fn queue_flow(
+        thread: &DeviceThread,
+        flow: u64,
+        weight: u64,
+        count: usize,
+        busy: Duration,
+        order: &Arc<Mutex<Vec<u64>>>,
+    ) -> Vec<impl Future<Output = Result<()>>> {
+        (0..count)
+            .map(|_| {
+                let order = order.clone();
+                thread.submit_tagged(DeviceJobTag { flow, weight }, move || {
+                    order.lock().unwrap().push(flow);
+                    std::thread::sleep(busy);
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn control_jobs_run_before_queued_dispatches() {
+        let thread = test_thread();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let release = block(&thread);
+        let dispatches = queue_flow(&thread, 1, 1, 2, Duration::ZERO, &order);
+        let control = {
+            let order = order.clone();
+            thread.submit(move || order.lock().unwrap().push(0))
+        };
+        release.send(()).unwrap();
+        control.await.expect("control job");
+        for dispatch in dispatches {
+            dispatch.await.expect("dispatch");
+        }
+        assert_eq!(*order.lock().unwrap(), [0, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_lane_of_long_jobs_does_not_hold_the_device() {
+        let thread = test_thread();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let release = block(&thread);
+        // Lane 1 queued four long jobs before lane 2's short steps arrived.
+        let (long, short) = (Duration::from_millis(100), Duration::from_millis(1));
+        let mut jobs = queue_flow(&thread, 1, 1, 4, long, &order);
+        jobs.extend(queue_flow(&thread, 2, 1, 8, short, &order));
+        release.send(()).unwrap();
+        for job in jobs {
+            job.await.expect("job");
+        }
+        // After one long job, every short step runs before the next long one.
+        assert_eq!(*order.lock().unwrap(), [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn lanes_share_the_device_by_weight() {
+        let thread = test_thread();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let release = block(&thread);
+        let busy = Duration::from_millis(5);
+        let mut jobs = queue_flow(&thread, 1, 1, 12, busy, &order);
+        jobs.extend(queue_flow(&thread, 2, 6, 12, busy, &order));
+        release.send(()).unwrap();
+        for job in jobs {
+            job.await.expect("job");
+        }
+        // Equal jobs at weights 1 and 6: about one light job per six heavy.
+        let order = order.lock().unwrap();
+        let light = order[..14].iter().filter(|flow| **flow == 1).count();
+        assert!((2..=3).contains(&light), "{order:?}");
     }
 
     #[test]

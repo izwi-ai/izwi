@@ -1253,6 +1253,18 @@ pub(crate) fn record_engine_device_idle(device: &str, idle: Duration) {
     ENGINE_DEVICE_IDLE_SECONDS.observe_duration(&[device], idle);
 }
 
+static ENGINE_DEVICE_QUEUE_WAIT_SECONDS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_device_queue_wait_seconds",
+    "Time a model dispatch waited on its device's queue before it started, by the workload class it was arbitrated as.",
+    &["device", "class"],
+    buckets::STEP_SECONDS,
+);
+
+/// Record how long a model dispatch waited for its device.
+pub(crate) fn record_engine_device_queue_wait(device: &str, class: &str, waited: Duration) {
+    ENGINE_DEVICE_QUEUE_WAIT_SECONDS.observe_duration(&[device, class], waited);
+}
+
 /// Observations and total seconds of one device's idle histogram.
 #[cfg(test)]
 pub(crate) fn engine_device_idle_totals(device: &str) -> (u64, f64) {
@@ -1346,6 +1358,7 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_MIXED_ROWS.render(payload);
     ENGINE_MIXED_TOKENS.render(payload);
     ENGINE_DEVICE_IDLE_SECONDS.render(payload);
+    ENGINE_DEVICE_QUEUE_WAIT_SECONDS.render(payload);
     payload.push_str(
         "# HELP izwi_engine_device_ops_off_thread_total Device operations (model calls, KV page operations, state allocation and frees) that ran off their device thread. Zero in a healthy process.\n\
          # TYPE izwi_engine_device_ops_off_thread_total counter\n",

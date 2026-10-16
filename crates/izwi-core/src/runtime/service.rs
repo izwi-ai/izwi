@@ -10466,6 +10466,7 @@ mod tests {
             "izwi_engine_mixed_rows",
             "izwi_engine_mixed_tokens",
             "izwi_engine_device_idle_seconds",
+            "izwi_engine_device_queue_wait_seconds",
             "izwi_request_duration_seconds",
             "izwi_request_ttft_seconds",
             "izwi_request_queue_wait_seconds",
