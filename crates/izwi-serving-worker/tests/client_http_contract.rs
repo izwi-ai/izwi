@@ -886,6 +886,56 @@ async fn first_output_timeout_requests_cancel_but_capacity_waits_for_teardown() 
     assert_eq!(query.state, AttemptState::Cancelled);
 }
 
+/// A long prompt earns first-output time in proportion to its size, so its
+/// slow prefill is not cancelled by the deadline sized for short prompts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_output_deadline_grows_with_the_prompt() {
+    let config = TestWorkerConfig {
+        script: WorkerScript::Complete,
+        output_cadence: Duration::from_millis(150),
+        cancellation_delay: Duration::from_millis(10),
+        ..TestWorkerConfig::default()
+    };
+    let worker = TestWorker::spawn(config).await.unwrap();
+    let client = WorkerClient::new(
+        &worker.endpoint(),
+        worker.config().credentials.clone(),
+        WorkerClientConfig {
+            first_output_timeout: Duration::from_millis(40),
+            first_output_timeout_per_kib: Duration::from_millis(40),
+            request_timeout: Duration::from_millis(500),
+            ..WorkerClientConfig::default()
+        },
+    )
+    .unwrap();
+
+    let error = client
+        .invoke_collect(request(worker.config(), "short-prompt"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkerClientError::Deadline(DeadlinePhase::FirstOutput)
+    ));
+
+    for _ in 0..100 {
+        if worker.active_invocations() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // 8 KiB of prompt: 40 ms + 8 x 40 ms outlasts the 150 ms prefill.
+    let mut long = request(worker.config(), "long-prompt");
+    let InvocationInput::Chat { input, .. } = &mut long.input;
+    input.messages[0].content = "x".repeat(8 * 1024);
+    let events = client.invoke_collect(long).await.unwrap();
+    assert!(matches!(
+        events.last().map(|event| &event.event),
+        Some(InvocationEventKind::Completed { .. })
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_trickle_does_not_reset_first_useful_output_deadline() {
     assert_peer_trickle_times_out(WireFault::UsageTrickle, "usage-trickle").await;

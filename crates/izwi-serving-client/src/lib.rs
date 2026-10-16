@@ -181,8 +181,12 @@ pub struct WorkerClientConfig {
     /// first contract-valid admission event.
     pub request_timeout: Duration,
     /// Maximum wait from worker acceptance to the first non-empty model output
-    /// or a legitimate terminal event.
+    /// or a legitimate terminal event, for an empty prompt.
     pub first_output_timeout: Duration,
+    /// Extra first-output allowance per KiB of invocation JSON, so a long
+    /// prompt's prefill (minutes on CPU) is not cancelled by a deadline sized
+    /// for short ones. The total invocation deadline still bounds it.
+    pub first_output_timeout_per_kib: Duration,
     /// Maximum idle time between non-empty model output events. Raw HTTP
     /// chunks, empty deltas, and usage-only events do not reset it.
     pub progress_timeout: Duration,
@@ -200,6 +204,7 @@ impl Default for WorkerClientConfig {
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(10),
             first_output_timeout: Duration::from_secs(60),
+            first_output_timeout_per_kib: Duration::ZERO,
             progress_timeout: Duration::from_secs(30),
             max_request_json_bytes: DEFAULT_MAX_REQUEST_JSON_BYTES,
             max_control_body_bytes: DEFAULT_MAX_CONTROL_BODY_BYTES,
@@ -522,6 +527,13 @@ impl WorkerClient {
                 limit: self.inner.config.max_request_json_bytes,
             });
         }
+        let prompt_kib = u32::try_from(encoded.len() / 1024).unwrap_or(u32::MAX);
+        let first_output_timeout = self.inner.config.first_output_timeout.saturating_add(
+            self.inner
+                .config
+                .first_output_timeout_per_kib
+                .saturating_mul(prompt_kib),
+        );
         // From this point until an explicit rejection or a live response stream, dropping this
         // future leaves admission uncertain. A tombstoned cancel also closes the race where the
         // cancellation reaches the worker just before the invocation POST.
@@ -593,6 +605,7 @@ impl WorkerClient {
             total_deadline,
             phase_deadline,
             deadline_phase: DeadlinePhase::InvocationAdmission,
+            first_output_timeout,
         };
         // The live stream now owns best-effort cancellation for every exit path.
         admission_guard.disarm();
@@ -923,6 +936,8 @@ pub struct InvocationStream {
     total_deadline: Instant,
     phase_deadline: Instant,
     deadline_phase: DeadlinePhase,
+    /// This invocation's first-output deadline, scaled by its prompt size.
+    first_output_timeout: Duration,
 }
 
 impl std::fmt::Debug for InvocationStream {
@@ -1098,10 +1113,7 @@ impl InvocationStream {
         self.last_sequence = Some(event.sequence);
         match &event.event {
             InvocationEventKind::Accepted { .. } => {
-                self.reset_phase_deadline(
-                    DeadlinePhase::FirstOutput,
-                    self.client.inner.config.first_output_timeout,
-                );
+                self.reset_phase_deadline(DeadlinePhase::FirstOutput, self.first_output_timeout);
             }
             InvocationEventKind::TextDelta { text, .. } if !text.is_empty() => {
                 self.reset_phase_deadline(

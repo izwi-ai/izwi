@@ -276,6 +276,15 @@ struct ServerArgs {
     )]
     gateway_worker_first_output_timeout_ms: u64,
 
+    /// Extra first-output allowance per KiB of prompt, so a long prompt's
+    /// prefill (slow on CPU) is not cancelled by the short-prompt deadline.
+    #[arg(
+        long,
+        env = "IZWI_GATEWAY_WORKER_FIRST_OUTPUT_TIMEOUT_PER_KIB_MS",
+        default_value_t = 1_000
+    )]
+    gateway_worker_first_output_timeout_per_kib_ms: u64,
+
     /// Maximum idle time between useful worker output events.
     #[arg(
         long,
@@ -1928,6 +1937,14 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
             );
         }
     }
+    if Duration::from_millis(args.gateway_worker_first_output_timeout_per_kib_ms)
+        > MAX_GATEWAY_STREAM_PHASE_TIMEOUT
+    {
+        anyhow::bail!(
+            "--gateway-worker-first-output-timeout-per-kib-ms must be at most {}",
+            MAX_GATEWAY_STREAM_PHASE_TIMEOUT.as_millis()
+        );
+    }
     let slow_consumer_timeout = Duration::from_millis(args.gateway_slow_consumer_timeout_ms);
     if slow_consumer_timeout.is_zero() || slow_consumer_timeout > MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT
     {
@@ -2030,6 +2047,9 @@ fn gateway_worker_client_config(
         max_in_flight: args.gateway_max_in_flight,
         request_timeout: Duration::from_millis(args.gateway_worker_admission_timeout_ms),
         first_output_timeout: Duration::from_millis(args.gateway_worker_first_output_timeout_ms),
+        first_output_timeout_per_kib: Duration::from_millis(
+            args.gateway_worker_first_output_timeout_per_kib_ms,
+        ),
         progress_timeout: Duration::from_millis(args.gateway_worker_progress_idle_timeout_ms),
         ndjson_limits: NdjsonLimits {
             max_line_bytes: GATEWAY_NDJSON_MAX_LINE_BYTES,
@@ -3197,6 +3217,10 @@ mod tests {
         );
         assert_eq!(client_config.request_timeout, Duration::from_secs(10));
         assert_eq!(client_config.first_output_timeout, Duration::from_secs(60));
+        assert_eq!(
+            client_config.first_output_timeout_per_kib,
+            Duration::from_secs(1)
+        );
         assert_eq!(client_config.progress_timeout, Duration::from_secs(30));
         assert_eq!(
             client_config.ndjson_limits,
@@ -3238,6 +3262,7 @@ mod tests {
         for (flag, value) in [
             ("--gateway-worker-admission-timeout-ms", "60001"),
             ("--gateway-worker-first-output-timeout-ms", "3600001"),
+            ("--gateway-worker-first-output-timeout-per-kib-ms", "3600001"),
             ("--gateway-worker-progress-idle-timeout-ms", "3600001"),
             ("--gateway-slow-consumer-timeout-ms", "60001"),
         ] {
