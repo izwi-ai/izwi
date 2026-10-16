@@ -9,3 +9,4 @@ pub mod realtime_translate;
 pub mod remote_chat_dispatch;
 pub mod transcription_realtime;
 pub mod voice_realtime;
+pub mod voice_reply;

@@ -24,17 +24,36 @@ fn seconds_to_samples(secs: f32, sample_rate: u32) -> usize {
     (secs * sample_rate as f32).round().max(1.0) as usize
 }
 
+/// Samples in the fade on each side of a segment join.
+pub(crate) fn segment_fade_samples(sample_rate: u32) -> usize {
+    seconds_to_samples(SEGMENT_FADE_SECS, sample_rate)
+}
+
+/// Samples of silence between two segments.
+pub(crate) fn segment_pause_samples(sample_rate: u32) -> usize {
+    seconds_to_samples(SEGMENT_PAUSE_SECS, sample_rate)
+}
+
 /// Fade the first samples of a segment in from silence.
 pub(crate) fn fade_in_segment(samples: &mut [f32], sample_rate: u32) {
-    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(samples.len());
+    let fade = segment_fade_samples(sample_rate).min(samples.len());
     for (index, sample) in samples.iter_mut().take(fade).enumerate() {
         *sample *= (index + 1) as f32 / (fade + 1) as f32;
     }
 }
 
+/// Fade the last samples of a segment out to silence.
+pub(crate) fn fade_out_segment(samples: &mut [f32], sample_rate: u32) {
+    let fade = segment_fade_samples(sample_rate).min(samples.len());
+    let tail = samples.len() - fade;
+    for (index, sample) in samples[tail..].iter_mut().enumerate() {
+        *sample *= (fade - index) as f32 / (fade + 1) as f32;
+    }
+}
+
 /// The pause before a later segment, followed by that segment faded in.
 pub(crate) fn pause_then_segment(segment: &[f32], sample_rate: u32) -> Vec<f32> {
-    let pause = seconds_to_samples(SEGMENT_PAUSE_SECS, sample_rate);
+    let pause = segment_pause_samples(sample_rate);
     let mut out = Vec::with_capacity(pause + segment.len());
     out.resize(pause, 0.0);
     out.extend_from_slice(segment);
@@ -49,11 +68,7 @@ pub(crate) fn append_segment(joined: &mut Vec<f32>, segment: &[f32], sample_rate
         joined.extend_from_slice(segment);
         return;
     }
-    let fade = seconds_to_samples(SEGMENT_FADE_SECS, sample_rate).min(joined.len());
-    let tail = joined.len() - fade;
-    for (index, sample) in joined[tail..].iter_mut().enumerate() {
-        *sample *= (fade - index) as f32 / (fade + 1) as f32;
-    }
+    fade_out_segment(joined, sample_rate);
     joined.extend(pause_then_segment(segment, sample_rate));
 }
 
