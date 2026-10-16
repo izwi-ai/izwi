@@ -47,9 +47,10 @@ use super::executor::{
     UnifiedExecutor, WorkerConfig,
 };
 use super::metrics::{
-    record_engine_execution_outcome, record_engine_physical_batch,
-    record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
-    record_engine_workspace_wait, EngineWorkspaceWaitOutcome,
+    model_calls_for_dispatch, record_engine_execution_outcome, record_engine_physical_batch,
+    record_engine_step_model_calls, record_engine_stream_checkpoint_committed,
+    record_engine_stream_checkpoint_rejection, record_engine_workspace_wait,
+    EngineWorkspaceWaitOutcome,
 };
 use super::output::OutputProcessor;
 use super::request::{
@@ -859,6 +860,9 @@ pub struct EngineCore {
     retry_policy: LifecycleRetryPolicy,
     #[cfg(test)]
     restart_after_reset_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Model calls of each committed step that dispatched work.
+    #[cfg(test)]
+    step_model_calls: Vec<usize>,
     /// Phase preferred when decode and prefill compete for a single physical
     /// candidate slot. It advances only after the preferred phase actually
     /// owns a ticket, so blocked work does not waste the device opportunity.
@@ -3685,6 +3689,8 @@ impl EngineCore {
             retry_policy: LifecycleRetryPolicy::default(),
             #[cfg(test)]
             restart_after_reset_hook: None,
+            #[cfg(test)]
+            step_model_calls: Vec::new(),
             next_single_candidate_phase: ExecutionPhase::Decode,
             initialized: false,
             next_batch_id: 1,
@@ -5137,6 +5143,7 @@ impl EngineCore {
         let mut executor_outputs =
             Vec::with_capacity(result_capacity + self.pending_terminal_outputs.len());
         let mut stream_deliveries = Vec::new();
+        let mut step_model_calls = 0;
         for mut batch in batches {
             let batch_id = batch.physical_batch.batch_id;
             let Some(in_flight) = self.in_flight_dispatches.remove(&batch_id) else {
@@ -5215,6 +5222,7 @@ impl EngineCore {
                 }
             } else {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
+                step_model_calls += model_calls_for_dispatch(batch.report.dispatch);
             }
 
             for (scheduled, result) in in_flight.scheduled.iter().filter_map(|scheduled| {
@@ -5318,6 +5326,11 @@ impl EngineCore {
                 .record_committed_batch_service(&committed_service_requests, decode_transaction);
             self.scheduler
                 .record_committed_decode_service(&committed_decode_work);
+        }
+        record_engine_step_model_calls(step_model_calls);
+        #[cfg(test)]
+        if step_model_calls > 0 {
+            self.step_model_calls.push(step_model_calls);
         }
         // Terminal events are a durable outbox until all fallible work for the
         // step has completed. Draining earlier can lose an abort/deadline event
@@ -11517,12 +11530,14 @@ mod tests {
     /// to `width` rows, for the host-overhead benchmark below.
     struct BatchedDecodeExecutor {
         width: usize,
+        prefill: PrefillMode,
         last_decode_rows: Arc<AtomicUsize>,
     }
 
     impl ModelExecutor for BatchedDecodeExecutor {
         fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
             let mut profile = ManagedReceiptExecutor.execution_profile(request)?;
+            profile.prefill = self.prefill;
             profile.incremental_decode = true;
             profile.prefill_batch = NativeBatchMode::Continuous;
             profile.decode_batch = NativeBatchMode::Continuous;
@@ -11583,43 +11598,65 @@ mod tests {
         }
     }
 
-    /// Mean host microseconds per decode step (prepare, then execute and
-    /// commit) with `rows` running requests in one native batch and a
-    /// no-op executor, measured over `steps` steps after every row decodes.
-    async fn measure_step_host_overhead(rows: usize, steps: usize) -> (f64, f64) {
-        let model = ModelInstanceId::new(101);
-        let last_decode_rows = Arc::new(AtomicUsize::new(0));
-        let executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
-            width: rows,
-            last_decode_rows: last_decode_rows.clone(),
-        }));
-        let mut core = EngineCore::new_with_unified_executor(
-            EngineCoreConfig {
-                enable_chunked_prefill: false,
-                block_size: 16,
-                // Full-request claims of 8 prompt + 4,000 output tokens.
-                max_blocks: rows * 256,
-                max_batch_size: rows,
-                max_tokens_per_step: rows * 16,
-                max_retained_sequences: rows,
-                max_staged_transactions: rows,
-                managed_chat_claim_quantum_tokens: 0,
-                backend: BackendKind::Cpu,
-                ..Default::default()
-            },
-            executor,
-        )
-        .expect("core");
-        core.retry_policy.execution_backoff_base = Duration::ZERO;
-        core.retry_policy.execution_backoff_max = Duration::ZERO;
-        let contract = crate::kv::test_contract();
-        let capability = crate::kv::InferenceStateCapability::Managed(contract.clone());
-        let physical = core
-            .load_managed_model_cache(model, &capability, None)
-            .expect("load managed state")
-            .expect("physical managed state");
-        for index in 0..rows {
-            let id = format!("bench-{index}");
+    /// A core over the no-op batched executor, and what it takes to add
+    /// benchmark requests: 8-token prompts with 4,000-token budgets.
+    struct BenchCore {
+        core: EngineCore,
+        last_decode_rows: Arc<AtomicUsize>,
+        model: ModelInstanceId,
+        contract: crate::kv::v2::InferenceStateContract,
+        physical: Arc<super::super::ManagedKvModelRuntime>,
+        prefill: PrefillMode,
+        width: usize,
+    }
+
+    impl BenchCore {
+        /// Room for `rows` requests in one native batch of `rows` rows.
+        fn new(rows: usize, prefill: PrefillMode) -> Self {
+            let model = ModelInstanceId::new(101);
+            let last_decode_rows = Arc::new(AtomicUsize::new(0));
+            let executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
+                width: rows,
+                prefill,
+                last_decode_rows: last_decode_rows.clone(),
+            }));
+            let mut core = EngineCore::new_with_unified_executor(
+                EngineCoreConfig {
+                    enable_chunked_prefill: prefill == PrefillMode::Incremental,
+                    block_size: 16,
+                    // Full-request claims of 8 prompt + 4,000 output tokens.
+                    max_blocks: rows * 256,
+                    max_batch_size: rows,
+                    max_tokens_per_step: rows * 16,
+                    max_retained_sequences: rows,
+                    max_staged_transactions: rows,
+                    managed_chat_claim_quantum_tokens: 0,
+                    backend: BackendKind::Cpu,
+                    ..Default::default()
+                },
+                executor,
+            )
+            .expect("core");
+            core.retry_policy.execution_backoff_base = Duration::ZERO;
+            core.retry_policy.execution_backoff_max = Duration::ZERO;
+            let contract = crate::kv::test_contract();
+            let capability = crate::kv::InferenceStateCapability::Managed(contract.clone());
+            let physical = core
+                .load_managed_model_cache(model, &capability, None)
+                .expect("load managed state")
+                .expect("physical managed state");
+            Self {
+                core,
+                last_decode_rows,
+                model,
+                contract,
+                physical,
+                prefill,
+                width: rows,
+            }
+        }
+
+        fn add(&mut self, id: String) {
             let mut request = EngineCoreRequest::chat(vec![ChatMessage {
                 role: ChatRole::User,
                 content: id.clone(),
@@ -11635,52 +11672,127 @@ mod tests {
                     8_192,
                 )
                 .expect("prepare prompt");
-            request.bind_model_instance(model).expect("model instance");
+            request
+                .bind_model_instance(self.model)
+                .expect("model instance");
             bind_managed_test_runtime_with_batch(
                 &mut request,
-                model,
-                contract.clone(),
-                physical.clone(),
-                PrefillMode::Full,
+                self.model,
+                self.contract.clone(),
+                self.physical.clone(),
+                self.prefill,
                 NativeBatchMode::Continuous,
-                rows,
+                self.width,
             );
-            core.add_request(request).expect("add");
+            self.core.add_request(request).expect("add");
         }
-        // Full prefill admits one row per starvation window of nine steps.
-        for _ in 0..rows * 12 {
-            for output in core.step().await.expect("warmup step") {
+
+        /// Step until one decode batch holds `rows` rows.
+        async fn warm(&mut self, rows: usize) {
+            // Full prefill admits one row per starvation window of nine steps.
+            for _ in 0..rows * 12 {
+                for output in self.core.step().await.expect("warmup step") {
+                    assert!(output.error.is_none(), "{:?}", output.error);
+                }
+                if self.last_decode_rows.load(Ordering::Relaxed) == rows {
+                    return;
+                }
+            }
+            panic!("{rows} rows never decoded together");
+        }
+
+        /// One step's prepare and whole host time.
+        async fn timed_step(&mut self) -> (Duration, Duration) {
+            let started = Instant::now();
+            let prepared = self
+                .core
+                .prepare_step()
+                .await
+                .expect("prepare")
+                .expect("work");
+            let prepare = started.elapsed();
+            for output in self
+                .core
+                .execute_and_commit_prepared_with_progress(prepared)
+                .await
+                .expect("execute and commit")
+            {
                 assert!(output.error.is_none(), "{:?}", output.error);
             }
-            if last_decode_rows.load(Ordering::Relaxed) == rows {
-                break;
-            }
+            (prepare, started.elapsed())
         }
-        assert_eq!(last_decode_rows.load(Ordering::Relaxed), rows);
+    }
+
+    fn mean_us(elapsed: Duration, steps: usize) -> f64 {
+        elapsed.as_secs_f64() * 1e6 / steps as f64
+    }
+
+    /// Mean host microseconds per decode step (prepare, then execute and
+    /// commit) with `rows` running requests in one native batch and a
+    /// no-op executor, measured over `steps` steps after every row decodes.
+    async fn measure_step_host_overhead(rows: usize, steps: usize) -> (f64, f64) {
+        let mut bench = BenchCore::new(rows, PrefillMode::Full);
+        for index in 0..rows {
+            bench.add(format!("bench-{index}"));
+        }
+        bench.warm(rows).await;
 
         let mut prepare = Duration::ZERO;
         let mut total = Duration::ZERO;
         for _ in 0..steps {
-            last_decode_rows.store(0, Ordering::Relaxed);
-            let started = Instant::now();
-            let prepared = core
-                .prepare_step()
-                .await
-                .expect("prepare")
-                .expect("decode work");
-            prepare += started.elapsed();
-            core.execute_and_commit_prepared_with_progress(prepared)
-                .await
-                .expect("execute and commit");
-            total += started.elapsed();
-            assert_eq!(last_decode_rows.load(Ordering::Relaxed), rows);
+            bench.last_decode_rows.store(0, Ordering::Relaxed);
+            let (step_prepare, step_total) = bench.timed_step().await;
+            prepare += step_prepare;
+            total += step_total;
+            assert_eq!(bench.last_decode_rows.load(Ordering::Relaxed), rows);
         }
-        let per_step = |elapsed: Duration| elapsed.as_secs_f64() * 1e6 / steps as f64;
-        (per_step(prepare), per_step(total))
+        (mean_us(prepare, steps), mean_us(total, steps))
+    }
+
+    /// A burst of `burst` prompts arriving while `rows` requests decode in
+    /// one native batch: the steps and model calls until every burst prompt
+    /// has prefilled, and the mean prepare and step host microseconds.
+    async fn measure_prefill_burst(
+        rows: usize,
+        burst: usize,
+        prefill: PrefillMode,
+    ) -> (usize, usize, f64, f64) {
+        let mut bench = BenchCore::new(rows + burst, prefill);
+        for index in 0..rows {
+            bench.add(format!("decode-{index}"));
+        }
+        bench.warm(rows).await;
+        let burst_ids = (0..burst)
+            .map(|index| format!("burst-{index}"))
+            .collect::<Vec<_>>();
+        for id in &burst_ids {
+            bench.add(id.clone());
+        }
+        bench.core.step_model_calls.clear();
+        let mut steps = 0;
+        let mut prepare = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        while !burst_ids.iter().all(|id| {
+            bench
+                .core
+                .request_phase_timings
+                .get(id)
+                .is_some_and(|timing| timing.prefill_steps > 0)
+        }) {
+            assert!(steps < burst * 64, "the burst never prefilled");
+            let (step_prepare, step_total) = bench.timed_step().await;
+            prepare += step_prepare;
+            total += step_total;
+            steps += 1;
+        }
+        let calls = bench.core.step_model_calls.iter().sum();
+        (steps, calls, mean_us(prepare, steps), mean_us(total, steps))
     }
 
     /// SCH-F9 microbenchmark: engine host time per decode step at 64 and 256
-    /// rows with a no-op executor. Run in release:
+    /// rows with a no-op executor, then a burst of 8 prompts under 64 decode
+    /// rows with full and resumable prefill: the steps and model calls the
+    /// split path needs to prefill the burst. Run in release:
     /// `cargo test --release -p izwi-core --lib step_host_overhead_bench -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "host-overhead microbenchmark; run explicitly in release"]
@@ -11698,6 +11810,26 @@ mod tests {
                  step_us={total:.1} per_row_us={:.2}",
                 total / rows as f64
             );
+        }
+        for prefill in [PrefillMode::Full, PrefillMode::Incremental] {
+            let (steps, calls, prepare, total) = measure_prefill_burst(64, 8, prefill).await;
+            let _ = writeln!(
+                std::io::stderr(),
+                "prefill_burst decode_rows=64 burst=8 prefill={prefill:?} steps={steps} \
+                 model_calls={calls} prepare_us={prepare:.1} step_us={total:.1}"
+            );
+        }
+    }
+
+    /// The split path serves a prompt arriving under decode in its own model
+    /// call: every step makes exactly one call, and the burst takes at least
+    /// one step per prompt plus the decode steps between them.
+    #[tokio::test]
+    async fn split_path_prefills_each_prompt_in_its_own_model_call() {
+        for prefill in [PrefillMode::Full, PrefillMode::Incremental] {
+            let (steps, calls, _, _) = measure_prefill_burst(4, 3, prefill).await;
+            assert_eq!(calls, steps, "{prefill:?}: one model call per step");
+            assert!(steps >= 3 + 2, "{prefill:?}: {steps} steps");
         }
     }
 

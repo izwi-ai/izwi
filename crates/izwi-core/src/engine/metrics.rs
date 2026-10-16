@@ -1233,6 +1233,30 @@ static ENGINE_BATCH_TOKENS: HistogramFamily = HistogramFamily::new(
     &[],
     buckets::BATCH_TOKENS,
 );
+static ENGINE_MODEL_CALLS_PER_STEP: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_model_calls_per_step",
+    "Model calls one engine step dispatched: one per tensor batch or serial row, one per row of a request-parallel batch.",
+    &[],
+    buckets::BATCH_ROWS,
+);
+
+/// Model entries one dispatched physical batch made.
+pub(crate) fn model_calls_for_dispatch(dispatch: BatchDispatch) -> usize {
+    match dispatch.kind {
+        BatchDispatchKind::NotDispatched => 0,
+        BatchDispatchKind::RequestParallel => dispatch.width,
+        BatchDispatchKind::Serial
+        | BatchDispatchKind::TensorStatic
+        | BatchDispatchKind::TensorContinuous => 1,
+    }
+}
+
+/// Record the model calls of one committed engine step that dispatched work.
+pub(crate) fn record_engine_step_model_calls(calls: usize) {
+    if calls > 0 {
+        ENGINE_MODEL_CALLS_PER_STEP.observe(&[], calls as f64);
+    }
+}
 
 /// Host phases of one engine step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1276,6 +1300,7 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_STEP_HOST_SECONDS.render(payload);
     ENGINE_BATCH_ROWS.render(payload);
     ENGINE_BATCH_TOKENS.render(payload);
+    ENGINE_MODEL_CALLS_PER_STEP.render(payload);
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {
