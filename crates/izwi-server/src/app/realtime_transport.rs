@@ -85,6 +85,9 @@ pub(crate) struct OutboundMailbox {
     limits: OutboundLimits,
     state: Mutex<OutboundMailboxState>,
     notify: Notify,
+    /// Wakes audio producers waiting for credit: the writer took a message,
+    /// a turn was cut off or the mailbox closed.
+    credit: Notify,
     minimum_turn_generation: AtomicU64,
 }
 
@@ -106,6 +109,7 @@ impl OutboundMailbox {
             },
             state: Mutex::new(OutboundMailboxState::default()),
             notify: Notify::new(),
+            credit: Notify::new(),
             minimum_turn_generation: AtomicU64::new(0),
         }
     }
@@ -176,6 +180,47 @@ impl OutboundMailbox {
         Ok(())
     }
 
+    /// Queue one audio message once the queue has credit for it: queued
+    /// audio plus this message within the byte and duration limits (a
+    /// message alone always fits) and a free slot. A slow client therefore
+    /// slows the audio producer down instead of closing the session (SPK-F11).
+    /// Fails when the turn is cut off or the mailbox closes while waiting.
+    pub(crate) async fn enqueue_audio(
+        &self,
+        item: OutboundItem,
+    ) -> Result<(), OutboundEnqueueError> {
+        let OutboundClass::Audio { bytes, duration_ms } = item.class else {
+            return self.enqueue(item);
+        };
+        loop {
+            let credit = self.credit.notified();
+            {
+                let mut state = self.lock();
+                if item.turn_generation.is_some_and(|generation| {
+                    generation < self.minimum_turn_generation.load(Ordering::Acquire)
+                }) {
+                    return Err(OutboundEnqueueError::Cutoff);
+                }
+                if state.closed || state.close_reason.is_some() {
+                    return Err(OutboundEnqueueError::Closed);
+                }
+                let audio_queued = state.audio_bytes > 0 || state.audio_ms > 0;
+                let fits = !audio_queued
+                    || (state.audio_bytes.saturating_add(bytes) <= self.limits.max_audio_bytes
+                        && state.audio_ms.saturating_add(duration_ms) <= self.limits.max_audio_ms);
+                if fits && state.queue.len() < self.limits.max_items {
+                    state.audio_bytes = state.audio_bytes.saturating_add(bytes);
+                    state.audio_ms = state.audio_ms.saturating_add(duration_ms);
+                    state.queue.push_back(item);
+                    drop(state);
+                    self.notify.notify_one();
+                    return Ok(());
+                }
+            }
+            credit.await;
+        }
+    }
+
     /// Drop turn `generation`'s queued messages and refuse its later ones.
     pub(crate) fn cutoff_turn(&self, generation: u64) {
         let mut state = self.lock();
@@ -190,6 +235,8 @@ impl OutboundMailbox {
             }
         }
         state.queue = retained;
+        drop(state);
+        self.credit.notify_waiters();
     }
 
     pub(crate) fn accepts_turn_generation(&self, generation: u64) -> bool {
@@ -212,6 +259,8 @@ impl OutboundMailbox {
                 }
                 if let Some(item) = state.queue.pop_front() {
                     subtract_audio_depth(&mut state, &item.class);
+                    drop(state);
+                    self.credit.notify_waiters();
                     return Some(MailboxOutput::Message(item.message));
                 }
                 if state.closed {
@@ -228,6 +277,7 @@ impl OutboundMailbox {
         state.closed = true;
         drop(state);
         self.notify.notify_waiters();
+        self.credit.notify_waiters();
     }
 
     /// Close the session with `reason`, dropping what is queued.
@@ -238,6 +288,7 @@ impl OutboundMailbox {
         }
         drop(state);
         self.notify.notify_one();
+        self.credit.notify_waiters();
     }
 }
 
@@ -250,7 +301,8 @@ fn subtract_audio_depth(state: &mut OutboundMailboxState, class: &OutboundClass)
 
 /// Drain `mailbox` into the socket until it closes, the peer stops taking
 /// messages for [`WS_WRITER_SEND_TIMEOUT`], or the mailbox closes the session
-/// (sent as a close frame with `close_code`).
+/// (sent as a close frame with `close_code`). The mailbox is closed when the
+/// writer stops, so producers waiting for audio credit give up.
 pub(crate) fn spawn_writer(
     mut sink: SplitSink<WebSocket, Message>,
     mailbox: Arc<OutboundMailbox>,
@@ -274,6 +326,7 @@ pub(crate) fn spawn_writer(
                 break;
             }
         }
+        mailbox.close();
     })
 }
 
@@ -406,6 +459,84 @@ mod tests {
             saturated.next().await,
             Some(MailboxOutput::Close(reason)) if reason == "outbound_audio_saturated"
         ));
+    }
+
+    /// SPK-F11: audio past the queue's limits waits for the writer to take
+    /// queued audio instead of closing the session, and arrives in order.
+    #[tokio::test]
+    async fn audio_waits_for_credit_instead_of_closing() {
+        let mailbox = Arc::new(OutboundMailbox::new(OutboundLimits {
+            max_items: 8,
+            max_audio_bytes: 1_000,
+            max_audio_ms: 100,
+        }));
+        mailbox
+            .enqueue_audio(audio(1, 10, 80))
+            .await
+            .expect("first audio");
+        let waiting = tokio::spawn({
+            let mailbox = mailbox.clone();
+            async move { mailbox.enqueue_audio(audio(2, 10, 40)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "audio past the limit waits for credit"
+        );
+
+        let Some(MailboxOutput::Message(Message::Binary(first))) = mailbox.next().await else {
+            panic!("the first audio is delivered, not a close");
+        };
+        assert_eq!(first.as_ref(), &[1]);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("credit wakes the producer")
+            .expect("join")
+            .expect("second audio queued");
+        let Some(MailboxOutput::Message(Message::Binary(second))) = mailbox.next().await else {
+            panic!("the second audio follows in order");
+        };
+        assert_eq!(second.as_ref(), &[2]);
+
+        // A single message larger than the limits still goes out alone.
+        mailbox
+            .enqueue_audio(audio(3, 5_000, 500))
+            .await
+            .expect("an oversized message alone fits");
+    }
+
+    /// SPK-F11: cutting off the turn, or the writer stopping, releases a
+    /// producer waiting for credit.
+    #[tokio::test]
+    async fn waiting_audio_is_released_by_cutoff_and_close() {
+        for release in ["cutoff", "close"] {
+            let mailbox = Arc::new(OutboundMailbox::new(OutboundLimits {
+                max_items: 8,
+                max_audio_bytes: 1_000,
+                max_audio_ms: 100,
+            }));
+            mailbox
+                .enqueue_audio(audio(1, 10, 100))
+                .await
+                .expect("audio");
+            let waiting = tokio::spawn({
+                let mailbox = mailbox.clone();
+                async move { mailbox.enqueue_audio(audio(2, 10, 10)).await }
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let expected = if release == "cutoff" {
+                mailbox.cutoff_turn(1);
+                OutboundEnqueueError::Cutoff
+            } else {
+                mailbox.close();
+                OutboundEnqueueError::Closed
+            };
+            let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("the waiting producer is released")
+                .expect("join");
+            assert_eq!(result, Err(expected), "{release}");
+        }
     }
 
     #[tokio::test]

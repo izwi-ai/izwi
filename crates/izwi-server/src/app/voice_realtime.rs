@@ -213,36 +213,67 @@ impl OutboundTx {
             .is_ok()
     }
 
-    fn send_audio(
+    /// Queue assistant audio once the client has taken enough of the audio
+    /// already queued (credit-based backpressure, SPK-F11).
+    async fn send_audio(
         &self,
         generation: u64,
         message: Message,
         bytes: usize,
         duration_ms: u64,
     ) -> Result<(), OutboundEnqueueError> {
-        if let Message::Binary(frame) = &message {
-            if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
-                && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
-                && frame.get(5).copied() == Some(WS_BIN_KIND_ASSISTANT_PCM16)
-            {
-                let chunk_sequence =
-                    u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
-                if let Some(typed) = self
-                    .wire
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .typed
-                    .as_mut()
-                {
-                    typed.last_audio_chunk_sequence = chunk_sequence;
-                }
-            }
-        }
+        self.note_audio_chunk(&message);
+        let result = self
+            .mailbox
+            .enqueue_audio(OutboundItem {
+                message,
+                class: OutboundClass::Audio { bytes, duration_ms },
+                turn_generation: Some(generation),
+            })
+            .await;
+        self.report(result)
+    }
+
+    /// Queue assistant audio without waiting: the unified speech-to-speech
+    /// callback cannot wait, so audio past the queue's limits closes the
+    /// session as before.
+    fn try_send_audio(
+        &self,
+        generation: u64,
+        message: Message,
+        bytes: usize,
+        duration_ms: u64,
+    ) -> Result<(), OutboundEnqueueError> {
+        self.note_audio_chunk(&message);
         self.enqueue(
             message,
             OutboundClass::Audio { bytes, duration_ms },
             Some(generation),
         )
+    }
+
+    /// Remember the chunk sequence of an assistant audio frame for the typed
+    /// protocol's `assistant_audio_completed`.
+    fn note_audio_chunk(&self, message: &Message) {
+        let Message::Binary(frame) = message else {
+            return;
+        };
+        if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
+            && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
+            && frame.get(5).copied() == Some(WS_BIN_KIND_ASSISTANT_PCM16)
+        {
+            let chunk_sequence =
+                u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
+            if let Some(typed) = self
+                .wire
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .typed
+                .as_mut()
+            {
+                typed.last_audio_chunk_sequence = chunk_sequence;
+            }
+        }
     }
 
     fn send_diagnostic(&self, message: Message) -> bool {
@@ -261,6 +292,10 @@ impl OutboundTx {
             class,
             turn_generation,
         });
+        self.report(result)
+    }
+
+    fn report(&self, result: Result<(), OutboundEnqueueError>) -> Result<(), OutboundEnqueueError> {
         if let Err(err) = &result {
             if !matches!(err, OutboundEnqueueError::Cutoff) {
                 self.runtime.record_voice_stream_backpressure();
@@ -2210,7 +2245,10 @@ fn spawn_turn_task(
             }
         };
 
+        // A cancelled turn reports its interruption even when the cutoff
+        // also failed the work it was doing.
         let turn_result = tokio::select! {
+            biased;
             _ = control.cancelled() => {
                 let reason = control.reason().unwrap_or_else(|| "cancelled".to_string());
                 if matches!(
@@ -2434,6 +2472,7 @@ async fn stream_tts_to_socket(
                     encoded.len(),
                     duration_ms,
                 )
+                .await
                 .map_err(|err| format!("Outbound audio delivery failed: {err:?}"))?;
             if sample_count > 0 {
                 if first_audio {
@@ -2683,7 +2722,7 @@ async fn stream_unified_s2s_to_socket(
                                     .saturating_mul(1_000)
                                     .checked_div(chunk.sample_rate.max(1) as u64)
                                     .unwrap_or(0);
-                                match out_tx.send_audio(
+                                match out_tx.try_send_audio(
                                     output_generation,
                                     Message::Binary(frame.into()),
                                     encoded.len(),
