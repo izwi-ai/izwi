@@ -72,6 +72,8 @@ pub struct CreateVoiceSessionRequest {
 }
 
 pub struct CreateVoiceTurnRequest {
+    /// The turn's id when the caller assigned one already.
+    pub turn_id: Option<String>,
     pub session_id: String,
     pub utterance_id: String,
     pub utterance_seq: u64,
@@ -302,7 +304,7 @@ impl VoiceStore {
     ) -> anyhow::Result<VoiceTurnRecord> {
         let db = self.db.connection().await?;
         let now = now_unix_millis_i64();
-        let turn_id = new_uuid();
+        let turn_id = request.turn_id.unwrap_or_else(new_uuid);
         let mode = sanitize_mode(request.mode.as_str())?;
         let session_id = request.session_id;
 
@@ -810,6 +812,7 @@ mod tests {
 
         let turn = store
             .create_turn(CreateVoiceTurnRequest {
+                turn_id: None,
                 session_id: session.id.clone(),
                 utterance_id: "utt-1".to_string(),
                 utterance_seq: 1,

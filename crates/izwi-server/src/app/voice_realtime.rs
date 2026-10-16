@@ -803,8 +803,7 @@ struct ConnectionState {
     system_prompt: String,
     voice_profile_id: Option<String>,
     voice_session_id: Option<String>,
-    agent_session_id: Option<String>,
-    agent_session_system_prompt: Option<String>,
+    agent_session: Arc<AgentSessionSlot>,
     streaming_input: Option<StreamingInputState>,
     /// Keeps the input stream's models resident between turns without
     /// pinning them; turns in flight hold their own clone.
@@ -827,8 +826,7 @@ impl Default for ConnectionState {
             system_prompt: DEFAULT_VOICE_AGENT_SYSTEM_PROMPT.to_string(),
             voice_profile_id: None,
             voice_session_id: None,
-            agent_session_id: None,
-            agent_session_system_prompt: None,
+            agent_session: Arc::default(),
             streaming_input: None,
             model_leases: SessionModelLeases::default(),
             active_turn: None,
@@ -1206,7 +1204,10 @@ impl StreamingInputState {
     }
 }
 
-async fn finalize_stream_vad_utterance(
+/// Start the turn for a finished utterance. Nothing here waits on storage
+/// or on the turn it preempts (SPK-F19): the turn task creates its own
+/// record, and a preempted turn is reaped in the background.
+fn finalize_stream_vad_utterance(
     state: &AppState,
     correlation_id: &str,
     out_tx: &OutboundTx,
@@ -1215,7 +1216,7 @@ async fn finalize_stream_vad_utterance(
     wav_bytes: Vec<u8>,
     end_reason: UtteranceEndReason,
 ) -> Result<(), String> {
-    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn").await {
+    if interrupt_active_turn(out_tx, &mut conn.active_turn, "preempted_by_new_turn") {
         state.runtime.record_voice_interruption();
         conn.voice_session.interrupt("preempted_by_new_turn");
     }
@@ -1229,57 +1230,42 @@ async fn finalize_stream_vad_utterance(
         .voice_session_id
         .clone()
         .ok_or_else(|| "Voice session not initialized".to_string())?;
-    let voice_profile_id = conn.voice_profile_id.clone();
     let model_ids = commit.turn_config.model_ids();
-    let turn_record = state
-        .voice_store
-        .create_turn(CreateVoiceTurnRequest {
-            session_id: voice_session_id.clone(),
-            utterance_id: commit.utterance_id.clone(),
-            utterance_seq: commit.utterance_seq,
-            mode: commit.turn_config.mode_str().to_string(),
-            vad_end_reason: Some(end_reason.as_str().to_string()),
-            asr_model_id: model_ids.asr_model_id,
-            text_model_id: model_ids.text_model_id,
-            tts_model_id: model_ids.tts_model_id,
-            s2s_model_id: model_ids.s2s_model_id,
-            speaker: commit.turn_config.speaker(),
-        })
-        .await
-        .map_err(|err| format!("Voice storage error: {err}"))?;
-
-    let agent_session_id = match &commit.turn_config {
-        VoiceTurnConfig::Modular(config) => Some(
-            ensure_agent_session(
-                state,
-                &mut conn.agent_session_id,
-                &mut conn.agent_session_system_prompt,
-                &conn.system_prompt,
-                &config.text_model_id,
-            )
-            .await?,
-        ),
-        VoiceTurnConfig::Unified(_) => None,
+    let turn_record_id = new_uuid();
+    let record = CreateVoiceTurnRequest {
+        turn_id: Some(turn_record_id.clone()),
+        session_id: voice_session_id.clone(),
+        utterance_id: commit.utterance_id.clone(),
+        utterance_seq: commit.utterance_seq,
+        mode: commit.turn_config.mode_str().to_string(),
+        vad_end_reason: Some(end_reason.as_str().to_string()),
+        asr_model_id: model_ids.asr_model_id,
+        text_model_id: model_ids.text_model_id,
+        tts_model_id: model_ids.tts_model_id,
+        s2s_model_id: model_ids.s2s_model_id,
+        speaker: commit.turn_config.speaker(),
     };
 
-    let turn_record_id = turn_record.id.clone();
     conn.next_turn_generation = conn.next_turn_generation.saturating_add(1);
     let output_generation = conn.next_turn_generation;
     let control = TurnControl::new(commit.endpointed_at);
     let task = spawn_turn_task(
-        state.clone(),
-        correlation_id.to_string(),
-        out_tx.clone(),
-        commit.clone(),
+        TurnContext {
+            state: state.clone(),
+            correlation_id: correlation_id.to_string(),
+            out_tx: out_tx.clone(),
+            commit: commit.clone(),
+            turn_record_id: turn_record_id.clone(),
+            voice_session_id,
+            voice_profile_id: conn.voice_profile_id.clone(),
+            system_prompt: conn.system_prompt.clone(),
+            agent_session: conn.agent_session.clone(),
+            control: control.clone(),
+            output_generation,
+            model_leases: conn.model_leases.clone(),
+        },
+        record,
         wav_bytes,
-        agent_session_id,
-        voice_session_id,
-        voice_profile_id,
-        conn.system_prompt.clone(),
-        turn_record_id.clone(),
-        control.clone(),
-        output_generation,
-        conn.model_leases.clone(),
     );
 
     conn.active_turn = Some(ActiveTurn {
@@ -1391,9 +1377,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
                             commit,
                             wav_bytes,
                             end_reason,
-                        )
-                        .await
-                        {
+                        ) {
                             send_error(&out_tx, None, None, err);
                         }
                     }
@@ -1444,7 +1428,7 @@ pub async fn handle_socket(mut socket: WebSocket, state: AppState, correlation_i
         }
     }
 
-    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed").await {
+    if interrupt_active_turn(&out_tx, &mut conn.active_turn, "socket_closed") {
         state.runtime.record_voice_interruption();
     }
     if let Some(session_id) = conn.close_voice_session_now() {
@@ -1488,9 +1472,6 @@ async fn handle_text_message(
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
             {
-                if conn.agent_session_system_prompt.as_deref() != Some(prompt.as_str()) {
-                    conn.agent_session_id = None;
-                }
                 conn.system_prompt = prompt;
             } else {
                 conn.system_prompt = profile.system_prompt;
@@ -1703,24 +1684,24 @@ async fn handle_text_message(
                         commit,
                         wav_bytes,
                         end_reason,
-                    )
-                    .await?;
+                    )?;
                 }
             }
             send_json(out_tx, json!({ "type": "input_stream_stopped" }));
             conn.model_leases = SessionModelLeases::default();
             if let Some(session_id) = conn.close_voice_session_if_idle() {
-                state
-                    .voice_store
-                    .end_session(session_id)
-                    .await
-                    .map_err(|err| format!("Voice storage error: {err}"))?;
                 conn.record_session_closed(&state.runtime);
+                let store = state.voice_store.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = store.end_session(session_id).await {
+                        warn!("failed to end voice session: {err}");
+                    }
+                });
             }
         }
         ClientEvent::Interrupt { reason } => {
             let reason = reason.unwrap_or_else(|| "client_interrupt".to_string());
-            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason).await {
+            if interrupt_active_turn(out_tx, &mut conn.active_turn, &reason) {
                 state.runtime.record_voice_interruption();
                 conn.voice_session.interrupt(reason);
             }
@@ -1794,9 +1775,7 @@ async fn handle_binary_message(
         );
     }
 
-    if frame_result.barge_in
-        && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in").await
-    {
+    if frame_result.barge_in && interrupt_active_turn(out_tx, &mut conn.active_turn, "barge_in") {
         state.runtime.record_voice_interruption();
         state.runtime.record_voice_barge_in();
         if let Some(started) = conn.speech_started_at {
@@ -1825,8 +1804,7 @@ async fn handle_binary_message(
             commit,
             wav_bytes,
             end_reason,
-        )
-        .await?;
+        )?;
     }
 
     if let Some(evt) = frame_result.speech_rejected {
@@ -1843,24 +1821,67 @@ async fn handle_binary_message(
     Ok(())
 }
 
-fn spawn_turn_task(
+/// What one turn task works with.
+struct TurnContext {
     state: AppState,
     correlation_id: String,
     out_tx: OutboundTx,
     commit: PendingAudioCommit,
-    audio_bytes: Vec<u8>,
-    agent_session_id: Option<String>,
+    turn_record_id: String,
     voice_session_id: String,
     voice_profile_id: Option<String>,
     system_prompt: String,
-    turn_record_id: String,
+    agent_session: Arc<AgentSessionSlot>,
     control: TurnControl,
     output_generation: u64,
     model_leases: SessionModelLeases,
+}
+
+fn spawn_turn_task(
+    context: TurnContext,
+    record: CreateVoiceTurnRequest,
+    audio_bytes: Vec<u8>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let TurnContext {
+            state,
+            correlation_id,
+            out_tx,
+            commit,
+            turn_record_id,
+            voice_session_id,
+            voice_profile_id,
+            system_prompt,
+            agent_session,
+            control,
+            output_generation,
+            model_leases,
+        } = context;
         let timeout_secs = state.request_timeout_secs.max(1);
         let timeout = Duration::from_secs(timeout_secs);
+
+        // The record exists before anything can complete it: a cancelled
+        // turn is still recorded as interrupted.
+        if let Err(err) = state.voice_store.create_turn(record).await {
+            send_turn_error(
+                &out_tx,
+                output_generation,
+                Some(commit.utterance_id.clone()),
+                Some(commit.utterance_seq),
+                format!("Voice storage error: {err}"),
+            );
+            send_turn_json(
+                &out_tx,
+                output_generation,
+                json!({
+                    "type": "turn_done",
+                    "utterance_id": commit.utterance_id,
+                    "utterance_seq": commit.utterance_seq,
+                    "status": "error",
+                }),
+            );
+            return;
+        }
 
         let turn_future = async {
             send_turn_json(
@@ -1998,9 +2019,9 @@ fn spawn_turn_task(
                         }),
                     );
 
-                    let Some(agent_session_id) = agent_session_id.as_deref() else {
-                        return Err("Missing agent session for modular voice turn".to_string());
-                    };
+                    let agent_session_id = agent_session
+                        .ensure(&state, &system_prompt, &config.text_model_id)
+                        .await?;
                     let text_variant = parse_chat_model_variant(Some(&config.text_model_id))
                         .map_err(|err| format!("Invalid chat model: {err}"))?;
                     let assistant_raw = with_stage_permit(&state, async |runtime_context| {
@@ -2010,7 +2031,7 @@ fn spawn_turn_task(
                             .map_err(|err| format!("Failed to load chat model: {err}"))?;
                         run_agent_turn(
                             &state,
-                            agent_session_id,
+                            &agent_session_id,
                             &user_text,
                             &config.text_model_id,
                             config.max_output_tokens,
@@ -2801,100 +2822,117 @@ async fn stream_unified_s2s_to_socket(
     Ok(generation)
 }
 
-async fn interrupt_active_turn(
+/// Interrupt the active turn without waiting for it (SPK-F19): its output
+/// is cut off and the interruption announced at once, and a background
+/// reaper gives the task [`TURN_CANCELLATION_TIMEOUT`] to stop on its own,
+/// aborts it otherwise, and records the turn as interrupted. Returns
+/// whether a running turn was interrupted.
+fn interrupt_active_turn(
     out_tx: &OutboundTx,
     active_turn: &mut Option<ActiveTurn>,
     reason: &str,
 ) -> bool {
-    if let Some(mut turn) = active_turn.take() {
-        out_tx.cutoff_turn(turn.output_generation);
-        let was_running = !turn.task.is_finished();
-        if !was_running {
-            let _ = turn.task.await;
-            return false;
-        }
-
-        turn.control.cancel(reason);
-        if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
-            .await
-            .is_err()
-        {
-            turn.task.abort();
-            let _ = turn.task.await;
-        }
-
-        let _ = tokio::time::timeout(
-            TURN_CANCELLATION_TIMEOUT,
-            turn.state.voice_store.complete_turn(
-                turn.turn_record_id.clone(),
-                "interrupted",
-                Some(reason.to_string()),
-            ),
-        )
-        .await;
-        out_tx.advance_typed_output_epoch();
-        send_json(
-            out_tx,
-            json!({
-                "type": "turn_interrupted",
-                "utterance_id": turn.utterance_id,
-                "utterance_seq": turn.utterance_seq,
-                "reason": reason,
-            }),
-        );
-        send_json(
-            out_tx,
-            json!({
-                "type": "turn_done",
-                "utterance_id": turn.utterance_id,
-                "utterance_seq": turn.utterance_seq,
-                "status": "interrupted",
-                "reason": reason,
-            }),
-        );
-        return true;
+    let Some(turn) = active_turn.take() else {
+        return false;
+    };
+    out_tx.cutoff_turn(turn.output_generation);
+    if turn.task.is_finished() {
+        return false;
     }
-    false
+
+    turn.control.cancel(reason);
+    out_tx.advance_typed_output_epoch();
+    send_json(
+        out_tx,
+        json!({
+            "type": "turn_interrupted",
+            "utterance_id": turn.utterance_id,
+            "utterance_seq": turn.utterance_seq,
+            "reason": reason,
+        }),
+    );
+    send_json(
+        out_tx,
+        json!({
+            "type": "turn_done",
+            "utterance_id": turn.utterance_id,
+            "utterance_seq": turn.utterance_seq,
+            "status": "interrupted",
+            "reason": reason,
+        }),
+    );
+    tokio::spawn(reap_interrupted_turn(turn, reason.to_string()));
+    true
 }
 
-async fn ensure_agent_session(
-    state: &AppState,
-    agent_session_id: &mut Option<String>,
-    agent_session_system_prompt: &mut Option<String>,
-    system_prompt: &str,
-    text_model_id: &str,
-) -> Result<String, String> {
-    if let Some(existing_id) = agent_session_id.as_ref() {
-        if agent_session_system_prompt.as_deref() == Some(system_prompt) {
-            return Ok(existing_id.clone());
-        }
-    }
-
-    let model_id = resolve_chat_model_id(Some(text_model_id))?;
-    let thread = state
-        .chat_store
-        .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
+async fn reap_interrupted_turn(mut turn: ActiveTurn, reason: String) {
+    if tokio::time::timeout(TURN_CANCELLATION_TIMEOUT, &mut turn.task)
         .await
-        .map_err(|err| format!("Chat storage error: {err:#}"))?;
+        .is_err()
+    {
+        turn.task.abort();
+        let _ = turn.task.await;
+    }
+    // A turn that stopped on its own has already recorded this; the record
+    // only moves out of `processing` once.
+    if let Err(err) = turn
+        .state
+        .voice_store
+        .complete_turn(turn.turn_record_id, "interrupted", Some(reason))
+        .await
+    {
+        warn!("failed to record an interrupted voice turn: {err}");
+    }
+}
 
-    let now = now_unix_millis();
-    let session_id = new_uuid();
-    let record = StoredAgentSessionRecord {
-        id: session_id.clone(),
-        agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
-        thread_id: thread.id,
-        model_id,
-        system_prompt: system_prompt.to_string(),
-        planning_mode: PlanningMode::Auto,
-        created_at: now,
-        updated_at: now,
-    };
+/// The connection's agent session, created by the first modular turn that
+/// needs it (off the receive loop) and replaced when the system prompt
+/// changes.
+#[derive(Default)]
+struct AgentSessionSlot {
+    /// The session's id and the system prompt it was created with.
+    binding: tokio::sync::Mutex<Option<(String, String)>>,
+}
 
-    state.store_agent_session_record(record).await;
+impl AgentSessionSlot {
+    async fn ensure(
+        &self,
+        state: &AppState,
+        system_prompt: &str,
+        text_model_id: &str,
+    ) -> Result<String, String> {
+        let mut binding = self.binding.lock().await;
+        if let Some((session_id, prompt)) = binding.as_ref() {
+            if prompt == system_prompt {
+                return Ok(session_id.clone());
+            }
+        }
 
-    *agent_session_id = Some(session_id.clone());
-    *agent_session_system_prompt = Some(system_prompt.to_string());
-    Ok(session_id)
+        let model_id = resolve_chat_model_id(Some(text_model_id))?;
+        let thread = state
+            .chat_store
+            .create_thread(Some("Voice Session".to_string()), Some(model_id.clone()))
+            .await
+            .map_err(|err| format!("Chat storage error: {err:#}"))?;
+
+        let now = now_unix_millis();
+        let session_id = new_uuid();
+        state
+            .store_agent_session_record(StoredAgentSessionRecord {
+                id: session_id.clone(),
+                agent_id: DEFAULT_VOICE_AGENT_ID.to_string(),
+                thread_id: thread.id,
+                model_id,
+                system_prompt: system_prompt.to_string(),
+                planning_mode: PlanningMode::Auto,
+                created_at: now,
+                updated_at: now,
+            })
+            .await;
+
+        *binding = Some((session_id.clone(), system_prompt.to_string()));
+        Ok(session_id)
+    }
 }
 
 async fn run_agent_turn(
@@ -3585,6 +3623,108 @@ mod tests {
         first.expect("first stage");
         second.expect("second stage");
         assert_eq!(realtime_permits_available(&state), 1);
+    }
+
+    /// A stored voice session with one processing turn, `turn_id`.
+    async fn stored_turn(state: &AppState, turn_id: &str) -> String {
+        let profile = state
+            .voice_store
+            .get_default_profile()
+            .await
+            .expect("profile");
+        let session = state
+            .voice_store
+            .create_session(crate::voice_store::CreateVoiceSessionRequest {
+                profile_id: profile.id,
+                mode: "modular".to_string(),
+                system_prompt: profile.system_prompt,
+            })
+            .await
+            .expect("session");
+        state
+            .voice_store
+            .create_turn(CreateVoiceTurnRequest {
+                turn_id: Some(turn_id.to_string()),
+                session_id: session.id.clone(),
+                utterance_id: "utt-1".to_string(),
+                utterance_seq: 1,
+                mode: "modular".to_string(),
+                vad_end_reason: None,
+                asr_model_id: None,
+                text_model_id: None,
+                tts_model_id: None,
+                s2s_model_id: None,
+                speaker: None,
+            })
+            .await
+            .expect("turn");
+        session.id
+    }
+
+    async fn turn_status(state: &AppState, session_id: &str) -> String {
+        let session = state
+            .voice_store
+            .get_session(session_id.to_string())
+            .await
+            .expect("session")
+            .expect("stored session");
+        session.turns[0].status.clone()
+    }
+
+    async fn drain_text(out_tx: &OutboundTx) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        out_tx.close();
+        while let Some(output) = out_tx.mailbox.next().await {
+            if let crate::app::realtime_transport::MailboxOutput::Message(Message::Text(text)) =
+                output
+            {
+                events.push(serde_json::from_str(text.as_str()).expect("json"));
+            }
+        }
+        events
+    }
+
+    /// SPK-F19: interrupting a turn that does not stop on its own returns at
+    /// once with the interruption announced; a background reaper aborts the
+    /// turn and records it as interrupted.
+    #[tokio::test]
+    async fn interrupting_a_turn_does_not_wait_for_it() {
+        let (_dir, state) = test_app_state(1);
+        let session_id = stored_turn(&state, "turn-1").await;
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let stubborn = tokio::spawn(tokio::time::sleep(Duration::from_secs(30)));
+        let mut active = Some(ActiveTurn {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_record_id: "turn-1".to_string(),
+            state: state.clone(),
+            task: stubborn,
+            control: TurnControl::new(Instant::now()),
+            output_generation: 1,
+        });
+
+        let started = Instant::now();
+        assert!(interrupt_active_turn(&out_tx, &mut active, "barge_in"));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the receive loop is not held for the turn ({:?})",
+            started.elapsed()
+        );
+        assert!(active.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while turn_status(&state, &session_id).await != "interrupted" {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper records the interruption"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let types: Vec<String> = drain_text(&out_tx)
+            .await
+            .iter()
+            .map(|event| event["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(types, ["turn_interrupted", "turn_done"]);
     }
 
     fn test_streaming_input() -> StreamingInputState {
