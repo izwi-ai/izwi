@@ -64,6 +64,14 @@ impl ModelFamily {
         }
     }
 
+    /// Whether a long-form transcription of this family runs one chunk per
+    /// engine dispatch, so the device serves other work between the chunks
+    /// of one file instead of holding it for the whole file. The chunks run
+    /// on the generic chunk executor, whose per-chunk state is host-only.
+    pub fn dispatches_long_form_asr_by_chunk(self) -> bool {
+        matches!(self, Self::WhisperAsr)
+    }
+
     /// Whether this family's ASR encoder pads every input to one fixed window
     /// (Whisper's 30 s mel window). A shorter chunk then costs a full window,
     /// so the route planner never cuts such a model's audio below its window

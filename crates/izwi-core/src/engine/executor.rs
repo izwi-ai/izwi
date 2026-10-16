@@ -22,6 +22,8 @@ mod handler_audio_chat;
 mod handler_chat;
 #[path = "executor/handler_tts.rs"]
 mod handler_tts;
+#[path = "executor/long_form.rs"]
+mod long_form;
 #[path = "executor/state.rs"]
 mod state;
 #[path = "executor/stop_sequences.rs"]
@@ -2727,6 +2729,7 @@ struct RealtimePendingQuantumFinalizer {
     fish: Arc<FishStateCoordinator>,
     voxtral: Arc<VoxtralRealtimeStateCoordinator>,
     nemotron: Arc<NemotronRealtimeStateCoordinator>,
+    long_form: Arc<long_form::LongFormAsrRuns>,
 }
 
 impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
@@ -2734,6 +2737,7 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
         self.fish.contains(plan_id, session)
             || self.voxtral.contains(plan_id, session)
             || self.nemotron.contains(plan_id, session)
+            || self.long_form.contains(plan_id, session)
     }
     fn prepare(
         &self,
@@ -2745,6 +2749,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             self.fish.prepare(plan_id, session, decision)
         } else if self.nemotron.contains(plan_id, session) {
             self.nemotron.prepare(plan_id, session, decision)
+        } else if self.long_form.contains(plan_id, session) {
+            self.long_form.prepare(plan_id, session, decision)
         } else {
             self.voxtral.prepare(plan_id, session, decision)
         }
@@ -2764,6 +2770,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             .is_some_and(|rows| rows.contains_key(&plan_id))
         {
             self.nemotron.publish(plan_id, session)
+        } else if self.long_form.has_prepared(plan_id) {
+            self.long_form.publish(plan_id, session)
         } else {
             self.voxtral.publish(plan_id, session)
         }
@@ -2779,6 +2787,8 @@ impl PendingQuantumFinalizer for RealtimePendingQuantumFinalizer {
             .is_some_and(|rows| rows.contains_key(&plan_id))
         {
             self.nemotron.discard(plan_id, session)
+        } else if self.long_form.has_prepared(plan_id) {
+            self.long_form.discard(plan_id, session)
         } else {
             self.voxtral.discard(plan_id, session)
         }
@@ -2861,6 +2871,7 @@ pub struct NativeExecutor {
     voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
     nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
     qwen_tts_decode_states: ExecutorStateStore<ActiveQwenTtsDecode>,
+    long_form_asr: Arc<long_form::LongFormAsrRuns>,
 }
 
 impl NativeExecutor {
@@ -2966,6 +2977,7 @@ impl NativeExecutor {
             Arc::new(VoxtralRealtimeStateCoordinator::new()),
             Arc::new(NemotronRealtimeStateCoordinator::new()),
             Arc::new(FishStateCoordinator::new()),
+            Arc::default(),
         )
     }
 
@@ -2974,6 +2986,7 @@ impl NativeExecutor {
         voxtral_realtime: Arc<VoxtralRealtimeStateCoordinator>,
         nemotron_realtime: Arc<NemotronRealtimeStateCoordinator>,
         fish_s2_pending: Arc<FishStateCoordinator>,
+        long_form_asr: Arc<long_form::LongFormAsrRuns>,
     ) -> Self {
         Self {
             config,
@@ -2992,6 +3005,7 @@ impl NativeExecutor {
             voxtral_realtime,
             nemotron_realtime,
             qwen_tts_decode_states: Mutex::new(HashMap::new()),
+            long_form_asr,
         }
     }
 
@@ -4079,6 +4093,7 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
+        self.long_form_asr.release(request_id);
         if self
             .fish_s2_pending
             .abort_matching(|session| session.request_id == request_id)
@@ -4164,6 +4179,7 @@ impl ModelExecutor for NativeExecutor {
     }
 
     fn cleanup_session(&self, session: &SessionKey) -> CacheReleaseReport {
+        self.long_form_asr.release_session(session);
         if self
             .fish_s2_pending
             .abort_matching(|pending| pending == session)
@@ -4334,6 +4350,7 @@ impl UnifiedExecutor {
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
         let nemotron_realtime = Arc::new(NemotronRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
+        let long_form_asr = Arc::new(long_form::LongFormAsrRuns::default());
         let device = match DeviceThread::for_device(&config.backend_context.device.device) {
             Ok(device) => Some(device),
             Err(error) => {
@@ -4350,6 +4367,7 @@ impl UnifiedExecutor {
                     voxtral_realtime.clone(),
                     nemotron_realtime.clone(),
                     fish_s2_pending.clone(),
+                    long_form_asr.clone(),
                 ),
             ))),
             batch_workspace,
@@ -4358,6 +4376,7 @@ impl UnifiedExecutor {
                 fish: fish_s2_pending,
                 voxtral: voxtral_realtime,
                 nemotron: nemotron_realtime,
+                long_form: long_form_asr,
             })),
         }
     }

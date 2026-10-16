@@ -116,6 +116,48 @@ fn output_visibility_for(
     }
 }
 
+/// The one stage of an atomic long-form ASR contract. A family that
+/// dispatches its long-form chunks one at a time (see
+/// `ModelFamily::dispatches_long_form_asr_by_chunk`) declares iterative
+/// progress with a safe point between chunks: the job yields after each
+/// chunk and the scheduler dispatches the next, so other work runs on the
+/// device between the chunks of one file. Other families keep `atomic_name`,
+/// one dispatch for the whole file.
+fn long_form_asr_stage(
+    metadata: &AdapterMetadata,
+    atomic_name: &str,
+    execution_profile: &ExecutionProfile,
+    transport_output: bool,
+) -> Result<StageDescriptor> {
+    let chunked = metadata
+        .model_variant
+        .family()
+        .dispatches_long_form_asr_by_chunk();
+    let mut stage = StageDescriptor::from_execution_profile(
+        StageId::new(3),
+        if chunked {
+            "asr.long_form.chunked"
+        } else {
+            atomic_name
+        },
+        execution_profile,
+        NativeBatchMode::None,
+    );
+    stage.selector = StageWorkSelector::Atomic;
+    stage.shape_policy = StageShapePolicy::Exact;
+    if chunked {
+        stage.progress = StageProgressKind::Iterative;
+        stage.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+    }
+    stage.output_visibility = output_visibility_for(
+        transport_output,
+        execution_profile.mode,
+        NativeBatchMode::None,
+    );
+    stage.validate()?;
+    Ok(stage)
+}
+
 fn scalar_request_parallelism(backend_kind: BackendKind, configured: usize) -> usize {
     match backend_kind {
         BackendKind::Cpu => configured.max(1),
@@ -4390,20 +4432,12 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
             execution_profile.concurrency = ConcurrencyClass::Exclusive;
             execution_profile.max_batch_size = 1;
             execution_profile.resolved_from_loaded_model = true;
-            let mut stage = StageDescriptor::from_execution_profile(
-                StageId::new(3),
+            let stage = long_form_asr_stage(
+                &metadata,
                 "asr.long_form.atomic",
                 &execution_profile,
-                NativeBatchMode::None,
-            );
-            stage.selector = StageWorkSelector::Atomic;
-            stage.shape_policy = StageShapePolicy::Exact;
-            stage.output_visibility = output_visibility_for(
                 streaming.transport_output,
-                execution_profile.mode,
-                NativeBatchMode::None,
-            );
-            stage.validate()?;
+            )?;
             return Ok(LoadedExecutionContract {
                 execution_group_id: self.execution_group_id,
                 model_instance_id: self.model_instance_id,
@@ -7688,8 +7722,14 @@ mod tests {
             .unwrap();
         assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
         assert_eq!(long.stages.len(), 1);
-        assert_eq!(long.stages[0].name, "asr.long_form.atomic");
+        // One chunk per dispatch: the job yields between chunks.
+        assert_eq!(long.stages[0].name, "asr.long_form.chunked");
         assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+        assert_eq!(long.stages[0].progress, StageProgressKind::Iterative);
+        assert_eq!(
+            long.stages[0].membership_safe_point,
+            MembershipSafePoint::QuantumBoundary
+        );
     }
 
     #[test]

@@ -3011,10 +3011,23 @@ impl ExecutionReport {
                 }
             }
             WorkUnit::AtomicJob { .. } => {
+                // An atomic stage with iterative progress (long-form ASR run
+                // one chunk per dispatch) may yield between its operations;
+                // a yield commits no scheduler progress.
+                let resumable = plan
+                    .stage
+                    .as_ref()
+                    .is_some_and(|stage| stage.progress == StageProgressKind::Iterative);
+                let yielded = matches!(
+                    self.disposition,
+                    ExecutionDisposition::Yielded(YieldReason::QuantumExhausted)
+                ) && self.input_consumed == 0
+                    && self.output_produced == 0;
                 if !matches!(
                     self.disposition,
                     ExecutionDisposition::Finished(_) | ExecutionDisposition::Failed(_)
-                ) {
+                ) && !(resumable && yielded)
+                {
                     return Err(Error::InferenceError(
                         "atomic execution must finish or fail in one transaction".to_string(),
                     ));

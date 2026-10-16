@@ -42,8 +42,9 @@ use super::super::{
 };
 use super::audio::{
     decode_request_audio_with_rate, timestamp_words_json, AsrChunkTranscription,
-    AsrRouteCapabilities, ChunkedAsrTranscription, PlannedAsrChunks,
+    AsrRouteCapabilities, ChunkStream, ChunkedAsrRun, ChunkedAsrTranscription, PlannedAsrChunks,
 };
+use super::long_form::LongFormAsrState;
 use super::state::{
     ActiveAsrDecode, ActiveLfm25AsrDecode, ActiveNemotronRealtime, ActiveParakeetAsrDecode,
     ActiveVoxtralRealtime,
@@ -92,6 +93,13 @@ fn late_cancelled_parakeet_rows(cancelled: &[bool], armed: &[bool]) -> Vec<usize
 enum AsrExecutionAudio {
     Prepared(Arc<[f32]>),
     Decoded(Vec<f32>),
+}
+
+/// What one generic ASR dispatch produced: the transcript, or one chunk of
+/// a long-form run that continues in a later dispatch.
+enum AsrTranscriptionStep {
+    Complete(String, Option<serde_json::Value>),
+    Yielded(Box<LongFormAsrState>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +210,13 @@ impl AsrExecutionAudio {
         match self {
             Self::Prepared(samples) => samples,
             Self::Decoded(samples) => samples,
+        }
+    }
+
+    fn shared(&self) -> Arc<[f32]> {
+        match self {
+            Self::Prepared(samples) => samples.clone(),
+            Self::Decoded(samples) => Arc::from(samples.as_slice()),
         }
     }
 }
@@ -6911,11 +6926,25 @@ impl NativeExecutor {
         let generation_options = Self::asr_generation_options(request);
         let stream_tx = Self::stream_sender(request);
         let stream_policy = request.stream_policy;
+        // A long-form row of a family that dispatches its chunks one at a
+        // time resumes the run its committed chunks left (`Some(None)` on
+        // its first dispatch).
+        let session = scheduled.session_key();
+        let long_form = (request.uses_asr_long_form_atomic()
+            && family.dispatches_long_form_asr_by_chunk())
+        .then(|| self.long_form_asr.committed(&session));
 
         let (execution_audio, sample_rate, audio_decode_ms) =
-            resolve_asr_execution_audio(request, family, || {
-                Self::run_blocking(|| decode_request_audio_with_rate(request))
-            })?;
+            match long_form.as_ref().and_then(Option::as_ref) {
+                Some(resumed) => (
+                    AsrExecutionAudio::Prepared(resumed.samples.clone()),
+                    resumed.sample_rate,
+                    resumed.audio_decode_ms,
+                ),
+                None => resolve_asr_execution_audio(request, family, || {
+                    Self::run_blocking(|| decode_request_audio_with_rate(request))
+                })?,
+            };
         let samples = execution_audio.samples();
         let samples_len = samples.len();
 
@@ -6984,7 +7013,7 @@ impl NativeExecutor {
                                 })
                             },
                         )?;
-                    return Ok(Self::chunked_asr_result(&chunk_plan, chunked));
+                    return Ok(Self::complete_chunked_asr(&chunk_plan, chunked));
                 }
 
                 if request.streaming {
@@ -7021,13 +7050,16 @@ impl NativeExecutor {
                             &request.id,
                             &mut sequence,
                         )?;
-                        return Ok((text, None));
+                        return Ok(AsrTranscriptionStep::Complete(text, None));
                     }
                 }
                 let details = with_single_invocation_cache(request, scheduled, |cache| {
                     model.transcribe_with_details_physical(samples, sample_rate, language, cache)
                 })?;
-                return Ok((details.text, details.diagnostics));
+                return Ok(AsrTranscriptionStep::Complete(
+                    details.text,
+                    details.diagnostics,
+                ));
             }
 
             let route = physical_asr_route(family)?;
@@ -7042,18 +7074,11 @@ impl NativeExecutor {
                 AsrRouteCapabilities::for_native_model(&model, variant, request, effective_context)
             })?;
             if chunk_plan.requires_chunk_path() {
-                let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
-                    &request.id,
-                    &|| request.is_cancelled(),
-                    stream_tx.as_ref(),
-                    stream_policy,
-                    &mut sequence,
-                    samples,
-                    sample_rate,
-                    &chunk_plan.chunks,
-                    &chunk_plan.config,
-                    Self::asr_chunk_stream_options(),
-                    |chunk_audio, sr, prefix_text, partial| {
+                let transcribe_chunk =
+                    |chunk_audio: &[f32],
+                     sr: u32,
+                     prefix_text: &str,
+                     partial: Option<&mut dyn FnMut(&str)>| {
                         let bounded_prefix_text = granite_plan
                             .filter(|plan| plan.prefix_replay)
                             .map(|_| Self::granite_asr_prefix_replay_text(prefix_text));
@@ -7253,9 +7278,34 @@ impl NativeExecutor {
                             text: details.text,
                             diagnostics: details.diagnostics,
                         })
-                    },
+                    };
+                if let Some(resumed) = long_form.filter(|_| !chunk_plan.chunks.is_empty()) {
+                    return Self::run_long_form_chunk(
+                        request,
+                        resumed,
+                        &execution_audio,
+                        sample_rate,
+                        audio_decode_ms,
+                        stream_tx.as_ref(),
+                        stream_policy,
+                        &chunk_plan,
+                        transcribe_chunk,
+                    );
+                }
+                let chunked = Self::transcribe_with_chunk_plan_with_streaming_details_and_options(
+                    &request.id,
+                    &|| request.is_cancelled(),
+                    stream_tx.as_ref(),
+                    stream_policy,
+                    &mut sequence,
+                    samples,
+                    sample_rate,
+                    &chunk_plan.chunks,
+                    &chunk_plan.config,
+                    Self::asr_chunk_stream_options(),
+                    transcribe_chunk,
                 )?;
-                return Ok(Self::chunked_asr_result(&chunk_plan, chunked));
+                return Ok(Self::complete_chunked_asr(&chunk_plan, chunked));
             }
 
             // Granite's public auto budget is admitted at its conservative
@@ -7379,7 +7429,7 @@ impl NativeExecutor {
                         &request.id,
                         &mut sequence,
                     )?;
-                    return Ok((text, None));
+                    return Ok(AsrTranscriptionStep::Complete(text, None));
                 }
             }
             let details = match route {
@@ -7455,13 +7505,41 @@ impl NativeExecutor {
                     })?
                 }
             };
-            Ok((details.text, details.diagnostics))
+            Ok(AsrTranscriptionStep::Complete(
+                details.text,
+                details.diagnostics,
+            ))
         });
-        let Some((text, asr_diagnostics)) = settle_atomic_asr_cancellation(request, transcription)?
-        else {
+        let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                 request.id.clone(),
             )));
+        };
+        let (text, asr_diagnostics) = match transcription {
+            AsrTranscriptionStep::Complete(text, diagnostics) => (text, diagnostics),
+            AsrTranscriptionStep::Yielded(state) => {
+                // The next chunk runs in a later dispatch; this one's state
+                // and staged stream output publish only if the core commits it.
+                self.long_form_asr
+                    .stage(scheduled.plan_id, session, *state)?;
+                return Ok(ModelSessionResult::yielded(
+                    ExecutorOutput {
+                        request_id: request.id.clone(),
+                        audio: None,
+                        text: None,
+                        input_transcription: None,
+                        tokens_processed: 0,
+                        tokens_generated: 0,
+                        finished: false,
+                        phase_timing_override: None,
+                        asr_diagnostics: None,
+                        error: None,
+                        logprobs: Vec::new(),
+                    },
+                    crate::engine::YieldReason::QuantumExhausted,
+                )
+                .requiring_pending_quantum());
+            }
         };
         let asr_diagnostics = Self::with_audio_decode_timing(asr_diagnostics, audio_decode_ms);
 
@@ -7483,6 +7561,79 @@ impl NativeExecutor {
             error: None,
             logprobs: Vec::new(),
         }))
+    }
+
+    fn complete_chunked_asr(
+        plan: &PlannedAsrChunks,
+        chunked: ChunkedAsrTranscription,
+    ) -> AsrTranscriptionStep {
+        let (text, diagnostics) = Self::chunked_asr_result(plan, chunked);
+        AsrTranscriptionStep::Complete(text, diagnostics)
+    }
+
+    /// Run the next chunk of a long-form row that dispatches its chunks one
+    /// at a time, starting the run on the row's first dispatch. Yields the
+    /// run until its last chunk, then completes it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_long_form_chunk<F>(
+        request: &EngineCoreRequest,
+        resumed: Option<LongFormAsrState>,
+        audio: &AsrExecutionAudio,
+        sample_rate: u32,
+        audio_decode_ms: f64,
+        stream_tx: Option<&super::super::request::StreamStagingBuffer>,
+        stream_policy: super::super::request::EngineStreamPolicy,
+        plan: &PlannedAsrChunks,
+        mut transcribe_chunk: F,
+    ) -> Result<AsrTranscriptionStep>
+    where
+        F: FnMut(&[f32], u32, &str, Option<&mut dyn FnMut(&str)>) -> Result<AsrChunkTranscription>,
+    {
+        let stream = ChunkStream {
+            request_id: &request.id,
+            tx: stream_tx,
+            policy: stream_policy,
+        };
+        let mut state = match resumed {
+            Some(state) => state,
+            None => {
+                let mut sequence = 0;
+                let samples = audio.shared();
+                let run = ChunkedAsrRun::start(
+                    &stream,
+                    &mut sequence,
+                    samples.len(),
+                    sample_rate,
+                    &plan.chunks,
+                    &plan.config,
+                )?;
+                LongFormAsrState {
+                    run,
+                    sequence,
+                    samples,
+                    sample_rate,
+                    audio_decode_ms,
+                }
+            }
+        };
+        state.run.run_chunk(
+            &stream,
+            &mut state.sequence,
+            &|| request.is_cancelled(),
+            &state.samples,
+            sample_rate,
+            &plan.chunks,
+            Self::asr_chunk_stream_options(),
+            &mut transcribe_chunk,
+        )?;
+        if !state.run.is_complete(&plan.chunks) {
+            return Ok(AsrTranscriptionStep::Yielded(Box::new(state)));
+        }
+        let LongFormAsrState {
+            run, mut sequence, ..
+        } = state;
+        let chunked = run.finish(&stream, &mut sequence, &plan.chunks, sample_rate)?;
+        Ok(Self::complete_chunked_asr(plan, chunked))
     }
 
     /// Transcript and diagnostics of a chunked run of `plan`, with the word

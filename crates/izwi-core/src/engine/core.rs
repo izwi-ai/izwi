@@ -5540,6 +5540,20 @@ impl EngineCore {
                             };
                             committed_service_rows
                                 .push((committed.session.request_id.clone(), phase));
+                        } else if prefill_row
+                            && matches!(
+                                committed.disposition,
+                                ExecutionDisposition::Yielded(super::YieldReason::QuantumExhausted)
+                            )
+                        {
+                            // One operation of a resumable atomic job (a
+                            // long-form ASR chunk) commits no token, but it
+                            // is the waiting prefill's service: it pays the
+                            // starvation debt that forced it.
+                            committed_service_rows.push((
+                                committed.session.request_id.clone(),
+                                SequencePhase::Prefill,
+                            ));
                         }
                         executor_outputs.push(committed);
                     }
@@ -13091,6 +13105,198 @@ mod tests {
         assert!(core.active_managed_cache.is_empty());
         assert!(core.active_stream_batches.is_empty());
         drop(decode);
+    }
+
+    /// Chat rows decode one token per call; the long-form ASR row transcribes
+    /// `windows` audio windows, one per dispatch when `by_chunk`, all of
+    /// them in one dispatch otherwise. Every window and chat call is logged.
+    struct LongFormMockExecutor {
+        windows: usize,
+        by_chunk: bool,
+        done: Mutex<usize>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl ModelExecutor for LongFormMockExecutor {
+        fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
+            let mode = if request.task_type == TaskType::ASR {
+                ExecutionMode::Atomic
+            } else {
+                ExecutionMode::Sequence
+            };
+            Some(ExecutionProfile::fail_closed(
+                BackendKind::Cpu,
+                request.model_variant,
+                mode,
+            ))
+        }
+
+        fn execute_prefill(
+            &self,
+            requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            Ok(scheduled
+                .iter()
+                .map(|row| {
+                    let asr = requests
+                        .iter()
+                        .any(|r| r.id == row.request_id && r.task_type == TaskType::ASR);
+                    if !asr {
+                        return ExecutorStepResult::new(
+                            row,
+                            MockExecutor::build_outputs(std::slice::from_ref(row)).remove(0),
+                        );
+                    }
+                    let mut done = self.done.lock().unwrap();
+                    let run = if self.by_chunk {
+                        1
+                    } else {
+                        self.windows - *done
+                    };
+                    for _ in 0..run {
+                        self.log.lock().unwrap().push("asr-window");
+                    }
+                    *done += run;
+                    let mut output = ExecutorOutput::terminal(row.request_id.clone());
+                    if *done < self.windows {
+                        output.finished = false;
+                        return ExecutorStepResult::from_session(
+                            row,
+                            ModelSessionResult::yielded(
+                                output,
+                                super::super::YieldReason::QuantumExhausted,
+                            ),
+                        );
+                    }
+                    output.text = Some("transcript".into());
+                    ExecutorStepResult::new(row, output)
+                })
+                .collect())
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            self.log.lock().unwrap().push("chat");
+            Ok(wrap_outputs(
+                scheduled,
+                MockExecutor::build_outputs(scheduled),
+            ))
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn cleanup_request(&self, _request_id: &str) -> super::super::executor::CacheReleaseReport {
+            super::super::executor::CacheReleaseReport::confirmed(1)
+        }
+    }
+
+    /// The most long-form windows the device ran between two chat steps
+    /// while a long-form transcription ran beside chat streams.
+    async fn windows_between_chat_steps(by_chunk: bool) -> usize {
+        let windows = 12;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let executor = UnifiedExecutor::new_for_test(Box::new(LongFormMockExecutor {
+            windows,
+            by_chunk,
+            done: Mutex::new(0),
+            log: log.clone(),
+        }));
+        let config = EngineCoreConfig {
+            max_batch_size: 4,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for id in ["chat-a", "chat-b"] {
+            let mut request = EngineCoreRequest::tts(id);
+            request.id = id.to_string();
+            request.prompt_tokens = vec![1];
+            request.params.max_tokens = 1_000;
+            request
+                .bind_model_instance(ModelInstanceId::new(1))
+                .unwrap();
+            core.add_request(request).unwrap();
+        }
+        for _ in 0..4 {
+            core.step().await.unwrap();
+        }
+
+        let variant = ModelVariant::WhisperLargeV3Turbo;
+        let model_instance = ModelInstanceId::new(2);
+        let profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        let mut stage = super::super::StageDescriptor::from_execution_profile(
+            StageId::new(3),
+            "asr.long_form",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = super::super::StageWorkSelector::Atomic;
+        if by_chunk {
+            stage.progress = super::super::StageProgressKind::Iterative;
+            stage.membership_safe_point = super::super::MembershipSafePoint::QuantumBoundary;
+        }
+        let mut asr = EngineCoreRequest::asr("long-form").with_model_variant(variant);
+        asr.id = "long-form".to_string();
+        asr.prompt_tokens = vec![1];
+        asr.bind_execution_adapter(super::super::ExecutionAdapterBinding {
+            execution_group_id: super::super::ExecutionGroupId::new(1),
+            model_instance_id: model_instance,
+            adapter_instance_id: super::super::AdapterInstanceId::new(3),
+            adapter_abi_revision: super::super::AdapterAbiRevision::new(1),
+            model_variant: variant,
+            capability_id: "asr".to_string(),
+            stages: Arc::from([stage]),
+        })
+        .unwrap();
+        core.add_request(asr).unwrap();
+        log.lock().unwrap().clear();
+
+        let mut transcribed = false;
+        for _ in 0..1_000 {
+            for output in core.step().await.unwrap() {
+                if output.request_id == "long-form" && output.is_finished {
+                    assert!(output.error.is_none(), "{:?}", output.error);
+                    transcribed = true;
+                }
+            }
+            if transcribed {
+                break;
+            }
+        }
+        assert!(transcribed, "the long-form transcription finished");
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.iter().filter(|event| **event == "asr-window").count(),
+            windows
+        );
+        log.split(|event| *event == "chat")
+            .map(<[_]>::len)
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// Phase 3c exit test: a long-form transcription beside chat streams
+    /// holds the device for at most one window between two chat steps, so
+    /// the streams keep advancing with bounded inter-token gaps.
+    #[tokio::test]
+    async fn long_form_asr_beside_chat_holds_the_device_one_window_at_a_time() {
+        assert_eq!(windows_between_chat_steps(true).await, 1);
     }
 
     #[tokio::test]
