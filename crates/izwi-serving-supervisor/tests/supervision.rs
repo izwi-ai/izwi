@@ -94,6 +94,8 @@ struct Behavior {
     never_ready: bool,
     /// Stop answering any request this long after starting.
     hang_status_after_secs: Option<f64>,
+    /// With `never_ready`, exit with a failure this long after starting.
+    die_after_secs: Option<f64>,
 }
 
 struct Rig {
@@ -198,6 +200,9 @@ impl Rig {
             if let Some(after) = behavior.hang_status_after_secs {
                 entry["hang_status_after_secs"] = serde_json::json!(after);
             }
+            if let Some(after) = behavior.die_after_secs {
+                entry["die_after_secs"] = serde_json::json!(after);
+            }
             manifest.insert(worker_id.to_string(), entry);
             config.push_str(&format!(
                 "\n[[workers]]\nworker_id = \"{worker_id}\"\nbind = \"127.0.0.1:{port}\"\nbinary = \"cpu\"\ncredential_id = \"cred-a\"\nbearer_token_env = \"WORKER_TOKEN\"\nmax_active_invocations = 1\nmax_request_bytes = 1048576\n\n[workers.assignment]\nbackend = \"cpu\"\nthread_budget = 1\naffinity = [0]\nhost_memory_limit_bytes = 1024\n\n[workers.deployment]\ndeployment_id = \"chat-prod\"\npublic_model = \"chat-model\"\nartifact_revision = \"rev-1\"\nmodel_generation = 1\ntask = \"chat\"\nbackend = \"cpu\"\nprecision = \"f32\"\nexecution_representation = \"gguf\"\nmodels_directory = \"{models}\"\n\n[workers.deployment.capability]\nstreaming = true\nrealtime = false\ncancellation = \"cooperative\"\naccepted_input_formats = [\"chat_messages\"]\noutput_formats = [\"text\"]\nmax_input_bytes = 1048576\nmax_context_tokens = 32\nmax_output_tokens = 32\n",
@@ -225,9 +230,9 @@ impl Rig {
         }
     }
 
-    fn spawn_supervisor(&self) -> SupervisorGuard {
-        let stderr = std::fs::File::create(&self.stderr).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
+    fn supervisor_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"));
+        command
             .arg("--config")
             .arg(&self.config)
             .arg("--cpu-worker-binary")
@@ -236,7 +241,23 @@ impl Rig {
             .arg("0,1")
             .arg("--allocatable-host-memory-bytes")
             .arg("8589934592")
-            .env("WORKER_TOKEN", "secret-token")
+            .env("WORKER_TOKEN", "secret-token");
+        command
+    }
+
+    /// Makes later launches of `worker_id` serve readiness.
+    fn heal(&self, worker_id: &str) {
+        let path = self.root.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest[worker_id]["serve"] = serde_json::json!(true);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn spawn_supervisor(&self) -> SupervisorGuard {
+        let stderr = std::fs::File::create(&self.stderr).unwrap();
+        let child = self
+            .supervisor_command()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
@@ -404,6 +425,111 @@ fn a_worker_that_stops_answering_is_restarted() {
             .count()
             >= 2),
         "the replacement incarnation must come back ready; stderr:\n{}",
+        rig.stderr_text()
+    );
+}
+
+fn crash_looping() -> Behavior {
+    Behavior {
+        never_ready: true,
+        die_after_secs: Some(0.0),
+        ..Behavior::default()
+    }
+}
+
+const QUARANTINE_FAST: &str = "\n[readiness]\nstartup_timeout_ms = 5000\npoll_interval_ms = 50\n\n[restart]\ninitial_backoff_ms = 50\nmaximum_backoff_ms = 50\nmax_restarts_per_window = 1\njitter_percent = 0\n";
+
+/// Quarantine is not permanent: the worker gets one more launch every
+/// quarantine_retry_ms.
+#[test]
+fn a_quarantined_worker_is_retried_on_a_slow_cadence() {
+    let rig = Rig::build(
+        &[("worker-a", crash_looping())],
+        &format!("{QUARANTINE_FAST}quarantine_retry_ms = 1500\n"),
+    );
+    let _supervisor = rig.spawn_supervisor();
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("quarantined; retrying it in 1 s")),
+        "stderr:\n{}",
+        rig.stderr_text()
+    );
+    let quarantined_launches = rig.launches("worker-a");
+    rig.heal("worker-a");
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("worker-a ready as incarnation")),
+        "the retry must launch the worker again; stderr:\n{}",
+        rig.stderr_text()
+    );
+    assert_eq!(rig.launches("worker-a"), quarantined_launches + 1);
+}
+
+/// With retries off, `--clear-quarantine` relaunches the worker at once.
+#[test]
+fn the_clear_quarantine_command_relaunches_a_quarantined_worker() {
+    let rig = Rig::build(
+        &[("worker-a", crash_looping())],
+        &format!("{QUARANTINE_FAST}quarantine_retry_ms = 0\n"),
+    );
+    let _supervisor = rig.spawn_supervisor();
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("quarantined until an operator clears it")),
+        "stderr:\n{}",
+        rig.stderr_text()
+    );
+    rig.heal("worker-a");
+    let unknown = rig
+        .supervisor_command()
+        .args(["--clear-quarantine", "worker-z"])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success(), "an unknown worker is refused");
+    let clear = rig
+        .supervisor_command()
+        .args(["--clear-quarantine", "worker-a"])
+        .output()
+        .unwrap();
+    assert!(
+        clear.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clear.stderr)
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("worker-a ready as incarnation")),
+        "the cleared worker must launch again; stderr:\n{}",
+        rig.stderr_text()
+    );
+}
+
+/// SIGHUP clears every quarantine.
+#[test]
+fn sighup_clears_every_quarantine() {
+    let rig = Rig::build(
+        &[("worker-a", crash_looping())],
+        &format!("{QUARANTINE_FAST}quarantine_retry_ms = 0\n"),
+    );
+    let supervisor = rig.spawn_supervisor();
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("quarantined until an operator clears it")),
+        "stderr:\n{}",
+        rig.stderr_text()
+    );
+    rig.heal("worker-a");
+    supervisor.signal("HUP");
+    assert!(
+        wait_until(Duration::from_secs(10), || rig
+            .stderr_text()
+            .contains("worker-a ready as incarnation")),
+        "SIGHUP must relaunch the quarantined worker; stderr:\n{}",
         rig.stderr_text()
     );
 }

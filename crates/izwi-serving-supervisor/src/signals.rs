@@ -39,6 +39,22 @@ pub fn forward_diagnostic_requests(sender: mpsc::Sender<()>) {
     drop(sender);
 }
 
+/// Sends one request per SIGHUP: clear every quarantined worker.
+pub fn forward_quarantine_clear_requests(sender: mpsc::Sender<()>) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+        while signal.recv().await.is_some() {
+            let _ = sender.try_send(());
+        }
+    });
+    #[cfg(not(unix))]
+    drop(sender);
+}
+
 /// Becomes true on SIGUSR2: an in-process rollout abort request. The sender
 /// lives as long as the runtime, so the receiver never observes a closed
 /// channel.

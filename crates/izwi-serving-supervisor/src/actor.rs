@@ -112,8 +112,10 @@ pub enum WorkerPhase {
     RestartPending {
         at: Instant,
     },
-    /// Exceeded its restart budget.
-    Quarantined,
+    /// Exceeded its restart budget; retried once at `retry_at`, if set.
+    Quarantined {
+        retry_at: Option<Instant>,
+    },
 }
 
 /// What an actor publishes about its worker.
@@ -187,6 +189,8 @@ enum Command {
     /// Drain and stop the worker (or cancel its pending restart) and stay
     /// idle; the sender learns when it is done.
     Stop(oneshot::Sender<()>),
+    /// An operator cleared the quarantine: relaunch with a fresh budget.
+    ClearQuarantine,
 }
 
 /// The main loop's handle on one worker actor.
@@ -250,6 +254,11 @@ impl WorkerActor {
         let _ = self.commands.send(Command::BeginDrain);
     }
 
+    /// Clears a quarantine; a worker that is not quarantined ignores it.
+    pub fn clear_quarantine(&self) {
+        let _ = self.commands.send(Command::ClearQuarantine);
+    }
+
     /// Asks the actor to stop its worker without waiting for it.
     pub fn request_stop(&self) -> oneshot::Receiver<()> {
         let (done, stopped) = oneshot::channel();
@@ -296,7 +305,12 @@ pub async fn stop_all<'a>(actors: impl IntoIterator<Item = &'a WorkerActor>) {
 /// Where the actor goes after a launch or a running process ends.
 enum Next {
     Idle,
-    Wait { until: Option<Instant> },
+    /// Wait for a restart (or a quarantine retry) due at `until`; never
+    /// when `until` is `None`.
+    Wait {
+        until: Option<Instant>,
+        quarantined: bool,
+    },
     Exit,
 }
 
@@ -325,13 +339,14 @@ impl Actor {
                             let _ = done.send(());
                             Next::Idle
                         }
-                        Some(Command::BeginDrain) => Next::Idle,
+                        Some(Command::BeginDrain | Command::ClearQuarantine) => Next::Idle,
                     }
                 }
-                Next::Wait { until } => {
-                    self.set_phase(match until {
-                        Some(at) => WorkerPhase::RestartPending { at },
-                        None => WorkerPhase::Quarantined,
+                Next::Wait { until, quarantined } => {
+                    self.set_phase(match (quarantined, until) {
+                        (true, retry_at) => WorkerPhase::Quarantined { retry_at },
+                        (false, Some(at)) => WorkerPhase::RestartPending { at },
+                        (false, None) => WorkerPhase::Idle,
                     });
                     let due = async {
                         match until {
@@ -340,7 +355,12 @@ impl Actor {
                         }
                     };
                     tokio::select! {
-                        () = due => self.launch().await,
+                        () = due => {
+                            if quarantined {
+                                info!("worker {} quarantine retry: launching it once", self.worker_id);
+                            }
+                            self.launch().await
+                        }
                         command = self.commands.recv() => match command {
                             None => Next::Exit,
                             Some(Command::Start) => self.launch().await,
@@ -348,7 +368,17 @@ impl Actor {
                                 let _ = done.send(());
                                 Next::Idle
                             }
-                            Some(Command::BeginDrain) => Next::Wait { until },
+                            Some(Command::ClearQuarantine) if quarantined => {
+                                self.restart.clear_quarantine();
+                                info!(
+                                    "worker {} quarantine cleared by the operator; relaunching",
+                                    self.worker_id
+                                );
+                                self.launch().await
+                            }
+                            Some(Command::BeginDrain | Command::ClearQuarantine) => {
+                                Next::Wait { until, quarantined }
+                            }
                         },
                     }
                 }
@@ -388,7 +418,7 @@ impl Actor {
                         let _ = done.send(());
                         return Next::Idle;
                     }
-                    Some(Command::Start | Command::BeginDrain) => {}
+                    Some(Command::Start | Command::BeginDrain | Command::ClearQuarantine) => {}
                 },
             }
         };
@@ -412,7 +442,7 @@ impl Actor {
                     command = self.commands.recv() => match command {
                         None => break Err(None),
                         Some(Command::Stop(done)) => break Err(Some(done)),
-                        Some(Command::Start | Command::BeginDrain) => {}
+                        Some(Command::Start | Command::BeginDrain | Command::ClearQuarantine) => {}
                     },
                 }
             }
@@ -437,6 +467,7 @@ impl Actor {
             }
         }
         bump(&self.metrics().readiness_successes);
+        self.restart.note_ready();
         let incarnation = process.readiness().expected().incarnation_id().clone();
         info!(
             "worker {} ready as incarnation {}",
@@ -556,7 +587,7 @@ impl Actor {
                     self.view
                         .send_modify(|view| view.phase = WorkerPhase::Draining);
                 }
-                Event::Command(Some(Command::Start)) => {}
+                Event::Command(Some(Command::Start | Command::ClearQuarantine)) => {}
                 Event::Command(Some(Command::Stop(done))) => {
                     self.stop_process(process).await;
                     let _ = done.send(());
@@ -616,15 +647,27 @@ impl Actor {
                 );
                 Next::Wait {
                     until: Some(Instant::now() + delay),
+                    quarantined: false,
                 }
             }
             RestartDecision::Quarantine => {
                 bump(&self.metrics().quarantines);
-                warn!(
-                    "worker {} exceeded its bounded restart budget and is quarantined",
-                    self.worker_id
-                );
-                Next::Wait { until: None }
+                let retry = self.restart.quarantine_retry();
+                match retry {
+                    Some(retry) => warn!(
+                        "worker {} exceeded its bounded restart budget and is quarantined; retrying it in {} s",
+                        self.worker_id,
+                        retry.as_secs()
+                    ),
+                    None => warn!(
+                        "worker {} exceeded its bounded restart budget and is quarantined until an operator clears it",
+                        self.worker_id
+                    ),
+                }
+                Next::Wait {
+                    until: retry.map(|retry| Instant::now() + retry),
+                    quarantined: true,
+                }
             }
         }
     }

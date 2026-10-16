@@ -720,6 +720,9 @@ pub struct RestartPolicy {
     pub stable_reset_ms: u64,
     pub max_restarts_per_window: u16,
     pub jitter_percent: u8,
+    /// How long a quarantined worker waits before one more launch. Zero
+    /// leaves it quarantined until an operator clears it.
+    pub quarantine_retry_ms: u64,
 }
 
 impl Default for RestartPolicy {
@@ -731,6 +734,7 @@ impl Default for RestartPolicy {
             stable_reset_ms: 600_000,
             max_restarts_per_window: 5,
             jitter_percent: 20,
+            quarantine_retry_ms: 600_000,
         }
     }
 }
@@ -760,6 +764,11 @@ impl RestartPolicy {
         if self.jitter_percent > 100 {
             return Err(ConfigError::InvalidPolicy(
                 "restart jitter percentage exceeds 100",
+            ));
+        }
+        if self.quarantine_retry_ms > MAX_POLICY_DURATION_MS {
+            return Err(ConfigError::InvalidPolicy(
+                "quarantine retry interval is out of range",
             ));
         }
         Ok(())

@@ -11,9 +11,10 @@ use izwi_serving_supervisor::autoscale::{
 use izwi_serving_supervisor::rollout::{self, RolloutPhase};
 use izwi_serving_supervisor::{approvals_file, signals};
 use izwi_serving_supervisor::{
-    BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory, LockNamespace,
-    MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, ValidatedNodeConfig,
-    WorkerBinaryFlavor, WorkerConfig, MAX_NODE_CONFIG_BYTES,
+    request_quarantine_clear, take_quarantine_clear_requests, BinaryCatalog, BinaryRecord,
+    CudaDeviceInventory, HostInventory, LockNamespace, MetalDeviceInventory, NodeConfig,
+    QuarantineClear, ResolvedWorkerSecret, ValidatedNodeConfig, WorkerBinaryFlavor, WorkerConfig,
+    MAX_NODE_CONFIG_BYTES,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,6 +38,8 @@ const MAX_DEVICE_DECLARATIONS: usize = 64;
 const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 16 * 1024;
 const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "\ndiagnostic_output=truncated\n";
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How often the supervisor looks for `--clear-quarantine` requests.
+const QUARANTINE_CLEAR_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// A path the supervisor keeps a Prometheus textfile at (for a node
 /// exporter's textfile collector); unset writes none.
 const METRICS_TEXTFILE_ENV: &str = "IZWI_SUPERVISOR_METRICS_TEXTFILE";
@@ -156,6 +159,11 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     }
     let binaries = BinaryCatalog::new(binary_records);
     let node = Arc::new(config.validate(&inventory, &binaries)?);
+    // --clear-quarantine leaves a request for the running supervisor; it
+    // takes no lock and launches nothing.
+    if let Some(target) = options.clear_quarantine.as_deref() {
+        return request_clear_quarantine(&node, target);
+    }
     let secrets = resolve_secrets(node.config().workers.iter())?;
     if validate_only {
         print!("{}", validation_diagnostic(&node));
@@ -281,6 +289,8 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     });
     let (diagnostic_tx, mut diagnostic_rx) = mpsc::channel(1);
     signals::forward_diagnostic_requests(diagnostic_tx);
+    let (quarantine_clear_tx, mut quarantine_clear_rx) = mpsc::channel(1);
+    signals::forward_quarantine_clear_requests(quarantine_clear_tx);
     // DS6: SIGUSR2 requests an in-process rollout abort while the rollout is
     // still reversible (launch or window phases).
     let mut abort_rx = signals::rollout_abort_requests();
@@ -386,6 +396,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         + autoscaler
             .as_ref()
             .map_or(Duration::ZERO, |scaler| scaler.evaluation_interval());
+    let mut next_clear_check = Instant::now();
     while !*shutdown_rx.borrow() {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -396,7 +407,16 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             Some(()) = diagnostic_rx.recv() => {
                 eprint!("{}", runtime_diagnostic(&node, &slots, &supervision));
             }
+            Some(()) = quarantine_clear_rx.recv() => {
+                clear_quarantines(&slots, &QuarantineClear::All);
+            }
             _ = poll.tick() => {
+                if Instant::now() >= next_clear_check {
+                    next_clear_check = Instant::now() + QUARANTINE_CLEAR_CHECK_INTERVAL;
+                    for request in take_quarantine_clear_requests(&node.config().runtime_directory) {
+                        clear_quarantines(&slots, &request);
+                    }
+                }
                 if let Some(scaler) = autoscaler.as_mut() {
                     sync_autoscaler(scaler, &mut slots);
                 }
@@ -424,6 +444,58 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     }
 
     shut_down_all(slots).await;
+    Ok(())
+}
+
+/// Applies one operator quarantine clear to the matching workers.
+fn clear_quarantines(slots: &[WorkerSlot], target: &QuarantineClear) {
+    let mut matched = false;
+    for slot in slots {
+        if matches!(target, QuarantineClear::Worker(worker) if worker != slot.worker_id()) {
+            continue;
+        }
+        matched = true;
+        if matches!(slot.actor.view().phase, WorkerPhase::Quarantined { .. }) {
+            info!("clearing the quarantine of worker {}", slot.worker_id());
+            slot.actor.clear_quarantine();
+        }
+    }
+    if !matched {
+        warn!("quarantine clear request names an unknown worker: {target:?}");
+    }
+}
+
+/// The `--clear-quarantine` command: validate the target against the node
+/// config and leave a request for the running supervisor.
+fn request_clear_quarantine(
+    node: &ValidatedNodeConfig,
+    target: &str,
+) -> Result<(), SupervisorError> {
+    let request = if target == "all" {
+        QuarantineClear::All
+    } else {
+        let worker = WorkerId::new(target)
+            .ok()
+            .filter(|worker| node.worker(worker).is_some())
+            .ok_or_else(|| {
+                SupervisorError::InvalidOption(format!(
+                "--clear-quarantine {target:?} names no configured worker (use a worker id or all)"
+            ))
+            })?;
+        QuarantineClear::Worker(worker)
+    };
+    request_quarantine_clear(&node.config().runtime_directory, &request).map_err(|source| {
+        SupervisorError::ReadConfig {
+            path: node
+                .config()
+                .runtime_directory
+                .join(izwi_serving_supervisor::QUARANTINE_CLEAR_DIRECTORY),
+            source,
+        }
+    })?;
+    eprintln!(
+        "quarantine clear requested for {target}; a running supervisor applies it within a second"
+    );
     Ok(())
 }
 
@@ -1077,7 +1149,7 @@ fn slot_state(view: &WorkerView, autoscale: Option<&AutoscaleSlotState>) -> &'st
         (_, WorkerPhase::Ready) => "ready",
         (_, WorkerPhase::WaitingForLoad | WorkerPhase::Starting) => "starting",
         (_, WorkerPhase::RestartPending { .. }) => "restart-pending",
-        (_, WorkerPhase::Quarantined) => "quarantined",
+        (_, WorkerPhase::Quarantined { .. }) => "quarantined",
         (Some(AutoscalePhase::Standby), WorkerPhase::Idle) => "standby",
         (_, WorkerPhase::Idle) => "stopped",
     }
@@ -1133,7 +1205,7 @@ fn render_runtime_diagnostic<'a>(
         slots.len(),
         in_phase(&WorkerView::is_running),
         in_phase(&|view| matches!(view.phase, WorkerPhase::RestartPending { .. })),
-        in_phase(&|view| view.phase == WorkerPhase::Quarantined),
+        in_phase(&|view| matches!(view.phase, WorkerPhase::Quarantined { .. })),
         count(&metrics.launch_attempts),
         count(&metrics.readiness_successes),
         count(&metrics.readiness_failures),
@@ -1217,7 +1289,7 @@ fn supervisor_prometheus(slots: &[WorkerSlot], metrics: &SupervisorMetrics) -> S
         "izwi_supervisor_workers_quarantined",
         "gauge",
         "Worker slots quarantined after exhausting their restart budget.",
-        in_phase(&|view| view.phase == WorkerPhase::Quarantined),
+        in_phase(&|view| matches!(view.phase, WorkerPhase::Quarantined { .. })),
     );
     metric(
         "izwi_supervisor_workers_restart_pending",
@@ -1669,6 +1741,7 @@ struct CliOptions {
     rollout_plan: Option<PathBuf>,
     rollout_abort: bool,
     rollout_status: bool,
+    clear_quarantine: Option<String>,
 }
 
 enum ParseOutcome {
@@ -1700,6 +1773,7 @@ impl CliOptions {
         let mut rollout_plan = None;
         let mut rollout_abort = false;
         let mut rollout_status = false;
+        let mut clear_quarantine = None;
         let mut index = 0;
         while index < arguments.len() {
             let name = arguments[index]
@@ -1786,6 +1860,12 @@ impl CliOptions {
                         .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
                     set_once(&mut rollout_plan, PathBuf::from(value), name)?;
                 }
+                "--clear-quarantine" => {
+                    let value = value
+                        .to_str()
+                        .ok_or_else(|| SupervisorError::InvalidOption(name.to_string()))?;
+                    set_once(&mut clear_quarantine, value.to_string(), name)?;
+                }
                 _ => return Err(SupervisorError::UnknownOption(name.to_string())),
             }
             index += 2;
@@ -1807,6 +1887,13 @@ impl CliOptions {
                     .to_string(),
             ));
         }
+        if clear_quarantine.is_some()
+            && (rollout_modes > 0 || validate_only || canary_worker_id.is_some())
+        {
+            return Err(SupervisorError::InvalidOption(
+                "--clear-quarantine is a command of its own".to_string(),
+            ));
+        }
         Ok(ParseOutcome::Run(Box::new(Self {
             config: config.ok_or(SupervisorError::MissingOption("--config"))?,
             cpu_worker_binary,
@@ -1823,6 +1910,7 @@ impl CliOptions {
             rollout_plan,
             rollout_abort,
             rollout_status,
+            clear_quarantine,
         })))
     }
 }
@@ -1946,9 +2034,13 @@ the supervisor admits nothing before that worker reports readiness."
   stdout and stderr are relayed line by line with the worker id. IZWI_SUPERVISOR_METRICS_TEXTFILE=PATH\n\
   keeps supervisor counters and worker-state gauges there in the Prometheus text format."
     );
+    eprintln!(
+        "--clear-quarantine WORKER_ID|all asks the running supervisor (same --config) to relaunch a\n\
+  quarantined worker at once; quarantined workers are otherwise retried every restart.quarantine_retry_ms."
+    );
     #[cfg(unix)]
     eprintln!(
-        "Send SIGUSR1 to a running supervisor for one bounded, redacted status snapshot on stderr; SIGUSR2 aborts a running rollout while it is still reversible."
+        "Send SIGUSR1 to a running supervisor for one bounded, redacted status snapshot on stderr; SIGUSR2 aborts a running rollout while it is still reversible; SIGHUP clears every quarantine."
     );
 }
 
@@ -2271,6 +2363,7 @@ mod tests {
             rollout_plan: None,
             rollout_abort: false,
             rollout_status: false,
+            clear_quarantine: None,
         };
         assert!(matches!(
             ensure_flavor_binaries(&config(metal.clone(), WorkerBinaryFlavor::Metal), &options),

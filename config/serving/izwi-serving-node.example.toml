@@ -33,6 +33,10 @@ restart_window_ms = 300000
 stable_reset_ms = 600000
 max_restarts_per_window = 5
 jitter_percent = 20
+# A worker that exhausts its restart budget is quarantined and retried once
+# every quarantine_retry_ms (0: only an operator clears it, with SIGHUP or
+# izwi-serving-supervisor --clear-quarantine WORKER_ID|all).
+quarantine_retry_ms = 600000
 
 [shutdown]
 drain_grace_ms = 30000
