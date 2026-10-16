@@ -5,6 +5,7 @@
 //! specifications, and supervises worker processes without initializing an
 //! inference backend in the supervisor.
 
+pub mod actor;
 pub mod approvals_file;
 pub mod autoscale;
 mod config;

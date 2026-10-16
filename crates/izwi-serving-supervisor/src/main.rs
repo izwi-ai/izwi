@@ -1,7 +1,9 @@
-use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
-    BackendKind, DeploymentId, DeviceId, GatewayWorkerApproval, IncarnationId, ServiceBearerToken,
-    ServiceCredentials, WorkerId,
+    BackendKind, DeploymentId, DeviceId, GatewayWorkerApproval, ServiceBearerToken, WorkerId,
+};
+use izwi_serving_supervisor::actor::{
+    bump, count, stop_all, LaunchCounts, LaunchOutcome, Supervision, SupervisorMetrics,
+    WorkerActor, WorkerPhase, WorkerView,
 };
 use izwi_serving_supervisor::autoscale::{
     self, Autoscaler, DeploymentObservation, ScaleDecision, WorkerSignals,
@@ -9,10 +11,9 @@ use izwi_serving_supervisor::autoscale::{
 use izwi_serving_supervisor::rollout::{self, RolloutPhase};
 use izwi_serving_supervisor::{approvals_file, signals};
 use izwi_serving_supervisor::{
-    build_child_launch_spec, BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory,
-    LockNamespace, MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, RestartController,
-    RestartDecision, ShutdownPolicy, SupervisedWorker, ValidatedNodeConfig, WorkerBinaryFlavor,
-    WorkerConfig, WorkerLockPaths, MAX_NODE_CONFIG_BYTES,
+    BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory, LockNamespace,
+    MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, ValidatedNodeConfig,
+    WorkerBinaryFlavor, WorkerConfig, MAX_NODE_CONFIG_BYTES,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,11 +22,11 @@ use std::{
     fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{mpsc, watch},
-    task::JoinSet,
     time::{Instant, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
@@ -154,8 +155,8 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         ));
     }
     let binaries = BinaryCatalog::new(binary_records);
-    let node = config.validate(&inventory, &binaries)?;
-    let mut slots = resolve_slots(&node)?;
+    let node = Arc::new(config.validate(&inventory, &binaries)?);
+    let secrets = resolve_secrets(node.config().workers.iter())?;
     if validate_only {
         print!("{}", validation_diagnostic(&node));
         return Ok(());
@@ -167,8 +168,6 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     if options.rollout_abort {
         return rollout_abort_command(&node);
     }
-
-    let inherited_environment = izwi_serving_supervisor::env::inherited_environment();
 
     let locks = LockNamespace::open(&node.config().runtime_directory)?;
     let lock_metadata = format!("node={} pid={}", node.config().node_id, std::process::id());
@@ -201,22 +200,44 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         .as_ref()
         .is_some_and(|prepared| prepared.state.phase == RolloutPhase::DrainingOld);
 
+    let supervision = Arc::new(Supervision::new(
+        locks.clone(),
+        izwi_serving_supervisor::env::inherited_environment(),
+        node.config().max_parallel_model_loads,
+    ));
+    let mut slots = Vec::with_capacity(secrets.len());
+    for (worker_id, secret) in secrets {
+        slots.push(WorkerSlot::new(WorkerActor::spawn(
+            Arc::clone(&node),
+            worker_id,
+            secret,
+            Arc::clone(&supervision),
+        )?));
+    }
+    if let Some(prepared) = rollout.as_mut() {
+        for (worker_id, secret) in std::mem::take(&mut prepared.replacement_secrets) {
+            prepared.replacements.push(WorkerActor::spawn(
+                Arc::clone(&prepared.target),
+                worker_id,
+                secret,
+                Arc::clone(&supervision),
+            )?);
+        }
+    }
+
     let mut autoscaler = Autoscaler::from_config(&node);
     if let Some(scaler) = autoscaler.as_mut() {
         // Partition slots: the min set keeps the static posture
         // (`autoscale: None`); every other declared worker of an autoscaled
         // deployment becomes a standby that only a scale-up decision starts.
         for slot in slots.iter_mut() {
-            let Some(state) = scaler.deployment_of(&slot.worker_id) else {
+            let Some(state) = scaler.deployment_of(slot.worker_id()) else {
                 continue;
             };
-            if state.core_set().contains(&slot.worker_id) {
+            if state.core_set().contains(slot.worker_id()) {
                 continue;
             }
-            slot.autoscale = Some(AutoscaleSlotState {
-                deployment: state.deployment_id().clone(),
-                phase: AutoscalePhase::Standby,
-            });
+            slot.autoscale = Some(AutoscaleSlotState::standby(state.deployment_id().clone()));
         }
         // Reconcile the shared view to the min set before any launch: lines
         // for this node's non-running autoscaled workers must not stay
@@ -243,13 +264,10 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         );
     }
     if let Some(canary_id) = options.canary_worker_id.as_ref() {
-        if slots.iter().any(|slot| {
-            &slot.worker_id == canary_id
-                && slot
-                    .autoscale
-                    .as_ref()
-                    .is_some_and(|state| state.phase == AutoscalePhase::Standby)
-        }) {
+        if slots
+            .iter()
+            .any(|slot| slot.worker_id() == canary_id && slot.is_standby())
+        {
             return Err(SupervisorError::Autoscale(format!(
                 "canary worker {canary_id} is an autoscaling standby; canaries must belong to the startup min set"
             )));
@@ -267,13 +285,10 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
     // still reversible (launch or window phases).
     let mut abort_rx = signals::rollout_abort_requests();
 
-    let started_at = Instant::now();
-    let mut metrics = SupervisorMetrics::default();
-
     if let Some(canary_id) = options.canary_worker_id.as_ref() {
-        let canary_index = slots
+        let canary = slots
             .iter()
-            .position(|slot| &slot.worker_id == canary_id)
+            .find(|slot| slot.worker_id() == canary_id)
             .ok_or_else(|| SupervisorError::CanaryWorkerNotFound {
                 worker_id: canary_id.clone(),
             })?;
@@ -281,41 +296,31 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
             "launching canary worker {} first; remaining workers will start after it reaches readiness",
             canary_id
         );
-        launch_slot(
-            &node,
-            &locks,
-            &inherited_environment,
-            &mut slots[canary_index],
-            &mut shutdown_rx,
-            started_at,
-            &mut metrics,
-        )
-        .await;
-        note_slot_launched(&mut autoscaler, &slots[canary_index]);
-        if slots[canary_index].process.is_none() {
-            warn!(
-                "canary worker {} failed to reach readiness; aborting rollout",
+        match start_and_wait(&canary.actor, &mut shutdown_rx).await {
+            Some(LaunchOutcome::Ready) => info!(
+                "canary worker {} is ready; launching remaining workers",
                 canary_id
-            );
-            return Err(SupervisorError::CanaryReadinessFailed {
-                worker_id: canary_id.clone(),
-            });
+            ),
+            Some(LaunchOutcome::Failed) => {
+                warn!(
+                    "canary worker {} failed to reach readiness; aborting rollout",
+                    canary_id
+                );
+                shut_down_all(slots).await;
+                return Err(SupervisorError::CanaryReadinessFailed {
+                    worker_id: canary_id.clone(),
+                });
+            }
+            None => {
+                shut_down_all(slots).await;
+                return Ok(());
+            }
         }
-        info!(
-            "canary worker {} is ready; launching remaining workers",
-            canary_id
-        );
     }
 
-    for slot in &mut slots {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-        if options
-            .canary_worker_id
-            .as_ref()
-            .is_some_and(|id| &slot.worker_id == id)
-        {
+    let mut started = Vec::new();
+    for slot in &slots {
+        if options.canary_worker_id.as_ref() == Some(slot.worker_id()) {
             continue;
         }
         // On resume into DrainingOld the old generation is retired and its
@@ -324,64 +329,53 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         if resume_draining_old
             && rollout
                 .as_ref()
-                .is_some_and(|prepared| prepared.spec.is_old_worker(slot.worker_id.as_str()))
+                .is_some_and(|prepared| prepared.spec.is_old_worker(slot.worker_id().as_str()))
         {
             continue;
         }
         // DS7: autoscaling standbys wait for a scale-up decision.
-        if slot
-            .autoscale
-            .as_ref()
-            .is_some_and(|state| state.phase == AutoscalePhase::Standby)
-        {
+        if slot.is_standby() {
             continue;
         }
-        launch_slot(
-            &node,
-            &locks,
-            &inherited_environment,
-            slot,
-            &mut shutdown_rx,
-            started_at,
-            &mut metrics,
-        )
-        .await;
-        note_slot_launched(&mut autoscaler, slot);
+        started.push((slot.actor.view().launch_counts(), &slot.actor));
+        slot.actor.start();
     }
 
-    // DS6: run the rollout state machine to commit or abort. After a commit
-    // the replacement slots join supervision under the target node config.
-    let mut replacement_slots: Vec<WorkerSlot> = Vec::new();
-    let mut target_node: Option<ValidatedNodeConfig> = None;
-    if rollout.is_some() {
-        match execute_rollout(
-            rollout.as_mut().expect("rollout is present"),
-            &node,
-            &locks,
-            &inherited_environment,
-            &mut slots,
-            &mut shutdown_rx,
-            &mut abort_rx,
-            started_at,
-            &mut metrics,
-        )
-        .await
-        {
-            outcome @ (RolloutOutcome::Committed | RolloutOutcome::DegradedAbort) => {
-                if matches!(outcome, RolloutOutcome::Committed) {
-                    metrics.rollouts_committed += 1;
-                } else {
-                    metrics.rollouts_degraded += 1;
+    // DS6: run the rollout state machine to commit or abort. The current
+    // generation settles first, as a rollout starts from a running node.
+    // After a commit the replacements join supervision.
+    if let Some(prepared) = rollout.as_mut() {
+        let settled = tokio::select! {
+            () = async {
+                for (before, actor) in &started {
+                    actor.launch_outcome(*before).await;
                 }
-                let prepared = rollout.take().expect("rollout is present");
-                replacement_slots = prepared.replacements;
-                target_node = Some(prepared.target);
-            }
-            RolloutOutcome::Aborted => {
-                metrics.rollouts_aborted += 1;
-                rollout.take();
+            } => true,
+            _ = shutdown_rx.wait_for(|stop| *stop) => false,
+        };
+        drop(started);
+        if settled {
+            let outcome =
+                execute_rollout(prepared, &node, &mut slots, &mut shutdown_rx, &mut abort_rx).await;
+            let metrics = &supervision.metrics;
+            match outcome {
+                RolloutOutcome::Committed | RolloutOutcome::DegradedAbort => {
+                    bump(if matches!(outcome, RolloutOutcome::Committed) {
+                        &metrics.rollouts_committed
+                    } else {
+                        &metrics.rollouts_degraded
+                    });
+                    let prepared = rollout.take().expect("rollout is present");
+                    slots.extend(prepared.replacements.into_iter().map(WorkerSlot::new));
+                }
+                RolloutOutcome::Aborted => {
+                    bump(&metrics.rollouts_aborted);
+                    rollout.take();
+                }
             }
         }
+    } else {
+        drop(started);
     }
 
     let metrics_textfile = env::var_os(METRICS_TEXTFILE_ENV).map(PathBuf::from);
@@ -400,49 +394,14 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                 }
             }
             Some(()) = diagnostic_rx.recv() => {
-                eprint!("{}", runtime_diagnostic(&node, &slots, &metrics, started_at));
-                if !replacement_slots.is_empty() {
-                    if let Some(target) = target_node.as_ref() {
-                        eprint!(
-                            "{}",
-                            runtime_diagnostic(target, &replacement_slots, &metrics, started_at)
-                        );
-                    }
-                }
+                eprint!("{}", runtime_diagnostic(&node, &slots, &supervision));
             }
             _ = poll.tick() => {
-                observe_exits(&mut slots, autoscaler.as_mut(), started_at, &mut metrics);
-                observe_exits(&mut replacement_slots, None, started_at, &mut metrics);
-                if let Some(slot) = next_restart_slot(&mut slots) {
-                    launch_slot(
-                        &node,
-                        &locks,
-                        &inherited_environment,
-                        slot,
-                        &mut shutdown_rx,
-                        started_at,
-                        &mut metrics,
-                    ).await;
-                    note_slot_launched(&mut autoscaler, slot);
-                }
-                if !replacement_slots.is_empty() {
-                    if let Some(target) = target_node.as_ref() {
-                        if let Some(slot) = next_restart_slot(&mut replacement_slots) {
-                            launch_slot(
-                                target,
-                                &locks,
-                                &inherited_environment,
-                                slot,
-                                &mut shutdown_rx,
-                                started_at,
-                                &mut metrics,
-                            ).await;
-                        }
-                    }
+                if let Some(scaler) = autoscaler.as_mut() {
+                    sync_autoscaler(scaler, &mut slots);
                 }
                 if let Some(path) = metrics_textfile.as_deref() {
-                    let rendered =
-                        supervisor_prometheus(&slots, &replacement_slots, &metrics);
+                    let rendered = supervisor_prometheus(&slots, &supervision.metrics);
                     if rendered != written_metrics {
                         match write_metrics_textfile(path, &rendered) {
                             Ok(()) => written_metrics = rendered,
@@ -457,42 +416,50 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                 if Instant::now() >= next_autoscale_eval {
                     if let Some(scaler) = autoscaler.as_mut() {
                         next_autoscale_eval = Instant::now() + scaler.evaluation_interval();
-                        run_autoscale_tick(
-                            scaler,
-                            &node,
-                            &mut slots,
-                            &locks,
-                            &inherited_environment,
-                            &mut shutdown_rx,
-                            started_at,
-                            &mut metrics,
-                        )
-                        .await;
+                        run_autoscale_tick(scaler, &node, &mut slots, &supervision).await;
                     }
                 }
             }
         }
     }
 
-    drain_all(slots, node.config().shutdown.clone(), &mut metrics).await;
-    let replacement_policy = target_node
-        .as_ref()
-        .map(|target| target.config().shutdown.clone())
-        .unwrap_or_else(|| node.config().shutdown.clone());
-    drain_all(replacement_slots, replacement_policy, &mut metrics).await;
+    shut_down_all(slots).await;
     Ok(())
 }
 
+/// Starts an idle worker and waits for its first launch outcome; `None`
+/// when shutdown came first.
+async fn start_and_wait(
+    actor: &WorkerActor,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<LaunchOutcome> {
+    let before = actor.view().launch_counts();
+    actor.start();
+    tokio::select! {
+        outcome = actor.launch_outcome(before) => Some(outcome),
+        _ = shutdown.wait_for(|stop| *stop) => None,
+    }
+}
+
+/// Drains every worker in parallel and ends their actors.
+async fn shut_down_all(slots: Vec<WorkerSlot>) {
+    stop_all(slots.iter().map(|slot| &slot.actor)).await;
+    for slot in slots {
+        slot.actor.shut_down().await;
+    }
+}
+
 /// A prepared DS6 rollout: validated spec, staged state, target config, and
-/// resolved replacement slots awaiting launch.
+/// idle replacement actors awaiting launch.
 struct PreparedRollout {
     spec: rollout::RolloutSpec,
     state: rollout::RolloutState,
-    target: ValidatedNodeConfig,
+    target: Arc<ValidatedNodeConfig>,
     approvals_path: PathBuf,
     /// The replacement lines the rollout adds to the shared approvals file.
     approval_lines: Vec<GatewayWorkerApproval>,
-    replacements: Vec<WorkerSlot>,
+    replacement_secrets: Vec<(WorkerId, ResolvedWorkerSecret)>,
+    replacements: Vec<WorkerActor>,
 }
 
 enum RolloutOutcome {
@@ -563,7 +530,7 @@ fn prepare_rollout(
         approvals_file::read(plan.shared_approvals_path()).map_err(rollout::RolloutError::from)?;
     rollout::verify_approvals_precondition(&approvals, &spec)?;
     let approval_lines = rollout::replacement_approvals(&spec, &target)?;
-    let replacements = resolve_replacement_slots(&target, &spec)?;
+    let replacement_secrets = resolve_replacement_secrets(&target, &spec)?;
 
     let state = match state {
         Some(state) => state,
@@ -599,10 +566,11 @@ fn prepare_rollout(
     Ok(PreparedRollout {
         spec,
         state,
-        target,
+        target: Arc::new(target),
         approvals_path: plan.shared_approvals_path().to_path_buf(),
         approval_lines,
-        replacements,
+        replacement_secrets,
+        replacements: Vec::new(),
     })
 }
 
@@ -635,99 +603,79 @@ fn reconcile_fresh_start_state(
     Ok(())
 }
 
-// Single-call-site orchestrator: every parameter is a distinct handle the
-// rollout state machine needs in place, so grouping them would only add
-// indirection without reducing real coupling.
-#[allow(clippy::too_many_arguments)]
 async fn execute_rollout(
     prepared: &mut PreparedRollout,
     node: &ValidatedNodeConfig,
-    locks: &LockNamespace,
-    inherited_environment: &BTreeMap<OsString, OsString>,
     current_slots: &mut Vec<WorkerSlot>,
     shutdown: &mut watch::Receiver<bool>,
     abort_requested: &mut watch::Receiver<bool>,
-    started_at: Instant,
-    metrics: &mut SupervisorMetrics,
 ) -> RolloutOutcome {
     let runtime_directory = node.config().runtime_directory.clone();
-    let shutdown_policy = node.config().shutdown.clone();
     let resuming_window = prepared.state.phase == RolloutPhase::WindowOpen;
 
-    // Launch the replacements canary-first. On window resume the crashed
-    // supervisor's replacements self-drained, so they relaunch here too.
+    // Launch the replacements: the canary first, then the rest together. On
+    // window resume the crashed supervisor's replacements self-drained, so
+    // they relaunch here too.
     if prepared.state.phase == RolloutPhase::LaunchingReplacement || resuming_window {
         let canary = prepared.spec.canary_worker_id.clone();
         prepared
             .replacements
-            .sort_by_key(|slot| slot.worker_id.as_str() != canary.as_str());
+            .sort_by_key(|actor| actor.worker_id().as_str() != canary.as_str());
         prepared.state.replacement_workers.clear();
-        for slot in prepared.replacements.iter_mut() {
-            if *shutdown.borrow() {
+        let (first, rest) = prepared.replacements.split_at(1);
+        let mut failed = None;
+        let mut interrupted = false;
+        for wave in [first, rest] {
+            let waiting: Vec<_> = wave
+                .iter()
+                .map(|actor| {
+                    let before = actor.view().launch_counts();
+                    actor.start();
+                    (before, actor)
+                })
+                .collect();
+            for (before, actor) in waiting {
+                tokio::select! {
+                    outcome = actor.launch_outcome(before) => {
+                        if outcome == LaunchOutcome::Failed && failed.is_none() {
+                            failed = Some(actor.worker_id().clone());
+                        }
+                    }
+                    _ = shutdown.wait_for(|stop| *stop) => interrupted = true,
+                }
+                if interrupted {
+                    break;
+                }
+            }
+            if failed.is_some() || interrupted {
                 break;
             }
-            launch_slot(
-                &prepared.target,
-                locks,
-                inherited_environment,
-                slot,
-                shutdown,
-                started_at,
-                metrics,
+        }
+        if let Some(worker_id) = failed {
+            warn!("replacement worker {worker_id} failed to reach readiness; aborting rollout");
+            return abort_rollout(
+                prepared,
+                &runtime_directory,
+                false,
+                "replacement readiness failed",
             )
             .await;
-            if slot.process.is_none() {
-                warn!(
-                    "replacement worker {} failed to reach readiness; aborting rollout",
-                    slot.worker_id
-                );
-                let restored = abort_rollout(
-                    prepared,
-                    &runtime_directory,
-                    metrics,
-                    false,
-                    &shutdown_policy,
-                    "replacement readiness failed",
-                )
-                .await;
-                return if restored {
-                    RolloutOutcome::Aborted
-                } else {
-                    RolloutOutcome::DegradedAbort
-                };
-            }
-            let pid = slot
-                .process
-                .as_ref()
-                .and_then(SupervisedWorker::process_id)
-                .unwrap_or(0);
+        }
+        if interrupted {
+            return abort_rollout(prepared, &runtime_directory, false, "shutdown requested").await;
+        }
+        for actor in &prepared.replacements {
             prepared
                 .state
                 .replacement_workers
                 .push(rollout::RolloutWorkerRecord {
-                    worker_id: slot.worker_id.to_string(),
-                    pid,
+                    worker_id: actor.worker_id().to_string(),
+                    pid: actor.view().process_id.unwrap_or(0),
                 });
-            prepared.state.updated_at_ms = now_ms();
-            if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-                warn!("rollout state persist failed: {error}");
-            }
         }
-        if *shutdown.borrow() {
-            let restored = abort_rollout(
-                prepared,
-                &runtime_directory,
-                metrics,
-                false,
-                &shutdown_policy,
-                "shutdown requested",
-            )
-            .await;
-            return if restored {
-                RolloutOutcome::Aborted
-            } else {
-                RolloutOutcome::DegradedAbort
-            };
+        prepared.state.updated_at_ms = now_ms();
+        if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
+            warn!("rollout state persist failed: {error}");
         }
     }
 
@@ -741,86 +689,71 @@ async fn execute_rollout(
         warn!("rollout window view failed to write: {error}; nothing changed");
         return RolloutOutcome::DegradedAbort;
     }
-    let deadline_ms = prepared
-        .state
-        .window_deadline_ms
-        .unwrap_or_else(|| now_ms().saturating_add(prepared.spec.window.as_millis() as u64));
+    // The window always runs in full from now on the monotonic clock: a
+    // resumed rollout re-arms it, so the gateways adopt the window view
+    // again before the commit view lands.
+    let window_end = Instant::now() + prepared.spec.window;
     prepared.state.phase = RolloutPhase::WindowOpen;
-    prepared.state.window_deadline_ms = Some(deadline_ms);
+    prepared.state.window_deadline_ms =
+        Some(now_ms().saturating_add(prepared.spec.window.as_millis() as u64));
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
         warn!("rollout state persist failed: {error}");
     }
     info!(
         "rollout window open: both generations approved; cutover fires when the successor generation is observed Ready; drain starts in {}s",
-        deadline_ms.saturating_sub(now_ms()) / 1000
+        prepared.spec.window.as_secs()
     );
     let mut window_watch = tokio::time::interval(Duration::from_millis(500));
     window_watch.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    while now_ms() < deadline_ms {
+    loop {
         tokio::select! {
-            _ = window_watch.tick() => {
-                let operator_abort = *abort_requested.borrow();
-                if *shutdown.borrow() || operator_abort {
-                    let reason = if *shutdown.borrow() {
-                        "shutdown requested"
-                    } else {
-                        "operator abort (SIGUSR2)"
-                    };
-                    let restored = abort_rollout(
-                        prepared,
-                        &runtime_directory,
-                        metrics,
-                        true,
-                        &shutdown_policy,
-                        reason,
-                    )
-                    .await;
-                    return if restored {
-                        RolloutOutcome::Aborted
-                    } else {
-                        RolloutOutcome::DegradedAbort
-                    };
-                }
-                for slot in prepared.replacements.iter_mut() {
-                    let Some(process) = slot.process.as_mut() else {
-                        continue;
-                    };
-                    if matches!(process.try_wait(), Ok(Some(_))) {
-                        warn!(
-                            "replacement worker {} exited during the rollout window; aborting rollout",
-                            slot.worker_id
-                        );
-                        let restored = abort_rollout(
-                            prepared,
-                            &runtime_directory,
-                            metrics,
-                            true,
-                            &shutdown_policy,
-                            "replacement exited during the window",
-                        )
-                        .await;
-                        return if restored {
-                            RolloutOutcome::Aborted
-                        } else {
-                            RolloutOutcome::DegradedAbort
-                        };
-                    }
-                }
-            }
+            () = tokio::time::sleep_until(window_end) => break,
+            _ = window_watch.tick() => {}
             _ = abort_requested.changed() => {}
+            _ = shutdown.changed() => {}
+        }
+        let reason = if *shutdown.borrow() {
+            Some("shutdown requested")
+        } else if *abort_requested.borrow() {
+            Some("operator abort (SIGUSR2)")
+        } else if let Some(actor) = prepared
+            .replacements
+            .iter()
+            .find(|actor| actor.view().phase != WorkerPhase::Ready)
+        {
+            warn!(
+                "replacement worker {} left readiness during the rollout window; aborting rollout",
+                actor.worker_id()
+            );
+            Some("replacement exited during the window")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return abort_rollout(prepared, &runtime_directory, true, reason).await;
         }
     }
 
     // DrainingOld is the point of no return: the commit view is written and
-    // the old generation's workers stop admitting. On resume into this
-    // phase the old workers already exited (the generation barrier proved
-    // it), so the drain finds nothing to stop.
+    // the old generation's workers stop admitting. It is entered only once
+    // persisted, so a crash can never resume an earlier phase and relaunch
+    // the drained generation. On resume into this phase the old workers
+    // already exited (the generation barrier proved it), so the drain finds
+    // nothing to stop.
     prepared.state.phase = RolloutPhase::DrainingOld;
     prepared.state.window_deadline_ms = None;
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
-        warn!("rollout state persist failed: {error}");
+        warn!("rollout state persist failed: {error}; aborting before the point of no return");
+        prepared.state.phase = RolloutPhase::WindowOpen;
+        return abort_rollout(
+            prepared,
+            &runtime_directory,
+            true,
+            "the draining_old state could not be persisted",
+        )
+        .await;
     }
     info!(
         "rollout drain: writing the commit approval view and draining the old generation (point of no return)"
@@ -846,13 +779,11 @@ async fn execute_rollout(
             _ = shutdown.wait_for(|stop| *stop) => {}
         }
     }
-    drain_selected(
-        current_slots,
-        |slot| prepared.spec.is_old_worker(slot.worker_id.as_str()),
-        &shutdown_policy,
-        metrics,
-    )
-    .await;
+    let (old, kept): (Vec<WorkerSlot>, Vec<WorkerSlot>) = std::mem::take(current_slots)
+        .into_iter()
+        .partition(|slot| prepared.spec.is_old_worker(slot.worker_id().as_str()));
+    *current_slots = kept;
+    shut_down_all(old).await;
     prepared.state.phase = RolloutPhase::Committed;
     prepared.state.updated_at_ms = now_ms();
     if let Err(error) = rollout::persist_state(&runtime_directory, &prepared.state) {
@@ -867,16 +798,13 @@ async fn execute_rollout(
 /// Aborts a reversible rollout: remove the replacement lines first so the
 /// gateway stops routing to the replacements within one refresh TTL, wait
 /// the abort grace, then drain the replacement workers. The previous
-/// generation never stopped serving. Returns whether the approvals were
-/// restored.
+/// generation never stopped serving.
 async fn abort_rollout(
     prepared: &mut PreparedRollout,
     runtime_directory: &Path,
-    metrics: &mut SupervisorMetrics,
     honor_grace: bool,
-    policy: &ShutdownPolicy,
     reason: &str,
-) -> bool {
+) -> RolloutOutcome {
     warn!("rollout aborted ({reason}): restoring the previous approval view");
     if let Err(error) = approvals_file::edit(&prepared.approvals_path, |document| {
         rollout::restore_view(document, &prepared.approval_lines, &[]);
@@ -885,7 +813,7 @@ async fn abort_rollout(
         warn!(
             "rollout abort could not restore approvals: {error}; workers keep running and the state stays resumable"
         );
-        return false;
+        return RolloutOutcome::DegradedAbort;
     }
     if honor_grace && !prepared.spec.abort_grace.is_zero() {
         info!(
@@ -894,29 +822,9 @@ async fn abort_rollout(
         );
         tokio::time::sleep(prepared.spec.abort_grace).await;
     }
-    let mut drains = JoinSet::new();
-    for slot in prepared.replacements.iter_mut() {
-        if let Some(process) = slot.process.take() {
-            let worker_id = slot.worker_id.clone();
-            let policy = policy.clone();
-            drains.spawn(async move { (worker_id, process.drain_and_stop(&policy).await) });
-        }
-    }
-    while let Some(result) = drains.join_next().await {
-        match result {
-            Ok((worker_id, Ok(report))) => info!(
-                "replacement worker {worker_id} stopped with {:?} ({})",
-                report.outcome, report.exit_status
-            ),
-            Ok((worker_id, Err(error))) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("replacement worker {worker_id} stop failed: {error}");
-            }
-            Err(error) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("replacement worker stop task failed: {error}");
-            }
-        }
+    stop_all(&prepared.replacements).await;
+    for actor in prepared.replacements.drain(..) {
+        actor.shut_down().await;
     }
     prepared.state.phase = RolloutPhase::Aborted;
     prepared.state.updated_at_ms = now_ms();
@@ -927,50 +835,7 @@ async fn abort_rollout(
     info!(
         "rollout abort complete: the previous approval view is restored and the replacement workers are stopped"
     );
-    true
-}
-
-/// Drains a selected subset of slots and removes them from supervision.
-async fn drain_selected(
-    slots: &mut Vec<WorkerSlot>,
-    select: impl Fn(&WorkerSlot) -> bool,
-    policy: &ShutdownPolicy,
-    metrics: &mut SupervisorMetrics,
-) {
-    let mut drains = JoinSet::new();
-    let mut selected = Vec::new();
-    for (index, slot) in slots.iter_mut().enumerate() {
-        if select(slot) {
-            if let Some(process) = slot.process.take() {
-                let worker_id = slot.worker_id.clone();
-                let policy = policy.clone();
-                drains.spawn(async move { (worker_id, process.drain_and_stop(&policy).await) });
-            }
-            selected.push(index);
-        }
-    }
-    while let Some(result) = drains.join_next().await {
-        match result {
-            Ok((worker_id, Ok(report))) => info!(
-                "worker {worker_id} drained with {:?} ({})",
-                report.outcome, report.exit_status
-            ),
-            Ok((worker_id, Err(error))) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker {worker_id} drain failed: {error}");
-            }
-            Err(error) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker drain task failed: {error}");
-            }
-        }
-    }
-    let mut cursor = 0;
-    slots.retain(|_| {
-        let keep = !selected.contains(&cursor);
-        cursor += 1;
-        keep
-    });
+    RolloutOutcome::Aborted
 }
 
 fn rollout_abort_command(node: &ValidatedNodeConfig) -> Result<(), SupervisorError> {
@@ -1050,17 +915,17 @@ fn print_rollout_status(config: &NodeConfig) -> Result<(), SupervisorError> {
     }
 }
 
-fn resolve_replacement_slots(
+fn resolve_replacement_secrets(
     target: &ValidatedNodeConfig,
     spec: &rollout::RolloutSpec,
-) -> Result<Vec<WorkerSlot>, SupervisorError> {
-    target
-        .config()
-        .workers
-        .iter()
-        .filter(|worker| spec.rolling_for(worker.worker_id.as_str()).is_some())
-        .map(|worker| resolve_slot(target, worker))
-        .collect()
+) -> Result<Vec<(WorkerId, ResolvedWorkerSecret)>, SupervisorError> {
+    resolve_secrets(
+        target
+            .config()
+            .workers
+            .iter()
+            .filter(|worker| spec.rolling_for(worker.worker_id.as_str()).is_some()),
+    )
 }
 
 /// Lifecycle phase of an autoscaling slot (DS7). Core (min-set) workers keep
@@ -1070,12 +935,13 @@ fn resolve_replacement_slots(
 enum AutoscalePhase {
     /// Declared standby: not launched; only a scale-up decision starts it.
     Standby,
-    /// Scale-up launched the process; the approvals line is not yet published.
-    Admitting,
+    /// Scale-up started the actor; the approvals line is published once its
+    /// launch after `since` reaches readiness.
+    Admitting { since: LaunchCounts },
     /// Running and approved in the shared approvals view.
     Active,
     /// Scale-down in progress: unapproved, admission stopped, draining.
-    Draining,
+    Draining { stop_requested: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -1084,134 +950,79 @@ struct AutoscaleSlotState {
     phase: AutoscalePhase,
 }
 
-struct WorkerSlot {
-    worker_id: WorkerId,
-    secret_environment_name: String,
-    secret: ResolvedWorkerSecret,
-    restart: RestartController,
-    process: Option<SupervisedWorker>,
-    process_started_at: Option<Instant>,
-    restart_at: Option<Instant>,
-    exit_observation_failed: bool,
-    autoscale: Option<AutoscaleSlotState>,
+impl AutoscaleSlotState {
+    fn standby(deployment: DeploymentId) -> Self {
+        Self {
+            deployment,
+            phase: AutoscalePhase::Standby,
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-struct SupervisorMetrics {
-    launch_attempts: u64,
-    readiness_successes: u64,
-    readiness_failures: u64,
-    restarts_scheduled: u64,
-    quarantines: u64,
-    unexpected_exits: u64,
-    exit_observation_failures: u64,
-    stop_failures: u64,
-    autoscale_ups: u64,
-    autoscale_downs: u64,
-    rollouts_committed: u64,
-    rollouts_aborted: u64,
-    rollouts_degraded: u64,
+/// One supervised worker: its actor, plus the autoscaling bookkeeping the
+/// main loop keeps for it.
+struct WorkerSlot {
+    actor: WorkerActor,
+    autoscale: Option<AutoscaleSlotState>,
+    /// The actor's ready-launch count at the last autoscaler sync.
+    seen_ready_launches: u64,
+    /// Whether the worker was running at the last autoscaler sync.
+    was_running: bool,
 }
 
 impl WorkerSlot {
-    /// Down without a scale decision and waiting for its scheduled restart.
-    fn restart_pending(&self) -> bool {
-        self.process.is_none()
-            && self.restart_at.is_some()
-            && !self.restart.is_quarantined()
-            && self
-                .autoscale
-                .as_ref()
-                .is_none_or(|state| state.phase == AutoscalePhase::Active)
+    fn new(actor: WorkerActor) -> Self {
+        Self {
+            actor,
+            autoscale: None,
+            seen_ready_launches: 0,
+            was_running: false,
+        }
     }
 
-    fn restart_due(&self) -> bool {
-        if self
-            .autoscale
+    fn worker_id(&self) -> &WorkerId {
+        self.actor.worker_id()
+    }
+
+    fn is_standby(&self) -> bool {
+        self.autoscale
             .as_ref()
-            .is_some_and(|state| state.phase != AutoscalePhase::Active)
-        {
-            // Standbys launch only via scale-up decisions; admitting and
-            // draining slots are mid-transition and never auto-restart.
-            return false;
-        }
-        self.process.is_none()
-            && !self.restart.is_quarantined()
-            && self
-                .restart_at
-                .is_some_and(|deadline| Instant::now() >= deadline)
+            .is_some_and(|state| state.phase == AutoscalePhase::Standby)
     }
 
-    fn record_failure(
-        &mut self,
-        supervisor_started_at: Instant,
-        uptime: Duration,
-        metrics: &mut SupervisorMetrics,
-    ) {
-        self.process = None;
-        self.process_started_at = None;
-        self.exit_observation_failed = false;
-        match self
-            .restart
-            .record_failure(supervisor_started_at.elapsed(), uptime)
-        {
-            RestartDecision::RestartAfter(delay) => {
-                metrics.restarts_scheduled = metrics.restarts_scheduled.saturating_add(1);
-                self.restart_at = Some(Instant::now() + delay);
-                info!(
-                    "worker {} unavailable; restart scheduled in {} ms",
-                    self.worker_id,
-                    delay.as_millis()
-                );
-            }
-            RestartDecision::Quarantine => {
-                metrics.quarantines = metrics.quarantines.saturating_add(1);
-                self.restart_at = None;
-                warn!(
-                    "worker {} exceeded its bounded restart budget and is quarantined",
-                    self.worker_id
-                );
-            }
-        }
+    /// Whether the restart controller, not a scale decision, owns this
+    /// worker's process: static and core workers, and active scale-ups.
+    fn restart_managed(&self) -> bool {
+        self.autoscale
+            .as_ref()
+            .is_none_or(|state| state.phase == AutoscalePhase::Active)
     }
 }
 
-fn resolve_slots(node: &ValidatedNodeConfig) -> Result<Vec<WorkerSlot>, SupervisorError> {
-    node.config()
-        .workers
-        .iter()
-        .map(|worker| resolve_slot(node, worker))
+/// Resolves each worker's bearer token from the supervisor's environment.
+fn resolve_secrets<'a>(
+    workers: impl Iterator<Item = &'a WorkerConfig>,
+) -> Result<Vec<(WorkerId, ResolvedWorkerSecret)>, SupervisorError> {
+    workers
+        .map(|worker| {
+            let value =
+                env::var(&worker.bearer_token_env).map_err(|_| SupervisorError::MissingSecret {
+                    worker: worker.worker_id.clone(),
+                    environment: worker.bearer_token_env.clone(),
+                })?;
+            let bearer_token = ServiceBearerToken::new(value).map_err(|source| {
+                SupervisorError::InvalidSecret {
+                    worker: worker.worker_id.clone(),
+                    environment: worker.bearer_token_env.clone(),
+                    source,
+                }
+            })?;
+            Ok((
+                worker.worker_id.clone(),
+                ResolvedWorkerSecret { bearer_token },
+            ))
+        })
         .collect()
-}
-
-fn resolve_slot(
-    node: &ValidatedNodeConfig,
-    worker: &izwi_serving_supervisor::WorkerConfig,
-) -> Result<WorkerSlot, SupervisorError> {
-    let value = env::var(&worker.bearer_token_env).map_err(|_| SupervisorError::MissingSecret {
-        worker: worker.worker_id.clone(),
-        environment: worker.bearer_token_env.clone(),
-    })?;
-    let secret = ResolvedWorkerSecret {
-        bearer_token: ServiceBearerToken::new(value).map_err(|source| {
-            SupervisorError::InvalidSecret {
-                worker: worker.worker_id.clone(),
-                environment: worker.bearer_token_env.clone(),
-                source,
-            }
-        })?,
-    };
-    Ok(WorkerSlot {
-        worker_id: worker.worker_id.clone(),
-        secret_environment_name: worker.bearer_token_env.clone(),
-        secret,
-        restart: RestartController::for_worker(node, &worker.worker_id)?,
-        process: None,
-        process_started_at: None,
-        restart_at: Some(Instant::now()),
-        exit_observation_failed: false,
-        autoscale: None,
-    })
 }
 
 fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
@@ -1257,52 +1068,93 @@ fn validation_diagnostic(node: &ValidatedNodeConfig) -> String {
     output.finish()
 }
 
+/// The diagnostic state name of one worker.
+fn slot_state(view: &WorkerView, autoscale: Option<&AutoscaleSlotState>) -> &'static str {
+    match (autoscale.map(|state| state.phase), view.phase) {
+        (Some(AutoscalePhase::Admitting { .. }), _) => "admitting",
+        (_, WorkerPhase::Draining) | (Some(AutoscalePhase::Draining { .. }), _) => "draining",
+        (_, WorkerPhase::Ready) if view.exit_observation_failed => "observation-uncertain",
+        (_, WorkerPhase::Ready) => "ready",
+        (_, WorkerPhase::WaitingForLoad | WorkerPhase::Starting) => "starting",
+        (_, WorkerPhase::RestartPending { .. }) => "restart-pending",
+        (_, WorkerPhase::Quarantined) => "quarantined",
+        (Some(AutoscalePhase::Standby), WorkerPhase::Idle) => "standby",
+        (_, WorkerPhase::Idle) => "stopped",
+    }
+}
+
 fn runtime_diagnostic(
     node: &ValidatedNodeConfig,
     slots: &[WorkerSlot],
+    supervision: &Supervision,
+) -> String {
+    let views: Vec<WorkerView> = slots.iter().map(|slot| slot.actor.view()).collect();
+    render_runtime_diagnostic(
+        node,
+        slots.iter().zip(&views).map(|(slot, view)| SlotSnapshot {
+            worker_id: slot.worker_id(),
+            config: slot
+                .actor
+                .node()
+                .worker(slot.worker_id())
+                .expect("actors are spawned for configured workers"),
+            view,
+            autoscale: slot.autoscale.as_ref(),
+        }),
+        &supervision.metrics,
+        supervision.started_at,
+    )
+}
+
+/// What diagnostics read about one worker.
+struct SlotSnapshot<'a> {
+    worker_id: &'a WorkerId,
+    config: &'a WorkerConfig,
+    view: &'a WorkerView,
+    autoscale: Option<&'a AutoscaleSlotState>,
+}
+
+fn render_runtime_diagnostic<'a>(
+    node: &ValidatedNodeConfig,
+    slots: impl Iterator<Item = SlotSnapshot<'a>>,
     metrics: &SupervisorMetrics,
     started_at: Instant,
 ) -> String {
+    let slots: Vec<SlotSnapshot<'a>> = slots.collect();
     let mut output = BoundedDiagnostic::new();
-    let running = slots.iter().filter(|slot| slot.process.is_some()).count();
-    let quarantined = slots
-        .iter()
-        .filter(|slot| slot.restart.is_quarantined())
-        .count();
-    let restart_pending = slots
-        .iter()
-        .filter(|slot| slot.process.is_none() && slot.restart_at.is_some())
-        .count();
+    let in_phase = |predicate: &dyn Fn(&WorkerView) -> bool| {
+        slots.iter().filter(|slot| predicate(slot.view)).count()
+    };
     output.push_line(&format!(
         "supervisor_status version={} node={} uptime_ms={} workers={} running={} restart_pending={} quarantined={} launch_attempts_total={} readiness_successes_total={} readiness_failures_total={} restarts_scheduled_total={} quarantines_total={} unexpected_exits_total={} exit_observation_failures_total={} stop_failures_total={} autoscale_ups_total={} autoscale_downs_total={}",
         env!("CARGO_PKG_VERSION"),
         node.config().node_id,
         started_at.elapsed().as_millis(),
         slots.len(),
-        running,
-        restart_pending,
-        quarantined,
-        metrics.launch_attempts,
-        metrics.readiness_successes,
-        metrics.readiness_failures,
-        metrics.restarts_scheduled,
-        metrics.quarantines,
-        metrics.unexpected_exits,
-        metrics.exit_observation_failures,
-        metrics.stop_failures,
-        metrics.autoscale_ups,
-        metrics.autoscale_downs,
+        in_phase(&WorkerView::is_running),
+        in_phase(&|view| matches!(view.phase, WorkerPhase::RestartPending { .. })),
+        in_phase(&|view| view.phase == WorkerPhase::Quarantined),
+        count(&metrics.launch_attempts),
+        count(&metrics.readiness_successes),
+        count(&metrics.readiness_failures),
+        count(&metrics.restarts_scheduled),
+        count(&metrics.quarantines),
+        count(&metrics.unexpected_exits),
+        count(&metrics.exit_observation_failures),
+        count(&metrics.stop_failures),
+        count(&metrics.autoscale_ups),
+        count(&metrics.autoscale_downs),
     ));
     let mut autoscale_summary: BTreeMap<String, [usize; 3]> = BTreeMap::new();
-    for slot in slots {
-        if let Some(state) = slot.autoscale.as_ref() {
+    for slot in &slots {
+        if let Some(state) = slot.autoscale {
             let entry = autoscale_summary
                 .entry(state.deployment.to_string())
                 .or_default();
             match state.phase {
                 AutoscalePhase::Standby => entry[1] += 1,
-                AutoscalePhase::Admitting | AutoscalePhase::Active => entry[0] += 1,
-                AutoscalePhase::Draining => entry[2] += 1,
+                AutoscalePhase::Admitting { .. } | AutoscalePhase::Active => entry[0] += 1,
+                AutoscalePhase::Draining { .. } => entry[2] += 1,
             }
         }
     }
@@ -1311,77 +1163,24 @@ fn runtime_diagnostic(
             "autoscale deployment={deployment} running={running_capacity} standby={standby} draining={draining}"
         ));
     }
-    for slot in slots {
-        let configured = node
-            .worker(&slot.worker_id)
-            .expect("worker slots are derived from validated configuration");
-        let (state, process_id, incarnation, assignment_source) =
-            if let Some(process) = &slot.process {
-                let transition_state = || {
-                    slot.autoscale
-                        .as_ref()
-                        .and_then(|autoscale| match autoscale.phase {
-                            AutoscalePhase::Admitting => Some("admitting"),
-                            AutoscalePhase::Draining => Some("draining"),
-                            _ => None,
-                        })
-                };
-                (
-                    transition_state().unwrap_or(if slot.exit_observation_failed {
-                        "observation-uncertain"
-                    } else {
-                        "ready"
-                    }),
-                    process
-                        .process_id()
-                        .map_or_else(|| "unavailable".to_string(), |id| id.to_string()),
-                    process.readiness().expected().incarnation_id().to_string(),
-                    "verified",
-                )
-            } else if slot.restart.is_quarantined() {
-                (
-                    "quarantined",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "configured",
-                )
-            } else if slot
-                .autoscale
-                .as_ref()
-                .is_some_and(|state| state.phase == AutoscalePhase::Standby)
-            {
-                (
-                    "standby",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "configured",
-                )
-            } else if slot.restart_at.is_some() {
-                (
-                    "restart-pending",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "configured",
-                )
-            } else {
-                (
-                    "unavailable",
-                    "none".to_string(),
-                    "none".to_string(),
-                    "configured",
-                )
-            };
+    for slot in &slots {
+        let running = slot.view.is_running();
         output.push_line(&format!(
             "worker={} state={} pid={} incarnation={} assignment_source={} backend={:?} assignment={:?} deployment={} generation={} secret=redacted",
             slot.worker_id,
-            state,
-            process_id,
-            incarnation,
-            assignment_source,
-            configured.assignment.backend(),
-            configured.assignment,
-            configured.deployment.deployment_id,
-            configured.deployment.model_generation.get(),
+            slot_state(slot.view, slot.autoscale),
+            slot.view
+                .process_id
+                .map_or_else(|| "none".to_string(), |id| id.to_string()),
+            slot.view
+                .incarnation
+                .as_ref()
+                .map_or_else(|| "none".to_string(), ToString::to_string),
+            if running { "verified" } else { "configured" },
+            slot.config.assignment.backend(),
+            slot.config.assignment,
+            slot.config.deployment.deployment_id,
+            slot.config.deployment.model_generation.get(),
         ));
     }
     output.finish()
@@ -1389,104 +1188,100 @@ fn runtime_diagnostic(
 
 /// Supervisor counters and worker-state gauges in the Prometheus text format.
 /// Only events change it, so it is rewritten only when it differs.
-fn supervisor_prometheus(
-    slots: &[WorkerSlot],
-    replacement_slots: &[WorkerSlot],
-    metrics: &SupervisorMetrics,
-) -> String {
+fn supervisor_prometheus(slots: &[WorkerSlot], metrics: &SupervisorMetrics) -> String {
     use std::fmt::Write as _;
+    let views: Vec<WorkerView> = slots.iter().map(|slot| slot.actor.view()).collect();
     let mut output = String::new();
     let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
         let _ = writeln!(output, "# HELP {name} {help}");
         let _ = writeln!(output, "# TYPE {name} {kind}");
         let _ = writeln!(output, "{name} {value}");
     };
-    let all = || slots.iter().chain(replacement_slots);
-    let count = |predicate: &dyn Fn(&WorkerSlot) -> bool| {
-        all().filter(|slot| predicate(slot)).count() as u64
+    let in_phase = |predicate: &dyn Fn(&WorkerView) -> bool| {
+        views.iter().filter(|view| predicate(view)).count() as u64
     };
     metric(
         "izwi_supervisor_workers",
         "gauge",
         "Configured worker slots.",
-        all().count() as u64,
+        views.len() as u64,
     );
     metric(
         "izwi_supervisor_workers_running",
         "gauge",
         "Worker slots with a ready process.",
-        count(&|slot| slot.process.is_some()),
+        in_phase(&WorkerView::is_running),
     );
     metric(
         "izwi_supervisor_workers_quarantined",
         "gauge",
         "Worker slots quarantined after exhausting their restart budget.",
-        count(&|slot| slot.restart.is_quarantined()),
+        in_phase(&|view| view.phase == WorkerPhase::Quarantined),
     );
     metric(
         "izwi_supervisor_workers_restart_pending",
         "gauge",
         "Worker slots waiting for a scheduled restart.",
-        count(&|slot| slot.process.is_none() && slot.restart_at.is_some()),
+        in_phase(&|view| matches!(view.phase, WorkerPhase::RestartPending { .. })),
     );
     for (name, help, value) in [
         (
             "izwi_supervisor_launch_attempts_total",
             "Worker launch attempts.",
-            metrics.launch_attempts,
+            &metrics.launch_attempts,
         ),
         (
             "izwi_supervisor_readiness_failures_total",
             "Launches that failed readiness.",
-            metrics.readiness_failures,
+            &metrics.readiness_failures,
         ),
         (
             "izwi_supervisor_restarts_scheduled_total",
             "Worker restarts scheduled.",
-            metrics.restarts_scheduled,
+            &metrics.restarts_scheduled,
         ),
         (
             "izwi_supervisor_quarantines_total",
             "Workers quarantined.",
-            metrics.quarantines,
+            &metrics.quarantines,
         ),
         (
             "izwi_supervisor_unexpected_exits_total",
             "Workers that exited unexpectedly.",
-            metrics.unexpected_exits,
+            &metrics.unexpected_exits,
         ),
         (
             "izwi_supervisor_stop_failures_total",
             "Worker stops that failed.",
-            metrics.stop_failures,
+            &metrics.stop_failures,
         ),
         (
             "izwi_supervisor_autoscale_ups_total",
             "Autoscaling scale-ups.",
-            metrics.autoscale_ups,
+            &metrics.autoscale_ups,
         ),
         (
             "izwi_supervisor_autoscale_downs_total",
             "Autoscaling scale-downs.",
-            metrics.autoscale_downs,
+            &metrics.autoscale_downs,
         ),
         (
             "izwi_supervisor_rollouts_committed_total",
             "Rollouts committed.",
-            metrics.rollouts_committed,
+            &metrics.rollouts_committed,
         ),
         (
             "izwi_supervisor_rollouts_aborted_total",
             "Rollouts aborted cleanly.",
-            metrics.rollouts_aborted,
+            &metrics.rollouts_aborted,
         ),
         (
             "izwi_supervisor_rollouts_degraded_total",
             "Rollout aborts that could not restore the approvals.",
-            metrics.rollouts_degraded,
+            &metrics.rollouts_degraded,
         ),
     ] {
-        metric(name, "counter", help, value);
+        metric(name, "counter", help, count(value));
     }
     output
 }
@@ -1542,190 +1337,35 @@ impl BoundedDiagnostic {
     }
 }
 
-async fn launch_slot(
-    node: &ValidatedNodeConfig,
-    locks: &LockNamespace,
-    inherited_environment: &BTreeMap<OsString, OsString>,
-    slot: &mut WorkerSlot,
-    shutdown: &mut watch::Receiver<bool>,
-    supervisor_started_at: Instant,
-    metrics: &mut SupervisorMetrics,
-) {
-    metrics.launch_attempts = metrics.launch_attempts.saturating_add(1);
-    slot.restart_at = None;
-    let incarnation = IncarnationId::new(uuid::Uuid::new_v4().simple().to_string())
-        .expect("UUID incarnation is a valid bounded identity");
-    let worker = node
-        .worker(&slot.worker_id)
-        .expect("worker slots are derived from the validated node");
-    let worker_locks = WorkerLockPaths::for_worker(locks, &slot.worker_id, &worker.assignment);
-    let spec = match build_child_launch_spec(
-        node,
-        &slot.worker_id,
-        &incarnation,
-        &slot.secret_environment_name,
-        &slot.secret,
-        inherited_environment,
-        &worker_locks,
-    ) {
-        Ok(spec) => spec,
-        Err(error) => {
-            warn!(
-                "worker {} launch specification failed: {error}",
-                slot.worker_id
-            );
-            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
-            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
-            return;
-        }
-    };
-    let expected = match izwi_serving_supervisor::ExpectedWorkerIdentity::from_config(
-        node,
-        &slot.worker_id,
-        incarnation,
-    ) {
-        Ok(expected) => expected,
-        Err(error) => {
-            warn!("worker {} identity setup failed: {error}", slot.worker_id);
-            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
-            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
-            return;
-        }
-    };
-    let credentials = ServiceCredentials {
-        credential_id: worker.credential_id.clone(),
-        bearer_token: slot.secret.bearer_token.clone(),
-    };
-    let mut process = match SupervisedWorker::spawn(
-        &spec,
-        expected,
-        credentials,
-        WorkerClientConfig::default(),
-    ) {
-        Ok(process) => process,
-        Err(error) => {
-            warn!("worker {} spawn failed: {error}", slot.worker_id);
-            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
-            slot.record_failure(supervisor_started_at, Duration::ZERO, metrics);
-            return;
-        }
-    };
-    let process_started_at = Instant::now();
-    let readiness = tokio::select! {
-        result = process.wait_until_ready(&node.config().readiness) => Some(result),
-        changed = shutdown.changed() => {
-            let _ = changed;
-            None
-        }
-    };
-    match readiness {
-        Some(Ok(_)) => {
-            metrics.readiness_successes = metrics.readiness_successes.saturating_add(1);
-            info!(
-                "worker {} ready as incarnation {}",
-                slot.worker_id,
-                process.readiness().expected().incarnation_id()
-            );
-            slot.process = Some(process);
-            slot.process_started_at = Some(process_started_at);
-            slot.exit_observation_failed = false;
-        }
-        Some(Err(error)) => {
-            metrics.readiness_failures = metrics.readiness_failures.saturating_add(1);
-            warn!("worker {} failed readiness: {error}", slot.worker_id);
-            if let Err(stop_error) = process.drain_and_stop(&node.config().shutdown).await {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker {} cleanup failed: {stop_error}", slot.worker_id);
-            }
-            slot.record_failure(supervisor_started_at, process_started_at.elapsed(), metrics);
-        }
-        None => {
-            if let Err(error) = process.drain_and_stop(&node.config().shutdown).await {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker {} shutdown cleanup failed: {error}", slot.worker_id);
-            }
-        }
-    }
-}
-
-fn observe_exits(
-    slots: &mut [WorkerSlot],
-    mut autoscaler: Option<&mut Autoscaler>,
-    supervisor_started_at: Instant,
-    metrics: &mut SupervisorMetrics,
-) {
-    for slot in slots {
-        let Some(process) = slot.process.as_mut() else {
+/// Keeps the autoscaler's running set in step with the actors: a crash of a
+/// restart-managed worker leaves it, a relaunch that reached readiness
+/// rejoins it, and a scale-down drain that ended returns its slot to the
+/// standby pool.
+fn sync_autoscaler(autoscaler: &mut Autoscaler, slots: &mut [WorkerSlot]) {
+    for slot in slots.iter_mut() {
+        let view = slot.actor.view();
+        let worker = slot.worker_id().clone();
+        let Some(state) = autoscaler.deployment_of_mut(&worker) else {
             continue;
         };
-        match process.try_wait() {
-            Ok(Some(status)) => {
-                if slot
-                    .autoscale
-                    .as_ref()
-                    .is_some_and(|state| state.phase == AutoscalePhase::Draining)
-                {
-                    // Expected completion of a scale-down: admission had
-                    // stopped, the worker finished its bounded shutdown on
-                    // its own, and the slot returns to the standby pool.
-                    slot.process = None;
-                    slot.process_started_at = None;
-                    slot.exit_observation_failed = false;
-                    if let Some(state) = slot.autoscale.as_mut() {
-                        state.phase = AutoscalePhase::Standby;
-                    }
-                    if let Some(state) = autoscaler
-                        .as_mut()
-                        .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
-                    {
-                        state.note_stopped();
-                    }
-                    info!(
-                        "autoscaling: draining worker {} exited cleanly ({status}); slot returned to standby",
-                        slot.worker_id
-                    );
-                    continue;
-                }
-                metrics.unexpected_exits = metrics.unexpected_exits.saturating_add(1);
-                warn!("worker {} exited with {status}", slot.worker_id);
-                let uptime = slot
-                    .process_started_at
-                    .map_or(Duration::ZERO, |started| started.elapsed());
-                slot.record_failure(supervisor_started_at, uptime, metrics);
-                if let Some(state) = autoscaler
-                    .as_mut()
-                    .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
-                {
-                    state.note_worker_lost(&slot.worker_id);
-                }
-            }
-            Ok(None) => slot.exit_observation_failed = false,
-            Err(error) => {
-                if !slot.exit_observation_failed {
-                    metrics.exit_observation_failures =
-                        metrics.exit_observation_failures.saturating_add(1);
-                    warn!("worker {} exit observation failed: {error}", slot.worker_id);
-                    slot.exit_observation_failed = true;
-                }
-                // A failed observation does not prove the process exited. Retain
-                // ownership and do not schedule a replacement until exit is known.
+        if slot.restart_managed() {
+            if view.ready_launches > slot.seen_ready_launches && view.phase == WorkerPhase::Ready {
+                state.note_launched(&worker);
+            } else if slot.was_running && !view.is_running() {
+                state.note_worker_lost(&worker);
             }
         }
-    }
-}
-
-/// Driver confirmation after any successful launch of a slot that belongs to
-/// an autoscaled deployment (startup min set, canary ordering, or crash
-/// restart): the state machine counts it toward running capacity.
-fn note_slot_launched(autoscaler: &mut Option<Autoscaler>, slot: &WorkerSlot) {
-    if slot.process.is_none() {
-        return;
-    }
-    if let Some(state) = autoscaler
-        .as_mut()
-        .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
-    {
-        state.note_launched(&slot.worker_id);
+        slot.seen_ready_launches = view.ready_launches;
+        slot.was_running = view.is_running();
+        if let Some(autoscale) = slot.autoscale.as_mut() {
+            if matches!(autoscale.phase, AutoscalePhase::Draining { .. })
+                && view.phase == WorkerPhase::Idle
+            {
+                autoscale.phase = AutoscalePhase::Standby;
+                state.note_stopped();
+                info!("autoscaling: draining worker {worker} exited cleanly; slot returned to standby");
+            }
+        }
     }
 }
 
@@ -1733,27 +1373,24 @@ fn note_slot_launched(autoscaler: &mut Option<Autoscaler>, slot: &WorkerSlot) {
 /// the running workers of each deployment, then act on at most one scale
 /// decision per deployment. Every step is conservative — a failed approvals
 /// write, a failed status poll, or a launch in flight freezes that
-/// deployment's decisions until the state is consistent again.
-#[allow(clippy::too_many_arguments)]
+/// deployment's decisions until the state is consistent again. Nothing here
+/// waits for a launch: the actors run them.
 async fn run_autoscale_tick(
     autoscaler: &mut Autoscaler,
     node: &ValidatedNodeConfig,
     slots: &mut [WorkerSlot],
-    locks: &LockNamespace,
-    inherited_environment: &BTreeMap<OsString, OsString>,
-    shutdown: &mut watch::Receiver<bool>,
-    supervisor_started_at: Instant,
-    metrics: &mut SupervisorMetrics,
+    supervision: &Supervision,
 ) {
     let Some(autoscaling) = node.config().autoscaling.as_ref() else {
         return;
     };
     let approvals_path = autoscaling.shared_approvals_path.clone();
+    let metrics = &supervision.metrics;
     let deployment_ids: Vec<DeploymentId> = autoscaler.deployments().keys().cloned().collect();
     for deployment_id in deployment_ids {
         // Monotonic scale-event time: a wall-clock step or a desktop sleep
         // must not open or close a stabilization window.
-        let now_ms = monotonic_ms(supervisor_started_at);
+        let now_ms = monotonic_ms(supervision.started_at);
         if !admit_pending_workers(
             autoscaler,
             &approvals_path,
@@ -1775,49 +1412,85 @@ async fn run_autoscale_tick(
         else {
             continue;
         };
+        let now_ms = monotonic_ms(supervision.started_at);
         let decision = autoscaler
             .deployment_mut(&deployment_id)
             .expect("deployment ids come from the autoscaler")
-            .evaluate(monotonic_ms(supervisor_started_at), &observation);
+            .evaluate(now_ms, &observation);
+        let Some(slot) = (match &decision {
+            ScaleDecision::NoAction => None,
+            ScaleDecision::ScaleUp { worker }
+            | ScaleDecision::MarkDraining { worker }
+            | ScaleDecision::StopDrained { worker } => {
+                slots.iter_mut().find(|slot| slot.worker_id() == worker)
+            }
+        }) else {
+            continue;
+        };
         match decision {
             ScaleDecision::NoAction => {}
             ScaleDecision::ScaleUp { worker } => {
-                scale_up(
-                    node,
-                    &deployment_id,
-                    slots,
-                    locks,
-                    inherited_environment,
-                    shutdown,
-                    supervisor_started_at,
-                    metrics,
-                    worker,
-                )
-                .await;
+                info!(
+                    "autoscaling: deployment {deployment_id} scaled up; launching standby {worker}"
+                );
+                slot.autoscale = Some(AutoscaleSlotState {
+                    deployment: deployment_id.clone(),
+                    phase: AutoscalePhase::Admitting {
+                        since: slot.actor.view().launch_counts(),
+                    },
+                });
+                slot.actor.start();
             }
             ScaleDecision::MarkDraining { worker } => {
-                mark_draining(
-                    autoscaler,
-                    node,
-                    &deployment_id,
-                    &approvals_path,
-                    slots,
-                    monotonic_ms(supervisor_started_at),
-                    metrics,
-                    worker,
-                )
-                .await;
+                // Remove the worker's approvals line (the gateway stops
+                // routing new work after its view refresh) and close its
+                // ownership pipe so it stops admission at once, covering the
+                // gateway's refresh gap.
+                if let Err(error) = autoscale::remove_worker(&approvals_path, node, &worker) {
+                    warn!(
+                        "autoscaling: could not unapprove worker {worker}: {error}; retrying next evaluation"
+                    );
+                    continue;
+                }
+                slot.actor.begin_drain();
+                slot.autoscale = Some(AutoscaleSlotState {
+                    deployment: deployment_id.clone(),
+                    phase: AutoscalePhase::Draining {
+                        stop_requested: false,
+                    },
+                });
+                autoscaler
+                    .deployment_mut(&deployment_id)
+                    .expect("deployment ids come from the autoscaler")
+                    .note_draining(now_ms, &worker);
+                bump(&metrics.autoscale_downs);
+                info!(
+                    "autoscaling: worker {worker} marked draining; waiting for zero active work before stopping it"
+                );
             }
             ScaleDecision::StopDrained { worker } => {
-                stop_drained(autoscaler, node, &deployment_id, slots, metrics, worker).await;
+                // The worker is fully quiet: stop it. Its slot returns to the
+                // standby pool once the actor reports it gone.
+                if let Some(AutoscaleSlotState {
+                    phase: AutoscalePhase::Draining { stop_requested },
+                    ..
+                }) = slot.autoscale.as_mut()
+                {
+                    if !*stop_requested {
+                        *stop_requested = true;
+                        drop(slot.actor.request_stop());
+                        info!("autoscaling: worker {worker} drained; stopping it");
+                    }
+                }
             }
         }
     }
 }
 
-/// Publishes approvals lines for slots that finished scale-up readiness but
-/// are not yet admitted. Returns false while any publication is outstanding
-/// so the deployment defers further decisions.
+/// Publishes approvals lines for scale-ups whose launch reached readiness,
+/// and returns failed scale-ups to the standby pool. Returns false while a
+/// scale-up is still launching or a publication failed, so the deployment
+/// defers further decisions.
 fn admit_pending_workers(
     autoscaler: &mut Autoscaler,
     approvals_path: &Path,
@@ -1825,46 +1498,63 @@ fn admit_pending_workers(
     deployment_id: &DeploymentId,
     slots: &mut [WorkerSlot],
     now_ms: u64,
-    metrics: &mut SupervisorMetrics,
+    metrics: &SupervisorMetrics,
 ) -> bool {
-    let pending: Vec<WorkerId> = slots
-        .iter()
-        .filter(|slot| {
-            slot.autoscale.as_ref().is_some_and(|state| {
-                &state.deployment == deployment_id && state.phase == AutoscalePhase::Admitting
-            })
-        })
-        .map(|slot| slot.worker_id.clone())
-        .collect();
-    let mut all_admitted = true;
-    for worker in pending {
-        match autoscale::add_worker(approvals_path, node, &worker) {
-            Ok(()) => {
-                if let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) {
-                    if let Some(state) = slot.autoscale.as_mut() {
-                        state.phase = AutoscalePhase::Active;
+    let mut settled = true;
+    for slot in slots.iter_mut() {
+        let Some(AutoscaleSlotState {
+            deployment,
+            phase: AutoscalePhase::Admitting { since },
+        }) = slot.autoscale.clone()
+        else {
+            continue;
+        };
+        if &deployment != deployment_id {
+            continue;
+        }
+        let worker = slot.worker_id().clone();
+        let view = slot.actor.view();
+        if view.ready_launches > since.ready && view.phase == WorkerPhase::Ready {
+            match autoscale::add_worker(approvals_path, node, &worker) {
+                Ok(()) => {
+                    slot.autoscale = Some(AutoscaleSlotState {
+                        deployment,
+                        phase: AutoscalePhase::Active,
+                    });
+                    slot.seen_ready_launches = view.ready_launches;
+                    slot.was_running = true;
+                    if let Some(state) = autoscaler.deployment_mut(deployment_id) {
+                        state.note_scaled_up(now_ms, &worker);
                     }
+                    bump(&metrics.autoscale_ups);
+                    info!("autoscaling: worker {worker} is ready and approved; scale-up complete");
                 }
-                if let Some(state) = autoscaler.deployment_mut(deployment_id) {
-                    state.note_scaled_up(now_ms, &worker);
+                Err(error) => {
+                    warn!(
+                        "autoscaling: approvals publish for worker {worker} failed: {error}; retrying next evaluation"
+                    );
+                    settled = false;
                 }
-                metrics.autoscale_ups = metrics.autoscale_ups.saturating_add(1);
-                info!("autoscaling: worker {worker} is ready and approved; scale-up complete");
             }
-            Err(error) => {
-                warn!(
-                    "autoscaling: approvals publish for worker {worker} failed: {error}; retrying next evaluation"
-                );
-                all_admitted = false;
+        } else if view.failed_launches > since.failed {
+            // Cancel the restart the actor scheduled: a standby only runs
+            // on a scale-up decision.
+            drop(slot.actor.request_stop());
+            slot.autoscale = Some(AutoscaleSlotState::standby(deployment));
+            if let Some(state) = autoscaler.deployment_mut(deployment_id) {
+                state.note_launch_abandoned(&worker);
             }
+            warn!("autoscaling: standby {worker} failed its launch; it remains standby");
+        } else {
+            settled = false;
         }
     }
-    all_admitted
+    settled
 }
 
 /// Polls the status of every running worker of a deployment. `None` means
-/// the deployment is not fully observable this tick (a launch in flight, a
-/// restart pending, a failed or timed-out poll) and must make no decisions.
+/// the deployment is not fully observable this tick (a restart pending, a
+/// failed or timed-out poll) and must make no decisions.
 async fn poll_deployment(
     autoscaler: &Autoscaler,
     slots: &[WorkerSlot],
@@ -1872,21 +1562,22 @@ async fn poll_deployment(
     poll_budget: Duration,
 ) -> Option<DeploymentObservation> {
     let state = autoscaler.deployment(deployment_id)?;
-    if let Some(slot) = slots
-        .iter()
-        .find(|slot| state.worker_order().contains(&slot.worker_id) && slot.restart_pending())
-    {
+    if let Some(slot) = slots.iter().find(|slot| {
+        state.worker_order().contains(slot.worker_id())
+            && slot.restart_managed()
+            && slot.actor.view().is_restarting()
+    }) {
         debug!(
             "autoscaling: deployment {deployment_id} holds its decisions while worker {} is restart-pending",
-            slot.worker_id
+            slot.worker_id()
         );
         return None;
     }
     let mut observation = DeploymentObservation::default();
     for worker in state.active() {
-        let slot = slots.iter().find(|slot| &slot.worker_id == worker)?;
-        let process = slot.process.as_ref()?;
-        let status = match tokio::time::timeout(poll_budget, process.client().status()).await {
+        let slot = slots.iter().find(|slot| slot.worker_id() == worker)?;
+        let client = slot.actor.view().client?;
+        let status = match tokio::time::timeout(poll_budget, client.status()).await {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
                 warn!("autoscaling: worker {worker} status poll failed: {error}");
@@ -1907,177 +1598,6 @@ async fn poll_deployment(
         );
     }
     Some(observation)
-}
-
-/// Scale-up: launch the standby through the existing launch/readiness path. Readiness is awaited inline (as the
-/// startup and canary paths do); the approvals line is published on the
-/// next evaluation pass (Admitting phase).
-#[allow(clippy::too_many_arguments)]
-async fn scale_up(
-    node: &ValidatedNodeConfig,
-    deployment_id: &DeploymentId,
-    slots: &mut [WorkerSlot],
-    locks: &LockNamespace,
-    inherited_environment: &BTreeMap<OsString, OsString>,
-    shutdown: &mut watch::Receiver<bool>,
-    supervisor_started_at: Instant,
-    metrics: &mut SupervisorMetrics,
-    worker: WorkerId,
-) {
-    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
-        warn!("autoscaling: scale-up candidate {worker} has no slot; abandoned");
-        return;
-    };
-    slot.restart_at = None;
-    slot.autoscale = Some(AutoscaleSlotState {
-        deployment: deployment_id.clone(),
-        phase: AutoscalePhase::Admitting,
-    });
-    info!("autoscaling: deployment {deployment_id} scaled up; launching standby {worker}");
-    launch_slot(
-        node,
-        locks,
-        inherited_environment,
-        slot,
-        shutdown,
-        supervisor_started_at,
-        metrics,
-    )
-    .await;
-    if slot.process.is_none() {
-        slot.autoscale = Some(AutoscaleSlotState {
-            deployment: deployment_id.clone(),
-            phase: AutoscalePhase::Standby,
-        });
-        warn!("autoscaling: standby {worker} failed its launch; it remains standby");
-    }
-}
-
-/// Scale-down step 1: remove the worker's approvals line (the gateway stops
-/// routing new work after its view refresh) and close the ownership pipe so
-/// the worker stops admission immediately, covering the gateway's refresh
-/// TTL gap.
-#[allow(clippy::too_many_arguments)]
-async fn mark_draining(
-    autoscaler: &mut Autoscaler,
-    node: &ValidatedNodeConfig,
-    deployment_id: &DeploymentId,
-    approvals_path: &Path,
-    slots: &mut [WorkerSlot],
-    now_ms: u64,
-    metrics: &mut SupervisorMetrics,
-    worker: WorkerId,
-) {
-    if let Err(error) = autoscale::remove_worker(approvals_path, node, &worker) {
-        warn!(
-            "autoscaling: could not unapprove worker {worker}: {error}; retrying next evaluation"
-        );
-        return;
-    }
-    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
-        return;
-    };
-    if let Some(process) = slot.process.as_mut() {
-        if let Err(error) = process.begin_drain().await {
-            warn!("autoscaling: worker {worker} admission stop failed: {error}");
-        }
-    }
-    slot.autoscale = Some(AutoscaleSlotState {
-        deployment: deployment_id.clone(),
-        phase: AutoscalePhase::Draining,
-    });
-    autoscaler
-        .deployment_mut(deployment_id)
-        .expect("deployment ids come from the autoscaler")
-        .note_draining(now_ms, &worker);
-    metrics.autoscale_downs = metrics.autoscale_downs.saturating_add(1);
-    info!(
-        "autoscaling: worker {worker} marked draining; waiting for zero active work before stopping it"
-    );
-}
-
-/// Scale-down step 2: the worker is fully quiet — stop it via the existing
-/// drain_and_stop path (mostly-immediate cooperative stop) and return the
-/// slot to the standby pool.
-async fn stop_drained(
-    autoscaler: &mut Autoscaler,
-    node: &ValidatedNodeConfig,
-    deployment_id: &DeploymentId,
-    slots: &mut [WorkerSlot],
-    metrics: &mut SupervisorMetrics,
-    worker: WorkerId,
-) {
-    let Some(slot) = slots.iter_mut().find(|slot| slot.worker_id == worker) else {
-        return;
-    };
-    if let Some(process) = slot.process.take() {
-        match process
-            .drain_and_stop(&node.config().shutdown.clone())
-            .await
-        {
-            Ok(report) => info!(
-                "autoscaling: worker {worker} stopped with {:?} ({})",
-                report.outcome, report.exit_status
-            ),
-            Err(error) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("autoscaling: worker {worker} stop failed: {error}");
-            }
-        }
-    }
-    slot.process_started_at = None;
-    slot.autoscale = Some(AutoscaleSlotState {
-        deployment: deployment_id.clone(),
-        phase: AutoscalePhase::Standby,
-    });
-    autoscaler
-        .deployment_mut(deployment_id)
-        .expect("deployment ids come from the autoscaler")
-        .note_stopped();
-    info!(
-        "autoscaling: worker {worker} drained and stopped; the slot returned to the standby pool"
-    );
-}
-
-fn next_restart_slot(slots: &mut [WorkerSlot]) -> Option<&mut WorkerSlot> {
-    let index = slots
-        .iter()
-        .enumerate()
-        .filter(|(_, slot)| slot.restart_due())
-        .min_by_key(|(_, slot)| slot.restart_at.expect("restart-ready slot has a deadline"))
-        .map(|(index, _)| index)?;
-    slots.get_mut(index)
-}
-
-async fn drain_all(
-    slots: Vec<WorkerSlot>,
-    policy: izwi_serving_supervisor::ShutdownPolicy,
-    metrics: &mut SupervisorMetrics,
-) {
-    let mut drains = JoinSet::new();
-    for slot in slots {
-        if let Some(process) = slot.process {
-            let worker_id = slot.worker_id;
-            let policy = policy.clone();
-            drains.spawn(async move { (worker_id, process.drain_and_stop(&policy).await) });
-        }
-    }
-    while let Some(result) = drains.join_next().await {
-        match result {
-            Ok((worker_id, Ok(report))) => info!(
-                "worker {worker_id} stopped with {:?} ({})",
-                report.outcome, report.exit_status
-            ),
-            Ok((worker_id, Err(error))) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker {worker_id} shutdown failed: {error}")
-            }
-            Err(error) => {
-                metrics.stop_failures = metrics.stop_failures.saturating_add(1);
-                warn!("worker shutdown task failed: {error}")
-            }
-        }
-    }
 }
 
 /// Every binary flavor referenced by the node configuration must have an
@@ -2683,28 +2203,34 @@ mod tests {
             },
         )]);
         let node = config.validate(&inventory, &binaries).unwrap();
-        let slot = WorkerSlot {
-            worker_id: id("worker-a"),
-            secret_environment_name: "WORKER_TOKEN".into(),
-            secret: ResolvedWorkerSecret {
-                bearer_token: ServiceBearerToken::new("private-worker-secret").unwrap(),
-            },
-            restart: RestartController::for_worker(&node, &id("worker-a")).unwrap(),
-            process: None,
-            process_started_at: None,
-            restart_at: Some(Instant::now()),
+        let view = WorkerView {
+            phase: WorkerPhase::RestartPending { at: Instant::now() },
+            ready_launches: 1,
+            failed_launches: 1,
+            process_id: None,
+            incarnation: None,
+            client: None,
             exit_observation_failed: false,
+        };
+        let metrics = SupervisorMetrics::default();
+        for (counter, value) in [
+            (&metrics.launch_attempts, 2),
+            (&metrics.readiness_successes, 1),
+            (&metrics.readiness_failures, 1),
+            (&metrics.restarts_scheduled, 1),
+        ] {
+            counter.store(value, std::sync::atomic::Ordering::Relaxed);
+        }
+        let worker_id = id("worker-a");
+        let snapshot = SlotSnapshot {
+            worker_id: &worker_id,
+            config: node.worker(&worker_id).unwrap(),
+            view: &view,
             autoscale: None,
         };
-        let metrics = SupervisorMetrics {
-            launch_attempts: 2,
-            readiness_successes: 1,
-            readiness_failures: 1,
-            restarts_scheduled: 1,
-            ..SupervisorMetrics::default()
-        };
 
-        let diagnostic = runtime_diagnostic(&node, &[slot], &metrics, Instant::now());
+        let diagnostic =
+            render_runtime_diagnostic(&node, std::iter::once(snapshot), &metrics, Instant::now());
 
         assert!(diagnostic.len() <= MAX_DIAGNOSTIC_RESPONSE_BYTES);
         assert!(diagnostic.contains("supervisor_status"));
