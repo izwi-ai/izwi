@@ -404,8 +404,69 @@ struct RegistryInner {
     workers: BTreeMap<WorkerInstanceKey, WorkerRecord>,
     active_incarnations: BTreeMap<WorkerId, IncarnationId>,
     dispatches: BTreeMap<u64, LocalDispatchRecord>,
+    /// Per-worker index of `dispatches`, so selection and status
+    /// reconciliation touch only one worker's dispatches.
+    worker_dispatches: BTreeMap<WorkerInstanceKey, WorkerDispatches>,
     next_dispatch_id: u64,
     generation_gate: Option<EligibleGenerationGate>,
+}
+
+#[derive(Default)]
+struct WorkerDispatches {
+    ids: BTreeSet<u64>,
+    /// Dispatches not yet `Reconciled` by a newer status.
+    unreconciled: usize,
+}
+
+impl RegistryInner {
+    fn insert_dispatch(&mut self, dispatch_id: u64, worker: WorkerInstanceKey) {
+        let index = self.worker_dispatches.entry(worker.clone()).or_default();
+        index.ids.insert(dispatch_id);
+        index.unreconciled += 1;
+        self.dispatches.insert(
+            dispatch_id,
+            LocalDispatchRecord {
+                worker,
+                state: LocalDispatchState::Dispatched,
+            },
+        );
+    }
+
+    fn remove_dispatch(&mut self, dispatch_id: u64) {
+        let Some(record) = self.dispatches.remove(&dispatch_id) else {
+            return;
+        };
+        let Some(index) = self.worker_dispatches.get_mut(&record.worker) else {
+            return;
+        };
+        index.ids.remove(&dispatch_id);
+        if record.state != LocalDispatchState::Reconciled {
+            index.unreconciled -= 1;
+        }
+        if index.ids.is_empty() {
+            self.worker_dispatches.remove(&record.worker);
+        }
+    }
+
+    /// Marks this worker's accepted dispatches reconciled once a status newer
+    /// than their acceptance arrives.
+    fn reconcile_dispatches(&mut self, worker: &WorkerInstanceKey, sequence: u64) {
+        let Some(index) = self.worker_dispatches.get_mut(worker) else {
+            return;
+        };
+        for dispatch_id in &index.ids {
+            let dispatch = self
+                .dispatches
+                .get_mut(dispatch_id)
+                .expect("indexed dispatch is tracked");
+            if let LocalDispatchState::AcceptedAfter { status_sequence } = dispatch.state {
+                if sequence > status_sequence {
+                    dispatch.state = LocalDispatchState::Reconciled;
+                    index.unreconciled -= 1;
+                }
+            }
+        }
+    }
 }
 
 struct WorkerRecord {
@@ -455,6 +516,7 @@ impl WorkerRegistry {
                 workers: BTreeMap::new(),
                 active_incarnations: BTreeMap::new(),
                 dispatches: BTreeMap::new(),
+                worker_dispatches: BTreeMap::new(),
                 next_dispatch_id: 1,
                 generation_gate: None,
             })),
@@ -555,16 +617,7 @@ impl WorkerRegistry {
             received_at,
         });
 
-        for dispatch in inner.dispatches.values_mut() {
-            if dispatch.worker != key {
-                continue;
-            }
-            if let LocalDispatchState::AcceptedAfter { status_sequence } = dispatch.state {
-                if sequence > status_sequence {
-                    dispatch.state = LocalDispatchState::Reconciled;
-                }
-            }
-        }
+        inner.reconcile_dispatches(&key, sequence);
         Ok(())
     }
 
@@ -910,13 +963,7 @@ impl WorkerRegistry {
         let deployment_id = deployment.deployment_id.clone();
         let model_generation = deployment.model_generation;
         let dispatch_id = next_dispatch_id(&mut inner);
-        inner.dispatches.insert(
-            dispatch_id,
-            LocalDispatchRecord {
-                worker: key.clone(),
-                state: LocalDispatchState::Dispatched,
-            },
-        );
+        inner.insert_dispatch(dispatch_id, key.clone());
 
         Ok(SelectedWorker {
             key: key.clone(),
@@ -1050,7 +1097,7 @@ impl Drop for LocalDispatchGuard {
             return;
         };
         let mut inner = lock_recover(&registry);
-        inner.dispatches.remove(&self.dispatch_id);
+        inner.remove_dispatch(self.dispatch_id);
         if self.circuit_probe
             && inner.active_incarnations.get(&self.worker.worker_id)
                 == Some(&self.worker.incarnation_id)
@@ -1329,12 +1376,9 @@ fn observed_credit_available(
 
 fn unreconciled_dispatches(inner: &RegistryInner, worker: &WorkerInstanceKey) -> usize {
     inner
-        .dispatches
-        .values()
-        .filter(|dispatch| {
-            dispatch.worker == *worker && dispatch.state != LocalDispatchState::Reconciled
-        })
-        .count()
+        .worker_dispatches
+        .get(worker)
+        .map_or(0, |index| index.unreconciled)
 }
 
 fn next_dispatch_id(inner: &mut RegistryInner) -> u64 {
@@ -2651,6 +2695,14 @@ mod tests {
             .select_and_reserve_at(&selection(), now + Duration::from_millis(1))
             .unwrap();
         assert_eq!(reconciled.key.worker_id.as_str(), "worker-b");
+
+        // Releasing reconciled and unreconciled dispatches empties the
+        // per-worker index exactly.
+        drop(first);
+        drop(reconciled);
+        let inner = lock_recover(&registry.inner);
+        assert!(inner.dispatches.is_empty());
+        assert!(inner.worker_dispatches.is_empty());
     }
 
     #[test]
