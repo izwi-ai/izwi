@@ -160,7 +160,7 @@ jobs:
           -p izwi-serving-client
 
   fleet-stores:
-    name: Fleet Store Validation (PostgreSQL)
+    name: Store Validation (PostgreSQL)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -182,6 +182,7 @@ jobs:
     env:
       IZWI_TEST_FLEET_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_test
       IZWI_TEST_FLEET_RIG_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_fleet_rig
+      IZWI_TEST_STORE_PG_URL: postgres://izwi:izwi@localhost:5432/izwi_store_test
 
     steps:
       - name: Checkout
@@ -203,9 +204,10 @@ jobs:
           workspaces: |
             . -> target
 
-      - name: Create the fleet rig database
+      - name: Create the fleet rig and store suite databases
         run: |
           PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_fleet_rig"
+          PGPASSWORD=izwi psql -h localhost -U izwi -d postgres -c "CREATE DATABASE izwi_store_test"
 
       - name: Run fleet store validation
         run: scripts/ci/check-backend-truth.sh cargo-fleet-stores

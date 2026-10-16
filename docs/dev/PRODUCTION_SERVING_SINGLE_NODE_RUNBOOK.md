@@ -653,6 +653,41 @@ Operators of a provider-managed schema must create that table (`quota_kind`,
 row), seed it the same way, and add `runtime_jobs.replay_swept_at INTEGER
 NULL` before upgrading.
 
+### The durable store on PostgreSQL
+
+Release and Docker builds of `izwi-server` include PostgreSQL support (with
+TLS, for example `?sslmode=require`): set
+`IZWI_DATABASE_URL=postgres://user:pass@host:5432/izwi` instead of a SQLite
+path. An enterprise database hook may choose Izwi-managed or provider-managed
+migrations on PostgreSQL. Every node that shares the database runs its own
+batch worker:
+
+- **Migrations** are versioned in `schema_migrations` (component, version).
+  Each boot applies the pending ones in one transaction under a PostgreSQL
+  advisory lock, so nodes starting together apply each migration once. A
+  database an earlier unversioned release created upgrades in place.
+- **Claims** take one stage per statement with `FOR UPDATE SKIP LOCKED`, so
+  workers on several nodes take different stages instead of queueing on one
+  row. A stage enqueued on a node wakes that node's idle worker slots at
+  once; other nodes pick it up within `idle_poll_interval` (1 s).
+- **Time**: leases, retry delays and retention cutoffs use the database
+  server's clock (read every 30 s and advanced locally in between), so clock
+  skew between nodes cannot expire a live lease early.
+
+For a provider-managed schema, `docs/dev/postgres-schema.sql` is the full
+application schema, generated from the migrator: apply it to an empty schema
+and Izwi finds every migration recorded. The PostgreSQL CI lane applies it and
+checks it against a migrated database.
+
+To run the store suite locally against a disposable database (each test
+creates its own schema in it):
+
+```
+createdb izwi_store_test
+IZWI_TEST_STORE_PG_URL=postgres://$(whoami)@localhost/izwi_store_test \
+  cargo test -p izwi-server --features db-postgres --lib -- batch_runtime::store db::migrator
+```
+
 ## Route migration gates
 
 Gateway mode currently exposes text-only
@@ -1077,8 +1112,10 @@ sessions carry a 5 s `statement_timeout` and
 claim transaction cannot hold a worker's advisory lock.
 
 PostgreSQL is the validated server-backed store: the migrator promotes the
-shared DDL per backend and the fleet store execution suite runs against real
-PostgreSQL in CI (`scripts/ci/check-backend-truth.sh cargo-fleet-stores`).
+shared DDL per backend, and the fleet store execution suite and the durable
+store suite run against real PostgreSQL in CI
+(`scripts/ci/check-backend-truth.sh cargo-fleet-stores`). The coordination
+database holds only the fleet tables (its own `fleet` migrations).
 To run it locally against a disposable Homebrew PostgreSQL database:
 
 ```
