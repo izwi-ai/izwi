@@ -2278,7 +2278,7 @@ mod tests {
             active.effective_mode.labeled_values(),
             [("serial", 0), ("shadow", 0), ("concurrent", 1)]
         );
-        assert_eq!(active.dispatches_in_flight, before.dispatches_in_flight + 2);
+        assert!(active.dispatches_in_flight >= 2);
         assert!(active.dispatches_max_in_flight >= active.dispatches_in_flight);
         assert!(active.dispatches_started_total >= before.dispatches_started_total + 2);
         assert!(active.cohort_wait.observations_total > before.cohort_wait.observations_total);
@@ -2292,10 +2292,6 @@ mod tests {
             ENGINE_PHYSICAL_PERMIT_WAIT_NANOS.load(Ordering::Relaxed)
                 >= before_permit_wait_nanos
                     .saturating_add(duration_nanos(Duration::from_millis(5)))
-        );
-        assert_eq!(
-            active.dispatch_duration.observations_total,
-            before.dispatch_duration.observations_total
         );
         assert!(active.fallbacks.uncertified_profile > before.fallbacks.uncertified_profile);
         assert!(active.defers.workspace_capacity > before.defers.workspace_capacity);
@@ -2333,14 +2329,40 @@ mod tests {
         drop(second_dispatch);
         drop(first_dispatch);
         let after = engine_physical_execution_metrics_snapshot();
-        assert_eq!(after.dispatches_in_flight, before.dispatches_in_flight);
         assert!(after.dispatches_completed_total >= before.dispatches_completed_total + 2);
         assert!(
             after.dispatch_duration.observations_total
                 >= before.dispatch_duration.observations_total + 2
         );
-        assert_eq!(after.workspace_current, before.workspace_current);
         assert!(after.workspace_high_water.host >= active.workspace_current.host);
+
+        // The gauges are process-wide and other tests dispatch concurrently,
+        // so exact accounting is checked in a window no other dispatch
+        // touched. A gauge that leaks or double-counts has no such window.
+        let exact_window = (0..1_000).any(|_| {
+            let before = engine_physical_execution_metrics_snapshot();
+            let first = begin_engine_physical_dispatch();
+            let second = begin_engine_physical_dispatch();
+            let workspace = begin_engine_physical_workspace(ResourceVector {
+                host_bytes: ResourceAmount::Known(11),
+                ..ResourceVector::zero()
+            });
+            let active = engine_physical_execution_metrics_snapshot();
+            drop(workspace);
+            drop(second);
+            drop(first);
+            let after = engine_physical_execution_metrics_snapshot();
+            active.dispatches_in_flight == before.dispatches_in_flight + 2
+                && active.dispatch_duration.observations_total
+                    == before.dispatch_duration.observations_total
+                && active.workspace_current.host == before.workspace_current.host + 11
+                && after.dispatches_in_flight == before.dispatches_in_flight
+                && after.workspace_current == before.workspace_current
+        });
+        assert!(
+            exact_window,
+            "in-flight and workspace gauges never balanced in an undisturbed window"
+        );
     }
 
     #[test]
