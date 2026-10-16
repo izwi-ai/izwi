@@ -510,7 +510,7 @@ pub async fn gateway_completions(
     let dispatcher = state.chat_dispatcher_for(&req.model)?;
     validate_chat_request_compatibility(&req, compatibility_profile())?;
     let (execution_request, format) = prepare_execution_request(&req, &ctx)?;
-    state
+    let usage = state
         .enforce_chat_rate_quota(&ctx, &execution_request)
         .await?;
     let tenant_work = tenant_work.take()?;
@@ -520,6 +520,7 @@ pub async fn gateway_completions(
         context: &ctx,
         admission,
         tenant_work,
+        usage,
     };
     complete_chat(
         backend,

@@ -714,7 +714,11 @@ fn apply_fleet_partition(
     let requests = partition.partition_limit(rate_quota.requests_per_minute());
     let burst = partition.partition_limit(rate_quota.burst_requests());
     let tracked = rate_quota.max_tracked_tenants();
+    let tokens = rate_quota
+        .tokens_per_minute()
+        .map(|tokens| partition.partition_limit(tokens));
     let rate_quota = GatewayRateQuotaConfig::new(requests, burst, tracked)
+        .and_then(|config| config.with_tokens_per_minute(tokens))
         .expect("partitioned rate-quota must remain valid");
     let per_tenant = u32::try_from(tenant_concurrency.max_active_per_tenant())
         .ok()

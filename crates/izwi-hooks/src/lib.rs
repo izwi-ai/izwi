@@ -286,6 +286,22 @@ pub struct QuotaRequest {
     pub metadata: HookMetadata,
 }
 
+/// What an admitted request actually used, reported once it completes so a
+/// metering backend can settle against the estimate it admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaUsage {
+    pub principal: Option<Principal>,
+    pub action: EnterpriseAction,
+    pub resource: ResourceDescriptor,
+    /// The `estimated_units` the request was evaluated with.
+    pub estimated_units: Option<u64>,
+    /// Input units consumed (prompt tokens for chat).
+    pub input_units: u64,
+    /// Output units produced (completion tokens for chat).
+    pub output_units: u64,
+    pub metadata: HookMetadata,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaDecision {
     pub allowed: bool,
@@ -592,6 +608,13 @@ pub trait ObservabilitySink: Send + Sync {
 #[async_trait]
 pub trait QuotaLimiter: Send + Sync {
     async fn evaluate(&self, request: &QuotaRequest) -> HookResult<QuotaDecision>;
+
+    /// Records the actual usage of a request `evaluate` admitted, once it
+    /// completes. Best effort: the response has already been served, so a
+    /// failure here is logged, never surfaced to the caller.
+    async fn commit(&self, _usage: &QuotaUsage) -> HookResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

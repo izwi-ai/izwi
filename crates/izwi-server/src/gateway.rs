@@ -35,7 +35,10 @@ use crate::api::request_context::{
 use crate::app::chat::{ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver};
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
 use crate::error::ApiError;
-use crate::gateway_rate_quota::{GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig};
+use crate::gateway_rate_quota::{
+    GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig, RateLimitSnapshot,
+    TokenDecision, TokenReservation,
+};
 use crate::gateway_security::GatewayPerimeterConfig;
 use crate::gateway_tenant_concurrency::{
     GatewayTenantConcurrency, GatewayTenantConcurrencyConfig, TenantWorkAdmissionError,
@@ -223,11 +226,15 @@ impl GatewayState {
         self
     }
 
+    /// The tenant's request rate, then its token rate, then the enterprise
+    /// quota hook: local limits are checked first so a request they refuse
+    /// is never charged by the hook. Returns the meter that settles the
+    /// request's tokens and reports its usage when it completes.
     pub(crate) async fn enforce_chat_rate_quota(
         &self,
         context: &crate::api::request_context::RequestContext,
         request: &ChatExecutionRequest,
-    ) -> Result<(), ApiError> {
+    ) -> Result<ChatUsageMeter, ApiError> {
         let requested_tokens = request
             .max_completion_tokens
             .or(request.max_tokens)
@@ -237,7 +244,52 @@ impl GatewayState {
             .unwrap_or(u32::MAX)
             .min(self.max_output_tokens)
             .max(1);
-        let resource = ResourceDescriptor::http_route(CHAT_COMPLETIONS_RESOURCE);
+        let tenant_key = context.tenant_key().ok_or_else(|| {
+            ApiError::service_unavailable("Gateway tenant identity is unavailable")
+        })?;
+        match self.rate_quota.check(tenant_key) {
+            Ok(GatewayRateDecision::Allowed) => {}
+            Ok(GatewayRateDecision::Limited) => {
+                self.metrics
+                    .inner
+                    .quota_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ApiError::too_many_requests(
+                    "Gateway tenant rate limit exceeded",
+                ));
+            }
+            Err(_) => {
+                return Err(ApiError::service_unavailable(
+                    "Gateway tenant rate limiter unavailable",
+                ))
+            }
+        }
+        // Prompt tokens are estimated at four bytes a token; usage settles
+        // the reservation to the worker's exact count.
+        let prompt_bytes = request
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64)
+            .sum::<u64>();
+        let token_estimate = u64::from(estimated_units).saturating_add(prompt_bytes.div_ceil(4));
+        let tokens = match self.rate_quota.reserve_tokens(tenant_key, token_estimate) {
+            Ok((TokenDecision::Allowed, reservation)) => reservation,
+            Ok((TokenDecision::Limited { .. }, _)) => {
+                self.metrics
+                    .inner
+                    .quota_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ApiError::too_many_requests(
+                    "Gateway tenant token rate limit exceeded",
+                ));
+            }
+            Err(_) => {
+                return Err(ApiError::service_unavailable(
+                    "Gateway tenant rate limiter unavailable",
+                ))
+            }
+        };
+
         let hook_budget = context
             .remaining_budget(Duration::from_secs(self.request_timeout_secs))
             .unwrap_or(Duration::ZERO)
@@ -250,7 +302,7 @@ impl GatewayState {
         let quota_request = QuotaRequest {
             principal: Some(context.principal.clone()),
             action: EnterpriseAction::Inference,
-            resource,
+            resource: ResourceDescriptor::http_route(CHAT_COMPLETIONS_RESOURCE),
             estimated_units: Some(u64::from(estimated_units)),
             metadata: HookMetadata::new(),
         };
@@ -274,25 +326,14 @@ impl GatewayState {
                 "Gateway tenant rate limit exceeded",
             ));
         }
-
-        let tenant_key = context.tenant_key().ok_or_else(|| {
-            ApiError::service_unavailable("Gateway tenant identity is unavailable")
-        })?;
-        match self.rate_quota.check(tenant_key) {
-            Ok(GatewayRateDecision::Allowed) => Ok(()),
-            Ok(GatewayRateDecision::Limited) => {
-                self.metrics
-                    .inner
-                    .quota_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(ApiError::too_many_requests(
-                    "Gateway tenant rate limit exceeded",
-                ))
-            }
-            Err(_) => Err(ApiError::service_unavailable(
-                "Gateway tenant rate limiter unavailable",
-            )),
-        }
+        Ok(ChatUsageMeter {
+            quotas: Arc::clone(&self.enterprise_hooks.quotas),
+            principal: context.principal.clone(),
+            correlation_id: context.correlation_id.clone(),
+            model: request.variant.dir_name(),
+            estimated_units: u64::from(estimated_units),
+            tokens,
+        })
     }
 
     pub(crate) fn begin_tenant_work(
@@ -335,6 +376,54 @@ impl GatewayState {
     }
 }
 
+/// Settles one chat request's usage: the token reservation against what the
+/// worker reported, and the enterprise quota hook's usage commit.
+pub(crate) struct ChatUsageMeter {
+    quotas: Arc<dyn izwi_hooks::QuotaLimiter>,
+    principal: izwi_hooks::Principal,
+    correlation_id: String,
+    model: &'static str,
+    estimated_units: u64,
+    tokens: Option<TokenReservation>,
+}
+
+impl ChatUsageMeter {
+    /// Output is flowing: from now on, an unsettled reservation stands.
+    fn started(&mut self) {
+        if let Some(tokens) = self.tokens.as_mut() {
+            tokens.mark_started();
+        }
+    }
+
+    fn complete(self, generation: &ChatGeneration) {
+        let input_units = generation.prompt_tokens as u64;
+        let output_units = generation.tokens_generated as u64;
+        if let Some(tokens) = self.tokens {
+            tokens.settle(input_units.saturating_add(output_units));
+        }
+        let usage = izwi_hooks::QuotaUsage {
+            principal: Some(self.principal),
+            action: EnterpriseAction::Inference,
+            resource: ResourceDescriptor::http_route(CHAT_COMPLETIONS_RESOURCE),
+            estimated_units: Some(self.estimated_units),
+            input_units,
+            output_units,
+            metadata: HookMetadata::from([
+                ("correlation_id".to_string(), self.correlation_id),
+                ("model".to_string(), self.model.to_string()),
+            ]),
+        };
+        let quotas = self.quotas;
+        tokio::spawn(async move {
+            match tokio::time::timeout(MAX_GATEWAY_QUOTA_HOOK_TIME, quotas.commit(&usage)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => warn!("Enterprise gateway quota usage commit failed"),
+                Err(_) => warn!("Enterprise gateway quota usage commit timed out"),
+            }
+        });
+    }
+}
+
 /// The tenant concurrent-work lease taken before global admission, handed
 /// to the chat handler through the request extensions.
 #[derive(Clone)]
@@ -365,6 +454,7 @@ pub(crate) struct GatewayChat<'a> {
     pub(crate) context: &'a RequestContext,
     pub(crate) admission: GatewayAdmissionGuard,
     pub(crate) tenant_work: UnboundTenantWorkLease,
+    pub(crate) usage: ChatUsageMeter,
 }
 
 /// Holds a streaming response's admission and stream metrics until its body
@@ -372,6 +462,7 @@ pub(crate) struct GatewayChat<'a> {
 pub(crate) struct GatewayChatStream {
     _admission: GatewayAdmissionGuard,
     metrics: GatewayStreamMetricsGuard,
+    usage: Option<ChatUsageMeter>,
 }
 
 impl ChatStreamObserver for GatewayChatStream {
@@ -381,6 +472,9 @@ impl ChatStreamObserver for GatewayChatStream {
 
     fn record_completion(&mut self, generation: &ChatGeneration) {
         self.metrics.record_completion(generation);
+        if let Some(usage) = self.usage.take() {
+            usage.complete(generation);
+        }
     }
 
     fn record_failure(&mut self) {
@@ -412,6 +506,7 @@ impl ChatBackend for GatewayChat<'_> {
                 chat.duration
                     .observe_duration(&[model, "false", "ok"], elapsed);
                 chat.record_tokens(model, generation);
+                self.usage.complete(generation);
             }
             Err(_) => chat
                 .duration
@@ -448,6 +543,8 @@ impl ChatBackend for GatewayChat<'_> {
                 return Err(error);
             }
         };
+        let mut usage = self.usage;
+        usage.started();
         Ok((
             events,
             GatewayChatStream {
@@ -456,6 +553,7 @@ impl ChatBackend for GatewayChat<'_> {
                     .state
                     .metrics
                     .begin_stream(model, self.context.received_at()),
+                usage: Some(usage),
             },
         ))
     }
@@ -1137,32 +1235,78 @@ async fn tenant_pre_admission(
         return ApiError::service_unavailable("Gateway tenant identity is unavailable")
             .into_response();
     };
-    match state.rate_quota.peek(tenant_key) {
-        Ok(GatewayRateDecision::Allowed) => {}
+    let response = match state.rate_quota.peek(tenant_key) {
+        Ok(GatewayRateDecision::Allowed) => match state.begin_tenant_work(&context) {
+            Ok(lease) => {
+                request
+                    .extensions_mut()
+                    .insert(PreAdmittedTenantWork(Arc::new(std::sync::Mutex::new(
+                        Some(lease),
+                    ))));
+                next.run(request).await
+            }
+            Err(error) => error.into_response(),
+        },
         Ok(GatewayRateDecision::Limited) => {
             state
                 .metrics
                 .inner
                 .quota_rejections
                 .fetch_add(1, Ordering::Relaxed);
-            return ApiError::too_many_requests("Gateway tenant rate limit exceeded")
-                .into_response();
+            ApiError::too_many_requests("Gateway tenant rate limit exceeded").into_response()
         }
         Err(_) => {
-            return ApiError::service_unavailable("Gateway tenant rate limiter unavailable")
-                .into_response()
+            ApiError::service_unavailable("Gateway tenant rate limiter unavailable").into_response()
+        }
+    };
+    with_rate_limit_headers(state.rate_quota.snapshot(tenant_key), response)
+}
+
+/// OpenAI's `x-ratelimit-*` headers for the tenant's request (and, when
+/// configured, token) limits on every chat response, and `Retry-After` on
+/// 429 and 503 answers that do not carry one.
+fn with_rate_limit_headers(
+    snapshot: Option<RateLimitSnapshot>,
+    mut response: Response,
+) -> Response {
+    let whole_seconds =
+        |duration: Duration| duration.as_secs() + u64::from(duration.subsec_nanos() > 0);
+    let status = response.status();
+    let headers = response.headers_mut();
+    let mut retry_after = Duration::from_secs(1);
+    if let Some(snapshot) = snapshot {
+        let mut windows = vec![("requests", snapshot.requests)];
+        windows.extend(snapshot.tokens.map(|tokens| ("tokens", tokens)));
+        for (name, window) in &windows {
+            let values = [
+                ("limit", window.limit.to_string()),
+                ("remaining", window.remaining.to_string()),
+                ("reset", format!("{}s", whole_seconds(window.reset))),
+            ];
+            for (field, value) in values {
+                if let (Ok(header), Ok(value)) = (
+                    header::HeaderName::try_from(format!("x-ratelimit-{field}-{name}")),
+                    axum::http::HeaderValue::try_from(value),
+                ) {
+                    headers.insert(header, value);
+                }
+            }
+        }
+        if let Some((_, exhausted)) = windows.iter().find(|(_, window)| window.remaining == 0) {
+            retry_after = retry_after.max(exhausted.retry_after);
         }
     }
-    let lease = match state.begin_tenant_work(&context) {
-        Ok(lease) => lease,
-        Err(error) => return error.into_response(),
-    };
-    request
-        .extensions_mut()
-        .insert(PreAdmittedTenantWork(Arc::new(std::sync::Mutex::new(
-            Some(lease),
-        ))));
-    next.run(request).await
+    if matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+    ) && !headers.contains_key(header::RETRY_AFTER)
+    {
+        headers.insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from(whole_seconds(retry_after)),
+        );
+    }
+    response
 }
 
 async fn bounded_gateway_admission(
@@ -3956,6 +4100,145 @@ mod tests {
         );
         assert!(!body.to_string().contains("private quota detail"));
         assert_eq!(state.metrics.snapshot().quota_rejections, 1);
+    }
+
+    fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn chat_responses_carry_rate_limit_headers_and_429s_a_retry_after() {
+        let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+        let state = state.with_rate_quota_config(GatewayRateQuotaConfig::new(2, 1, 8).unwrap());
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let served = send(app.clone(), valid_chat_request(4)).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(header(&served, "x-ratelimit-limit-requests"), Some("2"));
+        assert_eq!(header(&served, "x-ratelimit-remaining-requests"), Some("0"));
+        assert_eq!(header(&served, "x-ratelimit-reset-requests"), Some("30s"));
+        assert_eq!(header(&served, "x-ratelimit-limit-tokens"), None);
+
+        let limited = send(app, valid_chat_request(4)).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        // One request every 30 s refills the spent one.
+        let retry_after: u64 = header(&limited, "retry-after").unwrap().parse().unwrap();
+        assert!((29..=30).contains(&retry_after), "{retry_after}");
+    }
+
+    #[tokio::test]
+    async fn token_quota_admits_by_estimate_and_settles_to_reported_usage() {
+        let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+        // 60 tokens a minute: one a second refills during the test at most.
+        let state = state.with_rate_quota_config(
+            GatewayRateQuotaConfig::new(600, 64, 8)
+                .unwrap()
+                .with_tokens_per_minute(Some(60))
+                .unwrap(),
+        );
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let served = send(app.clone(), valid_chat_request(16)).await;
+        assert_eq!(served.status(), StatusCode::OK);
+        let body = json_body(served).await;
+        let used = body["usage"]["total_tokens"].as_u64().unwrap();
+        assert!(used > 0 && used < 16, "{used}");
+
+        // The next response reports the balance after settling to actual
+        // usage, not to the 16 + prompt estimate.
+        let next = send(app.clone(), valid_chat_request(16)).await;
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(header(&next, "x-ratelimit-limit-tokens"), Some("60"));
+        let remaining: u64 = header(&next, "x-ratelimit-remaining-tokens")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (60 - 2 * used..=60 - 2 * used + 2).contains(&remaining),
+            "{remaining} after two requests of {used}"
+        );
+
+        // A request whose estimate exceeds what is left is refused.
+        let limited = send(app, valid_chat_request(60)).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(header(&limited, "retry-after").is_some());
+        assert_eq!(
+            json_body(limited).await["error"]["message"],
+            "Gateway tenant token rate limit exceeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_chat_commits_its_usage_to_the_quota_hook() {
+        #[derive(Default)]
+        struct MeteringQuota(Mutex<Vec<izwi_hooks::QuotaUsage>>);
+
+        #[async_trait::async_trait]
+        impl QuotaLimiter for MeteringQuota {
+            async fn evaluate(&self, _request: &QuotaRequest) -> HookResult<QuotaDecision> {
+                Ok(QuotaDecision::allow())
+            }
+
+            async fn commit(&self, usage: &izwi_hooks::QuotaUsage) -> HookResult<()> {
+                self.0.lock().unwrap().push(usage.clone());
+                Ok(())
+            }
+        }
+
+        let (mut state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
+        let quota = Arc::new(MeteringQuota::default());
+        state.enterprise_hooks.quotas = quota.clone();
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+
+        let body = json_body(send(app.clone(), valid_chat_request(16)).await).await;
+        let stream = send(
+            app,
+            chat_request(json!({
+                "model": ModelVariant::Qwen354BGguf.dir_name(),
+                "messages": [{"role": "user", "content": "quota test"}],
+                "max_tokens": 16,
+                "stream": true
+            })),
+        )
+        .await;
+        assert_eq!(stream.status(), StatusCode::OK);
+        axum::body::to_bytes(stream.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let commits = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let commits = quota.0.lock().unwrap().clone();
+                if commits.len() == 2 {
+                    break commits;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both completions commit their usage");
+        for usage in commits {
+            assert_eq!(usage.estimated_units, Some(16));
+            assert_eq!(
+                usage.input_units,
+                body["usage"]["prompt_tokens"].as_u64().unwrap()
+            );
+            assert_eq!(
+                usage.output_units,
+                body["usage"]["completion_tokens"].as_u64().unwrap()
+            );
+            assert_eq!(
+                usage.principal.unwrap().tenant_id.as_deref(),
+                Some("test-tenant")
+            );
+            assert_eq!(
+                usage.metadata.get("model").map(String::as_str),
+                Some(ModelVariant::Qwen354BGguf.dir_name())
+            );
+        }
     }
 
     #[tokio::test]
