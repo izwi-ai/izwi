@@ -393,6 +393,21 @@ impl GatewayDeploymentTable {
             .and_then(GatewayDeploymentPool::eligible_generation)
     }
 
+    /// Every pool and the generation it routes new work to, for the
+    /// gateway's approvals status report.
+    pub fn pool_statuses(&self) -> Vec<izwi_serving_protocol::GatewayPoolStatus> {
+        self.pools
+            .iter()
+            .map(|pool| izwi_serving_protocol::GatewayPoolStatus {
+                task: pool.task,
+                public_model: pool.public_model.clone(),
+                deployment_id: pool.deployment_id.clone(),
+                eligible_generation: pool.eligible_generation(),
+                generations: pool.generations.keys().copied().collect(),
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.pools.len()

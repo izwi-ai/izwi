@@ -64,6 +64,8 @@ pub struct GatewayState {
     /// byte-identical to the pre-realtime shape.
     pub(crate) realtime_relay:
         Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
+    /// The adopted approvals view, for the admin status route.
+    approvals: Option<crate::gateway_shared_approvals::GatewayApprovalsReporter>,
 }
 
 impl GatewayState {
@@ -92,7 +94,18 @@ impl GatewayState {
             max_output_tokens,
             metrics: GatewayMetrics::default(),
             realtime_relay: None,
+            approvals: None,
         }
+    }
+
+    /// Install the adopted-approvals reporter behind
+    /// `GET /internal/admin/approvals`.
+    pub(crate) fn with_approvals_reporter(
+        mut self,
+        reporter: crate::gateway_shared_approvals::GatewayApprovalsReporter,
+    ) -> Self {
+        self.approvals = Some(reporter);
+        self
     }
 
     /// Override process-local request-rate policy and the exact private worker
@@ -490,6 +503,7 @@ fn gateway_route_label(path: &str) -> &'static str {
         "/readyz" => "/readyz",
         "/internal/metrics" | "/internal/metrics/prometheus" => "/internal/metrics",
         "/internal/admin/drain" => "/internal/admin/drain",
+        "/internal/admin/approvals" => "/internal/admin/approvals",
         _ => "other",
     }
 }
@@ -851,21 +865,46 @@ async fn api_not_found() -> Response {
     ApiError::not_found("unknown gateway route").into_response()
 }
 
-async fn gateway_drain(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+/// Admin routes exist only with an admin key or an admin-role principal,
+/// and answer only to it: the rejection is 404 without one configured and
+/// 401 for any other caller.
+fn admin_rejection(state: &GatewayState, headers: &HeaderMap) -> Option<Response> {
     let admin_available = state.perimeter.admin_enabled() || state.principal_keys.has_role("admin");
     if !admin_available {
-        return StatusCode::NOT_FOUND.into_response();
+        return Some(StatusCode::NOT_FOUND.into_response());
     }
     let admin_authorized = (state.perimeter.admin_enabled()
-        && state.perimeter.authenticate_admin(&headers))
-        || state.principal_keys.authorize(&headers, "admin");
+        && state.perimeter.authenticate_admin(headers))
+        || state.principal_keys.authorize(headers, "admin");
     if !admin_authorized {
         let mut response = StatusCode::UNAUTHORIZED.into_response();
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             axum::http::HeaderValue::from_static("Bearer realm=\"izwi-gateway-admin\""),
         );
-        return response;
+        return Some(response);
+    }
+    None
+}
+
+/// The approvals view this gateway adopted and the generation each pool
+/// routes to, so a rollout can confirm adoption before it moves on.
+async fn gateway_approvals_status(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(rejection) = admin_rejection(&state, &headers) {
+        return rejection;
+    }
+    match state.approvals.as_ref() {
+        Some(reporter) => Json(reporter.status()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn gateway_drain(State(state): State<GatewayState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = admin_rejection(&state, &headers) {
+        return rejection;
     }
     state.begin_drain();
     let lifecycle = state.lifecycle.snapshot();
@@ -1091,6 +1130,10 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         .route("/livez", get(live_check))
         .route("/readyz", get(ready_check))
         .route("/internal/admin/drain", post(gateway_drain))
+        .route(
+            izwi_serving_protocol::GATEWAY_APPROVALS_STATUS_PATH,
+            get(gateway_approvals_status),
+        )
         .route("/internal/metrics", get(gateway_metrics))
         .route("/internal/metrics/prometheus", get(gateway_metrics))
         .route(
@@ -2985,6 +3028,75 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND,
             "drain endpoint must 404 when admin key is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_approvals_status_reports_the_adopted_view_to_the_admin_key_only() {
+        const TEST_ADMIN_API_KEY: &str = "test-admin-api-key-999888";
+        let mut table = crate::gateway_deployments::GatewayDeploymentTable::default();
+        let approvals: Vec<crate::gateway_deployments::GatewayWorkerApproval> = [
+            "v1|http://127.0.0.1:9470|node-a|worker-old|chat|chat-model|chat-prod|1",
+            "v1|http://127.0.0.1:9471|node-a|worker-new|chat|chat-model|chat-prod|2",
+        ]
+        .iter()
+        .map(|line| line.parse().unwrap())
+        .collect();
+        table.apply_view(&approvals).unwrap();
+        let reporter = crate::gateway_shared_approvals::GatewayApprovalsReporter::new(
+            std::sync::Arc::new(std::sync::Mutex::new(table)),
+        );
+        reporter.record(Some("sha256:window"), &approvals);
+
+        let without_admin =
+            unreachable_gateway_state(test_perimeter()).with_approvals_reporter(reporter.clone());
+        let app = create_gateway_router(without_admin, &ServeRuntimeConfig::default());
+        assert_eq!(
+            send_raw(app, get("/internal/admin/approvals"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND,
+            "the route needs an admin key configured"
+        );
+
+        let perimeter = test_perimeter()
+            .with_admin_api_key_for_test(TEST_ADMIN_API_KEY)
+            .unwrap();
+        let state = unreachable_gateway_state(perimeter).with_approvals_reporter(reporter);
+        let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+        assert_eq!(
+            send_raw(
+                app.clone(),
+                get_with_bearer("/internal/admin/approvals", TEST_API_KEY)
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED,
+            "the inference key must not read admin state"
+        );
+        let response = send_raw(
+            app,
+            get_with_bearer("/internal/admin/approvals", TEST_ADMIN_API_KEY),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: izwi_serving_protocol::GatewayApprovalsStatus = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status.file_digest.as_deref(), Some("sha256:window"));
+        assert_eq!(status.adoptions, 1);
+        assert_eq!(status.approvals.len(), 2);
+        assert_eq!(status.pools.len(), 1);
+        let pool = &status.pools[0];
+        assert_eq!(pool.deployment_id.as_str(), "chat-prod");
+        assert_eq!(pool.generations.len(), 2, "a rollout window holds both");
+        assert_eq!(
+            pool.eligible_generation.map(|generation| generation.get()),
+            Some(1),
+            "before the successor is observed ready, the predecessor routes"
         );
     }
 

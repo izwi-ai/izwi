@@ -99,21 +99,30 @@ impl SharedApprovalsConfig {
 pub struct SharedApprovalsView {
     config: SharedApprovalsConfig,
     approvals: Vec<GatewayWorkerApproval>,
+    /// `sha256:<hex>` of the file text the cached approvals came from.
+    file_digest: String,
     last_refresh: Option<(std::time::SystemTime, std::time::Instant)>,
 }
 
 impl SharedApprovalsView {
     pub fn load(config: SharedApprovalsConfig) -> Result<Self, SharedApprovalsError> {
-        let approvals = read_approvals_file(config.path())?;
+        let text = read_approvals_text(config.path())?;
+        let approvals = parse_shared_approvals_text(&text)?;
         Ok(Self {
             config,
             approvals,
+            file_digest: text_digest(&text),
             last_refresh: Some((std::time::SystemTime::now(), std::time::Instant::now())),
         })
     }
 
     pub fn approvals(&self) -> &[GatewayWorkerApproval] {
         &self.approvals
+    }
+
+    /// The digest of the file text the cached approvals came from.
+    pub fn file_digest(&self) -> &str {
+        &self.file_digest
     }
 
     pub fn ttl(&self) -> std::time::Duration {
@@ -132,16 +141,95 @@ impl SharedApprovalsView {
         if !due {
             return Ok(false);
         }
-        let approvals = read_approvals_file(self.config.path())?;
-        self.approvals = approvals;
+        let text = read_approvals_text(self.config.path())?;
+        self.approvals = parse_shared_approvals_text(&text)?;
+        self.file_digest = text_digest(&text);
         self.last_refresh = Some((std::time::SystemTime::now(), std::time::Instant::now()));
         Ok(true)
     }
 }
 
+/// What the gateway reports at `GET /internal/admin/approvals`: the
+/// approvals view it last adopted, and the live pools of the deployment
+/// table (which generation each routes to, including a cutover the status
+/// pollers completed since). A rollout coordinator polls it to know every
+/// gateway adopted the view it wrote.
+#[derive(Clone)]
+pub struct GatewayApprovalsReporter {
+    adopted: std::sync::Arc<std::sync::Mutex<AdoptedApprovals>>,
+    deployment_table:
+        std::sync::Arc<std::sync::Mutex<crate::gateway_deployments::GatewayDeploymentTable>>,
+}
+
+#[derive(Debug, Default)]
+struct AdoptedApprovals {
+    file_digest: Option<String>,
+    adoptions: u64,
+    approvals: Vec<String>,
+}
+
+impl GatewayApprovalsReporter {
+    pub fn new(
+        deployment_table: std::sync::Arc<
+            std::sync::Mutex<crate::gateway_deployments::GatewayDeploymentTable>,
+        >,
+    ) -> Self {
+        Self {
+            adopted: Default::default(),
+            deployment_table,
+        }
+    }
+
+    /// Records an adopted view: the shared file's digest, when there is a
+    /// file, and the effective approvals the table now holds.
+    pub fn record(&self, file_digest: Option<&str>, approvals: &[GatewayWorkerApproval]) {
+        let mut adopted = self
+            .adopted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if file_digest.is_some() && adopted.file_digest.as_deref() != file_digest {
+            adopted.adoptions += 1;
+        }
+        adopted.file_digest = file_digest.map(str::to_string);
+        adopted.approvals = approvals
+            .iter()
+            .map(GatewayWorkerApproval::render_line)
+            .collect();
+    }
+
+    pub fn status(&self) -> izwi_serving_protocol::GatewayApprovalsStatus {
+        let pools = self
+            .deployment_table
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pool_statuses();
+        let adopted = self
+            .adopted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        izwi_serving_protocol::GatewayApprovalsStatus {
+            file_digest: adopted.file_digest.clone(),
+            adoptions: adopted.adoptions,
+            approvals: adopted.approvals.clone(),
+            pools,
+        }
+    }
+}
+
+#[cfg(test)]
 fn read_approvals_file(
     path: &std::path::Path,
 ) -> Result<Vec<GatewayWorkerApproval>, SharedApprovalsError> {
+    parse_shared_approvals_text(&read_approvals_text(path)?)
+}
+
+/// `sha256:<hex>`, the digest form the supervisor's rollout uses too.
+fn text_digest(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn read_approvals_text(path: &std::path::Path) -> Result<String, SharedApprovalsError> {
     let metadata = std::fs::metadata(path).map_err(|_| SharedApprovalsError::Unreadable)?;
     if !metadata.is_file() {
         return Err(SharedApprovalsError::Unreadable);
@@ -149,8 +237,7 @@ fn read_approvals_file(
     if metadata.len() > MAX_SHARED_APPROVALS_FILE_BYTES {
         return Err(SharedApprovalsError::FileTooLarge);
     }
-    let text = std::fs::read_to_string(path).map_err(|_| SharedApprovalsError::Unreadable)?;
-    parse_shared_approvals_text(&text)
+    std::fs::read_to_string(path).map_err(|_| SharedApprovalsError::Unreadable)
 }
 
 fn parse_shared_approvals_text(

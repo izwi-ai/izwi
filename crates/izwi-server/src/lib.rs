@@ -951,6 +951,14 @@ async fn gateway_state(
             .map_err(|error| anyhow::anyhow!("configured approvals view: {error}"))?;
         Arc::new(std::sync::Mutex::new(table))
     };
+    let approvals_reporter =
+        gateway_shared_approvals::GatewayApprovalsReporter::new(Arc::clone(&deployment_table));
+    approvals_reporter.record(
+        shared_approvals_view
+            .as_ref()
+            .map(gateway_shared_approvals::SharedApprovalsView::file_digest),
+        &worker_approvals,
+    );
     registry.set_generation_gate({
         let deployment_table = Arc::clone(&deployment_table);
         Arc::new(move |task, public_model| {
@@ -1160,6 +1168,7 @@ async fn gateway_state(
             gateway_shared_approvals::SharedApprovalsView::ttl,
         );
         let refresh_table = Arc::clone(&deployment_table);
+        let refresh_reporter = approvals_reporter.clone();
         let refresh_cli_approvals = cli_approvals.clone();
         let boot_approvals = worker_approvals.clone();
         tasks.push(tokio::spawn(async move {
@@ -1178,13 +1187,16 @@ async fn gateway_state(
                         let mut effective = refresh_cli_approvals.clone();
                         effective.extend(view.approvals().iter().cloned());
                         let rendered = render_approvals_text(&effective);
-                        if last_applied.as_deref() != Some(rendered.as_str()) {
-                            match refresh_table
+                        if last_applied.as_deref() == Some(rendered.as_str()) {
+                            refresh_reporter.record(Some(view.file_digest()), &effective);
+                        } else {
+                            let applied = refresh_table
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .apply_view(&effective)
-                            {
+                                .apply_view(&effective);
+                            match applied {
                                 Ok(outcome) => {
+                                    refresh_reporter.record(Some(view.file_digest()), &effective);
                                     last_applied = Some(rendered);
                                     info!(
                                         service = SERVICE_NAME,
@@ -1241,7 +1253,8 @@ async fn gateway_state(
         perimeter,
         serve_config.request_timeout_secs,
         args.gateway_max_in_flight,
-    );
+    )
+    .with_approvals_reporter(approvals_reporter);
     let state = if args.gateway_realtime == "on" {
         // Stage pools resolve per approved task for the public model; boot
         // fails closed only when no realtime stage can be served at all. A

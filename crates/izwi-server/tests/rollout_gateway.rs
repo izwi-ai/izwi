@@ -29,6 +29,7 @@ use izwi_serving_protocol::{ModelAlias, ModelGeneration, NodeId, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 
 const GATEWAY_API_KEY: &str = "rollout-rig-api-key";
+const GATEWAY_ADMIN_KEY: &str = "rollout-rig-admin-key-0123456789";
 const MODEL: ModelVariant = ModelVariant::Qwen354BGguf;
 const DEPLOYMENT_ID: &str = "test-chat-v1";
 
@@ -116,6 +117,11 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
                 MODEL.dir_name(),
             ])
             .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
+            .env(
+                "IZWI_GATEWAY_ADMIN_API_KEY_REF",
+                "env:ROLLOUT_RIG_ADMIN_KEY",
+            )
+            .env("ROLLOUT_RIG_ADMIN_KEY", GATEWAY_ADMIN_KEY)
             .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
             .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")
             .env("IZWI_GATEWAY_WORKER_STATUS_POLL_MS", "100")
@@ -217,6 +223,47 @@ fn write_view(path: &std::path::Path, text: &str) {
     ));
     std::fs::write(&temp, text).unwrap();
     std::fs::rename(&temp, path).unwrap();
+}
+
+/// The gateway's report of the approvals view it adopted.
+async fn approvals_status(
+    client: &reqwest::Client,
+    gateway: &GatewayProcess,
+) -> izwi_serving_protocol::GatewayApprovalsStatus {
+    let response = client
+        .get(format!(
+            "{}{}",
+            gateway.base,
+            izwi_serving_protocol::GATEWAY_APPROVALS_STATUS_PATH
+        ))
+        .header("Authorization", format!("Bearer {GATEWAY_ADMIN_KEY}"))
+        .send()
+        .await
+        .expect("approvals status reaches the gateway");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    response.json().await.expect("approvals status decodes")
+}
+
+/// Waits until the gateway reports it adopted exactly this file text.
+async fn wait_adopted(
+    client: &reqwest::Client,
+    gateway: &GatewayProcess,
+    text: &str,
+) -> izwi_serving_protocol::GatewayApprovalsStatus {
+    use sha2::{Digest, Sha256};
+    let digest = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = approvals_status(client, gateway).await;
+        if status.file_digest.as_deref() == Some(digest.as_str()) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway never reported adopting {digest}: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_ready(gateway: &GatewayProcess) {
@@ -357,6 +404,17 @@ async fn rollout_views_cut_over_generations_with_zero_dropped_requests() {
         "the gateway must adopt the successor generation; gateway log tail:\n{}",
         gateway.log_tail()
     );
+    // The admin report says so too: the window view is adopted and the
+    // pool routes to the successor (what a rollout waits for).
+    let status = wait_adopted(&client, &gateway, &window_view).await;
+    assert_eq!(status.approvals.len(), 2, "{status:?}");
+    assert_eq!(
+        status.pools[0]
+            .eligible_generation
+            .map(|generation| generation.get()),
+        Some(2),
+        "the cutover is reported: {status:?}"
+    );
 
     // From the cutover instant the predecessor must not receive any new
     // request: park its counter and push traffic through the window.
@@ -409,6 +467,11 @@ async fn rollout_views_cut_over_generations_with_zero_dropped_requests() {
         ),
     );
     write_view(&approvals_path, &commit_view);
+    let status = wait_adopted(&client, &gateway, &commit_view).await;
+    assert!(
+        status.approvals.iter().all(|line| !line.ends_with("|1")),
+        "the commit view no longer approves the predecessor: {status:?}"
+    );
     let committed = chat_until(&client, &gateway, Duration::from_secs(30), || {
         new_worker.served_invocations() > abort_new_count
     })
