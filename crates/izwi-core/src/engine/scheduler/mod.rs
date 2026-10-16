@@ -2948,6 +2948,25 @@ impl Scheduler {
         })
     }
 
+    /// The earliest future instant at which work becomes due without any
+    /// other event: a deferred row's retry time, a hard deadline, or a
+    /// cleanup retry. An idle step driver sleeps no longer than this, so a
+    /// deferred row runs at its retry time rather than after the idle
+    /// backoff (SCH-F11).
+    pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        let rows = self
+            .requests
+            .values()
+            .flat_map(|metadata| [metadata.retry_not_before, metadata.hard_deadline])
+            .flatten();
+        let cleanups = self
+            .pending_releases
+            .values()
+            .filter(|pending| pending.confirmation_required && !pending.cleanup_confirmed)
+            .map(|pending| pending.retry_at);
+        rows.chain(cleanups).filter(|at| *at > now).min()
+    }
+
     pub(crate) fn force_release_all_after_executor_shutdown(&mut self) {
         self.pending_releases.clear();
     }

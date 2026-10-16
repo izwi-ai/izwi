@@ -3957,11 +3957,9 @@ impl RuntimeService {
             let mut idle_backoff_ms = 1u64;
             loop {
                 if !engine.has_pending_work().await {
-                    let sleep_for = tokio::time::Duration::from_millis(idle_backoff_ms);
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_for) => {}
-                        _ = wakeup.notified() => {}
-                    }
+                    engine
+                        .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&wakeup))
+                        .await;
                     idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                     continue;
                 }
@@ -3971,11 +3969,11 @@ impl RuntimeService {
                 match step_result {
                     Ok(Ok(outputs)) => {
                         if outputs.is_empty() {
-                            let sleep_for = tokio::time::Duration::from_millis(idle_backoff_ms);
-                            tokio::select! {
-                                _ = tokio::time::sleep(sleep_for) => {}
-                                _ = wakeup.notified() => {}
-                            }
+                            // Sleeps until the next retry or deadline the
+                            // scheduler holds, or a wakeup, at the latest.
+                            engine
+                                .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&wakeup))
+                                .await;
                             idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
                             continue;
                         }

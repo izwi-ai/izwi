@@ -5573,6 +5573,11 @@ impl EngineCore {
             || self.scheduler.has_due_cleanup(Instant::now())
     }
 
+    /// See [`super::scheduler::Scheduler::next_wakeup`].
+    pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
+        self.scheduler.next_wakeup(now)
+    }
+
     /// Check if a request exists.
     pub fn has_request(&self, request_id: &RequestId) -> bool {
         self.requests.contains_key(request_id)
@@ -5602,6 +5607,15 @@ impl EngineCore {
         self.scheduler
             .get_sequence_id(request_id)
             .map(|epoch| super::SessionKey::new(request_id.clone(), epoch))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_execution_retry_for_test(
+        &mut self,
+        session: &super::SessionKey,
+        not_before: Instant,
+    ) -> bool {
+        self.scheduler.defer_execution_retry(session, not_before)
     }
 
     #[cfg(test)]

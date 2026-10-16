@@ -2663,6 +2663,26 @@ impl Engine {
             .acknowledge_terminal_output(&session)
     }
 
+    /// Wait after a step that produced nothing: for `backoff`, but no
+    /// later than the next retry, deadline or cleanup time the scheduler
+    /// holds, and only until the engine or `external` is woken (SCH-F11).
+    pub async fn idle_wait(&self, backoff: std::time::Duration, external: Option<&Notify>) {
+        let now = Instant::now();
+        let wake_at = self.core.read().await.next_wakeup(now);
+        let sleep_for = wake_at.map_or(backoff, |at| backoff.min(at.duration_since(now)));
+        let external = async {
+            match external {
+                Some(notify) => notify.notified().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {}
+            _ = self.wake_notify.notified() => {}
+            _ = external => {}
+        }
+    }
+
     /// Run the engine continuously, processing requests as they arrive.
     ///
     /// This should be called in a separate task. It will run until `stop()` is called.
@@ -2689,10 +2709,8 @@ impl Engine {
             if has_work {
                 match self.step().await {
                     Ok(outputs) if outputs.is_empty() => {
-                        tokio::select! {
-                            _ = self.wake_notify.notified() => {},
-                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms)) => {},
-                        }
+                        self.idle_wait(std::time::Duration::from_millis(idle_backoff_ms), None)
+                            .await;
                         idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
                     }
                     Ok(_) => idle_backoff_ms = 1,
@@ -4481,6 +4499,36 @@ mod tests {
         }
         let terminal = wait_for_lane_completion(&engine, &session).await;
         assert!(terminal.error.is_none(), "{:?}", terminal.error);
+    }
+
+    /// SCH-F11: a decode row deferred to a retry time used to wait out the
+    /// idle backoff (up to 50 ms) after its retry time. The idle wait now
+    /// ends at the retry time.
+    #[tokio::test]
+    async fn idle_wait_ends_at_a_deferred_rows_retry_time() {
+        let engine = engine_with_test_executor(Box::new(EndlessSequenceExecutor));
+        let mut request = EngineCoreRequest::tts("deferred row");
+        request.id = "deferred-row".to_string();
+        request.prompt_tokens = vec![1];
+        request.params.max_tokens = usize::MAX;
+        engine.core.write().await.add_request(request).unwrap();
+        engine.step().await.unwrap();
+        let session = engine
+            .request_session_key(&"deferred-row".to_string())
+            .await
+            .expect("admitted");
+        let retry_at = Instant::now() + Duration::from_millis(30);
+        assert!(engine
+            .core
+            .write()
+            .await
+            .defer_execution_retry_for_test(&session, retry_at));
+
+        let started = Instant::now();
+        engine.idle_wait(Duration::from_secs(5), None).await;
+        let waited = started.elapsed();
+        assert!(Instant::now() >= retry_at, "{waited:?}");
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
     }
 
     #[tokio::test]
