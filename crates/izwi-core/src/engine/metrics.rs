@@ -1252,6 +1252,27 @@ pub(crate) fn model_calls_for_dispatch(dispatch: BatchDispatch) -> usize {
     }
 }
 
+static ENGINE_MIXED_ROWS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_mixed_rows",
+    "Rows of each phase in one committed mixed prefill+decode batch.",
+    &["phase"],
+    buckets::BATCH_ROWS,
+);
+static ENGINE_MIXED_TOKENS: HistogramFamily = HistogramFamily::new(
+    "izwi_engine_mixed_tokens",
+    "Tokens (decode rows plus prefill spans) in one committed mixed prefill+decode batch.",
+    &[],
+    buckets::BATCH_TOKENS,
+);
+
+/// Record one committed mixed batch: its decode and prefill rows and its
+/// tokens.
+pub(crate) fn record_engine_mixed_batch(decode_rows: usize, prefill_rows: usize, tokens: usize) {
+    ENGINE_MIXED_ROWS.observe(&["decode"], decode_rows as f64);
+    ENGINE_MIXED_ROWS.observe(&["prefill"], prefill_rows as f64);
+    ENGINE_MIXED_TOKENS.observe(&[], tokens as f64);
+}
+
 /// Record the model calls of one committed engine step that dispatched work.
 pub(crate) fn record_engine_step_model_calls(calls: usize) {
     if calls > 0 {
@@ -1302,6 +1323,8 @@ pub fn push_engine_histograms(payload: &mut String) {
     ENGINE_BATCH_ROWS.render(payload);
     ENGINE_BATCH_TOKENS.render(payload);
     ENGINE_MODEL_CALLS_PER_STEP.render(payload);
+    ENGINE_MIXED_ROWS.render(payload);
+    ENGINE_MIXED_TOKENS.render(payload);
 }
 
 pub fn engine_metric_catalog() -> &'static [EngineMetricDescriptor] {

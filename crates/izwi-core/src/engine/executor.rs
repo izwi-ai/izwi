@@ -1597,14 +1597,20 @@ impl PhysicalBatchExecution<'_> {
             ));
         }
 
-        let is_prefill = self.scheduled[0].is_prefill;
-        if self
-            .scheduled
-            .iter()
-            .any(|scheduled| scheduled.is_prefill != is_prefill)
-        {
+        // Only a mixed batch holds rows of both phases, decode rows first.
+        let ordered = if self.batch.mode == NativeBatchMode::Mixed {
+            self.scheduled
+                .windows(2)
+                .all(|pair| !pair[0].is_prefill || pair[1].is_prefill)
+        } else {
+            let is_prefill = self.scheduled[0].is_prefill;
+            self.scheduled
+                .iter()
+                .all(|scheduled| scheduled.is_prefill == is_prefill)
+        };
+        if !ordered {
             return Err(Error::InferenceError(
-                "one physical batch cannot mix prefill and decode dispatch".to_string(),
+                "a physical batch mixes prefill and decode rows outside a mixed batch".to_string(),
             ));
         }
         Ok(())
@@ -1644,6 +1650,13 @@ pub trait ModelExecutor: Send + Sync {
         execution.validate().map_err(|error| {
             PhysicalDispatchError::not_started(error, width, FailureOrigin::ExecutorValidation)
         })?;
+        if execution.batch.mode == NativeBatchMode::Mixed {
+            return Err(PhysicalDispatchError::not_started(
+                Error::InvalidInput("this executor has no mixed prefill and decode route".into()),
+                width,
+                FailureOrigin::ExecutorValidation,
+            ));
+        }
         let dispatch = execution.expected_dispatch();
         let result = if execution.is_prefill() {
             self.execute_prefill(execution.requests, execution.scheduled)

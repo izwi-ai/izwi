@@ -47,10 +47,10 @@ use super::executor::{
     UnifiedExecutor, WorkerConfig,
 };
 use super::metrics::{
-    model_calls_for_dispatch, record_engine_execution_outcome, record_engine_physical_batch,
-    record_engine_step_model_calls, record_engine_stream_checkpoint_committed,
-    record_engine_stream_checkpoint_rejection, record_engine_workspace_wait,
-    EngineWorkspaceWaitOutcome,
+    model_calls_for_dispatch, record_engine_execution_outcome, record_engine_mixed_batch,
+    record_engine_physical_batch, record_engine_step_model_calls,
+    record_engine_stream_checkpoint_committed, record_engine_stream_checkpoint_rejection,
+    record_engine_workspace_wait, EngineWorkspaceWaitOutcome,
 };
 use super::output::OutputProcessor;
 use super::request::{
@@ -498,25 +498,41 @@ impl PhysicalBatchAssembly {
             && self.launch_policy == launch_policy
     }
 
-    /// Structural precondition of `try_push` for a row of this cost. Element
-    /// and workspace budgets need the prepared row; `try_push` checks them.
-    fn may_accept(&self, cost: &WorkCost) -> bool {
+    /// Structural precondition of `try_push` for a row of this work and
+    /// cost. Element and workspace budgets need the prepared row; `try_push`
+    /// checks them.
+    fn may_accept(&self, work: &WorkUnit, cost: &WorkCost) -> bool {
         self.physical_batch.rows.len() < self.physical_batch.budget.max_rows
-            && !self.isolates_multi_token_quanta(cost)
+            && !self.isolates_multi_token_quanta(work, cost)
     }
 
-    fn isolates_multi_token_quanta(&self, cost: &WorkCost) -> bool {
-        // Shared continuous envelopes are N rows by exactly one token.
-        // Model-authored multi-token quanta are isolated so membership can
-        // change only after their bounded transaction commits.
-        self.physical_batch.mode == NativeBatchMode::Continuous
-            && !self.physical_batch.rows.is_empty()
-            && (cost.logical_units > 1
-                || self
-                    .physical_batch
-                    .rows
-                    .iter()
-                    .any(|existing| existing.cost.logical_units > 1))
+    /// A model-authored multi-token decode quantum (MTP drafts and verify):
+    /// continuous envelopes are N rows by exactly one token, and a mixed
+    /// batch holds one-token decode rows beside prefill spans of any length.
+    fn is_isolated_quantum(mode: NativeBatchMode, work: &WorkUnit, cost: &WorkCost) -> bool {
+        cost.logical_units > 1
+            && match mode {
+                NativeBatchMode::Continuous => true,
+                NativeBatchMode::Mixed => matches!(
+                    work,
+                    WorkUnit::SequenceStep {
+                        phase: SequencePhase::Decode,
+                        ..
+                    }
+                ),
+                NativeBatchMode::None | NativeBatchMode::Static => false,
+            }
+    }
+
+    fn isolates_multi_token_quanta(&self, work: &WorkUnit, cost: &WorkCost) -> bool {
+        // Isolated quanta run alone so membership can change only after
+        // their bounded transaction commits.
+        let mode = self.physical_batch.mode;
+        !self.physical_batch.rows.is_empty()
+            && (Self::is_isolated_quantum(mode, work, cost)
+                || self.physical_batch.rows.iter().any(|existing| {
+                    Self::is_isolated_quantum(mode, &existing.work, &existing.cost)
+                }))
     }
 
     /// Append `row` when the batch stays valid. The row is validated in
@@ -528,7 +544,7 @@ impl PhysicalBatchAssembly {
         scheduled: super::scheduler::ScheduledRequest,
         row: ReadyQuantum,
     ) -> std::result::Result<(), Box<RefusedBatchRow>> {
-        if self.isolates_multi_token_quanta(&row.cost) {
+        if self.isolates_multi_token_quanta(&row.work, &row.cost) {
             return Err(Box::new((request, scheduled, row)));
         }
         let previous = (
@@ -1292,8 +1308,15 @@ impl EngineCore {
                 *auxiliary_state = Some(Arc::from(spans));
             }
         }
+        let batch_mode = bound_stage
+            .as_ref()
+            .map_or(NativeBatchMode::None, |stage| stage.batch_mode);
         let work_kind = match &work {
             WorkUnit::PreSequencePreparation { kind } => kind.clone(),
+            // Both phases of a mixed stage share one lane.
+            WorkUnit::SequenceStep { .. } if batch_mode == NativeBatchMode::Mixed => {
+                "sequence_step".to_string()
+            }
             WorkUnit::SequenceStep { phase, .. } => format!("{phase:?}").to_ascii_lowercase(),
             WorkUnit::SequenceAudioDecode { .. } => "sequence_audio_decode".to_string(),
             WorkUnit::SequenceFinalize { .. } => "sequence_finalize".to_string(),
@@ -1318,9 +1341,6 @@ impl EngineCore {
             .zip(bound_stage.as_ref())
             .map(|(binding, stage)| binding.key_for_stage(stage.id))
             .transpose()?;
-        let batch_mode = bound_stage
-            .as_ref()
-            .map_or(NativeBatchMode::None, |stage| stage.batch_mode);
         let max_batch_size = bound_stage.as_ref().map_or(1, |stage| {
             if stage.concurrency == ConcurrencyClass::Batchable {
                 stage.max_batch_size.min(profile.max_batch_size).max(1)
@@ -3193,6 +3213,49 @@ impl EngineCore {
         Ok(())
     }
 
+    /// Form the decode side of a step: the mixed batch first (decode rows
+    /// and prefill spans of mixed-step models), then split decode rows in the
+    /// candidates it left.
+    #[allow(clippy::too_many_arguments)]
+    fn form_decode_side(
+        &mut self,
+        mixed_requests: &[Arc<EngineCoreRequest>],
+        mixed_scheduled: &[super::scheduler::ScheduledRequest],
+        decode_requests: &[Arc<EngineCoreRequest>],
+        decode_scheduled: &[super::scheduler::ScheduledRequest],
+        max_candidates: usize,
+        capacity_blocked: &mut Vec<super::scheduler::ScheduledRequest>,
+        transaction_deferred: &mut Vec<super::scheduler::ScheduledRequest>,
+        prepare_failures: &mut Vec<ManagedPrepareFailure>,
+    ) -> Result<Vec<PreparedPhysicalDispatch>> {
+        let mut batches = if mixed_scheduled.is_empty() {
+            Vec::new()
+        } else {
+            self.form_physical_batches(
+                ExecutionPhase::Mixed,
+                mixed_requests,
+                mixed_scheduled,
+                max_candidates,
+                capacity_blocked,
+                transaction_deferred,
+                prepare_failures,
+            )?
+        };
+        if !decode_scheduled.is_empty() {
+            let decode = self.form_physical_batches(
+                ExecutionPhase::Decode,
+                decode_requests,
+                decode_scheduled,
+                max_candidates.saturating_sub(batches.len()),
+                capacity_blocked,
+                transaction_deferred,
+                prepare_failures,
+            )?;
+            batches.extend(decode);
+        }
+        Ok(batches)
+    }
+
     fn form_physical_batches(
         &mut self,
         phase: ExecutionPhase,
@@ -3299,7 +3362,7 @@ impl EngineCore {
                             output_visibility,
                             shape_policy,
                             launch_policy,
-                        ) && assembly.may_accept(&cost)
+                        ) && assembly.may_accept(&plan.work, &cost)
                     });
             if assemblies.len() >= available_candidates && !joins_launchable_assembly {
                 transaction_deferred.push(scheduled.clone());
@@ -4944,17 +5007,38 @@ impl EngineCore {
             }
         }
 
-        let prefill_requests: Vec<Arc<EngineCoreRequest>> = prefill_scheduled
-            .iter()
-            .filter_map(|s| self.requests.get(&s.request_id).cloned())
-            .collect();
-        let decode_requests: Vec<Arc<EngineCoreRequest>> = decode_scheduled
-            .iter()
-            .filter_map(|s| self.requests.get(&s.request_id).cloned())
-            .collect();
+        // Rows whose plan bound a mixed stage run as one mixed batch on the
+        // decode side of the candidate slot: decode rows first, then prefill
+        // spans. That is the token layout the model needs, and it reserves
+        // managed KV in the order the scheduler allocated the plans.
+        let active_plans = &self.active_plans;
+        let is_mixed = |scheduled: &super::scheduler::ScheduledRequest| {
+            active_plans
+                .get(&scheduled.plan_id)
+                .is_some_and(|plan| plan.batch_mode == NativeBatchMode::Mixed)
+        };
+        let (mixed_decode, decode_scheduled): (Vec<_>, Vec<_>) =
+            decode_scheduled.into_iter().partition(is_mixed);
+        let (mixed_prefill, prefill_scheduled): (Vec<_>, Vec<_>) =
+            prefill_scheduled.into_iter().partition(is_mixed);
+        let mixed_scheduled = mixed_decode
+            .into_iter()
+            .chain(mixed_prefill)
+            .collect::<Vec<_>>();
+        let requests_of = |scheduled: &[super::scheduler::ScheduledRequest]| {
+            scheduled
+                .iter()
+                .filter_map(|s| self.requests.get(&s.request_id).cloned())
+                .collect::<Vec<Arc<EngineCoreRequest>>>()
+        };
+        let prefill_requests = requests_of(&prefill_scheduled);
+        let decode_requests = requests_of(&decode_scheduled);
+        let mixed_requests = requests_of(&mixed_scheduled);
+        let decode_side_empty = decode_scheduled.is_empty() && mixed_scheduled.is_empty();
 
         if prefill_requests.is_empty()
             && decode_requests.is_empty()
+            && mixed_requests.is_empty()
             && self.pending_terminal_outputs.is_empty()
         {
             super::metrics::record_kv_blocked_requests(0);
@@ -4969,10 +5053,10 @@ impl EngineCore {
             .resolved_physical_execution_capacity()
             .candidate_dispatch_limit
             .get();
-        let both_phases = !decode_scheduled.is_empty() && !prefill_scheduled.is_empty();
+        let both_phases = !decode_side_empty && !prefill_scheduled.is_empty();
         let (decode_quota, prefill_quota) = Self::candidate_phase_quotas(
             candidate_capacity,
-            decode_scheduled.len(),
+            decode_scheduled.len() + mixed_scheduled.len(),
             prefill_scheduled.len(),
             self.next_single_candidate_phase,
         );
@@ -5007,8 +5091,9 @@ impl EngineCore {
 
         let decode_limit = candidate_capacity.saturating_sub(self.in_flight_dispatches.len());
         if decode_quota > 0 && decode_limit > 0 {
-            decode_batches = match self.form_physical_batches(
-                ExecutionPhase::Decode,
+            decode_batches = match self.form_decode_side(
+                &mixed_requests,
+                &mixed_scheduled,
                 &decode_requests,
                 &decode_scheduled,
                 decode_limit,
@@ -5027,7 +5112,8 @@ impl EngineCore {
                     return Err(error);
                 }
             };
-        } else if !(decode_scheduled.is_empty() || candidate_capacity == 1 && both_phases) {
+        } else if !(decode_side_empty || candidate_capacity == 1 && both_phases) {
+            transaction_deferred.extend(mixed_scheduled.iter().cloned());
             transaction_deferred.extend(decode_scheduled.iter().cloned());
         }
 
@@ -5064,8 +5150,9 @@ impl EngineCore {
                         };
                     }
                     SequencePhase::Prefill => {
-                        decode_batches = match self.form_physical_batches(
-                            ExecutionPhase::Decode,
+                        decode_batches = match self.form_decode_side(
+                            &mixed_requests,
+                            &mixed_scheduled,
                             &decode_requests,
                             &decode_scheduled,
                             1,
@@ -5099,7 +5186,8 @@ impl EngineCore {
         if prefill_quota == 0 && !prefill_scheduled.is_empty() && prefill_batches.is_empty() {
             transaction_deferred.extend(prefill_scheduled.iter().cloned());
         }
-        if decode_quota == 0 && !decode_scheduled.is_empty() && decode_batches.is_empty() {
+        if decode_quota == 0 && !decode_side_empty && decode_batches.is_empty() {
+            transaction_deferred.extend(mixed_scheduled.iter().cloned());
             transaction_deferred.extend(decode_scheduled.iter().cloned());
         }
         self.rollback_unexecuted_schedule(&transaction_deferred);
@@ -5233,6 +5321,18 @@ impl EngineCore {
             } else {
                 record_engine_physical_batch(&batch.physical_batch, batch.report.dispatch);
                 step_model_calls += model_calls_for_dispatch(batch.report.dispatch);
+                if batch.phase == ExecutionPhase::Mixed {
+                    let prefill_rows = in_flight
+                        .scheduled
+                        .iter()
+                        .filter(|row| row.is_prefill)
+                        .count();
+                    record_engine_mixed_batch(
+                        in_flight.scheduled.len() - prefill_rows,
+                        prefill_rows,
+                        in_flight.scheduled.iter().map(|row| row.num_tokens).sum(),
+                    );
+                }
             }
 
             for (scheduled, result) in in_flight.scheduled.iter().filter_map(|scheduled| {
@@ -11126,7 +11226,12 @@ mod tests {
     #[derive(Default)]
     struct ManagedDecodeExecutor {
         incremental_prefill: bool,
+        /// Declare resumable prefill beside continuous decode rows of this
+        /// width, which a bound mixed stage turns into mixed steps.
+        mixed_width: Option<usize>,
         executed: Arc<Mutex<Vec<(super::super::PlanId, RequestId, bool)>>>,
+        /// Each executed batch's rows: plan id and whether it prefilled.
+        batches: Arc<Mutex<Vec<Vec<(super::super::PlanId, bool)>>>>,
     }
 
     impl ModelExecutor for ManagedDecodeExecutor {
@@ -11134,6 +11239,13 @@ mod tests {
             let mut profile = ManagedReceiptExecutor.execution_profile(request)?;
             if self.incremental_prefill {
                 profile.prefill = PrefillMode::Incremental;
+            }
+            if let Some(width) = self.mixed_width {
+                profile.prefill = PrefillMode::Incremental;
+                profile.incremental_decode = true;
+                profile.decode_batch = NativeBatchMode::Continuous;
+                profile.concurrency = ConcurrencyClass::Batchable;
+                profile.max_batch_size = width;
             }
             Some(profile)
         }
@@ -11160,6 +11272,13 @@ mod tests {
                         scheduled.is_prefill,
                     )
                 }));
+            self.batches.lock().unwrap().push(
+                execution
+                    .scheduled
+                    .iter()
+                    .map(|scheduled| (scheduled.plan_id, scheduled.is_prefill))
+                    .collect(),
+            );
             Ok(execution
                 .scheduled
                 .iter()
@@ -11352,6 +11471,25 @@ mod tests {
         retained_rows: usize,
         prompts: &[(usize, usize)],
     ) {
+        run_hybrid_requests(config, retained_rows, prompts, None).await;
+    }
+
+    /// What one hybrid run executed: each batch's rows (plan id, prefill)
+    /// and each step's model calls.
+    struct HybridRun {
+        batches: Vec<Vec<(super::super::PlanId, bool)>>,
+        step_model_calls: Vec<usize>,
+    }
+
+    /// [`run_chunked_hybrid_requests`], or with `mixed_width` a model bound
+    /// to one mixed stage of that width with the engine's chunked prefill
+    /// off (CPU and Metal), so prefill spans run in mixed steps.
+    async fn run_hybrid_requests(
+        config: EngineCoreConfig,
+        retained_rows: usize,
+        prompts: &[(usize, usize)],
+        mixed_width: Option<usize>,
+    ) -> HybridRun {
         use crate::kv::v2::{
             BoundedShape, CheckpointPolicy, PlacementPolicy, PrefixPolicy, ShapeAxis,
             ShapeDimension, ShapeExtent, StateComponentId, StateDType, StateDomainHeader,
@@ -11359,13 +11497,16 @@ mod tests {
             TensorStateDomainSpec,
         };
         let model = ModelInstanceId::new(100);
+        let batches = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
             incremental_prefill: true,
+            mixed_width,
+            batches: batches.clone(),
             ..Default::default()
         }));
         let mut core = EngineCore::new_with_unified_executor(
             EngineCoreConfig {
-                enable_chunked_prefill: true,
+                enable_chunked_prefill: mixed_width.is_none(),
                 backend: BackendKind::Cpu,
                 ..config
             },
@@ -11429,13 +11570,24 @@ mod tests {
                 .install_chat_execution_preparation(ModelVariant::Qwen306B, prompt, None, 4096)
                 .expect("prepare prompt");
             request.bind_model_instance(model).expect("model instance");
-            bind_managed_test_runtime(
-                &mut request,
-                model,
-                contract.clone(),
-                physical.clone(),
-                PrefillMode::Incremental,
-            );
+            match mixed_width {
+                Some(width) => bind_managed_test_runtime_with_batch(
+                    &mut request,
+                    model,
+                    contract.clone(),
+                    physical.clone(),
+                    PrefillMode::Incremental,
+                    NativeBatchMode::Mixed,
+                    width,
+                ),
+                None => bind_managed_test_runtime(
+                    &mut request,
+                    model,
+                    contract.clone(),
+                    physical.clone(),
+                    PrefillMode::Incremental,
+                ),
+            }
             core.add_request(request).expect("add");
             ids.insert(id);
         }
@@ -11460,6 +11612,113 @@ mod tests {
         assert_eq!(finished, ids);
         let snapshot = core.managed_kv_cache.runtime_snapshot();
         assert_eq!(snapshot.totals.coordinator.active_transactions, 0);
+        let batches = std::mem::take(&mut *batches.lock().unwrap());
+        HybridRun {
+            batches,
+            step_model_calls: std::mem::take(&mut core.step_model_calls),
+        }
+    }
+
+    /// Whether some batch of the run held both phases.
+    fn mixed_batches(run: &HybridRun) -> usize {
+        run.batches
+            .iter()
+            .filter(|rows| {
+                rows.iter().any(|(_, prefill)| *prefill)
+                    && rows.iter().any(|(_, prefill)| !*prefill)
+            })
+            .count()
+    }
+
+    /// The mixed-step invariants of one run: every batch is decode rows then
+    /// prefill rows in plan-allocation order (so managed KV was reserved in
+    /// the order the scheduler allocated the plans), and every step made one
+    /// model call.
+    fn assert_mixed_run(run: &HybridRun) {
+        for rows in &run.batches {
+            assert!(
+                rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "rows left plan-allocation order: {rows:?}"
+            );
+            assert!(
+                rows.windows(2).all(|pair| !pair[0].1 || pair[1].1),
+                "a prefill row preceded a decode row: {rows:?}"
+            );
+        }
+        assert!(
+            run.step_model_calls.iter().all(|calls| *calls == 1),
+            "{:?}",
+            run.step_model_calls
+        );
+    }
+
+    /// A mixed step withholds a prefill row whose tensor-state slot is held
+    /// while its decode rows run. Decode rows are reserved first, so the
+    /// withheld row's aborted transaction is the step's highest plan id (the
+    /// order behind the DuplicateTransaction fix, 9d9bae87).
+    #[tokio::test]
+    async fn mixed_step_withholds_a_prefill_row_and_keeps_its_decode_rows() {
+        let run = run_hybrid_requests(
+            EngineCoreConfig {
+                chunked_prefill_threshold: 4,
+                block_size: 16,
+                max_blocks: 64,
+                max_batch_size: 4,
+                max_retained_sequences: 2,
+                max_staged_transactions: 2,
+                ..Default::default()
+            },
+            2,
+            &[(8, 6), (8, 6), (8, 6)],
+            Some(4),
+        )
+        .await;
+        assert_mixed_run(&run);
+        // The third prompt's span was planned beside the two decode rows and
+        // withheld: its plan ids never executed.
+        let executed = run.batches.iter().map(Vec::len).sum::<usize>();
+        let planned = run
+            .batches
+            .iter()
+            .flatten()
+            .map(|(plan, _)| *plan)
+            .max()
+            .unwrap() as usize;
+        assert!(planned > executed, "{:?}", run.batches);
+    }
+
+    /// The hybrid burst in mixed steps: more running requests than
+    /// tensor-state slots, mixed prompt lengths, contended pages, one and
+    /// two candidate dispatches per step.
+    #[tokio::test]
+    async fn mixed_step_hybrid_burst_finishes_every_request() {
+        let prompts = (0..16)
+            .map(|index| (5 + (index * 7) % 37, 3 + index % 9))
+            .collect::<Vec<_>>();
+        for mode in [
+            crate::config::PhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow,
+        ] {
+            let run = run_hybrid_requests(
+                EngineCoreConfig {
+                    chunked_prefill_threshold: 8,
+                    block_size: 16,
+                    max_blocks: 24,
+                    max_batch_size: 8,
+                    max_retained_sequences: 4,
+                    max_staged_transactions: 4,
+                    physical_execution_mode: mode,
+                    max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+                    ..Default::default()
+                },
+                4,
+                &prompts,
+                Some(8),
+            )
+            .await;
+            assert_mixed_run(&run);
+            assert!(mixed_batches(&run) > 0, "{mode:?}: {:?}", run.batches);
+        }
     }
 
     /// Chunked prefill mixes decode and prefill rows in one step. The
@@ -11698,12 +11957,19 @@ mod tests {
         contract: crate::kv::v2::InferenceStateContract,
         physical: Arc<super::super::ManagedKvModelRuntime>,
         prefill: PrefillMode,
+        mixed: bool,
         width: usize,
     }
 
     impl BenchCore {
-        /// Room for `rows` requests in one native batch of `rows` rows.
-        fn new(rows: usize, prefill: PrefillMode) -> Self {
+        /// Room for `rows` requests in one native batch of `rows` rows. A
+        /// mixed core binds one mixed stage, which runs resumable prefill.
+        fn new(rows: usize, prefill: PrefillMode, mixed: bool) -> Self {
+            let prefill = if mixed {
+                PrefillMode::Incremental
+            } else {
+                prefill
+            };
             let model = ModelInstanceId::new(101);
             let last_decode_rows = Arc::new(AtomicUsize::new(0));
             let executor = UnifiedExecutor::new_for_test(Box::new(BatchedDecodeExecutor {
@@ -11713,7 +11979,7 @@ mod tests {
             }));
             let mut core = EngineCore::new_with_unified_executor(
                 EngineCoreConfig {
-                    enable_chunked_prefill: prefill == PrefillMode::Incremental,
+                    enable_chunked_prefill: prefill == PrefillMode::Incremental && !mixed,
                     block_size: 16,
                     // Full-request claims of 8 prompt + 4,000 output tokens.
                     max_blocks: rows * 256,
@@ -11743,6 +12009,7 @@ mod tests {
                 contract,
                 physical,
                 prefill,
+                mixed,
                 width: rows,
             }
         }
@@ -11772,7 +12039,11 @@ mod tests {
                 self.contract.clone(),
                 self.physical.clone(),
                 self.prefill,
-                NativeBatchMode::Continuous,
+                if self.mixed {
+                    NativeBatchMode::Mixed
+                } else {
+                    NativeBatchMode::Continuous
+                },
                 self.width,
             );
             self.core.add_request(request).expect("add");
@@ -11822,7 +12093,7 @@ mod tests {
     /// commit) with `rows` running requests in one native batch and a
     /// no-op executor, measured over `steps` steps after every row decodes.
     async fn measure_step_host_overhead(rows: usize, steps: usize) -> (f64, f64) {
-        let mut bench = BenchCore::new(rows, PrefillMode::Full);
+        let mut bench = BenchCore::new(rows, PrefillMode::Full, false);
         for index in 0..rows {
             bench.add(format!("bench-{index}"));
         }
@@ -11847,8 +12118,9 @@ mod tests {
         rows: usize,
         burst: usize,
         prefill: PrefillMode,
+        mixed: bool,
     ) -> (usize, usize, f64, f64) {
-        let mut bench = BenchCore::new(rows + burst, prefill);
+        let mut bench = BenchCore::new(rows + burst, prefill, mixed);
         for index in 0..rows {
             bench.add(format!("decode-{index}"));
         }
@@ -11882,8 +12154,8 @@ mod tests {
 
     /// SCH-F9 microbenchmark: engine host time per decode step at 64 and 256
     /// rows with a no-op executor, then a burst of 8 prompts under 64 decode
-    /// rows with full and resumable prefill: the steps and model calls the
-    /// split path needs to prefill the burst. Run in release:
+    /// rows with full and resumable prefill on the split path and in mixed
+    /// steps: the steps and model calls to prefill the burst. Run in release:
     /// `cargo test --release -p izwi-core --lib step_host_overhead_bench -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "host-overhead microbenchmark; run explicitly in release"]
@@ -11902,12 +12174,16 @@ mod tests {
                 total / rows as f64
             );
         }
-        for prefill in [PrefillMode::Full, PrefillMode::Incremental] {
-            let (steps, calls, prepare, total) = measure_prefill_burst(64, 8, prefill).await;
+        for (prefill, mixed) in [
+            (PrefillMode::Full, false),
+            (PrefillMode::Incremental, false),
+            (PrefillMode::Incremental, true),
+        ] {
+            let (steps, calls, prepare, total) = measure_prefill_burst(64, 8, prefill, mixed).await;
             let _ = writeln!(
                 std::io::stderr(),
-                "prefill_burst decode_rows=64 burst=8 prefill={prefill:?} steps={steps} \
-                 model_calls={calls} prepare_us={prepare:.1} step_us={total:.1}"
+                "prefill_burst decode_rows=64 burst=8 prefill={prefill:?} mixed={mixed} \
+                 steps={steps} model_calls={calls} prepare_us={prepare:.1} step_us={total:.1}"
             );
         }
     }
@@ -11918,10 +12194,57 @@ mod tests {
     #[tokio::test]
     async fn split_path_prefills_each_prompt_in_its_own_model_call() {
         for prefill in [PrefillMode::Full, PrefillMode::Incremental] {
-            let (steps, calls, _, _) = measure_prefill_burst(4, 3, prefill).await;
+            let (steps, calls, _, _) = measure_prefill_burst(4, 3, prefill, false).await;
             assert_eq!(calls, steps, "{prefill:?}: one model call per step");
             assert!(steps >= 3 + 2, "{prefill:?}: {steps} steps");
         }
+    }
+
+    #[test]
+    fn mixed_batches_isolate_only_multi_token_decode_quanta() {
+        let step = |phase, tokens: usize| WorkUnit::SequenceStep {
+            phase,
+            input: super::super::InputRange {
+                start: 0,
+                end: tokens,
+            },
+            max_output_steps: tokens,
+            auxiliary_state: None,
+        };
+        let cost = |units| WorkCost::new(units, units, 0);
+        let isolated = PhysicalBatchAssembly::is_isolated_quantum;
+        // A model-authored multi-token decode quantum (MTP) stays alone.
+        assert!(isolated(
+            NativeBatchMode::Mixed,
+            &step(SequencePhase::Decode, 4),
+            &cost(4)
+        ));
+        assert!(!isolated(
+            NativeBatchMode::Mixed,
+            &step(SequencePhase::Decode, 1),
+            &cost(1)
+        ));
+        // Prefill spans of any length share a mixed batch.
+        assert!(!isolated(
+            NativeBatchMode::Mixed,
+            &step(SequencePhase::Prefill, 16),
+            &cost(16)
+        ));
+        // Continuous envelopes keep isolating every multi-token row.
+        assert!(isolated(
+            NativeBatchMode::Continuous,
+            &step(SequencePhase::Prefill, 16),
+            &cost(16)
+        ));
+    }
+
+    /// In mixed steps the same burst prefills beside the decode rows in one
+    /// model call.
+    #[tokio::test]
+    async fn mixed_steps_prefill_a_burst_beside_decode_in_one_call() {
+        let (steps, calls, _, _) =
+            measure_prefill_burst(4, 3, PrefillMode::Incremental, true).await;
+        assert_eq!((steps, calls), (1, 1));
     }
 
     /// H2: a row whose managed state can never be prepared fails alone. The

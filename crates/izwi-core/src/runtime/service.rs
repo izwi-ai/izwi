@@ -10463,6 +10463,8 @@ mod tests {
             "izwi_engine_batch_rows",
             "izwi_engine_batch_tokens",
             "izwi_engine_model_calls_per_step",
+            "izwi_engine_mixed_rows",
+            "izwi_engine_mixed_tokens",
             "izwi_request_duration_seconds",
             "izwi_request_ttft_seconds",
             "izwi_request_queue_wait_seconds",
