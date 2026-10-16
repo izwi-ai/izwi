@@ -18,10 +18,98 @@ pub const DATABASE_URL_SCHEMES: &[&str] = &["postgres", "postgresql", "mysql", "
 
 /// Where the store database lives: a SQLite file path (the historical and
 /// default form) or a bounded database URL such as `postgres://...`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DatabaseSource {
     Path(PathBuf),
     Url(String),
+}
+
+impl std::fmt::Debug for DatabaseSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            Self::Url(url) => f
+                .debug_tuple("Url")
+                .field(&redact_database_url(url))
+                .finish(),
+        }
+    }
+}
+
+/// `text` (a driver error, say) with `url` and its credentials masked.
+pub fn redact_database_url_in(text: &str, url: &str) -> String {
+    let mut redacted = text.replace(url, &redact_database_url(url));
+    for secret in database_url_secrets(url) {
+        // Short values would mask unrelated text; the full URL is masked
+        // above in any case.
+        if secret.len() >= 4 {
+            redacted = redacted.replace(secret, "***");
+        }
+    }
+    redacted
+}
+
+fn database_url_secrets(url: &str) -> Vec<&str> {
+    let Some((_, rest)) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let (location, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let mut secrets = Vec::new();
+    if let Some((userinfo, _)) = location.rsplit_once('@') {
+        if let Some((_, password)) = userinfo.split_once(':') {
+            secrets.push(password);
+        }
+    }
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if is_secret_query_key(key) {
+                secrets.push(value);
+            }
+        }
+    }
+    secrets
+}
+
+fn is_secret_query_key(key: &str) -> bool {
+    ["password", "pass", "pwd", "sslpassword", "passfile"]
+        .contains(&key.to_ascii_lowercase().as_str())
+}
+
+/// `url` with its password and any credential query values masked, for
+/// errors, logs and `Debug` output.
+pub fn redact_database_url(url: &str) -> String {
+    const MASK: &str = "***";
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (location, query) = match rest.split_once('?') {
+        Some((location, query)) => (location, Some(query)),
+        None => (rest, None),
+    };
+    // The last `@` ends the user information; a password may contain more.
+    let location = match location.rsplit_once('@') {
+        Some((userinfo, host)) => match userinfo.split_once(':') {
+            Some((user, _)) => format!("{user}:{MASK}@{host}"),
+            None => format!("{userinfo}@{host}"),
+        },
+        None => location.to_string(),
+    };
+    let query = query.map(|query| {
+        query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((key, _)) if is_secret_query_key(key) => {
+                    format!("{key}={MASK}")
+                }
+                _ => pair.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    match query {
+        Some(query) => format!("{scheme}://{location}?{query}"),
+        None => format!("{scheme}://{location}"),
+    }
 }
 
 /// Parse a raw database reference. Values carrying a recognized `scheme://`
@@ -164,34 +252,46 @@ pub fn persist_audio_file(
             .join(format!("{record_id}.{}.tmp", uuid::Uuid::new_v4().simple())),
     );
 
-    if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create media directory: {}", parent.display()))?;
-    }
+    let parent = full_path
+        .parent()
+        .context("Media file path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create media directory: {}", parent.display()))?;
 
-    std::fs::write(&temp_path, bytes).with_context(|| {
+    let persisted = write_file_durably(&temp_path, &full_path, bytes);
+    if persisted.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    persisted?;
+
+    Ok(normalize_relative_path(relative_path))
+}
+
+/// Write `bytes` to `temp_path`, flush them to disk, move the file over
+/// `full_path` and flush the directory entry, so a crash leaves either the
+/// old file or the complete new one.
+fn write_file_durably(temp_path: &Path, full_path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(temp_path).with_context(|| {
         format!(
             "Failed writing media file to temporary path: {}",
             temp_path.display()
         )
     })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| {
+            format!(
+                "Failed writing media file to temporary path: {}",
+                temp_path.display()
+            )
+        })?;
+    drop(file);
 
-    if let Err(err) = std::fs::rename(&temp_path, &full_path) {
-        if full_path.exists() {
-            std::fs::remove_file(&full_path).with_context(|| {
-                format!(
-                    "Failed replacing existing media file: {}",
-                    full_path.display()
-                )
-            })?;
-            std::fs::rename(&temp_path, &full_path).with_context(|| {
-                format!(
-                    "Failed moving media file from '{}' to '{}': {err}",
-                    temp_path.display(),
-                    full_path.display()
-                )
-            })?;
-        } else {
+    // rename replaces an existing file atomically on Unix. Windows refuses
+    // to rename over an existing file, so there the old file goes first.
+    if let Err(err) = std::fs::rename(temp_path, full_path) {
+        if !full_path.is_file() {
             return Err(err).with_context(|| {
                 format!(
                     "Failed moving media file from '{}' to '{}'",
@@ -200,9 +300,27 @@ pub fn persist_audio_file(
                 )
             });
         }
+        std::fs::remove_file(full_path).with_context(|| {
+            format!(
+                "Failed replacing existing media file: {}",
+                full_path.display()
+            )
+        })?;
+        std::fs::rename(temp_path, full_path).with_context(|| {
+            format!(
+                "Failed moving media file from '{}' to '{}': {err}",
+                temp_path.display(),
+                full_path.display()
+            )
+        })?;
     }
-
-    Ok(normalize_relative_path(relative_path))
+    #[cfg(unix)]
+    if let Some(parent) = full_path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync media directory: {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 pub fn read_media_file(media_root: &Path, relative_path: &str) -> anyhow::Result<Vec<u8>> {
@@ -370,6 +488,79 @@ fn normalize_relative_path(path: PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_urls_are_redacted_in_debug_output() {
+        assert_eq!(
+            redact_database_url(
+                "postgres://izwi:s3cr@t@db.internal:5432/izwi?sslmode=require&password=other"
+            ),
+            "postgres://izwi:***@db.internal:5432/izwi?sslmode=require&password=***"
+        );
+        assert_eq!(
+            redact_database_url("postgres://izwi@db.internal/izwi"),
+            "postgres://izwi@db.internal/izwi"
+        );
+        assert_eq!(
+            redact_database_url("sqlite:///var/lib/izwi/izwi.sqlite3?mode=rwc"),
+            "sqlite:///var/lib/izwi/izwi.sqlite3?mode=rwc"
+        );
+        let source = DatabaseSource::Url("postgresql://u:hunter2@h/db?PassWord=x".to_string());
+        let debug = format!("{source:?}");
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("=x"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn persisted_media_replaces_the_target_and_never_leaves_temporary_files() {
+        let root = tempfile::tempdir().unwrap();
+        let key = persist_audio_file(
+            root.path(),
+            MediaGroup::Uploads,
+            "uploads",
+            "record",
+            Some("clip.wav"),
+            "audio/wav",
+            b"first",
+        )
+        .unwrap();
+        persist_audio_file(
+            root.path(),
+            MediaGroup::Uploads,
+            "uploads",
+            "record",
+            Some("clip.wav"),
+            "audio/wav",
+            b"second",
+        )
+        .unwrap();
+        assert_eq!(read_media_file(root.path(), &key).unwrap(), b"second");
+
+        // A target that cannot be replaced fails without leaking the
+        // temporary file.
+        let blocked = resolve_media_path(root.path(), &key).unwrap();
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("occupied"), b"x").unwrap();
+        assert!(persist_audio_file(
+            root.path(),
+            MediaGroup::Uploads,
+            "uploads",
+            "record",
+            Some("clip.wav"),
+            "audio/wav",
+            b"third",
+        )
+        .is_err());
+        let leftovers = std::fs::read_dir(blocked.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
 
     #[test]
     fn raw_f32_pcm_content_type_round_trips_through_local_object_keys() {

@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(3);
-const SQLITE_MAX_CONNECTIONS: u32 = 5;
+const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
+const MAX_POOL_MAX_CONNECTIONS: u32 = 1024;
+const DEFAULT_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Server-side bound on every statement, and on any transaction left idle,
 /// for the fleet coordination store. Coordination queries are single-row
 /// claims, upserts and counts; one that runs this long is a stuck lock or a
@@ -61,11 +63,12 @@ async fn connect_url(
     if url.trim_start().starts_with("sqlite://") {
         apply_sqlite_options(&mut options);
     } else {
+        let pool = PoolSettings::from_env();
         options
-            .max_connections(SQLITE_MAX_CONNECTIONS)
+            .max_connections(pool.max_connections)
             .min_connections(1)
-            .connect_timeout(SQLITE_BUSY_TIMEOUT)
-            .acquire_timeout(SQLITE_BUSY_TIMEOUT)
+            .connect_timeout(pool.acquire_timeout)
+            .acquire_timeout(pool.acquire_timeout)
             .sqlx_logging(false);
         #[cfg(feature = "db-postgres")]
         if let Some(timeout) = statement_timeout {
@@ -81,9 +84,42 @@ async fn connect_url(
     #[cfg(not(feature = "db-postgres"))]
     let _ = statement_timeout;
 
-    Database::connect(options)
-        .await
-        .with_context(|| format!("Unable to open SeaORM database at {url}"))
+    // Driver errors can quote the connection string, so the cause is
+    // redacted too rather than chained as is.
+    Database::connect(options).await.map_err(|error| {
+        anyhow::anyhow!(
+            "Unable to open SeaORM database at {}: {}",
+            storage_layout::redact_database_url(url),
+            storage_layout::redact_database_url_in(&error.to_string(), url)
+        )
+    })
+}
+
+/// Connection pool bounds for every backend: `IZWI_DB_MAX_CONNECTIONS`
+/// (1-1024, default 5) and `IZWI_DB_ACQUIRE_TIMEOUT_MS` (default 3000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolSettings {
+    max_connections: u32,
+    acquire_timeout: Duration,
+}
+
+impl PoolSettings {
+    fn from_env() -> Self {
+        let max_connections = std::env::var("IZWI_DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| (1..=MAX_POOL_MAX_CONNECTIONS).contains(value))
+            .unwrap_or(DEFAULT_POOL_MAX_CONNECTIONS);
+        let acquire_timeout = std::env::var("IZWI_DB_ACQUIRE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map_or(DEFAULT_POOL_ACQUIRE_TIMEOUT, Duration::from_millis);
+        Self {
+            max_connections,
+            acquire_timeout,
+        }
+    }
 }
 
 async fn connect_source(
@@ -97,11 +133,12 @@ async fn connect_source(
 }
 
 fn apply_sqlite_options(options: &mut ConnectOptions) {
+    let pool = PoolSettings::from_env();
     options
-        .max_connections(SQLITE_MAX_CONNECTIONS)
+        .max_connections(pool.max_connections)
         .min_connections(1)
-        .connect_timeout(SQLITE_BUSY_TIMEOUT)
-        .acquire_timeout(SQLITE_BUSY_TIMEOUT)
+        .connect_timeout(pool.acquire_timeout)
+        .acquire_timeout(pool.acquire_timeout)
         .sqlx_logging(false)
         .map_sqlx_sqlite_opts(|options| {
             options
@@ -221,6 +258,53 @@ mod tests {
     use crate::voice_defaults::DEFAULT_VOICE_PROFILE_ID;
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn pool_settings_are_configurable_and_bounded() {
+        let _guard = env_lock();
+        std::env::remove_var("IZWI_DB_MAX_CONNECTIONS");
+        std::env::remove_var("IZWI_DB_ACQUIRE_TIMEOUT_MS");
+        assert_eq!(
+            PoolSettings::from_env(),
+            PoolSettings {
+                max_connections: DEFAULT_POOL_MAX_CONNECTIONS,
+                acquire_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            }
+        );
+        std::env::set_var("IZWI_DB_MAX_CONNECTIONS", "32");
+        std::env::set_var("IZWI_DB_ACQUIRE_TIMEOUT_MS", "750");
+        assert_eq!(
+            PoolSettings::from_env(),
+            PoolSettings {
+                max_connections: 32,
+                acquire_timeout: Duration::from_millis(750),
+            }
+        );
+        std::env::set_var("IZWI_DB_MAX_CONNECTIONS", "0");
+        std::env::set_var("IZWI_DB_ACQUIRE_TIMEOUT_MS", "never");
+        assert_eq!(
+            PoolSettings::from_env(),
+            PoolSettings {
+                max_connections: DEFAULT_POOL_MAX_CONNECTIONS,
+                acquire_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            }
+        );
+        std::env::remove_var("IZWI_DB_MAX_CONNECTIONS");
+        std::env::remove_var("IZWI_DB_ACQUIRE_TIMEOUT_MS");
+    }
+
+    /// DUR-F11: a database password never reaches errors or Debug output.
+    #[tokio::test]
+    async fn database_url_credentials_stay_out_of_errors_and_debug() {
+        let store = StoreDatabase::from_url(
+            "postgres://izwi:hunter2@127.0.0.1:1/izwi?password=hunter3".to_string(),
+        );
+        let debug = format!("{store:?}");
+        assert!(!debug.contains("hunter"), "{debug}");
+        let error = format!("{:#}", store.connection().await.unwrap_err());
+        assert!(error.contains("izwi:***@127.0.0.1"), "{error}");
+        assert!(!error.contains("hunter"), "{error}");
+    }
 
     #[tokio::test]
     async fn url_source_migrates_a_sqlite_database_without_a_path() {

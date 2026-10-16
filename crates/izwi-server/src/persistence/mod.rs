@@ -350,15 +350,23 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     ) -> HookResult<StoredMediaObject> {
         let content_length = bytes.len() as u64;
         let (group, namespace) = local_namespace(&request.namespace, &request.metadata);
-        let key = storage_layout::persist_audio_file(
-            &self.media_root,
-            group,
-            &namespace,
-            &request.record_id,
-            request.preferred_filename.as_deref(),
-            &request.content_type,
-            &bytes,
-        )
+        let media_root = self.media_root.clone();
+        let record_id = request.record_id.clone();
+        let preferred_filename = request.preferred_filename.clone();
+        let content_type = request.content_type.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            storage_layout::persist_audio_file(
+                &media_root,
+                group,
+                &namespace,
+                &record_id,
+                preferred_filename.as_deref(),
+                &content_type,
+                &bytes,
+            )
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
         .map_err(|err| HookError::Failed(err.to_string()))?;
 
         Ok(StoredMediaObject {
@@ -612,7 +620,14 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     async fn get(&self, request: MediaReadRequest) -> HookResult<StoredMediaBytes> {
         let key = request.key.key;
         let metadata = request.metadata;
-        let bytes = storage_layout::read_media_file(&self.media_root, &key).map_err(|err| {
+        let media_root = self.media_root.clone();
+        let read_key = key.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            storage_layout::read_media_file(&media_root, &read_key)
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
+        .map_err(|err| {
             if is_not_found_error(&err) {
                 HookError::NotFound(key.clone())
             } else {
@@ -745,20 +760,26 @@ impl MediaStorageProvider for LocalMediaStorageProvider {
     }
 
     async fn delete(&self, request: MediaDeleteRequest) -> HookResult<()> {
-        storage_layout::delete_media_file(&self.media_root, Some(&request.key.key))
-            .map_err(|err| HookError::Failed(err.to_string()))?;
-        if let Some(parent) = reserved_write_parent_for_key(&self.media_root, &request.key.key) {
-            match std::fs::remove_dir(parent) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                    ) => {}
-                Err(error) => return Err(HookError::Failed(error.to_string())),
+        let media_root = self.media_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let key = request.key.key;
+            storage_layout::delete_media_file(&media_root, Some(&key))
+                .map_err(|err| HookError::Failed(err.to_string()))?;
+            if let Some(parent) = reserved_write_parent_for_key(&media_root, &key) {
+                match std::fs::remove_dir(parent) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(error) => return Err(HookError::Failed(error.to_string())),
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
+        .map_err(|err| HookError::Failed(err.to_string()))?
     }
 }
 
