@@ -793,16 +793,7 @@ impl Scheduler {
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
-            workspace_prefill_token_cap: request.execution_adapter_binding().and_then(|binding| {
-                binding
-                    .stages
-                    .iter()
-                    .filter(|stage| {
-                        stage.selector == crate::engine::StageWorkSelector::SequencePrefill
-                    })
-                    .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
-                    .min()
-            }),
+            workspace_prefill_token_cap: loaded_prefill_token_cap(request),
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
                 .and_then(declared_snapshot_prefill_interval),
@@ -857,20 +848,7 @@ impl Scheduler {
                 retry_not_before: None,
                 replay_prompt_tokens: None,
                 capacity_blocked_on: None,
-                workspace_prefill_token_cap: request.execution_adapter_binding().and_then(
-                    |binding| {
-                        binding
-                            .stages
-                            .iter()
-                            .filter(|stage| {
-                                stage.selector == crate::engine::StageWorkSelector::SequencePrefill
-                            })
-                            .map(|stage| {
-                                usize::try_from(stage.max_work_units).unwrap_or(usize::MAX)
-                            })
-                            .min()
-                    },
-                ),
+                workspace_prefill_token_cap: loaded_prefill_token_cap(request),
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
                     .and_then(declared_snapshot_prefill_interval),
@@ -3988,6 +3966,26 @@ impl Scheduler {
     }
 }
 
+/// The most prompt tokens one prefill span of `request` may take: the work
+/// budget of its loaded prefill stage, or of the mixed stage whose spans share
+/// a step with decode rows.
+fn loaded_prefill_token_cap(request: &EngineCoreRequest) -> Option<usize> {
+    request.execution_adapter_binding().and_then(|binding| {
+        binding
+            .stages
+            .iter()
+            .filter(|stage| {
+                matches!(
+                    stage.selector,
+                    crate::engine::StageWorkSelector::SequencePrefill
+                        | crate::engine::StageWorkSelector::SequenceStep
+                )
+            })
+            .map(|stage| usize::try_from(stage.max_work_units).unwrap_or(usize::MAX))
+            .min()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::TaskType;
@@ -4833,6 +4831,50 @@ mod tests {
                 .expect("prefill scheduled");
             scheduler.update_after_step(&row.request_id, row.num_tokens, 1, 1.0);
         }
+    }
+
+    /// An isolated request may take its model's preferred prefill span, but
+    /// never more than its loaded mixed stage's work budget: a longer span
+    /// fails the physical batch's budget check every step.
+    #[test]
+    fn mixed_stage_budget_caps_an_isolated_preferred_span() {
+        let mut scheduler = mixed_scheduler(64, 32);
+        let variant = ModelVariant::Lfm2512BInstructGguf;
+        let mut request =
+            build_request(TaskType::Chat, "isolated", Priority::Normal).with_model_variant(variant);
+        request.prompt_tokens = (0..400).collect();
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
+        let mut stage = crate::engine::StageDescriptor::from_execution_profile(
+            crate::engine::StageId::new(3),
+            "chat.step.mixed",
+            &profile,
+            NativeBatchMode::Mixed,
+        );
+        stage.selector = crate::engine::StageWorkSelector::SequenceStep;
+        stage.max_work_units = 64;
+        request
+            .bind_execution_adapter(crate::engine::ExecutionAdapterBinding {
+                execution_group_id: crate::engine::ExecutionGroupId::new(1),
+                model_instance_id: crate::engine::ModelInstanceId::new(1),
+                adapter_instance_id: crate::engine::AdapterInstanceId::new(1),
+                adapter_abi_revision: crate::engine::AdapterAbiRevision::new(1),
+                model_variant: variant,
+                capability_id: "chat".into(),
+                stages: std::sync::Arc::from([stage]),
+            })
+            .unwrap();
+        assert!(scheduler.add_request(&request));
+        let epoch = scheduler.get_sequence_id(&request.id).unwrap();
+        profile.prefill = PrefillMode::Incremental;
+        profile.incremental_decode = true;
+        profile.decode_batch = NativeBatchMode::Continuous;
+        profile.max_batch_size = 4;
+        profile.mixed_step = true;
+        profile.preferred_prefill_tokens = 256;
+        assert!(scheduler.update_execution_profile(&SessionKey::new(request.id, epoch), &profile));
+        let row = scheduler.schedule().prefill_requests.remove(0);
+        assert_eq!((row.num_computed_tokens, row.num_tokens), (0, 64));
     }
 
     #[test]

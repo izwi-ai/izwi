@@ -953,7 +953,7 @@ impl EngineCore {
         }
     }
 
-    fn apply_adapter_execution_contract(
+    pub(super) fn apply_adapter_execution_contract(
         request: &EngineCoreRequest,
         mut profile: ExecutionProfile,
     ) -> Result<ExecutionProfile> {

@@ -3142,11 +3142,16 @@ fn loaded_native_batch_support(request: &EngineCoreRequest) -> NativeBatchSuppor
         max_output_steps: 1,
         auxiliary_state: None,
     };
+    // A mixed stage serves decode rows as continuous rows beside its spans.
     let decode = decode_supported
         && binding.stage_for_work(&decode_work).is_ok_and(|stage| {
-            stage.selector == StageWorkSelector::SequenceDecode
-                && stage.batch_mode == NativeBatchMode::Continuous
-                && stage.concurrency == ConcurrencyClass::Batchable
+            matches!(
+                (stage.selector, stage.batch_mode),
+                (
+                    StageWorkSelector::SequenceDecode,
+                    NativeBatchMode::Continuous
+                ) | (StageWorkSelector::SequenceStep, NativeBatchMode::Mixed)
+            ) && stage.concurrency == ConcurrencyClass::Batchable
         });
     let prefill_work = WorkUnit::SequenceStep {
         phase: SequencePhase::Prefill,

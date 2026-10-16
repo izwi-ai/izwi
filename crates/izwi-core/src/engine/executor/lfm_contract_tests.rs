@@ -368,3 +368,60 @@ fn sealed_mixed_step_replaces_the_split_chat_stages() {
         }
     }
 }
+
+/// A request bound to a sealed mixed stage resolves to resumable prefill and
+/// continuous decode rows, the profile the mixed stage requires, so the core
+/// accepts the contract and records the mixed step.
+#[test]
+fn mixed_stage_requests_resolve_to_a_mixed_profile() {
+    let variant = ModelVariant::Lfm2512BInstructGguf;
+    let model = ChatModelLease::for_test(tiny_lfm_model(variant));
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(1),
+        ModelInstanceId::new(1),
+        variant,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    draft.seal_chat_workspace(8192).unwrap();
+    draft.seal_chat_prefill_workspace(1_000, 256).unwrap();
+    draft.seal_chat_mixed_step(384).unwrap();
+    for contract in draft.execution_contracts(CapabilityKind::Chat).unwrap() {
+        let mut request = EngineCoreRequest::chat(vec![crate::models::shared::chat::ChatMessage {
+            role: crate::models::shared::chat::ChatRole::User,
+            content: "Hello".into(),
+        }]);
+        request.model_variant = Some(variant);
+        request
+            .install_chat_execution_preparation_with_model(
+                variant,
+                vec![1, 0],
+                None,
+                model.clone(),
+                32,
+            )
+            .unwrap();
+        request
+            .bind_execution_adapter(ExecutionAdapterBinding {
+                execution_group_id: contract.execution_group_id,
+                model_instance_id: contract.model_instance_id,
+                adapter_instance_id: contract.adapter_instance_id,
+                adapter_abi_revision: contract.adapter_abi_revision,
+                model_variant: variant,
+                capability_id: "chat".into(),
+                stages: contract.stages,
+            })
+            .unwrap();
+        // Chunked prefill stays off: the mixed stage alone makes prefill
+        // resumable.
+        let executor = NativeExecutor::new(WorkerConfig::default());
+        let profile = executor.execution_profile(&request).unwrap();
+        assert_eq!(profile.prefill, crate::engine::PrefillMode::Incremental);
+        assert_eq!(profile.decode_batch, NativeBatchMode::Continuous);
+        let profile =
+            crate::engine::core::EngineCore::apply_adapter_execution_contract(&request, profile)
+                .unwrap();
+        assert!(profile.mixed_step);
+    }
+}
