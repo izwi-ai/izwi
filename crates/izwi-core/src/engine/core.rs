@@ -59,7 +59,7 @@ use super::request::{
     STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
 };
 use super::scheduler::{
-    BeginTerminalRelease, ExecutionLane, LaneSelection, Scheduler, SchedulerConfig,
+    BeginTerminalRelease, ExecutionLane, LaneScope, LaneSelection, Scheduler, SchedulerConfig,
     TerminalReleaseCause,
 };
 use super::types::{
@@ -888,7 +888,7 @@ pub struct EngineCore {
     /// Phase preferred when decode and prefill compete for a single physical
     /// candidate slot. It advances only after the preferred phase actually
     /// owns a ticket, so blocked work does not waste the device opportunity.
-    next_single_candidate_phase: SequencePhase,
+    next_single_candidate_phase: HashMap<LaneScope, SequencePhase>,
     /// Whether the engine has been initialized
     initialized: bool,
     /// Step counter for periodic cache housekeeping.
@@ -3144,6 +3144,32 @@ impl EngineCore {
         Ok((budget, stage.shape_policy))
     }
 
+    /// The scope of a tracked request's lane step driver; `None` (the whole
+    /// engine) for an unknown request.
+    pub(super) fn request_lane_scope(&self, request_id: &RequestId) -> LaneScope {
+        self.requests
+            .get(request_id)
+            .map(|request| request.model_instance_id())
+    }
+
+    /// Lanes of the tracked requests that use `variant`.
+    pub(super) fn variant_lanes(&self, variant: ModelVariant) -> Vec<ExecutionLane> {
+        let mut lanes = self
+            .requests
+            .values()
+            .filter(|request| request.model_variant == Some(variant))
+            .map(|request| request.model_instance_id())
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        lanes
+    }
+
+    /// Lanes that hold scheduler work.
+    pub(super) fn lanes_with_work(&self) -> Vec<ExecutionLane> {
+        self.scheduler.lanes_with_work()
+    }
+
     /// The execution lane of a tracked request.
     fn request_lane(&self, request_id: &RequestId) -> ExecutionLane {
         self.requests
@@ -3824,7 +3850,7 @@ impl EngineCore {
             restart_after_reset_hook: None,
             #[cfg(test)]
             step_model_calls: Vec::new(),
-            next_single_candidate_phase: SequencePhase::Decode,
+            next_single_candidate_phase: HashMap::new(),
             initialized: false,
             next_batch_id: 1,
         })
@@ -4926,6 +4952,15 @@ impl EngineCore {
 
     /// Prepare an immutable execution transaction under the engine state lock.
     pub(super) async fn prepare_step(&mut self) -> Result<Option<PreparedEngineStep>> {
+        self.prepare_step_for(None).await
+    }
+
+    /// [`Self::prepare_step`] for the rows `scope` serves: the whole engine,
+    /// or one lane for that lane's step driver.
+    pub(super) async fn prepare_step_for(
+        &mut self,
+        scope: LaneScope,
+    ) -> Result<Option<PreparedEngineStep>> {
         if let Some(recovery) = self.pending_runner_recovery.take() {
             recovery.wait_for_task_drain().await;
             self.rollback_in_flight_dispatches(recovery.batch_ids());
@@ -4938,10 +4973,15 @@ impl EngineCore {
         // Decode and prefill of one lane share one physical-quantum
         // ownership fence: a lane with a registered ticket is not polled
         // again until it commits or rolls back. Other lanes schedule.
-        let lanes = LaneSelection::all().excluding(self.busy_lanes());
+        let lanes = LaneSelection::scoped(scope).excluding(self.busy_lanes());
 
-        let blocked = std::mem::take(&mut self.workspace_pressure)
-            .into_values()
+        let (blocked, other_lanes): (Vec<_>, Vec<_>) = std::mem::take(&mut self.workspace_pressure)
+            .into_iter()
+            .partition(|(_, row)| lanes.admits(self.request_lane(&row.request_id)));
+        self.workspace_pressure.extend(other_lanes);
+        let blocked = blocked
+            .into_iter()
+            .map(|(_, row)| row)
             .filter(|row| {
                 self.requests
                     .get(&row.request_id)
@@ -5113,11 +5153,16 @@ impl EngineCore {
             .candidate_dispatch_limit
             .get();
         let both_phases = !decode_side_empty && !prefill_scheduled.is_empty();
+        let candidate_phase = self
+            .next_single_candidate_phase
+            .get(&scope)
+            .copied()
+            .unwrap_or(SequencePhase::Decode);
         let (decode_quota, prefill_quota) = Self::candidate_phase_quotas(
             candidate_capacity,
             decode_scheduled.len() + mixed_scheduled.len(),
             prefill_scheduled.len(),
-            self.next_single_candidate_phase,
+            candidate_phase,
         );
         let mut decode_batches = Vec::new();
         let mut prefill_batches = Vec::new();
@@ -5180,12 +5225,12 @@ impl EngineCore {
         // If the preferred phase cannot form a ticket, immediately offer the
         // slot to its peer rather than idling the physical lane.
         if candidate_capacity == 1 {
-            let preferred_admitted = match self.next_single_candidate_phase {
+            let preferred_admitted = match candidate_phase {
                 SequencePhase::Decode => !decode_batches.is_empty(),
                 SequencePhase::Prefill => !prefill_batches.is_empty(),
             };
             if both_phases && !preferred_admitted && self.dispatches_in_flight_in(&lanes) == 0 {
-                match self.next_single_candidate_phase {
+                match candidate_phase {
                     SequencePhase::Decode => {
                         prefill_batches = match self.form_physical_batches(
                             ExecutionPhase::Prefill,
@@ -5234,12 +5279,13 @@ impl EngineCore {
                 }
             }
 
-            self.next_single_candidate_phase = Self::next_candidate_preference(
-                self.next_single_candidate_phase,
+            let next = Self::next_candidate_preference(
+                candidate_phase,
                 both_phases,
                 !decode_batches.is_empty(),
                 !prefill_batches.is_empty(),
             );
+            self.next_single_candidate_phase.insert(scope, next);
         }
 
         if prefill_quota == 0 && !prefill_scheduled.is_empty() && prefill_batches.is_empty() {
@@ -5457,7 +5503,7 @@ impl EngineCore {
                                     .scheduled
                                     .iter()
                                     .filter(|row| row.plan_id == plan_id)
-                                    .map(|row| &row.work),
+                                    .map(|row| (&row.request_id, &row.work)),
                             );
                         }
                         if (committed.output.tokens_processed > 0
@@ -7854,7 +7900,8 @@ mod tests {
 
         // The previous step served decode, so the single slot prefers prefill
         // and defers the realtime decode-phase row.
-        core.next_single_candidate_phase = SequencePhase::Prefill;
+        core.next_single_candidate_phase
+            .insert(None, SequencePhase::Prefill);
         core.step().await.expect("prefill step");
         assert!(core.active_plans.is_empty());
 

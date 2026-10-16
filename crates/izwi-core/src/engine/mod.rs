@@ -318,12 +318,12 @@ impl Drop for CompletionRegistration<'_> {
             return;
         };
         let core = Arc::downgrade(&self.engine.core);
-        let step_gate = self.engine.step_gate.clone();
+        let gates = self.engine.gates.clone();
         let controls = self.engine.request_controls.clone();
         let wake_notify = self.engine.wake_notify.clone();
         handle.spawn(async move {
             let initial_delay = {
-                let _step = step_gate.lock().await;
+                let _step = gates.engine().await;
                 let Some(core) = core.upgrade() else {
                     return;
                 };
@@ -348,7 +348,7 @@ impl Drop for CompletionRegistration<'_> {
             let mut retry_delay = initial_delay;
             while let Some(delay) = retry_delay {
                 tokio::time::sleep(delay).await;
-                let _step = step_gate.lock().await;
+                let _step = gates.engine().await;
                 retry_delay = {
                     let Some(core) = core.upgrade() else {
                         return;
@@ -400,6 +400,107 @@ impl PendingAborts {
     }
 }
 
+/// Serializes prepare/execute/commit transactions against operations that
+/// mutate engine state between steps (SCH-F12).
+///
+/// Without lane step drivers every step and every such operation holds the
+/// engine gate exclusively: one global step gate. With lane step drivers a
+/// lane's step holds the engine gate shared plus its lane's gate, so lanes
+/// step concurrently and an operation scoped to one lane (an abort, a model
+/// load or purge, a realtime operation) waits only for that lane's step.
+/// Whole-engine operations still take the engine gate exclusively. A lane
+/// gate is always taken after the shared engine gate and never alongside
+/// another lane's gate.
+#[derive(Clone)]
+struct StepGates {
+    engine: Arc<RwLock<()>>,
+    lanes: Arc<std::sync::Mutex<HashMap<scheduler::ExecutionLane, Arc<Mutex<()>>>>>,
+    per_lane: bool,
+}
+
+enum StepGuard {
+    Exclusive {
+        _engine: tokio::sync::OwnedRwLockWriteGuard<()>,
+    },
+    Shared {
+        _engine: tokio::sync::OwnedRwLockReadGuard<()>,
+        _lane: Option<tokio::sync::OwnedMutexGuard<()>>,
+    },
+}
+
+impl StepGuard {
+    /// Whether lanes may be mid-step while this guard is held.
+    fn shared(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+}
+
+impl StepGates {
+    fn new(per_lane: bool) -> Self {
+        Self {
+            engine: Arc::new(RwLock::new(())),
+            lanes: Arc::default(),
+            per_lane,
+        }
+    }
+
+    /// Hold the engine exclusively: no step of any lane runs meanwhile.
+    async fn engine(&self) -> StepGuard {
+        StepGuard::Exclusive {
+            _engine: self.engine.clone().write_owned().await,
+        }
+    }
+
+    /// Hold `scope`: one lane's gate with lane step drivers, else the
+    /// engine exclusively.
+    async fn scope(&self, scope: scheduler::LaneScope) -> StepGuard {
+        let Some(lane) = scope.filter(|_| self.per_lane) else {
+            return self.engine().await;
+        };
+        let gate = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(lane)
+            .or_default()
+            .clone();
+        let shared = self.engine.clone().read_owned().await;
+        StepGuard::Shared {
+            _engine: shared,
+            _lane: Some(gate.lock_owned().await),
+        }
+    }
+
+    /// Hold every lane that serves `variant`: none (only excluding
+    /// whole-engine operations) when no tracked request uses it, its lane
+    /// when one does, and the engine exclusively when several do or
+    /// without lane step drivers.
+    async fn variant(&self, core: &RwLock<EngineCore>, variant: ModelVariant) -> StepGuard {
+        if !self.per_lane {
+            return self.engine().await;
+        }
+        let lanes = core.read().await.variant_lanes(variant);
+        match lanes.as_slice() {
+            [] => StepGuard::Shared {
+                _engine: self.engine.clone().read_owned().await,
+                _lane: None,
+            },
+            [lane] => self.scope(Some(*lane)).await,
+            _ => self.engine().await,
+        }
+    }
+
+    /// Hold the lane of `request_id`'s current session (the engine
+    /// exclusively for an unknown request or without lane step drivers).
+    async fn request(&self, core: &RwLock<EngineCore>, request_id: &RequestId) -> StepGuard {
+        if !self.per_lane {
+            return self.engine().await;
+        }
+        let lane = core.read().await.request_lane_scope(request_id);
+        self.scope(lane).await
+    }
+}
+
 #[derive(Default)]
 struct DeliveryLaneState {
     lanes: HashMap<SessionKey, mpsc::UnboundedSender<LaneMessage>>,
@@ -421,7 +522,7 @@ struct DeliveryLane {
     deliveries: std::sync::Weak<std::sync::Mutex<DeliveryLaneState>>,
     core: std::sync::Weak<RwLock<EngineCore>>,
     controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
-    step_gate: Arc<Mutex<()>>,
+    gates: StepGates,
     wake_notify: Arc<Notify>,
     failure: Option<executor::StreamDeliveryFailure>,
 }
@@ -523,7 +624,7 @@ impl DeliveryLane {
                 let mut outputs = vec![terminal];
                 if let Some(failed) = self.failure.take() {
                     if let Some(core) = self.core.upgrade() {
-                        let _step = self.step_gate.lock().await;
+                        let _step = self.gates.engine().await;
                         core.write()
                             .await
                             .reconcile_stream_delivery_failures(&mut outputs, vec![failed])
@@ -577,7 +678,7 @@ impl DeliveryLane {
             }
         }
         if let Some(core) = self.core.upgrade() {
-            let _step = self.step_gate.lock().await;
+            let _step = self.gates.engine().await;
             core.write()
                 .await
                 .reconcile_stream_delivery_failures(&mut Vec::new(), vec![failed.clone()])
@@ -592,7 +693,7 @@ pub struct Engine {
     core: Arc<RwLock<EngineCore>>,
     /// Serializes one complete prepare/execute/commit transaction without
     /// keeping the mutable engine state locked during device execution.
-    step_gate: Arc<Mutex<()>>,
+    gates: StepGates,
     /// Request processor validates and preprocesses inputs
     request_processor: RequestProcessor,
     /// Output processor formats results for clients
@@ -624,7 +725,7 @@ pub struct Engine {
 /// cannot interrupt the prepare/execute/commit sequence.
 struct OwnedStepContext {
     core: Arc<RwLock<EngineCore>>,
-    step_gate: Arc<Mutex<()>>,
+    gates: StepGates,
     metrics: Arc<RwLock<EngineMetrics>>,
     request_controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
@@ -635,7 +736,7 @@ struct OwnedStepContext {
 
 struct OwnedRunnerRecoveryGuard {
     core: Arc<RwLock<EngineCore>>,
-    step_gate: Arc<Mutex<()>>,
+    gates: StepGates,
     recovery: Option<execution_group::PreparedStepRecovery>,
     abort: tokio::task::AbortHandle,
 }
@@ -665,7 +766,7 @@ impl Drop for OwnedRunnerRecoveryGuard {
         };
         self.abort.abort();
         let core = self.core.clone();
-        let step_gate = self.step_gate.clone();
+        let gates = self.gates.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 recovery.wait_for_task_drain().await;
@@ -673,7 +774,7 @@ impl Drop for OwnedRunnerRecoveryGuard {
                 // dropping step still holds it, so this waits for that step to
                 // release it and then rolls back between steps instead of
                 // racing the next step's prepare or commit.
-                let _step = step_gate.lock().await;
+                let _step = gates.engine().await;
                 core.write()
                     .await
                     .rollback_in_flight_dispatches(recovery.batch_ids());
@@ -793,7 +894,7 @@ impl OwnedStepContext {
         });
         let mut recovery_guard = OwnedRunnerRecoveryGuard {
             core: self.core.clone(),
-            step_gate: self.step_gate.clone(),
+            gates: self.gates.clone(),
             recovery: Some(recovery.clone()),
             abort: runner.abort_handle(),
         };
@@ -1002,7 +1103,7 @@ impl OwnedStepContext {
                     deliveries: Arc::downgrade(&self.delivery_lanes),
                     core: Arc::downgrade(&self.core),
                     controls: self.request_controls.clone(),
-                    step_gate: self.step_gate.clone(),
+                    gates: self.gates.clone(),
                     wake_notify: self.wake_notify.clone(),
                     failure: None,
                 }
@@ -1155,13 +1256,17 @@ impl OwnedStepContext {
         Ok(outputs)
     }
 
-    async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
-        let _step = self.step_gate.lock().await;
-        self.pending_aborts.apply(&self.core, false).await;
+    async fn run(
+        self,
+        defer_unregistered_terminal_ack: bool,
+        scope: scheduler::LaneScope,
+    ) -> Result<Vec<EngineOutput>> {
+        let step = self.gates.scope(scope).await;
+        self.pending_aborts.apply(&self.core, step.shared()).await;
         let prepared = {
             let mut core = self.core.write().await;
             let started = Instant::now();
-            let prepared = core.prepare_step().await?;
+            let prepared = core.prepare_step_for(scope).await?;
             metrics::record_engine_step_phase(metrics::EngineStepPhase::Prepare, started.elapsed());
             prepared
         };
@@ -1299,7 +1404,7 @@ impl Engine {
 
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
-            step_gate: Arc::new(Mutex::new(())),
+            gates: StepGates::new(config.lane_step_drivers),
             request_processor,
             output_processor,
             config,
@@ -2664,23 +2769,44 @@ impl Engine {
     ///
     /// Returns outputs for any completed or streaming requests.
     pub async fn step(&self) -> Result<Vec<EngineOutput>> {
-        self.step_with_terminal_ack(false).await
+        self.step_with_terminal_ack(false, None).await
     }
 
     /// Execute a step while retaining unregistered terminal fences for an
     /// outer dispatcher. `Engine::generate` mailboxes are still delivered and
     /// acknowledged here.
     pub(crate) async fn step_for_dispatch(&self) -> Result<Vec<EngineOutput>> {
-        self.step_with_terminal_ack(true).await
+        self.step_with_terminal_ack(true, None).await
+    }
+
+    /// [`Self::step_for_dispatch`] for one execution lane. With lane step
+    /// drivers, steps of different lanes run concurrently; without, this
+    /// is a whole-engine step restricted to the lane's rows.
+    pub(crate) async fn step_lane_for_dispatch(
+        &self,
+        lane: scheduler::ExecutionLane,
+    ) -> Result<Vec<EngineOutput>> {
+        self.step_with_terminal_ack(true, Some(lane)).await
+    }
+
+    /// Whether each lane runs its own step driver.
+    pub(crate) fn lane_step_drivers(&self) -> bool {
+        self.gates.per_lane
+    }
+
+    /// Lanes that hold scheduler work.
+    pub(crate) async fn lanes_with_work(&self) -> Vec<scheduler::ExecutionLane> {
+        self.core.read().await.lanes_with_work()
     }
 
     async fn step_with_terminal_ack(
         &self,
         defer_unregistered_terminal_ack: bool,
+        scope: scheduler::LaneScope,
     ) -> Result<Vec<EngineOutput>> {
         let context = OwnedStepContext {
             core: self.core.clone(),
-            step_gate: self.step_gate.clone(),
+            gates: self.gates.clone(),
             metrics: self.metrics.clone(),
             request_controls: self.request_controls.clone(),
             completion_mailboxes: self.completion_mailboxes.clone(),
@@ -2688,7 +2814,8 @@ impl Engine {
             wake_notify: self.wake_notify.clone(),
             pending_aborts: self.pending_aborts.clone(),
         };
-        match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack).await }).await
+        match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack, scope).await })
+            .await
         {
             Ok(result) => result,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -2841,7 +2968,8 @@ impl Engine {
     /// waiting for a running step to finish when the session has no
     /// in-flight work in it (SCH-F12): the step applies the abort itself.
     /// A session with in-flight work is aborted once that work commits or
-    /// the step ends, as before.
+    /// the step ends, as before. With lane step drivers only the session's
+    /// lane step is waited for.
     async fn abort_core_session(&self, session: &SessionKey) -> bool {
         let (reply, mut answer) = oneshot::channel();
         self.pending_aborts
@@ -2853,8 +2981,8 @@ impl Engine {
         tokio::select! {
             biased;
             answer = &mut answer => answer.unwrap_or(false),
-            _step = self.step_gate.lock() => {
-                self.pending_aborts.apply(&self.core, false).await;
+            step = self.gates.request(&self.core, &session.request_id) => {
+                self.pending_aborts.apply(&self.core, step.shared()).await;
                 answer.await.unwrap_or(false)
             }
         }
@@ -2893,7 +3021,7 @@ impl Engine {
         let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
         request.set_cancellation_signal(cancellation.clone());
         let request_id = request.id.clone();
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.engine().await;
         let session = self.core.write().await.add_realtime_asr_session(request)?;
         self.request_controls
             .lock()
@@ -2942,7 +3070,7 @@ impl Engine {
         // draining concurrently while waiting to reacquire the gate so a
         // bounded output channel cannot block that delivery and deadlock the
         // operation's final barrier.
-        let delivery_barrier = self.step_gate.lock();
+        let delivery_barrier = self.gates.request(&self.core, &handle.session.request_id);
         tokio::pin!(delivery_barrier);
         let _delivery_barrier = loop {
             tokio::select! {
@@ -3039,7 +3167,10 @@ impl Engine {
     ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
         let _operation = handle.operation_gate.lock().await;
         let (operation_id, waiter) = {
-            let _step = self.step_gate.lock().await;
+            let _step = self
+                .gates
+                .request(&self.core, &handle.session.request_id)
+                .await;
             let mut core = self.core.write().await;
             core.enqueue_realtime_asr_push_with_cost(
                 &handle.session,
@@ -3092,7 +3223,10 @@ impl Engine {
     ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
         let _operation = handle.operation_gate.lock().await;
         let (operation_id, waiter) = {
-            let _step = self.step_gate.lock().await;
+            let _step = self
+                .gates
+                .request(&self.core, &handle.session.request_id)
+                .await;
             let mut core = self.core.write().await;
             core.enqueue_realtime_asr_finish_with_cost(
                 &handle.session,
@@ -3141,7 +3275,7 @@ impl Engine {
         // the run loop that owns cleanup retries. An active operation holds
         // this mutex until cancellation resolves its exact waiter.
         handle.committed_outputs.lock().await.close();
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.engine().await;
         let confirmation = self
             .core
             .write()
@@ -3238,7 +3372,7 @@ impl Engine {
                 }
             }
         }
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.engine().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_requests_for_variant(variant).await;
         self.request_controls
@@ -3258,9 +3392,10 @@ impl Engine {
     /// holding it here cannot deadlock.
     async fn with_core_on_device<T: Send>(
         &self,
+        scope: scheduler::LaneScope,
         work: impl FnOnce(&mut EngineCore) -> Result<T> + Send,
     ) -> Result<T> {
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.scope(scope).await;
         let mut core = self.core.write().await;
         let core: &mut EngineCore = &mut core;
         match core.device_thread() {
@@ -3271,12 +3406,12 @@ impl Engine {
 
     /// Purge reusable executor cache state owned by one model variant.
     pub async fn purge_model_cache(&self, variant: ModelVariant) -> CacheReleaseReport {
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.variant(&self.core, variant).await;
         self.core.write().await.purge_model_cache(variant).await
     }
 
     pub(crate) async fn synchronize_worker_device(&self) -> Result<()> {
-        self.with_core_on_device(|core| core.synchronize_worker_device())
+        self.with_core_on_device(None, |core| core.synchronize_worker_device())
             .await
     }
 
@@ -3308,7 +3443,7 @@ impl Engine {
         cuda_resident_pool: core::CudaResidentPool,
         decode_workspace_reserve_bytes: u64,
     ) -> Result<Option<Arc<ManagedKvModelRuntime>>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_cache_with_capacity_policy(
                 model_instance,
                 capability,
@@ -3329,7 +3464,7 @@ impl Engine {
         minimum_tokens: u64,
         reserve: StateFitReserve,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_state(
                 model_instance,
                 retained_state,
@@ -3345,7 +3480,7 @@ impl Engine {
         &self,
         model_instance: ModelInstanceId,
     ) -> Result<()> {
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.scope(Some(Some(model_instance))).await;
         self.core
             .write()
             .await
@@ -3360,7 +3495,7 @@ impl Engine {
         retained_rows: usize,
         staged_rows: usize,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_state_with_row_limits(
                 model_instance,
                 retained_state,
@@ -3381,7 +3516,7 @@ impl Engine {
         rows: (usize, usize),
         minimum_tokens: u64,
     ) -> Result<Arc<ManagedKvModelRuntime>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_managed_model_state_with_portable_copies_and_rows(
                 model_instance,
                 retained_state,
@@ -3404,7 +3539,7 @@ impl Engine {
         logical_context_tokens: Option<usize>,
         minimum_tokens: u64,
     ) -> Result<Arc<CompositeRetainedStateRuntimeV2>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_composite_retained_state(
                 model_instance,
                 contract,
@@ -3422,7 +3557,7 @@ impl Engine {
         contract: &crate::kv::v2::InferenceStateContract,
         sequence_capacity: u32,
     ) -> Result<Arc<RetainedTensorStateRuntimeV2>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.load_retained_tensor_state(model_instance, contract, sequence_capacity)
         })
         .await
@@ -3438,7 +3573,7 @@ impl Engine {
         domain: &crate::kv::v2::InvocationWorkspaceDomain,
         slot_count: u32,
     ) -> Result<Arc<dyn crate::kv::v2::InvocationWorkspaceBackingV2>> {
-        self.with_core_on_device(|core| {
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
             core.resolve_and_load_invocation_workspace(
                 model_instance,
                 adapter_instance,
@@ -3457,8 +3592,10 @@ impl Engine {
         &self,
         model_instance: ModelInstanceId,
     ) -> Result<bool> {
-        self.with_core_on_device(|core| core.unload_managed_model_cache(model_instance))
-            .await
+        self.with_core_on_device(Some(Some(model_instance)), |core| {
+            core.unload_managed_model_cache(model_instance)
+        })
+        .await
     }
 
     /// Abort every request currently tracked by the engine.
@@ -3474,7 +3611,7 @@ impl Engine {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
         }
-        let _step = self.step_gate.lock().await;
+        let _step = self.gates.engine().await;
         let mut core = self.core.write().await;
         let aborted = core.abort_all_requests().await;
         self.request_controls
@@ -4182,12 +4319,13 @@ mod tests {
 
     impl BlockingForwardExecutor {
         fn execute(&self, scheduled: &[ScheduledRequest]) -> Vec<ExecutorStepResult> {
-            if let Some(entered) = self
+            // Only the first call blocks; later calls must not wait on it.
+            let entered = self
                 .entered
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .take()
-            {
+                .take();
+            if let Some(entered) = entered {
                 let _ = entered.send(());
                 let (released, wake) = self.release.as_ref();
                 let mut released = released.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -4277,7 +4415,7 @@ mod tests {
         let config = core.config().clone();
         Engine {
             core: Arc::new(RwLock::new(core)),
-            step_gate: Arc::new(Mutex::new(())),
+            gates: StepGates::new(config.lane_step_drivers),
             request_processor: RequestProcessor::new(config.clone()),
             output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(
@@ -4296,6 +4434,74 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lane_steps_and_aborts_while_another_lane_dispatch_runs() {
+        /// Unblocks the held dispatch when dropped, also on a failed
+        /// assertion, so the runtime can shut down.
+        struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let (released, wake) = self.0.as_ref();
+                *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+                wake.notify_all();
+            }
+        }
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let releaser = Release(release.clone());
+        let core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                lane_step_drivers: true,
+                max_batch_size: 1,
+                ..Default::default()
+            },
+            executor::UnifiedExecutor::new_for_test(Box::new(BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            })),
+        )
+        .unwrap();
+        let engine = Arc::new(engine_around_core(core));
+        let (held, free) = (ModelInstanceId::new(1), ModelInstanceId::new(2));
+        for (id, model) in [("held", held), ("free", free), ("free-queued", free)] {
+            let mut request = immediate_terminal_request(id);
+            request.bind_model_instance(model).unwrap();
+            engine.core.write().await.add_request(request).unwrap();
+        }
+
+        let held_step = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.step_lane_for_dispatch(Some(held)).await })
+        };
+        entered_rx.await.unwrap();
+        // The held lane's dispatch is running: the other lane still steps,
+        // and an abort in it waits only for that lane.
+        let outputs = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.step_lane_for_dispatch(Some(free)),
+        )
+        .await
+        .expect("the free lane steps while the held lane's dispatch runs")
+        .unwrap();
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "free" && output.is_finished));
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.abort_request(&"free-queued".to_string()),
+        )
+        .await
+        .expect("an abort in the free lane does not wait for the held lane")
+        .unwrap();
+        assert!(aborted);
+
+        drop(releaser);
+        let outputs = held_step.await.unwrap().unwrap();
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "held" && output.is_finished));
+    }
+
     #[tokio::test]
     async fn credited_audio_delivery_does_not_block_peers_or_overtake_terminal() {
         let engine = engine_with_test_executor(Box::new(ImmediateTerminalExecutor::new(Arc::new(
@@ -4303,7 +4509,7 @@ mod tests {
         ))));
         let context = OwnedStepContext {
             core: engine.core.clone(),
-            step_gate: engine.step_gate.clone(),
+            gates: engine.gates.clone(),
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
@@ -4393,7 +4599,7 @@ mod tests {
     fn owned_step_context(engine: &Engine) -> OwnedStepContext {
         OwnedStepContext {
             core: engine.core.clone(),
-            step_gate: engine.step_gate.clone(),
+            gates: engine.gates.clone(),
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
@@ -4632,7 +4838,7 @@ mod tests {
         ))));
         let context = OwnedStepContext {
             core: engine.core.clone(),
-            step_gate: engine.step_gate.clone(),
+            gates: engine.gates.clone(),
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
@@ -4727,7 +4933,7 @@ mod tests {
         );
         let context = OwnedStepContext {
             core: engine.core.clone(),
-            step_gate: engine.step_gate.clone(),
+            gates: engine.gates.clone(),
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
@@ -4856,7 +5062,7 @@ mod tests {
             committed_outputs: Arc::new(Mutex::new(rx)),
             operation_gate: Arc::new(Mutex::new(())),
         };
-        let barrier = engine.step_gate.lock().await;
+        let barrier = engine.gates.engine().await;
         let task_engine = engine.clone();
         let task_handle = handle.clone();
         let drain = tokio::spawn(async move {
@@ -5597,7 +5803,7 @@ mod tests {
         .unwrap();
         let engine = Arc::new(Engine {
             core: Arc::new(RwLock::new(core)),
-            step_gate: Arc::new(Mutex::new(())),
+            gates: StepGates::new(false),
             request_processor: RequestProcessor::new(config.clone()),
             output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(2)),

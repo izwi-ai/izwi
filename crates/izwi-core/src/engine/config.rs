@@ -96,6 +96,13 @@ pub struct EngineCoreConfig {
     #[serde(default)]
     pub max_physical_in_flight: PhysicalInFlightLimit,
 
+    /// Run one step driver per execution lane (loaded model instance)
+    /// instead of one for the whole engine, so one model's long dispatch
+    /// does not hold every other model's steps. Off by default; set with
+    /// IZWI_LANE_STEP_DRIVERS=1.
+    #[serde(default = "default_lane_step_drivers")]
+    pub lane_step_drivers: bool,
+
     /// Maximum retained sequence/session rows in managed model state.
     #[serde(default = "default_max_retained_sequences")]
     pub max_retained_sequences: usize,
@@ -387,6 +394,11 @@ fn default_kv_cache_dtype() -> String {
 fn default_max_blocks() -> usize {
     1024
 }
+fn default_lane_step_drivers() -> bool {
+    std::env::var("IZWI_LANE_STEP_DRIVERS")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+}
+
 fn default_cuda_incremental_chat() -> bool {
     cuda_incremental_chat_from_env(std::env::var("IZWI_CUDA_INCREMENTAL_CHAT").ok().as_deref())
 }
@@ -618,6 +630,7 @@ impl Default for EngineCoreConfig {
             max_tensor_batch_size: BatchSizePreference::Auto,
             physical_execution_mode: PhysicalExecutionMode::Serial,
             max_physical_in_flight: PhysicalInFlightLimit::default(),
+            lane_step_drivers: default_lane_step_drivers(),
             max_retained_sequences: default_max_retained_sequences(),
             max_staged_transactions: default_max_staged_transactions(),
             automatic_row_limits: AutomaticRowLimits::default(),

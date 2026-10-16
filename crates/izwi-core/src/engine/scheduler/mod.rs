@@ -45,6 +45,10 @@ pub(crate) type ManagedPrefixProbe<'a> = dyn FnMut(&SessionKey) -> Option<u32> +
 /// to. Rows with no bound instance share the unbound lane (`None`).
 pub(crate) type ExecutionLane = Option<ModelInstanceId>;
 
+/// What one step driver serves: `None` is the whole engine (the single
+/// step driver), `Some(lane)` one lane's step driver.
+pub(crate) type LaneScope = Option<ExecutionLane>;
+
 /// The lanes one schedule may serve. A lane with a dispatch in flight is
 /// busy: none of its rows is scheduled until that dispatch commits or rolls
 /// back, so its decode rows cannot be planned twice. Other lanes schedule
@@ -61,10 +65,10 @@ impl LaneSelection {
         Self::default()
     }
 
-    /// One lane only.
-    pub(crate) fn only(lane: ExecutionLane) -> Self {
+    /// The lanes `scope` serves.
+    pub(crate) fn scoped(scope: LaneScope) -> Self {
         Self {
-            only: Some(lane),
+            only: scope,
             busy: HashSet::new(),
         }
     }
@@ -460,6 +464,18 @@ pub struct Scheduler {
     class_virtual_floor: u64,
     tenant_service: HashMap<TenantServiceKey, TenantService>,
     tenant_service_floor: HashMap<WorkloadClass, u64>,
+    /// Starvation debts of the whole engine, read by the single step driver.
+    debts: StarvationDebts,
+    /// Starvation debts of each lane, read by that lane's step driver. Both
+    /// are kept on every commit; a lane is absent while it owes nothing.
+    lane_debts: HashMap<ExecutionLane, StarvationDebts>,
+    /// Committed non-realtime quanta, stamped on each row they served.
+    service_clock: u64,
+}
+
+/// Bounded-starvation guards, counted over committed transactions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StarvationDebts {
     /// Decode-only transactions observed while an indivisible full prefill was
     /// waiting. This bounds starvation without pretending that a Full adapter
     /// can safely resume a scheduler-authored chunk.
@@ -475,8 +491,6 @@ pub struct Scheduler {
     /// Committed decode transactions that served only codec or finalization
     /// rows while an AR decode row was ready; bounded the same way.
     audio_only_steps_with_ready_decode: usize,
-    /// Committed non-realtime quanta, stamped on each row they served.
-    service_clock: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -758,10 +772,8 @@ impl Scheduler {
             class_virtual_floor: 0,
             tenant_service: HashMap::new(),
             tenant_service_floor: HashMap::new(),
-            decode_only_steps_with_waiting_full_prefill: 0,
-            decode_only_steps_with_waiting_incremental_prefill: 0,
-            realtime_only_steps_with_ready_decode: 0,
-            audio_only_steps_with_ready_decode: 0,
+            debts: StarvationDebts::default(),
+            lane_debts: HashMap::new(),
             service_clock: 0,
         }
     }
@@ -1181,16 +1193,17 @@ impl Scheduler {
         self.update_dynamic_budget();
 
         let total_budget = self.current_token_budget();
+        let debts = self.debts(lanes.only);
         let waiting_in_lanes = self.waiting_in(lanes);
         let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now, lanes);
         let force_full_prefill_service = waiting_full_prefill
-            && self.decode_only_steps_with_waiting_full_prefill
+            && debts.decode_only_steps_with_waiting_full_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL;
         let waiting_incremental_prefill =
             self.has_eligible_incremental_prefill(scheduling_now, lanes);
         let force_incremental_prefill_service = !force_full_prefill_service
             && waiting_incremental_prefill
-            && self.decode_only_steps_with_waiting_incremental_prefill
+            && debts.decode_only_steps_with_waiting_incremental_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL;
         let latency_sensitive_waiting = self.has_latency_sensitive_waiting(lanes);
         let throughput_waiting_only =
@@ -1257,7 +1270,7 @@ impl Scheduler {
         // Realtime and ordinary rows never share a physical batch, and the
         // core launches the first-formed lane. Once committed realtime-only
         // transactions reach the bound, yield this transaction entirely.
-        let reserve_ordinary_decode = self.realtime_only_steps_with_ready_decode
+        let reserve_ordinary_decode = debts.realtime_only_steps_with_ready_decode
             >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE
             && self.ordinary_decode_ready(scheduling_now, false, lanes);
 
@@ -1327,7 +1340,7 @@ impl Scheduler {
         // A sustained supply of codec work must still leave a bounded
         // opportunity for AR to refill other streams' audio buffers. Codec and
         // AR rows form separate lanes, so the reserved transaction is AR-only.
-        let reserve_ordinary_decode = self.audio_only_steps_with_ready_decode >= 4
+        let reserve_ordinary_decode = debts.audio_only_steps_with_ready_decode >= 4
             && self.ordinary_decode_ready(scheduling_now, true, lanes);
         let mut finalize_candidates = self
             .running
@@ -2548,6 +2561,52 @@ impl Scheduler {
         true
     }
 
+    /// The starvation debts `scope`'s step driver reads.
+    fn debts(&self, scope: LaneScope) -> StarvationDebts {
+        match scope {
+            None => self.debts,
+            Some(lane) => self.lane_debts.get(&lane).copied().unwrap_or_default(),
+        }
+    }
+
+    /// Apply `update` to the engine's debts and to the debts of each lane
+    /// among `rows`, which sees only that lane's rows and requests.
+    fn update_debts<T>(
+        &mut self,
+        rows: &[(&RequestId, T)],
+        update: impl Fn(&Self, StarvationDebts, &[(&RequestId, T)], &LaneSelection) -> StarvationDebts,
+    ) where
+        T: Copy,
+    {
+        self.debts = update(self, self.debts, rows, &LaneSelection::all());
+        let mut lanes = rows
+            .iter()
+            .map(|(request_id, _)| self.requests.get(*request_id).and_then(|m| m.lane))
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        for lane in lanes {
+            let lane_rows = rows
+                .iter()
+                .filter(|(request_id, _)| {
+                    self.requests.get(*request_id).and_then(|m| m.lane) == lane
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            let debts = update(
+                self,
+                self.debts(Some(lane)),
+                &lane_rows,
+                &LaneSelection::scoped(Some(lane)),
+            );
+            if debts == StarvationDebts::default() {
+                self.lane_debts.remove(&lane);
+            } else {
+                self.lane_debts.insert(lane, debts);
+            }
+        }
+    }
+
     /// Advance starvation debt once per successfully committed physical
     /// transaction. Scheduler polling, retry deferral, and rolled-back model
     /// work must not mutate this service clock.
@@ -2561,34 +2620,37 @@ impl Scheduler {
         if committed_rows.is_empty() {
             return;
         }
-        let decode_transaction = committed_rows
+        let rows = committed_rows
             .iter()
-            .all(|(_, phase)| *phase == SequencePhase::Decode);
-        let served_prefill = |mode: PrefillMode| {
-            committed_rows.iter().any(|(request_id, phase)| {
-                *phase == SequencePhase::Prefill
-                    && self
-                        .requests
-                        .get(request_id)
-                        .is_some_and(|metadata| metadata.cache_policy.prefill == mode)
-            })
-        };
-        let served_full_prefill = served_prefill(PrefillMode::Full);
-        let served_incremental_prefill = served_prefill(PrefillMode::Incremental);
-        if served_full_prefill || !self.has_pending_full_prefill() {
-            self.decode_only_steps_with_waiting_full_prefill = 0;
-        } else if decode_transaction {
-            self.decode_only_steps_with_waiting_full_prefill = self
-                .decode_only_steps_with_waiting_full_prefill
-                .saturating_add(1);
-        }
-        if served_incremental_prefill || !self.has_pending_incremental_prefill() {
-            self.decode_only_steps_with_waiting_incremental_prefill = 0;
-        } else if decode_transaction {
-            self.decode_only_steps_with_waiting_incremental_prefill = self
-                .decode_only_steps_with_waiting_incremental_prefill
-                .saturating_add(1);
-        }
+            .map(|(request_id, phase)| (request_id, *phase))
+            .collect::<Vec<_>>();
+        self.update_debts(&rows, |scheduler, mut debts, rows, lanes| {
+            let decode_transaction = rows
+                .iter()
+                .all(|(_, phase)| *phase == SequencePhase::Decode);
+            let served_prefill = |mode: PrefillMode| {
+                rows.iter().any(|(request_id, phase)| {
+                    *phase == SequencePhase::Prefill
+                        && scheduler
+                            .requests
+                            .get(*request_id)
+                            .is_some_and(|metadata| metadata.cache_policy.prefill == mode)
+                })
+            };
+            if served_prefill(PrefillMode::Full) || !scheduler.has_pending_full_prefill(lanes) {
+                debts.decode_only_steps_with_waiting_full_prefill = 0;
+            } else if decode_transaction {
+                debts.decode_only_steps_with_waiting_full_prefill += 1;
+            }
+            if served_prefill(PrefillMode::Incremental)
+                || !scheduler.has_pending_incremental_prefill(lanes)
+            {
+                debts.decode_only_steps_with_waiting_incremental_prefill = 0;
+            } else if decode_transaction {
+                debts.decode_only_steps_with_waiting_incremental_prefill += 1;
+            }
+            debts
+        });
     }
 
     /// Rows withheld for managed capacity wait on state that running
@@ -2609,16 +2671,21 @@ impl Scheduler {
             if !scheduled.is_prefill {
                 continue;
             }
-            match self
-                .requests
-                .get(&scheduled.request_id)
-                .map(|metadata| metadata.cache_policy.prefill)
+            let Some(metadata) = self.requests.get(&scheduled.request_id) else {
+                continue;
+            };
+            let (mode, lane) = (metadata.cache_policy.prefill, metadata.lane);
+            for debts in [Some(&mut self.debts), self.lane_debts.get_mut(&lane)]
+                .into_iter()
+                .flatten()
             {
-                Some(PrefillMode::Full) => self.decode_only_steps_with_waiting_full_prefill = 0,
-                Some(PrefillMode::Incremental) => {
-                    self.decode_only_steps_with_waiting_incremental_prefill = 0;
+                match mode {
+                    PrefillMode::Full => debts.decode_only_steps_with_waiting_full_prefill = 0,
+                    PrefillMode::Incremental => {
+                        debts.decode_only_steps_with_waiting_incremental_prefill = 0;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
@@ -2627,44 +2694,48 @@ impl Scheduler {
     /// decode transaction, keyed on the rows that committed. The core defers
     /// scheduled rows whose lane does not own the physical slot, so a row
     /// that was merely scheduled is not service.
-    pub(crate) fn record_committed_decode_service(&mut self, committed: &[&WorkUnit]) {
+    pub(crate) fn record_committed_decode_service(
+        &mut self,
+        committed: &[(&RequestId, &WorkUnit)],
+    ) {
         if committed.is_empty() {
             return;
         }
         let now = Instant::now();
-        let realtime = |work: &WorkUnit| {
-            matches!(
-                work,
-                WorkUnit::RealtimePush { .. }
-                    | WorkUnit::RealtimeFinish { .. }
-                    | WorkUnit::RealtimePreparation { .. }
-                    | WorkUnit::RealtimePromptPrefill { .. }
-                    | WorkUnit::RealtimeDecodeContinuation { .. }
-                    | WorkUnit::RealtimeCompletion { .. }
-            )
-        };
-        let served_ordinary = committed.iter().any(|work| !realtime(work));
-        if served_ordinary || !self.ordinary_decode_ready(now, false, &LaneSelection::all()) {
-            self.realtime_only_steps_with_ready_decode = 0;
-        } else {
-            self.realtime_only_steps_with_ready_decode =
-                self.realtime_only_steps_with_ready_decode.saturating_add(1);
-        }
-        let served_token_decode = committed
-            .iter()
-            .any(|work| matches!(work, WorkUnit::SequenceStep { .. }));
-        let served_codec = committed.iter().any(|work| {
-            matches!(
-                work,
-                WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
-            )
+        self.update_debts(committed, |scheduler, mut debts, rows, lanes| {
+            let realtime = |work: &WorkUnit| {
+                matches!(
+                    work,
+                    WorkUnit::RealtimePush { .. }
+                        | WorkUnit::RealtimeFinish { .. }
+                        | WorkUnit::RealtimePreparation { .. }
+                        | WorkUnit::RealtimePromptPrefill { .. }
+                        | WorkUnit::RealtimeDecodeContinuation { .. }
+                        | WorkUnit::RealtimeCompletion { .. }
+                )
+            };
+            let served_ordinary = rows.iter().any(|(_, work)| !realtime(work));
+            if served_ordinary || !scheduler.ordinary_decode_ready(now, false, lanes) {
+                debts.realtime_only_steps_with_ready_decode = 0;
+            } else {
+                debts.realtime_only_steps_with_ready_decode += 1;
+            }
+            let served_token_decode = rows
+                .iter()
+                .any(|(_, work)| matches!(work, WorkUnit::SequenceStep { .. }));
+            let served_codec = rows.iter().any(|(_, work)| {
+                matches!(
+                    work,
+                    WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
+                )
+            });
+            if served_token_decode || !scheduler.ordinary_decode_ready(now, true, lanes) {
+                debts.audio_only_steps_with_ready_decode = 0;
+            } else if served_codec {
+                debts.audio_only_steps_with_ready_decode += 1;
+            }
+            debts
         });
-        if served_token_decode || !self.ordinary_decode_ready(now, true, &LaneSelection::all()) {
-            self.audio_only_steps_with_ready_decode = 0;
-        } else if served_codec {
-            self.audio_only_steps_with_ready_decode =
-                self.audio_only_steps_with_ready_decode.saturating_add(1);
-        }
     }
 
     /// Release an uncommitted prefill quantum so the exact request session can
@@ -3296,6 +3367,23 @@ impl Scheduler {
                 .any(|state| state.in_flight.is_some() || !state.pending.is_empty())
     }
 
+    /// Lanes that hold the work [`Self::has_pending_work`] counts.
+    pub(crate) fn lanes_with_work(&self) -> Vec<ExecutionLane> {
+        let mut lanes = self
+            .waiting_members
+            .iter()
+            .chain(self.running.keys().filter(|request_id| {
+                self.realtime_sessions
+                    .get(*request_id)
+                    .is_none_or(|state| state.in_flight.is_some() || !state.pending.is_empty())
+            }))
+            .filter_map(|request_id| self.requests.get(request_id).map(|metadata| metadata.lane))
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        lanes
+    }
+
     /// Get running request info.
     pub fn get_running_info(&self, request_id: &RequestId) -> Option<(usize, usize)> {
         self.running
@@ -3856,17 +3944,18 @@ impl Scheduler {
             })
     }
 
-    fn has_pending_full_prefill(&self) -> bool {
+    fn has_pending_full_prefill(&self, lanes: &LaneSelection) -> bool {
         self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
+                && self.lane_admits(lanes, request_id)
                 && self
                     .requests
                     .get(request_id)
                     .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
         }) || self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Full)
+            self.requests.get(request_id).is_some_and(|metadata| {
+                lanes.admits(metadata.lane) && metadata.cache_policy.prefill == PrefillMode::Full
+            })
         })
     }
 
@@ -3892,16 +3981,18 @@ impl Scheduler {
             })
     }
 
-    fn has_pending_incremental_prefill(&self) -> bool {
+    fn has_pending_incremental_prefill(&self, lanes: &LaneSelection) -> bool {
         self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
                 })
         }) || self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .is_some_and(|metadata| metadata.cache_policy.prefill == PrefillMode::Incremental)
+            self.requests.get(request_id).is_some_and(|metadata| {
+                lanes.admits(metadata.lane)
+                    && metadata.cache_policy.prefill == PrefillMode::Incremental
+            })
         })
     }
 
@@ -4853,7 +4944,10 @@ mod tests {
                     },
                 )
                 .expect("realtime commit");
-            scheduler.record_committed_decode_service(&[&realtime_rows[0].work]);
+            scheduler.record_committed_decode_service(&[(
+                &realtime_rows[0].request_id,
+                &realtime_rows[0].work,
+            )]);
         }
 
         let reserved = scheduler.schedule();
@@ -4866,8 +4960,9 @@ mod tests {
                 ..
             }
         ));
-        scheduler.record_committed_decode_service(&[&reserved.decode_requests[0].work]);
-        assert_eq!(scheduler.realtime_only_steps_with_ready_decode, 0);
+        let row = &reserved.decode_requests[0];
+        scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
+        assert_eq!(scheduler.debts.realtime_only_steps_with_ready_decode, 0);
         assert!(scheduler
             .schedule()
             .decode_requests
@@ -4934,6 +5029,57 @@ mod tests {
                 .expect("prefill scheduled");
             scheduler.update_after_step(&row.request_id, row.num_tokens, 1, 1.0);
         }
+    }
+
+    /// With lane step drivers each lane's starvation guard counts its own
+    /// decode-only transactions: another lane's decode does not force this
+    /// lane's waiting full prefill into an isolated step.
+    #[test]
+    fn starvation_debts_are_kept_per_lane() {
+        let mut scheduler = small_scheduler();
+        let (lane_a, lane_b) = (Some(ModelInstanceId::new(1)), Some(ModelInstanceId::new(2)));
+        for (id, lane) in [("a-decode", lane_a), ("b-decode", lane_b)] {
+            let mut request = build_request(TaskType::Chat, id, Priority::Normal);
+            request.params.max_tokens = 1_000;
+            request.bind_model_instance(lane.unwrap()).unwrap();
+            assert!(scheduler.add_request(&request));
+        }
+        start_decoding(&mut scheduler, &["a-decode", "b-decode"]);
+        let mut waiting = build_request(TaskType::Chat, "a-prefill", Priority::Normal);
+        waiting.bind_model_instance(lane_a.unwrap()).unwrap();
+        assert!(scheduler.add_request(&waiting));
+
+        let schedule = |scheduler: &mut Scheduler, lane| {
+            scheduler.schedule_with_prefix_probe(&mut |_| None, &LaneSelection::scoped(Some(lane)))
+        };
+        let commit_decode = |scheduler: &mut Scheduler, lane| {
+            let scheduled = schedule(scheduler, lane);
+            let row = &scheduled.decode_requests[0];
+            scheduler.update_after_step(&row.request_id, 1, 1, 1.0);
+            scheduler
+                .record_committed_batch_service(&[(row.request_id.clone(), SequencePhase::Decode)]);
+        };
+        for _ in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            commit_decode(&mut scheduler, lane_b);
+        }
+        // The whole engine owes the prefill an isolated step; lane A does not.
+        assert_eq!(
+            scheduler.debts.decode_only_steps_with_waiting_full_prefill,
+            MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL
+        );
+        assert_eq!(scheduler.debts(Some(lane_a)), StarvationDebts::default());
+        let lane_a_step = schedule(&mut scheduler, lane_a);
+        assert_eq!(lane_a_step.decode_requests[0].request_id, "a-decode");
+        assert!(lane_a_step.prefill_requests.is_empty());
+        scheduler.release_unexecuted_quantum(&lane_a_step.decode_requests[0]);
+
+        // Lane A's own decode-only steps do build its debt.
+        for _ in 0..MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL {
+            commit_decode(&mut scheduler, lane_a);
+        }
+        let forced = schedule(&mut scheduler, lane_a);
+        assert!(forced.decode_requests.is_empty());
+        assert_eq!(forced.prefill_requests[0].request_id, "a-prefill");
     }
 
     /// An isolated request may take its model's preferred prefill span, but
@@ -5099,15 +5245,23 @@ mod tests {
         let decode = ("decode-a".to_string(), SequencePhase::Decode);
         let prefill = ("prompt-a".to_string(), SequencePhase::Prefill);
 
-        scheduler.decode_only_steps_with_waiting_incremental_prefill = 5;
+        scheduler
+            .debts
+            .decode_only_steps_with_waiting_incremental_prefill = 5;
         scheduler.record_committed_batch_service(std::slice::from_ref(&decode));
         assert_eq!(
-            scheduler.decode_only_steps_with_waiting_incremental_prefill, 6,
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
+            6,
             "a batch of decode rows is decode-only"
         );
         scheduler.record_committed_batch_service(&[decode, prefill]);
         assert_eq!(
-            scheduler.decode_only_steps_with_waiting_incremental_prefill, 0,
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
+            0,
             "a mixed batch that served a prefill row pays the prefill debt"
         );
     }
@@ -6150,10 +6304,15 @@ mod tests {
             .update_execution_profile(&SessionKey::new(incremental_id.clone(), epoch), &profile,));
 
         for step in 0..=MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL {
-            let debt_before = scheduler.decode_only_steps_with_waiting_incremental_prefill;
+            let debt_before = scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill;
             let scheduled = scheduler.schedule();
             assert_eq!(
-                scheduler.decode_only_steps_with_waiting_incremental_prefill, debt_before,
+                scheduler
+                    .debts
+                    .decode_only_steps_with_waiting_incremental_prefill,
+                debt_before,
                 "scheduler polling changed committed-service debt"
             );
             if let Some(prefill) = scheduled.prefill_requests.first() {
@@ -6211,14 +6370,18 @@ mod tests {
             .get_mut(&request_id)
             .unwrap()
             .retry_not_before = Some(Instant::now() + Duration::from_secs(60));
-        scheduler.decode_only_steps_with_waiting_incremental_prefill =
+        scheduler
+            .debts
+            .decode_only_steps_with_waiting_incremental_prefill =
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL - 1;
         scheduler
             .record_committed_batch_service(&[("decode-row".to_string(), SequencePhase::Decode)]);
 
         assert!(!scheduler.has_eligible_incremental_prefill(Instant::now(), &LaneSelection::all()));
         assert_eq!(
-            scheduler.decode_only_steps_with_waiting_incremental_prefill,
+            scheduler
+                .debts
+                .decode_only_steps_with_waiting_incremental_prefill,
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
         );
     }
@@ -7315,7 +7478,7 @@ mod tests {
             assert!(matches!(row.work, WorkUnit::SequenceAudioDecode { .. }));
             scheduler.release_unexecuted_quantum(&step.decode_requests[1]);
             scheduler.update_after_step(&codec.id, 0, 0, 1.0);
-            scheduler.record_committed_decode_service(&[&row.work]);
+            scheduler.record_committed_decode_service(&[(&row.request_id, &row.work)]);
             scheduler
                 .request_sequence_audio_decode(&codec.id, 4)
                 .unwrap();

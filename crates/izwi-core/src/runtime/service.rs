@@ -274,6 +274,152 @@ async fn bind_waiter_registration(
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepOutcome {
+    Produced,
+    Idle,
+    Failed,
+}
+
+/// The task that steps the engine and routes terminal outputs: one loop
+/// over whole-engine steps, or one loop per execution lane with lane step
+/// drivers.
+#[derive(Clone)]
+struct StepDriver {
+    engine: Arc<CoreEngine>,
+    waiters: Arc<RuntimeCompletionWaiters>,
+    telemetry: Arc<RuntimeTelemetryCollector>,
+    wakeup: Arc<Notify>,
+}
+
+impl StepDriver {
+    async fn drive_engine(self) {
+        let mut idle_backoff_ms = 1u64;
+        loop {
+            if !self.engine.has_pending_work().await {
+                self.engine
+                    .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&self.wakeup))
+                    .await;
+                idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
+                continue;
+            }
+            match self.step(None).await {
+                StepOutcome::Produced => idle_backoff_ms = 1,
+                StepOutcome::Idle => {
+                    // Sleeps until the next retry or deadline the scheduler
+                    // holds, or a wakeup, at the latest.
+                    self.engine
+                        .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&self.wakeup))
+                        .await;
+                    idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
+                }
+                StepOutcome::Failed => {}
+            }
+        }
+    }
+
+    /// Run one step driver per lane with scheduler work, so one lane's long
+    /// dispatch does not hold another lane's steps. Work no lane holds
+    /// (terminal outbox, cleanup retries, delivery lanes) runs as a
+    /// whole-engine step while no lane is stepping.
+    async fn drive_lanes(self) {
+        let lane_wakeup = Arc::new(Notify::new());
+        let mut lanes = HashMap::new();
+        loop {
+            lanes.retain(|_, driver: &mut tokio::task::JoinHandle<()>| !driver.is_finished());
+            for lane in self.engine.lanes_with_work().await {
+                lanes.entry(lane).or_insert_with(|| {
+                    tokio::spawn(self.clone().drive_lane(lane, lane_wakeup.clone()))
+                });
+            }
+            if lanes.is_empty()
+                && self.engine.has_pending_work().await
+                && self.step(None).await == StepOutcome::Produced
+            {
+                continue;
+            }
+            self.engine
+                .idle_wait(Duration::from_millis(50), Some(&self.wakeup))
+                .await;
+            lane_wakeup.notify_waiters();
+        }
+    }
+
+    /// Step one lane until it holds no scheduler work.
+    async fn drive_lane(self, lane: Option<crate::engine::ModelInstanceId>, wakeup: Arc<Notify>) {
+        let mut idle_backoff_ms = 1u64;
+        while self.engine.lanes_with_work().await.contains(&lane) {
+            if self.step(Some(lane)).await == StepOutcome::Produced {
+                idle_backoff_ms = 1;
+                continue;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(idle_backoff_ms)) => {}
+                _ = wakeup.notified() => {}
+            }
+            idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
+        }
+    }
+
+    /// Run one step of `lane` (the whole engine for `None`) and route its
+    /// terminal outputs.
+    async fn step(&self, lane: Option<Option<crate::engine::ModelInstanceId>>) -> StepOutcome {
+        let step = match lane {
+            Some(lane) => self.engine.step_lane_for_dispatch(lane).boxed(),
+            None => self.engine.step_for_dispatch().boxed(),
+        };
+        match std::panic::AssertUnwindSafe(step).catch_unwind().await {
+            Ok(Ok(outputs)) => {
+                let produced = if outputs.is_empty() {
+                    StepOutcome::Idle
+                } else {
+                    StepOutcome::Produced
+                };
+                for output in outputs.into_iter().filter(|output| output.is_finished) {
+                    route_terminal_output(
+                        self.engine.as_ref(),
+                        self.waiters.as_ref(),
+                        self.telemetry.as_ref(),
+                        output,
+                    )
+                    .await;
+                }
+                produced
+            }
+            Ok(Err(err)) => {
+                error!(
+                    error = %err,
+                    "Engine step failed before commit; scheduled quanta were rolled back"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                StepOutcome::Failed
+            }
+            Err(payload) => {
+                let panic_message = panic_payload_to_string(payload.as_ref());
+                self.telemetry.record_worker_panic();
+                let mut w = self.waiters.lock().await;
+                let pending: Vec<_> = w.drain().collect();
+                drop(w);
+                let request_ids: Vec<_> = pending.iter().map(|(id, _)| id.as_str()).collect();
+                self.telemetry.record_forced_failures(request_ids).await;
+                let _ = self.engine.abort_all_requests().await;
+                for (_, waiter) in pending {
+                    let _ = waiter.sender.send(Err(Error::InferenceError(format!(
+                        "Engine worker panicked: {}",
+                        panic_message
+                    ))));
+                }
+                error!(
+                    "Engine step worker panicked ({}); continuing with isolated loop",
+                    panic_message
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                StepOutcome::Failed
+            }
+        }
+    }
+}
+
 async fn route_terminal_output(
     engine: &CoreEngine,
     waiters: &RuntimeCompletionWaiters,
@@ -3949,81 +4095,17 @@ impl RuntimeService {
             self.telemetry.record_worker_restart();
         }
 
-        let engine = self.core_engine.clone();
-        let waiters = self.completion_waiters.clone();
-        let telemetry = self.telemetry.clone();
-        let wakeup = self.step_driver_wakeup.clone();
-        let task = tokio::spawn(async move {
-            let mut idle_backoff_ms = 1u64;
-            loop {
-                if !engine.has_pending_work().await {
-                    engine
-                        .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&wakeup))
-                        .await;
-                    idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
-                    continue;
-                }
-                let step_result = std::panic::AssertUnwindSafe(engine.step_for_dispatch())
-                    .catch_unwind()
-                    .await;
-                match step_result {
-                    Ok(Ok(outputs)) => {
-                        if outputs.is_empty() {
-                            // Sleeps until the next retry or deadline the
-                            // scheduler holds, or a wakeup, at the latest.
-                            engine
-                                .idle_wait(Duration::from_millis(idle_backoff_ms), Some(&wakeup))
-                                .await;
-                            idle_backoff_ms = (idle_backoff_ms.saturating_mul(2)).min(50);
-                            continue;
-                        }
-                        idle_backoff_ms = 1;
-
-                        for output in outputs {
-                            if !output.is_finished {
-                                continue;
-                            }
-                            route_terminal_output(
-                                engine.as_ref(),
-                                waiters.as_ref(),
-                                telemetry.as_ref(),
-                                output,
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        error!(
-                            error = %err,
-                            "Engine step failed before commit; scheduled quanta were rolled back"
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
-                    }
-                    Err(payload) => {
-                        let panic_message = panic_payload_to_string(payload.as_ref());
-                        telemetry.record_worker_panic();
-                        let mut w = waiters.lock().await;
-                        let pending: Vec<_> = w.drain().collect();
-                        drop(w);
-                        let request_ids: Vec<_> =
-                            pending.iter().map(|(id, _)| id.as_str()).collect();
-                        telemetry.record_forced_failures(request_ids).await;
-                        let _ = engine.abort_all_requests().await;
-                        for (_, waiter) in pending {
-                            let _ = waiter.sender.send(Err(Error::InferenceError(format!(
-                                "Engine worker panicked: {}",
-                                panic_message
-                            ))));
-                        }
-                        error!(
-                            "Engine step worker panicked ({}); continuing with isolated loop",
-                            panic_message
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                    }
-                }
-            }
-        });
+        let driver = StepDriver {
+            engine: self.core_engine.clone(),
+            waiters: self.completion_waiters.clone(),
+            telemetry: self.telemetry.clone(),
+            wakeup: self.step_driver_wakeup.clone(),
+        };
+        let task = if driver.engine.lane_step_drivers() {
+            tokio::spawn(driver.drive_lanes())
+        } else {
+            tokio::spawn(driver.drive_engine())
+        };
 
         *guard = Some(task);
         self.step_driver_started.store(true, Ordering::Release);
