@@ -95,13 +95,14 @@ fn relative_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
     max_abs_diff(lhs, rhs) / scale.max(1.0)
 }
 
-/// `rows` caches over one arena of `backbone`'s attention layers on
-/// `device`, storing K/V as `dtype`.
+/// `rows` caches of `pages_per_row` pages over one arena of `backbone`'s
+/// attention layers on `device`, storing K/V as `dtype`.
 fn caches(
     backbone: &QuantizedLfm2Backbone,
     device: &Device,
     dtype: DType,
     rows: usize,
+    pages_per_row: u32,
 ) -> Vec<PhysicalPagedKvCache> {
     let bindings = backbone
         .state_layout
@@ -130,7 +131,7 @@ fn caches(
         id,
         group,
         page_tokens: PAGE_TOKENS,
-        capacity_pages: PAGES_PER_ROW * rows as u32,
+        capacity_pages: pages_per_row * rows as u32,
         growth: None,
         dtype,
         layers: bindings
@@ -162,7 +163,7 @@ fn caches(
     };
     (0..rows as u32)
         .map(|row| {
-            let blocks = (row * PAGES_PER_ROW..(row + 1) * PAGES_PER_ROW)
+            let blocks = (row * pages_per_row..(row + 1) * pages_per_row)
                 .map(|index| CacheBlockRef {
                     arena: id,
                     group,
@@ -237,7 +238,7 @@ struct World {
 impl World {
     fn new(backbone: &QuantizedLfm2Backbone, device: &Device, dtype: DType, rows: usize) -> Self {
         Self {
-            caches: caches(backbone, device, dtype, rows),
+            caches: caches(backbone, device, dtype, rows, PAGES_PER_ROW),
             states: (0..rows).map(|_| backbone.new_shortconv_state()).collect(),
         }
     }
@@ -588,4 +589,292 @@ fn lfm25_mixed_steps_match_split_calls_on_metal() {
     // where the split decode step takes mat-vec: measured top-8 0.33 (the
     // Metal-vs-F32 reference error is also 0.33), K/V 1.8%, state 0.8%.
     assert_real_parity(profile, 0.6, 0.05);
+}
+
+/// Milliseconds since `started`, after the device has drained.
+fn synced_ms(device: &Device, started: std::time::Instant) -> f64 {
+    device.synchronize().unwrap();
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+/// One timing world: `decoders` rows decoding at a long context and
+/// prefill rows continuing long prompts span by span.
+struct BenchWorld {
+    caches: Vec<PhysicalPagedKvCache>,
+    states: Vec<Lfm2ShortConvRuntimeState>,
+    positions: Vec<usize>,
+}
+
+const BENCH_CONTEXT: usize = 512;
+const BENCH_PROMPT: usize = 2_048;
+
+impl BenchWorld {
+    fn new(
+        backbone: &QuantizedLfm2Backbone,
+        device: &Device,
+        dtype: DType,
+        decoders: usize,
+    ) -> Self {
+        let rows = decoders + 2;
+        let pages_per_row = (BENCH_PROMPT as u32).div_ceil(PAGE_TOKENS) + 8;
+        let mut world = Self {
+            caches: caches(backbone, device, dtype, rows, pages_per_row),
+            states: (0..rows).map(|_| backbone.new_shortconv_state()).collect(),
+            positions: vec![0; rows],
+        };
+        for row in 0..decoders {
+            let prompt = token_ids(BENCH_CONTEXT, 900 + row as u64, (1_000, 30_000));
+            let ids = Tensor::from_slice(&prompt, (1, prompt.len()), device).unwrap();
+            backbone
+                .forward_tokens_retained(
+                    &ids,
+                    0,
+                    &mut world.caches[row],
+                    &mut world.states[row],
+                    false,
+                )
+                .unwrap();
+            world.positions[row] = BENCH_CONTEXT;
+        }
+        world
+    }
+
+    /// Restart prefill row `row` on a fresh prompt when `span` more tokens
+    /// would overrun it.
+    fn make_room(&mut self, backbone: &QuantizedLfm2Backbone, row: usize, span: usize) {
+        if self.positions[row] + span <= BENCH_PROMPT {
+            return;
+        }
+        let cache = &self.caches[row];
+        self.caches[row] = PhysicalPagedKvCache::new(
+            cache.arena().clone(),
+            (0..cache.arena().config().layers.len())
+                .map(|layer| cache.layer_binding(layer).unwrap())
+                .collect(),
+            cache.blocks.clone(),
+            0,
+        )
+        .unwrap();
+        self.states[row] = backbone.new_shortconv_state();
+        self.positions[row] = 0;
+    }
+}
+
+/// One step's tokens for `decoders` decode rows and `spans` prefill spans.
+fn bench_tokens(decoders: usize, spans: &[usize], step: usize) -> (Vec<u32>, Vec<Vec<u32>>) {
+    let decode = vec![1_234u32; decoders];
+    let prefill = spans
+        .iter()
+        .enumerate()
+        .map(|(row, span)| {
+            token_ids(
+                *span,
+                5_000 + 31 * step as u64 + row as u64,
+                (1_000, 30_000),
+            )
+        })
+        .collect();
+    (decode, prefill)
+}
+
+/// The split step: one decode-batch call (deferred commit after the
+/// readback, as served) and one chunk call per prefill span. Returns the
+/// decode and the prefill milliseconds.
+fn split_step(
+    backbone: &QuantizedLfm2Backbone,
+    device: &Device,
+    world: &mut BenchWorld,
+    decoders: usize,
+    spans: &[usize],
+    step: usize,
+) -> (f64, f64) {
+    let (decode, prefill) = bench_tokens(decoders, spans, step);
+    let started = std::time::Instant::now();
+    let (logits, pending) = {
+        let states = world.states[..decoders].iter().collect::<Vec<_>>();
+        let caches = world.caches[..decoders].iter().collect::<Vec<_>>();
+        backbone
+            .forward_token_ids_retained_batch_deferred(
+                &decode,
+                &world.positions[..decoders],
+                &states,
+                &caches,
+            )
+            .unwrap()
+    };
+    let _ = logits.argmax(D::Minus1).unwrap().to_vec1::<u32>().unwrap();
+    {
+        let (states, caches) = (&mut world.states, &mut world.caches);
+        let mut states = states[..decoders].iter_mut().collect::<Vec<_>>();
+        let mut caches = caches[..decoders].iter_mut().collect::<Vec<_>>();
+        pending.commit(&mut states, &mut caches).unwrap();
+    }
+    let decode_ms = synced_ms(device, started);
+    let started = std::time::Instant::now();
+    for (slot, ids) in prefill.iter().enumerate() {
+        let row = decoders + slot;
+        let input = Tensor::from_slice(ids, (1, ids.len()), device).unwrap();
+        backbone
+            .forward_tokens_retained(
+                &input,
+                world.positions[row],
+                &mut world.caches[row],
+                &mut world.states[row],
+                false,
+            )
+            .unwrap();
+    }
+    let prefill_ms = synced_ms(device, started);
+    for position in &mut world.positions[..decoders] {
+        *position += 1;
+    }
+    for (slot, span) in spans.iter().enumerate() {
+        world.positions[decoders + slot] += span;
+    }
+    (decode_ms, prefill_ms)
+}
+
+/// The same rows as one mixed step.
+fn mixed_step(
+    backbone: &QuantizedLfm2Backbone,
+    device: &Device,
+    world: &mut BenchWorld,
+    decoders: usize,
+    spans: &[usize],
+    step: usize,
+) -> f64 {
+    let (decode, prefill) = bench_tokens(decoders, spans, step);
+    let members = decoders + spans.len();
+    let mut layout = world.positions[..decoders]
+        .iter()
+        .map(|&start_pos| MixedRowSpan {
+            start_pos,
+            q_len: 1,
+        })
+        .collect::<Vec<_>>();
+    let mut ids = decode;
+    for (slot, span) in prefill.iter().enumerate() {
+        layout.push(MixedRowSpan {
+            start_pos: world.positions[decoders + slot],
+            q_len: span.len(),
+        });
+        ids.extend_from_slice(span);
+    }
+    let layout = MixedRowLayout::new(layout, decoders).unwrap();
+    let sample_rows = (0..decoders).collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let (logits, pending) = {
+        let states = world.states[..members].iter().collect::<Vec<_>>();
+        let caches = world.caches[..members].iter().collect::<Vec<_>>();
+        backbone
+            .forward_token_ids_mixed_deferred(&ids, layout, &states, &caches, &sample_rows)
+            .unwrap()
+    };
+    let _ = logits
+        .unwrap()
+        .argmax(D::Minus1)
+        .unwrap()
+        .to_vec1::<u32>()
+        .unwrap();
+    {
+        let (states, caches) = (&mut world.states, &mut world.caches);
+        let mut states = states[..members].iter_mut().collect::<Vec<_>>();
+        let mut caches = caches[..members].iter_mut().collect::<Vec<_>>();
+        pending.commit(&mut states, &mut caches).unwrap();
+    }
+    let ms = synced_ms(device, started);
+    for position in &mut world.positions[..decoders] {
+        *position += 1;
+    }
+    for (slot, span) in spans.iter().enumerate() {
+        world.positions[decoders + slot] += span;
+    }
+    ms
+}
+
+/// Interleaved in-process A/B of a mixed step against the split calls it
+/// replaces, on LFM2.5-1.2B: decode rows at a 512-token context beside
+/// prefill spans of several sizes. Both worlds run the same rows step by
+/// step in alternating order, so machine noise lands on both.
+fn mixed_vs_split_timing(profile: crate::backends::DeviceProfile) {
+    let Some(backbone) = lfm25_backbone(&profile) else {
+        return;
+    };
+    let device = profile.device.clone();
+    let kv_dtype = match super::super::chat::lfm2_chat_kv_dtype(BackendKind::from(profile.kind)) {
+        crate::kv::v2::StateDType::F16 => DType::F16,
+        _ => DType::F32,
+    };
+    let steps = std::env::var("IZWI_BENCH_STEPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16usize);
+    let warmup = 3;
+    for decoders in [4usize, 8] {
+        let mut split = BenchWorld::new(&backbone, &device, kv_dtype, decoders);
+        let mut mixed = BenchWorld::new(&backbone, &device, kv_dtype, decoders);
+        for spans in [&[64usize][..], &[192], &[376], &[192, 184]] {
+            let (mut split_ms, mut decode_ms, mut prefill_ms, mut mixed_ms) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for step in 0..warmup + steps {
+                for (slot, span) in spans.iter().enumerate() {
+                    split.make_room(&backbone, decoders + slot, *span);
+                    mixed.make_room(&backbone, decoders + slot, *span);
+                }
+                let mut run_split =
+                    || split_step(&backbone, &device, &mut split, decoders, spans, step);
+                let (split_times, mixed_time) = if step % 2 == 0 {
+                    let split_times = run_split();
+                    (
+                        split_times,
+                        mixed_step(&backbone, &device, &mut mixed, decoders, spans, step),
+                    )
+                } else {
+                    let mixed_time =
+                        mixed_step(&backbone, &device, &mut mixed, decoders, spans, step);
+                    (run_split(), mixed_time)
+                };
+                if step >= warmup {
+                    decode_ms.push(split_times.0);
+                    prefill_ms.push(split_times.1);
+                    split_ms.push(split_times.0 + split_times.1);
+                    mixed_ms.push(mixed_time);
+                }
+            }
+            let (split_ms, mixed_ms) = (median(&mut split_ms), median(&mut mixed_ms));
+            eprintln!(
+                "{:?} LFM2.5 {decoders} decode rows + spans {spans:?}: split {split_ms:.1} ms \
+                 (decode {:.1} + prefill {:.1}, 2 calls), mixed {mixed_ms:.1} ms (1 call), \
+                 mixed/split {:.2}",
+                profile.kind,
+                median(&mut decode_ms),
+                median(&mut prefill_ms),
+                mixed_ms / split_ms
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "timing; needs the LFM2.5-1.2B GGUF (run with --release)"]
+fn lfm25_mixed_vs_split_step_timing_cpu() {
+    mixed_vs_split_timing(crate::backends::DeviceProfile::cpu());
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "timing; needs the LFM2.5-1.2B GGUF (run with --release)"]
+fn lfm25_mixed_vs_split_step_timing_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    let Some((_, _serial)) =
+        crate::models::shared::metal_test_device_or_skip("lfm25_mixed_vs_split_step_timing_metal")
+    else {
+        return;
+    };
+    mixed_vs_split_timing(DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap());
 }
