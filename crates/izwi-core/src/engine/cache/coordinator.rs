@@ -115,18 +115,17 @@ pub enum KvTerminalState {
     Aborted,
 }
 
-/// Number of exact terminal dispositions retained for diagnostics.
+/// Number of exact terminal dispositions retained.
 ///
-/// Duplicate/stale transaction rejection does not depend on this window: the
-/// coordinator also keeps a constant-size high-water mark. The window only
-/// preserves the committed-versus-aborted detail for recently completed work.
+/// Stale transaction rejection is exact inside this window and, beyond it,
+/// falls back to a constant-size high-water mark over the evicted entries.
 const TERMINAL_TRANSACTION_HISTORY_LIMIT: usize = 4_096;
 
 #[derive(Debug)]
 struct TerminalTransactionHistory {
     states: HashMap<PlanId, KvTerminalState>,
     completion_order: VecDeque<PlanId>,
-    high_watermark: Option<PlanId>,
+    evicted_high_watermark: Option<PlanId>,
     limit: usize,
 }
 
@@ -138,17 +137,22 @@ impl TerminalTransactionHistory {
             // model arena; these grow only as that arena completes work.
             states: HashMap::new(),
             completion_order: VecDeque::new(),
-            high_watermark: None,
+            evicted_high_watermark: None,
             limit,
         }
     }
 
     fn contains(&self, txn_id: PlanId) -> bool {
-        // Scheduler PlanIds are globally monotonic on first admission. Active
-        // transactions may finish out of order, so exact recent states remain
-        // separate, but an ID at or below a completed high-water mark can only
-        // be a delayed report, a stale reservation, or a reused exhausted ID.
-        self.high_watermark.is_some_and(|high| txn_id <= high)
+        // Scheduler PlanIds are monotonic when allocated, but one engine step
+        // reserves its rows out of ID order (prefill before lower-numbered
+        // decode) and may abort a row before reserving the next. A recent
+        // terminal ID therefore says nothing about lower IDs that have not
+        // reserved yet; only an evicted ID is old enough that every ID below
+        // it was allocated by an earlier step.
+        self.states.contains_key(&txn_id)
+            || self
+                .evicted_high_watermark
+                .is_some_and(|high| txn_id <= high)
     }
 
     fn state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
@@ -156,7 +160,6 @@ impl TerminalTransactionHistory {
     }
 
     fn record(&mut self, txn_id: PlanId, state: KvTerminalState) {
-        self.high_watermark = Some(self.high_watermark.map_or(txn_id, |high| high.max(txn_id)));
         if self.states.insert(txn_id, state).is_none() {
             self.completion_order.push_back(txn_id);
         }
@@ -166,6 +169,7 @@ impl TerminalTransactionHistory {
                 .pop_front()
                 .expect("terminal history order matches retained states");
             self.states.remove(&expired);
+            self.evicted_high_watermark = self.evicted_high_watermark.max(Some(expired));
         }
     }
 }
@@ -1976,8 +1980,8 @@ mod tests {
             Some(KvTerminalState::Aborted)
         );
 
-        // Exact diagnostics may expire, but the high-water mark makes delayed
-        // aborts idempotent and permanently rejects a reused scheduler plan ID.
+        // Exact diagnostics may expire, but the evicted high-water mark makes
+        // delayed aborts idempotent and permanently rejects a reused plan ID.
         assert!(!coordinator.abort(10).unwrap());
         assert_eq!(
             coordinator.reserve(KvReserveRequest {
@@ -2005,16 +2009,43 @@ mod tests {
 
         assert!(coordinator.abort(21).unwrap());
         assert!(coordinator.abort(20).unwrap());
-        assert!(!coordinator.abort(19).unwrap());
-        assert_eq!(
-            coordinator.abort(22),
-            Err(KvCoordinatorError::MissingTransaction(22))
-        );
+        assert!(!coordinator.abort(21).unwrap());
+        for unseen in [19, 22] {
+            assert_eq!(
+                coordinator.abort(unseen),
+                Err(KvCoordinatorError::MissingTransaction(unseen))
+            );
+        }
         let current = coordinator
             .snapshot(&session("out-of-order-terminal", 1), CacheDomainId::new(0))
             .unwrap();
         reserve_fresh(&mut coordinator, 22, current, 1, 1);
         assert!(coordinator.abort(22).unwrap());
+        coordinator.check_invariants().unwrap();
+    }
+
+    /// One engine step allocates its plan IDs in order but reserves them out
+    /// of order: a prefill row can reserve, abort for tensor-state capacity,
+    /// and leave a lower-numbered decode row still to reserve. That fresh ID
+    /// is not stale and must reserve.
+    #[test]
+    fn a_lower_unseen_id_reserves_after_a_higher_id_aborts() {
+        let mut coordinator = KvCacheCoordinator::new(arena(1), 2);
+        let initial = coordinator
+            .register_table(session("withheld-prefill", 1), CacheDomainId::new(0))
+            .unwrap();
+        let decode = coordinator
+            .register_table(session("decode-after-withheld", 1), CacheDomainId::new(0))
+            .unwrap();
+        reserve_fresh(&mut coordinator, 31, initial, 1, 1);
+        assert!(coordinator.abort(31).unwrap());
+
+        reserve_fresh(&mut coordinator, 30, decode, 1, 1);
+        assert_eq!(
+            coordinator.transaction_state(30),
+            Some(KvTransactionState::Reserved)
+        );
+        assert!(coordinator.abort(30).unwrap());
         coordinator.check_invariants().unwrap();
     }
 

@@ -7216,16 +7216,32 @@ mod tests {
         request: &mut EngineCoreRequest,
         model_instance: ModelInstanceId,
     ) {
-        let variant = request.model_variant.expect("managed test model");
         let state_contract = crate::kv::test_contract();
         let capability = crate::kv::InferenceStateCapability::Managed(state_contract.clone());
         let physical = core
             .load_managed_model_cache(model_instance, &capability, None)
             .expect("load managed state")
             .expect("physical managed state");
+        bind_managed_test_runtime(
+            request,
+            model_instance,
+            state_contract,
+            physical,
+            PrefillMode::Full,
+        );
+    }
+
+    fn bind_managed_test_runtime(
+        request: &mut EngineCoreRequest,
+        model_instance: ModelInstanceId,
+        state_contract: crate::kv::v2::InferenceStateContract,
+        physical: Arc<super::super::ManagedKvModelRuntime>,
+        prefill: PrefillMode,
+    ) {
+        let variant = request.model_variant.expect("managed test model");
         let mut profile =
             ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Sequence);
-        profile.prefill = PrefillMode::Full;
+        profile.prefill = prefill;
         profile.incremental_decode = true;
         profile.cache_mode = CacheMode::ExternalPaged;
         profile.cache_namespace = Some("core-test-state-v2".to_string());
@@ -10705,18 +10721,55 @@ mod tests {
         assert!(older_peak > 32, "older peaked at {older_peak}");
     }
 
-    /// Managed full-prefill rows whose decode quanta emit tokens, so requests
-    /// finish at their output budget. Records each executed row's plan id,
-    /// request and phase.
+    /// Stage the hybrid test model's recurrent state (domain 2) over a row's
+    /// paged span, as a hybrid adapter does before its rows commit.
+    fn stage_test_tensor_state(
+        request: &EngineCoreRequest,
+        reservation: &super::super::ManagedCacheReservation,
+    ) {
+        let arena = request
+            .managed_cache_runtime()
+            .and_then(|runtime| runtime.tensor_state())
+            .expect("hybrid test row has a tensor-state arena");
+        let paged = &reservation.domains[0];
+        arena
+            .stage_replace(
+                crate::backends::state::PhysicalStateTransactionId::new(reservation.txn_id)
+                    .expect("tensor transaction"),
+                crate::kv::v2::StateDomainId::new(2),
+                u64::from(paged.expected_committed_tokens),
+                u64::from(paged.target_committed_tokens),
+                vec![crate::backends::state::StateComponentValue {
+                    component: crate::kv::v2::StateComponentId::new(1),
+                    tensor: Some(
+                        candle_core::Tensor::zeros(
+                            4,
+                            candle_core::DType::F32,
+                            &candle_core::Device::Cpu,
+                        )
+                        .expect("tensor"),
+                    ),
+                }],
+            )
+            .expect("stage tensor state");
+    }
+
+    /// Managed rows whose decode quanta emit tokens, so requests finish at
+    /// their output budget. Prefill is full unless `incremental_prefill`.
+    /// Records each executed row's plan id, request and phase.
     #[derive(Default)]
     struct ManagedDecodeExecutor {
-        prompt_tokens: usize,
+        incremental_prefill: bool,
         executed: Arc<Mutex<Vec<(super::super::PlanId, RequestId, bool)>>>,
     }
 
     impl ModelExecutor for ManagedDecodeExecutor {
         fn execution_profile(&self, request: &EngineCoreRequest) -> Option<ExecutionProfile> {
-            ManagedReceiptExecutor.execution_profile(request)
+            let mut profile = ManagedReceiptExecutor.execution_profile(request)?;
+            if self.incremental_prefill {
+                profile.prefill = PrefillMode::Incremental;
+            }
+            Some(profile)
         }
 
         fn cleanup_session(
@@ -10749,7 +10802,7 @@ mod tests {
                 .map(|((scheduled, request), row)| {
                     let decoded = (!scheduled.is_prefill).then_some(scheduled.num_tokens);
                     let generated = (scheduled.num_computed_tokens + scheduled.num_tokens)
-                        .saturating_sub(self.prompt_tokens);
+                        .saturating_sub(request.num_prompt_tokens());
                     let mut result = ExecutorStepResult::new(
                         scheduled,
                         ExecutorOutput {
@@ -10768,6 +10821,9 @@ mod tests {
                     );
                     result.dispatch = dispatch;
                     if let Some(reservation) = &row.managed_cache {
+                        if reservation.clocked_state.is_some() {
+                            stage_test_tensor_state(request, reservation);
+                        }
                         result.managed_cache = Some(reservation.completed_write_receipt_for_test());
                     }
                     result
@@ -10818,10 +10874,7 @@ mod tests {
     async fn capacity_blocked_forced_prefill_returns_service_to_decode() {
         let model = ModelInstanceId::new(98);
         let prompt: Vec<u32> = (1..=8).collect();
-        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
-            prompt_tokens: prompt.len(),
-            ..Default::default()
-        }));
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor::default()));
         let mut core = EngineCore::new_with_unified_executor(
             EngineCoreConfig {
                 enable_chunked_prefill: false,
@@ -10871,8 +10924,8 @@ mod tests {
         let prompt: Vec<u32> = (1..=8).collect();
         let executed = Arc::new(Mutex::new(Vec::new()));
         let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
-            prompt_tokens: prompt.len(),
             executed: executed.clone(),
+            ..Default::default()
         }));
         let mut core = EngineCore::new_with_unified_executor(
             EngineCoreConfig {
@@ -10923,6 +10976,149 @@ mod tests {
                 .collect::<HashSet<_>>();
             assert_eq!(served.len(), ids.len(), "{decoded:?}");
         }
+    }
+
+    /// Runs `prompts` (with their output budgets) through a hybrid paged +
+    /// recurrent-tensor model with chunked prefill on, and asserts every
+    /// request finishes without error and no managed transaction is left.
+    async fn run_chunked_hybrid_requests(
+        config: EngineCoreConfig,
+        retained_rows: usize,
+        prompts: &[(usize, usize)],
+    ) {
+        use crate::kv::v2::{
+            BoundedShape, CheckpointPolicy, PlacementPolicy, PrefixPolicy, ShapeAxis,
+            ShapeDimension, ShapeExtent, StateComponentId, StateDType, StateDomainHeader,
+            StateDomainId, StateDomainSpec, StateScope, TensorComponentSpec, TensorRole,
+            TensorStateDomainSpec,
+        };
+        let model = ModelInstanceId::new(100);
+        let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+            incremental_prefill: true,
+            ..Default::default()
+        }));
+        let mut core = EngineCore::new_with_unified_executor(
+            EngineCoreConfig {
+                enable_chunked_prefill: true,
+                backend: BackendKind::Cpu,
+                ..config
+            },
+            executor,
+        )
+        .expect("core");
+        core.retry_policy.execution_backoff_base = Duration::ZERO;
+        core.retry_policy.execution_backoff_max = Duration::ZERO;
+
+        // Paged attention plus one recurrent tensor domain, like LFM2, whose
+        // tensor-state sequence slots are the model's retained rows.
+        let mut contract = crate::kv::test_contract();
+        let tensor = StateDomainId::new(2);
+        contract
+            .domains
+            .push(StateDomainSpec::Tensor(TensorStateDomainSpec {
+                header: StateDomainHeader {
+                    id: tensor,
+                    scope: StateScope::Retained,
+                    clock: StateClock::DecoderTokens,
+                    placement: PlacementPolicy::BackendLocalWithHostOffload,
+                    prefix: PrefixPolicy::Disabled,
+                    checkpoint: CheckpointPolicy::Transactional,
+                },
+                components: vec![TensorComponentSpec {
+                    id: StateComponentId::new(1),
+                    role: TensorRole::RecurrentHidden,
+                    shape: BoundedShape {
+                        dimensions: vec![ShapeDimension {
+                            axis: ShapeAxis::Hidden,
+                            extent: ShapeExtent::Fixed { value: 4 },
+                        }],
+                    },
+                    accepted_dtypes: vec![StateDType::F32],
+                }],
+            }));
+        contract.groups[0].domains.push(tensor);
+        contract.groups[0].prefix_shareable = false;
+        let physical = core
+            .load_managed_model_state_with_row_limits(
+                model,
+                &contract,
+                None,
+                retained_rows,
+                retained_rows,
+            )
+            .expect("load hybrid managed state");
+
+        let mut ids = HashSet::new();
+        for (index, &(prompt_tokens, max_tokens)) in prompts.iter().enumerate() {
+            let id = format!("hybrid-{index}");
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: id.clone(),
+            }])
+            .with_model_variant(ModelVariant::Qwen306B);
+            request.id = id.clone();
+            request.params.max_tokens = max_tokens;
+            let prompt = (1..=prompt_tokens as u32).collect();
+            request
+                .install_chat_execution_preparation(ModelVariant::Qwen306B, prompt, None, 4096)
+                .expect("prepare prompt");
+            request.bind_model_instance(model).expect("model instance");
+            bind_managed_test_runtime(
+                &mut request,
+                model,
+                contract.clone(),
+                physical.clone(),
+                PrefillMode::Incremental,
+            );
+            core.add_request(request).expect("add");
+            ids.insert(id);
+        }
+
+        let mut finished = HashSet::new();
+        for _ in 0..2_000 {
+            for output in core.step().await.expect("step") {
+                if output.is_finished {
+                    assert!(
+                        output.error.is_none(),
+                        "{}: {:?}",
+                        output.request_id,
+                        output.error
+                    );
+                    finished.insert(output.request_id);
+                }
+            }
+            if finished == ids {
+                break;
+            }
+        }
+        assert_eq!(finished, ids);
+        let snapshot = core.managed_kv_cache.runtime_snapshot();
+        assert_eq!(snapshot.totals.coordinator.active_transactions, 0);
+    }
+
+    /// Chunked prefill mixes decode and prefill rows in one step. The
+    /// scheduler numbers decode plans first, but a step can prepare the
+    /// prefill row first. When that prefill reserved its pages and was then
+    /// withheld because every tensor-state sequence slot was held, its aborted
+    /// transaction used to raise the arena's terminal high-water mark above
+    /// the decode plans prepared next, and each decode prepare failed as a
+    /// "duplicate" transaction until its request was failed.
+    #[tokio::test]
+    async fn chunked_prefill_withheld_for_tensor_state_keeps_decode_rows_alive() {
+        run_chunked_hybrid_requests(
+            EngineCoreConfig {
+                chunked_prefill_threshold: 4,
+                block_size: 16,
+                max_blocks: 64,
+                max_batch_size: 4,
+                max_retained_sequences: 2,
+                max_staged_transactions: 2,
+                ..Default::default()
+            },
+            2,
+            &[(8, 6), (8, 6), (8, 6)],
+        )
+        .await;
     }
 
     /// H2: a row whose managed state can never be prepared fails alone. The
