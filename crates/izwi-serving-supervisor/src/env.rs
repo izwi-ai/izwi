@@ -9,10 +9,24 @@
 //! supervisor owns.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 
 use izwi_serving_protocol::WorkerId;
 
 use crate::ConfigError;
+
+/// Environment variables that may be deliberately inherited by a worker.
+/// Everything else is removed before these and the assignment variables are set.
+pub const INHERITED_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "RUST_LOG",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+];
 
 pub const MAX_WORKER_ENVIRONMENT_ENTRIES: usize = 64;
 pub const MAX_WORKER_ENVIRONMENT_VALUE_BYTES: usize = 4 * 1024;
@@ -92,6 +106,14 @@ const SECRET_NAME_MARKERS: &[&str] = &[
     "API_KEY",
     "PRIVATE_KEY",
 ];
+
+/// The allowlisted variables of the supervisor's own environment.
+pub fn inherited_environment() -> BTreeMap<OsString, OsString> {
+    INHERITED_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect()
+}
 
 /// Validates one worker's `[workers.environment]` table.
 pub fn validate_worker_environment(

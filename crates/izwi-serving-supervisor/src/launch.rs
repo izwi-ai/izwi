@@ -1,3 +1,4 @@
+use crate::env::INHERITED_ENV_ALLOWLIST;
 use crate::{ConfigError, ValidatedNodeConfig, WorkerConfig};
 use izwi_serving_protocol::{
     DeviceAssignment, IncarnationId, ServiceBearerToken, TaskKind, WorkerId,
@@ -8,19 +9,6 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
 };
-
-/// Environment variables that may be deliberately inherited by a worker.
-/// Everything else is removed before these and the assignment variables are set.
-pub const INHERITED_ENV_ALLOWLIST: &[&str] = &[
-    "PATH",
-    "RUST_LOG",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-    "SYSTEMROOT",
-];
 
 pub const MANAGED_WORKER_ENV: &str = "IZWI_WORKER_MANAGED";
 pub const WORKER_INCARNATION_ENV: &str = "IZWI_WORKER_INCARNATION_ID";

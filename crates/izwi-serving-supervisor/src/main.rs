@@ -3,11 +3,11 @@ use izwi_serving_protocol::{
     BackendKind, DeploymentId, DeviceId, GatewayWorkerApproval, IncarnationId, ServiceBearerToken,
     ServiceCredentials, WorkerId,
 };
-use izwi_serving_supervisor::approvals_file;
 use izwi_serving_supervisor::autoscale::{
     self, Autoscaler, DeploymentObservation, ScaleDecision, WorkerSignals,
 };
 use izwi_serving_supervisor::rollout::{self, RolloutPhase};
+use izwi_serving_supervisor::{approvals_file, signals};
 use izwi_serving_supervisor::{
     build_child_launch_spec, BinaryCatalog, BinaryRecord, CudaDeviceInventory, HostInventory,
     LockNamespace, MetalDeviceInventory, NodeConfig, ResolvedWorkerSecret, RestartController,
@@ -168,7 +168,7 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         return rollout_abort_command(&node);
     }
 
-    let inherited_environment = inherited_environment();
+    let inherited_environment = izwi_serving_supervisor::env::inherited_environment();
 
     let locks = LockNamespace::open(&node.config().runtime_directory)?;
     let lock_metadata = format!("node={} pid={}", node.config().node_id, std::process::id());
@@ -258,25 +258,14 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        wait_for_shutdown_request().await;
+        signals::shutdown_requested().await;
         let _ = shutdown_tx.send(true);
     });
     let (diagnostic_tx, mut diagnostic_rx) = mpsc::channel(1);
-    spawn_diagnostic_signal_listener(diagnostic_tx);
+    signals::forward_diagnostic_requests(diagnostic_tx);
     // DS6: SIGUSR2 requests an in-process rollout abort while the rollout is
     // still reversible (launch or window phases).
-    // Off unix nothing sends, but the sender must outlive the run so the
-    // receiver never observes a closed channel.
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    let (abort_tx, mut abort_rx) = watch::channel(false);
-    #[cfg(unix)]
-    tokio::spawn(async move {
-        let mut signal =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
-                .expect("install SIGUSR2 listener");
-        signal.recv().await;
-        let _ = abort_tx.send(true);
-    });
+    let mut abort_rx = signals::rollout_abort_requests();
 
     let started_at = Instant::now();
     let mut metrics = SupervisorMetrics::default();
@@ -1511,25 +1500,6 @@ fn write_metrics_textfile(path: &Path, contents: &str) -> io::Result<()> {
     std::fs::rename(&temporary, path)
 }
 
-fn spawn_diagnostic_signal_listener(sender: mpsc::Sender<()>) {
-    #[cfg(unix)]
-    tokio::spawn(async move {
-        // This is a local administrative surface: Unix signal permissions gate
-        // access, and no unauthenticated network listener is introduced.
-        let Ok(mut signal) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-        else {
-            return;
-        };
-        while signal.recv().await.is_some() {
-            // Coalesce repeated operator requests instead of buffering diagnostics.
-            let _ = sender.try_send(());
-        }
-    });
-    #[cfg(not(unix))]
-    drop(sender);
-}
-
 struct BoundedDiagnostic {
     output: String,
     truncated: bool,
@@ -2137,13 +2107,6 @@ fn ensure_flavor_binaries(
     Ok(())
 }
 
-fn inherited_environment() -> BTreeMap<OsString, OsString> {
-    izwi_serving_supervisor::INHERITED_ENV_ALLOWLIST
-        .iter()
-        .filter_map(|name| env::var_os(name).map(|value| (OsString::from(name), value)))
-        .collect()
-}
-
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, SupervisorError> {
     let file = File::open(path).map_err(|source| SupervisorError::ReadConfig {
         path: path.to_path_buf(),
@@ -2163,21 +2126,6 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, SupervisorError>
         });
     }
     Ok(bytes)
-}
-
-async fn wait_for_shutdown_request() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM listener");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
