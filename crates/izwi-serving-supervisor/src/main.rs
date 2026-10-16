@@ -5,7 +5,7 @@ use izwi_serving_protocol::{
 };
 use izwi_serving_supervisor::approvals_file;
 use izwi_serving_supervisor::autoscale::{
-    self, Autoscaler, DeploymentObservation, ResourceLedger, ScaleDecision, WorkerSignals,
+    self, Autoscaler, DeploymentObservation, ScaleDecision, WorkerSignals,
 };
 use izwi_serving_supervisor::rollout::{self, RolloutPhase};
 use izwi_serving_supervisor::{
@@ -202,7 +202,6 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         .is_some_and(|prepared| prepared.state.phase == RolloutPhase::DrainingOld);
 
     let mut autoscaler = Autoscaler::from_config(&node);
-    let mut ledger = ResourceLedger::new(&inventory, &node);
     if let Some(scaler) = autoscaler.as_mut() {
         // Partition slots: the min set keeps the static posture
         // (`autoscale: None`); every other declared worker of an autoscaled
@@ -423,14 +422,8 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                 }
             }
             _ = poll.tick() => {
-                observe_exits(
-                    &mut slots,
-                    autoscaler.as_mut(),
-                    &mut ledger,
-                    started_at,
-                    &mut metrics,
-                );
-                observe_exits(&mut replacement_slots, None, &mut ledger, started_at, &mut metrics);
+                observe_exits(&mut slots, autoscaler.as_mut(), started_at, &mut metrics);
+                observe_exits(&mut replacement_slots, None, started_at, &mut metrics);
                 if let Some(slot) = next_restart_slot(&mut slots) {
                     launch_slot(
                         &node,
@@ -478,7 +471,6 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
                         run_autoscale_tick(
                             scaler,
                             &node,
-                            &mut ledger,
                             &mut slots,
                             &locks,
                             &inherited_environment,
@@ -1673,7 +1665,6 @@ async fn launch_slot(
 fn observe_exits(
     slots: &mut [WorkerSlot],
     mut autoscaler: Option<&mut Autoscaler>,
-    ledger: &mut ResourceLedger,
     supervisor_started_at: Instant,
     metrics: &mut SupervisorMetrics,
 ) {
@@ -1697,7 +1688,6 @@ fn observe_exits(
                     if let Some(state) = slot.autoscale.as_mut() {
                         state.phase = AutoscalePhase::Standby;
                     }
-                    ledger.release(&slot.worker_id);
                     if let Some(state) = autoscaler
                         .as_mut()
                         .and_then(|scaler| scaler.deployment_of_mut(&slot.worker_id))
@@ -1762,7 +1752,6 @@ fn note_slot_launched(autoscaler: &mut Option<Autoscaler>, slot: &WorkerSlot) {
 async fn run_autoscale_tick(
     autoscaler: &mut Autoscaler,
     node: &ValidatedNodeConfig,
-    ledger: &mut ResourceLedger,
     slots: &mut [WorkerSlot],
     locks: &LockNamespace,
     inherited_environment: &BTreeMap<OsString, OsString>,
@@ -1808,7 +1797,6 @@ async fn run_autoscale_tick(
                 scale_up(
                     node,
                     &deployment_id,
-                    ledger,
                     slots,
                     locks,
                     inherited_environment,
@@ -1833,16 +1821,7 @@ async fn run_autoscale_tick(
                 .await;
             }
             ScaleDecision::StopDrained { worker } => {
-                stop_drained(
-                    autoscaler,
-                    node,
-                    &deployment_id,
-                    ledger,
-                    slots,
-                    metrics,
-                    worker,
-                )
-                .await;
+                stop_drained(autoscaler, node, &deployment_id, slots, metrics, worker).await;
             }
         }
     }
@@ -1932,15 +1911,13 @@ async fn poll_deployment(
     Some(observation)
 }
 
-/// Scale-up: reserve the candidate's budgets, then launch it through the
-/// existing launch/readiness path. Readiness is awaited inline (as the
+/// Scale-up: launch the standby through the existing launch/readiness path. Readiness is awaited inline (as the
 /// startup and canary paths do); the approvals line is published on the
 /// next evaluation pass (Admitting phase).
 #[allow(clippy::too_many_arguments)]
 async fn scale_up(
     node: &ValidatedNodeConfig,
     deployment_id: &DeploymentId,
-    ledger: &mut ResourceLedger,
     slots: &mut [WorkerSlot],
     locks: &LockNamespace,
     inherited_environment: &BTreeMap<OsString, OsString>,
@@ -1953,10 +1930,6 @@ async fn scale_up(
         warn!("autoscaling: scale-up candidate {worker} has no slot; abandoned");
         return;
     };
-    if let Err(rejection) = ledger.reserve(&worker) {
-        info!("autoscaling: {rejection}");
-        return;
-    }
     slot.restart_at = None;
     slot.autoscale = Some(AutoscaleSlotState {
         deployment: deployment_id.clone(),
@@ -1974,7 +1947,6 @@ async fn scale_up(
     )
     .await;
     if slot.process.is_none() {
-        ledger.release(&worker);
         slot.autoscale = Some(AutoscaleSlotState {
             deployment: deployment_id.clone(),
             phase: AutoscalePhase::Standby,
@@ -2033,7 +2005,6 @@ async fn stop_drained(
     autoscaler: &mut Autoscaler,
     node: &ValidatedNodeConfig,
     deployment_id: &DeploymentId,
-    ledger: &mut ResourceLedger,
     slots: &mut [WorkerSlot],
     metrics: &mut SupervisorMetrics,
     worker: WorkerId,
@@ -2061,7 +2032,6 @@ async fn stop_drained(
         deployment: deployment_id.clone(),
         phase: AutoscalePhase::Standby,
     });
-    ledger.release(&worker);
     autoscaler
         .deployment_mut(deployment_id)
         .expect("deployment ids come from the autoscaler")

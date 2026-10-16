@@ -1,29 +1,28 @@
 //! DS7 signal-driven worker autoscaling primitives.
 //!
-//! Three process-free concerns live here, each unit-testable in isolation:
+//! Two process-free concerns live here, each unit-testable in isolation:
 //!
 //! 1. The per-deployment scale state machine: capacity signals → scale
 //!    decisions under the configured bounds and the shared hysteresis window.
 //!    Decisions are pure observations; the supervision driver confirms the
 //!    lifecycle transitions it actually performed, so a failed launch or a
 //!    failed approvals write never desynchronizes the state machine.
-//! 2. The node resource ledger: reserved declared budgets of supervised
-//!    workers with a fail-closed candidate check, so a scale-up is rejected
-//!    with a diagnostic instead of launched into overcommit.
-//! 3. The shared approvals view editor: this node's autoscaled workers are
+//! 2. The shared approvals view editor: this node's autoscaled workers are
 //!    approved through v1 pinned lines that the supervisor alone adds and
 //!    removes, under the shared file lock and preserving every unrelated
 //!    line verbatim (see [`crate::approvals_file`]).
+//!
+//! Scale-ups need no resource check of their own: config validation proves
+//! that every declared worker, standbys included, fits the node at once.
 //!
 //! Scale state is intentionally in-memory: a supervisor restart relaunches
 //! the declared min set and reconciles the view to it, which is the fail-closed
 //! posture (a crashed supervisor never leaves phantom capacity behind).
 
 use crate::approvals_file::{self, ApprovalsDocument, SharedApprovalsError};
-use crate::{DeploymentAutoscalingPolicy, HostInventory, ValidatedNodeConfig, WorkerConfig};
+use crate::{DeploymentAutoscalingPolicy, ValidatedNodeConfig, WorkerConfig};
 use izwi_serving_protocol::{
-    DeploymentId, DeviceAssignment, DeviceId, GatewayWorkerApproval, GatewayWorkerApprovalIdentity,
-    NodeId, WorkerId,
+    DeploymentId, GatewayWorkerApproval, GatewayWorkerApprovalIdentity, NodeId, WorkerId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -344,236 +343,6 @@ impl Autoscaler {
     }
 }
 
-/// Node resource ledger for scale decisions (DS7.3). It reserves the
-/// declared budgets of supervised workers — running *and* restart-pending
-/// slots alike, so a crash-looping worker's budget is never handed to a
-/// scale-up — and rejects candidates that would overcommit host memory,
-/// CPU threads, or an exclusive device, with actionable diagnostics.
-///
-/// Config validation already proves that the sum over *all* declared workers
-/// fits the node, so a rejected reservation indicates ledger misuse rather
-/// than reachable config state; the check exists to keep that guarantee
-/// structural as the runtime evolves.
-#[derive(Debug)]
-pub struct ResourceLedger {
-    host_memory_budget_bytes: u64,
-    effective_cpu_count: usize,
-    metal_devices: BTreeSet<DeviceId>,
-    cuda_devices: BTreeMap<DeviceId, u64>,
-    worker_config: BTreeMap<WorkerId, WorkerConfig>,
-    reserved_host_memory_bytes: u64,
-    reserved_threads: u64,
-    reserved_metal: BTreeSet<DeviceId>,
-    reserved_cuda_memory: BTreeMap<DeviceId, u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LedgerRejection {
-    pub worker: WorkerId,
-    pub reason: String,
-}
-
-impl std::fmt::Display for LedgerRejection {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "scale-up of worker {} rejected by the node resource ledger: {}",
-            self.worker, self.reason
-        )
-    }
-}
-
-impl ResourceLedger {
-    pub fn new(inventory: &HostInventory, node: &ValidatedNodeConfig) -> Self {
-        Self {
-            host_memory_budget_bytes: node.config().host_memory_budget_bytes,
-            effective_cpu_count: inventory.effective_cpu_ids.len(),
-            metal_devices: inventory
-                .metal_devices
-                .iter()
-                .map(|device| device.device_id.clone())
-                .collect(),
-            cuda_devices: inventory
-                .cuda_devices
-                .iter()
-                .map(|device| (device.device_uuid.clone(), device.total_memory_bytes))
-                .collect(),
-            worker_config: node
-                .config()
-                .workers
-                .iter()
-                .map(|worker| (worker.worker_id.clone(), worker.clone()))
-                .collect(),
-            reserved_host_memory_bytes: 0,
-            reserved_threads: 0,
-            reserved_metal: BTreeSet::new(),
-            reserved_cuda_memory: BTreeMap::new(),
-        }
-    }
-
-    /// Reserves one worker's declared budgets, or explains the rejection.
-    pub fn reserve(&mut self, worker_id: &WorkerId) -> Result<(), LedgerRejection> {
-        let rejection = |reason: String| LedgerRejection {
-            worker: worker_id.clone(),
-            reason,
-        };
-        let worker = self
-            .worker_config
-            .get(worker_id)
-            .ok_or_else(|| rejection("worker is not declared on this node".to_string()))?;
-        match &worker.assignment {
-            DeviceAssignment::Cpu {
-                thread_budget,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*host_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        host_memory_limit_bytes
-                    )));
-                }
-                let threads = self
-                    .reserved_threads
-                    .saturating_add(u64::from(*thread_budget));
-                if threads > self.effective_cpu_count as u64 {
-                    return Err(rejection(format!(
-                        "CPU thread budget {} would be exceeded ({} reserved + {} requested)",
-                        self.effective_cpu_count, self.reserved_threads, thread_budget
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_threads = threads;
-            }
-            DeviceAssignment::Metal {
-                device_id,
-                shared_memory_limit_bytes,
-                ..
-            } => {
-                if self.reserved_metal.contains(device_id) {
-                    return Err(rejection(format!(
-                        "Metal device {device_id} is already reserved by another worker"
-                    )));
-                }
-                if !self.metal_devices.contains(device_id) {
-                    return Err(rejection(format!(
-                        "Metal device {device_id} is not in the host inventory"
-                    )));
-                }
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*shared_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        shared_memory_limit_bytes
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_metal.insert(device_id.clone());
-            }
-            DeviceAssignment::Cuda {
-                device_uuid,
-                device_memory_limit_bytes,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                let Some(device_total) = self.cuda_devices.get(device_uuid) else {
-                    return Err(rejection(format!(
-                        "CUDA device {device_uuid} is not in the host inventory"
-                    )));
-                };
-                let device_reserved = self
-                    .reserved_cuda_memory
-                    .get(device_uuid)
-                    .copied()
-                    .unwrap_or(0);
-                let device = device_reserved.saturating_add(*device_memory_limit_bytes);
-                if device > *device_total {
-                    return Err(rejection(format!(
-                        "CUDA device {device_uuid} memory {} bytes would be exceeded ({} reserved + {} requested)",
-                        device_total, device_reserved, device_memory_limit_bytes
-                    )));
-                }
-                let host = self
-                    .reserved_host_memory_bytes
-                    .saturating_add(*host_memory_limit_bytes);
-                if host > self.host_memory_budget_bytes {
-                    return Err(rejection(format!(
-                        "host memory budget {} bytes would be exceeded ({} reserved + {} requested)",
-                        self.host_memory_budget_bytes,
-                        self.reserved_host_memory_bytes,
-                        host_memory_limit_bytes
-                    )));
-                }
-                self.reserved_host_memory_bytes = host;
-                self.reserved_cuda_memory
-                    .insert(device_uuid.clone(), device);
-            }
-            DeviceAssignment::Unknown => {
-                return Err(rejection(
-                    "worker assignment backend is unknown".to_string(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Releases one worker's reservation after a scale-down stop or a failed
-    /// launch (idempotent for never-reserved workers).
-    pub fn release(&mut self, worker_id: &WorkerId) {
-        let Some(worker) = self.worker_config.get(worker_id) else {
-            return;
-        };
-        match &worker.assignment {
-            DeviceAssignment::Cpu {
-                thread_budget,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*host_memory_limit_bytes);
-                self.reserved_threads = self
-                    .reserved_threads
-                    .saturating_sub(u64::from(*thread_budget));
-            }
-            DeviceAssignment::Metal {
-                device_id,
-                shared_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*shared_memory_limit_bytes);
-                self.reserved_metal.remove(device_id);
-            }
-            DeviceAssignment::Cuda {
-                device_uuid,
-                device_memory_limit_bytes,
-                host_memory_limit_bytes,
-                ..
-            } => {
-                self.reserved_host_memory_bytes = self
-                    .reserved_host_memory_bytes
-                    .saturating_sub(*host_memory_limit_bytes);
-                if let Some(reserved) = self.reserved_cuda_memory.get_mut(device_uuid) {
-                    *reserved = reserved.saturating_sub(*device_memory_limit_bytes);
-                }
-            }
-            // `reserve` never admits it.
-            DeviceAssignment::Unknown => {}
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AutoscaleError {
     #[error("shared approvals view is unusable: {0}")]
@@ -748,11 +517,12 @@ pub fn remove_worker(
 mod tests {
     use super::*;
     use crate::{
-        BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, NodeConfig,
-        WorkerBinaryFlavor,
+        BinaryCatalog, BinaryRecord, CapabilityProfileConfig, DeploymentConfig, HostInventory,
+        NodeConfig, WorkerBinaryFlavor,
     };
     use izwi_serving_protocol::{
-        BackendKind, CancellationBehavior, InputFormat, ModelGeneration, OutputFormat, TaskKind,
+        BackendKind, CancellationBehavior, DeviceAssignment, InputFormat, ModelGeneration,
+        OutputFormat, TaskKind,
     };
     use std::collections::BTreeSet;
     use std::io::Write as IoWrite;
@@ -1162,86 +932,5 @@ mod tests {
             error,
             AutoscaleError::CollidingStandaloneLine { .. }
         ));
-    }
-
-    #[test]
-    fn ledger_overcommit_is_rejected_and_release_restores_capacity() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1, 2, 3],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-
-        // Simulate a ledger whose host budget cannot fit both workers; the
-        // second reservation must be rejected with an actionable diagnostic.
-        ledger.host_memory_budget_bytes = 1023;
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("host memory budget"),
-            "unexpected rejection: {rejection}"
-        );
-        ledger.release(&id("cpu-1"));
-        ledger.reserve(&id("cpu-2")).unwrap();
-    }
-
-    #[test]
-    fn ledger_rejects_cpu_thread_overcommit() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-        ledger.effective_cpu_count = 3;
-
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("CPU thread budget"),
-            "unexpected rejection: {rejection}"
-        );
-    }
-
-    #[test]
-    fn ledger_rejects_duplicate_exclusive_device_reservations() {
-        let directory = tempfile::tempdir().unwrap();
-        let node = autoscaled_node(directory.path());
-        let inventory = HostInventory {
-            effective_cpu_ids: vec![0, 1, 2, 3],
-            allocatable_host_memory_bytes: 2048,
-            metal_devices: Vec::new(),
-            cuda_devices: Vec::new(),
-        };
-        let mut ledger = ResourceLedger::new(&inventory, &node);
-
-        // Point both declared workers at one Metal device to exercise the
-        // exclusivity guard (config validation rejects this shape, so the
-        // fixture is edited post-construction).
-        let device: DeviceId = id("GPU-1");
-        for worker in ledger.worker_config.values_mut() {
-            worker.assignment = DeviceAssignment::Metal {
-                device_id: device.clone(),
-                process_local_device_index: 0,
-                shared_memory_limit_bytes: 512,
-            };
-        }
-        ledger.metal_devices.insert(device.clone());
-
-        ledger.reserve(&id("cpu-1")).unwrap();
-        let rejection = ledger.reserve(&id("cpu-2")).unwrap_err();
-        assert!(
-            rejection.reason.contains("already reserved"),
-            "unexpected rejection: {rejection}"
-        );
-        ledger.release(&id("cpu-1"));
-        ledger.reserve(&id("cpu-2")).unwrap();
     }
 }
