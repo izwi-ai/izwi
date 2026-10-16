@@ -4,7 +4,7 @@ use candle_core::DType;
 use candle_transformers::models::whisper::Config;
 
 use crate::backends::BackendKind;
-use crate::engine::{NativeBatchMode, StageDescriptor, StageProgressKind, StageWorkSelector};
+use crate::engine::{NativeBatchMode, StageDescriptor, StageWorkSelector};
 use crate::error::{Error, Result};
 use crate::kv::v2::{
     stage_graph_fingerprint, AttentionMask, AttentionPattern, CapabilityStateDescriptorV2,
@@ -96,7 +96,7 @@ pub(crate) fn whisper_physical_state_spec(
             stage.validate()?;
             match stage.selector {
                 StageWorkSelector::Atomic => {
-                    if stage.progress != StageProgressKind::Atomic
+                    if !stage.runs_independent_invocations()
                         || stage.batch_mode != NativeBatchMode::None
                     {
                         return Err(model_load(
@@ -443,7 +443,7 @@ mod tests {
     use super::*;
     use crate::engine::{
         ConcurrencyClass, ExecutionDomain, MembershipSafePoint, NativeBatchMode, OutputVisibility,
-        StageId, StageShapePolicy, StageWorkSelector,
+        StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     };
 
     fn config() -> Config {
@@ -731,14 +731,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_atomic_and_duplicate_stage_graphs() {
-        let mut iterative = stage(0);
-        iterative.progress = StageProgressKind::Iterative;
+    fn accepts_chunked_long_form_and_rejects_batched_or_duplicate_stage_graphs() {
+        // Long-form run one chunk per dispatch: still one complete
+        // invocation per dispatch, so it owns the invocation state.
+        let mut chunked = stage(0);
+        chunked.progress = StageProgressKind::Iterative;
+        chunked.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        let spec =
+            whisper_physical_state_spec(&config(), DType::F32, BackendKind::Cpu, &[&[chunked]])
+                .expect("chunked long-form graph");
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("long-form graph must own invocation state");
+        };
+        assert!(!profiles[0].stages[0].domains.is_empty());
+
+        let mut batched = stage(0);
+        batched.batch_mode = NativeBatchMode::Static;
+        batched.concurrency = ConcurrencyClass::Batchable;
+        batched.max_batch_size = 2;
+        batched.shape_policy = StageShapePolicy::Padded;
         assert!(whisper_physical_state_spec(
             &config(),
             DType::F32,
             BackendKind::Cpu,
-            &[&[iterative]],
+            &[&[batched]],
         )
         .is_err());
 

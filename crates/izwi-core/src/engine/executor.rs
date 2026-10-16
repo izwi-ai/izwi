@@ -76,8 +76,7 @@ use super::execution::{
     ExecutionMode, ExecutionProfile, FailureKind, FailureOrigin, FailureScope, FinishReason,
     HealthImpact, ManagedSessionGeneration, NativeBatchMode, OutcomeProvenance, PhysicalBatch,
     PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum, RealtimeStageOutcome,
-    RetryDisposition, SequencePhase, SessionKey, StageId, StageProgressKind, StageWorkSelector,
-    WorkUnit, YieldReason,
+    RetryDisposition, SequencePhase, SessionKey, StageId, StageWorkSelector, WorkUnit, YieldReason,
 };
 use super::metrics::{
     begin_engine_physical_dispatch, record_engine_physical_defer, record_engine_physical_fallback,
@@ -878,7 +877,7 @@ fn validate_atomic_scalar_invocation_stage(
             "scalar invocation workspace requires an atomic scheduled row".to_string(),
         ));
     }
-    if stage.progress != StageProgressKind::Atomic || stage.batch_mode != NativeBatchMode::None {
+    if !stage.runs_independent_invocations() || stage.batch_mode != NativeBatchMode::None {
         return Err(Error::InvalidInput(
             "atomic invocation workspace requires a scalar atomic execution stage".to_string(),
         ));
@@ -6197,6 +6196,16 @@ mod tests {
             kind: "test".to_string(),
         };
         validate_atomic_scalar_invocation_stage(&scalar, &atomic).unwrap();
+        // Long-form run one chunk per dispatch leases a whole workspace for
+        // each dispatch, like any atomic row.
+        let mut chunked = scalar.clone();
+        chunked.selector = super::super::StageWorkSelector::Atomic;
+        chunked.progress = super::super::StageProgressKind::Iterative;
+        validate_atomic_scalar_invocation_stage(&chunked, &atomic).unwrap();
+        let mut iterative = scalar.clone();
+        iterative.selector = super::super::StageWorkSelector::SequencePrefill;
+        iterative.progress = super::super::StageProgressKind::Iterative;
+        assert!(validate_atomic_scalar_invocation_stage(&iterative, &atomic).is_err());
 
         let sequence = WorkUnit::SequenceStep {
             phase: super::super::SequencePhase::Decode,

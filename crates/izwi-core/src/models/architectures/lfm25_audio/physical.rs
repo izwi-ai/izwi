@@ -74,9 +74,7 @@ pub(crate) fn lfm25_audio_physical_state_spec(
         }
         for stage in *stages {
             stage.validate()?;
-            if stage.progress != StageProgressKind::Atomic
-                || stage.batch_mode != NativeBatchMode::None
-            {
+            if !stage.runs_independent_invocations() || stage.batch_mode != NativeBatchMode::None {
                 return Err(Error::ModelLoadError(
                     "LFM2.5 Audio invocation state requires scalar atomic execution stages".into(),
                 ));
@@ -471,7 +469,7 @@ fn validate_retained_stage_graph(
     {
         let stage = &stages[0];
         stage.validate()?;
-        if stage.progress != StageProgressKind::Atomic
+        if !stage.runs_independent_invocations()
             || stage.batch_mode != NativeBatchMode::None
             || stage.max_batch_size != 1
             || stage.output_visibility != OutputVisibility::AfterQuantumCommit
@@ -686,6 +684,29 @@ mod tests {
         stage.workspace_base_bytes = workspace;
         stage.max_workspace_bytes = workspace;
         stage
+    }
+
+    /// Long-form ASR run one chunk per dispatch is still one complete
+    /// invocation per dispatch: it owns the invocation state, and the
+    /// long-form retained graph accepts it.
+    #[test]
+    fn a_chunked_long_form_stage_owns_invocation_state() {
+        let mut chunked = stage();
+        chunked.progress = StageProgressKind::Iterative;
+        chunked.membership_safe_point = MembershipSafePoint::QuantumBoundary;
+        let spec = lfm25_audio_physical_state_spec(
+            &main_config(),
+            &decoder_config(),
+            Lfm25AudioStateMode::MainOnly,
+            &[&[chunked.clone()]],
+        )
+        .expect("chunked long-form graph");
+        let InvocationWorkspaceSet::Bounded { profiles } = &spec.descriptor.invocation else {
+            panic!("audio state must use bounded invocation workspaces");
+        };
+        assert!(!profiles[0].stages[0].domains.is_empty());
+        validate_retained_stage_graph(Lfm25AudioRetainedMode::Asr, &[chunked])
+            .expect("long-form retained graph");
     }
 
     #[test]

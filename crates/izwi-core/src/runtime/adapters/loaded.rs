@@ -7731,6 +7731,26 @@ mod tests {
             long.stages[0].membership_safe_point,
             MembershipSafePoint::QuantumBoundary
         );
+        // The load seals both graphs into one physical state spec.
+        let config = candle_transformers::models::whisper::Config {
+            num_mel_bins: 80,
+            max_source_positions: 33,
+            d_model: 16,
+            encoder_attention_heads: 4,
+            encoder_layers: 2,
+            vocab_size: 128,
+            max_target_positions: 65,
+            decoder_attention_heads: 4,
+            decoder_layers: 2,
+            suppress_tokens: vec![],
+        };
+        crate::models::architectures::whisper::whisper_physical_state_spec(
+            &config,
+            candle_core::DType::F32,
+            BackendKind::Cpu,
+            &[&normal.stages, &long.stages],
+        )
+        .expect("the load authenticates the normal and chunked long-form graphs");
     }
 
     #[test]

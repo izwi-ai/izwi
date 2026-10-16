@@ -588,6 +588,14 @@ pub struct StageDescriptor {
 }
 
 impl StageDescriptor {
+    /// Whether each dispatch of this stage is one complete invocation that
+    /// leaves no model state for a later dispatch: atomic progress, or
+    /// atomic work that yields between its operations (a long-form ASR job
+    /// run one chunk per dispatch carries only host state between them).
+    pub fn runs_independent_invocations(&self) -> bool {
+        self.progress == StageProgressKind::Atomic || self.selector == StageWorkSelector::Atomic
+    }
+
     /// Conservative bridge for existing executors. Callers choose the phase's
     /// declared batch mode explicitly because one legacy profile can describe
     /// different prefill and decode behavior.
