@@ -26,12 +26,17 @@ until its acceptance gates pass.
 | `IZWI_TTS_MAX_ACTIVE_JOBS_PER_TENANT` | 32 | Live TTS jobs per trusted server-authored tenant identity; legacy/unidentified jobs share the anonymous bucket. |
 | `IZWI_TTS_REPLAY_RETENTION_SECONDS` | 86400 | Retention interval for replay PCM belonging to terminal jobs. |
 | `IZWI_TTS_MAX_JOURNAL_BYTES` | 8 GiB | Per-job replay journal ceiling; not an aggregate storage reservation. |
+| `IZWI_TTS_PCM_PUBLISH_INTERVAL_MS` | 250 | Durable replay merges a segment's chunks into one journal entry at most this often (0 publishes every chunk). Audio reaches listeners only once published, so this bounds their extra delay; the first chunk after a quiet interval publishes at once. |
+| `IZWI_TTS_PCM_PUBLISH_MAX_CHUNKS` | 8 | Publish earlier once this many chunks are waiting. Entries never exceed 1 MiB. |
 | `IZWI_TTS_TOTAL_SPOOL_BYTES` | 1 GiB | Process-wide concurrent temporary WAV reservation. Increase only with measured disk capacity and concurrency headroom. |
 
 Each PCM replay object is additionally capped at 1 MiB, and one job can retain
 at most 131,072 replay entries. The entry ceiling covers the two-hour
-qualification target at the default 4,800-sample Fish output chunk while keeping
-pathological tiny-chunk journals finite.
+qualification target even when every 4,800-sample Fish output chunk is its own
+entry (`IZWI_TTS_PCM_PUBLISH_INTERVAL_MS=0`) while keeping pathological
+tiny-chunk journals finite. Each entry costs a reservation, a provider write
+with file and directory fsync, an acknowledgement and one publication
+transaction that also commits the speech checkpoint.
 
 Explicit caller `max_tokens` / `max_output_tokens` remains a **whole-job** output
 budget. It is not multiplied by the number of segments. Omit a cap for

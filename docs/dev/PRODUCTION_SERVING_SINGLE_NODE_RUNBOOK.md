@@ -562,8 +562,8 @@ reconciliation pass to 512, with deterministic ordering and one shared repair
 budget. SQLite reopen/claim/attempt-token completion has focused restart proof.
 This does not establish multi-gateway database ownership. The opaque artifact
 facade similarly has bounded, integrity-checked reads and tombstone-first
-deletion, but no gateway artifact route, automatic expiry/GC, or fleet adapter
-is enabled.
+deletion, and its retention labels drive expiry (see below), but no gateway
+artifact route or fleet adapter is enabled.
 
 Opaque artifact creation requires reserved-write protocol v1 from the selected
 media provider. Its database reservation exists before bytes leave the process,
@@ -571,8 +571,8 @@ expires after one minute, and is atomically consumed by metadata publication.
 Provider calls are bounded to thirty seconds. Maintenance uses exact cleanup
 claim tokens and recovers by write ID, including reservations with no recorded
 provider key. `NotFound` means both absent and unable to commit later for that
-expired write ID. The reservation ledger is capped at 65,536 and each cleanup
-scan at 64. New durable Fish PCM replay chunks use tenant-scoped opaque artifact
+expired write ID. The reservation ledger is capped per tenant and in total
+(see below) and each cleanup scan at 64. New durable Fish PCM replay chunks use tenant-scoped opaque artifact
 IDs and an atomic attempt-publication transaction; provider keys remain private.
 Existing raw-key replay rows stay compatible. Durable Fish final WAV publication
 can be enabled with `IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED=1` after the reserved-file
@@ -602,6 +602,56 @@ Canonical mapped types (for example `image/png`, `video/mp4`, `audio/wav`,
 `audio/mpeg`, and `audio/pcm-f32le`) round-trip. Aliases such as `audio/x-wav` are rejected before
 publication rather than being stored under `.wav` and later misreported as
 `audio/wav`; callers should submit the canonical media type.
+
+### Durable state retention, quotas and idempotency
+
+Durable creates (`POST /v1/text-to-speech` without streaming, including
+reference and saved voices, and `POST /v1/speech-to-text/jobs`) accept an
+`Idempotency-Key` header. The key is scoped to the authenticated tenant and
+reserved before any work. The job, its inputs, its stages and the replay
+result commit in one transaction. A retry with the same body returns the
+original record (202). The same key with a different body, or while the
+first request is still being accepted, is a 409. A streaming request with a
+key is a 400. Results are replayable for 24 hours.
+
+Idempotency records and provider write reservations are counted per tenant
+and in total by counters kept in the same transactions as the records; a
+full tenant is refused (503 for idempotency) without affecting others.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT` | 65,536 | Live idempotency records (reserved or replayable) per tenant |
+| `IZWI_IDEMPOTENCY_MAX_RECORDS` | 1,048,576 | Live idempotency records in total |
+| `IZWI_PROVIDER_WRITE_MAX_RESERVATIONS_PER_TENANT` | 16,384 | Outstanding provider write reservations per tenant |
+| `IZWI_PROVIDER_WRITE_MAX_RESERVATIONS` | 65,536 | Outstanding provider write reservations in total |
+
+The local batch worker's maintenance pass (every 30 s, at most 64 rows of each
+kind per pass, each kind in its own short transaction) deletes state past its
+retention:
+
+| Setting | Default | What expires |
+|---|---|---|
+| `IZWI_JOB_RETENTION_SECONDS` | 2,592,000 (30 days) | Terminal jobs with their stages, artifact rows and text inputs, measured from the job's last update. Opaque objects labelled `job` expire with their job. A job that still owns live job- or ephemeral-labelled objects waits until they are deleted. |
+| `IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS` | 3,600 | Opaque objects labelled `ephemeral`, from creation. Objects labelled `durable` (speech-history audio) never expire here. |
+| `IZWI_TTS_REPLAY_RETENTION_SECONDS` | 86,400 | Replay PCM of terminal speech jobs (unchanged). |
+| `IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS` | 86,400 | Heartbeat rows of workers that stopped heartbeating. |
+| `IZWI_MEDIA_TOMBSTONE_RETENTION_SECONDS` | 86,400 | Media rows tombstoned after their object was deleted and that nothing references. |
+
+Expired idempotency records go on every pass; rows of the retired legacy
+`idempotency_keys` table (no longer written) go after seven days.
+Reconciliation repairs pending projections of jobs cancelled in the last seven
+days.
+
+Database pool bounds apply to SQLite and PostgreSQL alike:
+`IZWI_DB_MAX_CONNECTIONS` (1-1,024, default 5) and `IZWI_DB_ACQUIRE_TIMEOUT_MS`
+(default 3,000). Database URLs are redacted (password and credential query
+parameters) in errors and debug output.
+
+An upgrade creates `runtime_quota_usage` and seeds it from existing records.
+Operators of a provider-managed schema must create that table (`quota_kind`,
+`scope`, `used`, primary key on the first two; the empty scope is the global
+row), seed it the same way, and add `runtime_jobs.replay_swept_at INTEGER
+NULL` before upgrading.
 
 ## Route migration gates
 
