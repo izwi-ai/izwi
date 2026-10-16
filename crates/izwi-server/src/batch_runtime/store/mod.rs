@@ -3,7 +3,7 @@ use super::types::{
     RuntimeArtifactRole, RuntimeCancellationState, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
     RuntimeStageStatus, RuntimeWorkerHeartbeat, RuntimeWorkerHeartbeatDetails,
     RuntimeWorkerRegistration, StageLease, StageResourceHints, TextAsset, WorkerResourceCapacity,
-    WORKER_HEARTBEAT_DETAILS_VERSION, WORKER_REGISTRATION_VERSION,
+    STAGE_RESOURCE_HINTS_VERSION, WORKER_HEARTBEAT_DETAILS_VERSION, WORKER_REGISTRATION_VERSION,
 };
 #[cfg(test)]
 use super::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};

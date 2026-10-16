@@ -393,6 +393,11 @@ pub(super) fn push_claim_resource_clause(
     sql.push_str(" AND s.resource_concurrency_weight <= ?");
     sql.push_str(&placeholder.to_string());
     params.push(u32_to_i64_value(resources.concurrency_slots).into());
+
+    let placeholder = params.len() + 1;
+    sql.push_str(" AND s.resource_hints_version = ?");
+    sql.push_str(&placeholder.to_string());
+    params.push(i64::from(STAGE_RESOURCE_HINTS_VERSION).into());
 }
 
 pub(super) fn push_optional_resource_requirement(
@@ -496,22 +501,8 @@ impl BatchRuntimeStore {
             "s.stage_kind",
             &filter.stage_kinds,
         );
-        let limit_placeholder = params.len() + 1;
-        params.push(i64::try_from(filter.candidate_limit())?.into());
-
-        let rows = db
-            .query_all_raw(raw::statement(
-                db,
-                format!(
-                    r#"
-                SELECT
-                    s.id,
-                    s.stage_kind,
-                    j.job_kind,
-                    COALESCE(s.capability, j.capability) AS capability,
-                    COALESCE(s.model_id, j.model_id) AS model_id,
-                    s.queue_class,
-                    s.resource_hints_json
+        let claimable = format!(
+            r#"
                 FROM job_stages s
                 INNER JOIN runtime_jobs j ON j.id = s.job_id
                 WHERE s.status IN ('queued', 'retrying')
@@ -528,6 +519,30 @@ impl BatchRuntimeStore {
                   {claim_filter_sql}
                 ORDER BY j.priority DESC, s.sequence ASC, COALESCE(s.available_at, s.created_at) ASC,
                          CASE WHEN s.started_at IS NULL THEN 0 ELSE 1 END ASC, s.id ASC
+            "#
+        );
+        if db.get_database_backend() == DbBackend::Postgres {
+            return self
+                .claim_skipping_locked_stages(db, &claimable, params, worker_id, lease_expires_at)
+                .await;
+        }
+
+        let limit_placeholder = params.len() + 1;
+        params.push(i64::try_from(filter.candidate_limit())?.into());
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                format!(
+                    r#"
+                SELECT
+                    s.id,
+                    s.stage_kind,
+                    j.job_kind,
+                    COALESCE(s.capability, j.capability) AS capability,
+                    COALESCE(s.model_id, j.model_id) AS model_id,
+                    s.queue_class,
+                    s.resource_hints_json
+                {claimable}
                 LIMIT ?{limit_placeholder}
                 "#,
                 ),
@@ -552,6 +567,97 @@ impl BatchRuntimeStore {
         }
 
         Ok(None)
+    }
+
+    /// PostgreSQL claims the first claimable stage in one statement. The
+    /// candidate subquery locks the stage and its job and skips rows another
+    /// transaction holds, so concurrent workers take distinct stages instead
+    /// of queueing on the head row, and a job row locked by a cancellation is
+    /// passed over rather than waited for. Every filter is in the SQL, so the
+    /// first unlocked row is the one to take.
+    async fn claim_skipping_locked_stages(
+        &self,
+        db: &DatabaseConnection,
+        claimable: &str,
+        mut params: Vec<Value>,
+        worker_id: &str,
+        lease_expires_at: i64,
+    ) -> anyhow::Result<Option<ClaimedStage>> {
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start runtime stage claim transaction")?;
+        let attempt_token = new_uuid();
+        let worker_placeholder = params.len() + 1;
+        let lease_placeholder = params.len() + 2;
+        let token_placeholder = params.len() + 3;
+        params.extend([
+            worker_id.into(),
+            lease_expires_at.into(),
+            attempt_token.clone().into(),
+        ]);
+        let claimed = tx
+            .query_one_raw(raw::statement(
+                &tx,
+                format!(
+                    r#"
+                    UPDATE job_stages
+                    SET
+                        status = 'running',
+                        worker_id = ?{worker_placeholder},
+                        lease_expires_at = ?{lease_placeholder},
+                        available_at = NULL,
+                        attempt_token = ?{token_placeholder},
+                        attempt_count = attempt_count + 1,
+                        started_at = COALESCE(started_at, ?1),
+                        updated_at = ?1,
+                        error_code = NULL,
+                        error_message = NULL
+                    WHERE id IN (
+                        SELECT s.id
+                        {claimable}
+                        LIMIT 1
+                        FOR UPDATE OF s, j SKIP LOCKED
+                    )
+                    RETURNING id, job_id
+                    "#
+                ),
+                params,
+            )?)
+            .await
+            .context("Failed to claim runtime job stage")?;
+        let Some(claimed) = claimed else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let stage_id: String = col(&claimed, "id")?;
+        let job_id: String = col(&claimed, "job_id")?;
+        tx.execute_raw(raw::statement(
+            &tx,
+            r#"
+            UPDATE runtime_jobs
+            SET
+                status = 'running',
+                updated_at = ?1,
+                started_at = COALESCE(started_at, ?1),
+                error_code = NULL,
+                error_message = NULL
+            WHERE id = ?2 AND status IN ('queued', 'running', 'retrying')
+            "#,
+            vec![self.now_millis().into(), job_id.clone().into()],
+        )?)
+        .await
+        .context("Failed to mark claimed runtime job running")?;
+        let stage = get_stage_with(&tx, &stage_id)
+            .await?
+            .ok_or_else(|| anyhow!("Claimed runtime job stage was not found"))?;
+        let job = get_job_with(&tx, &job_id)
+            .await?
+            .ok_or_else(|| anyhow!("Claimed runtime job was not found"))?;
+        tx.commit()
+            .await
+            .context("Failed to commit runtime stage claim transaction")?;
+        Ok(Some(ClaimedStage { job, stage }))
     }
 
     pub(super) async fn try_claim_stage_candidate(
@@ -1341,6 +1447,7 @@ impl BatchRuntimeStore {
                 required_device_class,
                 min_resource_memory_bytes,
                 resource_concurrency_weight,
+                resource_hints_version,
                 status,
                 capability,
                 model_id,
@@ -1358,7 +1465,7 @@ impl BatchRuntimeStore {
                 error_code,
                 error_message
             )
-            VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, NULL, ?3, NULL, 0, ?16, ?17, '[]', NULL, NULL, NULL, NULL, NULL)
+            VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?18, ?13, ?14, ?15, NULL, NULL, ?3, NULL, 0, ?16, ?17, '[]', NULL, NULL, NULL, NULL, NULL)
             "#,
             vec![
                 id.clone().into(),
@@ -1386,6 +1493,7 @@ impl BatchRuntimeStore {
                 opt_string(stage.model_id),
                 u32_to_i64_value(stage.max_attempts).into(),
                 input_artifact_ids_json.into(),
+                i64::from(resource_hints.version).into(),
             ],
         )?)
         .await

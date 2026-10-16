@@ -32,7 +32,7 @@ impl Schema {
             // Version 1 is the schema every earlier unversioned release
             // created. Its statements are idempotent, so a database those
             // releases left behind upgrades by running it once.
-            Self::App => &[(1, "baseline")],
+            Self::App => &[(1, "baseline"), (2, "stage claim columns")],
             Self::Fleet => &[(1, "fleet coordination")],
         }
     }
@@ -138,6 +138,24 @@ async fn apply_migration<C: ConnectionTrait>(
             if !quota_usage_existed {
                 backfill_quota_usage(db).await?;
             }
+        }
+        (Schema::App, 2) => {
+            // The claim filters on the stage's resource-hints version in SQL
+            // (every stage written so far is version 1), and a partial index
+            // keeps the claim scan to claimable stages, not the history.
+            ensure_column(
+                db,
+                &CompatibilityColumn {
+                    table: "job_stages",
+                    column: "resource_hints_version",
+                    definition: "INTEGER NOT NULL DEFAULT 1",
+                },
+            )
+            .await?;
+            db.execute_unprepared(
+                "CREATE INDEX IF NOT EXISTS idx_job_stages_claimable ON job_stages(queue_class, available_at) WHERE status IN ('queued', 'retrying')",
+            )
+            .await?;
         }
         (Schema::Fleet, 1) => {
             for statement in FLEET_SCHEMA {
@@ -1379,7 +1397,7 @@ mod tests {
         Migrator::up(db).await.expect("a second run is a no-op");
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
-            1
+            2
         );
         assert!(has_table(db, "runtime_jobs").await);
         assert!(
@@ -1421,7 +1439,7 @@ mod tests {
         Migrator::up(db).await.expect("unversioned database upgrades");
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
-            1
+            2
         );
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM chat_threads WHERE id = 'kept'").await,
@@ -1453,7 +1471,7 @@ mod tests {
         let db = &connections[0];
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations").await,
-            1
+            2
         );
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM voice_profiles").await,

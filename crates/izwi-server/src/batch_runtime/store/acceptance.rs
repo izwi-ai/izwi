@@ -466,6 +466,7 @@ impl BatchRuntimeStore {
                 queue_class, resource_hints_json, resource_target,
                 required_backend, required_device_class,
                 min_resource_memory_bytes, resource_concurrency_weight,
+                resource_hints_version,
                 status, capability, model_id, worker_id, lease_expires_at,
                 available_at, attempt_token, attempt_count, max_attempts,
                 input_artifact_ids_json, output_artifact_ids_json,
@@ -473,7 +474,7 @@ impl BatchRuntimeStore {
                 error_message, cancellation_state
             )
             VALUES (?1, ?2, ?3, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, 'queued', 'tts', ?12, NULL, NULL, ?3, NULL, 0, ?13,
+                    ?11, ?15, 'queued', 'tts', ?12, NULL, NULL, ?3, NULL, 0, ?13,
                     ?14, '[]', NULL, NULL, NULL, NULL, NULL, NULL)
             "#,
             vec![
@@ -499,6 +500,7 @@ impl BatchRuntimeStore {
                 model_id.into(),
                 u32_to_i64_value(input.max_attempts).into(),
                 input_artifact_ids_json.into(),
+                i64::from(resource_hints.version).into(),
             ],
         )?)
         .await
@@ -782,6 +784,7 @@ impl BatchRuntimeStore {
                     queue_class, resource_hints_json, resource_target,
                     required_backend, required_device_class,
                     min_resource_memory_bytes, resource_concurrency_weight,
+                    resource_hints_version,
                     status, capability, model_id, worker_id, lease_expires_at,
                     available_at, attempt_token, attempt_count, max_attempts,
                     input_artifact_ids_json, output_artifact_ids_json,
@@ -789,7 +792,7 @@ impl BatchRuntimeStore {
                     error_message, cancellation_state
                 )
                 VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        'queued', ?13, ?14, NULL, NULL, ?3, NULL, 0, ?15, ?16,
+                        ?17, 'queued', ?13, ?14, NULL, NULL, ?3, NULL, 0, ?15, ?16,
                         '[]', NULL, NULL, NULL, NULL, NULL, NULL)
                 "#,
                 vec![
@@ -817,6 +820,7 @@ impl BatchRuntimeStore {
                     opt_string(stage.model_id),
                     u32_to_i64_value(stage.max_attempts).into(),
                     json_to_db_string(&json!(stage.input_artifact_ids), "[]")?.into(),
+                    i64::from(resource_hints.version).into(),
                 ],
             )?)
             .await

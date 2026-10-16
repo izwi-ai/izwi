@@ -463,6 +463,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
             "required_device_class",
             "min_resource_memory_bytes",
             "resource_concurrency_weight",
+            "resource_hints_version",
             "status",
             "capability",
             "model_id",

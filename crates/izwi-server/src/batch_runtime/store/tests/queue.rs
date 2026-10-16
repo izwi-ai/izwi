@@ -1170,3 +1170,83 @@ async fn leases_follow_the_database_clock_not_the_process_wall_clock() {
         "lease expires at {lease_expires_at}, expected about {expected}"
     );
 }
+
+/// On PostgreSQL a claim passes over a stage another transaction holds (a
+/// concurrent claimer mid-commit) instead of waiting on it. SQLite has one
+/// writer, so there is nothing to skip there.
+#[tokio::test]
+async fn postgres_claims_skip_a_stage_another_transaction_holds() {
+    let (store, _root) = build_store().await;
+    let db = store.connection().await.expect("connection");
+    if db.get_database_backend() != DbBackend::Postgres {
+        return;
+    }
+    let (_, held) = create_test_job_and_stage(&store, 1, "held_stage", 1).await;
+    let (_, free) = create_test_job_and_stage(&store, 0, "free_stage", 1).await;
+
+    let holder = db.begin().await.expect("holder transaction");
+    holder
+        .execute_raw(
+            raw::statement(
+                &holder,
+                "SELECT id FROM job_stages WHERE id = ?1 FOR UPDATE",
+                vec![held.id.clone().into()],
+            )
+            .expect("lock statement"),
+        )
+        .await
+        .expect("the head stage is locked");
+
+    let claimed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.claim_next_stage("worker-1", 60_000),
+    )
+    .await
+    .expect("the claim does not wait on the locked stage")
+    .expect("claim")
+    .expect("the unlocked stage is claimed");
+    assert_eq!(claimed.stage.id, free.id);
+    holder.rollback().await.expect("holder rolls back");
+
+    let next = store
+        .claim_next_stage("worker-2", 60_000)
+        .await
+        .expect("claim")
+        .expect("the released stage is claimable");
+    assert_eq!(next.stage.id, held.id);
+}
+
+/// Every claim filter is in the SQL, so stages a worker cannot run never
+/// crowd the candidates out (here, one candidate at a time).
+#[tokio::test]
+async fn claim_filters_resource_hints_versions_in_sql() {
+    let (store, _root) = build_store().await;
+    let (_, newer) = create_test_job_and_stage(&store, 1, "newer_hints_stage", 1).await;
+    let (_, current) = create_test_job_and_stage(&store, 0, "current_hints_stage", 1).await;
+    let db = store.connection().await.expect("connection");
+    db.execute_raw(
+        raw::statement(
+            db,
+            "UPDATE job_stages SET resource_hints_version = ?1, resource_hints_json = ?2 WHERE id = ?3",
+            vec![
+                i64::from(STAGE_RESOURCE_HINTS_VERSION + 1).into(),
+                json!({"version": STAGE_RESOURCE_HINTS_VERSION + 1}).to_string().into(),
+                newer.id.clone().into(),
+            ],
+        )
+        .expect("version statement"),
+    )
+    .await
+    .expect("the head stage carries a newer hints version");
+
+    let filter = StageClaimFilter {
+        max_candidates: 1,
+        ..StageClaimFilter::default()
+    };
+    let claimed = store
+        .claim_next_stage_with_filter("worker-1", 60_000, &filter)
+        .await
+        .expect("claim")
+        .expect("the compatible stage is claimed");
+    assert_eq!(claimed.stage.id, current.id);
+}
