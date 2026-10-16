@@ -360,6 +360,45 @@ impl Drop for CompletionRegistration<'_> {
     }
 }
 
+/// Exact-session aborts waiting for the step gate's holder (SCH-F12). A
+/// running step applies them as soon as their session has no in-flight
+/// work, instead of the caller waiting for the whole step (an atomic job can
+/// run for many seconds); whoever holds the gate next applies the rest.
+#[derive(Default)]
+struct PendingAborts {
+    queue: std::sync::Mutex<Vec<(SessionKey, oneshot::Sender<bool>)>>,
+    notify: Notify,
+}
+
+impl PendingAborts {
+    /// Apply the queued aborts. The caller holds the step gate; `during_step`
+    /// says its step is still executing, so a session with in-flight work
+    /// keeps its abort queued for after the step.
+    async fn apply(&self, core: &RwLock<EngineCore>, during_step: bool) {
+        let queued = std::mem::take(&mut *self.queue.lock().unwrap_or_else(|p| p.into_inner()));
+        if queued.is_empty() {
+            return;
+        }
+        let mut deferred = Vec::new();
+        {
+            let mut core = core.write().await;
+            for (session, reply) in queued {
+                if during_step && core.has_in_flight_work(&session) {
+                    deferred.push((session, reply));
+                    continue;
+                }
+                let _ = reply.send(core.abort_request_session(&session).await);
+            }
+        }
+        if !deferred.is_empty() {
+            self.queue
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(deferred);
+        }
+    }
+}
+
 #[derive(Default)]
 struct DeliveryLaneState {
     lanes: HashMap<SessionKey, mpsc::UnboundedSender<LaneMessage>>,
@@ -574,6 +613,7 @@ pub struct Engine {
     /// Exact-session terminal outputs for synchronous public callers.
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
     delivery_lanes: Arc<std::sync::Mutex<DeliveryLaneState>>,
+    pending_aborts: Arc<PendingAborts>,
     /// Distinguishes a cancelled registration from a later reuse of the public ID.
     next_completion_registration: std::sync::atomic::AtomicU64,
 }
@@ -589,6 +629,7 @@ struct OwnedStepContext {
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
     delivery_lanes: Arc<std::sync::Mutex<DeliveryLaneState>>,
     wake_notify: Arc<Notify>,
+    pending_aborts: Arc<PendingAborts>,
 }
 
 struct OwnedRunnerRecoveryGuard {
@@ -821,6 +862,9 @@ impl OwnedStepContext {
                         ),
                         None => delivery_failures_closed = true,
                     }
+                }
+                _ = self.pending_aborts.notify.notified() => {
+                    self.pending_aborts.apply(&self.core, true).await;
                 }
             }
         }
@@ -1112,6 +1156,7 @@ impl OwnedStepContext {
 
     async fn run(self, defer_unregistered_terminal_ack: bool) -> Result<Vec<EngineOutput>> {
         let _step = self.step_gate.lock().await;
+        self.pending_aborts.apply(&self.core, false).await;
         let prepared = {
             let mut core = self.core.write().await;
             let started = Instant::now();
@@ -1267,6 +1312,7 @@ impl Engine {
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
+            pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -2639,6 +2685,7 @@ impl Engine {
             completion_mailboxes: self.completion_mailboxes.clone(),
             delivery_lanes: self.delivery_lanes.clone(),
             wake_notify: self.wake_notify.clone(),
+            pending_aborts: self.pending_aborts.clone(),
         };
         match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack).await }).await
         {
@@ -2770,10 +2817,10 @@ impl Engine {
                 .cancellation
                 .store(true, std::sync::atomic::Ordering::Release);
         }
-        let _step = self.step_gate.lock().await;
-        let mut core = self.core.write().await;
-        let aborted = core.abort_request(request_id).await;
-        drop(core);
+        let Some(session) = self.core.read().await.get_session_key(request_id) else {
+            return Ok(false);
+        };
+        let aborted = self.abort_core_session(&session).await;
         if aborted {
             self.request_controls
                 .lock()
@@ -2782,6 +2829,29 @@ impl Engine {
             self.wake_notify.notify_one();
         }
         Ok(aborted)
+    }
+
+    /// Abort `session` in the engine core under the step gate, without
+    /// waiting for a running step to finish when the session has no
+    /// in-flight work in it (SCH-F12): the step applies the abort itself.
+    /// A session with in-flight work is aborted once that work commits or
+    /// the step ends, as before.
+    async fn abort_core_session(&self, session: &SessionKey) -> bool {
+        let (reply, mut answer) = oneshot::channel();
+        self.pending_aborts
+            .queue
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((session.clone(), reply));
+        self.pending_aborts.notify.notify_one();
+        tokio::select! {
+            biased;
+            answer = &mut answer => answer.unwrap_or(false),
+            _step = self.step_gate.lock() => {
+                self.pending_aborts.apply(&self.core, false).await;
+                answer.await.unwrap_or(false)
+            }
+        }
     }
 
     /// Read the session-fenced identity for the active request ID.
@@ -3128,10 +3198,7 @@ impl Engine {
                 })
                 .unwrap_or(false)
         };
-        let _step = self.step_gate.lock().await;
-        let mut core = self.core.write().await;
-        let aborted = core.abort_request_session(session).await;
-        drop(core);
+        let aborted = self.abort_core_session(session).await;
         let accepted = signaled || aborted;
         if accepted {
             let mut controls = self
@@ -4200,6 +4267,7 @@ mod tests {
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
+            pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -4217,6 +4285,7 @@ mod tests {
             completion_mailboxes: engine.completion_mailboxes.clone(),
             delivery_lanes: engine.delivery_lanes.clone(),
             wake_notify: engine.wake_notify.clone(),
+            pending_aborts: engine.pending_aborts.clone(),
         };
         let session = SessionKey::new("slow-audio".into(), 1);
         let (tx, mut rx) = mpsc::channel(1);
@@ -4306,6 +4375,7 @@ mod tests {
             completion_mailboxes: engine.completion_mailboxes.clone(),
             delivery_lanes: engine.delivery_lanes.clone(),
             wake_notify: engine.wake_notify.clone(),
+            pending_aborts: engine.pending_aborts.clone(),
         }
     }
 
@@ -4544,6 +4614,7 @@ mod tests {
             completion_mailboxes: engine.completion_mailboxes.clone(),
             delivery_lanes: engine.delivery_lanes.clone(),
             wake_notify: engine.wake_notify.clone(),
+            pending_aborts: engine.pending_aborts.clone(),
         };
         let session = SessionKey::new("closed-audio".into(), 7);
         let (tx, rx) = mpsc::channel(1);
@@ -4638,6 +4709,7 @@ mod tests {
             completion_mailboxes: engine.completion_mailboxes.clone(),
             delivery_lanes: engine.delivery_lanes.clone(),
             wake_notify: engine.wake_notify.clone(),
+            pending_aborts: engine.pending_aborts.clone(),
         };
         let (tx, mut rx) = mpsc::channel(1);
         let chunk = |sequence| StreamingOutput {
@@ -5115,6 +5187,69 @@ mod tests {
         assert!(engine.step().await.unwrap().is_empty());
     }
 
+    /// SCH-F12: aborting a queued request used to wait for the step gate,
+    /// so it waited out a running model call of another request (an atomic
+    /// job can take seconds). The running step now applies the abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_does_not_wait_for_another_requests_running_step() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            BlockingForwardExecutor {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: release.clone(),
+            },
+        )));
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request("running-job"))
+            .unwrap();
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("executor did not enter the model forward")
+            .expect("executor entry signal was dropped");
+
+        engine
+            .core
+            .write()
+            .await
+            .add_request(immediate_terminal_request("queued-job"))
+            .unwrap();
+        let queued = engine
+            .request_session_key(&"queued-job".to_string())
+            .await
+            .unwrap();
+        let aborted = tokio::time::timeout(
+            Duration::from_millis(500),
+            engine.abort_request_session(&queued),
+        )
+        .await;
+        let aborted_running = engine.has_request(&"queued-job".to_string()).await;
+
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let outputs = step.await.unwrap().unwrap();
+
+        assert!(
+            aborted
+                .expect("the abort waited for the running step")
+                .unwrap(),
+            "the queued session was not aborted"
+        );
+        assert!(!aborted_running);
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "running-job"));
+        assert!(outputs
+            .iter()
+            .any(|output| output.request_id == "queued-job" && output.is_finished));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_text_chat_preparation_runs_off_thread_and_authorizes_exact_tokens() {
         let caller_thread = std::thread::current().id();
@@ -5450,6 +5585,7 @@ mod tests {
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
+            pending_aborts: Arc::new(PendingAborts::default()),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         });
 

@@ -5573,6 +5573,16 @@ impl EngineCore {
             || self.scheduler.has_due_cleanup(Instant::now())
     }
 
+    /// Whether the session has a plan begun or a dispatch registered that
+    /// has not committed or rolled back.
+    pub(crate) fn has_in_flight_work(&self, session: &super::SessionKey) -> bool {
+        self.active_plans.contains_session(session)
+            || self
+                .in_flight_dispatches
+                .values()
+                .any(|dispatch| dispatch.contains_session(session))
+    }
+
     /// See [`super::scheduler::Scheduler::next_wakeup`].
     pub(crate) fn next_wakeup(&self, now: Instant) -> Option<Instant> {
         self.scheduler.next_wakeup(now)
