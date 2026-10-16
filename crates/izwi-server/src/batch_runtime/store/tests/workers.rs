@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn registered_worker_heartbeat_tracks_instance_resources_and_capacity() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let registration = RuntimeWorkerRegistration {
         version: WORKER_REGISTRATION_VERSION,
         worker_id: "worker-logical".to_string(),
@@ -72,7 +72,7 @@ async fn registered_worker_heartbeat_tracks_instance_resources_and_capacity() {
 
 #[tokio::test]
 async fn queue_health_requires_fresh_queue_coverage() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (_job, stage) = create_test_job_and_stage(&store, 0, "asr_infer", 1).await;
     assert_eq!(stage.queue_class, QueueClass::BatchAsr);
 

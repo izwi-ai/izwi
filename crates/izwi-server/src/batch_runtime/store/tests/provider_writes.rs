@@ -147,7 +147,7 @@ fn provider_write_request_envelope_is_typed_and_bounded() {
 
 #[tokio::test]
 async fn provider_write_request_roundtrips_and_legacy_recovery_fails_closed() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
 
@@ -225,7 +225,7 @@ async fn provider_write_request_roundtrips_and_legacy_recovery_fails_closed() {
 
 #[tokio::test]
 async fn invalid_provider_write_rows_remain_fenced_without_starving_cleanup() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let poison = store
@@ -336,7 +336,7 @@ async fn invalid_provider_write_rows_remain_fenced_without_starving_cleanup() {
 /// back by every path that deletes them.
 #[tokio::test]
 async fn provider_write_quota_is_per_tenant_and_released_by_cleanup() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     store.set_provider_write_limits_for_test(QuotaLimits {

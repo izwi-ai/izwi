@@ -4,7 +4,7 @@ use super::*;
 /// pages, and never a job that still owns live job-scoped media.
 #[tokio::test]
 async fn retention_sweep_deletes_only_expired_terminal_state() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let policy = retention_policy();
@@ -124,7 +124,7 @@ async fn retention_sweep_deletes_only_expired_terminal_state() {
 /// journal is marked swept and not scanned again, until a retry.
 #[tokio::test]
 async fn speech_replay_gc_marks_jobs_without_a_journal_swept() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let job = retention_job(&store, RuntimeJobStatus::Failed, None).await;

@@ -1,6 +1,5 @@
 use super::*;
-use crate::db::StoreDatabase;
-use tempfile::TempDir;
+use crate::db::test_database::TestDatabase;
 
 mod acceptance;
 mod artifacts;
@@ -13,12 +12,14 @@ mod retention;
 mod speech;
 mod workers;
 
-fn build_store() -> (BatchRuntimeStore, TempDir) {
-    let root = tempfile::tempdir().expect("temp dir");
-    let db_path = root.path().join("runtime.sqlite");
+/// A store on a fresh test database (SQLite, or PostgreSQL when
+/// `IZWI_TEST_STORE_PG_URL` is set). The database outlives the store handle
+/// so a test can reopen it.
+async fn build_store() -> (BatchRuntimeStore, TestDatabase) {
+    let database = TestDatabase::new().await;
     (
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path)),
-        root,
+        BatchRuntimeStore::initialize_with_database(database.database()),
+        database,
     )
 }
 

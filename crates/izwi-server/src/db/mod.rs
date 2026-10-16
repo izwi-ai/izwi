@@ -4,6 +4,8 @@ pub mod migrator;
 pub mod raw;
 pub mod schema_contract;
 pub mod sqlite;
+#[cfg(test)]
+pub(crate) mod test_database;
 
 use sea_orm::{SqliteTransactionMode, TransactionOptions};
 

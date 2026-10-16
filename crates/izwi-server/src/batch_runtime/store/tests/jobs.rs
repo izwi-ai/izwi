@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn creates_runtime_foundation_records() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
 
     let media = store
         .create_media_asset(NewMediaAsset {
@@ -124,7 +124,7 @@ async fn creates_runtime_foundation_records() {
 
 #[tokio::test]
 async fn active_job_indexes_exclude_terminal_jobs() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let job = store
         .create_job(NewRuntimeJob {
             job_kind: RuntimeJobKind::TtsSpeech,
@@ -215,7 +215,7 @@ async fn active_job_indexes_exclude_terminal_jobs() {
 
 #[tokio::test]
 async fn job_transitions_are_status_conditional() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let job = store
         .create_job(NewRuntimeJob {
             job_kind: RuntimeJobKind::TtsSpeech,
@@ -279,10 +279,8 @@ async fn job_transitions_are_status_conditional() {
 
 #[tokio::test]
 async fn acknowledged_job_survives_store_reconstruction_and_completes() {
-    let root = tempfile::tempdir().expect("temp dir");
-    let db_path = root.path().join("runtime.sqlite");
-    let first_store =
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+    let database = TestDatabase::new().await;
+    let first_store = BatchRuntimeStore::initialize_with_database(database.database());
     let input = first_store
         .create_text_asset(NewTextAsset {
             raw_text: "durable input".to_string(),
@@ -331,8 +329,7 @@ async fn acknowledged_job_survives_store_reconstruction_and_completes() {
 
     drop(first_store);
 
-    let restarted_store =
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+    let restarted_store = BatchRuntimeStore::initialize_with_database(database.database());
     let rediscovered_input = restarted_store
         .get_text_asset(&input.id)
         .await
@@ -380,7 +377,7 @@ async fn acknowledged_job_survives_store_reconstruction_and_completes() {
 
     drop(restarted_store);
 
-    let final_store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+    let final_store = BatchRuntimeStore::initialize_with_database(database.database());
     let final_job = final_store
         .get_job(&job.id)
         .await
@@ -411,7 +408,7 @@ async fn acknowledged_job_survives_store_reconstruction_and_completes() {
 
 #[tokio::test]
 async fn manual_retry_requeues_failed_job_and_stage() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let job = store
         .create_job(NewRuntimeJob {
             job_kind: RuntimeJobKind::TtsSpeech,

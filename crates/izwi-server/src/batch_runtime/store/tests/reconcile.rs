@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let record_id = "cancelled-transcription";
     let db = store.connection().await.expect("database");
     db.execute_raw(
@@ -121,7 +121,7 @@ async fn bounded_reconciliation_repairs_cancelled_transcription_projection() {
 
 #[tokio::test]
 async fn cancelled_job_cannot_overwrite_an_active_replacement_projection() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let record_id = "replacement-owned-transcription";
     let db = store.connection().await.expect("database");
     db.execute_raw(
@@ -232,7 +232,7 @@ async fn cancelled_job_cannot_overwrite_an_active_replacement_projection() {
 
 #[tokio::test]
 async fn reconcile_fails_jobs_orphaned_without_stages_and_releases_admission() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     store.test_tts_admission_limits = Some((1, 1));
@@ -269,7 +269,7 @@ async fn reconcile_fails_jobs_orphaned_without_stages_and_releases_admission() {
 
 #[tokio::test]
 async fn reconcile_keeps_old_jobs_that_have_stages() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
@@ -293,7 +293,7 @@ async fn reconcile_keeps_old_jobs_that_have_stages() {
 
 #[tokio::test]
 async fn reconciliation_repairs_crash_interrupted_terminal_transitions() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (completed_job, completed_stage) =
         create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
@@ -365,7 +365,7 @@ async fn reconciliation_repairs_crash_interrupted_terminal_transitions() {
 
 #[tokio::test]
 async fn reconciliation_consumes_one_shared_bounded_budget() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let mut job_ids = Vec::new();
     let db = store.connection().await.expect("database");
 

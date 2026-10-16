@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn speech_replay_gc_fences_retry_before_storage_deletion() {
     for retry_first in [false, true] {
-        let (mut store, _root) = build_store();
+        let (mut store, _root) = build_store().await;
         let clock = Arc::new(AtomicI64::new(1_000));
         store.set_test_clock(clock.clone());
         let (job, _) = create_test_job_and_stage(&store, 0, "speech", 3).await;
@@ -57,7 +57,7 @@ async fn speech_replay_gc_fences_retry_before_storage_deletion() {
 #[tokio::test]
 async fn manual_speech_replay_deletion_fences_concurrent_retry() {
     for retry_first in [false, true] {
-        let (store, _root) = build_store();
+        let (store, _root) = build_store().await;
         let (job, _) = create_test_job_and_stage(&store, 0, "speech", 3).await;
         let claim = store
             .claim_next_stage("worker", 60_000)
@@ -110,7 +110,7 @@ async fn manual_speech_replay_deletion_fences_concurrent_retry() {
 
 #[tokio::test]
 async fn speech_admission_preflight_has_no_reservation_and_rejects_overload() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     store.test_tts_admission_limits = Some((1, 1));
     store
         .preflight_speech_admission(Some([1; 32]))
@@ -136,7 +136,7 @@ async fn speech_admission_preflight_has_no_reservation_and_rejects_overload() {
 
 #[tokio::test]
 async fn speech_admission_serializes_concurrent_enqueue_and_terminal_releases_capacity() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     store.test_tts_admission_limits = Some((2, 2));
     store.connection().await.unwrap();
     let mut tasks = Vec::new();
@@ -175,7 +175,7 @@ async fn speech_admission_serializes_concurrent_enqueue_and_terminal_releases_ca
 
 #[tokio::test]
 async fn speech_admission_separates_tenants_and_retry_obeys_the_same_capacity() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     store.test_tts_admission_limits = Some((3, 1));
     let first = store.create_job(admission_job(1)).await.unwrap();
     assert!(store.create_job(admission_job(1)).await.is_err());
@@ -224,7 +224,7 @@ async fn speech_admission_separates_tenants_and_retry_obeys_the_same_capacity() 
 
 #[tokio::test]
 async fn active_tts_cancellation_updates_projection_only_after_teardown() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let accepted = match store
         .accept_durable_text_tts(durable_text_tts_acceptance(None))
         .await
@@ -344,7 +344,7 @@ async fn active_tts_cancellation_updates_projection_only_after_teardown() {
 
 #[tokio::test]
 async fn speech_replay_is_cursor_ordered_bounded_and_attempt_fenced() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, _) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)

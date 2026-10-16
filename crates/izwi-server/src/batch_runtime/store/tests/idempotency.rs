@@ -40,7 +40,7 @@ fn durable_idempotency_digest_uses_canonical_json_object_order() {
 
 #[tokio::test]
 async fn durable_idempotency_is_tenant_and_operation_scoped_with_replay() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock);
     let job = create_test_job(&store, 0, 1).await;
@@ -121,7 +121,7 @@ async fn concurrent_same_key_reservations_never_double_acquire() {
     // state instead of creating duplicate work. This holds on SQLite via
     // the named admission lock and on PostgreSQL via the
     // ON CONFLICT/INSERT IGNORE key fence.
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock);
     let first_request =
@@ -150,7 +150,7 @@ async fn concurrent_same_key_reservations_never_double_acquire() {
 
 #[tokio::test]
 async fn durable_idempotency_reservations_expire_and_fence_stale_commits() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let job = create_test_job(&store, 0, 1).await;
@@ -204,7 +204,7 @@ async fn durable_idempotency_reservations_expire_and_fence_stale_commits() {
 
 #[tokio::test]
 async fn durable_idempotency_concurrent_reservation_has_one_owner_and_fenced_release() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
     let request =
         durable_idempotency_request("tenant-a", "job.create", "concurrent-key", b"one", 500);
@@ -258,7 +258,7 @@ async fn durable_idempotency_concurrent_reservation_has_one_owner_and_fenced_rel
 
 #[tokio::test]
 async fn durable_idempotency_pruning_and_capacity_are_bounded_and_deterministic() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     for (offset, key) in [(0, "a"), (1, "b"), (2, "c")] {
@@ -339,7 +339,7 @@ async fn durable_idempotency_pruning_and_capacity_are_bounded_and_deterministic(
 /// kept as counters by the transactions that insert and delete records.
 #[tokio::test]
 async fn durable_idempotency_quota_is_per_tenant_and_counted_incrementally() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let limits = QuotaLimits {
@@ -433,7 +433,7 @@ async fn durable_idempotency_quota_is_per_tenant_and_counted_incrementally() {
 /// already exist; later migrations leave the live counts alone.
 #[tokio::test]
 async fn quota_usage_is_backfilled_once_when_its_table_is_created() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     for (tenant, key) in [("tenant-a", "a1"), ("tenant-a", "a2"), ("tenant-b", "b1")] {
         assert!(matches!(
             store
@@ -490,7 +490,7 @@ async fn quota_usage_is_backfilled_once_when_its_table_is_created() {
 
 #[tokio::test]
 async fn durable_idempotency_rejects_unbounded_or_unattached_records() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock);
     let oversized_key = "x".repeat(MAX_DURABLE_IDEMPOTENCY_KEY_BYTES + 1);

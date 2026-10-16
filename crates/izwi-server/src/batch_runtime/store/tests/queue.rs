@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn cooperative_yield_frees_worker_for_short_job_without_consuming_retries() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock);
     let (_long_job, long_stage) = create_test_job_and_stage(&store, 0, "speech", 1).await;
@@ -74,7 +74,7 @@ async fn cooperative_yield_frees_worker_for_short_job_without_consuming_retries(
 
 #[tokio::test]
 async fn cooperative_yield_rejects_foreign_expired_and_cancelled_attempts() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let (job, _stage) = create_test_job_and_stage(&store, 0, "speech", 2).await;
@@ -101,7 +101,7 @@ async fn cooperative_yield_rejects_foreign_expired_and_cancelled_attempts() {
 
 #[tokio::test]
 async fn queue_claim_recovery_and_cancel_are_durable() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let job = store
         .create_job(NewRuntimeJob {
             job_kind: RuntimeJobKind::AsrTranscription,
@@ -176,7 +176,7 @@ async fn queue_claim_recovery_and_cancel_are_durable() {
 
 #[tokio::test]
 async fn expired_lease_recovery_runs_in_stable_bounded_batches() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let mut stage_ids = Vec::new();
@@ -250,7 +250,7 @@ async fn expired_lease_recovery_runs_in_stable_bounded_batches() {
 
 #[tokio::test]
 async fn filtered_stage_claim_skips_incompatible_higher_priority_stage() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let tts_job = store
         .create_job(NewRuntimeJob {
             job_kind: RuntimeJobKind::TtsSpeech,
@@ -352,7 +352,7 @@ async fn filtered_stage_claim_skips_incompatible_higher_priority_stage() {
 
 #[tokio::test]
 async fn resource_aware_claim_rejects_backend_device_and_capacity_mismatch() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let gpu_job = create_test_job(&store, 50, 1).await;
     let gpu_stage = store
         .create_stage_with_dispatch(NewJobStageDispatch {
@@ -439,7 +439,7 @@ async fn resource_aware_claim_rejects_backend_device_and_capacity_mismatch() {
 
 #[tokio::test]
 async fn concurrent_claimers_take_distinct_candidates() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     create_test_job_and_stage(&store, 20, "fake_stage", 1).await;
     create_test_job_and_stage(&store, 10, "fake_stage", 1).await;
 
@@ -458,7 +458,7 @@ async fn concurrent_claimers_take_distinct_candidates() {
 
 #[tokio::test]
 async fn claim_waits_for_predecessor_completion() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, first_stage) = create_test_job_and_stage(&store, 0, "first_stage", 1).await;
     let second_stage = store
         .create_stage(NewJobStage {
@@ -501,7 +501,7 @@ async fn claim_waits_for_predecessor_completion() {
 
 #[tokio::test]
 async fn claim_cas_rechecks_parent_job_eligibility() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     store
         .transition_job_status(
@@ -548,7 +548,7 @@ async fn claim_cas_rechecks_parent_job_eligibility() {
 
 #[tokio::test]
 async fn terminal_parent_fences_late_stage_completion() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)
@@ -584,7 +584,7 @@ async fn terminal_parent_fences_late_stage_completion() {
 
 #[tokio::test]
 async fn stale_owner_cannot_finish_a_reclaimed_attempt() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (_job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 3).await;
     let first = store
         .claim_next_stage("worker-1", 0)
@@ -648,7 +648,7 @@ async fn stale_owner_cannot_finish_a_reclaimed_attempt() {
 
 #[tokio::test]
 async fn cancellation_fences_results_until_active_stage_teardown() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)
@@ -736,7 +736,7 @@ async fn cancellation_fences_results_until_active_stage_teardown() {
 
 #[tokio::test]
 async fn requested_cancellation_survives_lease_expiry_until_exact_owner_teardown() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
@@ -787,7 +787,7 @@ async fn requested_cancellation_survives_lease_expiry_until_exact_owner_teardown
 
 #[tokio::test]
 async fn abandoned_cancellation_settles_only_after_owner_stops_renewing_and_heartbeating() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     store.test_tts_admission_limits = Some((1, 1));
@@ -885,7 +885,7 @@ async fn abandoned_cancellation_settles_only_after_owner_stops_renewing_and_hear
 
 #[tokio::test]
 async fn abandoned_cancellation_ignores_a_restarted_incarnation_reusing_the_worker_id() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
@@ -941,7 +941,7 @@ async fn abandoned_cancellation_ignores_a_restarted_incarnation_reusing_the_work
 
 #[tokio::test]
 async fn completion_and_cancellation_race_has_one_authoritative_winner() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)
@@ -1013,7 +1013,7 @@ async fn completion_and_cancellation_race_has_one_authoritative_winner() {
 
 #[tokio::test]
 async fn retry_policy_delays_claims_and_enforces_attempt_budget() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 3).await;
     let db = store.connection().await.expect("database");
     db.execute_raw(

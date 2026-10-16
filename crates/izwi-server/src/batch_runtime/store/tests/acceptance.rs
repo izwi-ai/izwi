@@ -10,7 +10,7 @@ async fn durable_text_tts_acceptance_rolls_back_every_partial_graph_failpoint() 
         DurableAcceptanceFailpoint::Stage,
         DurableAcceptanceFailpoint::Idempotency,
     ] {
-        let (mut store, _root) = build_store();
+        let (mut store, _root) = build_store().await;
         let request = durable_idempotency_request(
             "tenant-a",
             "speech.text_to_speech.create.v1",
@@ -61,7 +61,7 @@ async fn durable_job_acceptance_rolls_back_every_partial_graph_failpoint() {
         DurableAcceptanceFailpoint::Stage,
         DurableAcceptanceFailpoint::Idempotency,
     ] {
-        let (mut store, _root) = build_store();
+        let (mut store, _root) = build_store().await;
         let media = durable_job_media_asset(&store).await;
         let request = durable_idempotency_request(
             "tenant-a",
@@ -106,7 +106,7 @@ async fn durable_job_acceptance_rolls_back_every_partial_graph_failpoint() {
 
 #[tokio::test]
 async fn durable_job_acceptance_commits_one_claimable_graph_and_replays() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let media = durable_job_media_asset(&store).await;
     let request = durable_idempotency_request(
         "tenant-a",
@@ -169,7 +169,7 @@ async fn durable_job_acceptance_commits_one_claimable_graph_and_replays() {
 
 #[tokio::test]
 async fn durable_job_acceptance_rejects_partial_graphs_and_lost_reservations() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let media = durable_job_media_asset(&store).await;
 
     let mut stageless = durable_speech_job_acceptance(&media, None);
@@ -221,7 +221,7 @@ async fn durable_job_acceptance_rejects_partial_graphs_and_lost_reservations() {
 
 #[tokio::test]
 async fn durable_text_tts_acceptance_has_one_graph_and_replays_after_reopen() {
-    let (store, root) = build_store();
+    let (store, root) = build_store().await;
     let request = durable_idempotency_request(
         "tenant-a",
         "speech.text_to_speech.create.v1",
@@ -282,9 +282,7 @@ async fn durable_text_tts_acceptance_has_one_graph_and_replays_after_reopen() {
     assert_eq!(accepted.input_artifact.job_id, accepted.job.id);
 
     drop(store);
-    let reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("runtime.sqlite"),
-    ));
+    let reopened = BatchRuntimeStore::initialize_with_database(root.database());
     let replay = match reopened
         .reserve_durable_idempotency(request)
         .await
@@ -306,7 +304,7 @@ async fn durable_text_tts_acceptance_has_one_graph_and_replays_after_reopen() {
 
 #[tokio::test]
 async fn durable_text_tts_acceptance_fences_expiry_and_bounds_replay_response() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
     let reservation = match store
@@ -426,7 +424,7 @@ async fn durable_text_tts_acceptance_fences_expiry_and_bounds_replay_response() 
 
 #[tokio::test]
 async fn unkeyed_text_tts_acceptance_is_atomic_and_only_claimable_after_commit() {
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     let mut acceptance = durable_text_tts_acceptance(None);
     acceptance.idempotency_retention_ms = 0;
     store.set_durable_acceptance_failpoint(Some(DurableAcceptanceFailpoint::Stage));

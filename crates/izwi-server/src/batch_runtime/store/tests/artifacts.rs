@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn attempt_token_fences_same_worker_and_attempt_publication() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (_job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)
@@ -43,7 +43,7 @@ async fn attempt_token_fences_same_worker_and_attempt_publication() {
 
 #[tokio::test]
 async fn attempt_owned_artifact_publication_is_idempotent() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-1", 60_000)
@@ -86,7 +86,7 @@ async fn attempt_owned_artifact_publication_is_idempotent() {
 
 #[tokio::test]
 async fn stage_completion_rejects_unbounded_or_unowned_output_references_atomically() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
     let claimed = store
         .claim_next_stage("worker-a", 60_000)
@@ -206,7 +206,7 @@ async fn stage_completion_rejects_unbounded_or_unowned_output_references_atomica
 #[tokio::test]
 async fn reclaimed_attempt_cannot_adopt_a_previous_attempts_output() {
     let clock = Arc::new(AtomicI64::new(current_timestamp_millis()));
-    let (mut store, _root) = build_store();
+    let (mut store, _root) = build_store().await;
     store.set_test_clock(clock.clone());
     let (_job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
     let first = store
@@ -263,7 +263,7 @@ async fn reclaimed_attempt_cannot_adopt_a_previous_attempts_output() {
 
 #[tokio::test]
 async fn stale_and_cancelled_attempts_cannot_publish_artifacts() {
-    let (store, _root) = build_store();
+    let (store, _root) = build_store().await;
     let (job, _stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
     let first = store
         .claim_next_stage("worker-1", 60_000)
