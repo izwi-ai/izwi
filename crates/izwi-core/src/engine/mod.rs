@@ -361,14 +361,190 @@ impl Drop for CompletionRegistration<'_> {
 }
 
 #[derive(Default)]
-struct AudioDeliveryState {
-    lanes: HashMap<SessionKey, mpsc::UnboundedSender<AudioDeliveryMessage>>,
+struct DeliveryLaneState {
+    lanes: HashMap<SessionKey, mpsc::UnboundedSender<LaneMessage>>,
     completed: std::collections::VecDeque<EngineOutput>,
 }
 
-struct AudioDeliveryMessage {
+#[derive(Default)]
+struct LaneMessage {
+    /// An incremental delivery task the lane waits for before anything
+    /// queued after it.
+    predecessor: Option<executor::IncrementalDeliveryTask>,
     delivery: Option<executor::CommittedStreamDelivery>,
     terminal: Option<EngineOutput>,
+}
+
+/// One session's ordered delivery task (see `enqueue_lane_delivery`).
+struct DeliveryLane {
+    session: SessionKey,
+    deliveries: std::sync::Weak<std::sync::Mutex<DeliveryLaneState>>,
+    core: std::sync::Weak<RwLock<EngineCore>>,
+    controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
+    step_gate: Arc<Mutex<()>>,
+    wake_notify: Arc<Notify>,
+    failure: Option<executor::StreamDeliveryFailure>,
+}
+
+impl DeliveryLane {
+    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<LaneMessage>) {
+        let cancellation = self
+            .controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&self.session.request_id)
+            .filter(|control| control.session_epoch == self.session.epoch)
+            .map(|control| control.cancellation.clone());
+        let cancellation = cancellation.as_ref();
+        let cancelled = || async move {
+            match cancellation {
+                Some(signal) => loop {
+                    if signal.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                },
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let text_timeout = crate::runtime::stream_slow_consumer_timeout();
+        let mut merged = 0usize;
+        let mut lookahead: Option<LaneMessage> = None;
+        loop {
+            let message = match lookahead.take() {
+                Some(message) => message,
+                None => tokio::select! {
+                    message = rx.recv() => match message { Some(message) => message, None => break },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if !self.owns_session() {
+                            if let Some(deliveries) = self.deliveries.upgrade() {
+                                deliveries.lock().unwrap_or_else(|poison| poison.into_inner())
+                                    .lanes.remove(&self.session);
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+                },
+            };
+            if let Some(mut predecessor) = message.predecessor {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled() => {
+                        predecessor.abort();
+                        Err(executor::StreamDeliveryFailureKind::Cancelled)
+                    }
+                    joined = &mut predecessor => match joined {
+                        Ok(result) => result,
+                        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                        Err(_) => Err(executor::StreamDeliveryFailureKind::Cancelled),
+                    },
+                };
+                if let Err(kind) = result {
+                    self.fail(kind).await;
+                }
+            }
+            if let Some(mut delivery) = message.delivery {
+                // Everything already queued behind this delivery goes out
+                // with it, so a lagging reader receives merged text.
+                while let Ok(next) = rx.try_recv() {
+                    match next {
+                        LaneMessage {
+                            predecessor: None,
+                            delivery: Some(later),
+                            terminal: None,
+                        } => {
+                            if let Err(later) = delivery.absorb(later) {
+                                lookahead = Some(LaneMessage {
+                                    delivery: Some(later),
+                                    ..LaneMessage::default()
+                                });
+                                break;
+                            }
+                        }
+                        next => {
+                            lookahead = Some(next);
+                            break;
+                        }
+                    }
+                }
+                if self.failure.is_none() {
+                    let result = tokio::select! {
+                        biased;
+                        _ = cancelled() => Err(executor::StreamDeliveryFailureKind::Cancelled),
+                        result = delivery.deliver_coalesced(&mut merged, text_timeout) => result,
+                    };
+                    if let Err(kind) = result {
+                        self.fail(kind).await;
+                    }
+                }
+            }
+            if let Some(terminal) = message.terminal {
+                let mut outputs = vec![terminal];
+                if let Some(failed) = self.failure.take() {
+                    if let Some(core) = self.core.upgrade() {
+                        let _step = self.step_gate.lock().await;
+                        core.write()
+                            .await
+                            .reconcile_stream_delivery_failures(&mut outputs, vec![failed])
+                            .await;
+                    }
+                }
+                if let Some(deliveries) = self.deliveries.upgrade() {
+                    let mut state = deliveries
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    state.lanes.remove(&self.session);
+                    state.completed.extend(outputs);
+                }
+                // The terminal waits for the next step to route it.
+                self.wake_notify.notify_one();
+                break;
+            }
+        }
+    }
+
+    fn owns_session(&self) -> bool {
+        self.controls
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&self.session.request_id)
+            .is_some_and(|control| control.session_epoch == self.session.epoch)
+    }
+
+    /// Record the session's first delivery failure: cancel the request and
+    /// reconcile its state now; the terminal output reports it later.
+    async fn fail(&mut self, kind: executor::StreamDeliveryFailureKind) {
+        if self.failure.is_some() {
+            return;
+        }
+        let failed = executor::StreamDeliveryFailure {
+            session: self.session.clone(),
+            kind,
+        };
+        {
+            let controls = self
+                .controls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if let Some(control) = controls
+                .get(&self.session.request_id)
+                .filter(|control| control.session_epoch == self.session.epoch)
+            {
+                control
+                    .cancellation
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if let Some(core) = self.core.upgrade() {
+            let _step = self.step_gate.lock().await;
+            core.write()
+                .await
+                .reconcile_stream_delivery_failures(&mut Vec::new(), vec![failed.clone()])
+                .await;
+        }
+        self.failure = Some(failed);
+    }
 }
 
 pub struct Engine {
@@ -397,7 +573,7 @@ pub struct Engine {
     request_controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
     /// Exact-session terminal outputs for synchronous public callers.
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
-    audio_deliveries: Arc<std::sync::Mutex<AudioDeliveryState>>,
+    delivery_lanes: Arc<std::sync::Mutex<DeliveryLaneState>>,
     /// Distinguishes a cancelled registration from a later reuse of the public ID.
     next_completion_registration: std::sync::atomic::AtomicU64,
 }
@@ -411,7 +587,8 @@ struct OwnedStepContext {
     metrics: Arc<RwLock<EngineMetrics>>,
     request_controls: Arc<std::sync::Mutex<HashMap<RequestId, RequestControl>>>,
     completion_mailboxes: Arc<std::sync::Mutex<HashMap<RequestId, CompletionMailbox>>>,
-    audio_deliveries: Arc<std::sync::Mutex<AudioDeliveryState>>,
+    delivery_lanes: Arc<std::sync::Mutex<DeliveryLaneState>>,
+    wake_notify: Arc<Notify>,
 }
 
 struct OwnedRunnerRecoveryGuard {
@@ -667,12 +844,8 @@ impl OwnedStepContext {
             self.enqueue_incremental_progress(progress, &mut failures, &mut deliveries)
                 .await;
         }
-        let barrier_failures = deliveries.finish().await;
+        self.adopt_incremental_deliveries(deliveries.detach().await);
         while let Ok(failure) = delivery_failures.try_recv() {
-            self.cancel_failed_stream(&failure);
-            failures.entry(failure.session.clone()).or_insert(failure);
-        }
-        for failure in barrier_failures {
             self.cancel_failed_stream(&failure);
             failures.entry(failure.session.clone()).or_insert(failure);
         }
@@ -721,9 +894,7 @@ impl OwnedStepContext {
             .iter()
             .map(|result| result.session.clone())
             .collect::<HashSet<_>>();
-        for failure in deliveries.finish_sessions(&sessions).await {
-            self.record_stream_failure(failure, failures, deliveries);
-        }
+        self.adopt_incremental_deliveries(deliveries.detach_sessions(&sessions).await);
         while let Ok(failure) = delivery_failures.try_recv() {
             self.record_stream_failure(failure, failures, deliveries);
         }
@@ -747,123 +918,58 @@ impl OwnedStepContext {
             .await
     }
 
-    fn enqueue_audio_delivery(&self, session: SessionKey, message: AudioDeliveryMessage) {
+    /// Keep incremental deliveries still waiting on a reader when their
+    /// dispatch commits running ahead of everything else the session
+    /// delivers, instead of failing them after a short barrier grace; their
+    /// own backpressure deadline bounds them (EXE-F13).
+    fn adopt_incremental_deliveries(
+        &self,
+        running: Vec<(SessionKey, executor::IncrementalDeliveryTask)>,
+    ) {
+        for (session, task) in running {
+            self.enqueue_lane_delivery(
+                session,
+                LaneMessage {
+                    predecessor: Some(task),
+                    ..LaneMessage::default()
+                },
+            );
+        }
+    }
+
+    /// Queue `message` on the session's delivery lane, starting the lane if
+    /// needed. A lane delivers the session's committed outputs in order off
+    /// the step gate: credited audio, outputs whose consumer was full when
+    /// the step offered them, and incremental deliveries still waiting on a
+    /// reader when their dispatch committed. Once a session has a lane, its
+    /// later outputs and its terminal output follow through the same lane.
+    fn enqueue_lane_delivery(&self, session: SessionKey, message: LaneMessage) {
         let mut state = self
-            .audio_deliveries
+            .delivery_lanes
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if !state.lanes.contains_key(&session) {
-            let (tx, mut rx) = mpsc::unbounded_channel::<AudioDeliveryMessage>();
+            let (tx, rx) = mpsc::unbounded_channel::<LaneMessage>();
             state.lanes.insert(session.clone(), tx);
-            let deliveries = Arc::downgrade(&self.audio_deliveries);
-            let core = Arc::downgrade(&self.core);
-            let controls = self.request_controls.clone();
-            let cancellation = controls
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .get(&session.request_id)
-                .filter(|control| control.session_epoch == session.epoch)
-                .map(|control| control.cancellation.clone());
-            let step_gate = self.step_gate.clone();
-            let session = session.clone();
-            tokio::spawn(async move {
-                let mut failure = None;
-                loop {
-                    let message = tokio::select! {
-                        message = rx.recv() => match message { Some(message) => message, None => break },
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                            let owns_session = controls.lock().unwrap_or_else(|poison| poison.into_inner())
-                                .get(&session.request_id).is_some_and(|control| control.session_epoch == session.epoch);
-                            if !owns_session {
-                                if let Some(deliveries) = deliveries.upgrade() {
-                                    deliveries.lock().unwrap_or_else(|poison| poison.into_inner()).lanes.remove(&session);
-                                }
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                    if let Some(delivery) = message.delivery {
-                        if failure.is_none() {
-                            let cancellation_wait = async {
-                                match cancellation.as_ref() {
-                                    Some(signal) => loop {
-                                        if signal.load(std::sync::atomic::Ordering::Acquire) {
-                                            break;
-                                        }
-                                        tokio::time::sleep(std::time::Duration::from_millis(10))
-                                            .await;
-                                    },
-                                    None => std::future::pending::<()>().await,
-                                }
-                            };
-                            let result = tokio::select! {
-                                biased;
-                                _ = cancellation_wait => Err(executor::StreamDeliveryFailureKind::Cancelled),
-                                result = delivery.deliver() => result,
-                            };
-                            if let Err(kind) = result {
-                                let failed = executor::StreamDeliveryFailure {
-                                    session: session.clone(),
-                                    kind,
-                                };
-                                {
-                                    let controls = controls
-                                        .lock()
-                                        .unwrap_or_else(|poison| poison.into_inner());
-                                    if let Some(control) = controls
-                                        .get(&session.request_id)
-                                        .filter(|control| control.session_epoch == session.epoch)
-                                    {
-                                        control
-                                            .cancellation
-                                            .store(true, std::sync::atomic::Ordering::Release);
-                                    }
-                                }
-                                if let Some(core) = core.upgrade() {
-                                    let _step = step_gate.lock().await;
-                                    core.write()
-                                        .await
-                                        .reconcile_stream_delivery_failures(
-                                            &mut Vec::new(),
-                                            vec![failed.clone()],
-                                        )
-                                        .await;
-                                }
-                                failure = Some(failed);
-                            }
-                        }
-                    }
-                    if let Some(terminal) = message.terminal {
-                        let mut outputs = vec![terminal];
-                        if let Some(failed) = failure.take() {
-                            if let Some(core) = core.upgrade() {
-                                let _step = step_gate.lock().await;
-                                core.write()
-                                    .await
-                                    .reconcile_stream_delivery_failures(&mut outputs, vec![failed])
-                                    .await;
-                            }
-                        }
-                        if let Some(deliveries) = deliveries.upgrade() {
-                            let mut state = deliveries
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner());
-                            state.lanes.remove(&session);
-                            state.completed.extend(outputs);
-                        }
-                        break;
-                    }
+            tokio::spawn(
+                DeliveryLane {
+                    session: session.clone(),
+                    deliveries: Arc::downgrade(&self.delivery_lanes),
+                    core: Arc::downgrade(&self.core),
+                    controls: self.request_controls.clone(),
+                    step_gate: self.step_gate.clone(),
+                    wake_notify: self.wake_notify.clone(),
+                    failure: None,
                 }
-            });
+                .run(rx),
+            );
         }
-        // Only bounded, credited PCM and one terminal control message enter a
-        // lane. Exact session identities prevent reuse from crossing epochs.
+        // Exact session identities prevent reuse from crossing epochs.
         if let Some(sender) = state.lanes.get(&session) {
             if let Err(error) = sender.send(message) {
                 state.lanes.remove(&session);
                 if let Some(mut terminal) = error.0.terminal {
-                    terminal.error = Some("Committed audio delivery lane closed".into());
+                    terminal.error = Some("Committed stream delivery lane closed".into());
                     terminal.finish_reason = Some(OutputFinishReason::Error);
                     state.completed.push_back(terminal);
                 }
@@ -902,43 +1008,57 @@ impl OwnedStepContext {
         defer_unregistered_terminal_ack: bool,
     ) -> Result<Vec<EngineOutput>> {
         let mut outputs = Vec::new();
-        let mut synchronous = Vec::new();
+        let mut failed_streams = Vec::new();
         for delivery in committed.stream_deliveries {
             let session = delivery.session.clone();
             let asynchronous = delivery.has_audio_credits()
                 || self
-                    .audio_deliveries
+                    .delivery_lanes
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .lanes
                     .contains_key(&session);
             if asynchronous {
-                self.enqueue_audio_delivery(
+                self.enqueue_lane_delivery(
                     session,
-                    AudioDeliveryMessage {
+                    LaneMessage {
                         delivery: Some(delivery),
-                        terminal: None,
+                        ..LaneMessage::default()
                     },
                 );
-            } else {
-                synchronous.push(delivery);
+                continue;
+            }
+            // The step gate never waits on a client (SCH-F10): whatever the
+            // consumer cannot take now continues from the session's lane.
+            match delivery.deliver_now() {
+                executor::ImmediateDelivery::Delivered => {}
+                executor::ImmediateDelivery::Failed(kind) => {
+                    failed_streams.push(executor::StreamDeliveryFailure { session, kind });
+                }
+                executor::ImmediateDelivery::Blocked(rest) => self.enqueue_lane_delivery(
+                    session,
+                    LaneMessage {
+                        delivery: Some(rest),
+                        ..LaneMessage::default()
+                    },
+                ),
             }
         }
         for output in committed.outputs {
             let session = SessionKey::new(output.request_id.clone(), output.sequence_id);
             let deferred = output.is_finished
                 && self
-                    .audio_deliveries
+                    .delivery_lanes
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .lanes
                     .contains_key(&session);
             if deferred {
-                self.enqueue_audio_delivery(
+                self.enqueue_lane_delivery(
                     session,
-                    AudioDeliveryMessage {
-                        delivery: None,
+                    LaneMessage {
                         terminal: Some(output),
+                        ..LaneMessage::default()
                     },
                 );
             } else {
@@ -946,13 +1066,12 @@ impl OwnedStepContext {
             }
         }
         outputs.extend(
-            self.audio_deliveries
+            self.delivery_lanes
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .completed
                 .drain(..),
         );
-        let failed_streams = executor::deliver_committed_streams(synchronous).await;
         if !failed_streams.is_empty() {
             let mut core = self.core.write().await;
             core.reconcile_stream_delivery_failures(&mut outputs, failed_streams)
@@ -1147,7 +1266,7 @@ impl Engine {
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            audio_deliveries: Arc::new(std::sync::Mutex::new(AudioDeliveryState::default())),
+            delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -2518,7 +2637,8 @@ impl Engine {
             metrics: self.metrics.clone(),
             request_controls: self.request_controls.clone(),
             completion_mailboxes: self.completion_mailboxes.clone(),
-            audio_deliveries: self.audio_deliveries.clone(),
+            delivery_lanes: self.delivery_lanes.clone(),
+            wake_notify: self.wake_notify.clone(),
         };
         match tokio::spawn(async move { context.run(defer_unregistered_terminal_ack).await }).await
         {
@@ -2559,7 +2679,7 @@ impl Engine {
                 let core = self.core.read().await;
                 core.has_pending_work() || {
                     let audio = self
-                        .audio_deliveries
+                        .delivery_lanes
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner());
                     !audio.lanes.is_empty() || !audio.completed.is_empty()
@@ -3297,7 +3417,7 @@ impl Engine {
         let core = self.core.read().await;
         core.has_pending_work() || {
             let audio = self
-                .audio_deliveries
+                .delivery_lanes
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             !audio.lanes.is_empty() || !audio.completed.is_empty()
@@ -4061,7 +4181,7 @@ mod tests {
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            audio_deliveries: Arc::new(std::sync::Mutex::new(AudioDeliveryState::default())),
+            delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -4077,7 +4197,8 @@ mod tests {
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
-            audio_deliveries: engine.audio_deliveries.clone(),
+            delivery_lanes: engine.delivery_lanes.clone(),
+            wake_notify: engine.wake_notify.clone(),
         };
         let session = SessionKey::new("slow-audio".into(), 1);
         let (tx, mut rx) = mpsc::channel(1);
@@ -4093,9 +4214,10 @@ mod tests {
             logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: Some(executor::CommittedStreamDelivery::new(
                     session.clone(),
                     tx,
@@ -4123,9 +4245,10 @@ mod tests {
             session.epoch,
             Duration::from_millis(1),
         );
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: None,
                 terminal: Some(terminal),
             },
@@ -4138,12 +4261,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(peer_output.is_finished);
-        assert!(engine.audio_deliveries.lock().unwrap().completed.is_empty());
+        assert!(engine.delivery_lanes.lock().unwrap().completed.is_empty());
         assert_eq!(rx.recv().await.unwrap().sequence, 0);
         assert_eq!(rx.recv().await.unwrap().sequence, 1);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !engine.audio_deliveries.lock().unwrap().completed.is_empty() {
+                if !engine.delivery_lanes.lock().unwrap().completed.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4151,9 +4274,213 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = engine.audio_deliveries.lock().unwrap();
+        let state = engine.delivery_lanes.lock().unwrap();
         assert!(!state.lanes.contains_key(&session));
         assert_eq!(state.completed.front().unwrap().request_id, "slow-audio");
+    }
+
+    fn owned_step_context(engine: &Engine) -> OwnedStepContext {
+        OwnedStepContext {
+            core: engine.core.clone(),
+            step_gate: engine.step_gate.clone(),
+            metrics: engine.metrics.clone(),
+            request_controls: engine.request_controls.clone(),
+            completion_mailboxes: engine.completion_mailboxes.clone(),
+            delivery_lanes: engine.delivery_lanes.clone(),
+            wake_notify: engine.wake_notify.clone(),
+        }
+    }
+
+    fn register_test_control(engine: &Engine, session: &SessionKey) {
+        engine.request_controls.lock().unwrap().insert(
+            session.request_id.clone(),
+            RequestControl {
+                session_epoch: session.epoch,
+                cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                model_variant: None,
+            },
+        );
+    }
+
+    fn finished_output(session: &SessionKey) -> EngineOutput {
+        OutputProcessor::new(24000).process(
+            executor::ExecutorOutput {
+                request_id: session.request_id.clone(),
+                audio: None,
+                text: None,
+                input_transcription: None,
+                tokens_processed: 0,
+                tokens_generated: 1,
+                finished: true,
+                phase_timing_override: None,
+                asr_diagnostics: None,
+                error: None,
+                logprobs: Vec::new(),
+            },
+            session.epoch,
+            Duration::from_millis(1),
+        )
+    }
+
+    async fn wait_for_lane_completion(engine: &Engine, session: &SessionKey) -> EngineOutput {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let mut state = engine.delivery_lanes.lock().unwrap();
+                    if let Some(index) = state
+                        .completed
+                        .iter()
+                        .position(|output| output.request_id == session.request_id)
+                    {
+                        return state.completed.remove(index).unwrap();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the lane completes its terminal")
+    }
+
+    /// SCH-F10: committed TTS audio without output credits used to be
+    /// delivered while the step held the step gate, waiting up to its 30 s
+    /// backpressure deadline on a reader that stopped reading, so every
+    /// other request stalled behind it. It now continues from the session's
+    /// lane: the step returns at once, a concurrent request completes, and
+    /// the TTS terminal still follows its audio.
+    #[tokio::test]
+    async fn slow_tts_reader_does_not_stall_a_concurrent_request() {
+        let engine = engine_with_test_executor(Box::new(ImmediateTerminalExecutor::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        ))));
+        let context = owned_step_context(&engine);
+        let session = SessionKey::new("slow-tts".into(), 1);
+        register_test_control(&engine, &session);
+        let (tx, mut rx) = mpsc::channel(1);
+        let chunk = |sequence| StreamingOutput {
+            request_id: "slow-tts".into(),
+            sequence,
+            samples: vec![0.25],
+            sample_rate: 24000,
+            is_final: false,
+            text: None,
+            stats: None,
+            asr_progress: None,
+            logprobs: Vec::new(),
+        };
+        tx.send(chunk(0)).await.unwrap();
+        let routed = tokio::time::timeout(
+            Duration::from_millis(500),
+            context.route_committed(
+                core::CommittedEngineStep {
+                    outputs: vec![finished_output(&session)],
+                    stream_deliveries: vec![executor::CommittedStreamDelivery::new(
+                        session.clone(),
+                        tx,
+                        EngineStreamPolicy::BlockWithDeadline { timeout_ms: 30_000 },
+                        vec![chunk(1)],
+                    )],
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("a full TTS reader held the step")
+        .unwrap();
+        assert!(routed.is_empty(), "the terminal waits behind its audio");
+
+        let peer = engine.generate(immediate_terminal_request("peer-request"));
+        let peer_output = tokio::time::timeout(Duration::from_millis(500), peer)
+            .await
+            .expect("the peer waited on the TTS reader")
+            .unwrap();
+        assert!(peer_output.is_finished);
+
+        assert_eq!(rx.recv().await.unwrap().sequence, 0);
+        assert_eq!(rx.recv().await.unwrap().sequence, 1);
+        let terminal = wait_for_lane_completion(&engine, &session).await;
+        assert!(terminal.error.is_none(), "{:?}", terminal.error);
+    }
+
+    /// The engine stream hop used to fail a chat stream whose 64-slot channel
+    /// was full. A lagging reader now receives the text it missed merged into
+    /// fewer deltas, numbered consecutively, then the final marker and the
+    /// terminal output.
+    #[tokio::test]
+    async fn lagging_text_reader_receives_coalesced_deltas_instead_of_a_failure() {
+        let engine = engine_with_test_executor(Box::new(ImmediateTerminalExecutor::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        ))));
+        let context = owned_step_context(&engine);
+        let session = SessionKey::new("lagging-chat".into(), 1);
+        register_test_control(&engine, &session);
+        let (tx, mut rx) = mpsc::channel(2);
+        let output = |sequence, text: Option<&str>| StreamingOutput {
+            request_id: "lagging-chat".into(),
+            sequence,
+            samples: Vec::new(),
+            sample_rate: 0,
+            is_final: text.is_none(),
+            text: text.map(str::to_string),
+            stats: None,
+            asr_progress: None,
+            logprobs: Vec::new(),
+        };
+        let pieces = ["a", "b", "c", "d", "e"];
+        for (sequence, piece) in pieces.iter().enumerate() {
+            let routed = context
+                .route_committed(
+                    core::CommittedEngineStep {
+                        outputs: Vec::new(),
+                        stream_deliveries: vec![executor::CommittedStreamDelivery::new(
+                            session.clone(),
+                            tx.clone(),
+                            EngineStreamPolicy::FailOnFull,
+                            vec![output(sequence, Some(piece))],
+                        )],
+                    },
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(routed.is_empty());
+        }
+        let routed = context
+            .route_committed(
+                core::CommittedEngineStep {
+                    outputs: vec![finished_output(&session)],
+                    stream_deliveries: vec![executor::CommittedStreamDelivery::new(
+                        session.clone(),
+                        tx,
+                        EngineStreamPolicy::FailOnFull,
+                        vec![output(pieces.len(), None)],
+                    )],
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(routed.is_empty(), "the terminal waits behind its text");
+
+        let mut received = Vec::new();
+        while let Some(output) = rx.recv().await {
+            let last = output.is_final;
+            received.push(output);
+            if last {
+                break;
+            }
+        }
+        let text = received
+            .iter()
+            .filter_map(|output| output.text.as_deref())
+            .collect::<String>();
+        assert_eq!(text, "abcde");
+        assert!(received.len() < pieces.len() + 1, "{received:?}");
+        for (index, output) in received.iter().enumerate() {
+            assert_eq!(output.sequence, index, "{received:?}");
+        }
+        let terminal = wait_for_lane_completion(&engine, &session).await;
+        assert!(terminal.error.is_none(), "{:?}", terminal.error);
     }
 
     #[tokio::test]
@@ -4167,7 +4494,8 @@ mod tests {
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
-            audio_deliveries: engine.audio_deliveries.clone(),
+            delivery_lanes: engine.delivery_lanes.clone(),
+            wake_notify: engine.wake_notify.clone(),
         };
         let session = SessionKey::new("closed-audio".into(), 7);
         let (tx, rx) = mpsc::channel(1);
@@ -4183,9 +4511,10 @@ mod tests {
             asr_progress: None,
             logprobs: Vec::new(),
         };
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: Some(executor::CommittedStreamDelivery::new(
                     session.clone(),
                     tx,
@@ -4212,16 +4541,17 @@ mod tests {
             session.epoch,
             Duration::from_millis(1),
         );
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: None,
                 terminal: Some(terminal),
             },
         );
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !engine.audio_deliveries.lock().unwrap().completed.is_empty() {
+                if !engine.delivery_lanes.lock().unwrap().completed.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4229,7 +4559,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = engine.audio_deliveries.lock().unwrap();
+        let state = engine.delivery_lanes.lock().unwrap();
         assert!(!state.lanes.contains_key(&session));
         let terminal = state.completed.front().unwrap();
         assert_eq!(terminal.sequence_id, 7);
@@ -4258,7 +4588,8 @@ mod tests {
             metrics: engine.metrics.clone(),
             request_controls: engine.request_controls.clone(),
             completion_mailboxes: engine.completion_mailboxes.clone(),
-            audio_deliveries: engine.audio_deliveries.clone(),
+            delivery_lanes: engine.delivery_lanes.clone(),
+            wake_notify: engine.wake_notify.clone(),
         };
         let (tx, mut rx) = mpsc::channel(1);
         let chunk = |sequence| StreamingOutput {
@@ -4273,9 +4604,10 @@ mod tests {
             logprobs: Vec::new(),
         };
         tx.send(chunk(0)).await.unwrap();
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: Some(executor::CommittedStreamDelivery::new(
                     session.clone(),
                     tx,
@@ -4302,9 +4634,10 @@ mod tests {
             session.epoch,
             Duration::from_millis(1),
         );
-        context.enqueue_audio_delivery(
+        context.enqueue_lane_delivery(
             session.clone(),
-            AudioDeliveryMessage {
+            LaneMessage {
+                predecessor: None,
                 delivery: None,
                 terminal: Some(terminal),
             },
@@ -4312,7 +4645,7 @@ mod tests {
         cancellation.store(true, std::sync::atomic::Ordering::Release);
         tokio::time::timeout(Duration::from_millis(500), async {
             loop {
-                if !engine.audio_deliveries.lock().unwrap().completed.is_empty() {
+                if !engine.delivery_lanes.lock().unwrap().completed.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -4320,7 +4653,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = engine.audio_deliveries.lock().unwrap();
+        let state = engine.delivery_lanes.lock().unwrap();
         assert_eq!(
             state.completed.front().unwrap().finish_reason,
             Some(OutputFinishReason::Aborted)
@@ -4597,6 +4930,101 @@ mod tests {
             .expect("stream closed before its final marker");
         assert_eq!(final_output.sequence, 1);
         assert!(final_output.is_final);
+    }
+
+    /// EXE-F13: an incremental delivery still waiting on its reader when the
+    /// atomic dispatch commits used to fail with a deadline after a 10 ms
+    /// barrier grace, although its policy lets it wait 5 s. It now continues
+    /// from the session's lane, ahead of the final marker and the terminal
+    /// output, and the step returns without waiting for the reader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_incremental_delivery_outlives_its_commit_barrier() {
+        let (emitted_tx, emitted_rx) = oneshot::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let variant = ModelVariant::Qwen3Tts12Hz06BCustomVoice;
+        let engine = Arc::new(engine_with_test_executor(Box::new(
+            IncrementalBlockingExecutor {
+                emitted: std::sync::Mutex::new(Some(emitted_tx)),
+                release: release.clone(),
+                variant,
+            },
+        )));
+        let mut profile =
+            ExecutionProfile::fail_closed(BackendKind::Cpu, Some(variant), ExecutionMode::Atomic);
+        profile.prefill = PrefillMode::None;
+        let mut stage = StageDescriptor::from_execution_profile(
+            StageId::new(41),
+            "test.atomic.incremental",
+            &profile,
+            NativeBatchMode::None,
+        );
+        stage.selector = StageWorkSelector::Atomic;
+        stage.output_visibility = OutputVisibility::IncrementalCommitted;
+        let binding = ExecutionAdapterBinding {
+            execution_group_id: ExecutionGroupId::new(11),
+            model_instance_id: ModelInstanceId::new(12),
+            adapter_instance_id: AdapterInstanceId::new(13),
+            adapter_abi_revision: AdapterAbiRevision::new(8),
+            model_variant: variant,
+            capability_id: "tts".to_string(),
+            stages: Arc::from([stage]),
+        };
+        let mut request =
+            EngineCoreRequest::tts("stream while running").with_model_variant(variant);
+        request.id = "blocked-incremental".to_string();
+        request.prompt_tokens = vec![1];
+        request.bind_execution_adapter(binding).unwrap();
+        request.streaming = true;
+        request.stream_policy = EngineStreamPolicy::BlockWithDeadline { timeout_ms: 5_000 };
+        // The reader has not read yet: its one-slot channel is full.
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        stream_tx
+            .try_send(StreamingOutput {
+                request_id: "unread".to_string(),
+                sequence: 0,
+                samples: Vec::new(),
+                sample_rate: 0,
+                is_final: false,
+                text: None,
+                stats: None,
+                asr_progress: None,
+                logprobs: Vec::new(),
+            })
+            .unwrap();
+        request.streaming_tx = Some(stream_tx);
+        engine.core.write().await.add_request(request).unwrap();
+        let session = engine
+            .request_session_key(&"blocked-incremental".to_string())
+            .await
+            .unwrap();
+        register_test_control(&engine, &session);
+
+        let stepping_engine = engine.clone();
+        let step = tokio::spawn(async move { stepping_engine.step().await });
+        tokio::time::timeout(Duration::from_secs(1), emitted_rx)
+            .await
+            .expect("model did not emit its first delta")
+            .expect("model emission signal was dropped");
+        let (released, wake) = release.as_ref();
+        *released.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        wake.notify_all();
+        let outputs = tokio::time::timeout(Duration::from_secs(1), step)
+            .await
+            .expect("the step waited on the reader")
+            .expect("engine step task panicked")
+            .expect("engine step failed");
+        assert!(outputs.is_empty(), "the terminal waits behind its stream");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(stream_rx.recv().await.unwrap().request_id, "unread");
+        let first = stream_rx.recv().await.unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(first.text.as_deref(), Some("first delta"));
+        let last = stream_rx.recv().await.unwrap();
+        assert_eq!(last.sequence, 1);
+        assert!(last.is_final);
+        let terminal = wait_for_lane_completion(&engine, &session).await;
+        assert!(terminal.error.is_none(), "{:?}", terminal.error);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4973,7 +5401,7 @@ mod tests {
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_mailboxes: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            audio_deliveries: Arc::new(std::sync::Mutex::new(AudioDeliveryState::default())),
+            delivery_lanes: Arc::new(std::sync::Mutex::new(DeliveryLaneState::default())),
             next_completion_registration: std::sync::atomic::AtomicU64::new(1),
         });
 

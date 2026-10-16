@@ -30,8 +30,8 @@ mod stop_sequences;
 mod streaming;
 
 pub(crate) use streaming::{
-    deliver_committed_streams, CommittedStreamDelivery, IncrementalStreamDeliveryWorkers,
-    StreamDeliveryFailure, StreamDeliveryFailureKind,
+    deliver_committed_streams, CommittedStreamDelivery, ImmediateDelivery, IncrementalDeliveryTask,
+    IncrementalStreamDeliveryWorkers, StreamDeliveryFailure, StreamDeliveryFailureKind,
 };
 
 pub(crate) fn decode_request_audio_with_rate(
