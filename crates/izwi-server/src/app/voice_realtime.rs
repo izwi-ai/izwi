@@ -4430,6 +4430,8 @@ mod tests {
     /// segments, even when a later segment synthesizes faster.
     #[tokio::test]
     async fn the_reply_is_spoken_while_written_with_one_segment_ahead() {
+        const REPLY: &str = "Hello there, it is lovely to hear from you today. The second \
+            sentence is a little longer than the first one. Third and last.";
         let (_dir, state) = test_app_state(4);
         let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
         let control = TurnControl::new(Instant::now());
@@ -4444,14 +4446,14 @@ mod tests {
         let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
         let writer = async {
             for delta in [
-                "<think>plan</think>Hello there.",
-                " Second sentence",
-                " ends here.",
+                "<think>plan</think>Hello there, it is lovely to hear from you today.",
+                " The second sentence",
+                " is a little longer than the first one.",
             ] {
                 deltas.send(delta.to_string()).expect("delta");
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            deltas.send(" Third.".to_string()).expect("delta");
+            deltas.send(" Third and last.".to_string()).expect("delta");
             drop(deltas);
         };
         let speech = speak_reply(
@@ -4470,13 +4472,10 @@ mod tests {
         let log = log.lock().expect("log").clone();
         let texts: Vec<&str> = log.iter().map(|(text, _, _)| text.as_str()).collect();
         assert_eq!(
-            texts[0], "Hello there.",
+            texts[0], "Hello there, it is lovely to hear from you today.",
             "the first sentence is spoken alone"
         );
-        assert_eq!(
-            texts.join(" "),
-            "Hello there. Second sentence ends here. Third."
-        );
+        assert_eq!(texts.join(" "), REPLY);
         let first_done = log[0].2.expect("first segment finished");
         assert!(
             log[1].1 < first_done,
@@ -4499,10 +4498,7 @@ mod tests {
                     .all(|sample| *sample == 0));
             }
         }
-        assert_eq!(
-            control.reply().ledger.spoken_text(),
-            "Hello there. Second sentence ends here. Third."
-        );
+        assert_eq!(control.reply().ledger.spoken_text(), REPLY);
     }
 
     /// SPK-F11: a session that asked for G.711 gets μ-law frames at 8 kHz,
