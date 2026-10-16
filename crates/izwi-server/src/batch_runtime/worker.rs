@@ -1,7 +1,8 @@
 use super::{
     store::{
         validate_stage_output_artifact_ids, BatchRuntimeStore, NewStageOutputArtifact,
-        RegisteredWorkerHeartbeatUpdate, StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
+        RegisteredWorkerHeartbeatUpdate, RetentionPolicy, StageClaimFilter,
+        DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
@@ -1169,6 +1170,23 @@ impl BatchWorkerRunner {
         }
         for executor in self.executors.values() {
             executor.maintenance().await?;
+        }
+        // Expired objects go first, so the jobs that owned them can be swept
+        // in the same pass.
+        let retention = RetentionPolicy::from_env();
+        if let Some(artifact_store) = self.artifact_store.as_ref() {
+            artifact_store
+                .expire_retained(retention, self.config.maintenance_batch_limit)
+                .await
+                .context("Failed to expire retained artifact objects")?;
+        }
+        let swept = self
+            .store
+            .sweep_retention(retention, self.config.maintenance_batch_limit)
+            .await
+            .context("Failed to sweep expired durable state")?;
+        if swept != Default::default() {
+            debug!(?swept, "Swept expired durable state");
         }
         Ok(())
     }

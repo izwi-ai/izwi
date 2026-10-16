@@ -438,6 +438,11 @@ const ABANDONED_CANCELLATION_GRACE_MS: i64 = 2 * 60 * 1000;
 /// separate transactions within one request. A job still stageless after this
 /// long was orphaned by a crash or error in between and can never be claimed.
 const STAGELESS_JOB_GRACE_MS: i64 = 5 * 60 * 1000;
+/// A cancelled job's route projection is left pending only by a crash between
+/// the job's cancellation and the projection update, so reconciliation looks
+/// back this far (through the status/update index) instead of scanning every
+/// cancelled job ever, every 30 seconds.
+const CANCELLED_PROJECTION_REPAIR_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACTS: usize = 64;
 pub(crate) const MAX_STAGE_OUTPUT_ARTIFACT_ID_BYTES: usize = 64;
 const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
@@ -687,6 +692,57 @@ pub fn canonical_request_digest(request: &serde_json::Value) -> anyhow::Result<S
     let mut canonical = BoundedJsonBytes::new(MAX_DURABLE_IDEMPOTENCY_CANONICAL_REQUEST_BYTES);
     write_canonical_json(request, &mut canonical, 0)?;
     Ok(sha256_hex(&canonical.bytes))
+}
+
+/// How long terminal and dead durable state is kept before the retention
+/// sweeper deletes it. Each value is read from the environment in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Terminal jobs, their stages, artifact rows and text inputs
+    /// (`IZWI_JOB_RETENTION_SECONDS`, 30 days). Job-retention media expires
+    /// with its job.
+    pub terminal_job_ms: u64,
+    /// Ephemeral-retention media, from creation
+    /// (`IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS`, 1 hour).
+    pub ephemeral_artifact_ms: u64,
+    /// Heartbeat rows of workers that stopped heartbeating
+    /// (`IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS`, 1 day).
+    pub worker_heartbeat_ms: u64,
+    /// Media rows tombstoned after their objects were deleted
+    /// (`IZWI_MEDIA_TOMBSTONE_RETENTION_SECONDS`, 1 day).
+    pub media_tombstone_ms: u64,
+    /// Rows of the retired, never-read legacy idempotency table.
+    pub legacy_idempotency_ms: u64,
+}
+
+impl RetentionPolicy {
+    pub fn from_env() -> Self {
+        let read = |key: &str, default_secs: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default_secs)
+                .saturating_mul(1_000)
+        };
+        Self {
+            terminal_job_ms: read("IZWI_JOB_RETENTION_SECONDS", 30 * 24 * 60 * 60),
+            ephemeral_artifact_ms: read("IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS", 60 * 60),
+            worker_heartbeat_ms: read("IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS", 24 * 60 * 60),
+            media_tombstone_ms: read("IZWI_MEDIA_TOMBSTONE_RETENTION_SECONDS", 24 * 60 * 60),
+            legacy_idempotency_ms: MAX_DURABLE_IDEMPOTENCY_RETENTION_MS,
+        }
+    }
+}
+
+/// Rows one retention pass deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub idempotency_records: u64,
+    pub legacy_idempotency_records: u64,
+    pub jobs: u64,
+    pub worker_heartbeats: u64,
+    pub media_tombstones: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3914,7 +3970,8 @@ impl BatchRuntimeStore {
                     attempt_count = attempt_count + 1,
                     cancellation_reason = NULL,
                     cancellation_state = NULL,
-                    admission_tenant = ?3
+                    admission_tenant = ?3,
+                    replay_swept_at = NULL
                 WHERE id = ?2
                   AND status IN ('failed', 'cancelled', 'expired')
                   AND (error_code IS NULL OR error_code <> 'speech_replay_expired')
@@ -5440,40 +5497,320 @@ impl BatchRuntimeStore {
     /// Claim expired replay for deletion before exposing storage keys to GC.
     /// A terminal job loses retry eligibility atomically with this claim. Retrying
     /// and GC both conditionally update the job row, fencing their race on every DB.
+    ///
+    /// Terminal jobs are visited oldest first through the replay-sweep
+    /// index; a job whose journal is empty is marked swept and never scanned
+    /// again, so each pass reads a bounded page instead of every artifact.
     pub async fn expired_speech_pcm(&self, before: u64) -> anyhow::Result<Vec<RuntimeArtifact>> {
+        const MAX_JOBS: i64 = 16;
+        const MAX_ARTIFACTS: usize = 64;
         let db = self.db.connection().await?;
         let tx = db.begin_with_options(write_transaction_options()).await?;
         let cutoff = i64::try_from(before)?;
-        let sql = RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL.replace(
-            "WHERE job_id = ?1 ORDER BY created_at ASC, id ASC",
-            "WHERE publication_key LIKE 'speech-pcm/%' AND job_id IN (SELECT id FROM runtime_jobs WHERE status IN ('completed','failed','cancelled','expired') AND updated_at < ?1) ORDER BY created_at ASC, id ASC LIMIT 64",
-        );
-        let rows = tx
-            .query_all_raw(raw::statement(&tx, sql, vec![cutoff.into()])?)
+        let now = self.now_millis();
+        let jobs = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT id FROM runtime_jobs
+                WHERE replay_swept_at IS NULL AND updated_at < ?1
+                  AND status IN ('completed','failed','cancelled','expired')
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?2
+                "#,
+                vec![cutoff.into(), MAX_JOBS.into()],
+            )?)
             .await?;
-        let artifacts = rows
-            .iter()
-            .map(map_runtime_artifact)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let jobs = artifacts
-            .iter()
-            .map(|artifact| artifact.job_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut claimed = std::collections::HashSet::new();
-        for job in jobs {
-            let result = tx.execute_raw(raw::statement(&tx,
+        let page_sql = RUNTIME_ARTIFACT_LIST_FOR_JOB_SQL.replace(
+            "ORDER BY created_at ASC, id ASC",
+            "AND publication_key >= 'speech-pcm/' AND publication_key < 'speech-pcm0' ORDER BY publication_key ASC LIMIT ?2",
+        );
+        let mut artifacts = Vec::new();
+        for row in jobs {
+            let remaining = MAX_ARTIFACTS - artifacts.len();
+            if remaining == 0 {
+                break;
+            }
+            let job_id: String = row.try_get_by_index(0)?;
+            let page = tx
+                .query_all_raw(raw::statement(
+                    &tx,
+                    page_sql.as_str(),
+                    vec![job_id.clone().into(), i64::try_from(remaining)?.into()],
+                )?)
+                .await?
+                .iter()
+                .map(map_runtime_artifact)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if page.is_empty() {
+                tx.execute_raw(raw::statement(
+                    &tx,
+                    "UPDATE runtime_jobs SET replay_swept_at = ?1 WHERE id = ?2 AND status IN ('completed','failed','cancelled','expired')",
+                    vec![now.into(), job_id.into()],
+                )?)
+                .await?;
+                continue;
+            }
+            let claimed = tx.execute_raw(raw::statement(&tx,
                 "UPDATE runtime_jobs SET error_code = 'speech_replay_expired' WHERE id = ?1 AND status IN ('completed','failed','cancelled','expired') AND updated_at < ?2",
-                vec![job.clone().into(), cutoff.into()],
+                vec![job_id.into(), cutoff.into()],
             )?).await?;
-            if result.rows_affected() == 1 {
-                claimed.insert(job);
+            if claimed.rows_affected() == 1 {
+                artifacts.extend(page);
             }
         }
         tx.commit().await?;
-        Ok(artifacts
-            .into_iter()
-            .filter(|artifact| claimed.contains(&artifact.job_id))
-            .collect())
+        Ok(artifacts)
+    }
+
+    /// Delete durable state past its retention, each kind in its own bounded
+    /// transaction: expired idempotency records, drained legacy idempotency
+    /// rows, terminal jobs with their stages and inputs, heartbeats of dead
+    /// worker incarnations, and media tombstones whose objects are gone.
+    ///
+    /// A terminal job that still owns live job- or ephemeral-retention media
+    /// is kept until the artifact store has expired that media, so no object
+    /// loses its last reference.
+    pub async fn sweep_retention(
+        &self,
+        policy: RetentionPolicy,
+        limit: usize,
+    ) -> anyhow::Result<RetentionReport> {
+        let limit = bounded_maintenance_batch_limit(limit);
+        let now = self.now_millis();
+        let mut report = RetentionReport {
+            idempotency_records: self.prune_expired_durable_idempotency(limit).await?,
+            ..RetentionReport::default()
+        };
+        let db = self.db.connection().await?;
+        let cutoff = |retention_ms: u64| -> anyhow::Result<i64> {
+            Ok(now.saturating_sub(i64::try_from(retention_ms)?))
+        };
+
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let legacy = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                "SELECT operation, idempotency_key FROM idempotency_keys WHERE created_at < ?1 ORDER BY created_at ASC LIMIT ?2",
+                vec![
+                    cutoff(policy.legacy_idempotency_ms)?.into(),
+                    i64::try_from(limit)?.into(),
+                ],
+            )?)
+            .await?;
+        for row in legacy {
+            let operation: String = row.try_get_by_index(0)?;
+            let key: String = row.try_get_by_index(1)?;
+            report.legacy_idempotency_records += tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    "DELETE FROM idempotency_keys WHERE operation = ?1 AND idempotency_key = ?2",
+                    vec![operation.into(), key.into()],
+                )?)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+
+        report.jobs = self
+            .delete_expired_jobs(cutoff(policy.terminal_job_ms)?, limit)
+            .await?;
+
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let heartbeat_cutoff = cutoff(policy.worker_heartbeat_ms)?;
+        let heartbeats = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                "SELECT worker_id FROM runtime_worker_heartbeats WHERE last_heartbeat_at < ?1 ORDER BY last_heartbeat_at ASC LIMIT ?2",
+                vec![heartbeat_cutoff.into(), i64::try_from(limit)?.into()],
+            )?)
+            .await?;
+        for row in heartbeats {
+            let worker_id: String = row.try_get_by_index(0)?;
+            report.worker_heartbeats += tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    "DELETE FROM runtime_worker_heartbeats WHERE worker_id = ?1 AND last_heartbeat_at < ?2",
+                    vec![worker_id.into(), heartbeat_cutoff.into()],
+                )?)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+
+        // A tombstone may go once its cleanup intent completed (the object is
+        // deleted) and nothing references the row any more.
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let unreferenced = r#"
+            NOT EXISTS (SELECT 1 FROM artifact_cleanup_intents c WHERE c.storage_key = media_assets.storage_key)
+            AND NOT EXISTS (SELECT 1 FROM runtime_artifacts a WHERE a.media_asset_id = media_assets.id)
+            AND NOT EXISTS (SELECT 1 FROM speech_history_records h WHERE h.audio_media_asset_id = media_assets.id)
+            AND NOT EXISTS (SELECT 1 FROM media_assets derived WHERE derived.source_asset_id = media_assets.id)
+        "#;
+        let tombstone_cutoff = cutoff(policy.media_tombstone_ms)?;
+        let tombstones = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                format!(
+                    "SELECT id FROM media_assets WHERE deleted_at IS NOT NULL AND deleted_at < ?1 AND {unreferenced} ORDER BY deleted_at ASC, id ASC LIMIT ?2"
+                ),
+                vec![tombstone_cutoff.into(), i64::try_from(limit)?.into()],
+            )?)
+            .await?;
+        for row in tombstones {
+            let id: String = row.try_get_by_index(0)?;
+            report.media_tombstones += tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    format!(
+                        "DELETE FROM media_assets WHERE id = ?1 AND deleted_at IS NOT NULL AND deleted_at < ?2 AND {unreferenced}"
+                    ),
+                    vec![id.into(), tombstone_cutoff.into()],
+                )?)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+
+        Ok(report)
+    }
+
+    /// Delete one bounded page of terminal jobs last updated before `before`,
+    /// with their stages, artifact rows and no longer referenced text inputs.
+    async fn delete_expired_jobs(&self, before: i64, limit: usize) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let rows = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                r#"
+                SELECT j.id, j.input_text_asset_id
+                FROM runtime_jobs AS j
+                WHERE j.status IN ('completed', 'failed', 'cancelled', 'expired')
+                  AND j.updated_at < ?1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runtime_artifacts AS a
+                      JOIN media_assets AS m ON m.id = a.media_asset_id
+                      WHERE a.job_id = j.id
+                        AND m.deleted_at IS NULL
+                        AND m.retention_policy IN ('artifact_job', 'artifact_ephemeral')
+                  )
+                ORDER BY j.updated_at ASC, j.id ASC
+                LIMIT ?2
+                "#,
+                vec![before.into(), i64::try_from(limit)?.into()],
+            )?)
+            .await
+            .context("Failed to select expired runtime jobs")?;
+        let mut deleted = 0_u64;
+        for row in rows {
+            let job_id: String = row.try_get_by_index(0)?;
+            let mut text_assets = row
+                .try_get_by_index::<Option<String>>(1)?
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            for artifact in tx
+                .query_all_raw(raw::statement(
+                    &tx,
+                    "SELECT text_asset_id FROM runtime_artifacts WHERE job_id = ?1 AND text_asset_id IS NOT NULL",
+                    vec![job_id.clone().into()],
+                )?)
+                .await?
+            {
+                text_assets.insert(artifact.try_get_by_index::<String>(0)?);
+            }
+            // Children first: a provider-managed schema may lack the cascades.
+            for sql in [
+                "DELETE FROM runtime_artifacts WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2)",
+                "DELETE FROM job_stages WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2)",
+            ] {
+                tx.execute_raw(raw::statement(
+                    &tx,
+                    sql,
+                    vec![job_id.clone().into(), before.into()],
+                )?)
+                .await?;
+            }
+            deleted += tx
+                .execute_raw(raw::statement(
+                    &tx,
+                    "DELETE FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2",
+                    vec![job_id.into(), before.into()],
+                )?)
+                .await?
+                .rows_affected();
+            for text_asset_id in text_assets {
+                tx.execute_raw(raw::statement(
+                    &tx,
+                    "DELETE FROM text_assets WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM runtime_jobs WHERE input_text_asset_id = ?1) AND NOT EXISTS (SELECT 1 FROM runtime_artifacts WHERE text_asset_id = ?1)",
+                    vec![text_asset_id.into()],
+                )?)
+                .await?;
+            }
+        }
+        tx.commit()
+            .await
+            .context("Failed to commit expired runtime job deletion")?;
+        Ok(deleted)
+    }
+
+    /// Live opaque media whose retention label has lapsed: ephemeral media
+    /// older than its retention, and job media of terminal jobs past job
+    /// retention. Durable media is never returned. The artifact store
+    /// deletes what this returns.
+    pub(crate) async fn expired_retained_media(
+        &self,
+        policy: RetentionPolicy,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaAsset>> {
+        let limit = i64::try_from(bounded_maintenance_batch_limit(limit))?;
+        let now = self.now_millis();
+        let db = self.db.connection().await?;
+        let opaque = "m.asset_kind = 'opaque_artifact' AND m.storage_namespace = 'artifact_store_v1' AND m.deleted_at IS NULL";
+        let columns = "SELECT DISTINCT m.id, m.created_at, m.updated_at, m.asset_kind, m.storage_namespace, m.storage_key, m.content_type, m.filename, m.size_bytes, m.sha256, m.duration_secs, m.sample_rate_hz, m.channel_count, m.peak_amplitude, m.rms_amplitude, m.source_asset_id, m.canonical_profile_version, m.scan_status, m.retention_policy, m.deleted_at, m.metadata_json";
+        let mut rows = db
+            .query_all_raw(raw::statement(
+                db,
+                format!(
+                    "{columns} FROM media_assets AS m WHERE m.retention_policy = 'artifact_ephemeral' AND {opaque} AND m.created_at < ?1 ORDER BY m.created_at ASC, m.id ASC LIMIT ?2"
+                ),
+                vec![
+                    now.saturating_sub(i64::try_from(policy.ephemeral_artifact_ms)?)
+                        .into(),
+                    limit.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to select expired ephemeral media")?;
+        let remaining = limit - i64::try_from(rows.len())?;
+        if remaining > 0 {
+            rows.extend(
+                db.query_all_raw(raw::statement(
+                    db,
+                    format!(
+                        r#"
+                        {columns}
+                        FROM runtime_jobs AS j
+                        JOIN runtime_artifacts AS a ON a.job_id = j.id
+                        JOIN media_assets AS m ON m.id = a.media_asset_id
+                        WHERE j.status IN ('completed', 'failed', 'cancelled', 'expired')
+                          AND j.updated_at < ?1
+                          AND m.retention_policy = 'artifact_job' AND {opaque}
+                        ORDER BY m.id ASC
+                        LIMIT ?2
+                        "#
+                    ),
+                    vec![
+                        now.saturating_sub(i64::try_from(policy.terminal_job_ms)?)
+                            .into(),
+                        remaining.into(),
+                    ],
+                )?)
+                .await
+                .context("Failed to select expired job media")?,
+            );
+        }
+        rows.iter().map(map_media_asset).collect()
     }
 
     /// Permanently fence manual replay deletion against concurrent job retry.
@@ -6587,6 +6924,7 @@ impl BatchRuntimeStore {
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
                     WHERE candidate.status = 'cancelled'
+                      AND candidate.updated_at >= ?2
                       AND NOT EXISTS (
                           SELECT 1 FROM runtime_jobs AS active
                           WHERE active.id <> candidate.id
@@ -6619,7 +6957,11 @@ impl BatchRuntimeStore {
                     ORDER BY candidate.updated_at ASC, candidate.id ASC
                     LIMIT ?1
                     "#,
-                    vec![i64::try_from(remaining)?.into()],
+                    vec![
+                        i64::try_from(remaining)?.into(),
+                        now.saturating_sub(CANCELLED_PROJECTION_REPAIR_WINDOW_MS)
+                            .into(),
+                    ],
                 )?)
                 .await
                 .context("Failed to select cancelled route projections for reconciliation")?;
@@ -10345,6 +10687,279 @@ mod tests {
         );
     }
 
+    fn retention_policy() -> RetentionPolicy {
+        RetentionPolicy {
+            terminal_job_ms: 10_000,
+            ephemeral_artifact_ms: 10_000,
+            worker_heartbeat_ms: 10_000,
+            media_tombstone_ms: 10_000,
+            legacy_idempotency_ms: 10_000,
+        }
+    }
+
+    async fn retention_job(
+        store: &BatchRuntimeStore,
+        status: RuntimeJobStatus,
+        text: Option<&str>,
+    ) -> RuntimeJob {
+        let text_asset = match text {
+            Some(text) => Some(
+                store
+                    .create_text_asset(NewTextAsset {
+                        raw_text: text.to_string(),
+                        normalized_text: None,
+                        language_hint: None,
+                        sha256: None,
+                        safety_status: "unchecked".to_string(),
+                        retention_policy: "default".to_string(),
+                        structure_json: json!({}),
+                    })
+                    .await
+                    .unwrap(),
+            ),
+            None => None,
+        };
+        let job = store
+            .create_job(NewRuntimeJob {
+                job_kind: RuntimeJobKind::AsrTranscription,
+                status,
+                priority: 0,
+                model_id: None,
+                capability: None,
+                route_record_kind: None,
+                route_record_id: None,
+                input_media_asset_id: None,
+                input_text_asset_id: text_asset.as_ref().map(|asset| asset.id.clone()),
+                request_json: json!({}),
+                model_snapshot_json: json!({}),
+                retry_policy_json: json!({}),
+                max_attempts: 1,
+                idempotency_key: None,
+                correlation_id: None,
+            })
+            .await
+            .unwrap();
+        store
+            .create_stage(NewJobStage {
+                job_id: job.id.clone(),
+                sequence: 0,
+                stage_kind: "asr_transcribe".to_string(),
+                status: if status == RuntimeJobStatus::Queued {
+                    RuntimeStageStatus::Queued
+                } else {
+                    RuntimeStageStatus::Completed
+                },
+                capability: None,
+                model_id: None,
+                max_attempts: 1,
+                input_artifact_ids: Vec::new(),
+            })
+            .await
+            .unwrap();
+        if let Some(text_asset) = text_asset {
+            store
+                .create_artifact(NewRuntimeArtifact {
+                    job_id: job.id.clone(),
+                    stage_id: None,
+                    artifact_kind: RuntimeArtifactKind::Text,
+                    artifact_role: RuntimeArtifactRole::InputOriginal,
+                    media_asset_id: None,
+                    text_asset_id: Some(text_asset.id),
+                    storage_key: None,
+                    content_type: None,
+                    filename: None,
+                    size_bytes: None,
+                    sha256: None,
+                    metadata_json: json!({}),
+                    retention_policy: "default".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        job
+    }
+
+    async fn opaque_media(store: &BatchRuntimeStore, retention_policy: &str) -> MediaAsset {
+        store
+            .create_media_asset(NewMediaAsset {
+                asset_kind: "opaque_artifact".to_string(),
+                storage_namespace: "artifact_store_v1".to_string(),
+                storage_key: format!("artifact-store/{}", new_uuid()),
+                content_type: "audio/pcm-f32le".to_string(),
+                filename: None,
+                size_bytes: 4,
+                sha256: Some(sha256_hex(b"data")),
+                duration_secs: None,
+                sample_rate_hz: None,
+                channel_count: None,
+                peak_amplitude: None,
+                rms_amplitude: None,
+                source_asset_id: None,
+                canonical_profile_version: None,
+                scan_status: "not_required".to_string(),
+                retention_policy: retention_policy.to_string(),
+                metadata_json: json!({"artifact_store": {"version": 1, "tenant_id": "tenant-a"}}),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// DUR-F6: the sweeper deletes only state past its retention, in bounded
+    /// pages, and never a job that still owns live job-scoped media.
+    #[tokio::test]
+    async fn retention_sweep_deletes_only_expired_terminal_state() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let policy = retention_policy();
+
+        let old_done = retention_job(&store, RuntimeJobStatus::Completed, Some("old")).await;
+        let old_failed = retention_job(&store, RuntimeJobStatus::Failed, None).await;
+        let old_active = retention_job(&store, RuntimeJobStatus::Queued, None).await;
+        let owns_media = retention_job(&store, RuntimeJobStatus::Completed, None).await;
+        let media = opaque_media(&store, "artifact_job").await;
+        store
+            .create_artifact(NewRuntimeArtifact {
+                job_id: owns_media.id.clone(),
+                stage_id: None,
+                artifact_kind: RuntimeArtifactKind::Audio,
+                artifact_role: RuntimeArtifactRole::OutputIntermediate,
+                media_asset_id: Some(media.id.clone()),
+                text_asset_id: None,
+                storage_key: None,
+                content_type: None,
+                filename: None,
+                size_bytes: None,
+                sha256: None,
+                metadata_json: json!({}),
+                retention_policy: "speech_job_replay".to_string(),
+            })
+            .await
+            .unwrap();
+        record_test_worker_heartbeat(&store, "dead-worker").await;
+        let db = store.connection().await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO idempotency_keys (operation, idempotency_key, created_at, request_hash) VALUES ('transcription.create', 'legacy', 1000, 'hash')",
+        )
+        .await
+        .unwrap();
+
+        clock.store(5_000, Ordering::SeqCst);
+        let recent_done = retention_job(&store, RuntimeJobStatus::Completed, None).await;
+        record_test_worker_heartbeat(&store, "live-worker").await;
+
+        assert_eq!(
+            store.sweep_retention(policy, 64).await.unwrap(),
+            RetentionReport::default(),
+            "nothing is past retention yet"
+        );
+
+        clock.store(12_000, Ordering::SeqCst);
+        let first = store.sweep_retention(policy, 1).await.unwrap();
+        assert_eq!(first.jobs, 1, "jobs are deleted in bounded pages");
+        let second = store.sweep_retention(policy, 64).await.unwrap();
+        assert_eq!(second.jobs, 1);
+        assert_eq!(first.worker_heartbeats + second.worker_heartbeats, 1);
+        assert_eq!(
+            first.legacy_idempotency_records + second.legacy_idempotency_records,
+            1
+        );
+        for job in [&old_done, &old_failed] {
+            assert!(store.get_job(&job.id).await.unwrap().is_none());
+            assert!(store.list_stages_for_job(&job.id).await.unwrap().is_empty());
+            assert!(store
+                .list_artifacts_for_job(&job.id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            count_where(&store, "SELECT COUNT(*) FROM text_assets", vec![]).await,
+            0,
+            "the deleted job's text input went with it"
+        );
+        for job in [&old_active, &owns_media, &recent_done] {
+            assert!(store.get_job(&job.id).await.unwrap().is_some());
+        }
+        assert!(store
+            .get_worker_heartbeat("dead-worker")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_worker_heartbeat("live-worker")
+            .await
+            .unwrap()
+            .is_some());
+
+        // Once its job-scoped media is tombstoned, the job can go too.
+        let expired = store.expired_retained_media(policy, 64).await.unwrap();
+        assert_eq!(
+            expired
+                .iter()
+                .map(|asset| asset.id.clone())
+                .collect::<Vec<_>>(),
+            vec![media.id.clone()]
+        );
+        assert!(store
+            .tombstone_media_asset_with_cleanup(
+                &media.id,
+                "tenant-a",
+                ArtifactCleanupReason::ArtifactDeleted
+            )
+            .await
+            .unwrap());
+        assert_eq!(store.sweep_retention(policy, 64).await.unwrap().jobs, 1);
+        assert!(store.get_job(&owns_media.id).await.unwrap().is_none());
+        // The tombstone stays while its cleanup intent is pending.
+        clock.store(30_000, Ordering::SeqCst);
+        assert_eq!(
+            store
+                .sweep_retention(policy, 64)
+                .await
+                .unwrap()
+                .media_tombstones,
+            0
+        );
+        assert!(store.get_media_asset(&media.id).await.unwrap().is_some());
+    }
+
+    /// DUR-F6: replay GC visits a terminal job's journal once; a job with no
+    /// journal is marked swept and not scanned again, until a retry.
+    #[tokio::test]
+    async fn speech_replay_gc_marks_jobs_without_a_journal_swept() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let job = retention_job(&store, RuntimeJobStatus::Failed, None).await;
+        clock.store(5_000, Ordering::SeqCst);
+        assert!(store.expired_speech_pcm(4_000).await.unwrap().is_empty());
+        let swept = count_where(
+            &store,
+            "SELECT COUNT(*) FROM runtime_jobs WHERE id = ?1 AND replay_swept_at IS NOT NULL",
+            vec![job.id.clone().into()],
+        );
+        assert_eq!(swept.await, 1);
+
+        let db = store.connection().await.unwrap();
+        db.execute_unprepared(
+            "UPDATE runtime_jobs SET max_attempts = 2; UPDATE job_stages SET status = 'failed', max_attempts = 2",
+        )
+        .await
+        .unwrap();
+        store.retry_job(&job.id).await.unwrap().expect("retryable");
+        assert_eq!(
+            count_where(
+                &store,
+                "SELECT COUNT(*) FROM runtime_jobs WHERE id = ?1 AND replay_swept_at IS NULL",
+                vec![job.id.into()],
+            )
+            .await,
+            1,
+            "a retried job's new journal is swept again"
+        );
+    }
+
     #[tokio::test]
     async fn durable_idempotency_rejects_unbounded_or_unattached_records() {
         let (mut store, _root) = build_store();
@@ -12227,12 +12842,34 @@ mod tests {
                     finished_at = ?1, updated_at = ?1
                 WHERE id = ?2
                 "#,
-                vec![current_timestamp_millis().into(), job.id.into()],
+                vec![
+                    (current_timestamp_millis() - CANCELLED_PROJECTION_REPAIR_WINDOW_MS - 1).into(),
+                    job.id.clone().into(),
+                ],
             )
             .expect("simulate terminal job statement"),
         )
         .await
         .expect("simulate terminal job");
+        // Cancellations older than the repair window are not scanned.
+        assert_eq!(
+            store
+                .reconcile_inconsistent_states(1)
+                .await
+                .expect("bounded reconciliation")
+                .route_projections_repaired,
+            0
+        );
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE runtime_jobs SET updated_at = ?1 WHERE id = ?2",
+                vec![current_timestamp_millis().into(), job.id.into()],
+            )
+            .expect("recent cancellation statement"),
+        )
+        .await
+        .expect("recent cancellation");
 
         let report = store
             .reconcile_inconsistent_states(1)

@@ -417,6 +417,7 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
         name: "runtime_jobs",
         columns: &[
             "admission_tenant",
+            "replay_swept_at",
             "id",
             "created_at",
             "updated_at",

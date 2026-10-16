@@ -430,6 +430,7 @@ mod tests {
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[
         ("runtime_jobs", "cancellation_state"),
+        ("runtime_jobs", "replay_swept_at"),
         ("job_stages", "cancellation_state"),
         ("chat_threads", "system_prompt"),
         ("chat_messages", "content_parts"),

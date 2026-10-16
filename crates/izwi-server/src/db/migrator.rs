@@ -746,6 +746,14 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_tenant_expiry ON durable_idempotency_keys_v2(tenant_scope, expires_at ASC);",
+    // Bounded scans for retention, replay GC and reconciliation.
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status_updated ON runtime_jobs(status, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_replay_sweep ON runtime_jobs(replay_swept_at, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_job_publication ON runtime_artifacts(job_id, publication_key);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_media_asset ON runtime_artifacts(media_asset_id);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_retention ON media_assets(retention_policy, deleted_at, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_deleted ON media_assets(deleted_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created ON idempotency_keys(created_at ASC);",
 ];
 
 /// Seed quota usage from the records that exist when the usage table is
@@ -790,6 +798,11 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
         table: "runtime_jobs",
         column: "admission_tenant",
         definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "runtime_jobs",
+        column: "replay_swept_at",
+        definition: "INTEGER NULL",
     },
     CompatibilityColumn {
         table: "chat_threads",

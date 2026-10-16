@@ -7,7 +7,8 @@
 use crate::batch_runtime::store::{
     validate_artifact_cleanup_storage_key, ArtifactCleanupIntent, ArtifactCleanupReason,
     BatchRuntimeStore, NewMediaAsset, NewProviderWriteReservation, NewStageOutputArtifact,
-    ProviderWriteReservation, ReservedStageArtifactPublication, SpeechHistoryFinalization,
+    ProviderWriteReservation, ReservedStageArtifactPublication, RetentionPolicy,
+    SpeechHistoryFinalization,
 };
 use crate::batch_runtime::types::{
     RuntimeArtifact, RuntimeArtifactKind, RuntimeArtifactRole, StageLease,
@@ -876,6 +877,38 @@ impl ArtifactStore {
                 report.completed += 1;
             } else {
                 report.deferred += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Delete opaque objects whose retention label has lapsed: ephemeral
+    /// objects past their retention and job objects of jobs past job
+    /// retention. Durable objects are never expired here. An object whose
+    /// provider delete fails stays tombstoned for `cleanup_due` to retry.
+    pub async fn expire_retained(
+        &self,
+        policy: RetentionPolicy,
+        limit: usize,
+    ) -> Result<ArtifactCleanupReport, ArtifactStoreError> {
+        let assets = self
+            .metadata
+            .expired_retained_media(policy, limit.min(64))
+            .await
+            .map_err(ArtifactStoreError::Metadata)?;
+        let mut report = ArtifactCleanupReport::default();
+        for asset in assets {
+            report.inspected += 1;
+            let tenant =
+                tenant_from_asset(&asset).and_then(|tenant| ArtifactTenant::parse(tenant).ok());
+            let (Some(tenant), Ok(id)) = (tenant, ArtifactId::parse(asset.id.clone())) else {
+                report.deferred += 1;
+                continue;
+            };
+            match self.delete(&tenant, &id).await {
+                Ok(_) => report.completed += 1,
+                Err(ArtifactStoreError::DeleteIncomplete) => report.deferred += 1,
+                Err(error) => return Err(error),
             }
         }
         Ok(report)
@@ -3643,6 +3676,99 @@ mod tests {
         provider.fail_deletes.store(false, Ordering::SeqCst);
         assert!(!store.delete(&tenant, &descriptor.id).await.unwrap());
         assert_eq!(provider.object_count(), 0);
+    }
+
+    /// DUR-F6: retention labels drive expiry. Ephemeral objects go after
+    /// their retention, durable ones never, and the tombstone row is purged
+    /// once the object is gone and the grace passed.
+    #[tokio::test]
+    async fn retention_labels_expire_ephemeral_objects_and_keep_durable_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
+        let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+            root.path().join("artifacts.sqlite3"),
+        ));
+        metadata.set_test_clock(clock.clone());
+        let metadata = Arc::new(metadata);
+        let provider = Arc::new(MemoryMediaProvider::default());
+        provider.set_now_unix_ms(1_000);
+        let store = ArtifactStore::new(
+            metadata.clone(),
+            provider.clone(),
+            ArtifactStoreLimits::default(),
+        )
+        .unwrap();
+        let tenant = ArtifactTenant::parse("tenant-a").unwrap();
+        let ephemeral = put_test_artifact(&store, &tenant, "ephemeral").await;
+        let durable = store
+            .put(
+                &tenant,
+                ArtifactWrite {
+                    content_type: "application/octet-stream".to_string(),
+                    filename: Some("durable.bin".to_string()),
+                    bytes: b"durable".to_vec(),
+                    retention: ArtifactRetention::Durable,
+                },
+            )
+            .await
+            .unwrap();
+        let policy = RetentionPolicy {
+            terminal_job_ms: 10_000,
+            ephemeral_artifact_ms: 5_000,
+            worker_heartbeat_ms: 10_000,
+            media_tombstone_ms: 1_000,
+            legacy_idempotency_ms: 10_000,
+        };
+
+        assert_eq!(
+            store.expire_retained(policy, 64).await.unwrap().inspected,
+            0
+        );
+        clock.store(7_000, Ordering::SeqCst);
+        provider.set_now_unix_ms(7_000);
+        assert_eq!(
+            store.expire_retained(policy, 64).await.unwrap(),
+            ArtifactCleanupReport {
+                inspected: 1,
+                completed: 1,
+                deferred: 0,
+            }
+        );
+        assert!(matches!(
+            store.stat(&tenant, &ephemeral.id).await,
+            Err(ArtifactStoreError::NotFound)
+        ));
+        assert_eq!(store.stat(&tenant, &durable.id).await.unwrap(), durable);
+        assert_eq!(provider.object_count(), 1);
+
+        // The tombstone outlives its object by the grace, then goes.
+        assert_eq!(
+            metadata
+                .sweep_retention(policy, 64)
+                .await
+                .unwrap()
+                .media_tombstones,
+            0
+        );
+        clock.store(9_000, Ordering::SeqCst);
+        assert_eq!(
+            metadata
+                .sweep_retention(policy, 64)
+                .await
+                .unwrap()
+                .media_tombstones,
+            1
+        );
+        assert!(metadata
+            .get_media_asset(ephemeral.id.as_str())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(metadata
+            .get_media_asset(durable.id.as_str())
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
