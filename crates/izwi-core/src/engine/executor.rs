@@ -3386,9 +3386,11 @@ impl ModelExecutor for NativeExecutor {
             profile.kv_dtype = "none".to_string();
         }
         if matches!(request.task_type, super::types::TaskType::Chat) {
-            // Stop strings are checked on each committed quantum, so a request
-            // with any decodes one token per quantum: no token past its stop
-            // string is sampled, counted or reported.
+            // The chat handler checks stop strings after every token of a
+            // quantum, so stop strings keep a family's multi-token quantum.
+            // A speculative quantum or envelope verifies several tokens per
+            // forward and cannot stop between them, so stop strings keep
+            // those rows at one token per quantum.
             let stops = request
                 .params
                 .stop_sequences
@@ -3398,8 +3400,17 @@ impl ModelExecutor for NativeExecutor {
                 request
                     .prepared_chat_model_for_executor()
                     .ok()
-                    .filter(|_| !stops)
-                    .map(|model| model.as_ref().speculative_decode_profile())
+                    .map(|model| {
+                        let model = model.as_ref();
+                        let (tokens, sustained, speculative) = model.speculative_decode_profile();
+                        if !stops {
+                            (tokens, sustained, speculative)
+                        } else if handler_chat::decodes_speculative_quanta(model) {
+                            (1, false, false)
+                        } else {
+                            (tokens, sustained, false)
+                        }
+                    })
                     .unwrap_or((1, false, false));
             profile.preferred_decode_tokens = preferred_decode_tokens;
             profile.sustained_decode_quantum = sustained_decode_quantum;

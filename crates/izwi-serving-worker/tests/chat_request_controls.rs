@@ -272,6 +272,104 @@ async fn a_stop_string_ends_generation_without_being_returned() {
     );
 }
 
+/// Stop strings that first complete at different tokens of `run`, past
+/// its first six: (stop, text before it, tokens through the one that
+/// completes it). The fixture decodes words joined by spaces.
+fn stops_across_quanta(run: &ChatRun) -> Vec<(String, String, usize)> {
+    let tokens = run.tokens();
+    let text = tokens.join(" ");
+    assert_eq!(text, run.deltas.concat(), "fixture text is its words");
+    let mut stops = Vec::new();
+    for end in 6..tokens.len() {
+        for width in 2..=3 {
+            let start = end + 1 - width;
+            let stop = tokens[start..=end].join(" ");
+            let at = tokens[..start].join(" ").len() + 1;
+            if text.find(&stop) == Some(at) {
+                stops.push((stop, text[..at].to_string(), end + 1));
+                break;
+            }
+        }
+    }
+    stops
+}
+
+/// Stop strings are checked after every token of a multi-token decode
+/// quantum (four tokens on the CPU, eight on Metal for LFM2), so a stop
+/// string ends the quantum at the token that completes it: the text stops
+/// before it, usage counts exactly the tokens through it, and the request
+/// still decodes several tokens per quantum.
+async fn assert_stop_string_ends_a_multi_token_quantum(runtime: &RuntimeService) {
+    // Stops completing at several different tokens, so some end inside a
+    // quantum rather than at its last token.
+    let mut found = None;
+    for seed in 0..64 {
+        let mut params = sampled(Some(seed));
+        params.max_tokens = 24;
+        let full = run_chat(runtime, params, true).await.unwrap();
+        let stops = stops_across_quanta(&full);
+        if stops.len() >= 4 {
+            found = Some((seed, full, stops));
+            break;
+        }
+    }
+    let (seed, full, stops) = found.expect("a seed samples a long varied text");
+    for (stop, expected, count) in stops.into_iter().take(8) {
+        for streaming in [true, false] {
+            let mut params = sampled(Some(seed));
+            params.max_tokens = 24;
+            params.stop_sequences = vec![stop.clone()];
+            let run = run_chat(runtime, params, streaming).await.unwrap();
+            if streaming {
+                assert_eq!(run.deltas.concat(), expected);
+                assert_eq!(run.delta_tokens, run.tokens());
+            }
+            assert_eq!(run.generation.text, expected);
+            assert_eq!(
+                run.generation.finish_reason,
+                Some(izwi_core::engine::OutputFinishReason::StopToken)
+            );
+            assert_eq!(run.tokens()[..], full.tokens()[..count], "{stop:?}");
+            assert_eq!(run.generation.tokens_generated, count);
+            let breakdown = run
+                .generation
+                .latency_breakdown
+                .as_ref()
+                .expect("latency breakdown");
+            let decode_tokens = breakdown.decode_tokens.expect("decode tokens");
+            assert!(
+                (breakdown.decode_steps as usize) < decode_tokens,
+                "stop strings forced one token per quantum: {breakdown:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_stop_string_ends_a_multi_token_quantum_on_cpu() {
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(models.path(), RuntimeDeviceAssignment::Cpu).await;
+    assert_stop_string_ends_a_multi_token_quantum(&runtime).await;
+}
+
+#[cfg(feature = "metal")]
+#[tokio::test]
+async fn a_stop_string_ends_an_eight_token_quantum_on_metal() {
+    let Some(expected_device_id) = metal_leg_device("stop-string quantum metal leg") else {
+        return;
+    };
+    let models = tempfile::tempdir().unwrap();
+    let runtime = tiny_lfm_runtime(
+        models.path(),
+        RuntimeDeviceAssignment::Metal {
+            process_local_device_index: 0,
+            expected_device_id,
+        },
+    )
+    .await;
+    assert_stop_string_ends_a_multi_token_quantum(&runtime).await;
+}
+
 fn greedy(max_tokens: usize) -> GenerationParams {
     GenerationParams {
         temperature: 0.0,

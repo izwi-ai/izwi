@@ -201,6 +201,28 @@ fn record_lfm_completion(
     }
 }
 
+/// Whether a family's multi-token quantum is speculative (MTP drafts
+/// verified several tokens per forward). Such a quantum cannot stop between
+/// tokens, so requests with stop strings decode one token per quantum there.
+pub(super) fn decodes_speculative_quanta(model: &NativeChatModel) -> bool {
+    matches!(
+        model,
+        NativeChatModel::Qwen38(_) | NativeChatModel::Qwen36Moe(_)
+    )
+}
+
+/// Fold the next one-token step of a quantum into the quantum's step.
+fn append_decode_step(quantum: &mut NativeChatDecodeStep, next: NativeChatDecodeStep) {
+    quantum.delta.push_str(&next.delta);
+    quantum.text = next.text;
+    quantum.tokens_generated = next.tokens_generated;
+    quantum.input_tokens_committed = quantum
+        .input_tokens_committed
+        .saturating_add(next.input_tokens_committed);
+    quantum.finished = next.finished;
+    quantum.logprobs.extend(next.logprobs);
+}
+
 fn canonical_chat_terminal_text(streamed_text: &str, terminal_text: String) -> String {
     if streamed_text.is_empty() {
         terminal_text
@@ -707,6 +729,9 @@ impl NativeExecutor {
                     prompt_tokens = request.num_prompt_tokens(), max_new_tokens = request.params.max_tokens,
                     prefill = scheduled.is_prefill, "LFM2 quantum diagnostic context");
             }
+            // A stop-string quantum has its stop strings applied token by
+            // token below and carries the logprob entries to stream.
+            let mut stopped_logprobs = None;
             let mut step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
                 match (model.as_ref(), &mut active_state.state) {
                     (NativeChatModel::Qwen38(qwen), NativeChatDecodeState::Qwen38(state)) => {
@@ -761,6 +786,26 @@ impl NativeExecutor {
                     active_state.last_tokens_generated,
                     || Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1)),
                 )?
+            } else if active_state.stop.is_some() && input_budget > 1 {
+                // Stop strings are checked after every token, so the
+                // quantum ends at a stop string like an end-of-sequence
+                // token: no token past it is sampled, counted or reported.
+                let mut quantum: Option<NativeChatDecodeStep> = None;
+                let mut stream_logprobs = Vec::new();
+                for _ in 0..input_budget {
+                    let mut token =
+                        Self::run_blocking(|| model.decode_quantum(&mut active_state.state, 1))?;
+                    stream_logprobs.extend(active_state.apply_stop_sequences(&mut token));
+                    match quantum.as_mut() {
+                        Some(quantum) => append_decode_step(quantum, token),
+                        None => quantum = Some(token),
+                    }
+                    if quantum.as_ref().is_some_and(|quantum| quantum.finished) {
+                        break;
+                    }
+                }
+                stopped_logprobs = Some(stream_logprobs);
+                quantum.expect("a quantum decodes at least one token")
             } else {
                 Self::run_blocking(|| model.decode_quantum(&mut active_state.state, input_budget))?
             };
@@ -771,7 +816,10 @@ impl NativeExecutor {
             }
 
             record_lfm_completion(&active_state.state, request, &step);
-            let stream_logprobs = active_state.apply_stop_sequences(&mut step);
+            let stream_logprobs = match stopped_logprobs {
+                Some(stream_logprobs) => stream_logprobs,
+                None => active_state.apply_stop_sequences(&mut step),
+            };
             let step_tokens_generated = step
                 .tokens_generated
                 .saturating_sub(active_state.last_tokens_generated);
