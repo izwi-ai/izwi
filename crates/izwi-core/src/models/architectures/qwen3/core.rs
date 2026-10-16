@@ -764,6 +764,17 @@ fn concat_linear_biases(name: &str, linears: &[&Linear]) -> Result<Option<Tensor
     Tensor::cat(&biases, 0).map(Some).map_err(Error::from)
 }
 
+/// Drops the projections a fusion replaced and synchronizes the device so
+/// Candle frees their buffers at once. Until a synchronization Candle keeps
+/// released buffers pooled and hands each to the next allocation it fits,
+/// however much smaller: a norm gain loaded after the fusion kept a whole
+/// pre-fusion projection's buffer resident (the dense forced aligner held
+/// 0.55 GiB of them on Metal).
+fn release_fused_parts<T>(parts: T, device: &Device) -> Result<()> {
+    drop(parts);
+    device.synchronize().map_err(Error::from)
+}
+
 struct Qwen3FusedQkvProjection {
     fused: Linear,
     q_out: usize,
@@ -903,9 +914,9 @@ impl Qwen3QkvProjection {
                 Qwen3Projection::Dense(v_dense),
             ) = (&q_proj, &k_proj, &v_proj)
             {
-                return Ok(Self::Fused(Qwen3FusedQkvProjection::new(
-                    q_dense, k_dense, v_dense,
-                )?));
+                let fused = Qwen3FusedQkvProjection::new(q_dense, k_dense, v_dense)?;
+                release_fused_parts((q_proj, k_proj, v_proj), device)?;
+                return Ok(Self::Fused(fused));
             }
         }
         Ok(Self::Separate {
@@ -1075,9 +1086,9 @@ impl Qwen3GateUpProjection {
             if let (Qwen3Projection::Dense(gate_dense), Qwen3Projection::Dense(up_dense)) =
                 (&gate_proj, &up_proj)
             {
-                return Ok(Self::Fused(Qwen3FusedGateUpProjection::new(
-                    gate_dense, up_dense,
-                )?));
+                let fused = Qwen3FusedGateUpProjection::new(gate_dense, up_dense)?;
+                release_fused_parts((gate_proj, up_proj), device)?;
+                return Ok(Self::Fused(fused));
             }
         }
         Ok(Self::Separate { gate_proj, up_proj })

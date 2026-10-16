@@ -26,7 +26,10 @@
 //!   synchronizes. Whisper, Granite and Voxtral read through
 //!   `staged::metal_staged_safetensors`, which on Metal casts on the host,
 //!   uploads exact sizes and synchronizes every
-//!   `METAL_LOAD_SYNC_INTERVAL_BYTES` of uploads ([`Ledger::staged`]). Freed private-pool
+//!   `METAL_LOAD_SYNC_INTERVAL_BYTES` of uploads ([`Ledger::staged`]). The
+//!   forced aligner reads through `staged::metal_synced_safetensors`, which
+//!   keeps Candle's device casts and synchronizes as often ([`Ledger::synced`]).
+//!   Freed private-pool
 //!   intermediates, such as the parts of a fused projection, are reused by later
 //!   allocations, so only their high-water mark counts. CPU and CUDA release a
 //!   buffer when it drops.
@@ -41,7 +44,9 @@
 //! - Candle's pool can serve a later, smaller allocation from a larger freed
 //!   buffer, so a Metal resident can occupy more than priced (not
 //!   conservative). The peak is unaffected because that buffer was already
-//!   counted.
+//!   counted. Qwen3 dense projection fusion and MLX conv kernel copies
+//!   synchronize once they free their sources, so the forced aligner loads
+//!   exactly its priced residency.
 //! - Derived tensors under about 1 MiB per family (concatenated norm gains,
 //!   scalars, decode masks, the LFM conformer BatchNorm folds) are not priced.
 //! - MLX scales and biases are priced as their host F32 copies; their short
@@ -357,10 +362,13 @@ pub(super) struct Ledger {
     prelude: u64,
     host_peak: u64,
     peak: u64,
-    /// Metal: the loader reads through `staged::metal_staged_safetensors`,
-    /// which converts each tensor on the host, uploads it at its exact size,
-    /// and synchronizes the device every this many uploaded bytes.
+    /// Metal: the loader synchronizes the device every this many uploaded
+    /// bytes (`staged::metal_staged_safetensors` and
+    /// `staged::metal_synced_safetensors`).
     sync_interval: Option<u64>,
+    /// Metal: the loader converts each tensor on the host and uploads it at
+    /// its exact size (`staged::metal_staged_safetensors`).
+    host_cast: bool,
     /// Metal, staged: the most one step that does not synchronize itself
     /// leaves held.
     held_step_max: u64,
@@ -387,6 +395,7 @@ impl Ledger {
             host_peak: 0,
             peak: 0,
             sync_interval: None,
+            host_cast: false,
             held_step_max: 0,
         }
     }
@@ -395,6 +404,15 @@ impl Ledger {
     /// `staged::metal_staged_safetensors`, which is Candle's own backend
     /// except on Metal.
     pub(super) fn staged(backend: BackendKind) -> Self {
+        let mut ledger = Self::synced(backend);
+        ledger.host_cast = ledger.metal();
+        ledger
+    }
+
+    /// A ledger for a loader that reads through
+    /// `staged::metal_synced_safetensors`: Candle's own backend, which on
+    /// Metal synchronizes the device by uploaded bytes.
+    pub(super) fn synced(backend: BackendKind) -> Self {
         let mut ledger = Self::new(backend);
         if ledger.metal() {
             ledger.sync_interval = Some(METAL_LOAD_SYNC_INTERVAL_BYTES);
@@ -404,7 +422,7 @@ impl Ledger {
 
     /// Metal: the loader converts on the host and uploads exact sizes.
     fn host_cast(&self) -> bool {
-        self.sync_interval.is_some()
+        self.host_cast
     }
 
     fn metal(&self) -> bool {
@@ -588,6 +606,39 @@ impl Ledger {
         dtype: DType,
         zeros: u64,
     ) -> Result<()> {
+        let step = self.fused_step(parts, source, dtype, zeros)?;
+        self.apply(step)
+    }
+
+    /// [`Self::fused`] for a loader that synchronizes the device once it has
+    /// dropped the parts (Qwen3 dense projection fusion,
+    /// `qwen3::core::release_fused_parts`): on Metal the parts are alive at
+    /// that synchronization, beside the concatenation, and none stays held
+    /// or pooled after it.
+    fn fused_then_synced(
+        &mut self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+    ) -> Result<()> {
+        let mut step = self.fused_step(parts, source, dtype, 0)?;
+        if self.metal() {
+            let parts = sum(&[step.held_until_sync, step.intermediates])?;
+            step.high = sum(&[step.high, step.intermediates])?;
+            step.before_sync = Some(parts);
+            step.held_until_sync = 0;
+            step.intermediates = 0;
+        }
+        self.apply(step)
+    }
+
+    fn fused_step(
+        &self,
+        parts: &[&CensusTensor],
+        source: Source,
+        dtype: DType,
+        zeros: u64,
+    ) -> Result<Step> {
         let zero_bytes = dense_bytes(zeros, dtype)?;
         let mut exact = vec![zero_bytes];
         let mut private = vec![self.kernel(zero_bytes)?];
@@ -648,18 +699,16 @@ impl Ledger {
                 }
             }
         };
-        self.apply(step)
+        Ok(step)
     }
 
     /// MLX-quantized weights read by `mlx::load_weight`
     /// (`models/shared/weights/mlx.rs`), joined by `Tensor::cat` into one
     /// projection when there are several. Per weight, the loader reads the
     /// scales and biases at F32 and the packed words, copies each to the host
-    /// (`to_vec2`, which synchronizes the device), dequantizes into a host F32
-    /// `[out, in]` buffer, uploads it at its exact size and casts the upload to
-    /// `dtype` on the device.
+    /// (`to_vec2`, which synchronizes the device), dequantizes into a host
+    /// `[out, in]` buffer at `dtype` and uploads it at its exact size.
     fn mlx_dequantized(&mut self, parts: &[MlxWeight], dtype: DType) -> Result<()> {
-        let cast = dtype != DType::F32;
         let mut logical = 0;
         let mut forms = Vec::with_capacity(parts.len());
         // Per weight, the most alive beside its own resident form: the host
@@ -672,36 +721,32 @@ impl Ledger {
             let elements = part.elements()?;
             let packed = part.weight.stored_bytes;
             let params = part.params_host_bytes()?;
-            let f32_bytes = dense_bytes(elements, DType::F32)?;
             let exact = dense_bytes(elements, dtype)?;
-            // The F32 upload, released once the cast replaces it.
-            let upload = if cast { f32_bytes } else { 0 };
             logical = sum(&[logical, exact])?;
-            let (form, part_transient) = match self.backend {
-                // The read U32 tensor and its host copy beside the scales,
-                // the biases and the F32 buffer (which the cast copies).
-                BackendKind::Cpu => (exact, sum(&[packed, packed, params, upload])?),
-                // The packed upload is freed before the F32 upload; the
+            // The dequantized host buffer is the resident tensor on CPU and
+            // the source of its exact-size upload elsewhere.
+            let dequantizing = sum(&[packed, exact, params])?;
+            let part_transient = match self.backend {
+                // The read U32 tensor and its host copy beside the scales and
+                // the biases.
+                BackendKind::Cpu => sum(&[packed, packed, params])?,
+                // The packed upload is freed before the dense upload; the
                 // host copies count on the host.
-                BackendKind::Cuda => (exact, packed.saturating_sub(exact).max(upload)),
+                BackendKind::Cuda => packed.saturating_sub(exact),
                 // The packed upload and its read-back buffer stay held until
                 // the next synchronization (the next weight's read-back),
-                // beside the dequantization (host packed copy, scales,
-                // biases and F32 buffer), then the host F32 buffer and its
-                // upload.
+                // beside the dequantization (host packed copy, scales, biases
+                // and the dense buffer, which its upload then copies).
                 BackendKind::Metal => {
                     let readback = self.kernel(packed)?;
-                    let dequantizing = sum(&[packed, f32_bytes, params])?;
-                    let uploading = sum(&[f32_bytes, upload])?;
-                    held = held.max(sum(&[packed, readback, upload])?);
+                    held = held.max(sum(&[packed, readback])?);
                     before_sync = before_sync.max(sum(&[packed, readback, params])?);
-                    let form = if cast { self.kernel(exact)? } else { f32_bytes };
-                    (form, sum(&[packed, readback, dequantizing.max(uploading)])?)
+                    sum(&[packed, readback, dequantizing])?
                 }
             };
-            host = host.max(sum(&[packed, f32_bytes, params])?);
+            host = host.max(dequantizing);
             transient = transient.max(part_transient);
-            forms.push(form);
+            forms.push(exact);
         }
         let forms = sum(&forms)?;
         let fused = parts.len() > 1;
@@ -737,18 +782,17 @@ impl Ledger {
                         ..Step::default()
                     }
                 } else {
-                    // Cast parts are private-pool intermediates; uncast parts
-                    // are their own uploads, held once the concatenation
-                    // releases them.
-                    let shared_parts = if cast { 0 } else { forms };
+                    // The parts stay alive beside each later part's
+                    // dequantization and beside their concatenation, then
+                    // the loader synchronizes (`qwen3::core::
+                    // release_fused_parts`), which drops them and the last
+                    // part's held upload.
                     let resident = self.kernel(logical)?;
                     Step {
                         logical,
                         resident,
-                        high: sum(&[resident, transient, shared_parts])?,
-                        held_until_sync: sum(&[held, shared_parts])?,
-                        intermediates: if cast { forms } else { 0 },
-                        before_sync: Some(sum(&[before_sync, shared_parts])?),
+                        high: sum(&[resident, transient, forms])?,
+                        before_sync: Some(sum(&[forms, before_sync.max(held)])?),
                         ..Step::default()
                     }
                 }
@@ -1425,12 +1469,13 @@ fn price_qwen3_aligner_as_loaded(
 }
 
 /// Qwen3-ForcedAligner (`Qwen3AsrModel::load`, safetensors): two
-/// `VarBuilder`s over the mapped checkpoint, the audio tower at the audio
-/// dtype and the text model (embedding, layers, norm, the classifier head) at
-/// the text dtype. MLX-packed weights are dequantized to dense ones; the
-/// audio tower's OHWI convolution kernels (MLX layout) are permuted and made
-/// contiguous by a device copy; with fusion, each text layer's Q/K/V and
-/// gate/up are concatenated. Plus the F32 audio position table built on the
+/// `VarBuilder`s over the mapped checkpoint (`staged::metal_synced_safetensors`),
+/// the audio tower at the audio dtype and the text model (embedding, layers,
+/// norm, the classifier head) at the text dtype. MLX-packed weights are
+/// dequantized to dense ones; the audio tower's OHWI convolution kernels (MLX
+/// layout) are permuted and made contiguous by a device copy; with fusion,
+/// each text layer's Q/K/V and gate/up are concatenated and the device
+/// synchronized. Plus the F32 audio position table built on the
 /// host. Per-layer concatenated Q/K norm gains are not priced (under 1 MiB).
 fn price_qwen3_aligner(
     files: &[CensusFile],
@@ -1441,7 +1486,7 @@ fn price_qwen3_aligner(
     let prefix = qwen3_asr_prefix(&tensors);
     let audio = format!("{prefix}audio_tower.");
     let text = [format!("{prefix}model."), format!("{prefix}lm_head.")];
-    let mut ledger = Ledger::new(backend);
+    let mut ledger = Ledger::synced(backend);
     let mut grouped = BTreeSet::new();
     if load.fused_projections {
         for name in tensors.keys() {
@@ -1471,7 +1516,7 @@ fn price_qwen3_aligner(
                         .iter()
                         .map(|stem| tensor(&tensors, &format!("{stem}.weight")))
                         .collect::<Result<Vec<_>>>()?;
-                    ledger.fused(&parts, Source::Mapped, load.text_dtype, 0)?;
+                    ledger.fused_then_synced(&parts, Source::Mapped, load.text_dtype)?;
                     grouped.extend(parts.iter().map(|part| part.name.as_str()));
                 }
             }
@@ -2681,10 +2726,12 @@ pub(super) mod tests {
                 Box::new(|b| aligner(&aligner_dense, b)),
                 [3.42, 2.30, 2.69, 2.30],
             ),
+            // MLX weights dequantize on the host at the text dtype and upload
+            // at their exact sizes (2.68 GiB with power-of-two device casts).
             (
                 "ForcedAligner-0.6B-4bit",
                 Box::new(|b| aligner(&aligner_4bit, b)),
-                [3.42, 2.30, 2.68, 2.30],
+                [3.42, 2.30, 2.42, 2.30],
             ),
             // ADM-4: F32 on every backend, in host memory on Metal (no
             // allocator rounding); the catalog held 3.0 / 2.0 GiB on CUDA.
@@ -3394,9 +3441,10 @@ pub(super) mod tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
-        // The catalog figure covers residency, not the Metal load peak (held
-        // uploads and dequantization scratch), so a retry judged by it would
-        // run when it could not fit.
+        // The catalog figure is the largest residency over the backends (CPU
+        // F32 text), not the Metal load peak (F16 text, held uploads and
+        // dequantization scratch), so a retry judged by it would misjudge a
+        // Metal load.
         for (variant, files) in [
             (
                 ModelVariant::Qwen3ForcedAligner06B,
@@ -3409,7 +3457,7 @@ pub(super) mod tests {
         ] {
             let catalog = super::super::model_memory_estimate(variant).load_peak_bytes;
             let metal = aligner(&files, BackendKind::Metal).load_peak_bytes;
-            assert!(metal > catalog, "{variant}: {metal} vs {catalog}");
+            assert_ne!(metal, catalog, "{variant}");
         }
     }
 
@@ -3814,5 +3862,148 @@ pub(super) mod tests {
         assert_eq!(cuda.resident_bytes, payload / 2);
         assert_eq!(cuda.memo_bytes, 7);
         assert_eq!(cuda.host_staging_bytes, NEMO_UNLISTED_TENSOR_BYTES);
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_residency_tests {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::backends::DeviceSelector;
+    use crate::models::architectures::qwen3::asr::Qwen3AsrModel;
+
+    const GIB: f64 = (1u64 << 30) as f64;
+
+    /// The process's physical footprint (Metal buffers and host memory).
+    fn footprint() -> u64 {
+        extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+        }
+        // rusage_info_v0: a 16-byte UUID, then u64 fields; ri_phys_footprint
+        // is index 9 counting the UUID as two words.
+        let mut info = [0_u64; 32];
+        // SAFETY: rusage_info_v0 is 96 bytes; the buffer outlives the call.
+        let status =
+            unsafe { proc_pid_rusage(std::process::id() as i32, 0, info.as_mut_ptr().cast()) };
+        assert_eq!(status, 0);
+        info[9]
+    }
+
+    /// Loads each published aligner on Metal and checks it against the plan
+    /// admission prices: Metal allocations never pass the planned load peak,
+    /// and after the load fence the weights occupy the planned residency.
+    /// Measured (2026-10-16, 16 GB M1 Pro; peak allocated / process footprint
+    /// with one checkpoint per process, resident; plan resident / peak, the
+    /// peak covering the F32 reload a failed F16 probe makes):
+    /// - dense: 2.73 / 2.79, 2.69 GiB; plan 2.69 / 4.77 GiB. Before: 4.95 /
+    ///   5.03, 3.24 GiB, over a 2.69 GiB resident plan.
+    /// - dense, F32 text (that reload): 4.24 peak, 4.19 GiB; plan 4.19 / 4.77
+    ///   GiB.
+    /// - 4-bit: 2.44 / 2.79, 2.42 GiB; plan 2.42 / 4.79 GiB. Before: 3.16 /
+    ///   3.83, 3.14 GiB over 2.69 GiB.
+    ///
+    /// The excess over the plan was Candle's Metal pool, which keeps a
+    /// released buffer until the next synchronization and hands it to the
+    /// next allocation it fits, however small: the q/k norm gains loaded
+    /// after a projection fusion kept the pre-fusion projections' buffers
+    /// (0.55 GiB), and a 4-bit conv bias the strided kernel's (8 MiB). The
+    /// first Metal load in a process also adds about 5 MiB of device state
+    /// that outlives the model, outside the plan. Run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner checkpoints and a Metal device"]
+    fn forced_aligner_metal_load_stays_within_its_plan() {
+        const DEVICE_STATE_BYTES: u64 = 8 << 20;
+        let models = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dirs::data_local_dir().unwrap().join("izwi/models"));
+        let device = DeviceSelector::detect_with_preference(Some("metal")).expect("metal");
+        let metal = device.device.as_metal_device().unwrap().clone();
+        let allocated = move || metal.metal_device().current_allocated_size() as u64;
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The dense text pinned to F32 is the load a failed F16 probe
+        // reloads (`precision_reload_plan`).
+        for (dir_name, variant, pin_f32) in [
+            (
+                "Qwen3-ForcedAligner-0.6B",
+                ModelVariant::Qwen3ForcedAligner06B,
+                false,
+            ),
+            (
+                "Qwen3-ForcedAligner-0.6B",
+                ModelVariant::Qwen3ForcedAligner06B,
+                true,
+            ),
+            (
+                "Qwen3-ForcedAligner-0.6B-4bit",
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+                false,
+            ),
+        ] {
+            if pin_f32 {
+                std::env::set_var("IZWI_METAL_DTYPE", "f32");
+            } else {
+                std::env::remove_var("IZWI_METAL_DTYPE");
+            }
+            let path = models.join(dir_name);
+            let plan = aligner_plan(variant, &path, &device, BackendKind::Metal)
+                .unwrap()
+                .expect("plan");
+            device.device.synchronize().unwrap();
+            let (before, footprint_before) = (allocated(), footprint());
+            // The load's high-water marks, sampled every 0.2 ms.
+            let peak = Arc::new(AtomicU64::new(before));
+            let footprint_peak = Arc::new(AtomicU64::new(footprint_before));
+            let done = Arc::new(AtomicBool::new(false));
+            let sampler = {
+                let (peak, footprint_peak, done) =
+                    (peak.clone(), footprint_peak.clone(), done.clone());
+                let allocated = allocated.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        peak.fetch_max(allocated(), Ordering::Relaxed);
+                        footprint_peak.fetch_max(footprint(), Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                })
+            };
+            let model = Qwen3AsrModel::load(&path, variant, device.clone());
+            std::env::remove_var("IZWI_METAL_DTYPE");
+            let model = model.expect("load");
+            device.device.synchronize().unwrap();
+            done.store(true, Ordering::Relaxed);
+            sampler.join().unwrap();
+            let peak = peak.load(Ordering::Relaxed) - before;
+            let footprint_peak = footprint_peak.load(Ordering::Relaxed) - footprint_before;
+            let resident = allocated() - before;
+            let _ = writeln!(
+                std::io::stderr(),
+                "{dir_name}{}: peak {:.3} GiB allocated ({:.3} footprint), resident {:.3} GiB; \
+                 plan peak {:.3}, resident {:.3} GiB",
+                if pin_f32 { " (F32 text)" } else { "" },
+                peak as f64 / GIB,
+                footprint_peak as f64 / GIB,
+                resident as f64 / GIB,
+                plan.load_peak_bytes as f64 / GIB,
+                plan.resident_bytes as f64 / GIB,
+            );
+            assert!(
+                peak <= plan.load_peak_bytes,
+                "{dir_name} {pin_f32}: load peak"
+            );
+            assert!(
+                resident.abs_diff(plan.resident_bytes) <= DEVICE_STATE_BYTES,
+                "{dir_name} {pin_f32}: residency"
+            );
+            drop(model);
+            device.device.synchronize().unwrap();
+        }
     }
 }

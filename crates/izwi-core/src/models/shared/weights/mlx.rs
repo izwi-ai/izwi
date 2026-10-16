@@ -8,7 +8,7 @@
 //! This module dequantizes those tensors into dense weights so existing Candle
 //! layers can be reused without model-specific branching.
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor, WithDType};
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Embedding, Linear, VarBuilder};
 
 use crate::error::{Error, Result};
@@ -137,13 +137,13 @@ fn quant_bits_from_packing(
     Ok(bits)
 }
 
-fn dequantize_affine_u32(
+fn dequantize_affine_u32<T: WithDType>(
     packed: Vec<Vec<u32>>,
     scales: Vec<Vec<f32>>,
     biases: Option<Vec<Vec<f32>>>,
     out_dim: usize,
     in_dim: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<T>> {
     if packed.len() != out_dim {
         return Err(Error::ModelLoadError(format!(
             "Quantized weight rows mismatch: expected out_dim={out_dim}, packed_rows={}",
@@ -165,7 +165,7 @@ fn dequantize_affine_u32(
     let (scales, biases, groups) = normalize_affine_params(scales, biases, out_dim, in_dim)?;
     let group_size = in_dim / groups;
 
-    let mut out = vec![0f32; out_dim * in_dim];
+    let mut out = vec![T::zero(); out_dim * in_dim];
     for row in 0..out_dim {
         for pcol in 0..packed_in {
             let word = packed[row][pcol];
@@ -177,20 +177,21 @@ fn dequantize_affine_u32(
                 }
                 let q = ((word >> (pi * bits)) & mask) as f32;
                 let g = col / group_size;
-                out[row * in_dim + col] = q * scales[row][g] + biases[row][g];
+                out[row * in_dim + col] =
+                    T::from_f64(f64::from(q * scales[row][g] + biases[row][g]));
             }
         }
     }
     Ok(out)
 }
 
-fn dequantize_affine_u8(
+fn dequantize_affine_u8<T: WithDType>(
     packed: Vec<Vec<u8>>,
     scales: Vec<Vec<f32>>,
     biases: Option<Vec<Vec<f32>>>,
     out_dim: usize,
     in_dim: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<T>> {
     if packed.len() != out_dim {
         return Err(Error::ModelLoadError(format!(
             "Quantized weight rows mismatch: expected out_dim={out_dim}, packed_rows={}",
@@ -208,7 +209,7 @@ fn dequantize_affine_u8(
     let (scales, biases, groups) = normalize_affine_params(scales, biases, out_dim, in_dim)?;
     let group_size = in_dim / groups;
 
-    let mut out = vec![0f32; out_dim * in_dim];
+    let mut out = vec![T::zero(); out_dim * in_dim];
     for row in 0..out_dim {
         for pcol in 0..packed_in {
             let word = packed[row][pcol] as u32;
@@ -220,7 +221,8 @@ fn dequantize_affine_u8(
                 }
                 let q = ((word >> (pi * bits)) & mask) as f32;
                 let g = col / group_size;
-                out[row * in_dim + col] = q * scales[row][g] + biases[row][g];
+                out[row * in_dim + col] =
+                    T::from_f64(f64::from(q * scales[row][g] + biases[row][g]));
             }
         }
     }
@@ -243,12 +245,10 @@ pub fn load_weight(vb: &VarBuilder, out_dim: usize, in_dim: usize) -> Result<Ten
         None
     };
 
-    let weight = if let Ok(w_u32) = vb.get_unchecked_dtype("weight", DType::U32) {
-        let packed = w_u32.to_vec2::<u32>()?;
-        dequantize_affine_u32(packed, scales, biases, out_dim, in_dim)?
+    let packed = if let Ok(w_u32) = vb.get_unchecked_dtype("weight", DType::U32) {
+        PackedWords::U32(w_u32.to_vec2::<u32>()?)
     } else if let Ok(w_u8) = vb.get_unchecked_dtype("weight", DType::U8) {
-        let packed = w_u8.to_vec2::<u8>()?;
-        dequantize_affine_u8(packed, scales, biases, out_dim, in_dim)?
+        PackedWords::U8(w_u8.to_vec2::<u8>()?)
     } else {
         return Err(Error::ModelLoadError(
             "MLX quantized tensor has unsupported packed dtype for `weight` (expected U32 or U8)"
@@ -256,8 +256,46 @@ pub fn load_weight(vb: &VarBuilder, out_dim: usize, in_dim: usize) -> Result<Ten
         ));
     };
 
-    let t = Tensor::from_vec(weight, (out_dim, in_dim), vb.device())?;
-    t.to_dtype(vb.dtype()).map_err(Error::from)
+    // Dequantize on the host straight into the requested dtype and upload the
+    // result once, at its exact size. An F32 buffer uploaded and cast on the
+    // device kept two F32 copies of the largest weight in flight (the 4-bit
+    // forced aligner's embedding: 0.58 GiB on the host, 0.58 GiB uploaded)
+    // and rounded the cast up to a power of two.
+    let (shape, device) = ((out_dim, in_dim), vb.device());
+    match vb.dtype() {
+        DType::F16 => packed.dequantize::<half::f16>(scales, biases, shape, device),
+        DType::BF16 => packed.dequantize::<half::bf16>(scales, biases, shape, device),
+        DType::F32 => packed.dequantize::<f32>(scales, biases, shape, device),
+        dtype => packed
+            .dequantize::<f32>(scales, biases, shape, device)?
+            .to_dtype(dtype)
+            .map_err(Error::from),
+    }
+}
+
+/// The packed words of an MLX affine-quantized weight.
+enum PackedWords {
+    U32(Vec<Vec<u32>>),
+    U8(Vec<Vec<u8>>),
+}
+
+impl PackedWords {
+    /// The dense `shape` weight at `T`, on `device`.
+    fn dequantize<T: WithDType>(
+        self,
+        scales: Vec<Vec<f32>>,
+        biases: Option<Vec<Vec<f32>>>,
+        (out_dim, in_dim): (usize, usize),
+        device: &Device,
+    ) -> Result<Tensor> {
+        let values = match self {
+            Self::U32(packed) => {
+                dequantize_affine_u32::<T>(packed, scales, biases, out_dim, in_dim)?
+            }
+            Self::U8(packed) => dequantize_affine_u8::<T>(packed, scales, biases, out_dim, in_dim)?,
+        };
+        Tensor::from_vec(values, (out_dim, in_dim), device).map_err(Error::from)
+    }
 }
 
 pub fn load_linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
@@ -315,7 +353,17 @@ pub fn load_conv2d(
     // Candle 0.11's Metal and non-cudnn CUDA im2col conv2d copy a strided
     // kernel to a contiguous buffer and then multiply the original one. Both
     // the permute above and a Fortran-ordered `.pth` tensor are strided.
-    let ws = ws.contiguous()?;
+    let ws = if ws.is_contiguous() {
+        ws
+    } else {
+        let contiguous = ws.contiguous()?;
+        // Free the strided original now: until a synchronization Candle
+        // pools it and hands it to the next allocation it fits, so the small
+        // bias read next would keep the whole kernel's buffer resident.
+        drop(ws);
+        contiguous.device().synchronize()?;
+        contiguous
+    };
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get(out_channels, "bias")?)
@@ -434,7 +482,7 @@ mod tests {
         let packed = vec![vec![0x7654_3210]];
         let scales = vec![vec![0.1, 0.2]];
         let biases = vec![vec![-1.0, 0.5]];
-        let out = dequantize_affine_u32(packed, scales, Some(biases), 1, 8).unwrap();
+        let out = dequantize_affine_u32::<f32>(packed, scales, Some(biases), 1, 8).unwrap();
 
         let expected = [
             -1.0 + 0.0 * 0.1,
@@ -456,7 +504,7 @@ mod tests {
         let packed = vec![vec![1u8, 2, 3, 4]];
         let scales = vec![vec![0.5, 2.0]];
         let biases = vec![vec![0.0, -1.0]];
-        let out = dequantize_affine_u8(packed, scales, Some(biases), 1, 4).unwrap();
+        let out = dequantize_affine_u8::<f32>(packed, scales, Some(biases), 1, 4).unwrap();
 
         let expected = [0.5, 1.0, 5.0, 7.0];
         for (a, b) in out.iter().zip(expected.iter()) {
@@ -468,7 +516,7 @@ mod tests {
     fn dequantize_u32_affine_no_biases() {
         let packed = vec![vec![0x7654_3210]];
         let scales = vec![vec![0.1, 0.2]];
-        let out = dequantize_affine_u32(packed, scales, None, 1, 8).unwrap();
+        let out = dequantize_affine_u32::<f32>(packed, scales, None, 1, 8).unwrap();
 
         let expected = [
             0.0 * 0.1,
@@ -489,11 +537,57 @@ mod tests {
     fn dequantize_u8_affine_no_biases() {
         let packed = vec![vec![1u8, 2, 3, 4]];
         let scales = vec![vec![0.5, 2.0]];
-        let out = dequantize_affine_u8(packed, scales, None, 1, 4).unwrap();
+        let out = dequantize_affine_u8::<f32>(packed, scales, None, 1, 4).unwrap();
 
         let expected = [0.5, 1.0, 6.0, 8.0];
         for (a, b) in out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    /// The host dequantization into the requested dtype matches the F32
+    /// dequantization cast to it, bit for bit, at the exact shape.
+    #[test]
+    fn load_weight_dequantizes_into_the_requested_dtype() {
+        let device = Device::Cpu;
+        let (out_dim, in_dim) = (3, 16);
+        let words: Vec<u32> = (0..out_dim * in_dim / 8)
+            .map(|i| 0x9E37_79B9u32.wrapping_mul(i as u32 + 1))
+            .collect();
+        let scales: Vec<f32> = (0..out_dim * 2).map(|i| 0.013 * (i as f32 + 1.0)).collect();
+        let biases: Vec<f32> = (0..out_dim * 2).map(|i| -0.07 * i as f32).collect();
+        let weights = std::collections::HashMap::from([
+            (
+                "weight".to_string(),
+                Tensor::from_vec(words, (out_dim, in_dim / 8), &device).unwrap(),
+            ),
+            (
+                "scales".to_string(),
+                Tensor::from_vec(scales, (out_dim, 2), &device).unwrap(),
+            ),
+            (
+                "biases".to_string(),
+                Tensor::from_vec(biases, (out_dim, 2), &device).unwrap(),
+            ),
+        ]);
+        let vb = |dtype| VarBuilder::from_tensors(weights.clone(), dtype, &device);
+        let reference = load_weight(&vb(DType::F32), out_dim, in_dim).unwrap();
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let weight = load_weight(&vb(dtype), out_dim, in_dim).unwrap();
+            assert_eq!(
+                (weight.dtype(), weight.dims2().unwrap()),
+                (dtype, (out_dim, in_dim))
+            );
+            let expected = reference.to_dtype(dtype).unwrap();
+            let bits = |t: &Tensor| {
+                t.flatten_all()
+                    .unwrap()
+                    .to_dtype(DType::F64)
+                    .unwrap()
+                    .to_vec1::<f64>()
+                    .unwrap()
+            };
+            assert_eq!(bits(&weight), bits(&expected), "{dtype:?}");
         }
     }
 
