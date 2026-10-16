@@ -1133,7 +1133,7 @@ mod tests {
         for (backend, expected) in [
             (BackendKind::Cpu, BatchDispatchKind::RequestParallel),
             (BackendKind::Metal, BatchDispatchKind::Serial),
-            (BackendKind::Cuda, BatchDispatchKind::RequestParallel),
+            (BackendKind::Cuda, BatchDispatchKind::Serial),
         ] {
             let config = super::super::WorkerConfig {
                 backend,

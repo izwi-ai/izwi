@@ -1095,27 +1095,23 @@ impl WorkerConfig {
         available_cpu_capacity: usize,
         override_value: Option<usize>,
     ) -> usize {
-        // Candle's Metal path is intentionally serialized in dispatch. Do not
-        // let an environment override inflate coordinator capacity beyond what
-        // the executor can actually run concurrently.
-        if backend == BackendKind::Metal {
+        // Accelerator rows are serialized in dispatch. Candle's Metal path
+        // shares one command queue, and CUDA rows share one device stream
+        // whose opt-in graph capture is thread-local, so another thread's
+        // launches would be captured into the graph (EXE-F11). Do not let an
+        // environment override inflate coordinator capacity beyond what the
+        // executor can actually run concurrently.
+        if backend != BackendKind::Cpu {
             return 1;
         }
 
-        if backend == BackendKind::Cpu {
-            let cpu_capacity = available_cpu_capacity.max(1);
-            let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
-            let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
-            // Preserve the operator override as the selected value, then keep
-            // both automatic and explicit widths within the process-visible
-            // CPU allocation and the executor's conservative worker ceiling.
-            return override_value.unwrap_or(automatic).clamp(1, hard_cap);
-        }
-
-        // CUDA does not gain automatic scalar concurrency here. Preserve the
-        // existing explicit override contract without coupling it to host CPU
-        // capacity; accelerator launch policy is sealed independently.
-        override_value.unwrap_or(1).max(1)
+        let cpu_capacity = available_cpu_capacity.max(1);
+        let hard_cap = cpu_capacity.min(MAX_CPU_REQUEST_PARALLELISM);
+        let automatic = (cpu_capacity / configured_intra_op_threads.max(1)).max(1);
+        // Preserve the operator override as the selected value, then keep
+        // both automatic and explicit widths within the process-visible
+        // CPU allocation and the executor's conservative worker ceiling.
+        override_value.unwrap_or(automatic).clamp(1, hard_cap)
     }
 
     fn request_parallelism_for(backend: BackendKind, configured_intra_op_threads: usize) -> usize {
@@ -5846,9 +5842,11 @@ mod tests {
             WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, None),
             1
         );
+        // EXE-F11: CUDA rows share one stream with thread-local graph
+        // capture, so an override cannot widen it either.
         assert_eq!(
             WorkerConfig::resolve_request_parallelism(BackendKind::Cuda, 1, 32, Some(4)),
-            4
+            1
         );
     }
 
@@ -6503,7 +6501,7 @@ mod tests {
             assert_eq!(profile.prefill, PrefillMode::Full);
             assert!(!profile.capabilities().native_batch);
             assert_eq!(profile.decode_batch, NativeBatchMode::None);
-            let expected_parallelism = if backend == BackendKind::Metal { 1 } else { 4 };
+            let expected_parallelism = if backend == BackendKind::Cpu { 4 } else { 1 };
             assert_eq!(profile.max_batch_size, expected_parallelism);
             assert_eq!(
                 profile.concurrency,
