@@ -822,7 +822,15 @@ realtime variant). TTS workers use `IZWI_WORKER_TASK=text_to_speech` with a
 TTS synthesis family (e.g. `Kokoro-82M`); boot includes a bounded streaming
 warm-up and fails closed if synthesis does not produce audio. Each stage
 session takes its own tenant lease and dispatch slot; the relay never holds
-one stage's permit while awaiting another stage's admission. Client identity:
+one stage's permit while awaiting another stage's admission.
+
+A TTS-stream admit (`"input": {"kind": "text_stream"}`) may name a built-in
+`speaker` and a `language`, and set `"incremental": true` to have each run of
+complete sentences synthesized as its `input` frame arrives instead of the
+whole text at `finish`; audio frames stay in order and the last one is
+final-flagged. TTS workers advertise `realtime_tts_text_stream` for this, and
+the relay sends an admit that sets any of these fields only to such workers
+(older ones would ignore them). Client identity:
 the gateway mints the attested caller context from the authenticated
 principal; the client's session/request/attempt ids pass through, so a
 worker-subprotocol client library works against the gateway unchanged. Owner

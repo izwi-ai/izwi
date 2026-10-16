@@ -1206,6 +1206,7 @@ Client JSON messages:
 | `input_stream_start` | Optional `mode`, model ids, speaker, ASR language, max tokens, VAD settings, and input sample rate. |
 | `input_stream_stop` | Stops listening and closes the current session. |
 | `interrupt` | Optional `reason`; interrupts active assistant turn. |
+| `conversation_item_truncate` | `utterance_seq` and `audio_end_ms`: the client played only that much of the reply's audio (also accepted as `conversation.item.truncate`, after OpenAI Realtime). The conversation remembers the reply only up to there. |
 | `ping` | Optional `timestamp_ms`. |
 
 `mode` values:
@@ -1223,7 +1224,8 @@ Client JSON messages:
 | `s2s_model_id` | Unified audio-chat model override. |
 | `speaker` | TTS speaker/voice. |
 | `asr_language` | Language hint. |
-| `max_output_tokens` | Text output budget. |
+| `max_output_tokens` | Reply token budget: default `384` in modular mode (a few spoken sentences), `1536` in unified mode. |
+| `output_audio_format` | `pcm_i16` (default: PCM16 at the model's rate), `g711_ulaw` or `g711_alaw` (8 kHz, one byte a sample). |
 | `vad_threshold` | Earshot speech score threshold, default `0.5`. Values are clamped to the valid score range. |
 | `min_speech_ms` | Minimum speech duration. |
 | `silence_duration_ms` | Silence before utterance end. |
@@ -1250,12 +1252,12 @@ Assistant audio binary frame:
 |-------|-------|
 | `0..4` | ASCII magic `IVWS`. |
 | `4` | Version `1`. |
-| `5` | Kind `2` for assistant PCM16. |
+| `5` | Kind: `2` assistant PCM16, `3` G.711 μ-law, `4` G.711 A-law (the session's `output_audio_format`). |
 | `6..8` | Flags; bit `0` marks final chunk. |
 | `8..16` | Little-endian `utterance_seq` (`u64`). |
 | `16..20` | Little-endian chunk sequence (`u32`). |
-| `20..24` | Little-endian sample rate (`u32`). |
-| `24..` | Mono PCM16 little-endian audio bytes. |
+| `20..24` | Little-endian sample rate (`u32`): the model's rate for PCM16, `8000` for G.711. |
+| `24..` | Mono audio: PCM16 little-endian, or one G.711 byte a sample. |
 
 Server events:
 
@@ -1263,16 +1265,26 @@ Server events:
 |------|-------|
 | `connected` | Socket accepted and protocol version announced. |
 | `session_ready` | Voice session initialized. |
-| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration. |
+| `input_stream_ready` | Includes resolved VAD settings, including backend, score sample rate, and score frame duration, and the `output_audio_format`. |
+| `models_ready` | Sent once the stream's models have loaded in the background after `input_stream_start`: each model's `stage`, `model_id`, `ready`, and `error` when it could not load. |
 | `input_stream_stopped` | Input stream stopped. |
 | `user_speech_start`, `user_speech_end` | VAD utterance boundaries. A client may duck assistant playback on `user_speech_start`; the server cancels the turn only after `barge_in_min_speech_ms` of speech. |
 | `user_speech_rejected` | A too-short speech start was rejected as noise and the input stream remains ready. Ducked playback can resume. |
 | `turn_processing` | Turn started. |
 | `user_transcript_start`, `user_transcript_delta`, `user_transcript_final` | User transcript events. |
-| `assistant_text_start`, `assistant_text_delta`, `assistant_text_final` | Assistant text events. |
-| `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks. |
+| `assistant_text_start`, `assistant_text_snapshot`, `assistant_text_final` | Assistant text events. A snapshot carries the whole reply so far; the final event also has `raw_text`. |
+| `assistant_audio_start`, `assistant_audio_done` | Assistant audio envelope around binary chunks; the start event names the `sample_rate` and `audio_format`. |
+| `conversation_item_truncated` | Acknowledges a truncate with the `text` the conversation now remembers for that reply. |
 | `turn_done` | Terminal turn status: `ok`, `error`, `timeout`, `interrupted`, or `no_input`. |
 | `pong` | Ping response. |
 | `error` | Error with optional utterance identifiers. |
+
+How a modular turn runs:
+
+- The models load at `input_stream_start` (`models_ready`), so the first turn does not pay the load.
+- The reply streams from the chat model with thinking disabled (any reasoning text is dropped). Complete sentences are spoken as they arrive: the first segment is the fewest sentences reaching about 40 characters, later ones pack the sentences that have arrived (up to 240 characters), and the next segment is synthesized while the current one plays. Segments are joined with a short pause and fades.
+- Each stage (ASR, the reply, each TTS segment) takes its own request admission slot, so a turn holds none while it waits.
+- Assistant audio is paced by the client: when more than about 5 s (or 4 MiB) of audio is queued, synthesis waits for the client to take it rather than closing the session. A client that stops reading for 5 s ends the session.
+- The prompt carries the most recent history (24 messages, about 3000 tokens). A reply is remembered without reasoning, and only as far as it was heard: up to `conversation_item_truncate`'s `audio_end_ms`, or up to the client's estimated playback position when the user interrupted it.
 
 Voice realtime persists voice sessions and turns in the local store. Modular turns can also update observational memory when that feature is enabled.
