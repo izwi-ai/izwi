@@ -11121,6 +11121,38 @@ mod tests {
         .await;
     }
 
+    /// CPU and Metal serve with chunked prefill off by default, so this burst
+    /// keeps CUDA's chunked path under test on CPU: more running requests
+    /// than tensor-state slots, mixed prompt lengths, contended pages, and
+    /// both one and two candidate dispatches per step.
+    #[tokio::test]
+    async fn chunked_prefill_hybrid_burst_finishes_every_request() {
+        let prompts = (0..16)
+            .map(|index| (5 + (index * 7) % 37, 3 + index % 9))
+            .collect::<Vec<_>>();
+        for mode in [
+            crate::config::PhysicalExecutionMode::Serial,
+            crate::config::PhysicalExecutionMode::Shadow,
+        ] {
+            run_chunked_hybrid_requests(
+                EngineCoreConfig {
+                    chunked_prefill_threshold: 8,
+                    block_size: 16,
+                    max_blocks: 24,
+                    max_batch_size: 8,
+                    max_retained_sequences: 4,
+                    max_staged_transactions: 4,
+                    physical_execution_mode: mode,
+                    max_physical_in_flight: crate::config::PhysicalInFlightLimit::new(2).unwrap(),
+                    ..Default::default()
+                },
+                4,
+                &prompts,
+            )
+            .await;
+        }
+    }
+
     /// H2: a row whose managed state can never be prepared fails alone. The
     /// step used to return the error for every scheduled row, and the run loop
     /// rescheduled the same row forever, starving all other requests.

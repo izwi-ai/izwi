@@ -366,6 +366,11 @@ run_cargo_cpu() {
     cargo check --locked -p izwi-cli
     cargo check --locked -p izwi-server
     cargo test --locked -p izwi-core --lib --tests
+    # CPU and Metal serve chat with chunked prefill off by default, while CUDA
+    # chat always chunks. Name the engine leg that runs chunked prefill on CPU
+    # (mixed prefill/decode steps under tensor-state and page pressure) so a
+    # filter or lane change cannot silently drop it.
+    cargo test --locked -p izwi-core --lib engine::core::tests::chunked_prefill_
     cargo test --locked -p izwi-server --lib
     scripts/bench/run_kv_cache_matrix.sh --lane default --iterations 1 --warmup 0
     scripts/ci/run-kv-lifecycle-soak.sh --profile pr
