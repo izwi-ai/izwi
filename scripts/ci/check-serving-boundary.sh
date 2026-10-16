@@ -21,7 +21,7 @@ boundary_crates=(
     izwi-serving-supervisor
 )
 tree_of() {
-    cargo tree --offline -p "$1" --edges normal,build --prefix none 2>/dev/null || true
+    cargo tree --locked -p "$1" --edges normal,build --prefix none 2>/dev/null || true
 }
 forbidden_pattern='(izwi-core|candle-core|candle-nn|candle-transformers|metal |/metal-|cuda|cudnn|accelerate)'
 
@@ -57,6 +57,35 @@ if printf '%s\n' "${worker_tree}" | grep -Eq 'izwi-serving-supervisor v'; then
     failures=$((failures + 1))
 else
     echo "ok: izwi-serving-worker does not link izwi-serving-supervisor"
+fi
+
+# A worker is the server's engine in another process: each backend feature
+# must enable exactly the izwi-core features the server's does (Accelerate on
+# macOS, FlashAttention with `cuda`), whichever binary a release builds.
+core_features_of() {
+    local tree
+    tree="$(cargo tree --locked -p "$1" --target "$2" ${3:+--features "$3"} \
+        --edges features,normal -i izwi-core --prefix none)" || return 1
+    printf '%s\n' "${tree}" | sed -n 's/^izwi-core feature "\([^"]*\)".*/\1/p' \
+        | sort -u | tr '\n' ' '
+}
+feature_mismatches=0
+for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+    for features in "" metal cuda-base cudnn-base cuda cudnn flash-attn; do
+        if ! server="$(core_features_of izwi-server "${target}" "${features}")" \
+            || ! worker="$(core_features_of izwi-serving-worker "${target}" "${features}")"; then
+            echo "error: could not resolve izwi-core features for --features '${features}' on ${target}" >&2
+            feature_mismatches=$((feature_mismatches + 1))
+        elif [ "${server}" != "${worker}" ]; then
+            echo "error: --features '${features}' on ${target} enables izwi-core [${server}] for izwi-server but [${worker}] for izwi-serving-worker" >&2
+            feature_mismatches=$((feature_mismatches + 1))
+        fi
+    done
+done
+if [ "${feature_mismatches}" -ne 0 ]; then
+    failures=$((failures + feature_mismatches))
+else
+    echo "ok: izwi-serving-worker enables the same izwi-core features as izwi-server"
 fi
 
 if [ "${failures}" -ne 0 ]; then
