@@ -37,7 +37,8 @@ use crate::models::architectures::granite_speech::asr::{
 };
 use crate::models::architectures::kokoro::KokoroTtsModel;
 use crate::models::architectures::lfm2::chat::{
-    ChatDecodeState as Lfm2ChatDecodeState, Lfm2ChatDecodeCheckpoint, Lfm2ChatModel,
+    ChatDecodeState as Lfm2ChatDecodeState, ChatDecodeStep as Lfm2ChatDecodeStep,
+    Lfm2ChatDecodeCheckpoint, Lfm2ChatModel, MixedPrefillRow as Lfm2MixedPrefillRow,
 };
 use crate::models::architectures::lfm25_audio::{
     asr_retained::{
@@ -5020,7 +5021,7 @@ impl NativeChatModel {
     /// trunk once its mixed forward matches the split path; whether a loaded
     /// model publishes the mixed stage is `catalog::mixed_step`'s call.
     pub fn supports_mixed_step(&self) -> bool {
-        matches!(self, Self::Qwen3(_))
+        matches!(self, Self::Qwen3(_) | Self::Lfm2(_))
     }
 
     /// Run `rows` (decode rows first, then prefill spans) in one forward and
@@ -5091,6 +5092,60 @@ impl NativeChatModel {
                                 finished: step.finished,
                                 logprobs: std::mem::take(&mut row.state.pending_logprobs),
                             }),
+                            None => MixedRowStep::Progress {
+                                input_tokens: row.span_end - row.span_start,
+                            },
+                        });
+                Ok(decoded.chain(prefilled).collect())
+            }
+            Self::Lfm2(model) => {
+                let mut decode = Vec::with_capacity(decode_rows);
+                let mut prefill = Vec::with_capacity(rows.len() - decode_rows);
+                for row in rows.iter_mut() {
+                    match (&mut *row.state, &row.input) {
+                        (NativeChatDecodeState::Lfm2(state), MixedInput::Decode) => {
+                            decode.push(state)
+                        }
+                        (
+                            NativeChatDecodeState::Lfm2(state),
+                            MixedInput::Prefill {
+                                prompt,
+                                prepared: None,
+                                span_start,
+                                span_end,
+                            },
+                        ) => prefill.push(Lfm2MixedPrefillRow {
+                            state,
+                            prompt,
+                            span_start: *span_start,
+                            span_end: *span_end,
+                        }),
+                        _ => return Err(crossed()),
+                    }
+                }
+                let (decode_steps, prefill_steps) = model.step_mixed(&mut decode, &mut prefill)?;
+                let token = |step: Lfm2ChatDecodeStep, logprobs| {
+                    MixedRowStep::Token(NativeChatDecodeStep {
+                        delta: step.delta,
+                        text: step.text,
+                        tokens_generated: step.tokens_generated,
+                        input_tokens_committed: step.input_tokens_committed,
+                        finished: step.finished,
+                        logprobs,
+                    })
+                };
+                let decoded = decode_steps
+                    .into_iter()
+                    .zip(decode)
+                    .map(|(step, state)| token(step, std::mem::take(&mut state.pending_logprobs)));
+                let prefilled =
+                    prefill_steps
+                        .into_iter()
+                        .zip(prefill)
+                        .map(|(step, row)| match step {
+                            Some(step) => {
+                                token(step, std::mem::take(&mut row.state.pending_logprobs))
+                            }
                             None => MixedRowStep::Progress {
                                 input_tokens: row.span_end - row.span_start,
                             },

@@ -2432,7 +2432,10 @@ mod tests {
     /// decode. Every row's output of every step must be equal.
     fn assert_mixed_steps_match_forced_split(world: impl Fn() -> MixedWorld) {
         let (mut mixed, mut split) = (world(), world());
+        // Each world's requests carry that world's managed runtime.
         let (decoder, prompt) = (mixed.decoder.clone(), mixed.prompt.clone());
+        let split_requests = (split.decoder.clone(), split.prompt.clone());
+        let split_requests = [&split_requests.0, &split_requests.1];
         let decode_at = decoder.num_prompt_tokens();
         let prompt_len = prompt.num_prompt_tokens();
         let first = prompt_len / 2;
@@ -2468,7 +2471,7 @@ mod tests {
 
             let reservations = scheduled
                 .iter()
-                .zip(requests)
+                .zip(split_requests)
                 .map(|(row, request)| split.reserve(request, row))
                 .collect::<Vec<_>>();
             let rows = scheduled
@@ -2478,7 +2481,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let expected = split
                 .executor
-                .chat_mixed_step_split(&requests, scheduled, &rows)
+                .chat_mixed_step_split(&split_requests, scheduled, &rows)
                 .unwrap();
             for (reservation, result) in reservations.iter().zip(&expected) {
                 split.commit(reservation, result);
@@ -2514,6 +2517,34 @@ mod tests {
                 };
                 (prompt, None)
             })
+        });
+    }
+
+    /// LFM2 mixed steps (each prefill span's ShortConv segment on its own
+    /// state) commit exactly what the split handlers commit.
+    #[test]
+    fn lfm2_mixed_steps_match_the_forced_split_oracle() {
+        use crate::kv::InferenceStateContractProvider;
+        use crate::models::architectures::lfm2::chat::tiny_lfm_model_for_test;
+        use crate::models::registry::ChatModelLease;
+
+        let model = tiny_lfm_model_for_test(3);
+        let capability = model.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Lfm2(model));
+        assert!(lease.supports_mixed_step());
+        assert_mixed_steps_match_forced_split(|| {
+            MixedWorld::with_prompts(
+                &lease,
+                &capability,
+                ModelVariant::Lfm2512BInstructGguf,
+                |id| {
+                    let prompt = match id {
+                        "decoder" => vec![1, 3, 4, 5],
+                        _ => vec![1, 4, 3, 6, 5, 3, 4, 6, 5],
+                    };
+                    (prompt, None)
+                },
+            )
         });
     }
 }

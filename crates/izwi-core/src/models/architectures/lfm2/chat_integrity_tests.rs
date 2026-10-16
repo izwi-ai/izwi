@@ -9,6 +9,22 @@ use candle_core::{DType, Device, Tensor};
 use std::sync::Arc;
 
 fn tiny_lfm_model() -> Lfm2ChatModel {
+    tiny_lfm_model_with(|shape| Tensor::ones(shape, DType::F32, &Device::Cpu).unwrap())
+}
+
+/// The tiny model with xorshift weights from `seed`: unlike the all-ones
+/// model it does not end every reply at once.
+pub(super) fn random_tiny_lfm_model(seed: u64) -> Lfm2ChatModel {
+    let mut seed = seed;
+    tiny_lfm_model_with(move |shape| {
+        seed += 1;
+        let values =
+            crate::kernels::numeric_check::xorshift_values(shape.iter().product(), seed, 1.0);
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    })
+}
+
+fn tiny_lfm_model_with(mut weight: impl FnMut(&[usize]) -> Tensor) -> Lfm2ChatModel {
     let variant = ModelVariant::Lfm2512BInstructGguf;
     let directory =
         std::env::temp_dir().join(format!("izwi-lfm-contract-{}", uuid::Uuid::new_v4()));
@@ -56,7 +72,7 @@ fn tiny_lfm_model() -> Lfm2ChatModel {
     ];
     let mut weights = vec![];
     let mut add = |name: String, shape: &[usize]| {
-        let tensor = Tensor::ones(shape, DType::F32, &Device::Cpu).unwrap();
+        let tensor = weight(shape);
         weights.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
     };
     add("token_embd.weight".into(), &[7, 4]);
@@ -430,5 +446,73 @@ fn cuda_lfm2_decode_rejects_nonfinite_logits_before_argmax() {
             .to_string();
         assert!(error.contains("non-finite"), "{error}");
         assert!(state.generated_ids.is_empty());
+    }
+}
+
+/// A mixed step whose op shapes equal a split call's (only decode rows, or
+/// one prefill row) is that call: same tokens and state.
+#[test]
+fn lfm2_mixed_steps_with_split_shapes_are_the_split_calls() {
+    let model = random_tiny_lfm_model(3);
+    let config = ChatGenerationConfig::default();
+    let summary = |state: &ChatDecodeState| {
+        (
+            state.position,
+            state.prefill_progress,
+            state.pending_token,
+            state.generated_ids.clone(),
+            state.physical_kv.context_len(),
+            state.shortconv.cursor(),
+        )
+    };
+    let prompt = [1, 3, 4, 5];
+    let prefilled = || {
+        let mut state = model
+            .begin_resumable_prefill_state_managed(&prompt, 16, &config, cache())
+            .unwrap();
+        model
+            .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+            .unwrap();
+        model.decode_step(&mut state).unwrap();
+        state
+    };
+    let (mut split, mut mixed) = (prefilled(), prefilled());
+    for _ in 0..3 {
+        let expected = model.decode_step_batch(&mut [&mut split]).unwrap();
+        let (actual, prefill) = model.step_mixed(&mut [&mut mixed], &mut []).unwrap();
+        assert!(prefill.is_empty());
+        assert_eq!(expected[0].delta, actual[0].delta);
+        assert_eq!(summary(&split), summary(&mixed));
+    }
+
+    let prompt = [1, 4, 3, 6, 5];
+    let fresh = || {
+        model
+            .begin_resumable_prefill_state_managed(&prompt, 16, &config, cache())
+            .unwrap()
+    };
+    let (mut split, mut mixed) = (fresh(), fresh());
+    for (start, end) in [(0, 3), (3, prompt.len())] {
+        let complete = model
+            .continue_resumable_prefill_managed(&mut split, &prompt, start, end)
+            .unwrap();
+        let expected = complete.then(|| model.decode_step(&mut split).unwrap());
+        let (decode, mut prefill) = model
+            .step_mixed(
+                &mut [],
+                &mut [MixedPrefillRow {
+                    state: &mut mixed,
+                    prompt: &prompt,
+                    span_start: start,
+                    span_end: end,
+                }],
+            )
+            .unwrap();
+        assert!(decode.is_empty());
+        assert_eq!(
+            expected.map(|step| step.delta),
+            prefill.remove(0).map(|step| step.delta)
+        );
+        assert_eq!(summary(&split), summary(&mixed));
     }
 }

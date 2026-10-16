@@ -18,6 +18,7 @@ use crate::backends::DeviceProfile;
 use crate::error::{Error, Result};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
+use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
 use crate::models::shared::sampling::{sample_chat_rows_guarded, ChatSampler};
@@ -62,6 +63,15 @@ pub(crate) struct Lfm2ChatDecodeCheckpoint {
     finished: bool,
     position: usize,
     prefill_progress: usize,
+}
+
+/// One prefill row of a mixed step: the prompt span `[span_start,
+/// span_end)` that continues `state`'s resumable prefill.
+pub(crate) struct MixedPrefillRow<'s, 'p> {
+    pub(crate) state: &'s mut ChatDecodeState,
+    pub(crate) prompt: &'p [u32],
+    pub(crate) span_start: usize,
+    pub(crate) span_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -796,6 +806,173 @@ impl Lfm2ChatModel {
         Ok(steps)
     }
 
+    /// One mixed step: `decode` rows take one token each and every
+    /// `prefill` row continues its resumable prefill over `[span_start,
+    /// span_end)`, in one model forward and one sampling readback. Returns
+    /// each decode row's step, and for each prefill row its bootstrap token
+    /// when the span ends the prompt. A step of only decode rows, or of one
+    /// prefill row, is exactly the split path's call.
+    pub(crate) fn step_mixed(
+        &self,
+        decode: &mut [&mut ChatDecodeState],
+        prefill: &mut [MixedPrefillRow<'_, '_>],
+    ) -> Result<(Vec<ChatDecodeStep>, Vec<Option<ChatDecodeStep>>)> {
+        match (decode.is_empty(), &mut *prefill) {
+            (_, []) => return Ok((self.decode_step_batch(decode)?, Vec::new())),
+            (true, [row]) => {
+                let complete = self.continue_resumable_prefill_managed(
+                    &mut *row.state,
+                    row.prompt,
+                    row.span_start,
+                    row.span_end,
+                )?;
+                let bootstrap = complete
+                    .then(|| self.decode_step(&mut *row.state))
+                    .transpose()?;
+                return Ok((Vec::new(), vec![bootstrap]));
+            }
+            _ => {}
+        }
+        for state in decode.iter() {
+            if state.finished
+                || state.generated_ids.len() >= state.max_new_tokens
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_none()
+                || state.physical_kv.context_len() != state.position
+                || state.shortconv.cursor() != state.position as u64
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2 mixed step contains a non-decodable decode row".into(),
+                ));
+            }
+        }
+        for row in prefill.iter() {
+            let state = &*row.state;
+            if state.prefill_progress != row.span_start
+                || row.span_start >= row.span_end
+                || row.span_end > row.prompt.len()
+                || state.physical_kv.context_len() != row.span_start
+                || state.shortconv.cursor() != row.span_start as u64
+                || state.unconsumed_output.is_some()
+                || state.pending_token.is_some()
+                || state.finished
+            {
+                return Err(Error::InvalidInput(
+                    "LFM2 mixed prefill span does not match its retained state".into(),
+                ));
+            }
+        }
+        let mut spans = Vec::with_capacity(decode.len() + prefill.len());
+        let mut tokens = Vec::with_capacity(decode.len());
+        for state in decode.iter_mut() {
+            spans.push(MixedRowSpan {
+                start_pos: state.position,
+                q_len: 1,
+            });
+            tokens.push(state.pending_token.take().expect("pending token checked"));
+        }
+        for row in prefill.iter() {
+            record_prefill_sequence_span(row.span_end - row.span_start);
+            spans.push(MixedRowSpan {
+                start_pos: row.span_start,
+                q_len: row.span_end - row.span_start,
+            });
+            tokens.extend_from_slice(&row.prompt[row.span_start..row.span_end]);
+        }
+        let completes = prefill
+            .iter()
+            .map(|row| row.span_end == row.prompt.len())
+            .collect::<Vec<_>>();
+        let sample_rows = (0..decode.len())
+            .chain(
+                completes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, complete)| **complete)
+                    .map(|(row, _)| decode.len() + row),
+            )
+            .collect::<Vec<_>>();
+        let layout = MixedRowLayout::new(spans, decode.len())?;
+        // As in a decode step, the KV writes and ShortConv states commit only
+        // after the sampled tokens are read back: one synchronization.
+        let (logits, pending) = {
+            let shortconv = decode
+                .iter()
+                .map(|state| &state.shortconv)
+                .chain(prefill.iter().map(|row| &row.state.shortconv))
+                .collect::<Vec<_>>();
+            let caches = decode
+                .iter()
+                .map(|state| &state.physical_kv)
+                .chain(prefill.iter().map(|row| &row.state.physical_kv))
+                .collect::<Vec<_>>();
+            self.text_model.forward_token_ids_mixed_deferred(
+                &tokens,
+                layout,
+                &shortconv,
+                &caches,
+                &sample_rows,
+            )?
+        };
+        let next_tokens = match logits {
+            Some(logits) => {
+                let mut sampled = decode
+                    .iter_mut()
+                    .map(|state| &mut **state)
+                    .chain(
+                        prefill
+                            .iter_mut()
+                            .zip(&completes)
+                            .filter(|(_, complete)| **complete)
+                            .map(|(row, _)| &mut *row.state),
+                    )
+                    .collect::<Vec<_>>();
+                match self.select_batch_tokens(&mut sampled, &logits) {
+                    Ok(next_tokens) => next_tokens,
+                    Err(error) => return Err(pending.abort_with(error)),
+                }
+            }
+            None => Vec::new(),
+        };
+        {
+            let mut shortconv = Vec::with_capacity(decode.len() + prefill.len());
+            let mut caches = Vec::with_capacity(decode.len() + prefill.len());
+            for state in decode
+                .iter_mut()
+                .map(|state| &mut **state)
+                .chain(prefill.iter_mut().map(|row| &mut *row.state))
+            {
+                shortconv.push(&mut state.shortconv);
+                caches.push(&mut state.physical_kv);
+            }
+            pending.commit(&mut shortconv, &mut caches)?;
+        }
+        for state in decode.iter_mut() {
+            state.position += 1;
+        }
+        for row in prefill.iter_mut() {
+            row.state.prefill_progress = row.span_end;
+            row.state.position = row.span_end;
+        }
+        let mut next_tokens = next_tokens.into_iter();
+        let mut accept = |state: &mut ChatDecodeState, committed| {
+            let (next, entry) = next_tokens
+                .next()
+                .ok_or_else(|| Error::InferenceError("LFM2 mixed step lost a row".into()))?;
+            self.accept_token(state, next, committed, entry)
+        };
+        let decode_steps = decode
+            .iter_mut()
+            .map(|state| accept(state, 1))
+            .collect::<Result<Vec<_>>>()?;
+        let prefill_steps = prefill
+            .iter_mut()
+            .zip(completes)
+            .map(|(row, complete)| complete.then(|| accept(&mut *row.state, 0)).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok((decode_steps, prefill_steps))
+    }
+
     /// Next token per row from finite, width-checked logits. Every row
     /// samples from one readback that also carries the finite flag, so the
     /// step synchronizes once, and no token is accepted (and no sampler
@@ -1209,6 +1386,12 @@ mod tests {
 #[cfg(test)]
 #[path = "chat_integrity_tests.rs"]
 mod integrity_tests;
+
+/// A tiny LFM2 chat model with xorshift weights from `seed`.
+#[cfg(test)]
+pub(crate) fn tiny_lfm_model_for_test(seed: u64) -> Lfm2ChatModel {
+    integrity_tests::random_tiny_lfm_model(seed)
+}
 
 #[cfg(test)]
 #[path = "chat_reference_tests.rs"]
