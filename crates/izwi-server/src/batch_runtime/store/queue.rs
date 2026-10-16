@@ -900,6 +900,8 @@ impl BatchRuntimeStore {
         tx.commit()
             .await
             .context("Failed to commit runtime stage completion transaction")?;
+        // The job's next stage, if any, is claimable now.
+        self.wake_claimers();
         Ok(Some(stage))
     }
 
@@ -1073,7 +1075,11 @@ impl BatchRuntimeStore {
                 ],
             )?)
             .await?;
-        Ok(result.rows_affected() == 1)
+        let yielded = result.rows_affected() == 1;
+        if yielded {
+            self.wake_claimers();
+        }
+        Ok(yielded)
     }
 
     pub async fn relinquish_stage_lease(
@@ -1153,6 +1159,7 @@ impl BatchRuntimeStore {
         tx.commit()
             .await
             .context("Failed to commit runtime stage failure transaction")?;
+        self.wake_claimers();
         Ok(result)
     }
 
@@ -1337,6 +1344,9 @@ impl BatchRuntimeStore {
             self.settle_abandoned_cancellations(db, now, limit.saturating_sub(scanned))
                 .await?,
         );
+        if recovered > 0 {
+            self.wake_claimers();
+        }
         Ok(recovered)
     }
 
@@ -1498,6 +1508,7 @@ impl BatchRuntimeStore {
         )?)
         .await
         .context("Failed to create runtime job stage")?;
+        self.wake_claimers();
 
         self.get_stage(&id)
             .await?

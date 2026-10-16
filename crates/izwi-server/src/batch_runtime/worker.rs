@@ -31,8 +31,8 @@ use std::{
 use tokio::{sync::Notify, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
-/// Every idle slot polls every `poll_interval`, and they all report the same
-/// worker row. An unchanged heartbeat is re-sent at most this often; any
+/// Every idle slot claims again after `idle_poll_interval` (sooner when this
+/// process enqueues work), and they all report the same worker row. An unchanged heartbeat is re-sent at most this often; any
 /// change (status, current stage, leases, slots, errors) is written at once.
 /// Readiness treats a heartbeat as stale after 5 s by default
 /// (`IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS`), so liveness stays fresh while
@@ -71,7 +71,12 @@ pub struct BatchWorkerConfig {
     pub stage_kinds: Vec<String>,
     pub resources: WorkerResourceCapacity,
     pub draining: bool,
+    /// How often a running stage checks its lease and cancellation state.
     pub poll_interval: Duration,
+    /// How long an idle slot waits for work before claiming again. A stage
+    /// enqueued through this process wakes it at once; this bounds the wait
+    /// for work other processes enqueue and for delayed retries.
+    pub idle_poll_interval: Duration,
     pub lease_duration: Duration,
     pub maintenance_interval: Duration,
     pub maintenance_batch_limit: usize,
@@ -92,6 +97,7 @@ impl BatchWorkerConfig {
             resources: WorkerResourceCapacity::default(),
             draining: false,
             poll_interval: Duration::from_millis(250),
+            idle_poll_interval: Duration::from_secs(1),
             lease_duration: Duration::from_secs(60),
             maintenance_interval: Duration::from_secs(30),
             maintenance_batch_limit: DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
@@ -1258,6 +1264,11 @@ impl BatchWorkerRunner {
                 break;
             }
 
+            // Registered before looking for work, so an enqueue that lands
+            // while this slot finds nothing still wakes it.
+            let stage_ready = runner.store.stage_ready();
+            tokio::pin!(stage_ready);
+            stage_ready.as_mut().enable();
             let iteration = runner.run_once();
             tokio::pin!(iteration);
             let result = tokio::select! {
@@ -1292,7 +1303,8 @@ impl BatchWorkerRunner {
             }
             if should_pause {
                 tokio::select! {
-                    _ = tokio::time::sleep(runner.config.poll_interval) => {}
+                    _ = tokio::time::sleep(runner.config.idle_poll_interval) => {}
+                    _ = &mut stage_ready => {}
                     _ = runner.drain.wait() => break,
                 }
             }
@@ -1838,6 +1850,7 @@ mod tests {
         let mut config = BatchWorkerConfig::local("concurrent-worker");
         config.resources.concurrency_slots = 2;
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         // Keep wall-clock margins generous for shared CI runners: a 150ms
         // lease flaked when renewal heartbeats slipped under parallel load.
         config.lease_duration = Duration::from_millis(800);
@@ -2292,6 +2305,7 @@ mod tests {
         let cancellation = Arc::new(RwLock::new(None));
         let mut config = BatchWorkerConfig::local("worker-test");
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         config.lease_duration = Duration::from_secs(60);
         let runner = BatchWorkerRunner::new(
             store.clone(),
@@ -2389,6 +2403,7 @@ mod tests {
         let cancellation = Arc::new(RwLock::new(None));
         let mut config = BatchWorkerConfig::local("worker-test");
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         config.lease_duration = Duration::from_millis(1_500);
         let runner = BatchWorkerRunner::new(
             store.clone(),
@@ -2454,6 +2469,7 @@ mod tests {
         let lease_duration = Duration::from_millis(600);
         let mut config = BatchWorkerConfig::local("worker-test");
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         config.lease_duration = lease_duration;
         let runner = BatchWorkerRunner::new(
             store.clone(),
@@ -2521,6 +2537,7 @@ mod tests {
         let mut config = BatchWorkerConfig::local("worker-test");
         config.execution_timeout = Some(Duration::from_millis(30));
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         let runner = BatchWorkerRunner::new(
             store.clone(),
             vec![Arc::new(CancellationAwareBlockingExecutor {
@@ -2729,6 +2746,7 @@ mod tests {
         let mut config = BatchWorkerConfig::local("worker-test");
         config.lease_duration = Duration::from_millis(40);
         config.poll_interval = Duration::from_millis(10);
+        config.idle_poll_interval = Duration::from_millis(10);
         let runner = BatchWorkerRunner::new(
             store.clone(),
             vec![Arc::new(CancellationAwareBlockingExecutor {
@@ -3173,6 +3191,51 @@ mod tests {
             .expect("job")
             .expect("job exists");
         assert_eq!(job.status, RuntimeJobStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn idle_slots_wake_when_this_process_enqueues_a_stage() {
+        let store = build_store();
+        let mut config = BatchWorkerConfig::local("wakeup-worker");
+        // Long enough that only the wake-up can explain a prompt claim.
+        config.idle_poll_interval = Duration::from_secs(60);
+        config.drain_timeout = Duration::from_millis(300);
+        let runner = BatchWorkerRunner::new(
+            store.clone(),
+            vec![Arc::new(FakeExecutor {
+                calls: AtomicUsize::new(0),
+                fail_first: false,
+            })],
+            config,
+            BatchWorkerHealth::new("wakeup-worker"),
+        );
+        let supervisor = runner.clone().spawn();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store
+                .get_worker_heartbeat("wakeup-worker")
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the slot polled");
+        // Let the slot find nothing and settle into its idle wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (_, stage_id) = create_queued_fake_stage(&store, 1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.get_stage(&stage_id).await.unwrap().unwrap().status
+                != RuntimeStageStatus::Completed
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the idle slot ran the new stage without waiting out its poll");
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]

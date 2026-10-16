@@ -368,6 +368,7 @@ impl BatchRuntimeStore {
         tx.commit()
             .await
             .context("Failed to commit runtime job retry transaction")?;
+        self.wake_claimers();
         self.get_job(job_id).await
     }
 

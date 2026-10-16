@@ -539,6 +539,7 @@ impl BatchRuntimeStore {
         tx.commit()
             .await
             .context("Failed to commit durable text TTS acceptance transaction")?;
+        self.wake_claimers();
 
         Ok(DurableTextTtsAcceptanceOutcome::Committed(
             DurableTextTtsAcceptance {
@@ -871,6 +872,7 @@ impl BatchRuntimeStore {
         tx.commit()
             .await
             .context("Failed to commit durable job acceptance transaction")?;
+        self.wake_claimers();
 
         Ok(DurableJobAcceptanceOutcome::Committed(
             DurableJobAcceptance {

@@ -31,8 +31,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{atomic::AtomicI64, atomic::Ordering, Arc};
+use std::sync::{atomic::AtomicI64, atomic::Ordering};
 
 mod acceptance;
 mod artifacts;
@@ -69,6 +70,9 @@ pub use workers::*;
 #[derive(Debug, Clone)]
 pub struct BatchRuntimeStore {
     db: StoreDatabase,
+    /// Woken when a stage may have become claimable, so idle worker slots
+    /// in this process claim at once instead of waiting out their poll.
+    stage_ready: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     test_clock: Option<Arc<AtomicI64>>,
     #[cfg(test)]
@@ -144,6 +148,7 @@ impl BatchRuntimeStore {
     pub fn initialize_with_database(db: StoreDatabase) -> Self {
         Self {
             db,
+            stage_ready: Arc::default(),
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
@@ -246,5 +251,16 @@ impl BatchRuntimeStore {
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
         self.db.connection().await
+    }
+
+    /// Resolves after the next [`Self::wake_claimers`]; register it (with
+    /// `Notified::enable`) before looking for work so no wake-up is lost.
+    pub(crate) fn stage_ready(&self) -> tokio::sync::futures::Notified<'_> {
+        self.stage_ready.notified()
+    }
+
+    /// A stage may have become claimable: wake this process's idle claimers.
+    fn wake_claimers(&self) {
+        self.stage_ready.notify_waiters();
     }
 }
