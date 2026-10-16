@@ -642,6 +642,98 @@ fn chat_budget_finish_reason(
     }
 }
 
+/// Execution plans keyed by plan id, with a per-session index so that the
+/// checks run for every scheduled row are lookups instead of scans of every
+/// active plan (SCH-F9). Reads go through the map; every mutation goes
+/// through a method that keeps the index exact.
+#[derive(Debug, Clone, Default)]
+struct ActivePlans {
+    by_plan: HashMap<u64, ExecutionPlan>,
+    sessions: HashMap<super::SessionKey, usize>,
+}
+
+impl std::ops::Deref for ActivePlans {
+    type Target = HashMap<u64, ExecutionPlan>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_plan
+    }
+}
+
+impl ActivePlans {
+    fn contains_session(&self, session: &super::SessionKey) -> bool {
+        self.sessions.contains_key(session)
+    }
+
+    fn index(sessions: &mut HashMap<super::SessionKey, usize>, session: &super::SessionKey) {
+        *sessions.entry(session.clone()).or_default() += 1;
+    }
+
+    fn unindex(sessions: &mut HashMap<super::SessionKey, usize>, session: &super::SessionKey) {
+        if let Some(count) = sessions.get_mut(session) {
+            *count -= 1;
+            if *count == 0 {
+                sessions.remove(session);
+            }
+        }
+    }
+
+    fn insert(&mut self, plan_id: u64, plan: ExecutionPlan) -> Option<ExecutionPlan> {
+        Self::index(&mut self.sessions, &plan.session);
+        let replaced = self.by_plan.insert(plan_id, plan);
+        if let Some(replaced) = replaced.as_ref() {
+            Self::unindex(&mut self.sessions, &replaced.session);
+        }
+        replaced
+    }
+
+    fn remove(&mut self, plan_id: &u64) -> Option<ExecutionPlan> {
+        let removed = self.by_plan.remove(plan_id);
+        if let Some(removed) = removed.as_ref() {
+            Self::unindex(&mut self.sessions, &removed.session);
+        }
+        removed
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&u64, &ExecutionPlan) -> bool) {
+        let sessions = &mut self.sessions;
+        self.by_plan.retain(|plan_id, plan| {
+            let kept = keep(plan_id, plan);
+            if !kept {
+                Self::unindex(sessions, &plan.session);
+            }
+            kept
+        });
+    }
+
+    fn clear(&mut self) {
+        self.by_plan.clear();
+        self.sessions.clear();
+    }
+
+    #[cfg(test)]
+    fn extend(&mut self, plans: impl IntoIterator<Item = (u64, ExecutionPlan)>) {
+        for (plan_id, plan) in plans {
+            self.insert(plan_id, plan);
+        }
+    }
+
+    /// Mutable access for tests that reshape a plan; the session is the index
+    /// key and must not change.
+    #[cfg(test)]
+    fn get_mut(&mut self, plan_id: &u64) -> Option<&mut ExecutionPlan> {
+        self.by_plan.get_mut(plan_id)
+    }
+}
+
+/// A session's execution profile, accepted by its adapter contract. A
+/// profile resolved from the loaded model depends only on the request and
+/// that model, so it is resolved once per session instead of on every step.
+struct CachedExecutionProfile {
+    epoch: u64,
+    profile: Arc<ExecutionProfile>,
+}
+
 /// The engine core - manages the inference loop.
 pub struct EngineCore {
     /// Configuration
@@ -660,6 +752,9 @@ pub struct EngineCore {
     output_processor: OutputProcessor,
     /// Active requests (by ID)
     requests: HashMap<RequestId, Arc<EngineCoreRequest>>,
+    /// Execution profiles resolved from a loaded model, by request and
+    /// keyed to the session epoch they were resolved for (SCH-F9).
+    execution_profiles: HashMap<RequestId, CachedExecutionProfile>,
     /// Request start times (for timing)
     request_start_times: HashMap<RequestId, Instant>,
     /// Per-request phase timing accumulated by scheduler steps.
@@ -667,7 +762,7 @@ pub struct EngineCore {
     /// Per-session lifecycle and active-plan fence.
     execution_trackers: HashMap<RequestId, ExecutionTracker>,
     /// Plans prepared under the core lock and awaiting one validated result.
-    active_plans: HashMap<u64, ExecutionPlan>,
+    active_plans: ActivePlans,
     /// Exact physical tickets currently owned outside the core lock.
     in_flight_dispatches: HashMap<BatchId, InFlightPhysicalDispatch>,
     /// Recovery left armed if a borrowed low-level step future is cancelled.
@@ -869,41 +964,87 @@ impl EngineCore {
         Ok(profile)
     }
 
+    /// The session's execution profile under its adapter contract, or the
+    /// executor's profile with the contract error. A profile resolved from
+    /// the loaded model is cached for the session; any other profile (a model
+    /// not loaded yet, or a contract mismatch) is resolved again next time.
+    async fn session_execution_profile(
+        &mut self,
+        request: &EngineCoreRequest,
+        epoch: u64,
+    ) -> std::result::Result<Arc<ExecutionProfile>, Box<(ExecutionProfile, Error)>> {
+        if let Some(cached) = self
+            .execution_profiles
+            .get(&request.id)
+            .filter(|cached| cached.epoch == epoch)
+        {
+            return Ok(cached.profile.clone());
+        }
+        let raw_profile = self
+            .executor
+            .execution_profile(request)
+            .await
+            .unwrap_or_else(|| {
+                ExecutionProfile::fail_closed(
+                    self.config.backend,
+                    request.model_variant,
+                    ExecutionMode::Atomic,
+                )
+            });
+        let cacheable = raw_profile.resolved_from_loaded_model;
+        match Self::apply_adapter_execution_contract(request, raw_profile.clone()) {
+            Ok(profile) => {
+                let profile = Arc::new(profile);
+                if cacheable {
+                    self.execution_profiles.insert(
+                        request.id.clone(),
+                        CachedExecutionProfile {
+                            epoch,
+                            profile: profile.clone(),
+                        },
+                    );
+                }
+                Ok(profile)
+            }
+            Err(error) => Err(Box::new((raw_profile, error))),
+        }
+    }
+
+    /// Publish each session's execution profile to the scheduler. A cached
+    /// profile was published when it was resolved, so only sessions without
+    /// one are resolved here.
     async fn refresh_scheduler_execution_profiles(&mut self) {
-        let requests: Vec<_> = self.requests.values().cloned().collect();
-        for request in requests {
-            let Some(epoch) = self.scheduler.get_sequence_id(&request.id) else {
-                continue;
-            };
-            let raw_profile = self
-                .executor
-                .execution_profile(&request)
-                .await
-                .unwrap_or_else(|| {
-                    ExecutionProfile::fail_closed(
-                        self.config.backend,
-                        request.model_variant,
-                        ExecutionMode::Atomic,
-                    )
-                });
-            let profile = match Self::apply_adapter_execution_contract(
-                &request,
-                raw_profile.clone(),
-            ) {
-                Ok(profile) => profile,
-                Err(error) => {
+        let unresolved: Vec<_> = self
+            .requests
+            .values()
+            .filter_map(|request| {
+                let epoch = self.scheduler.get_sequence_id(&request.id)?;
+                let cached = self
+                    .execution_profiles
+                    .get(&request.id)
+                    .is_some_and(|cached| cached.epoch == epoch);
+                (!cached).then(|| (request.clone(), epoch))
+            })
+            .collect();
+        for (request, epoch) in unresolved {
+            let session = super::SessionKey::new(request.id.clone(), epoch);
+            match self.session_execution_profile(&request, epoch).await {
+                Ok(profile) => {
+                    self.scheduler.update_execution_profile(&session, &profile);
+                }
+                Err(refused) => {
+                    let (raw_profile, error) = *refused;
                     warn!(
                         request_id = %request.id,
                         error = %error,
                         "Loaded adapter contract disagrees with executor; forcing scalar scheduling"
                     );
-                    Self::force_scalar_execution(raw_profile)
+                    self.scheduler.update_execution_profile(
+                        &session,
+                        &Self::force_scalar_execution(raw_profile),
+                    );
                 }
-            };
-            self.scheduler.update_execution_profile(
-                &super::SessionKey::new(request.id.clone(), epoch),
-                &profile,
-            );
+            }
         }
     }
 
@@ -913,10 +1054,7 @@ impl EngineCore {
     ) -> std::result::Result<(), PlanBeginError> {
         let session = scheduled.session_key();
         if self.active_plans.contains_key(&scheduled.plan_id)
-            || self
-                .active_plans
-                .values()
-                .any(|plan| plan.session == session)
+            || self.active_plans.contains_session(&session)
             || self.in_flight_dispatches.values().any(|dispatch| {
                 dispatch.contains_plan(scheduled.plan_id) || dispatch.contains_session(&session)
             })
@@ -936,19 +1074,10 @@ impl EngineCore {
                     scheduled.request_id
                 ))
             })?;
-        let raw_profile = self
-            .executor
-            .execution_profile(&request)
+        let profile = self
+            .session_execution_profile(&request, session.epoch)
             .await
-            .unwrap_or_else(|| {
-                ExecutionProfile::fail_closed(
-                    self.config.backend,
-                    request.model_variant,
-                    ExecutionMode::Atomic,
-                )
-            });
-        let profile = Self::apply_adapter_execution_contract(&request, raw_profile)
-            .map_err(PlanBeginError::AdapterContract)?;
+            .map_err(|refused| PlanBeginError::AdapterContract(refused.1))?;
         if scheduled.is_prefill
             && profile.prefill != PrefillMode::Incremental
             && (scheduled.num_computed_tokens != 0
@@ -1128,10 +1257,11 @@ impl EngineCore {
                 model_variant: profile.model_variant,
                 task_type: request.task_type,
                 work_kind,
-                compute_dtype: profile.compute_dtype,
-                kv_dtype: profile.kv_dtype,
+                compute_dtype: profile.compute_dtype.clone(),
+                kv_dtype: profile.kv_dtype.clone(),
                 cache_namespace: profile
                     .cache_namespace
+                    .clone()
                     .unwrap_or_else(|| "none".to_string()),
                 adapter: bound_adapter,
             },
@@ -1490,10 +1620,7 @@ impl EngineCore {
                     .is_some_and(|request| self.uses_incremental_chat_capacity(request))
             })
             .filter(|session| {
-                !self
-                    .active_plans
-                    .values()
-                    .any(|plan| plan.session == *session)
+                !self.active_plans.contains_session(session)
                     && !self
                         .active_managed_cache
                         .values()
@@ -1636,10 +1763,7 @@ impl EngineCore {
             .into_iter()
             .filter(|session| session.request_id != blocked_request.id)
             .filter(|session| {
-                !self
-                    .active_plans
-                    .values()
-                    .any(|plan| &plan.session == session)
+                !self.active_plans.contains_session(session)
                     && !self
                         .active_managed_cache
                         .values()
@@ -3481,10 +3605,11 @@ impl EngineCore {
             executor,
             output_processor,
             requests: HashMap::new(),
+            execution_profiles: HashMap::new(),
             request_start_times: HashMap::new(),
             request_phase_timings: HashMap::new(),
             execution_trackers: HashMap::new(),
-            active_plans: HashMap::new(),
+            active_plans: ActivePlans::default(),
             in_flight_dispatches: HashMap::new(),
             pending_runner_recovery: None,
             active_managed_cache: HashMap::new(),
@@ -5306,6 +5431,7 @@ impl EngineCore {
                 }
                 self.begin_terminal_release(&session, cause).await;
                 self.requests.remove(&request_id);
+                self.execution_profiles.remove(&request_id);
                 self.request_start_times.remove(&request_id);
                 self.request_phase_timings.remove(&request_id);
                 self.clear_exact_execution_state(&session);
@@ -5447,6 +5573,7 @@ impl EngineCore {
         };
         self.begin_terminal_release(session, cause).await;
         self.requests.remove(&session.request_id);
+        self.execution_profiles.remove(&session.request_id);
         self.clear_exact_execution_state(session);
         self.pending_terminal_outputs
             .push_back(CommittedExecutorOutput {
@@ -8491,7 +8618,7 @@ mod tests {
             super::super::ModelInstanceId::new(2)
         );
         assert_eq!(core.rollback_all_in_flight_dispatches(), 1);
-        core.active_plans.extend(active_plans);
+        core.active_plans.extend(active_plans.by_plan);
 
         core.active_plans
             .get_mut(&scheduled[1].plan_id)
