@@ -961,12 +961,16 @@ fn worker_chat_generation(
 /// neither layer retries the invocation.
 /// `reservation` (the registry dispatch) lives in the relay task until the
 /// terminal event is delivered or the consumer goes away.
+/// A `true` on `shutdown` ends the stream with an explicit "shutting down"
+/// failure, so a stream still running when the gateway stops sends the
+/// client a terminal event instead of being cut.
 pub(crate) fn spawn_started_remote_chat_stream<F, R>(
     remote: &RemoteChatExecution,
     mut worker_stream: InvocationStream,
     on_worker_error: F,
     tenant_work: BoundTenantWorkLease,
     reservation: R,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> mpsc::Receiver<ChatStreamEvent>
 where
     F: Fn(&WorkerClientError) + Send + Sync + 'static,
@@ -989,6 +993,11 @@ where
                 () = event_tx.closed() => return,
                 () = sink.stalled() => {
                     break ChatStreamEvent::Failed(backpressure_error());
+                }
+                () = shutdown_requested(shutdown.as_mut()) => {
+                    break ChatStreamEvent::Failed(ApiError::service_unavailable(
+                        "The gateway is shutting down; retry the request",
+                    ));
                 }
             };
             let event = match event {
@@ -1073,6 +1082,18 @@ where
         sink.finish(terminal).await;
     });
     event_rx
+}
+
+/// Resolves once `shutdown` holds `true`; never without a signal.
+async fn shutdown_requested(shutdown: Option<&mut tokio::sync::watch::Receiver<bool>>) {
+    match shutdown {
+        Some(shutdown) => {
+            if shutdown.wait_for(|stopping| *stopping).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn validate_remote_chat_scope(request: &ChatExecutionRequest) -> Result<(), ApiError> {

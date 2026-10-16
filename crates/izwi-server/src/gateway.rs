@@ -75,6 +75,11 @@ pub struct GatewayState {
         Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
     /// The adopted approvals view, for the admin status route.
     approvals: Option<crate::gateway_shared_approvals::GatewayApprovalsReporter>,
+    /// Set during the pre-stop window: readiness reports draining while
+    /// admission still serves, so load balancers move traffic away first.
+    prestop: Arc<std::sync::atomic::AtomicBool>,
+    /// Ends every live chat stream with a terminal event.
+    stream_shutdown: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl GatewayState {
@@ -90,8 +95,9 @@ impl GatewayState {
         let tenant_concurrency_config =
             GatewayTenantConcurrencyConfig::new(8_usize.min(max_in_flight), max_in_flight)
                 .expect("validated gateway admission limit supports tenant ownership");
+        let stream_shutdown = Arc::new(tokio::sync::watch::Sender::new(false));
         Self {
-            chat_dispatchers: vec![dispatcher],
+            chat_dispatchers: vec![dispatcher.with_shutdown(stream_shutdown.subscribe())],
             enterprise_hooks,
             lifecycle: ServerLifecycle::new(),
             perimeter,
@@ -105,6 +111,8 @@ impl GatewayState {
             metrics: GatewayMetrics::default(),
             realtime_relay: None,
             approvals: None,
+            prestop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stream_shutdown,
         }
     }
 
@@ -162,7 +170,8 @@ impl GatewayState {
 
     /// Serve one more public chat model. Requests route by their `model`.
     pub(crate) fn with_chat_model(mut self, dispatcher: RemoteChatDispatcher) -> Self {
-        self.chat_dispatchers.push(dispatcher);
+        self.chat_dispatchers
+            .push(dispatcher.with_shutdown(self.stream_shutdown.subscribe()));
         self
     }
 
@@ -365,6 +374,17 @@ impl GatewayState {
 
     pub fn mark_ready(&self) {
         self.lifecycle.mark_ready();
+    }
+
+    /// Starts the pre-stop window: readiness turns unready, requests are
+    /// still admitted.
+    pub(crate) fn begin_prestop(&self) {
+        self.prestop.store(true, Ordering::Release);
+    }
+
+    /// Ends every live chat stream with a terminal "shutting down" event.
+    pub(crate) fn end_streams(&self) {
+        self.stream_shutdown.send_replace(true);
     }
 
     pub fn begin_drain(&self) {
@@ -1019,6 +1039,7 @@ async fn live_check(State(state): State<GatewayState>) -> Json<GatewayLiveRespon
 
 async fn ready_check(State(state): State<GatewayState>) -> Response {
     let lifecycle = state.lifecycle.snapshot();
+    let draining = lifecycle.draining || state.prestop.load(Ordering::Acquire);
     // Ready while any served model has a ready worker; the message names the
     // models that have none.
     let unready: Vec<String> = state
@@ -1039,10 +1060,8 @@ async fn ready_check(State(state): State<GatewayState>) -> Response {
         },
         GatewayProbeCheck {
             name: "not_draining",
-            ok: !lifecycle.draining,
-            message: lifecycle
-                .draining
-                .then(|| "gateway is draining for shutdown".to_string()),
+            ok: !draining,
+            message: draining.then(|| "gateway is draining for shutdown".to_string()),
         },
         GatewayProbeCheck {
             name: "compatible_worker_ready",
@@ -1056,7 +1075,7 @@ async fn ready_check(State(state): State<GatewayState>) -> Response {
         version: env!("CARGO_PKG_VERSION"),
         ready,
         phase: lifecycle.phase,
-        draining: lifecycle.draining,
+        draining,
         uptime_secs: now_saturating_sub(lifecycle.started_at),
         checks,
     };

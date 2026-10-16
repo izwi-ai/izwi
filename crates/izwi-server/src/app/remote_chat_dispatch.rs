@@ -79,6 +79,8 @@ pub struct RemoteChatDispatcher {
     config: RemoteChatDispatchConfig,
     fleet: Option<Arc<FleetCoordinator>>,
     prefix: Option<Arc<PrefixRouter>>,
+    /// The gateway's shutdown broadcast to live streams.
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl RemoteChatDispatcher {
@@ -95,6 +97,7 @@ impl RemoteChatDispatcher {
             config,
             fleet: None,
             prefix,
+            shutdown: None,
         })
     }
 
@@ -102,6 +105,13 @@ impl RemoteChatDispatcher {
     /// dispatcher behaves exactly as before (single-gateway profile).
     pub fn with_fleet_coordinator(mut self, coordinator: Arc<FleetCoordinator>) -> Self {
         self.fleet = Some(coordinator);
+        self
+    }
+
+    /// End live streams with a terminal "shutting down" event once
+    /// `shutdown` turns `true`.
+    pub(crate) fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -213,6 +223,7 @@ impl RemoteChatDispatcher {
             move |error| report_stream_error(&registry, &key, error),
             tenant_work,
             selected.dispatch,
+            self.shutdown.clone(),
         ))
     }
 

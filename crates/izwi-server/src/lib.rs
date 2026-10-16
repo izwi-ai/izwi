@@ -116,6 +116,7 @@ const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_GATEWAY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_GATEWAY_STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GATEWAY_SHUTDOWN_BUDGET_SECS: u64 = 600;
 const GATEWAY_NDJSON_MAX_LINE_BYTES: usize = 1024 * 1024;
 const GATEWAY_NDJSON_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const GATEWAY_NDJSON_MAX_EVENTS: usize = 8192;
@@ -292,6 +293,18 @@ struct ServerArgs {
         default_value_t = 30_000
     )]
     gateway_worker_progress_idle_timeout_ms: u64,
+
+    /// Total gateway shutdown budget after SIGTERM: the pre-stop window,
+    /// then draining in-flight requests. The default fits Kubernetes'
+    /// default 30 s termination grace period.
+    #[arg(long, env = "IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS", default_value_t = 25)]
+    gateway_shutdown_budget_secs: u64,
+
+    /// Pre-stop window at the start of the shutdown budget: readiness turns
+    /// unready while requests are still served, so load balancers stop
+    /// routing here before the listener closes.
+    #[arg(long, env = "IZWI_GATEWAY_PRESTOP_SECS", default_value_t = 5)]
+    gateway_prestop_secs: u64,
 
     /// Deadline for receiving a public request body. A slow upload holds a
     /// global admission permit at most this long.
@@ -809,25 +822,85 @@ async fn run_gateway(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Gateway listening on http://{}", listener.local_addr()?);
 
-    let shutdown_state = state.clone();
-    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(gateway_shutdown_signal(shutdown_state, shutdown_started_tx));
-    let http_shutdown_grace = http_shutdown_grace_timeout();
-    let server_result = await_http_server_shutdown(
-        async move { server.await },
-        shutdown_started_rx,
-        http_shutdown_grace,
-    )
-    .await;
-    if server_result.is_none() {
-        warn!(
-            grace_secs = http_shutdown_grace.as_secs(),
-            "Gateway HTTP graceful shutdown timed out; dropping remaining connections"
-        );
+    let plan = GatewayShutdownPlan {
+        prestop: Duration::from_secs(args.gateway_prestop_secs),
+        budget: Duration::from_secs(args.gateway_shutdown_budget_secs),
+    };
+    serve_gateway(listener, app, state, gateway_shutdown_requested(), plan).await
+}
+
+/// How a gateway spends its shutdown budget: a pre-stop window in which
+/// readiness is unready but requests are served, then a drain of in-flight
+/// requests. Streams still open near the end of the drain are ended with a
+/// terminal event, so no client is cut off without one.
+#[derive(Debug, Clone, Copy)]
+struct GatewayShutdownPlan {
+    prestop: Duration,
+    budget: Duration,
+}
+
+impl GatewayShutdownPlan {
+    fn drain(&self) -> Duration {
+        self.budget.saturating_sub(self.prestop)
     }
-    if let Some(server_result) = server_result {
-        server_result?;
+
+    /// When, into the drain, open streams are told to end: late enough for
+    /// most to finish on their own, early enough to deliver the event.
+    fn stream_notice(&self) -> Duration {
+        let drain = self.drain();
+        drain.saturating_sub((drain / 4).min(Duration::from_secs(2)))
+    }
+}
+
+async fn serve_gateway<S>(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    state: gateway::GatewayState,
+    shutdown_requested: S,
+    plan: GatewayShutdownPlan,
+) -> anyhow::Result<()>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    let signal_state = state.clone();
+    let (drain_started_tx, drain_started_rx) = oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_requested.await;
+        signal_state.begin_prestop();
+        info!(
+            prestop_secs = plan.prestop.as_secs_f64(),
+            budget_secs = plan.budget.as_secs_f64(),
+            "Gateway pre-stop: readiness is unready, requests are still served"
+        );
+        tokio::time::sleep(plan.prestop).await;
+        signal_state.begin_drain();
+        let _ = drain_started_tx.send(());
+    });
+    let server = async move { server.await };
+    tokio::pin!(server);
+    let finished = tokio::select! {
+        result = &mut server => Some(result),
+        started = drain_started_rx => {
+            if started.is_err() {
+                Some(server.await)
+            } else {
+                match tokio::time::timeout(plan.stream_notice(), &mut server).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        state.end_streams();
+                        let rest = plan.drain().saturating_sub(plan.stream_notice());
+                        tokio::time::timeout(rest, &mut server).await.ok()
+                    }
+                }
+            }
+        }
+    };
+    match finished {
+        Some(result) => result?,
+        None => warn!(
+            budget_secs = plan.budget.as_secs(),
+            "Gateway shutdown budget spent; dropping remaining connections"
+        ),
     }
     Ok(())
 }
@@ -1979,6 +2052,14 @@ fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
             );
         }
     }
+    if args.gateway_shutdown_budget_secs == 0
+        || args.gateway_shutdown_budget_secs > MAX_GATEWAY_SHUTDOWN_BUDGET_SECS
+        || args.gateway_prestop_secs >= args.gateway_shutdown_budget_secs
+    {
+        anyhow::bail!(
+            "--gateway-shutdown-budget-secs must be between 1 and {MAX_GATEWAY_SHUTDOWN_BUDGET_SECS} and longer than --gateway-prestop-secs"
+        );
+    }
     let body_read_timeout = Duration::from_millis(args.gateway_body_read_timeout_ms);
     if body_read_timeout.is_zero() || body_read_timeout > MAX_GATEWAY_SLOW_CONSUMER_TIMEOUT {
         anyhow::bail!(
@@ -2601,10 +2682,7 @@ async fn shutdown_signal<S>(
     drop(state);
 }
 
-async fn gateway_shutdown_signal(
-    state: gateway::GatewayState,
-    shutdown_started: oneshot::Sender<()>,
-) {
+async fn gateway_shutdown_requested() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -2627,9 +2705,6 @@ async fn gateway_shutdown_signal(
         _ = terminate => info!("Received SIGTERM, shutting down gateway..."),
         _ = desktop_owner_exit_signal() => info!("Desktop owner pipe closed, shutting down gateway..."),
     }
-
-    state.begin_drain();
-    let _ = shutdown_started.send(());
 }
 
 async fn desktop_owner_exit_signal() {
@@ -3487,6 +3562,99 @@ mod tests {
         .expect("registry gateway configuration should build");
         assert_eq!(poller.poller_count, 1);
         assert!(state.chat_dispatchers[0].readiness_check().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateway_shutdown_serves_through_prestop_and_ends_streams_with_a_terminal_event() {
+        let model = ModelVariant::Qwen354BGguf;
+        let worker = TestWorker::spawn(TestWorkerConfig {
+            public_model: ModelAlias::new(model.dir_name()).unwrap(),
+            script: izwi_serving_worker::test_support::WorkerScript::Hang,
+            max_active_invocations: 4,
+            cancellation_delay: Duration::from_millis(10),
+            ..TestWorkerConfig::default()
+        })
+        .await
+        .expect("test worker should bind");
+        let dispatcher = crate::test_support::single_worker_dispatcher(
+            model,
+            &worker.endpoint(),
+            worker.config().credentials.clone(),
+        )
+        .await;
+        let api_key = "shutdown-test-api-key";
+        let state = gateway::GatewayState::new(
+            dispatcher,
+            EnterpriseHooks::noop(),
+            GatewayPerimeterConfig::new_for_test(api_key, 1024 * 1024).unwrap(),
+            30,
+            4,
+        );
+        state.mark_ready();
+        let app = gateway::create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (signal_tx, signal_rx) = oneshot::channel::<()>();
+        let plan = GatewayShutdownPlan {
+            prestop: Duration::from_millis(400),
+            budget: Duration::from_millis(1600),
+        };
+        let server = tokio::spawn(serve_gateway(
+            listener,
+            app,
+            state,
+            async move {
+                let _ = signal_rx.await;
+            },
+            plan,
+        ));
+
+        let client = reqwest::Client::new();
+        let stream = || {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(api_key)
+                .json(&serde_json::json!({
+                    "model": model.dir_name(),
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true,
+                    "max_tokens": 8
+                }))
+                .send()
+        };
+        let open = stream().await.unwrap();
+        assert_eq!(open.status(), reqwest::StatusCode::OK);
+
+        signal_tx.send(()).unwrap();
+        let signalled = Instant::now();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Pre-stop: unready, yet a new request is still served.
+        let ready = client.get(format!("{base}/readyz")).send().await.unwrap();
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let during_prestop = stream().await.unwrap();
+        assert_eq!(during_prestop.status(), reqwest::StatusCode::OK);
+
+        // Both streams outlive the drain's notice point and end with a
+        // terminal error event, not a cut connection.
+        for response in [open, during_prestop] {
+            let body = tokio::time::timeout(Duration::from_secs(3), response.text())
+                .await
+                .expect("the stream ends within the shutdown budget")
+                .expect("the stream ends cleanly");
+            assert!(body.contains("service_unavailable"), "{body}");
+            assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        }
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("the gateway stops within its budget")
+            .unwrap()
+            .unwrap();
+        let elapsed = signalled.elapsed();
+        assert!(
+            elapsed >= plan.stream_notice() + plan.prestop
+                && elapsed < plan.budget + Duration::from_millis(500),
+            "{elapsed:?}"
+        );
     }
 
     #[tokio::test]
