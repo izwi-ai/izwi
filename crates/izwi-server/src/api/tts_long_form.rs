@@ -350,6 +350,14 @@ pub async fn generate_long_form_tts(
 
     let started = std::time::Instant::now();
     let split_request_count = planned_requests.len();
+    let outputs = generate_segments(
+        planned_requests,
+        long_form_segment_concurrency(runtime),
+        retry_runaways,
+        &request.id,
+        |segment| runtime.generate(segment),
+    )
+    .await?;
     let mut constituent_diagnostics = Vec::with_capacity(split_request_count);
     let mut merged_samples: Vec<f32> = Vec::new();
     let mut sample_rate: Option<u32> = None;
@@ -359,22 +367,9 @@ pub async fn generate_long_form_tts(
     let mut retried_segments = Vec::new();
     let mut budget_segments = Vec::new();
 
-    for (index, chunk_request) in planned_requests.into_iter().enumerate() {
-        let retry = retry_runaways.then(|| chunk_request.clone());
-        let mut output = runtime.generate(chunk_request).await?;
-        if let Some(retry) = retry.filter(|_| ran_to_budget(&output)) {
-            // A sampled segment that ran to its budget without ending
-            // speech babbled (TPIPE-27); one fresh sample usually ends.
-            tracing::warn!(
-                request_id = %request.id,
-                segment = index + 1,
-                "Long-form segment ran to its budget without end of speech; sampling it again"
-            );
+    for (index, (output, retried)) in outputs.into_iter().enumerate() {
+        if retried {
             retried_segments.push(index + 1);
-            let again = runtime.generate(retry).await?;
-            if !ran_to_budget(&again) {
-                output = again;
-            }
         }
         if ran_to_budget(&output) {
             tracing::warn!(
@@ -423,6 +418,64 @@ pub async fn generate_long_form_tts(
         })),
         stop_reason: TtsStopReason::combine(stop_reasons),
     })
+}
+
+/// Long-form segments in flight at once: the rows the engine batches TTS at
+/// (the resolved tensor width on CUDA, two rows on CPU and Metal; the
+/// engine's `engine_row_width`), so segments synthesize side by side
+/// instead of one after another (SPK-F12). More would only queue.
+fn long_form_segment_concurrency(runtime: &RuntimeService) -> usize {
+    let backend = runtime.backend_context().backend_kind;
+    let width = runtime.config().max_batch_size.resolve(backend);
+    match backend {
+        izwi_core::backends::BackendKind::Cuda => width,
+        izwi_core::backends::BackendKind::Cpu | izwi_core::backends::BackendKind::Metal => {
+            width.min(2)
+        }
+    }
+    .max(1)
+}
+
+/// Generate the segments with up to `concurrency` in flight, returning each
+/// output (and whether it was sampled again) in segment order. A sampled
+/// Qwen3-TTS segment that ran to its budget without ending speech babbled
+/// (TPIPE-27); when `retry_runaways`, it is sampled once more and the second
+/// draw kept if it ended.
+async fn generate_segments<F, Fut>(
+    segments: Vec<GenerationRequest>,
+    concurrency: usize,
+    retry_runaways: bool,
+    request_id: &str,
+    generate: F,
+) -> Result<Vec<(GenerationResult, bool)>, izwi_core::Error>
+where
+    F: Fn(GenerationRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<GenerationResult, izwi_core::Error>>,
+{
+    use futures::{StreamExt, TryStreamExt};
+    let generate = &generate;
+    futures::stream::iter(
+        segments
+            .into_iter()
+            .enumerate()
+            .map(|(index, segment)| async move {
+                let retry = retry_runaways.then(|| segment.clone());
+                let output = generate(segment).await?;
+                let Some(retry) = retry.filter(|_| ran_to_budget(&output)) else {
+                    return Ok((output, false));
+                };
+                tracing::warn!(
+                    request_id = %request_id,
+                    segment = index + 1,
+                    "Long-form segment ran to its budget without end of speech; sampling it again"
+                );
+                let again = generate(retry).await?;
+                Ok((if ran_to_budget(&again) { output } else { again }, true))
+            }),
+    )
+    .buffered(concurrency.max(1))
+    .try_collect()
+    .await
 }
 
 /// Whether long form samples a Qwen3-TTS segment again when it runs to its
@@ -734,6 +787,85 @@ impl Drop for AbortSpeechTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPK-F12: segments run `concurrency` at a time, and their outputs come
+    /// back in segment order however long each takes.
+    #[tokio::test]
+    async fn long_form_segments_run_concurrently_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let segments: Vec<GenerationRequest> = (0..6)
+            .map(|index| GenerationRequest::new(format!("segment {index}")))
+            .collect();
+        let outputs = generate_segments(segments, 3, false, "request", |segment| {
+            let (in_flight, peak) = (&in_flight, &peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(now, Ordering::AcqRel);
+                let index: u64 = segment.text["segment ".len()..].parse().unwrap();
+                // Later segments finish first.
+                tokio::time::sleep(std::time::Duration::from_millis(60 - 10 * index)).await;
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                Ok(GenerationResult {
+                    request_id: segment.text.clone(),
+                    samples: vec![index as f32],
+                    sample_rate: 24_000,
+                    total_tokens: 1,
+                    total_time_ms: 1.0,
+                    diagnostics: None,
+                    stop_reason: Some(TtsStopReason::EndOfSpeech),
+                })
+            }
+        })
+        .await
+        .expect("segments");
+        let order: Vec<f32> = outputs
+            .iter()
+            .map(|(output, _)| output.samples[0])
+            .collect();
+        assert_eq!(order, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(peak.load(Ordering::Acquire), 3, "three segments in flight");
+    }
+
+    /// A segment that ran to its budget is sampled again, and the retry is
+    /// kept only if it ended speech.
+    #[tokio::test]
+    async fn runaway_segments_are_sampled_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let outputs = generate_segments(
+            vec![GenerationRequest::new("a"), GenerationRequest::new("b")],
+            2,
+            true,
+            "request",
+            |segment| {
+                let call = calls.fetch_add(1, Ordering::AcqRel);
+                async move {
+                    // "a" runs away on its first draw only.
+                    let runaway = segment.text == "a" && call == 0;
+                    Ok(GenerationResult {
+                        request_id: segment.text,
+                        samples: vec![call as f32],
+                        sample_rate: 24_000,
+                        total_tokens: 1,
+                        total_time_ms: 1.0,
+                        diagnostics: None,
+                        stop_reason: Some(if runaway {
+                            TtsStopReason::OutputBudget
+                        } else {
+                            TtsStopReason::EndOfSpeech
+                        }),
+                    })
+                }
+            },
+        )
+        .await
+        .expect("segments");
+        assert!(outputs[0].1, "the runaway segment was retried");
+        assert!(!ran_to_budget(&outputs[0].0));
+        assert!(!outputs[1].1);
+    }
 
     #[test]
     fn fish_plan_preserves_utf8_text_and_short_fast_path() {
