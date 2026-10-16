@@ -2263,19 +2263,20 @@ mod tests {
         let (state, _root) = test_state("durable_speech_disconnect", false);
         state.lifecycle.mark_ready();
         let (id, job_id, _) = speech_replay_fixture(&state, None, true).await;
-        state
-            .batch_runtime_store
-            .transition_job_status(
-                &job_id,
-                &[RuntimeJobStatus::Completed],
-                RuntimeJobStatus::Running,
-                None,
-                None,
-                None,
+        // Stand the fixture's completed job back up as running, as a worker
+        // still executing it would leave it.
+        let db = state.batch_runtime_store.connection().await.unwrap();
+        sea_orm::ConnectionTrait::execute_raw(
+            db,
+            crate::db::raw::statement(
+                db,
+                "UPDATE runtime_jobs SET status = 'running', finished_at = NULL WHERE id = ?1",
+                vec![job_id.clone().into()],
             )
-            .await
-            .unwrap()
-            .unwrap();
+            .unwrap(),
+        )
+        .await
+        .unwrap();
         state
             .speech_history_store
             .update_processing_status(

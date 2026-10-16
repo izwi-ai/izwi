@@ -298,12 +298,12 @@ pub(super) async fn complete_job_if_all_stages_finished_with<C: ConnectionTrait>
             error_code = NULL,
             error_message = NULL
         WHERE id = ?2
-          AND status IN ('running', 'retrying', 'postprocessing', 'queued')
+          AND status IN ('running', 'retrying', 'queued')
           AND cancellation_state IS NULL
           AND EXISTS (SELECT 1 FROM job_stages WHERE job_id = ?2)
           AND NOT EXISTS (
               SELECT 1 FROM job_stages
-              WHERE job_id = ?2 AND status NOT IN ('completed', 'skipped')
+              WHERE job_id = ?2 AND status <> 'completed'
           )
         "#,
         vec![now.into(), job_id.into()],
@@ -517,13 +517,13 @@ impl BatchRuntimeStore {
                 WHERE s.status IN ('queued', 'retrying')
                   AND (s.available_at IS NULL OR s.available_at <= ?1)
                   AND (s.lease_expires_at IS NULL OR s.lease_expires_at <= ?1)
-                  AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  AND j.status IN ('queued', 'running', 'retrying')
                   AND NOT EXISTS (
                       SELECT 1
                       FROM job_stages predecessor
                       WHERE predecessor.job_id = s.job_id
                         AND predecessor.sequence < s.sequence
-                        AND predecessor.status NOT IN ('completed', 'skipped')
+                        AND predecessor.status <> 'completed'
                   )
                   {claim_filter_sql}
                 ORDER BY j.priority DESC, s.sequence ASC, COALESCE(s.available_at, s.created_at) ASC,
@@ -593,19 +593,13 @@ impl BatchRuntimeStore {
                       FROM job_stages predecessor
                       WHERE predecessor.job_id = job_stages.job_id
                         AND predecessor.sequence < job_stages.sequence
-                        AND predecessor.status NOT IN ('completed', 'skipped')
+                        AND predecessor.status <> 'completed'
                   )
                   AND EXISTS (
                       SELECT 1
                       FROM runtime_jobs
                       WHERE runtime_jobs.id = job_stages.job_id
-                        AND runtime_jobs.status IN (
-                            'created',
-                            'queued',
-                            'running',
-                            'retrying',
-                            'postprocessing'
-                        )
+                        AND runtime_jobs.status IN ('queued', 'running', 'retrying')
                   )
                 "#,
                 vec![
@@ -634,7 +628,7 @@ impl BatchRuntimeStore {
                 error_code = NULL,
                 error_message = NULL
             WHERE id = (SELECT job_id FROM job_stages WHERE id = ?2)
-              AND status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND status IN ('queued', 'running', 'retrying')
             "#,
             vec![now.into(), candidate.stage_id.clone().into()],
         )?)
@@ -698,7 +692,7 @@ impl BatchRuntimeStore {
                     error_code = NULL,
                     error_message = NULL
                 WHERE id = ?3
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND cancellation_state IS NULL
                   AND worker_id = ?4
                   AND attempt_count = ?5
@@ -709,7 +703,7 @@ impl BatchRuntimeStore {
                       SELECT 1
                       FROM runtime_jobs
                       WHERE runtime_jobs.id = job_stages.job_id
-                        AND runtime_jobs.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                        AND runtime_jobs.status IN ('queued', 'running', 'retrying')
                         AND runtime_jobs.cancellation_state IS NULL
                   )
                 "#,
@@ -819,7 +813,7 @@ impl BatchRuntimeStore {
                 UPDATE job_stages
                 SET lease_expires_at = ?1, updated_at = ?2
                 WHERE id = ?3
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND worker_id = ?4
                   AND attempt_count = ?5
                   AND (attempt_token = ?6 OR (attempt_token IS NULL AND ?6 IS NULL))
@@ -858,7 +852,7 @@ impl BatchRuntimeStore {
                 FROM job_stages s
                 JOIN runtime_jobs j ON j.id = s.job_id
                 WHERE s.id = ?1
-                  AND s.status IN ('running', 'postprocessing')
+                  AND s.status = 'running'
                   AND s.worker_id = ?2
                   AND s.attempt_count = ?3
                   AND (s.attempt_token = ?4 OR (s.attempt_token IS NULL AND ?4 IS NULL))
@@ -867,7 +861,7 @@ impl BatchRuntimeStore {
                       s.lease_expires_at > ?5
                       OR s.cancellation_state IN ('requested', 'execution_stopping')
                   )
-                  AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  AND j.status IN ('queued', 'running', 'retrying')
                 LIMIT 1
                 "#,
                 vec![
@@ -914,7 +908,7 @@ impl BatchRuntimeStore {
                 UPDATE job_stages
                 SET progress_json = ?1, updated_at = ?2
                 WHERE id = ?3
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND cancellation_state IS NULL
                   AND worker_id = ?4
                   AND attempt_count = ?5
@@ -924,7 +918,7 @@ impl BatchRuntimeStore {
                   AND EXISTS (
                       SELECT 1 FROM runtime_jobs
                       WHERE runtime_jobs.id = job_stages.job_id
-                        AND runtime_jobs.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                        AND runtime_jobs.status IN ('queued', 'running', 'retrying')
                         AND runtime_jobs.cancellation_state IS NULL
                   )
                 "#,
@@ -956,11 +950,11 @@ impl BatchRuntimeStore {
                 lease_expires_at = NULL, attempt_token = NULL,
                 attempt_count = attempt_count - 1, available_at = ?1, updated_at = ?1
             WHERE id = ?2 AND worker_id = ?3 AND attempt_count = ?4 AND attempt_token = ?5
-                AND attempt_count > 0 AND status IN ('running','postprocessing')
+                AND attempt_count > 0 AND status = 'running'
                 AND cancellation_state IS NULL AND lease_expires_at > ?1
                 AND job_id IN (
                     SELECT id FROM runtime_jobs
-                    WHERE status IN ('running','queued','retrying','postprocessing')
+                    WHERE status IN ('running','queued','retrying')
                       AND cancellation_state IS NULL
                 )
         "#,
@@ -1003,10 +997,7 @@ impl BatchRuntimeStore {
             tx.rollback().await?;
             return Ok(None);
         };
-        if !matches!(
-            stage.status,
-            RuntimeStageStatus::Running | RuntimeStageStatus::Postprocessing
-        ) || stage.cancellation_state.is_some()
+        if !is_live_stage_status(stage.status) || stage.cancellation_state.is_some()
         {
             tx.rollback().await?;
             return Ok(None);
@@ -1074,7 +1065,7 @@ impl BatchRuntimeStore {
                 UPDATE job_stages
                 SET cancellation_state = 'execution_stopping', updated_at = ?1
                 WHERE id = ?2
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND cancellation_state = 'requested'
                   AND worker_id = ?3
                   AND attempt_count = ?4
@@ -1102,7 +1093,7 @@ impl BatchRuntimeStore {
             SET cancellation_state = 'execution_stopping', updated_at = ?1
             WHERE id = (SELECT job_id FROM job_stages WHERE id = ?2)
               AND cancellation_state IS NOT NULL
-              AND status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND status IN ('queued', 'running', 'retrying')
             "#,
             vec![now.into(), lease.stage_id.clone().into()],
         )?)
@@ -1160,7 +1151,7 @@ impl BatchRuntimeStore {
                 r#"
                 SELECT id, worker_id, attempt_count, attempt_token
                 FROM job_stages
-                WHERE status IN ('running', 'postprocessing')
+                WHERE status = 'running'
                   AND cancellation_state IS NULL
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= ?1
@@ -1267,7 +1258,7 @@ impl BatchRuntimeStore {
                     r#"
                     SELECT id, worker_id, attempt_count, attempt_token
                     FROM job_stages
-                    WHERE status IN ('running', 'postprocessing')
+                    WHERE status = 'running'
                       AND cancellation_state IN ('requested', 'execution_stopping')
                       AND worker_id IS NOT NULL
                       AND lease_expires_at IS NOT NULL
@@ -1453,7 +1444,7 @@ impl BatchRuntimeStore {
                     error_code = ?2,
                     error_message = ?3
                 WHERE id = ?4
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND worker_id = ?5
                   AND attempt_count = ?6
                   AND (attempt_token = ?8 OR (attempt_token IS NULL AND ?8 IS NULL))
@@ -1523,7 +1514,7 @@ impl BatchRuntimeStore {
                         error_code = NULL,
                         error_message = NULL
                     WHERE id = ?2
-                      AND status IN ('running', 'postprocessing')
+                      AND status = 'running'
                       AND cancellation_state IN ('requested', 'execution_stopping')
                       AND worker_id = ?3
                       AND attempt_count = ?4
@@ -1560,11 +1551,11 @@ impl BatchRuntimeStore {
                 finished_at = COALESCE(finished_at, ?1)
             WHERE id = (SELECT job_id FROM job_stages WHERE id = ?2)
               AND cancellation_state IS NOT NULL
-              AND status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND status IN ('queued', 'running', 'retrying')
               AND NOT EXISTS (
                   SELECT 1 FROM job_stages
                   WHERE job_stages.job_id = runtime_jobs.id
-                    AND job_stages.status IN ('running', 'postprocessing')
+                    AND job_stages.status = 'running'
                     AND job_stages.cancellation_state IS NOT NULL
               )
             "#,
@@ -1617,7 +1608,7 @@ impl BatchRuntimeStore {
                         AND active.job_kind = cancelled.job_kind
                         AND active.route_record_kind = cancelled.route_record_kind
                         AND active.route_record_id = cancelled.route_record_id
-                        AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                        AND active.status IN ('queued', 'running', 'retrying')
                   )
                 "#,
                 vec![job_id.into()],
@@ -1656,7 +1647,7 @@ impl BatchRuntimeStore {
                         AND active.job_kind = cancelled.job_kind
                         AND active.route_record_kind = cancelled.route_record_kind
                         AND active.route_record_id = cancelled.route_record_id
-                        AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                        AND active.status IN ('queued', 'running', 'retrying')
                   )
                 "#,
                 vec![job_id.into()],
@@ -1691,7 +1682,7 @@ impl BatchRuntimeStore {
                     error_code = ?2,
                     error_message = ?3
                 WHERE id = ?4
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND worker_id = ?5
                   AND attempt_count = ?6
                   AND (attempt_token = ?7 OR (attempt_token IS NULL AND ?7 IS NULL))
@@ -1730,7 +1721,7 @@ impl BatchRuntimeStore {
                 finished_at = COALESCE(finished_at, ?1),
                 error_code = ?2,
                 error_message = ?3
-            WHERE id = ?4 AND status IN ('running', 'retrying', 'postprocessing')
+            WHERE id = ?4 AND status IN ('running', 'retrying')
             "#,
             vec![
                 now.into(),

@@ -156,7 +156,7 @@ impl BatchRuntimeStore {
                   AND route_record_kind = ?1
                   AND route_record_id = ?2
                   AND COALESCE(admission_tenant, 'anonymous') = ?3
-                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  AND status IN ('queued', 'running', 'retrying')
                 LIMIT 1
                 "#,
                 vec![route_kind.into(), record_id.into(), tenant_scope.into()],
@@ -176,7 +176,7 @@ impl BatchRuntimeStore {
               AND route_record_kind = ?1
               AND route_record_id = ?2
               AND COALESCE(admission_tenant, 'anonymous') = ?3
-              AND status IN ('failed', 'cancelled', 'expired')
+              AND status IN ('failed', 'cancelled')
             "#,
             vec![route_kind.into(), record_id.into(), tenant_scope.into()],
         )?)
@@ -369,7 +369,7 @@ impl BatchRuntimeStore {
               ON h.id = j.route_record_id
              AND h.route_kind = j.route_record_kind
             WHERE s.id = ?1
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.worker_id = ?2
               AND s.attempt_count = ?3
@@ -379,7 +379,7 @@ impl BatchRuntimeStore {
               AND j.job_kind = 'tts_speech'
               AND j.route_record_kind = ?6
               AND j.route_record_id = ?7
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
               AND COALESCE(j.admission_tenant, 'anonymous') = ?8
               AND h.id = ?7
@@ -508,7 +508,7 @@ impl BatchRuntimeStore {
             FROM job_stages s
             JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = ?15
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.worker_id = ?16
               AND s.attempt_count = ?2
@@ -518,7 +518,7 @@ impl BatchRuntimeStore {
               AND j.job_kind = 'tts_speech'
               AND j.route_record_kind = ?17
               AND j.route_record_id = ?18
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
               AND COALESCE(j.admission_tenant, 'anonymous') = ?19
                 "#,
@@ -639,7 +639,7 @@ impl BatchRuntimeStore {
                     error_code = NULL,
                     error_message = NULL
                 WHERE id = ?4
-                  AND status IN ('running', 'postprocessing')
+                  AND status = 'running'
                   AND cancellation_state IS NULL
                   AND attempt_count = ?5
                   AND attempt_token = ?6
@@ -718,7 +718,7 @@ impl BatchRuntimeStore {
         // PostgreSQL connections; a read/count alone would allow concurrent overflow.
         lock_named(tx, TTS_ADMISSION_LOCK).await?;
         let row = tx.query_one_raw(raw::statement(tx,
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(admission_tenant, 'anonymous') = ?1 THEN 1 ELSE 0 END), 0) FROM runtime_jobs WHERE job_kind = 'tts_speech' AND status IN ('created','queued','running','paused','retrying','postprocessing')",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN COALESCE(admission_tenant, 'anonymous') = ?1 THEN 1 ELSE 0 END), 0) FROM runtime_jobs WHERE job_kind = 'tts_speech' AND status IN ('queued','running','retrying')",
             vec![tenant.into()],
         )?).await?.ok_or_else(|| anyhow!("Speech admission count returned no row"))?;
         let active = u64::try_from(row.try_get_by_index::<i64>(0)?)?;
@@ -764,7 +764,7 @@ impl BatchRuntimeStore {
                 r#"
                 SELECT id FROM runtime_jobs
                 WHERE replay_swept_at IS NULL AND updated_at < ?1
-                  AND status IN ('completed','failed','cancelled','expired')
+                  AND status IN ('completed','failed','cancelled')
                 ORDER BY updated_at ASC, id ASC
                 LIMIT ?2
                 "#,
@@ -796,14 +796,14 @@ impl BatchRuntimeStore {
             if page.is_empty() {
                 tx.execute_raw(raw::statement(
                     &tx,
-                    "UPDATE runtime_jobs SET replay_swept_at = ?1 WHERE id = ?2 AND status IN ('completed','failed','cancelled','expired')",
+                    "UPDATE runtime_jobs SET replay_swept_at = ?1 WHERE id = ?2 AND status IN ('completed','failed','cancelled')",
                     vec![now.into(), job_id.into()],
                 )?)
                 .await?;
                 continue;
             }
             let claimed = tx.execute_raw(raw::statement(&tx,
-                "UPDATE runtime_jobs SET error_code = 'speech_replay_expired' WHERE id = ?1 AND status IN ('completed','failed','cancelled','expired') AND updated_at < ?2",
+                "UPDATE runtime_jobs SET error_code = 'speech_replay_expired' WHERE id = ?1 AND status IN ('completed','failed','cancelled') AND updated_at < ?2",
                 vec![job_id.into(), cutoff.into()],
             )?).await?;
             if claimed.rows_affected() == 1 {
@@ -819,7 +819,7 @@ impl BatchRuntimeStore {
     pub async fn fence_speech_replay_deletion(&self, job_id: &str) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
         let result = db.execute_raw(raw::statement(db,
-            "UPDATE runtime_jobs SET error_code = 'speech_replay_expired' WHERE id = ?1 AND status IN ('completed','failed','cancelled','expired')",
+            "UPDATE runtime_jobs SET error_code = 'speech_replay_expired' WHERE id = ?1 AND status IN ('completed','failed','cancelled')",
             vec![job_id.into()],
         )?).await?;
         Ok(result.rows_affected() == 1)

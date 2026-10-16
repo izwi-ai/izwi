@@ -34,53 +34,37 @@ impl BatchRuntimeStore {
         let mut report = RuntimeReconciliationReport::default();
         let mut remaining = bounded_maintenance_batch_limit(limit);
 
-        for (status, stage_status, excluded_statuses) in [
-            ("failed", "failed", "'failed'"),
-            ("expired", "expired", "'failed', 'expired'"),
-        ] {
-            if remaining == 0 {
-                break;
-            }
-            let result = tx
-                .execute_raw(raw::statement(
-                    &tx,
-                    format!(
-                        r#"
-                        UPDATE runtime_jobs
-                        SET
-                            status = '{status}',
-                            updated_at = ?1,
-                            finished_at = COALESCE(finished_at, ?1),
-                            error_code = COALESCE(error_code, 'stage_{status}'),
-                            error_message = COALESCE(error_message, 'Runtime stage became {status}')
-                        WHERE id IN (
-                            SELECT candidate.id
-                            FROM runtime_jobs AS candidate
-                            WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
-                              AND candidate.cancellation_state IS NULL
-                              AND EXISTS (
-                                  SELECT 1 FROM job_stages
-                                  WHERE job_stages.job_id = candidate.id
-                                    AND job_stages.status = '{stage_status}'
-                              )
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM job_stages
-                                  WHERE job_stages.job_id = candidate.id
-                                    AND job_stages.status IN ({excluded_statuses})
-                                    AND job_stages.status <> '{stage_status}'
-                              )
-                            ORDER BY candidate.updated_at ASC, candidate.id ASC
-                            LIMIT ?2
-                          )
-                        "#
-                    ),
-                    vec![now.into(), i64::try_from(remaining)?.into()],
-                )?)
-                .await
-                .with_context(|| format!("Failed to reconcile {status} runtime jobs"))?;
-            report.jobs_repaired = report.jobs_repaired.saturating_add(result.rows_affected());
-            remaining = remaining.saturating_sub(result.rows_affected() as usize);
-        }
+        let failed = tx
+            .execute_raw(raw::statement(
+                &tx,
+                r#"
+                UPDATE runtime_jobs
+                SET
+                    status = 'failed',
+                    updated_at = ?1,
+                    finished_at = COALESCE(finished_at, ?1),
+                    error_code = COALESCE(error_code, 'stage_failed'),
+                    error_message = COALESCE(error_message, 'Runtime stage became failed')
+                WHERE id IN (
+                    SELECT candidate.id
+                    FROM runtime_jobs AS candidate
+                    WHERE candidate.status IN ('queued', 'running', 'retrying')
+                      AND candidate.cancellation_state IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM job_stages
+                          WHERE job_stages.job_id = candidate.id
+                            AND job_stages.status = 'failed'
+                      )
+                    ORDER BY candidate.updated_at ASC, candidate.id ASC
+                    LIMIT ?2
+                  )
+                "#,
+                vec![now.into(), i64::try_from(remaining)?.into()],
+            )?)
+            .await
+            .context("Failed to reconcile failed runtime jobs")?;
+        report.jobs_repaired = report.jobs_repaired.saturating_add(failed.rows_affected());
+        remaining = remaining.saturating_sub(failed.rows_affected() as usize);
 
         let stageless = if remaining == 0 {
             0
@@ -98,7 +82,7 @@ impl BatchRuntimeStore {
                 WHERE id IN (
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
-                    WHERE candidate.status IN ('created', 'queued')
+                    WHERE candidate.status = 'queued'
                       AND candidate.created_at <= ?3
                       AND NOT EXISTS (
                           SELECT 1 FROM job_stages WHERE job_stages.job_id = candidate.id
@@ -136,7 +120,7 @@ impl BatchRuntimeStore {
                 WHERE id IN (
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
-                    WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                    WHERE candidate.status IN ('queued', 'running', 'retrying')
                       AND EXISTS (
                           SELECT 1 FROM job_stages
                           WHERE job_stages.job_id = candidate.id AND status = 'cancelled'
@@ -144,7 +128,7 @@ impl BatchRuntimeStore {
                       AND NOT EXISTS (
                           SELECT 1 FROM job_stages
                           WHERE job_stages.job_id = candidate.id
-                            AND status NOT IN ('completed', 'skipped', 'cancelled')
+                            AND status NOT IN ('completed', 'cancelled')
                       )
                     ORDER BY candidate.updated_at ASC, candidate.id ASC
                     LIMIT ?2
@@ -175,13 +159,13 @@ impl BatchRuntimeStore {
                 WHERE id IN (
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
-                    WHERE candidate.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                    WHERE candidate.status IN ('queued', 'running', 'retrying')
                       AND candidate.cancellation_state IS NULL
                       AND EXISTS (SELECT 1 FROM job_stages WHERE job_stages.job_id = candidate.id)
                       AND NOT EXISTS (
                           SELECT 1 FROM job_stages
                           WHERE job_stages.job_id = candidate.id
-                            AND status NOT IN ('completed', 'skipped')
+                            AND status <> 'completed'
                       )
                     ORDER BY candidate.updated_at ASC, candidate.id ASC
                     LIMIT ?2
@@ -207,7 +191,7 @@ impl BatchRuntimeStore {
                 WHERE id IN (
                     SELECT candidate.id
                     FROM runtime_jobs AS candidate
-                    WHERE candidate.status IN ('created', 'queued', 'running', 'postprocessing')
+                    WHERE candidate.status IN ('queued', 'running')
                       AND candidate.cancellation_state IS NULL
                       AND EXISTS (
                           SELECT 1 FROM job_stages
@@ -234,10 +218,7 @@ impl BatchRuntimeStore {
                 r#"
                 UPDATE job_stages
                 SET
-                    status = CASE
-                        WHEN (SELECT status FROM runtime_jobs WHERE id = job_stages.job_id) = 'expired' THEN 'expired'
-                        ELSE 'cancelled'
-                    END,
+                    status = 'cancelled',
                     updated_at = ?1,
                     finished_at = COALESCE(finished_at, ?1),
                     worker_id = NULL,
@@ -248,11 +229,11 @@ impl BatchRuntimeStore {
                 WHERE id IN (
                     SELECT candidate.id
                     FROM job_stages AS candidate
-                    WHERE candidate.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                    WHERE candidate.status IN ('queued', 'running', 'retrying')
                       AND EXISTS (
                           SELECT 1 FROM runtime_jobs
                           WHERE runtime_jobs.id = candidate.job_id
-                            AND runtime_jobs.status IN ('failed', 'cancelled', 'expired')
+                            AND runtime_jobs.status IN ('failed', 'cancelled')
                       )
                     ORDER BY candidate.updated_at ASC, candidate.id ASC
                     LIMIT ?2
@@ -282,7 +263,7 @@ impl BatchRuntimeStore {
                             AND active.job_kind = candidate.job_kind
                             AND active.route_record_kind = candidate.route_record_kind
                             AND active.route_record_id = candidate.route_record_id
-                            AND active.status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                            AND active.status IN ('queued', 'running', 'retrying')
                       )
                       AND (
                           (

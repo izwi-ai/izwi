@@ -503,18 +503,13 @@ async fn claim_waits_for_predecessor_completion() {
 async fn claim_cas_rechecks_parent_job_eligibility() {
     let (store, _root) = build_store().await;
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 1).await;
-    store
-        .transition_job_status(
-            &job.id,
-            &[RuntimeJobStatus::Queued],
-            RuntimeJobStatus::Cancelled,
-            None,
-            None,
-            Some("cancel before claim CAS".to_string()),
-        )
-        .await
-        .expect("cancel job")
-        .expect("job transition");
+    force_job_status(
+        &store,
+        &job.id,
+        RuntimeJobStatus::Cancelled,
+        Some("cancel before claim CAS"),
+    )
+    .await;
 
     let now = current_timestamp_millis();
     let claimed = store
@@ -555,18 +550,13 @@ async fn terminal_parent_fences_late_stage_completion() {
         .await
         .expect("claim")
         .expect("stage should be claimed");
-    store
-        .transition_job_status(
-            &job.id,
-            &[RuntimeJobStatus::Running],
-            RuntimeJobStatus::Cancelled,
-            None,
-            None,
-            Some("cancelled outside stage transaction".to_string()),
-        )
-        .await
-        .expect("cancel parent")
-        .expect("parent transition");
+    force_job_status(
+        &store,
+        &job.id,
+        RuntimeJobStatus::Cancelled,
+        Some("cancelled outside stage transaction"),
+    )
+    .await;
 
     assert!(store
         .complete_stage(&claimed.lease().expect("lease"), vec![])

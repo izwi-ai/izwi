@@ -712,13 +712,16 @@ first-party ASR and non-streaming text-to-speech jobs:
 | `GET` | `/v1/jobs/{job_id}` | Fetch the runtime job, ordered stages, and artifacts. |
 | `GET` | `/v1/jobs/{job_id}/artifacts` | Fetch only artifact lineage for the job. |
 | `POST` | `/v1/jobs/{job_id}/cancel` | Cancel a non-terminal job and update the linked route record when one exists. |
-| `POST` | `/v1/jobs/{job_id}/retry` | Requeue failed, cancelled, or expired jobs that have retryable stages. |
+| `POST` | `/v1/jobs/{job_id}/retry` | Requeue a failed or cancelled job that has retryable stages. |
 
-Runtime jobs use statuses such as `created`, `queued`, `running`, `paused`,
-`retrying`, `postprocessing`, `completed`, `failed`, `cancelled`, and
-`expired`. Stages and artifacts include IDs, capability/model metadata, attempt
-counts, timing/error fields, media/text asset references, and storage keys when
-available.
+Runtime jobs and their stages use the statuses `queued`, `running`, `retrying`,
+`completed`, `failed`, and `cancelled`. `completed`, `failed`, and `cancelled`
+are terminal for workers. A manual retry requeues the job while the job's own
+retry budget (`max_attempts`) is not used up and every failed or cancelled
+stage still has attempts left; a stage that used all of its attempts is not
+revived, so submit a new job instead. Stages and artifacts include IDs,
+capability/model metadata, attempt counts, timing/error fields, media/text
+asset references, and storage keys when available.
 
 ### Saved Voices
 

@@ -33,27 +33,6 @@ pub(super) async fn get_job_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow
     row.as_ref().map(map_runtime_job).transpose()
 }
 
-pub(super) fn is_terminal_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Completed
-            | RuntimeJobStatus::Failed
-            | RuntimeJobStatus::Cancelled
-            | RuntimeJobStatus::Expired
-    )
-}
-
-pub(super) fn is_claimable_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Created
-            | RuntimeJobStatus::Queued
-            | RuntimeJobStatus::Running
-            | RuntimeJobStatus::Retrying
-            | RuntimeJobStatus::Postprocessing
-    )
-}
-
 impl BatchRuntimeStore {
     pub async fn create_job(&self, input: NewRuntimeJob) -> anyhow::Result<RuntimeJob> {
         let db = self.db.connection().await?;
@@ -169,7 +148,7 @@ impl BatchRuntimeStore {
                     select_runtime_jobs!(),
                     r#"
                     WHERE job_kind = ?1
-                      AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                      AND status IN ('queued', 'running', 'retrying')
                     ORDER BY created_at ASC, id ASC
                     "#
                 ),
@@ -197,7 +176,7 @@ impl BatchRuntimeStore {
                     WHERE job_kind = ?1
                       AND route_record_kind = ?2
                       AND route_record_id = ?3
-                      AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                      AND status IN ('queued', 'running', 'retrying')
                     ORDER BY created_at DESC, id DESC
                     LIMIT 1
                     "#
@@ -268,72 +247,6 @@ impl BatchRuntimeStore {
             .collect()
     }
 
-    pub async fn transition_job_status(
-        &self,
-        job_id: &str,
-        expected_statuses: &[RuntimeJobStatus],
-        next_status: RuntimeJobStatus,
-        error_code: Option<String>,
-        error_message: Option<String>,
-        cancellation_reason: Option<String>,
-    ) -> anyhow::Result<Option<RuntimeJob>> {
-        if expected_statuses.is_empty() {
-            bail!("At least one expected status is required for runtime job transitions");
-        }
-
-        let db = self.db.connection().await?;
-        let now = self.now_millis();
-        let expected_placeholders = (0..expected_statuses.len())
-            .map(|index| format!("?{}", index + 7))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            r#"
-            UPDATE runtime_jobs
-            SET
-                status = ?1,
-                updated_at = ?2,
-                queued_at = CASE WHEN ?1 = 'queued' THEN COALESCE(queued_at, ?2) ELSE queued_at END,
-                started_at = CASE WHEN ?1 = 'running' THEN COALESCE(started_at, ?2) ELSE started_at END,
-                finished_at = CASE WHEN ?1 IN ('completed', 'failed', 'cancelled', 'expired') THEN COALESCE(finished_at, ?2) ELSE finished_at END,
-                error_code = ?3,
-                error_message = ?4,
-                cancellation_reason = CASE WHEN ?1 = 'cancelled' THEN ?5 ELSE cancellation_reason END,
-                cancellation_state = CASE
-                    WHEN ?1 IN ('completed', 'failed', 'cancelled', 'expired') THEN NULL
-                    ELSE cancellation_state
-                END
-            WHERE id = ?6
-              AND status IN ({expected_placeholders})
-              AND cancellation_state IS NULL
-            "#
-        );
-        let mut values = vec![
-            next_status.as_db_value().into(),
-            now.into(),
-            opt_string(error_code),
-            opt_string(error_message),
-            opt_string(cancellation_reason),
-            job_id.into(),
-        ];
-        values.extend(
-            expected_statuses
-                .iter()
-                .map(|status| status.as_db_value().into()),
-        );
-
-        let result = db
-            .execute_raw(raw::statement(db, sql, values)?)
-            .await
-            .context("Failed to transition runtime job status")?;
-        if result.rows_affected() == 0 {
-            return Ok(None);
-        }
-
-        self.get_job(job_id).await
-    }
-
     pub async fn retry_job(&self, job_id: &str) -> anyhow::Result<Option<RuntimeJob>> {
         let db = self.db.connection().await?;
         let tx = db
@@ -346,7 +259,7 @@ impl BatchRuntimeStore {
         };
         if !matches!(
             job.status,
-            RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled | RuntimeJobStatus::Expired
+            RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled
         ) {
             tx.rollback().await?;
             return Ok(None);
@@ -367,7 +280,7 @@ impl BatchRuntimeStore {
                     SUM(CASE WHEN attempt_count < max_attempts THEN 1 ELSE 0 END)
                 FROM job_stages
                 WHERE job_id = ?1
-                  AND status IN ('failed', 'cancelled', 'expired')
+                  AND status IN ('failed', 'cancelled')
                 "#,
                 vec![job_id.into()],
             )?)
@@ -410,7 +323,7 @@ impl BatchRuntimeStore {
                     admission_tenant = ?3,
                     replay_swept_at = NULL
                 WHERE id = ?2
-                  AND status IN ('failed', 'cancelled', 'expired')
+                  AND status IN ('failed', 'cancelled')
                   AND (error_code IS NULL OR error_code <> 'speech_replay_expired')
                   AND attempt_count < max_attempts
                 "#,
@@ -441,7 +354,7 @@ impl BatchRuntimeStore {
                 error_code = NULL,
                 error_message = NULL
             WHERE job_id = ?2
-              AND status IN ('failed', 'cancelled', 'expired')
+              AND status IN ('failed', 'cancelled')
               AND attempt_count < max_attempts
             "#,
                 vec![now.into(), job_id.into()],
@@ -480,7 +393,7 @@ impl BatchRuntimeStore {
                         WHEN EXISTS (
                             SELECT 1 FROM job_stages
                             WHERE job_stages.job_id = runtime_jobs.id
-                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.status = 'running'
                               AND job_stages.worker_id IS NOT NULL
                               AND job_stages.lease_expires_at IS NOT NULL
                         ) THEN status
@@ -491,7 +404,7 @@ impl BatchRuntimeStore {
                         WHEN EXISTS (
                             SELECT 1 FROM job_stages
                             WHERE job_stages.job_id = runtime_jobs.id
-                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.status = 'running'
                               AND job_stages.worker_id IS NOT NULL
                               AND job_stages.lease_expires_at IS NOT NULL
                         ) THEN NULL
@@ -502,14 +415,14 @@ impl BatchRuntimeStore {
                         WHEN EXISTS (
                             SELECT 1 FROM job_stages
                             WHERE job_stages.job_id = runtime_jobs.id
-                              AND job_stages.status IN ('running', 'postprocessing')
+                              AND job_stages.status = 'running'
                               AND job_stages.worker_id IS NOT NULL
                               AND job_stages.lease_expires_at IS NOT NULL
                         ) THEN COALESCE(cancellation_state, 'requested')
                         ELSE NULL
                     END
                 WHERE id = ?3
-                  AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+                  AND status IN ('queued', 'running', 'retrying')
                 "#,
                 vec![now.into(), opt_string(reason), job_id.into()],
             )?)
@@ -533,9 +446,9 @@ impl BatchRuntimeStore {
                 worker_id = NULL,
                 available_at = NULL
             WHERE job_id = ?2
-              AND status IN ('created', 'queued', 'running', 'paused', 'retrying', 'postprocessing')
+              AND status IN ('queued', 'running', 'retrying')
               AND (
-                  status NOT IN ('running', 'postprocessing')
+                  status <> 'running'
                   OR worker_id IS NULL
                   OR lease_expires_at IS NULL
               )
@@ -558,7 +471,7 @@ impl BatchRuntimeStore {
                 updated_at = ?1,
                 available_at = NULL
             WHERE job_id = ?2
-              AND status IN ('running', 'postprocessing')
+              AND status = 'running'
               AND worker_id IS NOT NULL
               AND lease_expires_at IS NOT NULL
             "#,

@@ -22,7 +22,7 @@ until its acceptance gates pass.
 | `IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS` | 480 | Preliminary segment target; Fish uses at most 480 characters, with exact loaded-context validation afterward. |
 | `IZWI_TTS_SEGMENT_TIMEOUT_SECS` | 1800 | Inference deadline for an individual segment. |
 | `IZWI_TTS_MAX_JOB_SECONDS` | 86400 | Whole-job wall deadline measured from durable creation, including queueing, retries and cooperative continuations. |
-| `IZWI_TTS_MAX_ACTIVE_JOBS` | 256 | Database-wide admitted live TTS jobs, including queued, running, paused and retrying jobs. |
+| `IZWI_TTS_MAX_ACTIVE_JOBS` | 256 | Database-wide admitted live TTS jobs, including queued, running and retrying jobs. |
 | `IZWI_TTS_MAX_ACTIVE_JOBS_PER_TENANT` | 32 | Live TTS jobs per trusted server-authored tenant identity; legacy/unidentified jobs share the anonymous bucket. |
 | `IZWI_TTS_REPLAY_RETENTION_SECONDS` | 86400 | Retention interval for replay PCM belonging to terminal jobs. |
 | `IZWI_TTS_MAX_JOURNAL_BYTES` | 8 GiB | Per-job replay journal ceiling; not an aggregate storage reservation. |

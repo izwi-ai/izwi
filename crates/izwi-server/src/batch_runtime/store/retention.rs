@@ -177,7 +177,7 @@ impl BatchRuntimeStore {
                 r#"
                 SELECT j.id, j.input_text_asset_id
                 FROM runtime_jobs AS j
-                WHERE j.status IN ('completed', 'failed', 'cancelled', 'expired')
+                WHERE j.status IN ('completed', 'failed', 'cancelled')
                   AND j.updated_at < ?1
                   AND NOT EXISTS (
                       SELECT 1 FROM runtime_artifacts AS a
@@ -212,8 +212,8 @@ impl BatchRuntimeStore {
             }
             // Children first: a provider-managed schema may lack the cascades.
             for sql in [
-                "DELETE FROM runtime_artifacts WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2)",
-                "DELETE FROM job_stages WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2)",
+                "DELETE FROM runtime_artifacts WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled') AND updated_at < ?2)",
+                "DELETE FROM job_stages WHERE job_id = ?1 AND EXISTS (SELECT 1 FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled') AND updated_at < ?2)",
             ] {
                 tx.execute_raw(raw::statement(
                     &tx,
@@ -225,7 +225,7 @@ impl BatchRuntimeStore {
             deleted += tx
                 .execute_raw(raw::statement(
                     &tx,
-                    "DELETE FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled', 'expired') AND updated_at < ?2",
+                    "DELETE FROM runtime_jobs WHERE id = ?1 AND status IN ('completed', 'failed', 'cancelled') AND updated_at < ?2",
                     vec![job_id.into(), before.into()],
                 )?)
                 .await?
@@ -284,7 +284,7 @@ impl BatchRuntimeStore {
                         FROM runtime_jobs AS j
                         JOIN runtime_artifacts AS a ON a.job_id = j.id
                         JOIN media_assets AS m ON m.id = a.media_asset_id
-                        WHERE j.status IN ('completed', 'failed', 'cancelled', 'expired')
+                        WHERE j.status IN ('completed', 'failed', 'cancelled')
                           AND j.updated_at < ?1
                           AND m.retention_policy = 'artifact_job' AND {opaque}
                         ORDER BY m.id ASC

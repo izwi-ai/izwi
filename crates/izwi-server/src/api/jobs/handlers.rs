@@ -12,8 +12,9 @@ use tracing::warn;
 
 use crate::{
     api::request_context::RequestContext,
-    batch_runtime::types::{
-        JobStage, RuntimeArtifact, RuntimeJob, RuntimeJobKind, RuntimeJobStatus,
+    batch_runtime::{
+        store::is_terminal_job_status,
+        types::{JobStage, RuntimeArtifact, RuntimeJob, RuntimeJobKind, RuntimeJobStatus},
     },
     error::ApiError,
     speech_history_store::{SpeechHistoryProcessingStatus, SpeechRouteKind},
@@ -96,12 +97,9 @@ pub async fn retry_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<RuntimeJobTraceResponse>, ApiError> {
     let existing = load_owned_job(&state, &ctx, &job_id).await?;
-    if !matches!(
-        existing.status,
-        RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled | RuntimeJobStatus::Expired
-    ) {
+    if !matches!(existing.status, RuntimeJobStatus::Failed | RuntimeJobStatus::Cancelled) {
         return Err(ApiError::bad_request(
-            "Runtime job can only be retried from failed, cancelled, or expired status",
+            "Runtime job can only be retried from failed or cancelled status",
         ));
     }
 
@@ -328,16 +326,6 @@ fn parse_speech_route_kind(value: &str) -> Option<SpeechRouteKind> {
         "voice_cloning" => Some(SpeechRouteKind::VoiceCloning),
         _ => None,
     }
-}
-
-fn is_terminal_job_status(status: RuntimeJobStatus) -> bool {
-    matches!(
-        status,
-        RuntimeJobStatus::Completed
-            | RuntimeJobStatus::Failed
-            | RuntimeJobStatus::Cancelled
-            | RuntimeJobStatus::Expired
-    )
 }
 
 fn warn_if_projection_missing(updated: bool, job: &RuntimeJob) {

@@ -46,6 +46,7 @@ mod reconcile;
 mod retention;
 mod speech;
 mod sql;
+mod transitions;
 mod workers;
 #[cfg(test)]
 mod tests;
@@ -62,6 +63,7 @@ pub use reconcile::*;
 pub use retention::*;
 pub(crate) use speech::*;
 pub use sql::*;
+pub(crate) use transitions::*;
 pub use workers::*;
 
 #[derive(Debug, Clone)]

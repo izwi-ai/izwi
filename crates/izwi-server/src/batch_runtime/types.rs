@@ -229,46 +229,34 @@ pub struct RuntimeWorkerHeartbeatDetails {
 #[derive(Default)]
 pub enum RuntimeJobStatus {
     #[default]
-    Created,
     Queued,
     Running,
-    Paused,
     Retrying,
-    Postprocessing,
     Completed,
     Failed,
     Cancelled,
-    Expired,
 }
 
 impl RuntimeJobStatus {
     pub const fn as_db_value(self) -> &'static str {
         match self {
-            Self::Created => "created",
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::Paused => "paused",
             Self::Retrying => "retrying",
-            Self::Postprocessing => "postprocessing",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
         }
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
-            "created" => Some(Self::Created),
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
             "retrying" => Some(Self::Retrying),
-            "postprocessing" => Some(Self::Postprocessing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
-            "expired" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -279,49 +267,34 @@ impl RuntimeJobStatus {
 #[derive(Default)]
 pub enum RuntimeStageStatus {
     #[default]
-    Created,
     Queued,
     Running,
-    Paused,
     Retrying,
-    Postprocessing,
     Completed,
     Failed,
     Cancelled,
-    Expired,
-    Skipped,
 }
 
 impl RuntimeStageStatus {
     pub const fn as_db_value(self) -> &'static str {
         match self {
-            Self::Created => "created",
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::Paused => "paused",
             Self::Retrying => "retrying",
-            Self::Postprocessing => "postprocessing",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
-            Self::Skipped => "skipped",
         }
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
-            "created" => Some(Self::Created),
             "queued" => Some(Self::Queued),
             "running" => Some(Self::Running),
-            "paused" => Some(Self::Paused),
             "retrying" => Some(Self::Retrying),
-            "postprocessing" => Some(Self::Postprocessing),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
-            "expired" => Some(Self::Expired),
-            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }

@@ -1575,11 +1575,11 @@ fn active_transcription_attempt_condition(
             INNER JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = {stage_placeholder}
               AND s.attempt_token = {token_placeholder}
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > {now_placeholder}
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
               AND j.route_record_id = transcription_records.id
               AND j.route_record_kind IN ('transcription', 'speaker_attributed_asr')

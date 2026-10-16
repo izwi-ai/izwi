@@ -163,14 +163,14 @@ pub(super) async fn active_stage_output_for_key_with<C: ConnectionTrait>(
               AND a.producer_attempt_count = ?2
               AND a.producer_attempt_token = ?3
               AND a.publication_key = ?4
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.worker_id = ?5
               AND s.attempt_count = ?2
               AND s.attempt_token = ?3
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > ?6
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
             LIMIT 1
             "#,
@@ -360,14 +360,14 @@ impl BatchRuntimeStore {
             FROM job_stages s
             JOIN runtime_jobs j ON j.id = s.job_id
             WHERE s.id = ?17
-              AND s.status IN ('running', 'postprocessing')
+              AND s.status = 'running'
               AND s.cancellation_state IS NULL
               AND s.worker_id = ?18
               AND s.attempt_count = ?2
               AND s.attempt_token = ?3
               AND s.lease_expires_at IS NOT NULL
               AND s.lease_expires_at > ?5
-              AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+              AND j.status IN ('queued', 'running', 'retrying')
               AND j.cancellation_state IS NULL
             {conflict_clause}
             "#
@@ -429,14 +429,14 @@ impl BatchRuntimeStore {
                   AND a.producer_attempt_count = ?2
                   AND a.producer_attempt_token = ?3
                   AND a.publication_key = ?4
-                  AND s.status IN ('running', 'postprocessing')
+                  AND s.status = 'running'
                   AND s.cancellation_state IS NULL
                   AND s.worker_id = ?5
                   AND s.attempt_count = ?2
                   AND s.attempt_token = ?3
                   AND s.lease_expires_at IS NOT NULL
                   AND s.lease_expires_at > ?6
-                  AND j.status IN ('created', 'queued', 'running', 'retrying', 'postprocessing')
+                  AND j.status IN ('queued', 'running', 'retrying')
                   AND j.cancellation_state IS NULL
                 LIMIT 1
                 "#,

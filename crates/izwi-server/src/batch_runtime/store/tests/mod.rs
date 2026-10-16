@@ -143,6 +143,31 @@ async fn durable_text_tts_row_counts(store: &BatchRuntimeStore) -> [u64; 6] {
     counts
 }
 
+/// Set a job's status directly, as a writer racing the transaction under
+/// test would.
+async fn force_job_status(
+    store: &BatchRuntimeStore,
+    job_id: &str,
+    status: RuntimeJobStatus,
+    cancellation_reason: Option<&str>,
+) {
+    let db = store.connection().await.expect("connection");
+    db.execute_raw(
+        raw::statement(
+            db,
+            "UPDATE runtime_jobs SET status = ?1, cancellation_reason = ?2 WHERE id = ?3",
+            vec![
+                status.as_db_value().into(),
+                cancellation_reason.map(str::to_string).into(),
+                job_id.into(),
+            ],
+        )
+        .expect("status statement"),
+    )
+    .await
+    .expect("job status is forced");
+}
+
 async fn create_test_job_and_stage(
     store: &BatchRuntimeStore,
     priority: i32,

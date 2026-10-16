@@ -735,7 +735,7 @@ pub(super) async fn replay_response(
                 }
                 Ok(Some(record)) if record.processing_status == SpeechHistoryProcessingStatus::Failed => {
                     match state.batch_runtime_store.get_job(&job.id).await {
-                        Ok(Some(job)) if matches!(job.status, RuntimeJobStatus::Created | RuntimeJobStatus::Queued | RuntimeJobStatus::Running | RuntimeJobStatus::Retrying | RuntimeJobStatus::Postprocessing) => {
+                        Ok(Some(job)) if matches!(job.status, RuntimeJobStatus::Queued | RuntimeJobStatus::Running | RuntimeJobStatus::Retrying) => {
                             tokio::time::sleep(Duration::from_millis(250)).await; continue;
                         }
                         _ => {}
