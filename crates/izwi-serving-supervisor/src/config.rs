@@ -345,12 +345,22 @@ pub struct WorkerConfig {
     /// host-memory check remains truthful.
     #[serde(default)]
     pub host_kv_pool_budget_bytes: u64,
+    /// Extra environment for this worker's process: operator switches
+    /// (`IZWI_*`) and loader paths, validated by
+    /// [`crate::env::validate_worker_environment`]. Never secrets.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
 }
 
 impl WorkerConfig {
     fn validate_common(&self) -> Result<(), ConfigError> {
         self.reject_unknown_protocol_values()?;
         validate_env_name(&self.bearer_token_env)?;
+        crate::env::validate_worker_environment(
+            &self.worker_id,
+            &self.bearer_token_env,
+            &self.environment,
+        )?;
         validate_path_length("models_directory", &self.deployment.models_directory)?;
         if self.max_active_invocations == 0 {
             return Err(ConfigError::ZeroWorkerBudget {
@@ -1091,6 +1101,14 @@ pub enum ConfigError {
     InvalidAttemptRetention { worker: WorkerId },
     #[error("invalid bearer-token environment variable name {0:?}")]
     InvalidEnvironmentName(String),
+    #[error("worker {worker} environment may not set {name}: {reason}")]
+    ForbiddenWorkerEnvironment {
+        worker: WorkerId,
+        name: String,
+        reason: &'static str,
+    },
+    #[error("worker {worker} environment exceeds its 64 entry or 64 KiB limit")]
+    WorkerEnvironmentTooLarge { worker: WorkerId },
     #[error("invalid policy: {0}")]
     InvalidPolicy(&'static str),
     #[error(
@@ -1224,7 +1242,7 @@ fn validate_duration(name: &'static str, value: u64) -> Result<(), ConfigError> 
     Ok(())
 }
 
-fn validate_env_name(name: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_env_name(name: &str) -> Result<(), ConfigError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_ENV_NAME_BYTES
         && name
@@ -1413,6 +1431,7 @@ mod tests {
                 max_retained_attempts: 2,
                 attempt_retention_secs: 30,
                 host_kv_pool_budget_bytes: 0,
+                environment: Default::default(),
                 streaming: true,
             }],
             readiness: ReadinessPolicy::default(),
@@ -1566,6 +1585,9 @@ max_input_bytes = 1048576
 max_context_tokens = 32
 max_output_tokens = 32
 
+[workers.environment]
+IZWI_ENABLE_PREFIX_CACHING = "0"
+
 [autoscaling]
 shared_approvals_path = "/tmp/shared-approvals"
 
@@ -1578,6 +1600,11 @@ scale_down_stabilization_window_ms = 60000
 "#
         );
         let parsed = NodeConfig::parse_bounded(toml.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.workers[0].environment,
+            BTreeMap::from([("IZWI_ENABLE_PREFIX_CACHING".to_string(), "0".to_string())]),
+            "a worker's [workers.environment] table parses"
+        );
         let autoscaling = parsed.autoscaling.expect("autoscaling block parses");
         assert_eq!(
             autoscaling.evaluation_interval_ms,
@@ -1602,6 +1629,26 @@ scale_down_stabilization_window_ms = 60000
         assert!(matches!(
             NodeConfig::parse_bounded(unknown_field.as_bytes()),
             Err(ConfigError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn worker_environment_tables_are_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let binaries = catalog(executable(directory.path()));
+        let mut config = cpu_config(directory.path());
+        config.workers[0].environment =
+            BTreeMap::from([("IZWI_KV_HOST_OFFLOAD".to_string(), "0".to_string())]);
+        config
+            .clone()
+            .validate(&inventory(), &binaries)
+            .expect("an operator switch is valid");
+        config.workers[0]
+            .environment
+            .insert("IZWI_WORKER_ID".to_string(), "spoofed".to_string());
+        assert!(matches!(
+            config.validate(&inventory(), &binaries),
+            Err(ConfigError::ForbiddenWorkerEnvironment { .. })
         ));
     }
 

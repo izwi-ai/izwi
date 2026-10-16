@@ -2621,6 +2621,7 @@ mod tests {
                 attempt_retention_secs: 60,
                 streaming: true,
                 host_kv_pool_budget_bytes: 0,
+                environment: Default::default(),
             }],
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),

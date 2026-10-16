@@ -8,6 +8,7 @@
 pub mod approvals_file;
 pub mod autoscale;
 mod config;
+pub mod env;
 mod launch;
 mod lifecycle;
 mod locks;

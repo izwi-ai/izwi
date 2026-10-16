@@ -69,3 +69,13 @@ output_formats = ["text"]
 max_input_bytes = 1048576
 max_context_tokens = 8192
 max_output_tokens = 4096
+
+# Optional extra environment for this worker. The supervisor clears the
+# child environment, so operator switches (IZWI_*) and loader paths
+# (LD_LIBRARY_PATH, CUDA_HOME, CUDA_PATH, HF_HOME, HF_HUB_OFFLINE,
+# RUST_BACKTRACE) reach a worker only through this table. Names the
+# supervisor sets itself and anything that looks like a credential are
+# rejected at validation.
+# [workers.environment]
+# IZWI_KV_HOST_OFFLOAD = "0"
+# IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS = "60000"

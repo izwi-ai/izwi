@@ -255,6 +255,11 @@ pub fn build_child_launch_spec(
         }
         environment.insert(key.clone(), value.clone());
     }
+    // The operator's validated table comes next, and the supervisor's own
+    // variables last, so an owned name can never be overridden.
+    for (name, value) in &worker.environment {
+        environment.insert(OsString::from(name), OsString::from(value));
+    }
     let mut set = |name: &str, value: OsString| {
         environment.insert(OsString::from(name), value);
     };
@@ -578,6 +583,7 @@ mod tests {
                 attempt_retention_secs: 30,
                 streaming: true,
                 host_kv_pool_budget_bytes: 0,
+                environment: Default::default(),
             }],
             readiness: ReadinessPolicy::default(),
             restart: RestartPolicy::default(),
@@ -704,6 +710,73 @@ mod tests {
             env_value(&with, "IZWI_KV_HOST_POOL_BUDGET_BYTES"),
             OsStr::new("512")
         );
+    }
+
+    #[test]
+    fn operator_environment_reaches_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let assignment = DeviceAssignment::Cuda {
+            device_uuid: id("GPU-1234"),
+            process_local_device_index: 0,
+            device_memory_limit_bytes: 2048,
+            host_memory_limit_bytes: 512,
+        };
+        let spec = build_with(directory.path(), assignment, |config| {
+            config.workers[0].environment = BTreeMap::from([
+                ("IZWI_KV_HOST_OFFLOAD".to_string(), "0".to_string()),
+                (
+                    "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS".to_string(),
+                    "60000".to_string(),
+                ),
+                (
+                    "LD_LIBRARY_PATH".to_string(),
+                    "/usr/local/cuda/lib64".to_string(),
+                ),
+            ]);
+        });
+        assert_eq!(env_value(&spec, "IZWI_KV_HOST_OFFLOAD"), "0");
+        assert_eq!(
+            env_value(&spec, "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS"),
+            "60000"
+        );
+        assert_eq!(env_value(&spec, "LD_LIBRARY_PATH"), "/usr/local/cuda/lib64");
+    }
+
+    /// Every variable the launch sets is in the owned list, so the
+    /// environment table's validation can name exactly what it protects.
+    #[test]
+    fn every_supervisor_variable_is_declared_owned() {
+        let directory = tempfile::tempdir().unwrap();
+        for assignment in [
+            DeviceAssignment::Cpu {
+                thread_budget: 2,
+                affinity: vec![0, 1],
+                host_memory_limit_bytes: 1024,
+            },
+            DeviceAssignment::Metal {
+                device_id: id("metal-registry-1"),
+                process_local_device_index: 1,
+                shared_memory_limit_bytes: 2048,
+            },
+            DeviceAssignment::Cuda {
+                device_uuid: id("GPU-1234"),
+                process_local_device_index: 0,
+                device_memory_limit_bytes: 2048,
+                host_memory_limit_bytes: 512,
+            },
+        ] {
+            let spec = build_with(directory.path(), assignment, |config| {
+                config.workers[0].host_kv_pool_budget_bytes = 256;
+            });
+            for name in spec.environment.keys() {
+                let name = name.to_str().unwrap();
+                assert!(
+                    INHERITED_ENV_ALLOWLIST.contains(&name)
+                        || crate::env::SUPERVISOR_OWNED_ENVIRONMENT.contains(&name),
+                    "{name} is set by the supervisor but not declared owned"
+                );
+            }
+        }
     }
 
     #[test]

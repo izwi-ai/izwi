@@ -939,6 +939,7 @@ mod tests {
             attempt_retention_secs: 30,
             streaming: true,
             host_kv_pool_budget_bytes: 0,
+            environment: Default::default(),
         };
         let config = NodeConfig {
             schema_version: crate::NODE_CONFIG_SCHEMA_VERSION,
