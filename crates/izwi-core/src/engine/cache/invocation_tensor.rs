@@ -82,6 +82,7 @@ impl InvocationSlotArena for InvocationTensorArena {
     }
 
     fn reset_for_reuse(&mut self) -> Result<()> {
+        crate::backends::probe_device_op("invocation.reset_for_reuse");
         InvocationTensorArena::reset_for_reuse(self)
     }
 
@@ -114,6 +115,7 @@ impl InvocationSlotArena for InvocationStaticAttentionArena {
     }
 
     fn reset_for_reuse(&mut self) -> Result<()> {
+        crate::backends::probe_device_op("invocation.reset_for_reuse");
         InvocationStaticAttentionArena::reset_for_reuse(self)
     }
 

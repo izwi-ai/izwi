@@ -2960,6 +2960,7 @@ impl NativeExecutor {
     }
 
     fn run_blocking<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::backends::probe_device_op("model.run_blocking");
         let run_catching_panic = || {
             let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             match unwind_result {
@@ -3489,6 +3490,7 @@ impl ModelExecutor for NativeExecutor {
         &self,
         execution: PhysicalBatchExecution<'_>,
     ) -> PhysicalDispatchResult {
+        crate::backends::probe_device_op("model.execute_physical_batch");
         let width = execution.scheduled.len().max(1);
         let expected_dispatch = execution.expected_dispatch();
         execution.validate().map_err(|error| {

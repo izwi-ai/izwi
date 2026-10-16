@@ -1845,6 +1845,7 @@ impl InferenceCoordinator {
             let _physical_dispatch = (task_kind == "inference")
                 .then(crate::engine::metrics::begin_engine_physical_dispatch);
             if task_kind == "inference" {
+                crate::backends::probe_device_op("model.blocking_stage");
                 return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
                     Ok(result) => {
                         if let Err(error) = &result {
