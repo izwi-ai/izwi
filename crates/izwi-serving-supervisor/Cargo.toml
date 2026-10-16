@@ -25,4 +25,5 @@ uuid = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+izwi-test-process = { path = "../izwi-test-process" }
 tempfile = "3.10"

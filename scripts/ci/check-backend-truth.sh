@@ -382,9 +382,11 @@ run_cargo_serving() {
 
     # Every serving crate's unit and integration tests (the client's contract
     # suites run in the worker crate, against the real worker), plus the
-    # gateway process suites. The fleet rig's gateway pairs share one
-    # coordination database per test, so it runs serially.
+    # gateway process suites and the process harness they spawn through. The
+    # fleet rig's gateway pairs share one coordination database per test, so
+    # it runs serially.
     cargo test --locked --no-fail-fast \
+        -p izwi-test-process \
         -p izwi-serving-protocol \
         -p izwi-serving-client \
         -p izwi-serving-supervisor \

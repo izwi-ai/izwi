@@ -27,6 +27,7 @@ use izwi_server::{
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{ServiceBearerToken, ServiceCredentials};
+use izwi_test_process::ProcessGuard;
 use serde_json::{json, Value};
 use std::{net::TcpListener, path::Path, process::Stdio, time::Duration};
 use tower::ServiceExt;
@@ -45,19 +46,11 @@ const DEPLOYMENT: &str = "lfm25-cpu-v1";
 /// slow each other.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
-
 /// The local server and the gateway over one backend.
 struct Paths {
     local: Router,
     gateway: Router,
-    _worker: ChildGuard,
+    _worker: ProcessGuard,
     _models: tempfile::TempDir,
     _data: tempfile::TempDir,
 }
@@ -112,11 +105,12 @@ async fn gateway_to_worker(
     models: &Path,
     worker_env: &[(&str, &str)],
     startup_deadline: Duration,
-) -> (Router, ChildGuard) {
+) -> (Router, ProcessGuard) {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models)
         .env("IZWI_WORKER_CREDENTIAL_ID", WORKER_CREDENTIAL)
@@ -129,10 +123,8 @@ async fn gateway_to_worker(
         .envs(worker_env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
     let client = WorkerClient::new(
         &format!("http://{address}/"),
         ServiceCredentials {

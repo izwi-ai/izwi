@@ -17,26 +17,20 @@ use izwi_server::{
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_test_process::ProcessGuard;
 use std::{collections::BTreeSet, net::TcpListener, process::Stdio, time::Duration};
 use tower::ServiceExt;
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 /// Starts the worker binary on the tiny fixture in `models` and waits until
 /// it has loaded, warmed, and bound.
 async fn spawn_tiny_worker(
     models: &std::path::Path,
-) -> (ChildGuard, WorkerClient, WorkerDescriptor) {
+) -> (ProcessGuard, WorkerClient, WorkerDescriptor) {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models)
         .env("IZWI_WORKER_CREDENTIAL_ID", "real-cpu-credential")
@@ -47,10 +41,8 @@ async fn spawn_tiny_worker(
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("real-cpu-credential"),
@@ -160,8 +152,7 @@ async fn worker_capability_follows_the_loaded_model() {
         Some(InvocationEventKind::Completed { .. })
     ));
 
-    child.0.start_kill().unwrap();
-    let _ = child.0.wait().await;
+    child.kill().unwrap();
 }
 
 #[tokio::test]
@@ -294,6 +285,5 @@ async fn separate_cpu_worker_executes_tiny_lfm_over_real_http() {
     assert!(body.contains("\"completion_tokens\":1"));
     assert!(body.contains("data: [DONE]"));
 
-    child.0.start_kill().unwrap();
-    let _ = child.0.wait().await;
+    child.kill().unwrap();
 }

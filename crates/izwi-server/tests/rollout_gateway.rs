@@ -20,13 +20,14 @@
 //! served-invocation counters on both workers: every request is accounted
 //! for on exactly one worker and every HTTP response is 200.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
 use izwi_serving_protocol::{ModelAlias, ModelGeneration, NodeId, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
+use izwi_test_process::ProcessGuard;
 
 const GATEWAY_API_KEY: &str = "rollout-rig-api-key";
 const GATEWAY_ADMIN_KEY: &str = "rollout-rig-admin-key-0123456789";
@@ -66,7 +67,7 @@ fn approval_line(endpoint: &str, worker_id: &str, generation: u64) -> String {
 }
 
 struct GatewayProcess {
-    child: Child,
+    child: ProcessGuard,
     base: String,
     stderr: Arc<std::sync::Mutex<String>>,
     stdout: Arc<std::sync::Mutex<String>>,
@@ -75,7 +76,6 @@ struct GatewayProcess {
 impl GatewayProcess {
     fn kill(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 
     fn log_tail(&self) -> String {
@@ -92,12 +92,6 @@ impl GatewayProcess {
         let lines: Vec<&str> = guard.lines().collect();
         let start = lines.len().saturating_sub(30);
         lines[start..].join("\n")
-    }
-}
-
-impl Drop for GatewayProcess {
-    fn drop(&mut self) {
-        self.kill();
     }
 }
 
@@ -138,7 +132,7 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
             )
             .env("RUST_LOG", "izwi_server=debug,izwi_serving_client=debug");
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = command.spawn().expect("gateway binary spawns");
+        let mut child = ProcessGuard::spawn(&mut command).expect("gateway binary spawns");
         let stderr_buffer = Arc::new(std::sync::Mutex::new(String::new()));
         let stdout_buffer = Arc::new(std::sync::Mutex::new(String::new()));
         if let Some(stderr) = child.stderr.take() {

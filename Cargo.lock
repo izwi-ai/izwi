@@ -3814,6 +3814,7 @@ dependencies = [
  "izwi-serving-client",
  "izwi-serving-protocol",
  "izwi-serving-worker",
+ "izwi-test-process",
  "izwi-vad",
  "libc",
  "rand 0.8.5",
@@ -3877,6 +3878,7 @@ dependencies = [
  "fs2",
  "izwi-serving-client",
  "izwi-serving-protocol",
+ "izwi-test-process",
  "libc",
  "reqwest 0.11.27",
  "serde",
@@ -3911,6 +3913,7 @@ dependencies = [
  "izwi-serving-protocol",
  "izwi-serving-supervisor",
  "izwi-serving-worker",
+ "izwi-test-process",
  "reqwest 0.11.27",
  "rustls-pemfile",
  "safetensors 0.4.5",
@@ -3926,6 +3929,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "izwi-test-process"
+version = "0.1.0-beta-18"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use izwi_serving_protocol::{
@@ -19,6 +19,7 @@ use izwi_serving_protocol::{
     ModelReadiness, NodeId, OutputFormat, TaskKind, WorkerDescriptor, WorkerFeature, WorkerId,
     WorkerProcessState, WorkerStatus, PROTOCOL_V1,
 };
+use izwi_test_process::ProcessGuard;
 
 const FAKE_WORKER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import json, os, sys, threading, time
@@ -256,13 +257,13 @@ impl Rig {
 
     fn spawn_supervisor(&self) -> SupervisorGuard {
         let stderr = std::fs::File::create(&self.stderr).unwrap();
-        let child = self
-            .supervisor_command()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn supervisor");
+        let child = ProcessGuard::spawn(
+            self.supervisor_command()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(stderr)),
+        )
+        .expect("spawn supervisor");
         SupervisorGuard(child)
     }
 
@@ -277,7 +278,7 @@ impl Rig {
     }
 }
 
-struct SupervisorGuard(Child);
+struct SupervisorGuard(ProcessGuard);
 
 impl SupervisorGuard {
     fn signal(&self, signal: &str) {
@@ -287,13 +288,6 @@ impl SupervisorGuard {
             .status()
             .unwrap();
         assert!(status.success());
-    }
-}
-
-impl Drop for SupervisorGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 

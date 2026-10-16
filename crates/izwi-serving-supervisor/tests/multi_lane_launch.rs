@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use izwi_test_process::ProcessGuard;
+
 #[cfg(unix)]
 #[test]
 fn supervisor_launches_metal_and_cuda_lane_workers_with_exact_assignments() {
@@ -130,19 +132,20 @@ max_output_tokens = 32
         )
         .unwrap();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
-            .arg("--config")
-            .arg(&config)
-            .arg("--cpu-ids")
-            .arg("0,1")
-            .arg("--allocatable-host-memory-bytes")
-            .arg("8192")
-            .args(&device_args)
-            .env("TEST_LANE_WORKER_TOKEN", "lane-worker-token")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("supervisor binary spawns");
+        let mut child = ProcessGuard::spawn(
+            Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--cpu-ids")
+                .arg("0,1")
+                .arg("--allocatable-host-memory-bytes")
+                .arg("8192")
+                .args(&device_args)
+                .env("TEST_LANE_WORKER_TOKEN", "lane-worker-token")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .expect("supervisor binary spawns");
         // Drain supervisor diagnostics so a restart loop cannot fill the pipe.
         let stderr = child.stderr.take().expect("supervisor stderr piped");
         std::thread::spawn(move || {
@@ -195,6 +198,5 @@ max_output_tokens = 32
             }
         }
         let _ = child.kill();
-        let _ = child.wait();
     }
 }

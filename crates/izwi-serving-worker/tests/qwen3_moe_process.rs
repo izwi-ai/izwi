@@ -18,16 +18,9 @@ use izwi_server::{
 };
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_test_process::ProcessGuard;
 use std::{collections::BTreeSet, net::TcpListener, process::Stdio, time::Duration};
 use tower::ServiceExt;
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 #[tokio::test]
 async fn separate_cpu_worker_executes_tiny_qwen3_moe_over_real_http() {
@@ -38,7 +31,8 @@ async fn separate_cpu_worker_executes_tiny_qwen3_moe_over_real_http() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models.path())
         .env("IZWI_WORKER_MODEL", "Qwen3-30B-A3B-GGUF")
@@ -51,10 +45,8 @@ async fn separate_cpu_worker_executes_tiny_qwen3_moe_over_real_http() {
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let _child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let _child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("moe-cpu-credential"),

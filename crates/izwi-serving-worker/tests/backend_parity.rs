@@ -20,20 +20,13 @@ use common::{
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
 use izwi_serving_worker::WORKER_METRICS_PATH;
+use izwi_test_process::ProcessGuard;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::TcpListener,
     process::Stdio,
     time::Duration,
 };
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 const PARITY_PROMPTS: [&str; 3] = ["hello", "ab", "a"];
 const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
@@ -53,7 +46,8 @@ async fn collect_lane_outputs(
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models_dir)
         .env("IZWI_WORKER_CREDENTIAL_ID", "parity-credential")
@@ -65,10 +59,8 @@ async fn collect_lane_outputs(
         .envs(backend_env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("parity-credential"),
@@ -353,7 +345,8 @@ async fn collect_prefix_lane_with_env(
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_MODELS_DIR", models_dir)
         .envs(
@@ -363,10 +356,8 @@ async fn collect_prefix_lane_with_env(
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let child = ChildGuard(child);
+        .stderr(Stdio::inherit());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id(PREFIX_PARITY_CREDENTIAL),

@@ -13,6 +13,7 @@ members = [
     "crates/izwi-serving-client",
     "crates/izwi-serving-supervisor",
     "crates/izwi-serving-worker",
+    "crates/izwi-test-process",
 ]
 
 [workspace.package]

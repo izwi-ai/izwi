@@ -21,18 +21,11 @@ use izwi_core::ModelVariant;
 use izwi_serving_client::realtime::{connect, RealtimeClientConfig, RealtimeClientError};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::*;
+use izwi_test_process::ProcessGuard;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-
-struct ChildGuard(tokio::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
 
 /// Minimal RIFF/WAVE reader for mono 16-bit PCM fixtures.
 fn read_wav_pcm16_mono(path: &Path) -> (u32, Vec<u8>) {
@@ -119,7 +112,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
         "metal" => BackendKind::Metal,
         _ => BackendKind::Cpu,
     };
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izwi-serving-worker"));
     command
         .env("IZWI_WORKER_BIND", address.to_string())
         .env("IZWI_WORKER_TASK", "speech_to_text")
@@ -144,7 +137,7 @@ async fn real_cpu_worker_streams_asr_through_the_realtime_subprotocol() {
             command.env(name, inherited);
         }
     }
-    let child = ChildGuard(command.spawn().unwrap());
+    let child = ProcessGuard::spawn(&mut command).unwrap();
 
     let credentials = ServiceCredentials {
         credential_id: id("real-rt-credential"),

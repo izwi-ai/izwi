@@ -7,13 +7,14 @@
 //! proves the request was executed remotely, not locally.
 
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use izwi_core::ModelVariant;
 use izwi_serving_protocol::ModelAlias;
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
+use izwi_test_process::ProcessGuard;
 
 const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
 
@@ -22,7 +23,7 @@ const GATEWAY_API_KEY: &str = "t01-gateway-api-key";
 /// it for the gateway to bind raced other processes ("Address already in
 /// use").
 struct GatewayProcess {
-    child: Child,
+    child: ProcessGuard,
     port: u16,
     /// Every stdout and stderr line, for failure messages.
     output: Arc<Mutex<String>>,
@@ -35,12 +36,13 @@ impl GatewayProcess {
         if !command.get_envs().any(|(key, _)| key == "RUST_LOG") {
             command.env("RUST_LOG", "izwi_server=info");
         }
-        let mut child = command
-            .args(["--port", "0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("gateway binary spawns");
+        let mut child = ProcessGuard::spawn(
+            command
+                .args(["--port", "0"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .expect("gateway binary spawns");
         let output = Arc::new(Mutex::new(String::new()));
         let (lines_tx, lines) = mpsc::channel();
         let stdout = child.stdout.take().expect("piped stdout");
@@ -90,19 +92,12 @@ impl GatewayProcess {
             .unwrap_or_default()
     }
 
-    fn kill(&mut self) -> std::io::Result<()> {
+    fn kill(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.kill()
     }
 
     fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait()
-    }
-}
-
-impl Drop for GatewayProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 

@@ -23,6 +23,7 @@ use izwi_serving_protocol::{
     ModelReadiness, NodeId, OutputFormat, TaskKind, WorkerDescriptor, WorkerFeature,
     WorkerId, WorkerProcessState, WorkerStatus, PROTOCOL_V1,
 };
+use izwi_test_process::ProcessGuard;
 
 const FAKE_WORKER_SCRIPT: &str = r#"#!/usr/bin/env python3
 import json, os, sys, threading, time
@@ -356,7 +357,7 @@ impl Rig {
         self.runtime_directory().join("rollout-state.json")
     }
 
-    fn spawn_supervisor(&self, extra_args: &[&str]) -> Child {
+    fn spawn_supervisor(&self, extra_args: &[&str]) -> ProcessGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"));
         command
             .arg("--config")
@@ -376,10 +377,10 @@ impl Rig {
         for arg in extra_args {
             command.arg(arg);
         }
-        command.spawn().expect("spawn supervisor")
+        ProcessGuard::spawn(&mut command).expect("spawn supervisor")
     }
 
-    fn spawn_supervisor_captured(&self, extra_args: &[&str]) -> Child {
+    fn spawn_supervisor_captured(&self, extra_args: &[&str]) -> ProcessGuard {
         let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"));
         command
             .arg("--config")
@@ -398,14 +399,14 @@ impl Rig {
         for arg in extra_args {
             command.arg(arg);
         }
-        command.spawn().expect("spawn supervisor")
+        ProcessGuard::spawn(&mut command).expect("spawn supervisor")
     }
 }
 
 /// A fake gateway admin endpoint plus the plan section that points the
 /// rollout at it.
 struct FakeGateway {
-    child: Child,
+    _child: ProcessGuard,
     status: PathBuf,
 }
 
@@ -417,14 +418,15 @@ impl FakeGateway {
         make_executable(&script);
         let status = rig.root.join("gateway-status.json");
         let gateway = Self {
-            child: Command::new(&script)
-                .arg(&status)
-                .arg(GATEWAY_ADMIN_KEY)
-                .arg(port.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
+            _child: ProcessGuard::spawn(
+                Command::new(&script)
+                    .arg(&status)
+                    .arg(GATEWAY_ADMIN_KEY)
+                    .arg(port.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap(),
             status,
         };
         gateway.report(&rig.original_approvals, 1);
@@ -462,13 +464,6 @@ impl FakeGateway {
         let temporary = self.status.with_extension("tmp");
         std::fs::write(&temporary, serde_json::to_vec(&status).unwrap()).unwrap();
         std::fs::rename(&temporary, &self.status).unwrap();
-    }
-}
-
-impl Drop for FakeGateway {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -523,11 +518,6 @@ fn read_file(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn terminate(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 #[test]
 fn canary_readiness_failure_aborts_and_restores_approvals() {
     let rig = Rig::build(2, 1);
@@ -564,7 +554,7 @@ fn canary_readiness_failure_aborts_and_restores_approvals() {
         supervisor.try_wait().unwrap().is_none(),
         "the supervisor keeps supervising the old generation after the abort"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -621,7 +611,7 @@ fn promote_path_commits_and_drains_the_old_generation() {
     });
     assert!(committed, "the rollout state must record the commit");
 
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -661,7 +651,7 @@ fn replacement_exit_during_window_aborts_and_restores() {
         supervisor.try_wait().unwrap().is_none(),
         "the supervisor keeps supervising the old generation after the abort"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 /// The approvals as a sorted list of entries, ignoring order and comments.
@@ -720,7 +710,7 @@ fn commit_waits_for_the_gateways_to_acknowledge_each_view() {
         drained,
         "the acknowledged commit view must drain the old generation"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 /// A gateway that never acknowledges the window view aborts the rollout.
@@ -744,7 +734,7 @@ fn an_unacknowledged_window_aborts_the_rollout() {
         !rig.root.join("worker-old.exited").exists(),
         "the old generation never stopped serving"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -769,7 +759,7 @@ fn a_node_without_room_for_both_generations_recreates() {
         serving(rig.old_port),
         "the replacement serves on the shared bind"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -811,7 +801,7 @@ fn a_failed_recreate_rolls_back_to_the_old_generation() {
         supervisor.try_wait().unwrap().is_none(),
         "the supervisor keeps supervising the old generation"
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -856,7 +846,7 @@ fn abort_keeps_a_peer_edit_made_during_the_window() {
         "the abort removes only the rollout's lines and keeps the peer's: {}",
         read_file(&rig.approvals)
     );
-    terminate(&mut supervisor);
+    let _ = supervisor.kill();
 }
 
 #[test]
@@ -873,8 +863,9 @@ fn resume_after_crash_commits_and_fresh_start_fails_closed() {
     });
     assert!(window_open, "the window must open before the crash");
 
-    // Crash the supervisor mid-window: state stays, workers self-drain.
-    let _ = supervisor.kill();
+    // Crash the supervisor mid-window: state stays, workers self-drain. Kill
+    // the supervisor alone, not its process group, so the workers outlive it.
+    let _ = Child::kill(&mut supervisor);
     let _ = supervisor.wait();
     let state = read_file(&rig.state_file());
     assert!(
@@ -910,7 +901,7 @@ fn resume_after_crash_commits_and_fresh_start_fails_closed() {
             && !read_file(&rig.approvals).contains("chat-prod|1")
     });
     assert!(committed, "the resumed rollout must commit");
-    terminate(&mut resumed);
+    let _ = resumed.kill();
 }
 
 #[test]

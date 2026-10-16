@@ -8,6 +8,8 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use izwi_test_process::ProcessGuard;
+
 #[cfg(unix)]
 #[test]
 fn repeatedly_crashing_worker_is_quarantined() {
@@ -104,26 +106,27 @@ max_output_tokens = 32
     )
     .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
-        .arg("--config")
-        .arg(&config)
-        .arg("--cpu-worker-binary")
-        .arg(&fake_worker)
-        .arg("--cpu-ids")
-        .arg("0")
-        .arg("--allocatable-host-memory-bytes")
-        .arg("8589934592")
-        .env(
-            "IZWI_SUPERVISOR_RECOVERY_TEST_TOKEN",
-            "recovery-test-secret-1234567890",
-        )
-        .env("IZWI_LOG_FORMAT", "json")
-        .env("IZWI_SUPERVISOR_METRICS_TEXTFILE", &metrics_textfile)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("supervisor should spawn");
+    let mut child = ProcessGuard::spawn(
+        Command::new(env!("CARGO_BIN_EXE_izwi-serving-supervisor"))
+            .arg("--config")
+            .arg(&config)
+            .arg("--cpu-worker-binary")
+            .arg(&fake_worker)
+            .arg("--cpu-ids")
+            .arg("0")
+            .arg("--allocatable-host-memory-bytes")
+            .arg("8589934592")
+            .env(
+                "IZWI_SUPERVISOR_RECOVERY_TEST_TOKEN",
+                "recovery-test-secret-1234567890",
+            )
+            .env("IZWI_LOG_FORMAT", "json")
+            .env("IZWI_SUPERVISOR_METRICS_TEXTFILE", &metrics_textfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+    )
+    .expect("supervisor should spawn");
 
     let stderr = child.stderr.take().expect("stderr should be piped");
     let (line_tx, line_rx) = std::sync::mpsc::channel();
@@ -173,7 +176,6 @@ max_output_tokens = 32
         std::thread::sleep(Duration::from_millis(50));
     };
     let _ = child.kill();
-    let _ = child.wait();
     assert!(
         quarantined,
         "a worker that crashes on every start must be quarantined instead of restarted without bound"

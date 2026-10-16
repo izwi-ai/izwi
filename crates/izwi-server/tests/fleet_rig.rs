@@ -24,7 +24,7 @@
 //! separate worker processes and every property under test lives in the
 //! gateway processes and the shared store.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 
@@ -32,6 +32,7 @@ use izwi_core::ModelVariant;
 use izwi_server::FleetStore;
 use izwi_serving_protocol::{ModelAlias, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
+use izwi_test_process::ProcessGuard;
 
 const GATEWAY_API_KEY: &str = "fleet-rig-api-key";
 const WORKER_ONE_ID: &str = "fleet-rig-worker-1";
@@ -48,7 +49,7 @@ async fn reserve_port() -> u16 {
 }
 
 struct GatewayProcess {
-    child: Child,
+    child: ProcessGuard,
     base: String,
     stderr: std::sync::Arc<std::sync::Mutex<String>>,
 }
@@ -56,7 +57,6 @@ struct GatewayProcess {
 impl GatewayProcess {
     fn kill(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 
     fn stderr_tail(&self) -> String {
@@ -64,12 +64,6 @@ impl GatewayProcess {
         let lines: Vec<&str> = guard.lines().collect();
         let start = lines.len().saturating_sub(30);
         lines[start..].join("\n")
-    }
-}
-
-impl Drop for GatewayProcess {
-    fn drop(&mut self) {
-        self.kill();
     }
 }
 
@@ -174,7 +168,7 @@ async fn spawn_gateway_once(
         command.env(key, value);
     }
     command.stdout(Stdio::null()).stderr(Stdio::piped());
-    let mut child = command.spawn().expect("gateway binary spawns");
+    let mut child = ProcessGuard::spawn(&mut command).expect("gateway binary spawns");
     let stderr_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(stderr) = child.stderr.take() {
         let buffer = std::sync::Arc::clone(&stderr_buffer);

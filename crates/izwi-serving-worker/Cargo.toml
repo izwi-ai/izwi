@@ -44,6 +44,7 @@ sha2 = { workspace = true }
 izwi-serving-worker = { path = ".", features = ["test-support"] }
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-server = { path = "../izwi-server" }
+izwi-test-process = { path = "../izwi-test-process" }
 reqwest = { workspace = true }
 safetensors = { workspace = true }
 tempfile = "3.10"
