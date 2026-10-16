@@ -3,7 +3,8 @@
 //! Two process-free concerns live here, each unit-testable in isolation:
 //!
 //! 1. The per-deployment scale state machine: capacity signals → scale
-//!    decisions under the configured bounds and the shared hysteresis window.
+//!    decisions under the configured bounds and the per-direction
+//!    stabilization windows.
 //!    Decisions are pure observations; the supervision driver confirms the
 //!    lifecycle transitions it actually performed, so a failed launch or a
 //!    failed approvals write never desynchronizes the state machine.
@@ -42,6 +43,13 @@ impl WorkerSignals {
     /// reserved realtime sessions; scale-down waits for a fully quiet worker.
     pub fn is_busy(&self) -> bool {
         self.queued_invocations > 0 || self.active_invocations > 0 || self.reserved_sessions > 0
+    }
+
+    /// Invocations the worker holds: running plus queued. Workers do not
+    /// queue today, so this is their active count.
+    pub fn outstanding(&self) -> u64 {
+        self.queued_invocations
+            .saturating_add(u64::from(self.active_invocations))
     }
 }
 
@@ -87,6 +95,10 @@ pub struct DeploymentScaleState {
     worker_order: Vec<WorkerId>,
     active: BTreeSet<WorkerId>,
     draining: Option<WorkerId>,
+    /// Workers whose process went down without a scale decision (crashed,
+    /// restarting or quarantined). Scale-up never picks one as a standby:
+    /// the restart controller owns whether it comes back.
+    lost: BTreeSet<WorkerId>,
     sustained_up_polls: u32,
     last_scale_event_ms: Option<u64>,
     idle_since_ms: BTreeMap<WorkerId, u64>,
@@ -109,6 +121,7 @@ impl DeploymentScaleState {
             worker_order,
             active: BTreeSet::new(),
             draining: None,
+            lost: BTreeSet::new(),
             sustained_up_polls: 0,
             last_scale_event_ms: None,
             idle_since_ms: BTreeMap::new(),
@@ -154,12 +167,14 @@ impl DeploymentScaleState {
     /// Driver confirmation: a launch reached readiness as part of the
     /// startup min set. Records running capacity but is not a scale event.
     pub fn note_launched(&mut self, worker: &WorkerId) {
+        self.lost.remove(worker);
         self.active.insert(worker.clone());
     }
 
     /// Driver confirmation: a scale-up launch reached readiness. Records the
     /// scale event for hysteresis.
     pub fn note_scaled_up(&mut self, now_ms: u64, worker: &WorkerId) {
+        self.lost.remove(worker);
         self.active.insert(worker.clone());
         self.last_scale_event_ms = Some(now_ms);
     }
@@ -170,11 +185,13 @@ impl DeploymentScaleState {
     }
 
     /// Driver confirmation: a process exited unexpectedly (crash). The
-    /// restart controller owns whether it comes back; the autoscaler only
-    /// stops counting it toward the deployment's running capacity.
+    /// restart controller owns whether it comes back; the autoscaler stops
+    /// counting it toward the deployment's running capacity and never picks
+    /// it as a standby until a relaunch confirms it again.
     pub fn note_worker_lost(&mut self, worker: &WorkerId) {
         self.active.remove(worker);
         self.idle_since_ms.remove(worker);
+        self.lost.insert(worker.clone());
     }
 
     /// Driver confirmation: the approvals line was removed and admission
@@ -198,7 +215,11 @@ impl DeploymentScaleState {
     fn next_standby(&self) -> Option<WorkerId> {
         self.worker_order
             .iter()
-            .find(|worker| !self.active.contains(*worker) && !self.is_core(worker))
+            .find(|worker| {
+                !self.active.contains(*worker)
+                    && !self.lost.contains(*worker)
+                    && !self.is_core(worker)
+            })
             .cloned()
     }
 
@@ -230,23 +251,23 @@ impl DeploymentScaleState {
         self.idle_since_ms
             .retain(|worker, _| self.active.contains(worker));
 
-        let hysteresis_elapsed = self
+        let up_allowed = self
             .policy
-            .hysteresis_elapsed(now_ms, self.last_scale_event_ms);
-        let max_queued = observation
+            .scale_up_allowed(now_ms, self.last_scale_event_ms);
+        let max_outstanding = observation
             .signals
             .values()
-            .map(|signals| signals.queued_invocations)
+            .map(WorkerSignals::outstanding)
             .max()
             .unwrap_or(0);
-        let saturated = max_queued >= self.policy.scale_up_queue_depth;
-        if saturated && hysteresis_elapsed {
+        let saturated = max_outstanding >= self.policy.scale_up_queue_depth;
+        if saturated && up_allowed {
             self.sustained_up_polls = self.sustained_up_polls.saturating_add(1);
         } else {
             self.sustained_up_polls = 0;
         }
         if saturated
-            && hysteresis_elapsed
+            && up_allowed
             && self.sustained_up_polls >= self.policy.scale_up_sustained_polls
             && self.active.len() < self.policy.max_workers
         {
@@ -255,7 +276,10 @@ impl DeploymentScaleState {
             }
         }
 
-        if hysteresis_elapsed && self.active.len() > self.policy.min_workers {
+        let down_allowed = self
+            .policy
+            .scale_down_allowed(now_ms, self.last_scale_event_ms);
+        if down_allowed && self.active.len() > self.policy.min_workers {
             let window = self.policy.scale_down_stabilization_window_ms;
             let candidate = self
                 .worker_order
@@ -557,6 +581,7 @@ mod tests {
             max_workers,
             scale_up_queue_depth: 4,
             scale_up_sustained_polls: 3,
+            scale_up_stabilization_window_ms: 0,
             scale_down_stabilization_window_ms: 1_000,
         }
     }
@@ -634,6 +659,106 @@ mod tests {
                 worker: id("worker-b")
             }
         );
+    }
+
+    #[test]
+    fn active_invocations_count_toward_the_scale_up_threshold() {
+        let mut state = state(1, 2);
+        state.note_launched(&id("worker-a"));
+        // Workers do not queue: a full worker reports active work only.
+        let full = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(0, &full), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(1, &full), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(2, &full),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-b")
+            }
+        );
+    }
+
+    /// Scale out right after a scale-in: the scale-down window must not
+    /// hold back a burst (scale-up stabilization defaults to zero).
+    #[test]
+    fn a_burst_scales_up_right_after_a_scale_down() {
+        let mut state = state(1, 2);
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        let idle = observation(&[("worker-a", signals(0, 0)), ("worker-b", signals(0, 0))]);
+        assert_eq!(state.evaluate(0, &idle), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(1_000, &idle),
+            ScaleDecision::MarkDraining {
+                worker: id("worker-b")
+            }
+        );
+        state.note_draining(1_000, &id("worker-b"));
+        assert_eq!(
+            state.evaluate(1_001, &idle),
+            ScaleDecision::StopDrained {
+                worker: id("worker-b")
+            }
+        );
+        state.note_stopped();
+
+        let busy = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(1_002, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(1_003, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(1_004, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-b")
+            }
+        );
+    }
+
+    #[test]
+    fn the_scale_up_window_holds_scale_up_after_a_scale_event() {
+        let mut policy = policy(1, 3);
+        policy.scale_up_stabilization_window_ms = 500;
+        let mut state = DeploymentScaleState::new(
+            id("deployment-1"),
+            policy,
+            vec![id("worker-a"), id("worker-b"), id("worker-c")],
+        );
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        let busy = observation(&[("worker-a", signals(0, 4)), ("worker-b", signals(0, 4))]);
+        for now in [100, 200, 300, 499] {
+            assert_eq!(state.evaluate(now, &busy), ScaleDecision::NoAction);
+        }
+        assert_eq!(state.evaluate(500, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(501, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(502, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-c")
+            }
+        );
+    }
+
+    #[test]
+    fn a_crashed_worker_is_never_picked_as_a_standby() {
+        let mut state = state(1, 3);
+        state.note_launched(&id("worker-a"));
+        state.note_scaled_up(0, &id("worker-b"));
+        // worker-b crashes: the restart controller owns it now.
+        state.note_worker_lost(&id("worker-b"));
+
+        let busy = observation(&[("worker-a", signals(0, 4))]);
+        assert_eq!(state.evaluate(1, &busy), ScaleDecision::NoAction);
+        assert_eq!(state.evaluate(2, &busy), ScaleDecision::NoAction);
+        assert_eq!(
+            state.evaluate(3, &busy),
+            ScaleDecision::ScaleUp {
+                worker: id("worker-c")
+            },
+            "scale-up must take the next free standby, not the crashed worker"
+        );
+
+        // Once its restart reaches readiness it counts as running again.
+        state.note_launched(&id("worker-b"));
+        assert!(state.active().contains(&id("worker-b")));
     }
 
     #[test]
@@ -808,9 +933,9 @@ mod tests {
                 },
                 models_directory: directory.to_path_buf(),
             },
-            max_active_invocations: 1,
+            max_active_invocations: 4,
             max_request_bytes: 4096,
-            max_retained_attempts: 2,
+            max_retained_attempts: 4,
             attempt_retention_secs: 30,
             streaming: true,
             host_kv_pool_budget_bytes: 0,

@@ -753,7 +753,7 @@ impl ShutdownPolicy {
 /// declared replica count and `min_workers` the subset launched at startup.
 /// The remaining declared workers are standby replicas that only scale-up
 /// launches, so the config-time aggregate budget check already proves that
-/// any reachable scale-out state fits the node ledger.
+/// any reachable scale-out state fits the node.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutoscalingConfig {
@@ -783,16 +783,16 @@ impl AutoscalingConfig {
             return Err(ConfigError::EmptyAutoscalingDeployments);
         }
         for (deployment_id, policy) in &self.deployments {
-            let declared = workers
+            let declared: Vec<&WorkerConfig> = workers
                 .iter()
                 .filter(|worker| worker.deployment.deployment_id.as_str() == deployment_id)
-                .count();
-            if declared == 0 {
+                .collect();
+            if declared.is_empty() {
                 return Err(ConfigError::UnknownAutoscalingDeployment(
                     deployment_id.clone(),
                 ));
             }
-            policy.validate(deployment_id, declared)?;
+            policy.validate(deployment_id, &declared)?;
         }
         Ok(())
     }
@@ -809,19 +809,26 @@ impl AutoscalingConfig {
 pub struct DeploymentAutoscalingPolicy {
     pub min_workers: usize,
     pub max_workers: usize,
-    /// Sustained queue depth that drives a scale-up: at least one running
-    /// worker of the deployment must report `queued_invocations` at or above
-    /// this depth for `scale_up_sustained_polls` consecutive evaluations.
+    /// Sustained load that drives a scale-up: at least one running worker
+    /// of the deployment must report this many outstanding invocations
+    /// (active plus queued) for `scale_up_sustained_polls` consecutive
+    /// evaluations. Workers do not queue today, so this is at most the
+    /// workers' `max_active_invocations`.
     pub scale_up_queue_depth: u64,
     pub scale_up_sustained_polls: u32,
-    /// Hysteresis window: no scale event (either direction) may start within
-    /// this window after a previous scale event, and a scale-down candidate
-    /// must stay fully idle for the whole window.
+    /// No scale-up may start within this window after the previous scale
+    /// event. Zero (the default) lets a burst scale out at once.
+    #[serde(default)]
+    pub scale_up_stabilization_window_ms: u64,
+    /// No scale-down may start within this window after the previous scale
+    /// event, and a scale-down candidate must stay fully idle for the whole
+    /// window.
     pub scale_down_stabilization_window_ms: u64,
 }
 
 impl DeploymentAutoscalingPolicy {
-    fn validate(&self, deployment: &str, declared: usize) -> Result<(), ConfigError> {
+    fn validate(&self, deployment: &str, workers: &[&WorkerConfig]) -> Result<(), ConfigError> {
+        let declared = workers.len();
         if self.min_workers == 0 {
             return Err(ConfigError::InvalidAutoscalingPolicy {
                 deployment: deployment.to_string(),
@@ -853,6 +860,15 @@ impl DeploymentAutoscalingPolicy {
                 reason: "scale_up_queue_depth is outside 1..=100000",
             });
         }
+        if workers
+            .iter()
+            .any(|worker| self.scale_up_queue_depth > u64::from(worker.max_active_invocations))
+        {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_queue_depth exceeds a worker's max_active_invocations, so the deployment could never scale up",
+            });
+        }
         if self.scale_up_sustained_polls == 0
             || self.scale_up_sustained_polls > MAX_SCALE_UP_SUSTAINED_POLLS
         {
@@ -869,11 +885,23 @@ impl DeploymentAutoscalingPolicy {
                 reason: "scale_down_stabilization_window_ms is outside 1000..=86400000",
             });
         }
+        if self.scale_up_stabilization_window_ms > MAX_POLICY_DURATION_MS {
+            return Err(ConfigError::InvalidAutoscalingPolicy {
+                deployment: deployment.to_string(),
+                reason: "scale_up_stabilization_window_ms is outside 0..=86400000",
+            });
+        }
         Ok(())
     }
 
-    /// Whether a scale event may start at `now_ms` given the last one.
-    pub fn hysteresis_elapsed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
+    /// Whether a scale-up may start at `now_ms` given the last scale event.
+    pub fn scale_up_allowed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
+        last_scale_event_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= self.scale_up_stabilization_window_ms)
+    }
+
+    /// Whether a scale-down may start at `now_ms` given the last scale event.
+    pub fn scale_down_allowed(&self, now_ms: u64, last_scale_event_ms: Option<u64>) -> bool {
         last_scale_event_ms.is_none_or(|last| {
             now_ms.saturating_sub(last) >= self.scale_down_stabilization_window_ms
         })
@@ -1466,6 +1494,18 @@ mod tests {
                 "min_workers",
                 Box::new(|policy: &mut DeploymentAutoscalingPolicy| policy.min_workers = 0),
             ),
+            (
+                "scale_up_queue_depth above the workers' max_active_invocations",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_queue_depth = 2
+                }),
+            ),
+            (
+                "scale-up stabilization window",
+                Box::new(|policy: &mut DeploymentAutoscalingPolicy| {
+                    policy.scale_up_stabilization_window_ms = MAX_POLICY_DURATION_MS + 1
+                }),
+            ),
         ] {
             let mut config = cpu_config(directory.path());
             let mut autoscaling = autoscaling_config("deployment-1", 1, 1);
@@ -1550,6 +1590,10 @@ scale_down_stabilization_window_ms = 60000
         let policy = autoscaling.policy("deployment-1").unwrap();
         assert_eq!(policy.min_workers, 1);
         assert_eq!(policy.scale_up_queue_depth, 4);
+        assert_eq!(
+            policy.scale_up_stabilization_window_ms, 0,
+            "scale-up is not held back unless configured"
+        );
 
         let unknown_field = toml.replace(
             "scale_down_stabilization_window_ms = 60000",
@@ -1615,8 +1659,9 @@ scale_down_stabilization_window_ms = 60000
                 DeploymentAutoscalingPolicy {
                     min_workers,
                     max_workers,
-                    scale_up_queue_depth: 4,
+                    scale_up_queue_depth: 1,
                     scale_up_sustained_polls: 2,
+                    scale_up_stabilization_window_ms: 0,
                     scale_down_stabilization_window_ms: 60_000,
                 },
             )]),

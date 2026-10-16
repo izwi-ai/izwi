@@ -28,7 +28,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, MissedTickBehavior},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_CLI_ARGUMENTS: usize = 24;
 const MAX_CPU_IDS: usize = 1024;
@@ -516,6 +516,11 @@ enum RolloutOutcome {
     /// Abort could not restore the approvals; everything keeps running and
     /// the state stays non-terminal for a manual `--rollout-abort` retry.
     DegradedAbort,
+}
+
+/// Milliseconds since the supervisor started, from the monotonic clock.
+fn monotonic_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn now_ms() -> u64 {
@@ -1120,6 +1125,17 @@ struct SupervisorMetrics {
 }
 
 impl WorkerSlot {
+    /// Down without a scale decision and waiting for its scheduled restart.
+    fn restart_pending(&self) -> bool {
+        self.process.is_none()
+            && self.restart_at.is_some()
+            && !self.restart.is_quarantined()
+            && self
+                .autoscale
+                .as_ref()
+                .is_none_or(|state| state.phase == AutoscalePhase::Active)
+    }
+
     fn restart_due(&self) -> bool {
         if self
             .autoscale
@@ -1759,13 +1775,15 @@ async fn run_autoscale_tick(
     supervisor_started_at: Instant,
     metrics: &mut SupervisorMetrics,
 ) {
-    let now_ms = now_ms();
     let Some(autoscaling) = node.config().autoscaling.as_ref() else {
         return;
     };
     let approvals_path = autoscaling.shared_approvals_path.clone();
     let deployment_ids: Vec<DeploymentId> = autoscaler.deployments().keys().cloned().collect();
     for deployment_id in deployment_ids {
+        // Monotonic scale-event time: a wall-clock step or a desktop sleep
+        // must not open or close a stabilization window.
+        let now_ms = monotonic_ms(supervisor_started_at);
         if !admit_pending_workers(
             autoscaler,
             &approvals_path,
@@ -1790,7 +1808,7 @@ async fn run_autoscale_tick(
         let decision = autoscaler
             .deployment_mut(&deployment_id)
             .expect("deployment ids come from the autoscaler")
-            .evaluate(now_ms, &observation);
+            .evaluate(monotonic_ms(supervisor_started_at), &observation);
         match decision {
             ScaleDecision::NoAction => {}
             ScaleDecision::ScaleUp { worker } => {
@@ -1814,7 +1832,7 @@ async fn run_autoscale_tick(
                     &deployment_id,
                     &approvals_path,
                     slots,
-                    now_ms,
+                    monotonic_ms(supervisor_started_at),
                     metrics,
                     worker,
                 )
@@ -1884,6 +1902,16 @@ async fn poll_deployment(
     poll_budget: Duration,
 ) -> Option<DeploymentObservation> {
     let state = autoscaler.deployment(deployment_id)?;
+    if let Some(slot) = slots
+        .iter()
+        .find(|slot| state.worker_order().contains(&slot.worker_id) && slot.restart_pending())
+    {
+        debug!(
+            "autoscaling: deployment {deployment_id} holds its decisions while worker {} is restart-pending",
+            slot.worker_id
+        );
+        return None;
+    }
     let mut observation = DeploymentObservation::default();
     for worker in state.active() {
         let slot = slots.iter().find(|slot| &slot.worker_id == worker)?;
