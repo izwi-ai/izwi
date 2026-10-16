@@ -372,6 +372,9 @@ impl NativeExecutor {
         }
 
         let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, ModelSessionResult)>>();
+        // CPU tensors have no thread affinity: the workers run this device
+        // job's work and are joined before it returns.
+        let device_scope = crate::backends::DeviceScope::current();
         thread::scope(|scope| {
             for chunk in partitions {
                 if chunk.is_empty() {
@@ -379,6 +382,7 @@ impl NativeExecutor {
                 }
                 let tx = tx.clone();
                 scope.spawn(move || {
+                    let _device_scope = device_scope.map(crate::backends::DeviceScope::enter);
                     let mut local = Vec::with_capacity(chunk.len());
                     for (idx, scheduled_req) in chunk {
                         let managed_cache = rows.and_then(|rows| {

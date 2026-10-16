@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use serde::Serialize;
 
-use crate::backends::{BackendKind, DeviceKind, DeviceProfile};
+use crate::backends::{BackendKind, DeviceKind, DeviceProfile, DeviceThread};
 use crate::engine::{
     AdapterBindingKey, BatchId, BatchWorkspaceLease, CapacitySource, ExecutionDomain,
     ExecutionGroupId, ModelInstanceId, NativeBatchMode, PhysicalCapacityProvider,
@@ -563,6 +564,9 @@ pub struct InferenceCoordinator {
     host_work: Arc<Semaphore>,
     execution: PhysicalExecutionAdmission,
     resources: Arc<ResourceAuthority>,
+    /// Runs direct inference stages; `None` only for device-less test
+    /// coordinators, whose stages run on the blocking pool.
+    device_thread: Option<Arc<DeviceThread>>,
     admission_gate: Mutex<()>,
     idle: Arc<Notify>,
     active_jobs: AtomicUsize,
@@ -597,14 +601,17 @@ impl InferenceCoordinator {
         max_queued_jobs: usize,
     ) -> Result<Self> {
         let location = validate_device_identity(backend, &device)?;
+        let device_thread = DeviceThread::for_device(&device.device)?;
         let provider = Arc::new(DeviceCapacityProvider::new(backend, device)?);
         let resources = shared_resource_authority(location, provider)?;
-        Ok(Self::with_resource_authority(
+        let mut coordinator = Self::with_resource_authority(
             backend,
             execution_parallelism,
             max_queued_jobs,
             resources,
-        ))
+        );
+        coordinator.device_thread = Some(device_thread);
+        Ok(coordinator)
     }
 
     fn with_resource_authority(
@@ -634,6 +641,7 @@ impl InferenceCoordinator {
                 idle.clone(),
             ),
             resources,
+            device_thread: None,
             admission_gate: Mutex::new(()),
             idle,
             active_jobs: AtomicUsize::new(0),
@@ -644,6 +652,12 @@ impl InferenceCoordinator {
             expired_total: AtomicU64::new(0),
             draining: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn with_device_thread_for_test(mut self, device: Arc<DeviceThread>) -> Self {
+        self.device_thread = Some(device);
+        self
     }
 
     pub fn resource_authority(&self) -> Arc<ResourceAuthority> {
@@ -1836,7 +1850,7 @@ impl InferenceCoordinator {
         let blocking_request_id = request_id.clone();
         let poison_admission = self.execution.clone();
         let poison_resources = self.resources.clone();
-        let handle = tokio::task::spawn_blocking(move || {
+        let job = move || {
             let _guard = guard;
             let _job = retained_job;
             if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
@@ -1862,7 +1876,22 @@ impl InferenceCoordinator {
                 };
             }
             operation()
-        });
+        };
+        // Device work runs on the device's own thread; host preparation and
+        // device-less test coordinators use the blocking pool. Either way a
+        // deadline detaches the job instead of cancelling it.
+        let handle: Pin<Box<dyn Future<Output = Result<Result<T>>> + Send>> =
+            match (&self.device_thread, task_kind) {
+                (Some(device), "inference") => Box::pin(device.submit(job)),
+                _ => {
+                    let handle = tokio::task::spawn_blocking(job);
+                    Box::pin(async move {
+                        handle
+                            .await
+                            .map_err(|error| Error::InferenceError(error.to_string()))
+                    })
+                }
+            };
         let joined = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), handle)
                 .await
@@ -5703,6 +5732,36 @@ Pages free: 10.\n";
             assert_eq!(called.load(Ordering::Relaxed), 0);
             assert_eq!(coordinator.snapshot().expired_total, 1);
         });
+    }
+
+    /// B2: direct inference stages run on the device thread, and a panic
+    /// there still poisons the runtime.
+    #[tokio::test]
+    async fn blocking_inference_runs_on_the_device_thread() {
+        let device = DeviceThread::for_location(DeviceLocation::Cpu).expect("device thread");
+        let coordinator = Arc::new(
+            InferenceCoordinator::new(BackendKind::Cpu, 1, 4).with_device_thread_for_test(device),
+        );
+        let admitted = coordinator.admit(job("device-thread-stage")).await.unwrap();
+        let thread = coordinator
+            .run_blocking_stage(&admitted, || {
+                Ok(std::thread::current().name().map(str::to_string))
+            })
+            .await
+            .expect("stage");
+        assert_eq!(thread.as_deref(), Some("izwi-device-cpu-0"));
+        drop(admitted);
+
+        let panicking = coordinator.admit(job("device-thread-panic")).await.unwrap();
+        let result = coordinator
+            .run_blocking_stage::<(), _>(&panicking, || panic!("device stage panic"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::InferenceError(message))
+                if message.contains("blocking inference task failed")
+        ));
+        assert!(coordinator.snapshot().poisoned);
     }
 
     #[tokio::test]

@@ -88,7 +88,7 @@ use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, TaskType};
 use crate::backends::{
     can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
-    BackendSelectionSource,
+    BackendSelectionSource, DeviceThread,
 };
 use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
@@ -1539,6 +1539,30 @@ pub struct PhysicalBatchExecution<'a> {
     pub scheduled: &'a [ScheduledRequest],
 }
 
+/// Owned inputs of one physical batch: they move to the device thread for
+/// the batch's execution and come back with its result.
+pub(super) trait PhysicalExecutionInputs: Send + 'static {
+    fn with_execution<R>(&self, run: impl FnOnce(PhysicalBatchExecution<'_>) -> R) -> R;
+}
+
+/// Copied inputs for the compatibility entry point.
+struct OwnedPhysicalExecution {
+    batch: PhysicalBatch,
+    requests: Vec<EngineCoreRequest>,
+    scheduled: Vec<ScheduledRequest>,
+}
+
+impl PhysicalExecutionInputs for OwnedPhysicalExecution {
+    fn with_execution<R>(&self, run: impl FnOnce(PhysicalBatchExecution<'_>) -> R) -> R {
+        let requests = self.requests.iter().collect::<Vec<_>>();
+        run(PhysicalBatchExecution {
+            batch: &self.batch,
+            requests: &requests,
+            scheduled: &self.scheduled,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PhysicalDispatchError {
     pub error: Error,
@@ -2959,27 +2983,19 @@ impl NativeExecutor {
         f(registry)
     }
 
+    /// Run one model call, logging a panic before it unwinds to the physical
+    /// boundary. Model calls run on the device thread (the unified executor
+    /// sends every physical batch there), so this no longer moves work off a
+    /// tokio worker.
     fn run_blocking<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
         crate::backends::probe_device_op("model.run_blocking");
-        let run_catching_panic = || {
-            let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            match unwind_result {
-                Ok(result) => result,
-                Err(payload) => {
-                    let message = panic_payload_to_string(payload.as_ref());
-                    error!("Model execution panicked: {message}");
-                    std::panic::resume_unwind(payload)
-                }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = panic_payload_to_string(payload.as_ref());
+                error!("Model execution panicked: {message}");
+                std::panic::resume_unwind(payload)
             }
-        };
-
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                // Long-running CPU inference should not monopolize Tokio workers; this allows
-                // async tasks (including SSE stream forwarding) to continue making progress.
-                tokio::task::block_in_place(run_catching_panic)
-            }
-            _ => run_catching_panic(),
         }
     }
 }
@@ -4222,6 +4238,9 @@ struct BatchWorkspaceContext {
 #[derive(Clone)]
 pub struct UnifiedExecutor {
     inner: Arc<RwLock<Box<dyn ModelExecutor>>>,
+    /// Runs every model call and executor-state drop; `None` only for
+    /// device-less test executors, which run inline.
+    device: Option<Arc<DeviceThread>>,
     batch_workspace: Option<BatchWorkspaceContext>,
     physical_execution_admission: Option<PhysicalExecutionAdmission>,
     pending_quantum_finalizer: Option<Arc<dyn PendingQuantumFinalizer>>,
@@ -4256,7 +4275,15 @@ impl UnifiedExecutor {
         let voxtral_realtime = Arc::new(VoxtralRealtimeStateCoordinator::new());
         let nemotron_realtime = Arc::new(NemotronRealtimeStateCoordinator::new());
         let fish_s2_pending = Arc::new(FishStateCoordinator::new());
+        let device = match DeviceThread::for_device(&config.backend_context.device.device) {
+            Ok(device) => Some(device),
+            Err(error) => {
+                error!("Model execution runs on the calling thread: {error}");
+                None
+            }
+        };
         Self {
+            device,
             inner: Arc::new(RwLock::new(Box::new(
                 NativeExecutor::with_realtime_coordinators(
                     config,
@@ -4279,10 +4306,17 @@ impl UnifiedExecutor {
     pub(crate) fn new_for_test(executor: Box<dyn ModelExecutor>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            device: None,
             batch_workspace: None,
             physical_execution_admission: None,
             pending_quantum_finalizer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_device_for_test(mut self, device: Arc<DeviceThread>) -> Self {
+        self.device = Some(device);
+        self
     }
 
     #[cfg(test)]
@@ -4303,6 +4337,7 @@ impl UnifiedExecutor {
     ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(executor)),
+            device: None,
             batch_workspace: Some(BatchWorkspaceContext { backend, authority }),
             physical_execution_admission: Some(admission),
             pending_quantum_finalizer: None,
@@ -4517,38 +4552,42 @@ impl UnifiedExecutor {
         ))
     }
 
-    /// Execute a batch whose exact physical capacity has already been admitted.
-    pub(super) async fn execute_admitted_physical_batch(
+    /// The admission token, deadline, cancellation and health checks that
+    /// gate device entry; `Some` is the result when the batch must not enter.
+    fn device_entry_refusal(
         &self,
-        admitted: AdmittedPhysicalExecution,
-        batch: &PhysicalBatch,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> PhysicalDispatchResult {
+        admitted: &AdmittedPhysicalExecution,
+        execution: &PhysicalBatchExecution<'_>,
+    ) -> Option<PhysicalDispatchResult> {
+        let PhysicalBatchExecution {
+            batch,
+            requests,
+            scheduled,
+        } = execution;
         if admitted.batch_id != batch.batch_id
             || admitted.lane != batch.lane
             || admitted.width != batch.rows.len().max(1)
         {
-            return Err(PhysicalDispatchError::not_started(
+            return Some(Err(PhysicalDispatchError::not_started(
                 Error::InvalidInput(
                     "physical execution admission does not match its batch envelope".to_string(),
                 ),
                 batch.rows.len().max(1),
                 FailureOrigin::ExecutorValidation,
-            ));
+            )));
         }
         if let Some(deadline) = requests.iter().filter_map(|request| request.deadline).min() {
             if deadline <= std::time::Instant::now() {
-                return Err(PhysicalDispatchError::not_started(
+                return Some(Err(PhysicalDispatchError::not_started(
                     Error::Timeout("physical batch device entry".to_string()),
                     admitted.width,
                     FailureOrigin::DispatchCoordination,
-                ));
+                )));
             }
         }
         if !requests.is_empty() && requests.iter().all(|request| request.is_cancelled()) {
             let dispatch = BatchDispatch::not_dispatched(admitted.width);
-            return Ok(scheduled
+            return Some(Ok(scheduled
                 .iter()
                 .map(|scheduled| {
                     ExecutorStepResult::from_session(
@@ -4559,52 +4598,113 @@ impl UnifiedExecutor {
                     )
                     .with_dispatch(dispatch)
                 })
-                .collect());
+                .collect()));
         }
         if let Some(admission) = &self.physical_execution_admission {
             if let Err(error) = admission.ensure_healthy() {
-                return Err(PhysicalDispatchError::not_started(
+                return Some(Err(PhysicalDispatchError::not_started(
                     error,
                     admitted.width,
                     FailureOrigin::DispatchCoordination,
-                ));
+                )));
             }
         }
-        let _physical_dispatch = begin_engine_physical_dispatch();
-        let executor = self.inner.read().await;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            executor.execute_physical_batch(PhysicalBatchExecution {
-                batch,
-                requests,
-                scheduled,
-            })
-        }));
-        match result {
-            Ok(result) => {
-                drop(executor);
-                drop(admitted);
-                self.latch_fatal_device_fault(batch, &result);
+        None
+    }
+
+    /// Execute a batch whose exact physical capacity has already been
+    /// admitted, on the device thread. The inputs move to the device thread
+    /// and come back with the result. `retained` (and the admission) stay
+    /// alive until the device work ends, even if this future is dropped.
+    pub(super) async fn execute_admitted_physical_batch<D: PhysicalExecutionInputs>(
+        &self,
+        admitted: AdmittedPhysicalExecution,
+        inputs: D,
+        retained: impl Send + 'static,
+    ) -> (D, PhysicalDispatchResult) {
+        if let Some(refusal) =
+            inputs.with_execution(|execution| self.device_entry_refusal(&admitted, &execution))
+        {
+            return (inputs, refusal);
+        }
+        let (batch_id, expected_dispatch) =
+            inputs.with_execution(|execution| {
+                (execution.batch.batch_id, execution.batch.expected_dispatch())
+            });
+        let slot = Arc::new(Mutex::new(Some(inputs)));
+        let job_slot = slot.clone();
+        let run = move |executor: &dyn ModelExecutor| {
+            let _physical_dispatch = begin_engine_physical_dispatch();
+            let inputs = job_slot.lock().unwrap_or_else(|poison| poison.into_inner());
+            let result = inputs
+                .as_ref()
+                .expect("physical batch inputs stay in place until the device job ends")
+                .with_execution(|execution| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        executor.execute_physical_batch(execution)
+                    }))
+                });
+            drop(inputs);
+            drop(admitted);
+            drop(retained);
+            result
+        };
+        let outcome = match &self.device {
+            Some(device) => {
+                let executor = self.inner.clone();
+                device
+                    .submit(move || run(executor.blocking_read().as_ref()))
+                    .await
+            }
+            None => Ok(run(self.inner.read().await.as_ref())),
+        };
+        let inputs = slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .expect("the device job hands its inputs back");
+        let result = match outcome {
+            Ok(Ok(result)) => {
+                inputs.with_execution(|execution| {
+                    self.latch_fatal_device_fault(execution.batch, &result)
+                });
                 result
             }
-            Err(payload) => {
+            Ok(Err(payload)) => {
                 let message = panic_payload_to_string(payload.as_ref());
                 error!(
-                    batch_id = batch.batch_id.get(),
+                    batch_id = batch_id.get(),
                     "Physical model execution panicked after entry: {message}"
                 );
-                record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
-                self.poison_physical_runtime("physical model execution panicked after entry");
-                drop(executor);
-                drop(admitted);
+                self.fail_after_entry("physical model execution panicked after entry");
                 Err(PhysicalDispatchError::started(
                     Error::InferenceError(
                         "physical model execution panicked; runtime must be recreated".to_string(),
                     ),
-                    batch.expected_dispatch(),
+                    expected_dispatch,
                     FailureOrigin::Panic,
                 ))
             }
-        }
+            Err(error) => {
+                // The device job may have run partway: state is unknown.
+                error!(
+                    batch_id = batch_id.get(),
+                    "Physical model execution lost its device job: {error}"
+                );
+                self.fail_after_entry("physical model execution lost its device job");
+                Err(PhysicalDispatchError::started(
+                    error,
+                    expected_dispatch,
+                    FailureOrigin::Panic,
+                ))
+            }
+        };
+        (inputs, result)
+    }
+
+    fn fail_after_entry(&self, reason: &str) {
+        record_engine_physical_fallback(EnginePhysicalFallbackReason::DispatchFailure);
+        self.poison_physical_runtime(reason);
     }
 
     /// Compatibility boundary for callers that do not need to interpose
@@ -4620,8 +4720,14 @@ impl UnifiedExecutor {
             .await?;
         match admitted {
             PhysicalExecutionAdmissionOutcome::Admitted(admitted) => {
-                self.execute_admitted_physical_batch(admitted, batch, requests, scheduled)
+                let inputs = OwnedPhysicalExecution {
+                    batch: batch.clone(),
+                    requests: requests.iter().map(|request| (*request).clone()).collect(),
+                    scheduled: scheduled.to_vec(),
+                };
+                self.execute_admitted_physical_batch(admitted, inputs, ())
                     .await
+                    .1
             }
             PhysicalExecutionAdmissionOutcome::Cancelled => {
                 let dispatch = BatchDispatch::not_dispatched(batch.rows.len().max(1));
@@ -6342,6 +6448,14 @@ mod tests {
 
     #[tokio::test]
     async fn post_entry_panic_poisons_physical_runtime_and_releases_admission() {
+        let device = crate::backends::DeviceThread::for_location(candle_core::DeviceLocation::Cpu)
+            .expect("device thread");
+        for device in [None, Some(device)] {
+            post_entry_panic_poisons_physical_runtime(device).await;
+        }
+    }
+
+    async fn post_entry_panic_poisons_physical_runtime(device: Option<Arc<DeviceThread>>) {
         let authority = Arc::new(ResourceAuthority::new(Arc::new(FixedCapacityProvider {
             capacity: ResourceVector {
                 host_bytes: ResourceAmount::Known(64),
@@ -6349,12 +6463,15 @@ mod tests {
             },
         })));
         let admission = PhysicalExecutionAdmission::standalone(1);
-        let executor = UnifiedExecutor::new_for_test_with_physical_context(
+        let mut executor = UnifiedExecutor::new_for_test_with_physical_context(
             Box::new(PanickingPhysicalExecutor),
             BackendKind::Cpu,
             authority.clone(),
             admission.clone(),
         );
+        if let Some(device) = device {
+            executor = executor.with_device_for_test(device);
+        }
         let mut request = EngineCoreRequest::tts("panic containment");
         request.id = "panic-containment".to_string();
         let (batch, scheduled, lane) = single_row_physical_batch(&request);
@@ -6391,6 +6508,93 @@ mod tests {
                 .await,
             Err(Error::Overloaded(message)) if message.contains("poisoned")
         ));
+    }
+
+    /// Records the thread each physical batch ran on.
+    #[derive(Default)]
+    struct ThreadRecordingExecutor {
+        threads: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl ModelExecutor for ThreadRecordingExecutor {
+        fn execute_physical_batch(
+            &self,
+            execution: PhysicalBatchExecution<'_>,
+        ) -> PhysicalDispatchResult {
+            crate::backends::probe_device_op("test.model_call");
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().map(str::to_string));
+            Ok(execution
+                .scheduled
+                .iter()
+                .map(|scheduled| {
+                    ExecutorStepResult::new(
+                        scheduled,
+                        ExecutorOutput::error(scheduled.request_id.clone(), "recorded"),
+                    )
+                    .with_dispatch(execution.expected_dispatch())
+                })
+                .collect())
+        }
+
+        fn execute_prefill(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical batches use execute_physical_batch")
+        }
+
+        fn execute_decode(
+            &self,
+            _requests: &[&EngineCoreRequest],
+            _scheduled: &[ScheduledRequest],
+        ) -> Result<Vec<ExecutorStepResult>> {
+            unreachable!("physical batches use execute_physical_batch")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn initialize(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// B2: model calls run on the device thread, never on the tokio thread
+    /// that awaits them.
+    #[tokio::test]
+    async fn physical_batches_run_on_the_device_thread() {
+        let watch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::backends::device_thread::watch_off_thread_ops(Some(watch.clone()));
+        let recorder = ThreadRecordingExecutor::default();
+        let threads = recorder.threads.clone();
+        let device = crate::backends::DeviceThread::for_location(candle_core::DeviceLocation::Cpu)
+            .expect("device thread");
+        let executor = UnifiedExecutor::new_for_test(Box::new(recorder)).with_device_for_test(device);
+        let mut request = EngineCoreRequest::tts("device thread");
+        request.id = "device-thread".to_string();
+        let (batch, scheduled, _) = single_row_physical_batch(&request);
+
+        let results = executor
+            .execute_physical_batch(&batch, &[&request], &[scheduled])
+            .await
+            .expect("recorded batch");
+
+        crate::backends::device_thread::watch_off_thread_ops(None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            threads.lock().unwrap().as_slice(),
+            [Some("izwi-device-cpu-0".to_string())]
+        );
+        assert_eq!(watch.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     struct FailingPhysicalExecutor {
