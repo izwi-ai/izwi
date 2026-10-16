@@ -58,10 +58,9 @@ fn bench(profile: DeviceProfile) {
     model
         .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
         .unwrap();
-    let mut position = prompt.len();
     let started = Instant::now();
     let mut last = None;
-    for _ in 0..steps() {
+    for position in prompt.len()..prompt.len() + steps() {
         let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
         last = model
             .text_model
@@ -73,7 +72,6 @@ fn bench(profile: DeviceProfile) {
                 true,
             )
             .unwrap();
-        position += 1;
     }
     let _ = last.unwrap().to_vec2::<f32>().unwrap();
     let forward_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
@@ -86,10 +84,9 @@ fn bench(profile: DeviceProfile) {
     model
         .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
         .unwrap();
-    let mut position = prompt.len();
     let mut encode = std::time::Duration::ZERO;
     let started = Instant::now();
-    for _ in 0..steps() {
+    for position in prompt.len()..prompt.len() + steps() {
         let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
         let call = Instant::now();
         let logits = model
@@ -106,7 +103,6 @@ fn bench(profile: DeviceProfile) {
         encode += call.elapsed();
         device.synchronize().unwrap();
         drop(logits);
-        position += 1;
     }
     let sync_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
     let encode_ms = encode.as_secs_f64() * 1000.0 / steps() as f64;
@@ -121,9 +117,8 @@ fn bench(profile: DeviceProfile) {
     model
         .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
         .unwrap();
-    let mut position = prompt.len();
     let started = Instant::now();
-    for _ in 0..steps() {
+    for position in prompt.len()..prompt.len() + steps() {
         let input = Tensor::from_slice(&[1234u32], (1, 1), &device).unwrap();
         let logits = model
             .text_model
@@ -138,7 +133,6 @@ fn bench(profile: DeviceProfile) {
             .unwrap();
         let finite = diagnostics::finite_flag(&logits).unwrap();
         let _ = packed_greedy_selection(&logits, &finite).unwrap();
-        position += 1;
     }
     let readback_ms = started.elapsed().as_secs_f64() * 1000.0 / steps() as f64;
 
