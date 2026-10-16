@@ -525,6 +525,9 @@ run_hygiene() {
         cargo clippy --locked --workspace --all-targets -- -D warnings -A deprecated
     TAURI_CONFIG="${tauri_check_config}" \
         cargo check --locked --workspace --all-targets
+    # The gateway, transport, launch contract and supervisor stay
+    # accelerator-free, and the worker's backend features match the server's.
+    bash scripts/ci/check-serving-boundary.sh
     bash -n scripts/ci/*.sh scripts/bench/*.sh
     scripts/bench/test-run-kv-cache-matrix.sh
     scripts/test-install-cli-backend-selection.sh
