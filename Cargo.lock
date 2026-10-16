@@ -3835,6 +3835,7 @@ dependencies = [
  "libc",
  "rand 0.8.5",
  "reqwest 0.11.27",
+ "rubato 0.15.0",
  "scalar_api_reference",
  "sea-orm",
  "serde",

@@ -404,6 +404,10 @@ pub enum RealtimeTurnStatus {
 pub enum RealtimeAudioFormat {
     PcmI16,
     PcmF32,
+    /// G.711 μ-law at 8 kHz, one byte a sample.
+    G711Ulaw,
+    /// G.711 A-law at 8 kHz, one byte a sample.
+    G711Alaw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

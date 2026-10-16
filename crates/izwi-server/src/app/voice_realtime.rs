@@ -25,7 +25,6 @@ use izwi_agent::{
     ModelRequest, NoopTool, ReasoningFilter, TimeTool, ToolRegistry, TurnInput,
 };
 use izwi_core::{
-    audio::{AudioEncoder, AudioFormat},
     parse_chat_model_variant, parse_model_variant, parse_tts_model_variant,
     resolve_asr_model_variant, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
     GenerationConfig, GenerationParams, GenerationRequest, RuntimeRequestContext, RuntimeService,
@@ -41,6 +40,7 @@ use serde_json::json;
 use tokio::sync::Notify;
 use tracing::warn;
 
+use crate::app::realtime_codec::{AudioOutputEncoder, OutputAudioFormat};
 use crate::app::realtime_protocol::{
     RealtimeAudioFormat, RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode,
     RealtimeCloseReason, RealtimeErrorCode, RealtimeEventEnvelope, RealtimeInterruptionReason,
@@ -74,6 +74,8 @@ const MAX_UTTERANCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_UTTERANCE_PCM16_SAMPLES: usize = (MAX_UTTERANCE_BYTES - 44) / 2;
 const WS_BIN_MAGIC: &[u8; 4] = b"IVWS";
 const WS_BIN_KIND_ASSISTANT_PCM16: u8 = 2;
+const WS_BIN_KIND_ASSISTANT_G711_ULAW: u8 = 3;
+const WS_BIN_KIND_ASSISTANT_G711_ALAW: u8 = 4;
 const WS_BIN_ASSISTANT_HEADER_LEN: usize = 24;
 const DEFAULT_STREAM_VAD_THRESHOLD: f32 = DEFAULT_SPEECH_THRESHOLD;
 const DEFAULT_STREAM_MIN_SPEECH_MS: u32 = DEFAULT_MIN_SPEECH_MS;
@@ -269,7 +271,9 @@ impl OutboundTx {
         };
         if frame.len() >= WS_BIN_ASSISTANT_HEADER_LEN
             && frame.get(..4) == Some(WS_BIN_MAGIC.as_slice())
-            && frame.get(5).copied() == Some(WS_BIN_KIND_ASSISTANT_PCM16)
+            && frame.get(5).is_some_and(|kind| {
+                (WS_BIN_KIND_ASSISTANT_PCM16..=WS_BIN_KIND_ASSISTANT_G711_ALAW).contains(kind)
+            })
         {
             let chunk_sequence =
                 u32::from_le_bytes([frame[16], frame[17], frame[18], frame[19]]) as u64;
@@ -454,6 +458,9 @@ enum ClientEvent {
         barge_in_min_speech_ms: Option<u32>,
         #[serde(default)]
         input_sample_rate: Option<u32>,
+        /// `pcm_i16` (default), `g711_ulaw` or `g711_alaw`.
+        #[serde(default)]
+        output_audio_format: Option<String>,
     },
     InputStreamStop,
     Interrupt {
@@ -499,6 +506,7 @@ struct ModularVoiceTurnConfig {
     speaker: Option<String>,
     asr_language: Option<String>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -506,6 +514,7 @@ struct UnifiedVoiceTurnConfig {
     s2s_model_id: String,
     speaker: Option<String>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -914,6 +923,13 @@ impl VoiceTurnConfig {
         match self {
             Self::Modular(config) => config.speaker.clone(),
             Self::Unified(config) => config.speaker.clone(),
+        }
+    }
+
+    fn output_format(&self) -> OutputAudioFormat {
+        match self {
+            Self::Modular(config) => config.output_format,
+            Self::Unified(config) => config.output_format,
         }
     }
 
@@ -1507,23 +1523,31 @@ fn normalize_stream_vad_threshold(value: Option<f32>) -> f32 {
         .unwrap_or(DEFAULT_STREAM_VAD_THRESHOLD)
 }
 
+/// An assistant audio frame: the 24-byte header (magic, version, kind,
+/// flags, utterance sequence, chunk sequence, sample rate) and the payload
+/// in the session's output format, which the kind names.
 fn encode_assistant_audio_binary_frame(
+    format: OutputAudioFormat,
     utterance_seq: u64,
     chunk_seq: u32,
     sample_rate: u32,
     is_final: bool,
-    payload_pcm16: &[u8],
+    payload: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(WS_BIN_ASSISTANT_HEADER_LEN + payload_pcm16.len());
+    let mut out = Vec::with_capacity(WS_BIN_ASSISTANT_HEADER_LEN + payload.len());
     out.extend_from_slice(WS_BIN_MAGIC);
     out.push(crate::app::realtime_transport::WS_BIN_VERSION);
-    out.push(WS_BIN_KIND_ASSISTANT_PCM16);
+    out.push(match format {
+        OutputAudioFormat::PcmI16 => WS_BIN_KIND_ASSISTANT_PCM16,
+        OutputAudioFormat::G711Ulaw => WS_BIN_KIND_ASSISTANT_G711_ULAW,
+        OutputAudioFormat::G711Alaw => WS_BIN_KIND_ASSISTANT_G711_ALAW,
+    });
     let flags: u16 = if is_final { 1 } else { 0 };
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&utterance_seq.to_le_bytes());
     out.extend_from_slice(&chunk_seq.to_le_bytes());
     out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(payload_pcm16);
+    out.extend_from_slice(payload);
     out
 }
 
@@ -1735,6 +1759,7 @@ async fn handle_text_message(
             pre_roll_ms,
             barge_in_min_speech_ms,
             input_sample_rate,
+            output_audio_format,
         } => {
             if !conn.started {
                 return Err("Session not started. Send `session_start` first.".to_string());
@@ -1755,6 +1780,7 @@ async fn handle_text_message(
             let normalized_speaker = speaker
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let output_format = OutputAudioFormat::parse(output_audio_format.as_deref())?;
             let normalized_asr_language = asr_language
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -1801,6 +1827,7 @@ async fn handle_text_message(
                         max_output_tokens: max_output_tokens
                             .unwrap_or(VOICE_DEFAULT_MAX_OUTPUT_TOKENS)
                             .clamp(1, 4096),
+                        output_format,
                     })
                 }
                 RealtimeVoiceMode::Unified => {
@@ -1822,6 +1849,7 @@ async fn handle_text_message(
                         s2s_model_id,
                         speaker: normalized_speaker,
                         max_output_tokens: max_output_tokens.unwrap_or(1536).clamp(1, 4096),
+                        output_format,
                     })
                 }
             };
@@ -1874,6 +1902,7 @@ async fn handle_text_message(
                 out_tx,
                 json!({
                     "type": "input_stream_ready",
+                    "output_audio_format": output_format.as_str(),
                     "vad": {
                         "backend": "earshot",
                         "threshold": conn.streaming_input.as_ref().map(|s| s.config.vad_threshold),
@@ -2425,6 +2454,7 @@ fn spawn_turn_task(
                             &system_prompt,
                             history_messages,
                             config.max_output_tokens,
+                            config.output_format,
                             audio_bytes.as_slice(),
                             runtime_context,
                             &control,
@@ -2728,6 +2758,8 @@ struct ReplyAudio<'a> {
     utterance_id: &'a str,
     utterance_seq: u64,
     output_generation: u64,
+    format: OutputAudioFormat,
+    encoder: Option<AudioOutputEncoder>,
     announced_rate: Option<u32>,
     chunk_seq: u32,
     first_text_at: Option<Instant>,
@@ -2738,6 +2770,7 @@ impl ReplyAudio<'_> {
     fn rate(&mut self, chunk_rate: u32) -> Result<u32, String> {
         let (sample_rate, first) = realtime_chunk_rate(&mut self.announced_rate, chunk_rate)?;
         if first {
+            self.encoder = Some(AudioOutputEncoder::new(self.format, sample_rate)?);
             send_turn_json(
                 self.out_tx,
                 self.output_generation,
@@ -2745,8 +2778,8 @@ impl ReplyAudio<'_> {
                     "type": "assistant_audio_start",
                     "utterance_id": self.utterance_id,
                     "utterance_seq": self.utterance_seq,
-                    "sample_rate": sample_rate,
-                    "audio_format": "pcm_i16",
+                    "sample_rate": self.format.wire_rate(sample_rate),
+                    "audio_format": self.format.as_str(),
                 }),
             );
         }
@@ -2760,13 +2793,21 @@ impl ReplyAudio<'_> {
         if samples.is_empty() && !is_final {
             return Ok(());
         }
-        let encoded = AudioEncoder::new(sample_rate, 1)
-            .encode(samples, AudioFormat::RawI16)
-            .map_err(|err| format!("Failed to encode streamed TTS chunk: {err}"))?;
+        let Some(encoder) = self.encoder.as_mut() else {
+            return Ok(());
+        };
+        let mut encoded = encoder.encode(samples)?;
+        if is_final {
+            encoded.extend(encoder.finish()?);
+        } else if encoded.is_empty() {
+            // The resampler holds this audio for the next chunk.
+            return Ok(());
+        }
         let frame = encode_assistant_audio_binary_frame(
+            self.format,
             self.utterance_seq,
             self.chunk_seq,
-            sample_rate,
+            self.format.wire_rate(sample_rate),
             is_final,
             &encoded,
         );
@@ -2830,6 +2871,8 @@ async fn speak_reply(
         utterance_id: &commit.utterance_id,
         utterance_seq: commit.utterance_seq,
         output_generation,
+        format: commit.turn_config.output_format(),
+        encoder: None,
         announced_rate: None,
         chunk_seq: 0,
         first_text_at: None,
@@ -3026,6 +3069,7 @@ async fn stream_unified_s2s_to_socket(
     system_prompt: &str,
     history_messages: Vec<ChatMessage>,
     max_output_tokens: usize,
+    output_format: OutputAudioFormat,
     audio_bytes: &[u8],
     runtime_context: RuntimeRequestContext,
     control: &TurnControl,
@@ -3055,12 +3099,12 @@ async fn stream_unified_s2s_to_socket(
             "type": "assistant_audio_start",
             "utterance_id": utterance_id,
             "utterance_seq": utterance_seq,
-            "sample_rate": 24_000,
-            "audio_format": "pcm_i16",
+            "sample_rate": output_format.wire_rate(24_000),
+            "audio_format": output_format.as_str(),
         }),
     );
 
-    let encoder = AudioEncoder::new(24_000, 1);
+    let mut encoder: Option<AudioOutputEncoder> = None;
     let delivery_error = Arc::new(Mutex::new(None::<String>));
     let params = GenerationParams {
         max_tokens: max_output_tokens.clamp(1, 4096),
@@ -3108,20 +3152,30 @@ async fn stream_unified_s2s_to_socket(
                     }
 
                     if !chunk.samples.is_empty() {
-                        match encoder.encode(&chunk.samples, AudioFormat::RawI16) {
+                        let encoded = match encoder.as_mut() {
+                            Some(encoder) => encoder.encode(&chunk.samples),
+                            None => {
+                                AudioOutputEncoder::new(output_format, chunk.sample_rate.max(1))
+                                    .and_then(|created| {
+                                        encoder.insert(created).encode(&chunk.samples)
+                                    })
+                            }
+                        };
+                        match encoded {
                             Ok(encoded) => {
                                 let chunk_seq = u32::try_from(chunk.sequence).unwrap_or(u32::MAX);
+                                let model_rate = chunk.sample_rate.max(1);
                                 let frame = encode_assistant_audio_binary_frame(
+                                    output_format,
                                     utterance_seq,
                                     chunk_seq,
-                                    chunk.sample_rate.max(1),
+                                    output_format.wire_rate(model_rate),
                                     chunk.is_final,
                                     &encoded,
                                 );
-                                let sample_count = encoded.len() / std::mem::size_of::<i16>();
-                                let duration_ms = (sample_count as u64)
+                                let duration_ms = (chunk.samples.len() as u64)
                                     .saturating_mul(1_000)
-                                    .checked_div(chunk.sample_rate.max(1) as u64)
+                                    .checked_div(u64::from(model_rate))
                                     .unwrap_or(0);
                                 match out_tx.try_send_audio(
                                     output_generation,
@@ -3635,6 +3689,8 @@ fn map_typed_voice_event(
                 .and_then(serde_json::Value::as_str)
             {
                 Some("pcm_f32") => RealtimeAudioFormat::PcmF32,
+                Some("g711_ulaw") => RealtimeAudioFormat::G711Ulaw,
+                Some("g711_alaw") => RealtimeAudioFormat::G711Alaw,
                 _ => RealtimeAudioFormat::PcmI16,
             },
         },
@@ -4449,12 +4505,80 @@ mod tests {
         );
     }
 
+    /// SPK-F11: a session that asked for G.711 gets μ-law frames at 8 kHz,
+    /// announced as such, one byte a sample.
+    #[tokio::test]
+    async fn the_reply_goes_out_in_the_session_codec() {
+        let (_dir, state) = test_app_state(4);
+        let out_tx = OutboundTx::new(state.runtime.clone(), "voice test");
+        let control = TurnControl::new(Instant::now());
+        let commit = PendingAudioCommit {
+            utterance_id: "utt-1".to_string(),
+            utterance_seq: 1,
+            turn_config: VoiceTurnConfig::Modular(ModularVoiceTurnConfig {
+                asr_model_id: "Parakeet-TDT-0.6B-v3".to_string(),
+                text_model_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+                tts_model_id: "Kokoro-82M".to_string(),
+                speaker: None,
+                asr_language: None,
+                max_output_tokens: 64,
+                output_format: OutputAudioFormat::G711Ulaw,
+            }),
+            endpointed_at: Instant::now(),
+            endpointing_delay: None,
+        };
+        let (deltas, delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        deltas.send("Hello there.".to_string()).expect("delta");
+        drop(deltas);
+        speak_reply(
+            &state,
+            &out_tx,
+            &commit,
+            &control,
+            1,
+            delta_rx,
+            Instant::now(),
+            fake_synthesis(Arc::default()),
+        )
+        .await
+        .expect("spoken");
+
+        out_tx.close();
+        let (mut start, mut payload, mut kinds) = (None, 0, Vec::new());
+        while let Some(output) = out_tx.mailbox.next().await {
+            match output {
+                crate::app::realtime_transport::MailboxOutput::Message(Message::Text(text)) => {
+                    let event: serde_json::Value =
+                        serde_json::from_str(text.as_str()).expect("json");
+                    if event["type"] == "assistant_audio_start" {
+                        start = Some(event);
+                    }
+                }
+                crate::app::realtime_transport::MailboxOutput::Message(Message::Binary(frame)) => {
+                    kinds.push(frame[5]);
+                    assert_eq!(&frame[20..24], &8_000_u32.to_le_bytes());
+                    payload += frame.len() - WS_BIN_ASSISTANT_HEADER_LEN;
+                }
+                _ => {}
+            }
+        }
+        let start = start.expect("audio start");
+        assert_eq!(start["audio_format"], "g711_ulaw");
+        assert_eq!(start["sample_rate"], 8_000);
+        assert!(kinds
+            .iter()
+            .all(|kind| *kind == WS_BIN_KIND_ASSISTANT_G711_ULAW));
+        // 300 samples at 1 kHz is 2 400 at 8 kHz, one byte each.
+        assert!((payload as i64 - 2_400).abs() <= 16, "{payload} bytes");
+    }
+
     fn test_streaming_input() -> StreamingInputState {
         StreamingInputState::new(StreamingInputConfig {
             turn_config: VoiceTurnConfig::Unified(UnifiedVoiceTurnConfig {
                 s2s_model_id: "LFM2.5-Audio-1.5B".to_string(),
                 speaker: None,
                 max_output_tokens: 32,
+                output_format: OutputAudioFormat::PcmI16,
             }),
             vad_threshold: DEFAULT_STREAM_VAD_THRESHOLD,
             min_speech_ms: 50,

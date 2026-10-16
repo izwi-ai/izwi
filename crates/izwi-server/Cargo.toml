@@ -58,6 +58,7 @@ async-trait = "0.1"
 izwi-hooks = { path = "../izwi-hooks" }
 izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
+rubato = { workspace = true }
 izwi-gateway = { path = "../izwi-gateway" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
