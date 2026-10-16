@@ -4,6 +4,7 @@ pub mod capabilities;
 pub mod cuda_plan;
 pub mod cuda_runtime;
 pub mod device;
+pub mod device_thread;
 pub mod kv;
 pub mod model_io;
 pub mod policy;
@@ -27,6 +28,9 @@ pub use device::{
     DTypeSelection, DTypeSelectionError, DTypeSelectionPolicy, DTypeSelectionRequest,
     DeviceCapabilities, DeviceKind, DeviceProfile, DeviceSelector, MetalDTypeOverride,
     METAL_DTYPE_ENV, METAL_PAGED_ATTENTION_SUPPORTS_BF16,
+};
+pub use device_thread::{
+    device_ops_off_thread_total, probe_device_op, DeviceScope, DeviceThread, DeviceThreadKey,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,
