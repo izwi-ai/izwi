@@ -3427,6 +3427,9 @@ mod tests {
             .local_addr()
             .expect("probe address");
         let credentials = first.config().credentials.clone();
+        // CLI defaults come from the environment, which other tests set
+        // under this lock (IZWI_GATEWAY_TOPOLOGY, for one).
+        let env = crate::test_support::env_lock();
         let mut args = parse(&[
             "izwi-server",
             "--role",
@@ -3442,6 +3445,7 @@ mod tests {
             "--worker-model-generation",
             "1",
         ]);
+        drop(env);
         args.gateway_worker_endpoints = vec![first.endpoint(), format!("http://{late_address}/")];
         args.gateway_worker_status_poll_ms = 50;
 
