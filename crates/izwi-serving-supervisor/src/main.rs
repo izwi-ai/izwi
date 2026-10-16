@@ -2677,6 +2677,104 @@ mod tests {
         }
     }
 
+    /// The runbook promises that autoscaling decisions hold while a worker
+    /// of the deployment waits for a restart: a crashed scale-up must not
+    /// be replaced by another standby before its own restart settles.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn autoscaling_holds_decisions_while_a_worker_is_restart_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["work", "run", "models"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        // A worker that exits at once: every launch fails readiness.
+        let worker_binary = root.path().join("worker");
+        std::fs::write(&worker_binary, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&worker_binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let assignment = DeviceAssignment::Cpu {
+            thread_budget: 1,
+            affinity: vec![1],
+            host_memory_limit_bytes: 512,
+        };
+        let mut config = config(assignment, WorkerBinaryFlavor::Cpu);
+        config.working_directory = root.path().join("work");
+        config.runtime_directory = root.path().join("run");
+        config.workers[0].deployment.models_directory = root.path().join("models");
+        config.restart.initial_backoff_ms = 60_000;
+        config.restart.maximum_backoff_ms = 60_000;
+        config.autoscaling = Some(izwi_serving_supervisor::AutoscalingConfig {
+            shared_approvals_path: root.path().join("approvals"),
+            evaluation_interval_ms: 1_000,
+            deployments: BTreeMap::from([(
+                "deployment-a".to_string(),
+                izwi_serving_supervisor::DeploymentAutoscalingPolicy {
+                    min_workers: 1,
+                    max_workers: 1,
+                    scale_up_queue_depth: 1,
+                    scale_up_sustained_polls: 1,
+                    scale_up_stabilization_window_ms: 0,
+                    scale_down_stabilization_window_ms: 1_000,
+                },
+            )]),
+        });
+        let inventory = HostInventory {
+            effective_cpu_ids: vec![1],
+            allocatable_host_memory_bytes: 4096,
+            metal_devices: Vec::new(),
+            cuda_devices: Vec::new(),
+        };
+        let binaries = BinaryCatalog::new([(
+            WorkerBinaryFlavor::Cpu,
+            BinaryRecord {
+                path: worker_binary,
+                supported_backends: vec![BackendKind::Cpu],
+            },
+        )]);
+        let node = Arc::new(config.validate(&inventory, &binaries).unwrap());
+        let supervision = Arc::new(Supervision::new(
+            LockNamespace::open(root.path().join("run")).unwrap(),
+            BTreeMap::new(),
+            1,
+        ));
+        let slot = WorkerSlot::new(
+            WorkerActor::spawn(
+                Arc::clone(&node),
+                id("worker-a"),
+                ResolvedWorkerSecret {
+                    bearer_token: ServiceBearerToken::new("private-worker-secret").unwrap(),
+                },
+                supervision,
+            )
+            .unwrap(),
+        );
+        let autoscaler = Autoscaler::from_config(&node).unwrap();
+        let deployment = id::<DeploymentId>("deployment-a");
+        let slots = std::slice::from_ref(&slot);
+        let poll = || poll_deployment(&autoscaler, slots, &deployment, Duration::from_secs(1));
+        assert!(poll().await.is_some(), "an idle deployment is observable");
+
+        let before = slot.actor.view().launch_counts();
+        slot.actor.start();
+        assert_eq!(
+            slot.actor.launch_outcome(before).await,
+            LaunchOutcome::Failed
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(slot.actor.view().phase, WorkerPhase::RestartPending { .. }) {
+            assert!(
+                Instant::now() < deadline,
+                "the failed launch schedules a restart"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            poll().await.is_none(),
+            "decisions hold while a worker of the deployment is restart-pending"
+        );
+        slot.actor.shut_down().await;
+    }
+
     #[test]
     fn ensure_flavor_binaries_requires_the_configured_lanes() {
         let metal = DeviceAssignment::Metal {
