@@ -58,7 +58,10 @@ use super::request::{
     RealtimeAsrOperationWaiter, RealtimeAsrTerminalOutcome, RequestStatus, StreamProgressBudget,
     STREAM_PROGRESS_MAX_BUFFERED_BYTES, STREAM_PROGRESS_QUEUE_CAPACITY,
 };
-use super::scheduler::{BeginTerminalRelease, Scheduler, SchedulerConfig, TerminalReleaseCause};
+use super::scheduler::{
+    BeginTerminalRelease, ExecutionLane, LaneSelection, Scheduler, SchedulerConfig,
+    TerminalReleaseCause,
+};
 use super::types::{
     AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
 };
@@ -281,10 +284,12 @@ struct InFlightPhysicalDispatch {
     output_visibility: OutputVisibility,
     managed_cache_reservations: Vec<super::ManagedCacheReservation>,
     launch_policy: PhysicalLaunchPolicy,
+    /// Execution lanes of the rows, fixed at registration.
+    lanes: Vec<ExecutionLane>,
 }
 
 impl InFlightPhysicalDispatch {
-    fn from_prepared(dispatch: &PreparedPhysicalDispatch) -> Self {
+    fn from_prepared(dispatch: &PreparedPhysicalDispatch, lanes: Vec<ExecutionLane>) -> Self {
         Self {
             registered_at: Instant::now(),
             phase: dispatch.phase(),
@@ -293,6 +298,7 @@ impl InFlightPhysicalDispatch {
             output_visibility: dispatch.output_visibility(),
             managed_cache_reservations: dispatch.managed_cache_reservations().to_vec(),
             launch_policy: dispatch.launch_policy(),
+            lanes,
         }
     }
 
@@ -3138,6 +3144,30 @@ impl EngineCore {
         Ok((budget, stage.shape_policy))
     }
 
+    /// The execution lane of a tracked request.
+    fn request_lane(&self, request_id: &RequestId) -> ExecutionLane {
+        self.requests
+            .get(request_id)
+            .and_then(|request| request.model_instance_id())
+    }
+
+    /// Lanes with a dispatch in flight.
+    fn busy_lanes(&self) -> HashSet<ExecutionLane> {
+        self.in_flight_dispatches
+            .values()
+            .flat_map(|dispatch| dispatch.lanes.iter().copied())
+            .collect()
+    }
+
+    /// Dispatches in flight in `lanes`: during a prepare, the ones this
+    /// step registered, since a busy lane is never admitted.
+    fn dispatches_in_flight_in(&self, lanes: &LaneSelection) -> usize {
+        self.in_flight_dispatches
+            .values()
+            .filter(|dispatch| dispatch.lanes.iter().all(|lane| lanes.admits(*lane)))
+            .count()
+    }
+
     fn allocate_batch_id(&mut self) -> Result<BatchId> {
         let batch_id = BatchId::new(self.next_batch_id);
         self.next_batch_id = self.next_batch_id.checked_add(1).ok_or_else(|| {
@@ -3150,14 +3180,33 @@ impl EngineCore {
         &mut self,
         dispatch: &PreparedPhysicalDispatch,
     ) -> Result<()> {
-        let in_flight = InFlightPhysicalDispatch::from_prepared(dispatch);
+        let mut lanes = dispatch
+            .scheduled()
+            .iter()
+            .map(|row| self.request_lane(&row.request_id))
+            .collect::<Vec<_>>();
+        lanes.sort_unstable();
+        lanes.dedup();
+        let in_flight = InFlightPhysicalDispatch::from_prepared(dispatch, lanes);
         let batch_id = in_flight.physical_batch.batch_id;
         let candidate_limit = self
             .config
             .resolved_physical_execution_capacity()
             .candidate_dispatch_limit
             .get();
-        if self.in_flight_dispatches.len() >= candidate_limit {
+        // The candidate limit is per lane: another lane's dispatch in
+        // flight does not own this lane's slots.
+        let lane_in_flight = self
+            .in_flight_dispatches
+            .values()
+            .filter(|active| {
+                active
+                    .lanes
+                    .iter()
+                    .any(|lane| in_flight.lanes.contains(lane))
+            })
+            .count();
+        if lane_in_flight >= candidate_limit {
             return Err(Error::InferenceError(
                 "physical dispatch candidate limit is already fully owned".to_string(),
             ));
@@ -3287,14 +3336,14 @@ impl EngineCore {
         // could only open a later assembly is deferred before preparation, so
         // formation never stages more transactions than one step launches
         // (candidate limit x batch width), the bound automatic staged rows use.
+        // Callers net the tickets this step already registered out of
+        // `max_candidates`; other lanes' tickets own no slot of this step.
         let candidate_limit = self
             .config
             .resolved_physical_execution_capacity()
             .candidate_dispatch_limit
             .get();
-        let available_candidates = candidate_limit
-            .saturating_sub(self.in_flight_dispatches.len())
-            .min(max_candidates);
+        let available_candidates = candidate_limit.min(max_candidates);
 
         for scheduled in scheduled {
             if !available.contains(&scheduled.request_id) {
@@ -4886,12 +4935,10 @@ impl EngineCore {
             self.initialize().await?;
         }
 
-        // Decode and prefill share one physical-quantum ownership fence. The
-        // current rollout remains strictly serial, so do not poll the
-        // scheduler again until the registered ticket commits or rolls back.
-        if !self.in_flight_dispatches.is_empty() {
-            return Ok(None);
-        }
+        // Decode and prefill of one lane share one physical-quantum
+        // ownership fence: a lane with a registered ticket is not polled
+        // again until it commits or rolls back. Other lanes schedule.
+        let lanes = LaneSelection::all().excluding(self.busy_lanes());
 
         let blocked = std::mem::take(&mut self.workspace_pressure)
             .into_values()
@@ -4918,9 +4965,10 @@ impl EngineCore {
         self.refresh_scheduler_execution_profiles().await;
         self.reconcile_due_cleanup().await;
         let (managed_kv_cache, requests) = (&mut self.managed_kv_cache, &mut self.requests);
-        let schedule_result = self.scheduler.schedule_with_prefix_probe(&mut |session| {
-            reprobe_managed_prefix(managed_kv_cache, requests, session)
-        });
+        let schedule_result = self.scheduler.schedule_with_prefix_probe(
+            &mut |session| reprobe_managed_prefix(managed_kv_cache, requests, session),
+            &lanes,
+        );
 
         // Reconcile capability-authoritative state for expired sessions before
         // newly scheduled work executes.
@@ -5100,7 +5148,7 @@ impl EngineCore {
             };
         }
 
-        let decode_limit = candidate_capacity.saturating_sub(self.in_flight_dispatches.len());
+        let decode_limit = candidate_capacity.saturating_sub(self.dispatches_in_flight_in(&lanes));
         if decode_quota > 0 && decode_limit > 0 {
             decode_batches = match self.form_decode_side(
                 &mixed_requests,
@@ -5136,7 +5184,7 @@ impl EngineCore {
                 SequencePhase::Decode => !decode_batches.is_empty(),
                 SequencePhase::Prefill => !prefill_batches.is_empty(),
             };
-            if both_phases && !preferred_admitted && self.in_flight_dispatches.is_empty() {
+            if both_phases && !preferred_admitted && self.dispatches_in_flight_in(&lanes) == 0 {
                 match self.next_single_candidate_phase {
                     SequencePhase::Decode => {
                         prefill_batches = match self.form_physical_batches(
@@ -12996,6 +13044,60 @@ mod tests {
         assert!(core.active_managed_cache.is_empty());
         assert!(core.active_stream_batches.is_empty());
         drop(decode);
+    }
+
+    #[tokio::test]
+    async fn in_flight_fence_holds_only_its_own_lane() {
+        let executor = UnifiedExecutor::new_for_test(Box::new(MockExecutor::new(Arc::new(
+            Mutex::new(Vec::new()),
+        ))));
+        let config = EngineCoreConfig {
+            max_batch_size: 1,
+            max_tokens_per_step: 1,
+            min_tokens_per_step: 1,
+            enable_chunked_prefill: false,
+            enable_adaptive_batching: false,
+            block_size: 1,
+            max_blocks: 8,
+            ..Default::default()
+        };
+        let mut core = EngineCore::new_with_unified_executor(config, executor).unwrap();
+        for (id, model) in [("lane-a", 501), ("lane-b", 502)] {
+            let mut request = EngineCoreRequest::tts(id);
+            request.id = id.to_string();
+            request.prompt_tokens = vec![1];
+            request
+                .bind_model_instance(ModelInstanceId::new(model))
+                .unwrap();
+            core.add_request(request).unwrap();
+        }
+
+        let first = core.prepare_step().await.unwrap().expect("first lane");
+        assert_eq!(core.in_flight_dispatches.len(), 1);
+        // The other lane prepares while the first lane's ticket is in flight;
+        // the first lane is not polled again.
+        let second = core.prepare_step().await.unwrap().expect("second lane");
+        assert_eq!(core.in_flight_dispatches.len(), 2);
+        let lanes = core
+            .in_flight_dispatches
+            .values()
+            .flat_map(|dispatch| dispatch.lanes.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            lanes,
+            HashSet::from([
+                Some(ModelInstanceId::new(501)),
+                Some(ModelInstanceId::new(502)),
+            ])
+        );
+        assert!(core.prepare_step().await.unwrap().is_none());
+
+        for prepared in [first, second] {
+            let executed = core.execute_prepared_with_progress(prepared).await.unwrap();
+            core.commit_step(executed).await.unwrap();
+        }
+        assert!(core.in_flight_dispatches.is_empty());
+        assert!(core.active_plans.is_empty());
     }
 
     #[tokio::test]

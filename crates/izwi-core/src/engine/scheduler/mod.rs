@@ -21,7 +21,9 @@ use super::execution::{
 };
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{Priority, RequestId, SequenceId, TaskType};
-use super::{InputRange, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit};
+use super::{
+    InputRange, ModelInstanceId, PlanId, RealtimeOperationId, SequencePhase, SessionKey, WorkUnit,
+};
 use crate::model::ModelVariant;
 
 pub(super) const MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL: usize = 8;
@@ -38,6 +40,49 @@ const MAX_MANAGED_PREFIX_CURSOR_LOSSES: u8 = 2;
 /// Schedule-time managed prefix probe for one exact session: the cursor its
 /// first prefill span may start at, or `None` for a zero-start prefill.
 pub(crate) type ManagedPrefixProbe<'a> = dyn FnMut(&SessionKey) -> Option<u32> + 'a;
+
+/// The execution lane of a request: the loaded model instance it is bound
+/// to. Rows with no bound instance share the unbound lane (`None`).
+pub(crate) type ExecutionLane = Option<ModelInstanceId>;
+
+/// The lanes one schedule may serve. A lane with a dispatch in flight is
+/// busy: none of its rows is scheduled until that dispatch commits or rolls
+/// back, so its decode rows cannot be planned twice. Other lanes schedule
+/// as usual.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaneSelection {
+    only: Option<ExecutionLane>,
+    busy: HashSet<ExecutionLane>,
+}
+
+impl LaneSelection {
+    /// Every lane.
+    pub(crate) fn all() -> Self {
+        Self::default()
+    }
+
+    /// One lane only.
+    pub(crate) fn only(lane: ExecutionLane) -> Self {
+        Self {
+            only: Some(lane),
+            busy: HashSet::new(),
+        }
+    }
+
+    /// This selection without `busy` lanes.
+    pub(crate) fn excluding(mut self, busy: impl IntoIterator<Item = ExecutionLane>) -> Self {
+        self.busy.extend(busy);
+        self
+    }
+
+    pub(crate) fn admits(&self, lane: ExecutionLane) -> bool {
+        self.only.is_none_or(|only| only == lane) && !self.busy.contains(&lane)
+    }
+
+    fn is_unrestricted(&self) -> bool {
+        self.only.is_none() && self.busy.is_empty()
+    }
+}
 
 /// Scheduling policy for the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -555,6 +600,7 @@ struct RequestMetadata {
     sequence_id: SequenceId,
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
+    lane: ExecutionLane,
     priority: Priority,
     workload_class: WorkloadClass,
     tenant_key: Option<[u8; 32]>,
@@ -777,6 +823,7 @@ impl Scheduler {
             sequence_id,
             task_type: request.task_type,
             model_variant: request.model_variant,
+            lane: request.model_instance_id(),
             priority: request.priority,
             workload_class: request.workload_class,
             tenant_key: request.tenant_key,
@@ -836,6 +883,7 @@ impl Scheduler {
                 sequence_id,
                 task_type: request.task_type,
                 model_variant: request.model_variant,
+                lane: request.model_instance_id(),
                 priority: request.priority,
                 workload_class: request.workload_class,
                 tenant_key: request.tenant_key,
@@ -1084,21 +1132,44 @@ impl Scheduler {
 
     /// Schedule requests for the next step.
     pub fn schedule(&mut self) -> ScheduleResult {
-        self.schedule_inner(None)
+        self.schedule_inner(None, &LaneSelection::all())
     }
 
-    /// [`Self::schedule`], re-probing the managed prefix index for every
-    /// resumable prefill selected before it has made progress (SCH-F7).
+    /// [`Self::schedule`] for the rows of `lanes` only, re-probing the
+    /// managed prefix index for every resumable prefill selected before it
+    /// has made progress (SCH-F7).
     pub(crate) fn schedule_with_prefix_probe(
         &mut self,
         probe: &mut ManagedPrefixProbe<'_>,
+        lanes: &LaneSelection,
     ) -> ScheduleResult {
-        self.schedule_inner(Some(probe))
+        self.schedule_inner(Some(probe), lanes)
+    }
+
+    /// Whether `lanes` admits the request's lane.
+    fn lane_admits(&self, lanes: &LaneSelection, request_id: &RequestId) -> bool {
+        lanes.is_unrestricted()
+            || self
+                .requests
+                .get(request_id)
+                .is_some_and(|metadata| lanes.admits(metadata.lane))
+    }
+
+    /// Waiting requests in `lanes`.
+    fn waiting_in(&self, lanes: &LaneSelection) -> usize {
+        if lanes.is_unrestricted() {
+            return self.waiting_count();
+        }
+        self.waiting_members
+            .iter()
+            .filter(|request_id| self.lane_admits(lanes, request_id))
+            .count()
     }
 
     fn schedule_inner(
         &mut self,
         mut prefix_probe: Option<&mut ManagedPrefixProbe<'_>>,
+        lanes: &LaneSelection,
     ) -> ScheduleResult {
         let mut result = ScheduleResult::empty();
         result.expired_requests = self.expire_deadlines();
@@ -1110,25 +1181,27 @@ impl Scheduler {
         self.update_dynamic_budget();
 
         let total_budget = self.current_token_budget();
-        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now);
+        let waiting_in_lanes = self.waiting_in(lanes);
+        let waiting_full_prefill = self.has_eligible_full_prefill(scheduling_now, lanes);
         let force_full_prefill_service = waiting_full_prefill
             && self.decode_only_steps_with_waiting_full_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_FULL_PREFILL;
-        let waiting_incremental_prefill = self.has_eligible_incremental_prefill(scheduling_now);
+        let waiting_incremental_prefill =
+            self.has_eligible_incremental_prefill(scheduling_now, lanes);
         let force_incremental_prefill_service = !force_full_prefill_service
             && waiting_incremental_prefill
             && self.decode_only_steps_with_waiting_incremental_prefill
                 >= MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL;
-        let latency_sensitive_waiting = self.has_latency_sensitive_waiting();
+        let latency_sensitive_waiting = self.has_latency_sensitive_waiting(lanes);
         let throughput_waiting_only =
-            !latency_sensitive_waiting && self.has_throughput_or_background_waiting();
+            !latency_sensitive_waiting && self.has_throughput_or_background_waiting(lanes);
         let mut decode_budget = total_budget;
         let mut reserved_prefill_budget = 0;
         // When every live request runs mixed steps, prefill spans share the
         // decode dispatch: decode rows take their tokens first and prefill
         // spans the rest of one budget, so no slice is reserved for a slot
         // the phases no longer contend for.
-        let unified_budget = self.all_requests_mixed();
+        let unified_budget = self.all_requests_mixed(lanes);
         if !unified_budget && self.config.enable_adaptive_batching && total_budget > 0 {
             let target_ttft_ms = self.config.target_ttft_ms;
             let mut prefill_share: f64 = if self.telemetry.avg_ttft_ms > target_ttft_ms {
@@ -1152,7 +1225,7 @@ impl Scheduler {
             decode_budget = total_budget.saturating_sub(reserved_prefill_budget);
         } else if !unified_budget
             && self.config.policy == SchedulingPolicy::WeightedFair
-            && !self.waiting_members.is_empty()
+            && waiting_in_lanes > 0
             && total_budget > 0
         {
             reserved_prefill_budget = total_budget.clamp(1, 32);
@@ -1186,7 +1259,7 @@ impl Scheduler {
         // transactions reach the bound, yield this transaction entirely.
         let reserve_ordinary_decode = self.realtime_only_steps_with_ready_decode
             >= MAX_REALTIME_ONLY_STEPS_WITH_READY_DECODE
-            && self.ordinary_decode_ready(scheduling_now, false);
+            && self.ordinary_decode_ready(scheduling_now, false, lanes);
 
         // Realtime operations are already admitted, session-fenced quanta.
         // Schedule at most one FIFO head per session and keep their source
@@ -1196,7 +1269,10 @@ impl Scheduler {
             .realtime_sessions
             .iter()
             .filter_map(|(request_id, state)| {
-                (state.in_flight.is_none() && !state.pending.is_empty()).then_some((
+                (state.in_flight.is_none()
+                    && !state.pending.is_empty()
+                    && self.lane_admits(lanes, request_id))
+                .then_some((
                     state.last_service_clock,
                     state.sequence_id,
                     request_id.clone(),
@@ -1252,7 +1328,7 @@ impl Scheduler {
         // opportunity for AR to refill other streams' audio buffers. Codec and
         // AR rows form separate lanes, so the reserved transaction is AR-only.
         let reserve_ordinary_decode = self.audio_only_steps_with_ready_decode >= 4
-            && self.ordinary_decode_ready(scheduling_now, true);
+            && self.ordinary_decode_ready(scheduling_now, true, lanes);
         let mut finalize_candidates = self
             .running
             .iter()
@@ -1261,6 +1337,7 @@ impl Scheduler {
                     && !running.finalize_in_flight
                     && !running.audio_decode_in_flight
                     && !self.realtime_sessions.contains_key(*id)
+                    && self.lane_admits(lanes, id)
             })
             .filter_map(|(id, running)| {
                 let metadata = self.requests.get(id)?;
@@ -1345,7 +1422,9 @@ impl Scheduler {
             .filter(|(_, r)| {
                 r.prefill_complete && !r.finalize_pending && r.audio_decode_pending.is_none()
             })
-            .filter(|(id, _)| !self.realtime_sessions.contains_key(*id))
+            .filter(|(id, _)| {
+                !self.realtime_sessions.contains_key(*id) && self.lane_admits(lanes, id)
+            })
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
                 if self.capacity_waiting(metadata) {
@@ -1480,6 +1559,7 @@ impl Scheduler {
         let highest_waiting_priority = self
             .waiting_members
             .iter()
+            .filter(|request_id| self.lane_admits(lanes, request_id))
             .filter_map(|request_id| self.requests.get(request_id).map(|m| m.priority))
             .max();
         let effective_prefill_chunk_threshold = self.effective_prefill_chunk_threshold();
@@ -1519,7 +1599,7 @@ impl Scheduler {
                 break;
             }
             if self.config.policy == SchedulingPolicy::WeightedFair
-                && !self.waiting_members.is_empty()
+                && waiting_in_lanes > 0
                 && remaining_batch <= 1
             {
                 break;
@@ -1562,7 +1642,7 @@ impl Scheduler {
             let num_tokens = self.decode_token_quanta(
                 remaining_decode_budget,
                 remaining_decode_tokens,
-                self.waiting_count() > 0,
+                waiting_in_lanes > 0,
                 overdue_ms,
                 workload_class,
                 preferred_decode_tokens,
@@ -1584,7 +1664,7 @@ impl Scheduler {
                 "model_preference"
             } else if remaining_decode_budget <= 1 || remaining_decode_tokens <= 1 {
                 "token_budget"
-            } else if self.waiting_count() > 0 || self.running.len() > 1 {
+            } else if waiting_in_lanes > 0 || self.running.len() > 1 {
                 "peer_fairness"
             } else if overdue_ms > 0.0 && !sustained_decode_quantum {
                 "soft_deadline"
@@ -1653,7 +1733,9 @@ impl Scheduler {
         let mut incomplete_prefill_candidates: Vec<_> = self
             .running
             .iter()
-            .filter(|(_, r)| !r.prefill_complete && !r.prefill_in_flight)
+            .filter(|(id, r)| {
+                !r.prefill_complete && !r.prefill_in_flight && self.lane_admits(lanes, id)
+            })
             .filter_map(|(id, r)| {
                 let metadata = self.requests.get(id)?;
                 if self.capacity_waiting(metadata) {
@@ -1731,6 +1813,7 @@ impl Scheduler {
                 &metadata,
                 effective_prefill_chunk_threshold,
                 has_decode_demand,
+                waiting_in_lanes,
                 remaining_prefill_budget,
             );
             if !full_prefill
@@ -1836,6 +1919,10 @@ impl Scheduler {
             if self.running.contains_key(&request_id) {
                 continue;
             }
+            if !lanes.admits(metadata.lane) {
+                deferred_waiting.push(request_id);
+                continue;
+            }
 
             // Calculate tokens for this prefill. A probed managed prefix
             // cursor makes the shared-prefix span start above zero; the
@@ -1877,6 +1964,7 @@ impl Scheduler {
                 &metadata,
                 effective_prefill_chunk_threshold,
                 has_decode_demand,
+                waiting_in_lanes,
                 remaining_prefill_budget,
             );
 
@@ -1999,12 +2087,18 @@ impl Scheduler {
     /// Whether a non-realtime row can take a token decode step now.
     /// `token_rows_only` excludes rows whose next quantum is codec or
     /// finalization work.
-    fn ordinary_decode_ready(&self, now: Instant, token_rows_only: bool) -> bool {
+    fn ordinary_decode_ready(
+        &self,
+        now: Instant,
+        token_rows_only: bool,
+        lanes: &LaneSelection,
+    ) -> bool {
         self.running.iter().any(|(request_id, running)| {
             running.prefill_complete
                 && !(token_rows_only
                     && (running.finalize_pending || running.audio_decode_pending.is_some()))
                 && !self.realtime_sessions.contains_key(request_id)
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     running.num_tokens_generated < metadata.max_tokens
                         && !self.capacity_waiting(metadata)
@@ -2015,12 +2109,15 @@ impl Scheduler {
 
     /// Whether every live non-realtime request runs mixed steps, so decode
     /// rows and prefill spans share one token budget.
-    fn all_requests_mixed(&self) -> bool {
+    fn all_requests_mixed(&self, lanes: &LaneSelection) -> bool {
         let mut live = self
             .running
             .keys()
             .chain(self.waiting_members.iter())
-            .filter(|request_id| !self.realtime_sessions.contains_key(*request_id))
+            .filter(|request_id| {
+                !self.realtime_sessions.contains_key(*request_id)
+                    && self.lane_admits(lanes, request_id)
+            })
             .peekable();
         live.peek().is_some()
             && live.all(|request_id| {
@@ -2547,7 +2644,7 @@ impl Scheduler {
             )
         };
         let served_ordinary = committed.iter().any(|work| !realtime(work));
-        if served_ordinary || !self.ordinary_decode_ready(now, false) {
+        if served_ordinary || !self.ordinary_decode_ready(now, false, &LaneSelection::all()) {
             self.realtime_only_steps_with_ready_decode = 0;
         } else {
             self.realtime_only_steps_with_ready_decode =
@@ -2562,7 +2659,7 @@ impl Scheduler {
                 WorkUnit::SequenceAudioDecode { .. } | WorkUnit::SequenceFinalize { .. }
             )
         });
-        if served_token_decode || !self.ordinary_decode_ready(now, true) {
+        if served_token_decode || !self.ordinary_decode_ready(now, true, &LaneSelection::all()) {
             self.audio_only_steps_with_ready_decode = 0;
         } else if served_codec {
             self.audio_only_steps_with_ready_decode =
@@ -3717,33 +3814,38 @@ impl Scheduler {
             + (prompt_bonus * 0.2)
     }
 
-    fn has_latency_sensitive_waiting(&self) -> bool {
+    fn has_latency_sensitive_waiting(&self, lanes: &LaneSelection) -> bool {
         self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .map(|metadata| metadata.workload_class.is_latency_sensitive())
-                .unwrap_or(false)
+            self.lane_admits(lanes, request_id)
+                && self
+                    .requests
+                    .get(request_id)
+                    .map(|metadata| metadata.workload_class.is_latency_sensitive())
+                    .unwrap_or(false)
         })
     }
 
-    fn has_throughput_or_background_waiting(&self) -> bool {
+    fn has_throughput_or_background_waiting(&self, lanes: &LaneSelection) -> bool {
         self.waiting_members.iter().any(|request_id| {
-            self.requests
-                .get(request_id)
-                .map(|metadata| {
-                    matches!(
-                        metadata.workload_class,
-                        WorkloadClass::Batch | WorkloadClass::Background
-                    )
-                })
-                .unwrap_or(false)
+            self.lane_admits(lanes, request_id)
+                && self
+                    .requests
+                    .get(request_id)
+                    .map(|metadata| {
+                        matches!(
+                            metadata.workload_class,
+                            WorkloadClass::Batch | WorkloadClass::Background
+                        )
+                    })
+                    .unwrap_or(false)
         })
     }
 
-    fn has_eligible_full_prefill(&self, now: Instant) -> bool {
+    fn has_eligible_full_prefill(&self, now: Instant, lanes: &LaneSelection) -> bool {
         let running_full = self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
                 && !running.prefill_in_flight
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Full
                         && !self.capacity_waiting(metadata)
@@ -3753,7 +3855,8 @@ impl Scheduler {
         running_full
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Full
+                    lanes.admits(metadata.lane)
+                        && metadata.cache_policy.prefill == PrefillMode::Full
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
@@ -3774,10 +3877,11 @@ impl Scheduler {
         })
     }
 
-    fn has_eligible_incremental_prefill(&self, now: Instant) -> bool {
+    fn has_eligible_incremental_prefill(&self, now: Instant, lanes: &LaneSelection) -> bool {
         let running_incremental = self.running.iter().any(|(request_id, running)| {
             !running.prefill_complete
                 && !running.prefill_in_flight
+                && self.lane_admits(lanes, request_id)
                 && self.requests.get(request_id).is_some_and(|metadata| {
                     metadata.cache_policy.prefill == PrefillMode::Incremental
                         && !self.capacity_waiting(metadata)
@@ -3787,7 +3891,8 @@ impl Scheduler {
         running_incremental
             || self.waiting_members.iter().any(|request_id| {
                 self.requests.get(request_id).is_some_and(|metadata| {
-                    metadata.cache_policy.prefill == PrefillMode::Incremental
+                    lanes.admits(metadata.lane)
+                        && metadata.cache_policy.prefill == PrefillMode::Incremental
                         && !self.capacity_waiting(metadata)
                         && metadata.retry_not_before.is_none_or(|retry| retry <= now)
                 })
@@ -3856,10 +3961,11 @@ impl Scheduler {
         metadata: &RequestMetadata,
         threshold: usize,
         has_decode_demand: bool,
+        waiting: usize,
         remaining_budget: usize,
     ) -> (usize, usize) {
         let preferred = metadata.cache_policy.preferred_prefill_tokens;
-        let isolated = !has_decode_demand && self.running.len() <= 1 && self.waiting_count() <= 1;
+        let isolated = !has_decode_demand && self.running.len() <= 1 && waiting <= 1;
         if isolated && preferred > threshold {
             (preferred, remaining_budget.max(preferred))
         } else {
@@ -4001,6 +4107,7 @@ mod tests {
             sequence_id: 1,
             task_type: TaskType::Chat,
             model_variant: None,
+            lane: None,
             priority: Priority::Normal,
             workload_class: WorkloadClass::default(),
             tenant_key: None,
@@ -4222,11 +4329,14 @@ mod tests {
 
         let mut probes = 0;
         for (offered, expected_start) in [(64, 64), (48, 48), (32, 0)] {
-            let scheduled = scheduler.schedule_with_prefix_probe(&mut |probed| {
-                assert_eq!(probed, &session);
-                probes += 1;
-                Some(offered)
-            });
+            let scheduled = scheduler.schedule_with_prefix_probe(
+                &mut |probed| {
+                    assert_eq!(probed, &session);
+                    probes += 1;
+                    Some(offered)
+                },
+                &LaneSelection::all(),
+            );
             let row = scheduled
                 .prefill_requests
                 .iter()
@@ -6113,7 +6223,7 @@ mod tests {
         scheduler
             .record_committed_batch_service(&[("decode-row".to_string(), SequencePhase::Decode)]);
 
-        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now()));
+        assert!(!scheduler.has_eligible_incremental_prefill(Instant::now(), &LaneSelection::all()));
         assert_eq!(
             scheduler.decode_only_steps_with_waiting_incremental_prefill,
             MAX_DECODE_ONLY_STEPS_WITH_WAITING_INCREMENTAL_PREFILL
