@@ -2406,11 +2406,10 @@ impl ManagedKvCacheManager {
                 } else {
                     let request = reserve_request
                         .as_ref()
-                        .expect("non-window reservation exists")
-                        .clone();
+                        .expect("non-window reservation exists");
                     match coordinator.reserve(request.clone()) {
                         Err(KvCoordinatorError::WriteConflict) => {
-                            let mut copy_on_write = request;
+                            let mut copy_on_write = request.clone();
                             for intent in &mut copy_on_write.groups[0].blocks {
                                 if let KvBlockIntent::Writable(source) = *intent {
                                     *intent = KvBlockIntent::CopyOnWrite(source);
@@ -2529,23 +2528,12 @@ impl ManagedKvCacheManager {
                 abort_domains(state, txn_id, &domains);
                 return Err(error);
             }
-            let old = prepared
-                .expected
-                .groups
-                .iter()
-                .flat_map(|group| group.blocks.iter().copied())
-                .collect::<HashSet<_>>();
-            let fresh = prepared
-                .writable_blocks
-                .iter()
-                .copied()
-                .filter(|block| !old.contains(block))
-                .collect::<Vec<_>>();
+            let fresh = &prepared.fresh_blocks;
             if !fresh.is_empty() {
                 let arena = runtime
                     .arena(group.arena)
                     .expect("resolved arena allocated");
-                if let Err(error) = arena.zero_pages(&fresh).and_then(|fence| fence.wait()) {
+                if let Err(error) = arena.zero_pages(fresh).and_then(|fence| fence.wait()) {
                     let _ = coordinator.abort(txn_id);
                     abort_domains(state, txn_id, &domains);
                     return Err(error);
@@ -3121,7 +3109,7 @@ impl ManagedKvCacheManager {
             };
             let coordinator = state
                 .coordinators
-                .get(&domain.arena)
+                .get_mut(&domain.arena)
                 .expect("reservation arena has a coordinator");
             let commit = coordinator.stage_commit_with_prefix_updates(
                 reservation.txn_id,
