@@ -520,6 +520,43 @@ pub(super) fn gguf_shaped_test_tokenizer(architecture: Option<&str>) -> Result<A
 mod tests {
     use super::*;
 
+    /// QFA-6 on the real aligner tokenizer (vocab.json + merges.txt, no
+    /// tokenizer.json): ids equal Qwen2TokenizerFast's. Goldens from
+    /// `tokenizers` 0.22.2 with transformers 4.57's `Qwen2Converter` pipeline
+    /// (NFC, Qwen2 split regex, byte-level BPE) over the same files,
+    /// 2026-10-15. The first six differed under the GPT-2 split.
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint"]
+    fn aligner_tokenizer_matches_qwen2_tokenizer_fast() {
+        let models = std::env::var("IZWI_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::data_local_dir()
+                    .expect("data dir")
+                    .join("izwi")
+                    .join("models")
+            });
+        let tokenizer = AsrTokenizer::load(&models.join("Qwen3-ForcedAligner-0.6B"), 152_064)
+            .expect("aligner tokenizer");
+        let goldens: [(&str, &[u32]); 12] = [
+            ("well-known", &[9157, 21309]),
+            ("e-mail", &[68, 11468]),
+            ("DON'T", &[84641, 17323]),
+            ("IT'S", &[952, 13272]),
+            ("rock'n'roll", &[20521, 43786, 6, 1100]),
+            ("cafe\u{301}", &[924, 58858]),
+            ("don't", &[15007, 944]),
+            ("COVID-19", &[77963, 12, 16, 24]),
+            ("2026", &[17, 15, 17, 21]),
+            ("你好", &[108386]),
+            ("안녕", &[126246, 144370]),
+            ("AIautonomous", &[15469, 2717, 29846]),
+        ];
+        for (word, ids) in goldens {
+            assert_eq!(tokenizer.encode_text(word).unwrap(), ids, "{word}");
+        }
+    }
+
     #[test]
     fn gguf_qwen3_asr_tokenizer_gains_the_official_added_tokens() {
         let tokenizer = gguf_shaped_test_tokenizer(Some("qwen3_asr")).unwrap();

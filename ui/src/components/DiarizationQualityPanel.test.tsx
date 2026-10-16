@@ -62,4 +62,25 @@ describe("DiarizationQualityPanel", () => {
       }),
     );
   });
+
+  it("lists the pipeline warnings stored with the record", () => {
+    render(
+      <DiarizationQualityPanel
+        record={{
+          ...record,
+          warnings: [
+            "Forced aligner unavailable (out of memory); word timings are estimated, not aligned",
+          ],
+        }}
+        onRerun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Pipeline warning")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Forced aligner unavailable (out of memory); word timings are estimated, not aligned",
+      ),
+    ).toBeInTheDocument();
+  });
 });

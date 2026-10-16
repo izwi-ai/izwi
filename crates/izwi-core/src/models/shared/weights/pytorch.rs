@@ -146,7 +146,9 @@ fn read_tensor_from_zip(path: &Path, info: &TensorInfo, member_path: &str) -> Re
         let reversed_shape = info.layout.dims().iter().rev().copied().collect::<Vec<_>>();
         let tensor = Tensor::from_raw_buffer(&raw, info.dtype, &reversed_shape, &Device::Cpu)?;
         let perm = (0..rank).rev().collect::<Vec<_>>();
-        tensor.permute(perm)?
+        // A permuted view would reach conv kernels strided; Candle 0.11's
+        // im2col convs multiply a strided kernel as if it were row-major.
+        tensor.permute(perm)?.contiguous()?
     } else {
         Tensor::from_raw_buffer(&raw, info.dtype, info.layout.dims(), &Device::Cpu)?
     };
@@ -251,5 +253,119 @@ impl PthTensorMap {
             tensors.insert(name.clone(), tensor);
         }
         Ok(tensors)
+    }
+}
+
+/// Torch-free `.pth` fixtures for loader tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::Write;
+    use std::path::Path;
+
+    use candle_core::Tensor;
+
+    fn unicode(pickle: &mut Vec<u8>, value: &str) {
+        pickle.push(b'X');
+        pickle.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        pickle.extend_from_slice(value.as_bytes());
+    }
+
+    fn global(pickle: &mut Vec<u8>, module: &str, name: &str) {
+        pickle.push(b'c');
+        pickle.extend_from_slice(format!("{module}\n{name}\n").as_bytes());
+    }
+
+    fn int_tuple(pickle: &mut Vec<u8>, values: &[usize]) {
+        pickle.push(b'(');
+        for &value in values {
+            pickle.push(b'J');
+            pickle.extend_from_slice(&(value as i32).to_le_bytes());
+        }
+        pickle.push(b't');
+    }
+
+    /// Write `tensor` (F32) as the one-entry state dict `{name: tensor}`, in
+    /// the zip/pickle layout `torch.save` produces. With `fortran`, the
+    /// storage is column-major, as for a tensor saved from a transposed view.
+    pub(crate) fn write_f32_state_dict(path: &Path, name: &str, tensor: &Tensor, fortran: bool) {
+        let dims = tensor.dims().to_vec();
+        let rank = dims.len();
+        let (storage, strides) = if fortran {
+            let reversed = (0..rank).rev().collect::<Vec<_>>();
+            let mut strides = Vec::with_capacity(rank);
+            let mut stride = 1;
+            for &dim in &dims {
+                strides.push(stride);
+                stride *= dim;
+            }
+            (
+                tensor.permute(reversed).unwrap().contiguous().unwrap(),
+                strides,
+            )
+        } else {
+            (tensor.contiguous().unwrap(), tensor.stride().to_vec())
+        };
+        let values = storage.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let mut pickle = vec![0x80, 0x02, b'}'];
+        unicode(&mut pickle, name);
+        global(&mut pickle, "torch._utils", "_rebuild_tensor_v2");
+        pickle.push(b'(');
+        pickle.push(b'(');
+        unicode(&mut pickle, "storage");
+        global(&mut pickle, "torch", "FloatStorage");
+        unicode(&mut pickle, "0");
+        unicode(&mut pickle, "cpu");
+        pickle.push(b'J');
+        pickle.extend_from_slice(&(values.len() as i32).to_le_bytes());
+        pickle.extend_from_slice(b"tQ");
+        pickle.extend_from_slice(&[b'K', 0]);
+        int_tuple(&mut pickle, &dims);
+        int_tuple(&mut pickle, &strides);
+        pickle.push(0x89);
+        global(&mut pickle, "collections", "OrderedDict");
+        pickle.extend_from_slice(b")RtRs.");
+
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("archive/data.pkl", options).unwrap();
+        zip.write_all(&pickle).unwrap();
+        zip.start_file("archive/data/0", options).unwrap();
+        for value in values {
+            zip.write_all(&value.to_le_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fortran_ordered_pth_tensor_loads_contiguous() {
+        let dir = std::env::temp_dir().join(format!("izwi-pth-fortran-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reference = Tensor::arange(0f32, 24., &Device::Cpu)
+            .unwrap()
+            .reshape((2, 3, 4))
+            .unwrap();
+        for fortran in [false, true] {
+            let path = dir.join(format!("w-{fortran}.pth"));
+            test_support::write_f32_state_dict(&path, "w", &reference, fortran);
+            let map = PthTensorMap::open(&path, None).unwrap();
+            let info = &map.tensor_infos["w"];
+            assert_eq!(info.layout.is_fortran_contiguous(), fortran);
+
+            let loaded = map.get("w", &Device::Cpu, None).unwrap().unwrap();
+            assert!(loaded.is_contiguous(), "fortran={fortran}");
+            assert_eq!(
+                loaded.to_vec3::<f32>().unwrap(),
+                reference.to_vec3::<f32>().unwrap(),
+                "fortran={fortran}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

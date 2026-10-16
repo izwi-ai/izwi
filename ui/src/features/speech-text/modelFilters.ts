@@ -40,7 +40,13 @@ export function isDiarizationPipelineAsrModel(model: ModelInfo): boolean {
   if (model.variant === GRANITE_SPEECH_PLUS_VARIANT) {
     return false;
   }
-  return hasCapability(model, "openai_audio_transcriptions");
+  // The pipeline transcribes as a speech-to-text job: audio-chat models
+  // serve /audio/transcriptions but cannot run one, and the server rejects
+  // them as the pipeline ASR.
+  return (
+    hasCapability(model, "openai_audio_transcriptions") &&
+    hasCapability(model, "speech_to_text_jobs")
+  );
 }
 
 export function isDiarizationPipelineAlignerModel(model: ModelInfo): boolean {

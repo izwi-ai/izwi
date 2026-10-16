@@ -11,6 +11,12 @@
 //!   and one decoder layer's prefill live set over the chunk's prompt (the two
 //!   run as separate stages), plus one decode logits row.
 //!
+//! The forced aligner (ADM-5) reuses the formulas for one alignment window:
+//! its prompt holds the reference words beside the audio, its classifier
+//! scores only the timestamp rows, its portable prefill attends by query
+//! blocks, and its convolution stem runs by slices; each window is reserved
+//! as a stage workspace when it runs, not held at load.
+//!
 //! Activations are priced at F32 on every backend (the families compute
 //! softmax, norms and logits in F32 even when their weights are half
 //! precision), so the envelope is an upper bound for the half-precision
@@ -26,6 +32,11 @@ use crate::catalog::ModelFamily;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::architectures::parakeet::asr::parakeet_preparation_bytes;
+use crate::models::architectures::qwen3::asr::{
+    qwen3_aligner_max_words, qwen3_audio_cnn_chunk_bytes, qwen3_audio_cnn_slice_chunks,
+    QWEN3_ALIGNER_MAX_AUDIO_SECONDS,
+};
+use crate::models::architectures::qwen3::core::QWEN3_STATELESS_QUERY_BLOCK;
 
 const F32_BYTES: u64 = 4;
 const CANONICAL_SAMPLE_RATE: u64 = 16_000;
@@ -46,9 +57,18 @@ const HIDDEN_PLANES: u64 = 6;
 const FF_PLANES: u64 = 2;
 /// Attention scores and their softmax.
 const SCORE_PLANES: u64 = 2;
+/// The portable causal prefill's scores per query block: scaled, masked and
+/// softmaxed copies are alive together.
+const BLOCKED_SCORE_PLANES: u64 = 3;
 /// Fixed host allowance for request bookkeeping, tokenization and buffers
 /// the formulas do not name.
 const HOST_BASE_BYTES: u64 = 16 * 1024 * 1024;
+/// Candle's Metal pool rounds every buffer up to a power of two and reuses a
+/// free buffer only when it is at least as large (`buf_size`,
+/// `find_available_buffer` in `metal_backend/device.rs`), so a Metal working
+/// set can take up to twice its tensor bytes. A 175 s aligner window
+/// measured 1.6×; the aligner's Metal envelope is priced at the bound.
+const METAL_POOL_ROUNDING: u64 = 2;
 
 /// What one ASR request holds while it runs, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,6 +127,35 @@ pub(crate) struct AsrEnvelopeGeometry {
     pub(crate) prompt_tokens: u64,
     pub(crate) decoder: StackGeometry,
     pub(crate) vocab: u64,
+    /// The audio convolution stem, when it is priced (`None`: folded into
+    /// the encoder estimate).
+    pub(crate) conv_stem: Option<ConvStemGeometry>,
+    /// The forced aligner's text side; `None` for ASR.
+    pub(crate) forced_alignment: Option<ForcedAlignmentGeometry>,
+}
+
+/// A convolution stem over 1 s feature chunks that runs by slices of whole
+/// chunks (`AudioTower::conv_stem`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConvStemGeometry {
+    pub(crate) channels: u64,
+    pub(crate) mel_bins: u64,
+    pub(crate) chunk_frames: u64,
+    /// Feature rows (mel bins / 8) and frames per chunk after the stem.
+    pub(crate) output_rows: u64,
+    pub(crate) output_frames: u64,
+    pub(crate) conv_chunksize: usize,
+}
+
+/// What a forced-alignment window adds to the ASR formulas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ForcedAlignmentGeometry {
+    /// Prompt tokens per aligned word: its text and two timestamp markers.
+    pub(crate) tokens_per_word: f32,
+    /// Classifier rows per word (its start and end timestamps).
+    pub(crate) scored_rows_per_word: u64,
+    /// Query rows per block of the portable causal prefill.
+    pub(crate) query_block: u64,
 }
 
 const fn stack(hidden: u64, ff: u64, heads: u64) -> StackGeometry {
@@ -131,6 +180,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: 448,
             decoder: stack(1280, 5120, 20),
             vocab: 51_866,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // Audio tower after its ×8 convolution stem: 13 positions per second.
         ModelVariant::Qwen3Asr06BGguf => AsrEnvelopeGeometry {
@@ -142,6 +193,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: PROMPT_TEXT_TOKENS,
             decoder: stack(1024, 3072, 16),
             vocab: 151_936,
+            conv_stem: None,
+            forced_alignment: None,
         },
         ModelVariant::Qwen3Asr17BGguf => AsrEnvelopeGeometry {
             max_chunk_secs: CHUNK_SECS,
@@ -152,6 +205,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: PROMPT_TEXT_TOKENS,
             decoder: stack(2048, 6144, 16),
             vocab: 151_936,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // FastConformer at 12.5 positions per second; an RNN-T prediction
         // network and joint (13,088 outputs) instead of an LLM decoder.
@@ -164,6 +219,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: 0,
             decoder: stack(640, 640, 1),
             vocab: 13_088,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // Conformer over 50 positions per second in 4 s attention blocks;
         // the projector emits 10 audio tokens per second.
@@ -176,6 +233,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: PROMPT_TEXT_TOKENS,
             decoder: stack(2048, 8192, 32),
             vocab: 100_353,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // The retained route takes one 60 s tokenizer chunk (450 audio
         // tokens) and 512 prompt tokens; the σ-VAE tokenizers are
@@ -189,6 +248,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: 512,
             decoder: stack(3584, 18_944, 28),
             vocab: 152_064,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // Causal Whisper-style encoder at 50 positions per second, 12.5
         // audio tokens per second into the decoder.
@@ -201,6 +262,8 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: PROMPT_TEXT_TOKENS,
             decoder: stack(3072, 9216, 32),
             vocab: 131_072,
+            conv_stem: None,
+            forced_alignment: None,
         },
         // FastConformer at 12.5 positions per second into the LFM2 backbone.
         ModelVariant::Lfm25Audio15BGguf => AsrEnvelopeGeometry {
@@ -212,6 +275,35 @@ pub(crate) fn envelope_geometry(variant: ModelVariant) -> Option<AsrEnvelopeGeom
             prompt_tokens: PROMPT_TEXT_TOKENS,
             decoder: stack(2048, 8192, 32),
             vocab: 65_536,
+            conv_stem: None,
+            forced_alignment: None,
+        },
+        // The audio tower of Qwen3-ASR-1.7B (104-position ≈ 8 s attention
+        // windows after the ×8 stem) under a 5,000-class timestamp head; the
+        // prompt is the window's audio and about 3.5 tokens per word.
+        _ if variant.family() == ModelFamily::Qwen3ForcedAligner => AsrEnvelopeGeometry {
+            max_chunk_secs: QWEN3_ALIGNER_MAX_AUDIO_SECONDS as f32,
+            encoder_positions_per_sec: 13.0,
+            encoder_window_secs: Some(8.0),
+            encoder: stack(1024, 4096, 16),
+            audio_tokens_per_sec: 13.0,
+            // `<|audio_start|>` and `<|audio_end|>`.
+            prompt_tokens: 2,
+            decoder: stack(1024, 3072, 16),
+            vocab: 5_000,
+            conv_stem: Some(ConvStemGeometry {
+                channels: 480,
+                mel_bins: MEL_BINS,
+                chunk_frames: MEL_FRAMES_PER_SEC,
+                output_rows: MEL_BINS / 8,
+                output_frames: 13,
+                conv_chunksize: 500,
+            }),
+            forced_alignment: Some(ForcedAlignmentGeometry {
+                tokens_per_word: 3.5,
+                scored_rows_per_word: 2,
+                query_block: QWEN3_STATELESS_QUERY_BLOCK as u64,
+            }),
         },
         _ => return None,
     })
@@ -319,6 +411,49 @@ fn layer_bytes(geometry: StackGeometry, length: u64, context: u64) -> Result<u64
     ])
 }
 
+/// One causal prefill layer over `length` positions whose attention runs
+/// `block` query rows at a time against the keys before them.
+fn blocked_prefill_bytes(geometry: StackGeometry, length: u64, block: u64) -> Result<u64> {
+    sum(&[
+        product(&[HIDDEN_PLANES, length, geometry.hidden, F32_BYTES])?,
+        product(&[FF_PLANES, length, geometry.ff, F32_BYTES])?,
+        product(&[
+            BLOCKED_SCORE_PLANES,
+            geometry.heads,
+            block.min(length),
+            length,
+            F32_BYTES,
+        ])?,
+    ])
+}
+
+impl ConvStemGeometry {
+    /// The stem's peak over `chunks` chunks: one slice's transient beside
+    /// the slice outputs already produced, and those outputs with their
+    /// concatenation.
+    fn bytes(self, chunks: u64) -> Result<u64> {
+        let slice = qwen3_audio_cnn_slice_chunks(
+            self.channels,
+            self.mel_bins,
+            self.chunk_frames,
+            Some(self.conv_chunksize),
+        ) as u64;
+        let transient = product(&[
+            slice.min(chunks),
+            qwen3_audio_cnn_chunk_bytes(self.channels, self.mel_bins, self.chunk_frames),
+        ])?;
+        let outputs = product(&[
+            2,
+            chunks,
+            self.channels,
+            self.output_rows,
+            self.output_frames,
+            F32_BYTES,
+        ])?;
+        sum(&[transient, outputs])
+    }
+}
+
 /// The envelope of one `variant` request over `audio_secs` of audio on
 /// `backend`, or `None` for a variant without one. Audio beyond one chunk
 /// adds nothing (it is chunked), except Parakeet's host features and
@@ -345,6 +480,39 @@ pub(crate) fn request_envelope(
     let Some(geometry) = envelope_geometry(variant) else {
         return Ok(None);
     };
+    // Without the transcript, a window holds the most words it accepts.
+    let words = geometry
+        .forced_alignment
+        .map(|_| qwen3_aligner_max_words(f64::from(audio_secs.min(geometry.max_chunk_secs))));
+    geometry_envelope(geometry, audio_secs, words, backend).map(Some)
+}
+
+/// The working set of one forced-alignment window of `audio_secs` holding
+/// `words` words on `backend`, or `None` for a variant that is not a forced
+/// aligner.
+pub(crate) fn forced_alignment_envelope(
+    variant: ModelVariant,
+    audio_secs: f32,
+    words: usize,
+    backend: BackendKind,
+) -> Result<Option<AsrRequestEnvelope>> {
+    let Some(geometry) = envelope_geometry(variant).filter(|g| g.forced_alignment.is_some()) else {
+        return Ok(None);
+    };
+    let audio_secs = if audio_secs.is_finite() {
+        audio_secs.max(0.0)
+    } else {
+        0.0
+    };
+    geometry_envelope(geometry, audio_secs, Some(words), backend).map(Some)
+}
+
+fn geometry_envelope(
+    geometry: AsrEnvelopeGeometry,
+    audio_secs: f32,
+    words: Option<usize>,
+    backend: BackendKind,
+) -> Result<AsrRequestEnvelope> {
     let secs = audio_secs.min(geometry.max_chunk_secs);
     let samples = positions(CANONICAL_SAMPLE_RATE as f32, secs);
     let host_bytes = sum(&[
@@ -365,25 +533,52 @@ pub(crate) fn request_envelope(
         })
         .max(1);
     let encoder = layer_bytes(geometry.encoder, encoder_length, encoder_context)?;
-    let prompt = positions(geometry.audio_tokens_per_sec, secs)
-        .checked_add(geometry.prompt_tokens)
-        .ok_or_else(overflow)?
-        .max(1);
-    let prefill = layer_bytes(geometry.decoder, prompt, prompt)?;
-    let logits_row = product(&[geometry.vocab, F32_BYTES])?;
-    Ok(Some(AsrRequestEnvelope {
+    let words = u64::try_from(words.unwrap_or(0)).map_err(|_| overflow())?;
+    let text_tokens = geometry.forced_alignment.map_or(0, |alignment| {
+        (alignment.tokens_per_word * words as f32).ceil() as u64
+    });
+    let prompt = sum(&[
+        positions(geometry.audio_tokens_per_sec, secs),
+        geometry.prompt_tokens,
+        text_tokens,
+    ])?
+    .max(1);
+    let prefill = match geometry.forced_alignment {
+        Some(alignment) => blocked_prefill_bytes(geometry.decoder, prompt, alignment.query_block)?,
+        None => layer_bytes(geometry.decoder, prompt, prompt)?,
+    };
+    let stem = match geometry.conv_stem {
+        Some(stem) => stem.bytes(secs.ceil().max(1.0) as u64)?,
+        None => 0,
+    };
+    // ASR reads one decode row; the aligner its timestamp rows.
+    let logits_rows = geometry.forced_alignment.map_or(Ok(1), |alignment| {
+        product(&[alignment.scored_rows_per_word, words]).map(|rows| rows.max(1))
+    })?;
+    let logits = product(&[logits_rows, geometry.vocab, F32_BYTES])?;
+    let mut accelerator_bytes = sum(&[encoder.max(prefill).max(stem), logits])?;
+    // The ASR families keep their established Metal pricing.
+    if geometry.forced_alignment.is_some() && backend == BackendKind::Metal {
+        accelerator_bytes = product(&[accelerator_bytes, METAL_POOL_ROUNDING])?;
+    }
+    Ok(AsrRequestEnvelope {
         host_bytes,
-        accelerator_bytes: sum(&[encoder.max(prefill), logits_row])?,
-    }))
+        accelerator_bytes,
+    })
 }
 
 /// What load holds back from the state fits for `request_slots` concurrent
 /// requests, each on one full chunk (Parakeet: one full encoder window).
+/// `None` for the forced aligner: it has no state fit, and each alignment
+/// window reserves its own envelope as a stage workspace.
 pub(crate) fn deferred_request_envelope(
     variant: ModelVariant,
     backend: BackendKind,
     request_slots: usize,
 ) -> Result<Option<AsrRequestEnvelope>> {
+    if envelope_geometry(variant).is_some_and(|geometry| geometry.forced_alignment.is_some()) {
+        return Ok(None);
+    }
     let Some(secs) = max_chunk_secs(variant) else {
         return Ok(None);
     };
@@ -461,6 +656,88 @@ mod tests {
             envelope(ModelVariant::WhisperLargeV3Turbo, f32::NAN),
             envelope(ModelVariant::WhisperLargeV3Turbo, 0.0)
         );
+
+        // The forced aligner (ADM-5): one window, at its most words, grows
+        // with the window and stops at the 180 s limit, within 2 GiB on Metal
+        // (pool rounding included). It is reserved per window stage, never
+        // held at load.
+        for variant in ALIGNER_VARIANTS {
+            let window = max_chunk_secs(variant).expect("aligner window");
+            assert_eq!(window, 180.0);
+            let mut previous = AsrRequestEnvelope::default();
+            for secs in [0.5, 5.0, 15.0, 30.0, 90.0, window] {
+                let current = envelope(variant, secs);
+                assert!(
+                    current.host_bytes > previous.host_bytes
+                        && current.accelerator_bytes > previous.accelerator_bytes,
+                    "{variant}: {secs} s did not grow: {previous:?} -> {current:?}"
+                );
+                previous = current;
+            }
+            let at_window = envelope(variant, window);
+            assert_eq!(envelope(variant, 3_600.0), at_window, "{variant}");
+            assert!(
+                at_window.total_bytes().unwrap() < 2 * GIB,
+                "{variant}: {at_window:?}"
+            );
+            assert_eq!(
+                deferred_request_envelope(variant, BackendKind::Metal, 2).unwrap(),
+                None
+            );
+        }
+    }
+
+    const ALIGNER_VARIANTS: [ModelVariant; 2] = [
+        ModelVariant::Qwen3ForcedAligner06B,
+        ModelVariant::Qwen3ForcedAligner06B4Bit,
+    ];
+
+    /// A window's envelope follows its words and seconds; the 180 s window
+    /// at its word bound prices the slice-bounded convolution stem, the
+    /// query-blocked prefill and only the timestamp logits rows.
+    #[test]
+    fn forced_alignment_envelope_follows_words_and_seconds() {
+        const MIB: u64 = 1024 * 1024;
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let window = |secs: f32, words: usize| {
+            forced_alignment_envelope(variant, secs, words, BackendKind::Cpu)
+                .unwrap()
+                .expect("aligner envelope")
+        };
+        assert!(window(30.0, 80).accelerator_bytes > window(30.0, 20).accelerator_bytes);
+        assert!(window(60.0, 80).accelerator_bytes > window(30.0, 80).accelerator_bytes);
+        assert!(window(60.0, 80).host_bytes > window(30.0, 80).host_bytes);
+        assert_eq!(window(f32::NAN, 10), window(0.0, 10));
+        assert_eq!(
+            forced_alignment_envelope(ModelVariant::Qwen3Asr06BGguf, 30.0, 80, BackendKind::Cpu)
+                .unwrap(),
+            None
+        );
+        for secs in [30.0f32, 60.0, 120.0, 180.0] {
+            let words = qwen3_aligner_max_words(f64::from(secs));
+            let bound = window(secs, words);
+            let typical = window(secs, (secs * 2.7).ceil() as usize);
+            let metal = forced_alignment_envelope(variant, secs, words, BackendKind::Metal)
+                .unwrap()
+                .unwrap();
+            assert_eq!(metal.accelerator_bytes, 2 * bound.accelerator_bytes);
+            assert_eq!(metal.host_bytes, bound.host_bytes);
+            eprintln!(
+                "aligner envelope {secs} s: CPU {} MiB at {words} words, {} MiB at 2.7 words/s; \
+                 Metal {} MiB at {words} words",
+                bound.total_bytes().unwrap() / MIB,
+                typical.total_bytes().unwrap() / MIB,
+                metal.total_bytes().unwrap() / MIB
+            );
+        }
+        // 180 s at the 10 words/s bound: an 8,642-token prompt.
+        let bound = window(180.0, 1_800);
+        let geometry = envelope_geometry(variant).unwrap();
+        let prefill = blocked_prefill_bytes(geometry.decoder, 8_642, 256).unwrap();
+        let stem = geometry.conv_stem.unwrap().bytes(180).unwrap();
+        let logits = 2 * 1_800 * 5_000 * 4;
+        assert!(stem > 300 * MIB, "{stem}");
+        assert_eq!(bound.accelerator_bytes, prefill.max(stem) + logits);
     }
 
     /// One chunk per sequence: a default request's prompt and decode budget.
@@ -578,6 +855,25 @@ mod tests {
         assert_eq!(
             shape(fixture!("lfm2_5_audio_1_5b_q4_0.json"), "token_embd.weight"),
             [lfm.vocab, lfm.decoder.hidden]
+        );
+        let aligner = envelope_geometry(ModelVariant::Qwen3ForcedAligner06B).unwrap();
+        let fixture = fixture!("qwen3_forced_aligner_0_6b.json");
+        assert_eq!(
+            shape(fixture, "thinker.lm_head.weight"),
+            [aligner.vocab, aligner.decoder.hidden]
+        );
+        assert_eq!(
+            shape(fixture, "thinker.model.layers.{i}.mlp.gate_proj.weight"),
+            [aligner.decoder.ff, aligner.decoder.hidden]
+        );
+        assert_eq!(
+            shape(fixture, "thinker.audio_tower.layers.{i}.fc1.weight"),
+            [aligner.encoder.ff, aligner.encoder.hidden]
+        );
+        let stem = aligner.conv_stem.unwrap();
+        assert_eq!(
+            shape(fixture, "thinker.audio_tower.conv_out.weight"),
+            [aligner.encoder.hidden, stem.channels * stem.output_rows]
         );
     }
 }

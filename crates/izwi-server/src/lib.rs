@@ -48,6 +48,7 @@ mod gateway_worker_tls;
 mod ids;
 mod logging;
 pub mod media_ingest;
+mod node_identity;
 mod onboarding_store;
 mod persistence;
 mod saved_voice_store;
@@ -391,6 +392,30 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
     run_with_args(args, enterprise_hooks).await
 }
 
+/// How long blocking work still running after shutdown cleanup (for example a
+/// model unload waiting in `Device::synchronize` on queued GPU work) may delay
+/// process exit. Cleanup itself is bounded by its own timeout first.
+pub const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Run [`run_from_cli`] on a runtime whose shutdown is bounded, so SIGTERM
+/// exits after the cleanup budget instead of waiting on a stuck GPU drain.
+pub fn run_server_process(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    run_with_bounded_exit(run_from_cli(enterprise_hooks), PROCESS_EXIT_GRACE)
+}
+
+fn run_with_bounded_exit<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+    exit_grace: Duration,
+) -> anyhow::Result<T> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(future);
+    // Dropping a runtime waits for every blocking task without limit.
+    runtime.shutdown_timeout(exit_grace);
+    result
+}
+
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     validate_role_topology(args.role, args.gateway_topology)?;
     let serve_config = resolve_serve_runtime_config(&args)?;
@@ -460,18 +485,51 @@ async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> a
             "Failed to reconcile durable runtime jobs during startup: {err}"
         ));
     }
+    // Streamed speech, diarization jobs and streamed transcriptions run as
+    // tasks of the node that accepted them; fail the ones this node left
+    // running. On a shared database only its own (P1V-1).
+    let mut unscoped_recovery = false;
     match state
         .speech_history_store
         .reconcile_stale_processing_records()
         .await
     {
-        Ok(reconciled) if reconciled > 0 => {
+        Ok(Some(reconciled)) if reconciled > 0 => {
             info!(reconciled, "Reconciled stale speech history records");
         }
-        Ok(_) => {}
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
         Err(err) => startup_warnings.push(format!(
             "Failed to reconcile speech history records during startup: {err}"
         )),
+    }
+    match state.diarization_store.fail_interrupted_records().await {
+        Ok(Some(failed)) if failed > 0 => {
+            info!(failed, "Failed diarization jobs interrupted by a shutdown");
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted diarization jobs during startup: {err}"
+        )),
+    }
+    match state.transcription_store.fail_interrupted_records().await {
+        Ok(Some(failed)) if failed > 0 => {
+            info!(failed, "Failed transcriptions interrupted by a shutdown");
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted transcriptions during startup: {err}"
+        )),
+    }
+    if unscoped_recovery {
+        // A configuration gap, not a readiness failure: the node serves.
+        warn!(
+            "Skipped failing interrupted jobs: this database may be shared by several nodes. \
+             Set {} to a stable id unique to this node to recover the jobs it left running.",
+            node_identity::NODE_ID_ENV
+        );
     }
     match state
         .artifact_store
@@ -2510,6 +2568,30 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn bounded_exit_does_not_wait_for_a_blocking_drain_that_never_finishes() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_with_bounded_exit(
+                async {
+                    // Stands in for an unload stuck in Device::synchronize.
+                    tokio::task::spawn_blocking(|| loop {
+                        std::thread::park();
+                    });
+                    Ok(())
+                },
+                Duration::from_millis(200),
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+        let started = Instant::now();
+        let ok = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("process exit must not wait for a never-ending blocking task");
+        assert!(ok);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn jittered_poll_interval_is_deterministic_and_bounded() {
         let base = Duration::from_millis(2_000);
         for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX, 123_456_789] {
@@ -2745,6 +2827,8 @@ mod tests {
 
     #[test]
     fn local_server_role_remains_the_default() {
+        // IZWI_GATEWAY_TOPOLOGY is set by a sibling test under this lock.
+        let _guard = env_lock();
         let args = parse(&["izwi-server"]);
         assert_eq!(args.role, ServerRole::Local);
         assert_eq!(args.gateway_topology, GatewayTopology::Standalone);

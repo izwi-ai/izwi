@@ -19,6 +19,7 @@ use crate::engine::{
     RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::{with_precision_reload_gate, PrecisionReloadGate};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
 use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
@@ -71,6 +72,7 @@ use crate::models::architectures::nemotron::asr::{
 use crate::models::architectures::parakeet::asr::{
     ParakeetAsrModel, ParakeetAsrTranscriptionOutput, ParakeetPhysicalStateSpec,
 };
+pub(crate) use crate::models::architectures::qwen3::asr::AlignmentUnit;
 use crate::models::architectures::qwen3::asr::{
     AsrDecodeCheckpoint as Qwen3AsrDecodeCheckpoint, AsrDecodeState as Qwen3AsrDecodeState,
     AsrDecodeStep as Qwen3AsrDecodeStep, AsrTranscriptionOutput as Qwen3AsrTranscriptionOutput,
@@ -95,8 +97,8 @@ use crate::models::architectures::qwen38::chat::{
     Qwen38SharedStepCheckpoint,
 };
 use crate::models::architectures::sortformer::diarization::{
-    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerWorkspaceEstimate,
-    SortformerWorkspaceEvent,
+    SortformerDiarizerModel, SortformerPhysicalStateSpec, SortformerStream,
+    SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
 use crate::models::architectures::vibevoice::asr::{
     VibeVoiceAsrDecodeCheckpoint, VibeVoiceAsrDecodeState, VibeVoiceAsrDecodeStep,
@@ -2324,6 +2326,8 @@ impl NativeAsrModel {
         }
     }
 
+    /// Forced alignment of `reference_text`, split into word units for
+    /// `language`: each unit's source text with its start and end in ms.
     pub fn force_align(
         &self,
         audio: &[f32],
@@ -2331,21 +2335,25 @@ impl NativeAsrModel {
         reference_text: &str,
         language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        self.forced_aligner()?
+            .force_align(audio, sample_rate, reference_text, language)
+    }
+
+    /// Forced alignment of word units: one `(start_ms, end_ms)` per unit.
+    pub(crate) fn force_align_units(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        units: &[AlignmentUnit],
+    ) -> Result<Vec<(u32, u32)>> {
+        self.forced_aligner()?
+            .force_align_units(audio, sample_rate, units)
+    }
+
+    fn forced_aligner(&self) -> Result<&Qwen3AsrModel> {
         match self {
-            Self::Qwen3(model) => model.force_align(audio, sample_rate, reference_text, language),
-            Self::Parakeet(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::Nemotron(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::WhisperTurbo(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::VibeVoice(_) => Err(Error::InvalidInput(
-                "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
-            )),
-            Self::GraniteSpeech(_) => Err(Error::InvalidInput(
+            Self::Qwen3(model) => Ok(model),
+            _ => Err(Error::InvalidInput(
                 "Forced alignment is only available for Qwen3-ForcedAligner models".to_string(),
             )),
         }
@@ -3689,6 +3697,12 @@ impl NativeAudioChatModel {
 }
 
 impl NativeDiarizationModel {
+    pub fn family_diagnostics(&self) -> Value {
+        match self {
+            Self::Sortformer(model) => model.family_diagnostics(),
+        }
+    }
+
     pub(crate) fn physical_state_spec(
         &self,
         stage_graphs: &[&[StageDescriptor]],
@@ -3735,10 +3749,37 @@ impl NativeDiarizationModel {
         }
     }
 
-    pub(crate) fn diarize_with_workspace_observer_physical<F>(
+    /// Start a diarization that runs in steps of about `step_audio_secs`
+    /// of audio each (PIPE-8).
+    pub(crate) fn begin_stream(
         &self,
         audio: &[f32],
-        sample_rate: u32,
+        config: &DiarizationConfig,
+        step_audio_secs: f32,
+    ) -> Result<SortformerStream> {
+        match self {
+            Self::Sortformer(model) => model.begin_stream(audio, config, step_audio_secs),
+        }
+    }
+
+    pub(crate) fn advance_stream<F>(
+        &self,
+        stream: &mut SortformerStream,
+        audio: &[f32],
+        observer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        match self {
+            Self::Sortformer(model) => model.advance_stream(stream, audio, observer),
+        }
+    }
+
+    pub(crate) fn finish_stream_physical<F>(
+        &self,
+        stream: SortformerStream,
+        audio: &[f32],
         config: &DiarizationConfig,
         state: &mut InvocationTensorLease,
         observer: F,
@@ -3747,13 +3788,9 @@ impl NativeDiarizationModel {
         F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
     {
         match self {
-            Self::Sortformer(model) => model.diarize_with_workspace_observer_physical(
-                audio,
-                sample_rate,
-                config,
-                state,
-                observer,
-            ),
+            Self::Sortformer(model) => {
+                model.finish_stream_physical(stream, audio, config, state, observer)
+            }
         }
     }
 }
@@ -6371,7 +6408,7 @@ impl ModelRegistry {
                     LoadedModelActualRuntime::default(),
                     None,
                     None,
-                    None,
+                    Some(model.family_diagnostics()),
                 ));
             }
         }
@@ -6576,10 +6613,14 @@ impl ModelRegistry {
         diagnostics
     }
 
+    /// Loads an ASR or forced-aligner model. With `reload_gate`, a component
+    /// whose lowered precision fails its load-time probe reloads only once
+    /// the gate admits it (the model lifecycle's load authorization).
     pub async fn load_asr(
         &self,
         variant: ModelVariant,
         model_dir: &Path,
+        reload_gate: Option<PrecisionReloadGate>,
     ) -> Result<Arc<NativeAsrModel>> {
         let registration = resolve_asr_loader_registration(variant).ok_or_else(|| {
             Error::InvalidInput(format!(
@@ -6614,7 +6655,11 @@ impl ModelRegistry {
                 let loader = registration.loader;
                 move || async move {
                     tokio::task::spawn_blocking(move || {
-                        let model = loader(&model_dir, variant, device)?;
+                        let load = || loader(&model_dir, variant, device);
+                        let model = match reload_gate {
+                            Some(gate) => with_precision_reload_gate(gate, load),
+                            None => load(),
+                        }?;
                         Ok::<NativeAsrModel, Error>(model)
                     })
                     .await

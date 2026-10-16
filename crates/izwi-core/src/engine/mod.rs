@@ -3211,11 +3211,19 @@ impl Engine {
         &self,
         model_instance: ModelInstanceId,
     ) -> Result<bool> {
-        let _step = self.step_gate.lock().await;
-        self.core
-            .write()
-            .await
-            .unload_managed_model_cache(model_instance)
+        // Draining waits on the device (`Device::synchronize`), which blocks
+        // for as long as queued GPU work runs. Do it on the blocking pool so
+        // no async worker stalls; both guards stay held until it finishes.
+        let step = self.step_gate.clone().lock_owned().await;
+        let mut core = self.core.clone().write_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _step = step;
+            core.unload_managed_model_cache(model_instance)
+        })
+        .await
+        .map_err(|error| {
+            Error::InferenceError(format!("managed model cache unload task failed: {error}"))
+        })?
     }
 
     /// Abort every request currently tracked by the engine.

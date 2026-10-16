@@ -2378,9 +2378,22 @@ mod tests {
             .expect("cancel")
             .expect("cancelled job");
         assert_eq!(cancellation.status, RuntimeJobStatus::Running);
-        assert_eq!(
-            cancellation.cancellation_state,
-            Some(RuntimeCancellationState::Requested)
+        // The worker polls every 10 ms and marks a requested cancellation
+        // `ExecutionStopping` as soon as it sees it, which can land before
+        // either read below; both states are the cancellation converging.
+        let converging = |state| {
+            matches!(
+                state,
+                Some(
+                    RuntimeCancellationState::Requested
+                        | RuntimeCancellationState::ExecutionStopping
+                )
+            )
+        };
+        assert!(
+            converging(cancellation.cancellation_state),
+            "{:?}",
+            cancellation.cancellation_state
         );
 
         let requested = store
@@ -2392,9 +2405,10 @@ mod tests {
         let lease_expiry = requested.lease_expires_at;
         let attempt_token = requested.attempt_token.clone();
         assert_eq!(requested.status, RuntimeStageStatus::Running);
-        assert_eq!(
-            requested.cancellation_state,
-            Some(RuntimeCancellationState::Requested)
+        assert!(
+            converging(requested.cancellation_state),
+            "{:?}",
+            requested.cancellation_state
         );
         assert!(owner.is_some());
         assert!(lease_expiry.is_some());

@@ -1147,6 +1147,7 @@ describe("TranscriptionPage detail route", () => {
           asr_model_id: "Whisper-Large-v3-Turbo",
           aligner_model_id: "Qwen3-ForcedAligner-0.6B",
           llm_model_id: "Qwen3.5-4B",
+          generate_summary: true,
         }),
         expect.objectContaining({
           onUploadProgress: expect.any(Function),

@@ -214,10 +214,26 @@ impl SameConv1d {
         dilation: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let conv = candle_nn::conv1d(
-            in_channels,
-            out_channels,
-            kernel_size,
+        // Dense checkpoints store the kernel OIK, the MLX Base ones OKI.
+        let oik = (out_channels, in_channels, kernel_size);
+        let oki = (out_channels, kernel_size, in_channels);
+        let weight = match vb.get(oik, "weight") {
+            Ok(weight) => weight,
+            Err(oik_error) => vb
+                .get(oki, "weight")
+                .and_then(|weight| weight.permute((0, 2, 1)))
+                .map_err(|_| {
+                    Error::ModelLoadError(format!(
+                        "speaker encoder conv {} is neither OIK nor OKI {oki:?}: {oik_error}",
+                        vb.prefix()
+                    ))
+                })?,
+        };
+        // Candle 0.11's im2col conv1d multiplies a strided kernel as if it
+        // were row-major, so the permuted OKI kernel must be made contiguous.
+        let conv = Conv1d::new(
+            weight.contiguous()?,
+            Some(vb.get(out_channels, "bias")?),
             Conv1dConfig {
                 padding: 0,
                 stride: 1,
@@ -225,8 +241,7 @@ impl SameConv1d {
                 groups: 1,
                 ..Default::default()
             },
-            vb,
-        )?;
+        );
         let total = dilation * (kernel_size - 1);
         Ok(Self {
             conv,

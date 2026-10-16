@@ -549,6 +549,13 @@ impl InvocationStaticAttentionArena {
         Ok(())
     }
 
+    /// Wait for device work a failed operation may still have queued against
+    /// this arena, and mark it dirty so it is reset before any reuse.
+    pub(crate) fn fence_after_error(&mut self) -> Result<()> {
+        self.dirty = true;
+        self.device.synchronize().map_err(Error::from)
+    }
+
     pub(crate) fn prepare_completion(&mut self) -> Result<()> {
         if self.pending_install.is_some() {
             return Err(invalid(

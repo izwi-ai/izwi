@@ -191,6 +191,10 @@ export function TranscriptionRecordDetail({
     }
     return warnings.join(" ");
   }, [record?.saa_status, record?.saa_warnings]);
+  const alignmentWarning = useMemo(() => {
+    const warnings = record?.alignment_warnings ?? [];
+    return warnings.length > 0 ? warnings.join(" ") : null;
+  }, [record?.alignment_warnings]);
   const statusMessage = useMemo(
     () =>
       processingStatus === "failed"
@@ -337,6 +341,19 @@ export function TranscriptionRecordDetail({
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
                 <p>{saaWarning}</p>
+              </div>
+            </Card>
+          ) : null}
+
+          {alignmentWarning ? (
+            <Card
+              className="border-[var(--status-warning-border)] bg-[var(--status-warning-bg)] p-4 text-sm text-[var(--status-warning-text)]"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <p>{alignmentWarning}</p>
               </div>
             </Card>
           ) : null}

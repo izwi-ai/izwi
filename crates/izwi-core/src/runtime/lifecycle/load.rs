@@ -16,6 +16,7 @@ use crate::engine::{
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::PrecisionReloadGate;
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
     InvocationStateCapacity, InvocationWorkspaceBindingV2, InvocationWorkspaceDomain,
@@ -114,6 +115,28 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
+}
+
+/// Parakeet's retained predictor is owned by the exact executor session, so
+/// no graph activates managed retained state: sequence graphs read it through
+/// their session and the atomic long-form graph leases invocation tensors.
+fn parakeet_retained_uses(
+    contracts: &[LoadedExecutionContract],
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    contracts
+        .iter()
+        .map(|contract| {
+            let graph = stage_graph_fingerprint(&contract.stages)?;
+            match contract.execution_profile.mode {
+                crate::engine::ExecutionMode::Sequence | crate::engine::ExecutionMode::Atomic => {
+                    Ok((graph, RetainedStateUseV2::Inactive))
+                }
+                _ => Err(Error::ModelLoadError(
+                    "Parakeet graph has an incompatible execution mode".into(),
+                )),
+            }
+        })
+        .collect()
 }
 
 fn uses_asr_model_registry(variant: ModelVariant) -> bool {
@@ -491,6 +514,42 @@ fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> Res
     }
 }
 
+/// A loading thread's request to admit a precision fallback's reload
+/// ([`PrecisionReloadGate`]): the lifecycle answers once it has grown the
+/// load's authorization, or refused.
+struct PrecisionReloadRequest {
+    component: String,
+    dtype: candle_core::DType,
+    reply: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+/// A [`PrecisionReloadGate`] for a loading thread, and the requests it sends
+/// to the load task, which owns admission. The gate blocks its thread until
+/// the reply, so the reload allocates only once it is authorized.
+fn precision_reload_gate() -> (
+    PrecisionReloadGate,
+    tokio::sync::mpsc::UnboundedReceiver<PrecisionReloadRequest>,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Box::new(move |component: &str, dtype| {
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let ended = || {
+            Error::ModelLoadError(format!(
+                "the load ended before admitting the {component} reload at {dtype:?}"
+            ))
+        };
+        requests
+            .send(PrecisionReloadRequest {
+                component: component.to_string(),
+                dtype,
+                reply,
+            })
+            .map_err(|_| ended())?;
+        outcome.blocking_recv().map_err(|_| ended())?
+    });
+    (gate, receiver)
+}
+
 /// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
 /// rows are sized for chat (on CUDA one per 256 MiB of device memory, about
 /// 320 on an H100), and every ASR retained row owns a prepared-input tensor
@@ -540,13 +599,17 @@ fn admit_asr_request_floor(
     Ok(authorization)
 }
 
-/// Whether a load of `variant` is reconciled against the device observer:
-/// the families whose admission is a residency plan (ASR and TTS), so an
-/// observed excess means the plan under-prices the loader.
-fn reconciles_device_usage(variant: ModelVariant) -> bool {
-    asr_memory::is_asr_variant(variant)
+/// Whether a load of `variant` on `backend` is reconciled against the device
+/// observer: the families whose admission is a residency plan (ASR, the
+/// forced aligner, the Sortformer diarizers, TTS and LFM2 chat), so an
+/// observed excess means the plan under-prices the loader, as long as the
+/// weights land where the observer looks (Sortformer on Metal loads into host
+/// memory).
+fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
+    (asr_memory::has_plan(variant)
         || tts_memory::has_plan(variant)
-        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat
+        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat)
+        && asr_memory::weights_on_backend_device(variant, backend)
 }
 
 /// A request envelope in `backend`'s ledger domains: host and accelerator
@@ -1981,18 +2044,19 @@ impl ModelLifecycleController {
     }
 
     /// One reconciliation checkpoint for a load priced by a residency plan
-    /// (ASR and TTS), or `None` for other families and backends without a
-    /// device observer (CPU).
+    /// (ASR, the forced aligner, the diarizers and TTS), or `None` for other
+    /// families, for weights the observer cannot see, and for backends
+    /// without a device observer (CPU).
     fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
-        if !reconciles_device_usage(variant) {
+        let backend = self.backend_router.context().backend_kind;
+        if !reconciles_device_usage(variant, backend) {
             return None;
         }
         let authority = self.coordinator.resource_authority();
         let observed = authority.observed_device_usage_bytes()?;
         Some(DeviceUsageSample {
             observed,
-            reserved: authority
-                .reserved_bytes_in_domain(self.backend_router.context().backend_kind),
+            reserved: authority.reserved_bytes_in_domain(backend),
         })
     }
 
@@ -2079,6 +2143,72 @@ impl ModelLifecycleController {
             host_bytes,
             accelerator_bytes,
         }))
+    }
+
+    /// Grows a loading slot's authorization to the precision reload plan
+    /// of `variant` before a component whose load-time probe failed reloads
+    /// at `request.dtype`, through the same live check as the load itself
+    /// (pooled-scratch flush and eviction included). Returns the reload plan
+    /// that now prices the load, or `None` when the load has none (its plan
+    /// already covers the reload). Refuses, with the shortfall, when the
+    /// reload cannot fit.
+    async fn admit_precision_reload(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+        current: &ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<Option<ModelResourcePlan>> {
+        let device = &self.backend_router.context().device;
+        let Some(reload) = asr_memory::precision_reload_plan(variant, model_path, device)? else {
+            return Ok(None);
+        };
+        self.grow_load_authorization_for_reload(variant, current, reload, request)
+            .await
+            .map(Some)
+    }
+
+    async fn grow_load_authorization_for_reload(
+        &self,
+        variant: ModelVariant,
+        current: &ModelResourcePlan,
+        reload: ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<ModelResourcePlan> {
+        let backend = self.backend_router.context().backend_kind;
+        let refused = |error: Error| {
+            Error::ModelLoadError(format!(
+                "Cannot reload {variant} {} at {:?} after its load-time probe failed: {error}",
+                request.component, request.dtype
+            ))
+        };
+        let growth = match (
+            load_domain_bytes(current.load_authorization, backend),
+            load_domain_bytes(reload.load_authorization, backend),
+        ) {
+            (ResourceAmount::Known(current), ResourceAmount::Known(reload)) => {
+                reload.saturating_sub(current)
+            }
+            _ => 0,
+        };
+        warn!(
+            model = %variant,
+            component = %request.component,
+            dtype = ?request.dtype,
+            growth_bytes = growth,
+            "A lowered-precision load failed its probe; admitting the reload"
+        );
+        // The loader synchronized the device after dropping the lowered
+        // component, so a fresh sample sees its memory free.
+        self.coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        self.ensure_portable_memory_before_load(variant, growth)
+            .await
+            .map_err(refused)?;
+        self.grow_loading_slot_authorization(variant, reload.load_authorization)
+            .map_err(refused)?;
+        Ok(reload)
     }
 
     async fn reserve_model_resources(
@@ -2356,7 +2486,27 @@ impl ModelLifecycleController {
             // are both installed above.
             let weights_started = Instant::now();
             let usage_before_weights = self.sample_device_usage(variant);
-            let instantiated = self.instantiate_model(acquired).await?;
+            // Admission priced the selected precision. A component whose
+            // load-time probe fails reloads at F32 only once this task has
+            // grown the authorization for it.
+            let model_path = acquired.model_path.clone();
+            let (reload_gate, mut reload_requests) = precision_reload_gate();
+            let instantiate = self.instantiate_model(acquired, reload_gate);
+            tokio::pin!(instantiate);
+            let instantiated = loop {
+                tokio::select! {
+                    instantiated = &mut instantiate => break instantiated?,
+                    Some(request) = reload_requests.recv() => {
+                        let admitted = self
+                            .admit_precision_reload(variant, &model_path, &resource_plan, &request)
+                            .await;
+                        if let Ok(Some(reload)) = admitted {
+                            resource_plan = reload;
+                        }
+                        let _ = request.reply.send(admitted.map(|_| ()));
+                    }
+                }
+            };
             let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
             let preparation_started = Instant::now();
             if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
@@ -2518,7 +2668,7 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
-            if reconciles_device_usage(variant) {
+            if reconciles_device_usage(variant, backend) {
                 // The cached live sample can predate the fence that released
                 // the load's staging; the state fits read a fresh one.
                 self.coordinator
@@ -3027,33 +3177,23 @@ impl ModelLifecycleController {
                                 )
                             })?,
                         )?;
-                        let retained_uses = contracts
-                            .iter()
-                            .map(|contract| {
-                                let graph = stage_graph_fingerprint(&contract.stages)?;
-                                if contract.execution_profile.mode
-                                    != crate::engine::ExecutionMode::Sequence
-                                {
-                                    return Err(Error::ModelLoadError(
-                                        "Parakeet retained graph has an incompatible execution mode"
-                                            .into(),
-                                    ));
-                                }
-                                Ok((graph, RetainedStateUseV2::Inactive))
-                            })
-                            .collect::<Result<HashMap<_, _>>>()?;
-                        if physical_spec.invocation.is_some() {
-                            return Err(Error::ModelLoadError(
-                                "Parakeet sequence graph unexpectedly published invocation predictor state"
-                                    .into(),
-                            ));
-                        }
-                        let publication = self.load_scratch_only_workspace_publication(
-                            &contracts,
-                            physical_spec.descriptor,
-                            Some(retained.into()),
-                            retained_uses,
-                        )?;
+                        let invocation_contract =
+                            physical_spec.invocation.as_ref().ok_or_else(|| {
+                                Error::ModelLoadError(
+                                    "Parakeet long-form graph did not author invocation predictor state"
+                                        .into(),
+                                )
+                            })?;
+                        let publication = self
+                            .load_invocation_workspace_publication(
+                                model_instance_id,
+                                &contracts,
+                                physical_spec.descriptor,
+                                invocation_contract,
+                                Some(retained.into()),
+                                parakeet_retained_uses(&contracts)?,
+                            )
+                            .await?;
                         state_publications.insert(CapabilityKind::Asr, publication);
                     } else if publication_route
                         == LoadedAsrStatePublicationRoute::NemotronOffline
@@ -3913,13 +4053,13 @@ mod tests {
         kokoro_effective_context_tokens, loaded_asr_state_publication_route,
         managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
         model_resource_plan, now_unix_millis, plan_invocation_allocations,
-        portable_context_reserve_bytes, portable_invocation_context_intent,
+        portable_context_reserve_bytes, portable_invocation_context_intent, precision_reload_gate,
         qwen38_representation_memory_estimate, reconcile_observed_growth,
         residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
         validate_scratch_only_invocation_publication, DeviceUsageSample,
         LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
-        QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
-        QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
+        PrecisionReloadRequest, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+        QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
     };
     use crate::backends::kv::managed_kv_backend_compiled;
     use crate::backends::{BackendKind, BackendPreference};
@@ -4824,6 +4964,146 @@ mod tests {
     }
 
     #[test]
+    fn parakeet_load_route_publishes_long_form_predictor_beside_retained_state() {
+        use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceBindingV2};
+        use crate::models::architectures::parakeet::asr::{
+            parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE_DOMAIN,
+        };
+        use crate::runtime::adapters::{
+            LoadedModelBundleDraft, LoadedStatePublication, RuntimeAdapterRegistry,
+            StreamingRequirements,
+        };
+
+        let model = ModelInstanceId::new(91);
+        let draft = LoadedModelBundleDraft::build(
+            &RuntimeAdapterRegistry::built_in(),
+            ExecutionGroupId::new(7),
+            model,
+            crate::model::ModelVariant::ParakeetTdt06BV3,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
+        let graphs = contracts
+            .iter()
+            .map(|contract| contract.stages.as_ref())
+            .collect::<Vec<_>>();
+        let spec = parakeet_physical_state_spec(&graphs).unwrap();
+        let invocation = spec
+            .invocation
+            .as_ref()
+            .expect("long-form predictor contract");
+        let mut core = crate::engine::EngineCore::new(crate::engine::EngineCoreConfig {
+            backend: BackendKind::Cpu,
+            ..crate::engine::EngineCoreConfig::default()
+        })
+        .unwrap();
+        let retained = core
+            .load_retained_tensor_state(model, spec.retained.as_ref().unwrap(), 1)
+            .unwrap();
+        let retained_uses = super::parakeet_retained_uses(&contracts).unwrap();
+        let retained: crate::kv::v2::RetainedStateRuntimeV2 = retained.into();
+        super::validate_physical_publication_backing(
+            &spec.descriptor,
+            &contracts,
+            Some(&retained),
+            &retained_uses,
+        )
+        .unwrap();
+
+        // Only the two atomic long-form graphs (with and without transport
+        // output) allocate typed state: one predictor slot each.
+        let allocations =
+            plan_invocation_allocations(&spec.descriptor, invocation, &contracts).unwrap();
+        assert_eq!(allocations.len(), 2);
+        let mut bindings = Vec::new();
+        for allocation in allocations {
+            assert_eq!(allocation.key.domain, PARAKEET_PREDICTOR_STATE_DOMAIN);
+            assert_eq!(allocation.slot_count, 1);
+            // Four [1, 640] LSTM tensors plus one [1, 1, 640] output, F32.
+            assert_eq!(allocation.domain.maximum_bytes().unwrap(), 5 * 640 * 4);
+            let backing = core
+                .resolve_and_load_invocation_workspace(
+                    model,
+                    allocation.adapter_instance,
+                    allocation.key.stage_graph,
+                    allocation.key.stage,
+                    invocation,
+                    &allocation.domain,
+                    allocation.slot_count,
+                )
+                .unwrap();
+            bindings.push(InvocationWorkspaceBindingV2 {
+                key: allocation.key,
+                backing,
+            });
+        }
+        let bundle = draft
+            .seal(HashMap::from([(
+                CapabilityKind::Asr,
+                LoadedStatePublication::PhysicalV2 {
+                    descriptor: spec.descriptor,
+                    retained: Some(retained),
+                    retained_uses,
+                    invocation_workspace: crate::kv::v2::InvocationWorkspaceRuntimeV2::new(
+                        bindings,
+                    )
+                    .unwrap(),
+                },
+            )]))
+            .unwrap();
+
+        let long_form = StreamingRequirements::NONE.with_asr_long_form(true);
+        let contract = bundle
+            .contract_for_streaming(CapabilityKind::Asr, long_form)
+            .unwrap();
+        let stage = contract
+            .adapter_binding()
+            .unwrap()
+            .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                kind: "diarization.transcribe".into(),
+            })
+            .unwrap()
+            .id;
+        let binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, long_form)
+            .unwrap();
+        binding
+            .state
+            .validate_against(BackendKind::Cpu, &binding.execution)
+            .unwrap();
+        let mut leases = binding
+            .state
+            .lease_complete_invocation_workspace_set(stage)
+            .unwrap();
+        let predictor = leases
+            .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)
+            .unwrap()
+            .typed_mut::<crate::engine::InvocationTensorLease>()
+            .unwrap();
+        assert_eq!(predictor.domain(), PARAKEET_PREDICTOR_STATE_DOMAIN);
+        leases.release().unwrap();
+
+        // Ordinary requests keep the retained sequence graph and lease nothing.
+        let normal = bundle
+            .contract_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
+        assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+        let normal_binding = bundle
+            .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+            .unwrap();
+        for stage in normal.stages.iter() {
+            assert!(normal_binding
+                .state
+                .lease_complete_invocation_workspace_set(stage.id)
+                .unwrap()
+                .domains()
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn generic_invocation_planner_allocates_every_domain_at_exact_row_concurrency() {
         let execution = invocation_execution(3);
         let contract = invocation_contract(2);
@@ -5584,6 +5864,98 @@ mod tests {
             assert!(left >= envelope, "{variant}: {left} < {envelope}");
             assert!(fit > 0, "{variant}");
         }
+    }
+
+    /// A loading thread's precision reload waits on its gate until the load
+    /// task answers, and sees the task's refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
+        let (mut gate, mut requests) = precision_reload_gate();
+        let loader = tokio::task::spawn_blocking(move || {
+            let admitted = gate("text", candle_core::DType::F32);
+            let refused = gate("text", candle_core::DType::F32);
+            (admitted, refused)
+        });
+        for answer in [Ok(()), Err(Error::ModelLoadError("no room".into()))] {
+            let request = requests.recv().await.expect("reload request");
+            assert_eq!(
+                (request.component.as_str(), request.dtype),
+                ("text", candle_core::DType::F32)
+            );
+            request.reply.send(answer).unwrap();
+        }
+        let (admitted, refused) = loader.await.unwrap();
+        admitted.unwrap();
+        assert!(refused.unwrap_err().to_string().contains("no room"));
+        // A gate whose load task is gone refuses instead of blocking.
+        let (mut gate, requests) = precision_reload_gate();
+        drop(requests);
+        let orphaned = tokio::task::spawn_blocking(move || gate("text", candle_core::DType::F32));
+        assert!(orphaned.await.unwrap().is_err());
+    }
+
+    /// A failed probe's reload takes a second reservation: the loading
+    /// slot's authorization grows from the lowered load's peak to the reload
+    /// plan's before the reload allocates, and the reload plan then prices
+    /// the load. A reload that cannot fit is refused with the shortfall and
+    /// leaves the authorization as admitted.
+    #[tokio::test]
+    async fn a_failed_probe_grows_the_load_authorization_to_the_reload_plan() {
+        let models_dir =
+            std::env::temp_dir().join(format!("izwi-precision-reload-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let runtime = RuntimeService::new(EngineConfig {
+            models_dir: models_dir.clone(),
+            backend: BackendPreference::Cpu,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = |load_peak_bytes, resident_bytes| {
+            model_resource_plan(
+                BackendKind::Cpu,
+                ModelMemoryEstimate {
+                    load_peak_bytes,
+                    resident_bytes,
+                },
+            )
+        };
+        let (lowered, reload, too_large) = (plan(256, 128), plan(512, 384), plan(2048, 1024));
+        let authority = vector_authority(all_memory_capacity(1024));
+        let variant = ModelVariant::Qwen3ForcedAligner06B;
+        let lease = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Model, "precision-reload"),
+                lowered.load_authorization,
+            )
+            .unwrap();
+        let lifecycle = &runtime.model_lifecycle;
+        lifecycle.install_loading_slot(variant, lease).unwrap();
+        let (reply, _) = oneshot::channel();
+        let request = PrecisionReloadRequest {
+            component: "text".into(),
+            dtype: candle_core::DType::F32,
+            reply,
+        };
+        let grown = lifecycle
+            .grow_load_authorization_for_reload(variant, &lowered, reload, &request)
+            .await
+            .unwrap();
+        assert_eq!(grown, reload);
+        assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+        let error = lifecycle
+            .grow_load_authorization_for_reload(variant, &reload, too_large, &request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "Cannot reload {variant} text at F32 after its load-time probe failed"
+            )),
+            "{error}"
+        );
+        assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+        assert!(lifecycle.remove_resident_slot(variant));
+        std::fs::remove_dir_all(models_dir).unwrap();
     }
 
     /// The weight lease records the smaller of the estimate and the observed

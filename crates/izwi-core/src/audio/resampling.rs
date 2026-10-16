@@ -3,12 +3,132 @@
 //! This module is intentionally a primitive, not a blanket replacement for
 //! model-specific preprocessing. Model adapters should opt into it one call site
 //! at a time with fixture-backed parity tests.
+//!
+//! The response matches soxr's "HQ" recipe, which the reference pipelines get
+//! from `librosa.resample` (`res_type="soxr_hq"`): an FFT resampler with a
+//! near-ideal anti-alias filter changes the rate, then a linear-phase Kaiser
+//! lowpass at the output rate gives soxr's passband (flat to 91.3 % of the
+//! lower Nyquist) and its rolloff to -126 dB at the Nyquist. Without that
+//! stage the 7.3-8 kHz band of 16 kHz speech passed whole where soxr removes
+//! it, which moved forced-alignment word boundaries by up to 800 ms.
 
 use rubato::{FftFixedInOut, Resampler};
 
 use crate::error::{Error, Result};
 
 const DEFAULT_FFT_RESAMPLE_CHUNK_FRAMES: usize = 4096;
+/// soxr HQ's passband end, as a fraction of the lower rate's Nyquist.
+const PASSBAND_END: f64 = 0.913;
+/// soxr HQ's stopband rejection: (20 bits + 1) * 6.02 dB.
+const STOPBAND_ATTENUATION_DB: f64 = 126.0;
+
+/// The linear-phase lowpass that shapes the output band like soxr HQ: flat
+/// to `PASSBAND_END` of the lower Nyquist, `STOPBAND_ATTENUATION_DB` down
+/// from the Nyquist on (a Kaiser-windowed sinc, normalized to unit DC gain).
+/// Odd length, so its delay is a whole number of samples.
+fn passband_filter_taps(src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    let band_edge = f64::from(src_rate.min(dst_rate)) / 2.0;
+    let rate = f64::from(dst_rate);
+    let transition = band_edge * (1.0 - PASSBAND_END) / rate;
+    let len = ((STOPBAND_ATTENUATION_DB - 7.95) / (2.285 * std::f64::consts::TAU * transition))
+        .ceil() as usize
+        | 1;
+    let beta = 0.1102 * (STOPBAND_ATTENUATION_DB - 8.7);
+    let cutoff = band_edge * (1.0 + PASSBAND_END) / 2.0 / rate;
+    let half = (len - 1) as f64 / 2.0;
+    let taps = (0..len)
+        .map(|index| {
+            let n = index as f64 - half;
+            let x = 2.0 * cutoff * n;
+            let sinc = if n == 0.0 {
+                1.0
+            } else {
+                (std::f64::consts::PI * x).sin() / (std::f64::consts::PI * x)
+            };
+            let ratio = n / half;
+            let window = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) / bessel_i0(beta);
+            2.0 * cutoff * sinc * window
+        })
+        .collect::<Vec<_>>();
+    let gain = taps.iter().sum::<f64>();
+    taps.into_iter().map(|tap| (tap / gain) as f32).collect()
+}
+
+/// The modified Bessel function of the first kind, order zero.
+fn bessel_i0(x: f64) -> f64 {
+    let (mut sum, mut term, mut k) = (1.0, 1.0, 1.0);
+    loop {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+        if term < sum * 1e-17 {
+            return sum;
+        }
+        k += 1.0;
+    }
+}
+
+/// Zero-phase FIR over a stream: output `i` is the filter centred on input
+/// `i`, with zeros beyond both ends, so the output keeps the input's length
+/// and timing. Each output is computed from the same window in the same
+/// order whatever the push sizes, so streamed and whole-buffer output match
+/// bit for bit.
+struct PassbandFilter {
+    taps: Vec<f32>,
+    /// Inputs from the first one the next output needs, after `half` leading
+    /// zeros at the start of the stream.
+    window: Vec<f32>,
+}
+
+impl PassbandFilter {
+    fn new(taps: Vec<f32>) -> Self {
+        let half = taps.len() / 2;
+        Self {
+            taps,
+            window: vec![0.0; half],
+        }
+    }
+
+    fn push(&mut self, samples: &[f32], out: &mut Vec<f32>) {
+        // A non-finite input would spread over a whole filter length.
+        self.window.extend(
+            samples
+                .iter()
+                .map(|sample| if sample.is_finite() { *sample } else { 0.0 }),
+        );
+        let len = self.taps.len();
+        if self.window.len() < len {
+            return;
+        }
+        let outputs = self.window.len() - len + 1;
+        out.extend((0..outputs).map(|start| dot(&self.taps, &self.window[start..start + len])));
+        self.window.drain(..outputs);
+    }
+
+    /// Flush the trailing outputs, which see zeros past the end.
+    fn finish(&mut self, out: &mut Vec<f32>) {
+        let half = self.taps.len() / 2;
+        self.push(&vec![0.0; half], out);
+    }
+}
+
+/// An eight-lane dot product: vectorizable, and the same summation order on
+/// every call.
+fn dot(taps: &[f32], window: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let (taps_chunks, taps_tail) = taps.as_chunks::<8>();
+    let (window_chunks, window_tail) = window.as_chunks::<8>();
+    for (tap, sample) in taps_chunks.iter().zip(window_chunks) {
+        for lane in 0..8 {
+            lanes[lane] += tap[lane] * sample[lane];
+        }
+    }
+    let tail = taps_tail
+        .iter()
+        .zip(window_tail)
+        .map(|(tap, sample)| tap * sample)
+        .sum::<f32>();
+    lanes.iter().sum::<f32>() + tail
+}
 
 /// Incremental high-quality mono resampler.
 ///
@@ -25,6 +145,9 @@ pub(crate) struct HighQualityResampler {
     delay_holdback: Vec<f32>,
     delay_holdback_open: bool,
     produced_total: usize,
+    /// Rate-converted samples handed to `passband` so far.
+    forwarded: usize,
+    passband: PassbandFilter,
     finished: bool,
 }
 
@@ -49,6 +172,8 @@ impl HighQualityResampler {
             delay_holdback: Vec::new(),
             delay_holdback_open: true,
             produced_total: 0,
+            forwarded: 0,
+            passband: PassbandFilter::new(passband_filter_taps(src_rate, dst_rate)),
             finished: false,
         })
     }
@@ -89,13 +214,17 @@ impl HighQualityResampler {
         self.finished = true;
         let output_delay = self.resampler.output_delay();
         let flush_limit = target_len.saturating_add(output_delay);
+        // The rate-converted tail, cut or padded so the filter sees exactly
+        // `target_len` samples and its zero padding starts where the output
+        // ends, as in a whole-buffer filter of the aligned signal.
+        let mut tail = Vec::new();
         if !self.input_tail.is_empty() {
             let input = [&self.input_tail[..]];
             let (_consumed, written) = self
                 .resampler
                 .process_partial_into_buffer(Some(&input), &mut self.outbuffer, None)
                 .map_err(|err| Error::AudioError(format!("Failed to resample audio: {err}")))?;
-            self.emit(written, out);
+            self.hold_back_delay(written, &mut tail);
             self.input_tail.clear();
         }
         while self.produced_total < flush_limit {
@@ -106,25 +235,39 @@ impl HighQualityResampler {
             if written == 0 {
                 break;
             }
-            self.emit(written, out);
+            self.hold_back_delay(written, &mut tail);
         }
+        tail.resize(target_len.saturating_sub(self.forwarded), 0.0);
+        self.forwarded += tail.len();
+        self.passband.push(&tail, out);
+        self.passband.finish(out);
         Ok(())
     }
 
+    /// Filter newly rate-converted samples into `out`.
     fn emit(&mut self, written: usize, out: &mut Vec<f32>) {
+        let mut converted = Vec::new();
+        self.hold_back_delay(written, &mut converted);
+        self.forwarded += converted.len();
+        self.passband.push(&converted, out);
+    }
+
+    /// Append newly rate-converted samples to `converted`, minus the
+    /// resampler's leading output delay.
+    fn hold_back_delay(&mut self, written: usize, converted: &mut Vec<f32>) {
         if written == 0 {
             return;
         }
         self.produced_total = self.produced_total.saturating_add(written);
         let produced = &self.outbuffer[0][..written];
         if !self.delay_holdback_open {
-            out.extend_from_slice(produced);
+            converted.extend_from_slice(produced);
             return;
         }
         let delay = self.resampler.output_delay();
         self.delay_holdback.extend_from_slice(produced);
         if self.delay_holdback.len() >= delay {
-            out.extend_from_slice(&self.delay_holdback[delay..]);
+            converted.extend_from_slice(&self.delay_holdback[delay..]);
             self.delay_holdback.clear();
             self.delay_holdback_open = false;
         }
@@ -225,6 +368,65 @@ mod tests {
             rms(&high_quality),
             rms(&linear)
         );
+    }
+
+    /// The response matches soxr HQ (`librosa.resample`'s default): flat
+    /// passband, the same rolloff above 7.3 kHz, no aliasing. The soxr gains
+    /// were measured with python-soxr 1.1.0 (44.1/22.05 kHz input; 24/48 kHz
+    /// differ by under 0.2 dB below 7.9 kHz).
+    #[test]
+    fn response_matches_soxr_hq_at_16k() {
+        for src_rate in [44_100, 24_000] {
+            for (frequency, soxr_db, tolerance_db) in [
+                (1_000.0, 0.0, 0.05),
+                (7_000.0, -0.01, 0.05),
+                (7_400.0, -0.02, 0.1),
+                (7_600.0, -2.84, 0.5),
+                (7_800.0, -25.0, 1.5),
+                (7_900.0, -52.9, 3.0),
+            ] {
+                let input = sine_f64(frequency, src_rate, src_rate as usize * 2);
+                let output =
+                    resample_mono_high_quality(&input, src_rate, 16_000).expect("resample");
+                let gain = tone_gain_db(&output, frequency, 16_000);
+                assert!(
+                    (gain - soxr_db).abs() <= tolerance_db,
+                    "{src_rate} Hz: {frequency} Hz at {gain:.2} dB, soxr {soxr_db} dB"
+                );
+            }
+        }
+        // 9 kHz at 44.1 kHz would alias to 7 kHz.
+        let input = sine_f64(9_000.0, 44_100, 88_200);
+        let output = resample_mono_high_quality(&input, 44_100, 16_000).expect("resample");
+        assert!(tone_gain_db(&output, 7_000.0, 16_000) < -120.0);
+    }
+
+    /// A unit tone with an f64 phase: an f32 phase over two seconds is noisy
+    /// enough to fill the stopband.
+    fn sine_f64(frequency_hz: f64, sample_rate: u32, samples: usize) -> Vec<f32> {
+        (0..samples)
+            .map(|index| {
+                (std::f64::consts::TAU * frequency_hz * index as f64 / f64::from(sample_rate)).sin()
+                    as f32
+            })
+            .collect()
+    }
+
+    /// Gain in dB of a unit-amplitude tone, from a Hann-windowed correlation
+    /// at `frequency` away from the edges.
+    fn tone_gain_db(samples: &[f32], frequency: f64, sample_rate: u32) -> f64 {
+        let samples = &samples[2_000..samples.len() - 2_000];
+        let len = samples.len() as f64;
+        let (mut re, mut im, mut window_sum) = (0.0f64, 0.0f64, 0.0f64);
+        for (index, sample) in samples.iter().enumerate() {
+            let window = 0.5 - 0.5 * (std::f64::consts::TAU * index as f64 / (len - 1.0)).cos();
+            let phase = std::f64::consts::TAU * frequency * index as f64 / f64::from(sample_rate);
+            re += f64::from(*sample) * window * phase.cos();
+            im += f64::from(*sample) * window * phase.sin();
+            window_sum += window;
+        }
+        let amplitude = 2.0 * (re * re + im * im).sqrt() / window_sum;
+        20.0 * amplitude.max(1e-12).log10()
     }
 
     #[test]

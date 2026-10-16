@@ -101,6 +101,9 @@ pub use config::{
     PhysicalExecutionMode, PhysicalInFlightLimit,
 };
 pub use error::{Error, Result};
+/// The separator between two transcript pieces: none where a script is
+/// written without spaces (CJK, Thai) or punctuation closes, else a space.
+pub use izwi_asr_toolkit::spacing_between;
 pub use models::shared::telemetry::KernelPathTelemetrySnapshot;
 pub use performance::{
     CpuPerformanceConfig, CpuPerformanceConfigOverrides, CpuProjectionBackend,
@@ -138,9 +141,11 @@ pub use runtime::{
     TRACE_STREAMING_MODE,
 };
 pub use runtime::{
-    validate_asr_language, AsrTranscription, ChatGeneration, ChunkStats, DiarizationConfig,
-    DiarizationResult, DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance,
-    DiarizationWord, GenerationRequest, GenerationResult, TtsStopReason, TtsStreamingMode,
+    validate_asr_language, AlignedWindow, AlignmentSource, AlignmentWindow, AsrTranscription,
+    ChatGeneration, ChunkStats, DiarizationConfig, DiarizationPipelineOptions, DiarizationResult,
+    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
+    GenerationRequest, GenerationResult, JobCancellation, TtsStopReason, TtsStreamingMode,
+    WindowedAlignment,
 };
 pub use serve_runtime::{ServeRuntimeConfig, ServeRuntimeConfigOverrides};
 
@@ -152,11 +157,13 @@ pub use artifacts::{
 pub use catalog::{
     normalize_stored_model_id, parse_chat_model_variant, parse_model_variant,
     parse_tts_model_variant, removed_model_variant, resolve_asr_model_variant,
+    resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
     resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
-    ChatModelCapabilities, CudaEvidenceLevel, CudaExecutionStatus, CudaOperatorCapability,
-    CudaOperatorKind, CudaProviderClass, CudaQuantizationInfo, CudaQuantizationSupportLevel,
-    CudaSupportInfo, CudaSupportLevel, ModelFamily, ModelInfo, ModelStatus, ModelVariant,
-    RemovedModelVariant, SpeechModelCapabilities, REMOVED_MODEL_VARIANTS,
+    validate_diarization_speaker_limits, ChatModelCapabilities, CudaEvidenceLevel,
+    CudaExecutionStatus, CudaOperatorCapability, CudaOperatorKind, CudaProviderClass,
+    CudaQuantizationInfo, CudaQuantizationSupportLevel, CudaSupportInfo, CudaSupportLevel,
+    ModelFamily, ModelInfo, ModelStatus, ModelVariant, RemovedModelVariant,
+    SpeechModelCapabilities, REMOVED_MODEL_VARIANTS,
 };
 pub use runtime_models::shared::chat::{
     ChatMediaInput, ChatMediaKind, ChatMessage, ChatReasoningEffort, ChatRequestConfig, ChatRole,
