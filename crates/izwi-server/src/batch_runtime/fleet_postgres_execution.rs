@@ -11,7 +11,7 @@
 //! must not hold state anyone cares about.
 
 use crate::gateway_fleet::{FleetStore, FleetWorkerObservation};
-use crate::db::migrator::Migrator;
+use crate::db::migrator::{Migrator, Schema};
 use crate::db::raw;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use std::sync::atomic::AtomicI64;
@@ -42,6 +42,9 @@ async fn fresh_store() -> Option<(FleetStore, PgTestGuard)> {
     let connection = store.connection().await.expect("postgres connection opens");
     drop_all_tables(connection).await.expect("tables drop");
     Migrator::up(connection).await.expect("migrations run");
+    Migrator::up_schema(connection, Schema::Fleet)
+        .await
+        .expect("fleet migrations run");
     Some((store, guard))
 }
 
@@ -215,6 +218,9 @@ async fn postgres_fleet_capacity_claims_are_atomic_across_connections() {
         let connection = stores[0].connection().await.expect("connection");
         drop_all_tables(connection).await.expect("tables drop");
         Migrator::up(connection).await.expect("migrations run");
+        Migrator::up_schema(connection, Schema::Fleet)
+            .await
+            .expect("fleet migrations run");
     }
 
     let mut handles = Vec::new();

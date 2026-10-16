@@ -40,6 +40,19 @@ impl TestDatabase {
         }
     }
 
+    /// A new connection pool on this test's database that runs no migrations.
+    pub(crate) async fn connect_unmigrated(&self) -> sea_orm::DatabaseConnection {
+        match &self.location {
+            Location::Sqlite(path) => super::sqlite::connect_path(path)
+                .await
+                .expect("test SQLite database opens"),
+            #[cfg(feature = "db-postgres")]
+            Location::Postgres(url) => sea_orm::Database::connect(url.as_str())
+                .await
+                .expect("test PostgreSQL database opens"),
+        }
+    }
+
     /// A new handle, with its own pool, on this test's database.
     pub(crate) fn database(&self) -> StoreDatabase {
         match &self.location {

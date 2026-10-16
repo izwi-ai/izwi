@@ -1,37 +1,153 @@
-use crate::db::raw;
+use crate::db::{raw, write_transaction_options};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use anyhow::Context;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Migrator;
 
+/// A database's schema: the application's, or the fleet coordination
+/// store's two tables. Each has its own numbered migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Schema {
+    App,
+    Fleet,
+}
+
+impl Schema {
+    fn component(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Fleet => "fleet",
+        }
+    }
+
+    /// Every migration, in the order it applies. A schema change is a new
+    /// entry here; an applied migration's statements never change.
+    fn migrations(self) -> &'static [(i64, &'static str)] {
+        match self {
+            // Version 1 is the schema every earlier unversioned release
+            // created. Its statements are idempotent, so a database those
+            // releases left behind upgrades by running it once.
+            Self::App => &[(1, "baseline")],
+            Self::Fleet => &[(1, "fleet coordination")],
+        }
+    }
+}
+
+/// Which migrations have been applied, per schema component.
+const SCHEMA_MIGRATIONS_DDL: &str = r#"
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        component TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL,
+        PRIMARY KEY(component, version)
+    );
+"#;
+
 impl Migrator {
+    /// Bring the application schema up to date.
     pub async fn up(db: &DatabaseConnection) -> anyhow::Result<()> {
+        Self::up_schema(db, Schema::App).await
+    }
+
+    /// Apply `schema`'s pending migrations in one transaction. PostgreSQL
+    /// migrators on several nodes serialize on an advisory lock held to
+    /// commit, and SQLite's immediate transaction holds the writer lock, so
+    /// concurrent boots apply each migration exactly once.
+    pub async fn up_schema(db: &DatabaseConnection, schema: Schema) -> anyhow::Result<()> {
         let backend = db.get_database_backend();
-        let quota_usage_existed = table_has_column(db, "runtime_quota_usage", "used").await?;
-        for statement in BASELINE_SCHEMA {
-            db.execute_unprepared(&dialect_ddl(backend, statement))
-                .await?;
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start the migration transaction")?;
+        if backend == DbBackend::Postgres {
+            tx.execute_unprepared(
+                "SELECT pg_advisory_xact_lock(hashtextextended('izwi.schema_migrations', 0))",
+            )
+            .await
+            .context("Failed to take the migration lock")?;
         }
-
-        for column in COMPATIBILITY_COLUMNS {
-            ensure_column(db, column).await?;
+        tx.execute_unprepared(&dialect_ddl(backend, SCHEMA_MIGRATIONS_DDL))
+            .await?;
+        let applied = tx
+            .query_all_raw(raw::statement(
+                &tx,
+                "SELECT version FROM schema_migrations WHERE component = ?1",
+                vec![schema.component().into()],
+            )?)
+            .await?
+            .iter()
+            .map(|row| row.try_get_by_index::<i64>(0))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for &(version, name) in schema.migrations() {
+            if applied.contains(&version) {
+                continue;
+            }
+            apply_migration(&tx, schema, version)
+                .await
+                .with_context(|| {
+                    format!("{} migration {version} ({name}) failed", schema.component())
+                })?;
+            tx.execute_raw(raw::statement(
+                &tx,
+                "INSERT INTO schema_migrations (component, version, name, applied_at) VALUES (?1, ?2, ?3, ?4)",
+                vec![
+                    schema.component().into(),
+                    version.into(),
+                    name.into(),
+                    current_timestamp_millis().into(),
+                ],
+            )?)
+            .await?;
         }
-
-        for statement in POST_COMPATIBILITY_SCHEMA {
-            db.execute_unprepared(&dialect_ddl(backend, statement))
-                .await?;
+        if schema == Schema::App {
+            ensure_default_voice_profile(&tx).await?;
         }
-
-        if !quota_usage_existed {
-            backfill_quota_usage(db).await?;
-        }
-
-        ensure_default_voice_profile(db).await?;
+        tx.commit()
+            .await
+            .context("Failed to commit the migration transaction")?;
         Ok(())
     }
+}
+
+async fn apply_migration<C: ConnectionTrait>(
+    db: &C,
+    schema: Schema,
+    version: i64,
+) -> anyhow::Result<()> {
+    let backend = db.get_database_backend();
+    match (schema, version) {
+        (Schema::App, 1) => {
+            let quota_usage_existed = table_has_column(db, "runtime_quota_usage", "used").await?;
+            for statement in BASELINE_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+            for column in COMPATIBILITY_COLUMNS {
+                ensure_column(db, column).await?;
+            }
+            for statement in POST_COMPATIBILITY_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+            if !quota_usage_existed {
+                backfill_quota_usage(db).await?;
+            }
+        }
+        (Schema::Fleet, 1) => {
+            for statement in FLEET_SCHEMA {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
+            }
+        }
+        _ => anyhow::bail!("Unknown {} migration {version}", schema.component()),
+    }
+    Ok(())
 }
 
 /// Translate the shared SQLite-flavored DDL into the target backend's
@@ -704,6 +820,31 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_artifacts_attempt_publication ON runtime_artifacts(stage_id, producer_attempt_token, publication_key);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_assets_source_profile ON media_assets(source_asset_id, canonical_profile_version);",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_speech_history_audio_media_asset ON speech_history_records(audio_media_asset_id);",
+    // Per-tenant and global (`scope = ''`) record counts for bounded tables,
+    // kept by the transactions that insert and delete those records.
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_quota_usage (
+        quota_kind TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(quota_kind, scope)
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_tenant_expiry ON durable_idempotency_keys_v2(tenant_scope, expires_at ASC);",
+    // Bounded scans for retention, replay GC and reconciliation.
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status_updated ON runtime_jobs(status, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_replay_sweep ON runtime_jobs(replay_swept_at, updated_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_job_publication ON runtime_artifacts(job_id, publication_key);",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_media_asset ON runtime_artifacts(media_asset_id);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_retention ON media_assets(retention_policy, deleted_at, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_media_assets_deleted ON media_assets(deleted_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created ON idempotency_keys(created_at ASC);",
+];
+
+/// The fleet coordination store: worker observations and capacity claims
+/// shared by the gateways of one fleet. Releases before versioned migrations
+/// created these tables in every application database too.
+const FLEET_SCHEMA: &[&str] = &[
     r#"
     CREATE TABLE IF NOT EXISTS fleet_worker_observations (
         worker_id TEXT PRIMARY KEY,
@@ -730,25 +871,6 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
-    // Per-tenant and global (`scope = ''`) record counts for bounded tables,
-    // kept by the transactions that insert and delete those records.
-    r#"
-    CREATE TABLE IF NOT EXISTS runtime_quota_usage (
-        quota_kind TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        used INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(quota_kind, scope)
-    );
-    "#,
-    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_tenant_expiry ON durable_idempotency_keys_v2(tenant_scope, expires_at ASC);",
-    // Bounded scans for retention, replay GC and reconciliation.
-    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_status_updated ON runtime_jobs(status, updated_at ASC);",
-    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_replay_sweep ON runtime_jobs(replay_swept_at, updated_at ASC);",
-    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_job_publication ON runtime_artifacts(job_id, publication_key);",
-    "CREATE INDEX IF NOT EXISTS idx_runtime_artifacts_media_asset ON runtime_artifacts(media_asset_id);",
-    "CREATE INDEX IF NOT EXISTS idx_media_assets_retention ON media_assets(retention_policy, deleted_at, created_at ASC);",
-    "CREATE INDEX IF NOT EXISTS idx_media_assets_deleted ON media_assets(deleted_at ASC);",
-    "CREATE INDEX IF NOT EXISTS idx_idempotency_keys_created ON idempotency_keys(created_at ASC);",
 ];
 
 /// Seed quota usage from the records that exist when the usage table is
@@ -760,7 +882,7 @@ const QUOTA_USAGE_BACKFILL: &[&str] = &[
     "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', '', COUNT(*) FROM provider_write_reservations WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
 ];
 
-async fn backfill_quota_usage(db: &DatabaseConnection) -> anyhow::Result<()> {
+async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
         db.execute_unprepared(statement).await?;
     }
@@ -1130,8 +1252,8 @@ const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     },
 ];
 
-async fn ensure_column(
-    db: &DatabaseConnection,
+async fn ensure_column<C: ConnectionTrait>(
+    db: &C,
     column: &CompatibilityColumn,
 ) -> anyhow::Result<()> {
     if table_has_column(db, column.table, column.column).await? {
@@ -1146,8 +1268,8 @@ async fn ensure_column(
     Ok(())
 }
 
-async fn table_has_column(
-    db: &DatabaseConnection,
+async fn table_has_column<C: ConnectionTrait>(
+    db: &C,
     table: &str,
     target: &str,
 ) -> anyhow::Result<bool> {
@@ -1180,7 +1302,7 @@ async fn table_has_column(
     }
 }
 
-async fn ensure_default_voice_profile(db: &DatabaseConnection) -> anyhow::Result<()> {
+async fn ensure_default_voice_profile<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     let exists = db
         .query_one_raw(raw::statement(
             db,
@@ -1229,6 +1351,117 @@ fn current_timestamp_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::test_database::TestDatabase;
+
+    async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
+        db.query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+            .await
+            .expect("count query")
+            .expect("count row")
+            .try_get_by_index::<i64>(0)
+            .expect("count value")
+    }
+
+    async fn has_table(db: &DatabaseConnection, table: &str) -> bool {
+        db.query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            format!("SELECT 1 FROM {table} LIMIT 1"),
+        ))
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn migrations_apply_once_per_schema_and_record_their_versions() {
+        let database = TestDatabase::new().await;
+        let app = database.database();
+        let db = app.connection().await.expect("app schema migrates");
+        Migrator::up(db).await.expect("a second run is a no-op");
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
+            1
+        );
+        assert!(has_table(db, "runtime_jobs").await);
+        assert!(
+            !has_table(db, "fleet_capacity_claims").await,
+            "the application schema no longer carries fleet tables"
+        );
+
+        let fleet_database = TestDatabase::new().await;
+        let fleet = fleet_database.database().for_fleet();
+        let db = fleet.connection().await.expect("fleet schema migrates");
+        assert!(has_table(db, "fleet_capacity_claims").await);
+        assert!(has_table(db, "fleet_worker_observations").await);
+        assert!(!has_table(db, "runtime_jobs").await);
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'fleet'").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unversioned_database_upgrades_in_place() {
+        let database = TestDatabase::new().await;
+        let store = database.database();
+        let db = store.connection().await.expect("connection");
+        // A database an unversioned release created: the schema without the
+        // version table, holding data, and missing a later index.
+        db.execute_unprepared("DROP TABLE schema_migrations")
+            .await
+            .expect("version table drops");
+        db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
+            .await
+            .expect("index drops");
+        db.execute_unprepared(
+            "INSERT INTO chat_threads (id, title, created_at, updated_at) VALUES ('kept', 'kept', 1, 1)",
+        )
+        .await
+        .expect("row inserts");
+
+        Migrator::up(db).await.expect("unversioned database upgrades");
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
+            1
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM chat_threads WHERE id = 'kept'").await,
+            1
+        );
+        db.execute_unprepared("DROP INDEX idx_runtime_jobs_status_updated")
+            .await
+            .expect("the baseline recreated the index");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_migrators_apply_each_migration_once() {
+        let database = TestDatabase::new().await;
+        let mut connections = Vec::new();
+        for _ in 0..8 {
+            connections.push(database.connect_unmigrated().await);
+        }
+        let handles = connections
+            .iter()
+            .cloned()
+            .map(|db| tokio::spawn(async move { Migrator::up(&db).await }))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .await
+                .expect("migrator joins")
+                .expect("every concurrent migrator succeeds");
+        }
+        let db = &connections[0];
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM schema_migrations").await,
+            1
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM voice_profiles").await,
+            1,
+            "the default voice profile is seeded once"
+        );
+    }
+
 
     #[test]
     fn sqlite_ddl_passes_through_unchanged() {

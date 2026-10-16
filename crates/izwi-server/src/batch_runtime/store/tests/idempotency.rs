@@ -450,7 +450,11 @@ async fn quota_usage_is_backfilled_once_when_its_table_is_created() {
         ));
     }
     let db = store.connection().await.unwrap();
+    // A database from before the usage table and versioned migrations.
     db.execute_unprepared("DROP TABLE runtime_quota_usage")
+        .await
+        .unwrap();
+    db.execute_unprepared("DROP TABLE schema_migrations")
         .await
         .unwrap();
     crate::db::migrator::Migrator::up(db).await.unwrap();

@@ -1,4 +1,7 @@
-use crate::{db::migrator::Migrator, storage_layout};
+use crate::{
+    db::migrator::{Migrator, Schema},
+    storage_layout,
+};
 use anyhow::Context;
 use sea_orm::{sqlx::sqlite::SqliteJournalMode, ConnectOptions, Database, DatabaseConnection};
 use std::fmt;
@@ -154,6 +157,7 @@ pub struct StoreDatabase {
     source: Option<storage_layout::DatabaseSource>,
     connection: Arc<OnceCell<DatabaseConnection>>,
     statement_timeout: Option<Duration>,
+    schema: Schema,
 }
 
 impl StoreDatabase {
@@ -168,6 +172,7 @@ impl StoreDatabase {
             source: Some(source),
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
+            schema: Schema::App,
         })
     }
 
@@ -176,6 +181,7 @@ impl StoreDatabase {
             source: Some(storage_layout::DatabaseSource::Path(db_path)),
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
+            schema: Schema::App,
         }
     }
 
@@ -186,6 +192,7 @@ impl StoreDatabase {
             source: Some(storage_layout::DatabaseSource::Url(url)),
             connection: Arc::new(OnceCell::new()),
             statement_timeout: None,
+            schema: Schema::App,
         }
     }
 
@@ -200,6 +207,13 @@ impl StoreDatabase {
         }
     }
 
+    /// Migrate this database to the fleet coordination schema instead of
+    /// the application schema.
+    pub fn for_fleet(mut self) -> Self {
+        self.schema = Schema::Fleet;
+        self
+    }
+
     pub fn from_connection(connection: DatabaseConnection) -> Self {
         let cell = OnceCell::new();
         cell.set(connection)
@@ -209,17 +223,19 @@ impl StoreDatabase {
             source: None,
             connection: Arc::new(cell),
             statement_timeout: None,
+            schema: Schema::App,
         }
     }
 
     pub async fn connection(&self) -> anyhow::Result<&DatabaseConnection> {
         if let Some(source) = self.source.clone() {
             let statement_timeout = self.statement_timeout;
+            let schema = self.schema;
             return self
                 .connection
                 .get_or_try_init(|| async move {
                     let db = connect_source(&source, statement_timeout).await?;
-                    Migrator::up(&db)
+                    Migrator::up_schema(&db, schema)
                         .await
                         .context("Failed to run migrations for SeaORM store")?;
                     Ok(db)
@@ -507,9 +523,8 @@ mod tests {
         "provider_write_reservations",
         "durable_idempotency_keys_v2",
         "runtime_quota_usage",
-        "fleet_worker_observations",
-        "fleet_capacity_claims",
         "gateway_principal_keys",
+        "schema_migrations",
     ];
 
     const EXPECTED_COMPAT_COLUMNS: &[(&str, &str)] = &[

@@ -115,7 +115,7 @@ impl FleetFaults {
 impl FleetStore {
     pub fn new(db: StoreDatabase) -> Self {
         Self {
-            db,
+            db: db.for_fleet(),
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
