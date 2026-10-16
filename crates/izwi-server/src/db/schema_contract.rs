@@ -536,6 +536,10 @@ const REQUIRED_SCHEMA_TABLES: &[RequiredSchemaTable] = &[
         ],
     },
     RequiredSchemaTable {
+        name: "runtime_quota_usage",
+        columns: &["quota_kind", "scope", "used"],
+    },
+    RequiredSchemaTable {
         name: "runtime_worker_heartbeats",
         columns: &[
             "worker_id",

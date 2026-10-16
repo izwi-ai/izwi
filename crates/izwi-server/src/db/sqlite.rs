@@ -422,6 +422,7 @@ mod tests {
         "artifact_cleanup_intents",
         "provider_write_reservations",
         "durable_idempotency_keys_v2",
+        "runtime_quota_usage",
         "fleet_worker_observations",
         "fleet_capacity_claims",
         "gateway_principal_keys",

@@ -44,7 +44,7 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_artifact_cleanup_capacity: Option<u64>,
     #[cfg(test)]
-    test_provider_write_capacity: Option<u64>,
+    test_provider_write_limits: Option<QuotaLimits>,
     #[cfg(test)]
     test_pcm_replay_entry_limit: Option<u64>,
     #[cfg(test)]
@@ -446,7 +446,8 @@ const MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES: usize = 2 * 1024;
 const MAX_ARTIFACT_CLEANUP_TENANT_BYTES: usize = 128;
 const MAX_ARTIFACT_CLEANUP_ERROR_BYTES: usize = 512;
 const MAX_ARTIFACT_CLEANUP_BACKOFF_MS: u64 = 60 * 60 * 1000;
-const MAX_PROVIDER_WRITE_RESERVATIONS: u64 = 65_536;
+const DEFAULT_PROVIDER_WRITE_RESERVATIONS: u64 = 65_536;
+const DEFAULT_PROVIDER_WRITE_RESERVATIONS_PER_TENANT: u64 = 16_384;
 const MAX_PROVIDER_WRITE_CLEANUP_BATCH: usize = 64;
 const MAX_PROVIDER_WRITE_NAMESPACE_BYTES: usize = 128;
 const MAX_PROVIDER_WRITE_CONTENT_TYPE_BYTES: usize = 256;
@@ -670,7 +671,8 @@ const MAX_DURABLE_TTS_REQUEST_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DURABLE_TTS_METADATA_JSON_BYTES: usize = 64 * 1024;
 const MAX_DURABLE_TTS_OPTIONAL_FIELD_BYTES: usize = 64 * 1024;
 const MAX_DURABLE_TTS_CORRELATION_BYTES: usize = 256;
-const MAX_DURABLE_IDEMPOTENCY_RECORDS: u64 = 65_536;
+const DEFAULT_DURABLE_IDEMPOTENCY_RECORDS: u64 = 1_048_576;
+const DEFAULT_DURABLE_IDEMPOTENCY_RECORDS_PER_TENANT: u64 = 65_536;
 const DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 64;
 const MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 512;
 const MAX_DURABLE_IDEMPOTENCY_JSON_DEPTH: usize = 128;
@@ -880,7 +882,7 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_artifact_cleanup_capacity: None,
             #[cfg(test)]
-            test_provider_write_capacity: None,
+            test_provider_write_limits: None,
             #[cfg(test)]
             test_pcm_replay_entry_limit: None,
             #[cfg(test)]
@@ -915,7 +917,15 @@ impl BatchRuntimeStore {
 
     #[cfg(test)]
     pub(crate) fn set_provider_write_capacity_for_test(&mut self, capacity: u64) {
-        self.test_provider_write_capacity = Some(capacity);
+        self.set_provider_write_limits_for_test(QuotaLimits {
+            global: capacity,
+            per_tenant: capacity,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_provider_write_limits_for_test(&mut self, limits: QuotaLimits) {
+        self.test_provider_write_limits = Some(limits);
     }
 
     #[cfg(test)]
@@ -1448,21 +1458,15 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start provider write reservation transaction")?;
-        lock_provider_write_capacity(&tx).await?;
-        let count = tx
-            .query_one_raw(raw::statement(
-                &tx,
-                "SELECT COUNT(*) FROM provider_write_reservations",
-                vec![],
-            )?)
-            .await?
-            .context("Provider write reservation count returned no row")?
-            .try_get_by_index::<i64>(0)?;
-        let capacity = self.provider_write_capacity();
-        anyhow::ensure!(
-            u64::try_from(count)? < capacity,
-            "Provider write reservation capacity exhausted ({capacity} active reservations)"
-        );
+        let limits = self.provider_write_limits();
+        if !acquire_quota_with(&tx, QuotaKind::ProviderWrite, &input.tenant_scope, limits).await? {
+            tx.rollback().await?;
+            bail!(
+                "Provider write reservation capacity exhausted ({} per tenant, {} in total)",
+                limits.per_tenant,
+                limits.global
+            );
+        }
         let now = self.now_millis();
         let expires_at = now.saturating_add(i64::try_from(input.lifetime_ms)?);
         let write_id = input.write_id.clone();
@@ -1631,6 +1635,7 @@ impl BatchRuntimeStore {
             tx.rollback().await?;
             return Ok(None);
         }
+        release_quota_with(&tx, QuotaKind::ProviderWrite, &reservation.tenant_scope, 1).await?;
         let asset = get_media_asset_with(&tx, &id).await?;
         tx.commit().await?;
         Ok(asset)
@@ -2010,6 +2015,7 @@ impl BatchRuntimeStore {
             tx.rollback().await?;
             return Ok(None);
         }
+        release_quota_with(&tx, QuotaKind::ProviderWrite, &reservation.tenant_scope, 1).await?;
         let asset = get_media_asset_with(&tx, &media_id)
             .await?
             .context("Published opaque stage media asset was not found")?;
@@ -2471,6 +2477,7 @@ impl BatchRuntimeStore {
             tx.rollback().await?;
             return Ok(None);
         }
+        release_quota_with(&tx, QuotaKind::ProviderWrite, &reservation.tenant_scope, 1).await?;
         let asset = get_media_asset_with(&tx, &media_id)
             .await?
             .context("Settled speech final media asset was not found")?;
@@ -2571,11 +2578,17 @@ impl BatchRuntimeStore {
         reservation: &ProviderWriteReservation,
     ) -> anyhow::Result<bool> {
         let db = self.db.connection().await?;
-        let result = db.execute_raw(raw::statement(db,
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let result = tx.execute_raw(raw::statement(&tx,
             "DELETE FROM provider_write_reservations WHERE write_id = ?1 AND state = 'cleanup_claimed' AND cleanup_claim_token = ?2",
             vec![reservation.write_id.clone().into(), opt_string(reservation.cleanup_claim_token.clone())],
         )?).await?;
-        Ok(result.rows_affected() == 1)
+        let completed = result.rows_affected() == 1;
+        if completed {
+            release_quota_with(&tx, QuotaKind::ProviderWrite, &reservation.tenant_scope, 1).await?;
+        }
+        tx.commit().await?;
+        Ok(completed)
     }
 
     pub(crate) async fn defer_provider_write_cleanup(
@@ -2613,12 +2626,26 @@ impl BatchRuntimeStore {
         Ok(result.rows_affected() == 1)
     }
 
-    fn provider_write_capacity(&self) -> u64 {
+    fn provider_write_limits(&self) -> QuotaLimits {
         #[cfg(test)]
-        if let Some(capacity) = self.test_provider_write_capacity {
-            return capacity;
+        if let Some(limits) = self.test_provider_write_limits {
+            return limits;
         }
-        MAX_PROVIDER_WRITE_RESERVATIONS
+        QuotaLimits::from_env(
+            "IZWI_PROVIDER_WRITE_MAX_RESERVATIONS",
+            DEFAULT_PROVIDER_WRITE_RESERVATIONS,
+            "IZWI_PROVIDER_WRITE_MAX_RESERVATIONS_PER_TENANT",
+            DEFAULT_PROVIDER_WRITE_RESERVATIONS_PER_TENANT,
+        )
+    }
+
+    fn durable_idempotency_limits(&self) -> QuotaLimits {
+        QuotaLimits::from_env(
+            "IZWI_IDEMPOTENCY_MAX_RECORDS",
+            DEFAULT_DURABLE_IDEMPOTENCY_RECORDS,
+            "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT",
+            DEFAULT_DURABLE_IDEMPOTENCY_RECORDS_PER_TENANT,
+        )
     }
 
     pub async fn get_media_asset_by_storage_key(
@@ -3058,7 +3085,6 @@ impl BatchRuntimeStore {
             .context("Failed to start durable text TTS acceptance transaction")?;
 
         if let Some(reservation) = input.reservation.as_ref() {
-            lock_durable_idempotency(&tx).await?;
             if !durable_reservation_is_live_with(&tx, reservation, now_u64).await? {
                 tx.rollback().await?;
                 return Ok(DurableTextTtsAcceptanceOutcome::ReservationLost);
@@ -3380,7 +3406,6 @@ impl BatchRuntimeStore {
             .context("Failed to start durable job acceptance transaction")?;
 
         if let Some(reservation) = reservation.as_ref() {
-            lock_durable_idempotency(&tx).await?;
             if !durable_reservation_is_live_with(&tx, reservation, now_u64).await? {
                 tx.rollback().await?;
                 return Ok(DurableJobAcceptanceOutcome::ReservationLost);
@@ -5536,18 +5561,37 @@ impl BatchRuntimeStore {
         &self,
         request: DurableIdempotencyRequest,
     ) -> anyhow::Result<DurableIdempotencyBegin> {
-        self.reserve_durable_idempotency_with_capacity(request, MAX_DURABLE_IDEMPOTENCY_RECORDS)
+        self.reserve_durable_idempotency_with_limits(request, self.durable_idempotency_limits())
             .await
     }
 
+    #[cfg(test)]
     async fn reserve_durable_idempotency_with_capacity(
         &self,
         request: DurableIdempotencyRequest,
         max_records: u64,
     ) -> anyhow::Result<DurableIdempotencyBegin> {
+        self.reserve_durable_idempotency_with_limits(
+            request,
+            QuotaLimits {
+                global: max_records,
+                per_tenant: max_records,
+            },
+        )
+        .await
+    }
+
+    /// Records count against per-tenant and global quota rows kept in the
+    /// same transactions that insert and delete them, so a reservation costs
+    /// two keyed row updates instead of a table count under a global lock.
+    async fn reserve_durable_idempotency_with_limits(
+        &self,
+        request: DurableIdempotencyRequest,
+        limits: QuotaLimits,
+    ) -> anyhow::Result<DurableIdempotencyBegin> {
         validate_durable_idempotency_request(&request)?;
         anyhow::ensure!(
-            max_records > 0,
+            limits.global > 0 && limits.per_tenant > 0,
             "Durable idempotency capacity must be positive"
         );
         let db = self.db.connection().await?;
@@ -5555,10 +5599,8 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable idempotency reservation transaction")?;
-        lock_durable_idempotency(&tx).await?;
         let now = nonnegative_timestamp(self.now_millis())?;
-        prune_expired_durable_idempotency_with(&tx, now, DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT)
-            .await?;
+        let kind = QuotaKind::DurableIdempotency;
 
         if let Some(existing) = load_durable_idempotency_with(
             &tx,
@@ -5568,32 +5610,40 @@ impl BatchRuntimeStore {
         )
         .await?
         {
-            if existing.expires_at <= now {
-                delete_durable_idempotency_with(
-                    &tx,
-                    &request.tenant_scope,
-                    &request.operation,
-                    &request.idempotency_key,
-                    now,
-                )
-                .await?;
-            } else {
+            if existing.expires_at > now {
                 let outcome = existing.begin_outcome(&request)?;
                 tx.commit().await?;
                 return Ok(outcome);
             }
+            if delete_durable_idempotency_with(
+                &tx,
+                &request.tenant_scope,
+                &request.operation,
+                &request.idempotency_key,
+                now,
+            )
+            .await?
+            {
+                release_quota_with(&tx, kind, &request.tenant_scope, 1).await?;
+            }
         }
 
-        let count = tx
-            .query_one_raw(raw::statement(
+        let mut acquired = acquire_quota_with(&tx, kind, &request.tenant_scope, limits).await?;
+        // A tenant at its cap first gives back its own expired records; other
+        // tenants' are left to the retention sweeper.
+        if !acquired
+            && prune_expired_durable_idempotency_with(
                 &tx,
-                "SELECT COUNT(*) FROM durable_idempotency_keys_v2",
-                vec![],
-            )?)
+                Some(&request.tenant_scope),
+                now,
+                DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT,
+            )
             .await?
-            .ok_or_else(|| anyhow!("Durable idempotency count returned no row"))?
-            .try_get_by_index::<i64>(0)?;
-        if u64::try_from(count)? >= max_records {
+                > 0
+        {
+            acquired = acquire_quota_with(&tx, kind, &request.tenant_scope, limits).await?;
+        }
+        if !acquired {
             tx.commit().await?;
             return Ok(DurableIdempotencyBegin::CapacityExceeded);
         }
@@ -5645,6 +5695,7 @@ impl BatchRuntimeStore {
             .context("Failed to reserve durable idempotency key")?;
 
         if inserted.rows_affected() == 0 {
+            release_quota_with(&tx, kind, &request.tenant_scope, 1).await?;
             let existing = load_durable_idempotency_with(
                 &tx,
                 &request.tenant_scope,
@@ -5799,9 +5850,10 @@ impl BatchRuntimeStore {
         )?;
         validate_bounded_field("reservation token", &reservation.reservation_token, 64)?;
         let db = self.db.connection().await?;
-        let result = db
+        let tx = db.begin_with_options(write_transaction_options()).await?;
+        let result = tx
             .execute_raw(raw::statement(
-                db,
+                &tx,
                 r#"
                 DELETE FROM durable_idempotency_keys_v2
                 WHERE tenant_scope = ?1 AND operation = ?2 AND idempotency_key = ?3
@@ -5819,7 +5871,18 @@ impl BatchRuntimeStore {
             )?)
             .await
             .context("Failed to release durable idempotency reservation")?;
-        Ok(result.rows_affected() == 1)
+        let released = result.rows_affected() == 1;
+        if released {
+            release_quota_with(
+                &tx,
+                QuotaKind::DurableIdempotency,
+                &reservation.tenant_scope,
+                1,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(released)
     }
 
     /// Delete a deterministic bounded page of expired reservations/results.
@@ -5829,9 +5892,9 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start durable idempotency prune transaction")?;
-        lock_durable_idempotency(&tx).await?;
         let removed = prune_expired_durable_idempotency_with(
             &tx,
+            None,
             nonnegative_timestamp(self.now_millis())?,
             limit.clamp(1, MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT),
         )
@@ -6794,29 +6857,6 @@ fn write_canonical_json<W: Write>(
     Ok(())
 }
 
-async fn lock_durable_idempotency<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
-    let insert_sql = match db.get_database_backend() {
-        DbBackend::Sqlite | DbBackend::Postgres => {
-            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('durable_idempotency_v2', 1) ON CONFLICT (id) DO NOTHING"
-        }
-        DbBackend::MySql => {
-            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('durable_idempotency_v2', 1)"
-        }
-        backend => bail!("Unsupported durable idempotency database backend: {backend:?}"),
-    };
-    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
-        .await
-        .context("Failed to initialize durable idempotency lock")?;
-    db.execute_raw(raw::statement(
-        db,
-        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'durable_idempotency_v2'",
-        vec![],
-    )?)
-    .await
-    .context("Failed to lock durable idempotency capacity")?;
-    Ok(())
-}
-
 async fn lock_tts_admission_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     let insert_sql = match db.get_database_backend() {
         DbBackend::Sqlite | DbBackend::Postgres => {
@@ -6863,24 +6903,161 @@ async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::R
     Ok(())
 }
 
-async fn lock_provider_write_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
-    let insert_sql = match db.get_database_backend() {
+/// Bounded records counted in `runtime_quota_usage`, per tenant and in total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuotaKind {
+    DurableIdempotency,
+    ProviderWrite,
+}
+
+impl QuotaKind {
+    fn as_db_value(self) -> &'static str {
+        match self {
+            Self::DurableIdempotency => "durable_idempotency",
+            Self::ProviderWrite => "provider_write",
+        }
+    }
+}
+
+/// Caps on one quota kind; each is at least one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaLimits {
+    pub(crate) global: u64,
+    pub(crate) per_tenant: u64,
+}
+
+impl QuotaLimits {
+    fn from_env(global_key: &str, global: u64, tenant_key: &str, per_tenant: u64) -> Self {
+        let read = |key: &str, default: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            global: read(global_key, global),
+            per_tenant: read(tenant_key, per_tenant),
+        }
+    }
+}
+
+/// The scope of the row that counts every tenant; tenant scopes are never
+/// empty.
+const GLOBAL_QUOTA_SCOPE: &str = "";
+
+async fn ensure_quota_row_with<C: ConnectionTrait>(
+    db: &C,
+    kind: QuotaKind,
+    scope: &str,
+) -> anyhow::Result<()> {
+    let sql = match db.get_database_backend() {
         DbBackend::Sqlite | DbBackend::Postgres => {
-            "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('provider_writes', 1) ON CONFLICT (id) DO NOTHING"
+            "INSERT INTO runtime_quota_usage (quota_kind, scope, used) VALUES (?1, ?2, 0) ON CONFLICT (quota_kind, scope) DO NOTHING"
         }
         DbBackend::MySql => {
-            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('provider_writes', 1)"
+            "INSERT IGNORE INTO runtime_quota_usage (quota_kind, scope, used) VALUES (?1, ?2, 0)"
         }
-        backend => bail!("Unsupported provider write database backend: {backend:?}"),
+        backend => bail!("Unsupported quota database backend: {backend:?}"),
     };
-    db.execute_raw(raw::statement(db, insert_sql, vec![])?)
-        .await?;
     db.execute_raw(raw::statement(
         db,
-        "UPDATE runtime_admission_locks SET lock_value = lock_value WHERE id = 'provider_writes'",
-        vec![],
+        sql,
+        vec![kind.as_db_value().into(), scope.into()],
     )?)
-    .await?;
+    .await
+    .context("Failed to initialize quota usage")?;
+    Ok(())
+}
+
+/// Take one unit of `kind` for `tenant` when both its tenant cap and the
+/// global cap allow it. Every transaction locks quota rows in one order,
+/// tenants before the global row, so PostgreSQL cannot deadlock on them.
+async fn acquire_quota_with<C: ConnectionTrait>(
+    db: &C,
+    kind: QuotaKind,
+    tenant: &str,
+    limits: QuotaLimits,
+) -> anyhow::Result<bool> {
+    for (scope, cap) in [
+        (tenant, limits.per_tenant),
+        (GLOBAL_QUOTA_SCOPE, limits.global),
+    ] {
+        ensure_quota_row_with(db, kind, scope).await?;
+        let taken = db
+            .execute_raw(raw::statement(
+                db,
+                "UPDATE runtime_quota_usage SET used = used + 1 WHERE quota_kind = ?1 AND scope = ?2 AND used < ?3",
+                vec![
+                    kind.as_db_value().into(),
+                    scope.into(),
+                    i64::try_from(cap)?.into(),
+                ],
+            )?)
+            .await
+            .context("Failed to take quota")?
+            .rows_affected()
+            == 1;
+        if !taken {
+            if scope == GLOBAL_QUOTA_SCOPE {
+                adjust_quota_with(db, kind, tenant, 1).await?;
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Give back `count` units of `tenant`'s quota and of the global quota.
+async fn release_quota_with<C: ConnectionTrait>(
+    db: &C,
+    kind: QuotaKind,
+    tenant: &str,
+    count: u64,
+) -> anyhow::Result<()> {
+    release_quotas_with(
+        db,
+        kind,
+        &std::collections::BTreeMap::from([(tenant.to_string(), count)]),
+    )
+    .await
+}
+
+/// Give back quota for several tenants: tenant rows in sorted order, then
+/// the global row once.
+async fn release_quotas_with<C: ConnectionTrait>(
+    db: &C,
+    kind: QuotaKind,
+    released: &std::collections::BTreeMap<String, u64>,
+) -> anyhow::Result<()> {
+    let mut total = 0_u64;
+    for (tenant, count) in released {
+        adjust_quota_with(db, kind, tenant, *count).await?;
+        total = total.saturating_add(*count);
+    }
+    adjust_quota_with(db, kind, GLOBAL_QUOTA_SCOPE, total).await
+}
+
+async fn adjust_quota_with<C: ConnectionTrait>(
+    db: &C,
+    kind: QuotaKind,
+    scope: &str,
+    released: u64,
+) -> anyhow::Result<()> {
+    if released == 0 {
+        return Ok(());
+    }
+    db.execute_raw(raw::statement(
+        db,
+        "UPDATE runtime_quota_usage SET used = CASE WHEN used > ?3 THEN used - ?3 ELSE 0 END WHERE quota_kind = ?1 AND scope = ?2",
+        vec![
+            kind.as_db_value().into(),
+            scope.into(),
+            i64::try_from(released)?.into(),
+        ],
+    )?)
+    .await
+    .context("Failed to release quota")?;
     Ok(())
 }
 
@@ -7362,27 +7539,40 @@ async fn delete_durable_idempotency_with<C: ConnectionTrait>(
     Ok(result.rows_affected() == 1)
 }
 
+/// Delete a deterministic bounded page of expired records, of one tenant or
+/// of all, and give their quota back.
 async fn prune_expired_durable_idempotency_with<C: ConnectionTrait>(
     db: &C,
+    tenant_scope: Option<&str>,
     now: u64,
     limit: usize,
 ) -> anyhow::Result<u64> {
+    let mut values = vec![i64::try_from(now)?.into(), i64::try_from(limit)?.into()];
+    let tenant_predicate = match tenant_scope {
+        Some(tenant_scope) => {
+            values.push(tenant_scope.into());
+            "AND tenant_scope = ?3"
+        }
+        None => "",
+    };
     let rows = db
         .query_all_raw(raw::statement(
             db,
-            r#"
-            SELECT tenant_scope, operation, idempotency_key
-            FROM durable_idempotency_keys_v2
-            WHERE expires_at <= ?1
-            ORDER BY expires_at ASC, created_at ASC, tenant_scope ASC,
-                     operation ASC, idempotency_key ASC
-            LIMIT ?2
-            "#,
-            vec![i64::try_from(now)?.into(), i64::try_from(limit)?.into()],
+            format!(
+                r#"
+                SELECT tenant_scope, operation, idempotency_key
+                FROM durable_idempotency_keys_v2
+                WHERE expires_at <= ?1 {tenant_predicate}
+                ORDER BY expires_at ASC, created_at ASC, tenant_scope ASC,
+                         operation ASC, idempotency_key ASC
+                LIMIT ?2
+                "#
+            ),
+            values,
         )?)
         .await
         .context("Failed to select expired durable idempotency keys")?;
-    let mut removed = 0_u64;
+    let mut removed = std::collections::BTreeMap::<String, u64>::new();
     for row in rows {
         let tenant_scope: String = row.try_get_by_index(0)?;
         let operation: String = row.try_get_by_index(1)?;
@@ -7390,10 +7580,11 @@ async fn prune_expired_durable_idempotency_with<C: ConnectionTrait>(
         if delete_durable_idempotency_with(db, &tenant_scope, &operation, &idempotency_key, now)
             .await?
         {
-            removed = removed.saturating_add(1);
+            *removed.entry(tenant_scope).or_default() += 1;
         }
     }
-    Ok(removed)
+    release_quotas_with(db, QuotaKind::DurableIdempotency, &removed).await?;
+    Ok(removed.values().sum())
 }
 
 async fn get_job_with<C: ConnectionTrait>(db: &C, id: &str) -> anyhow::Result<Option<RuntimeJob>> {
@@ -9870,6 +10061,290 @@ mod tests {
         ));
     }
 
+    async fn count_where(store: &BatchRuntimeStore, sql: &str, values: Vec<Value>) -> u64 {
+        let db = store.connection().await.expect("database");
+        let row = db
+            .query_one_raw(raw::statement(db, sql, values).expect("count statement"))
+            .await
+            .expect("count query")
+            .expect("count row");
+        u64::try_from(row.try_get_by_index::<i64>(0).expect("count")).expect("count")
+    }
+
+    /// The quota rows must always equal the records they count.
+    async fn assert_quota_matches_records(store: &BatchRuntimeStore, kind: QuotaKind, table: &str) {
+        let db = store.connection().await.expect("database");
+        let rows = db
+            .query_all_raw(
+                raw::statement(
+                    db,
+                    "SELECT scope, used FROM runtime_quota_usage WHERE quota_kind = ?1",
+                    vec![kind.as_db_value().into()],
+                )
+                .expect("quota statement"),
+            )
+            .await
+            .expect("quota rows");
+        assert!(!rows.is_empty(), "{table} has quota rows");
+        for row in rows {
+            let scope: String = row.try_get_by_index(0).unwrap();
+            let used = u64::try_from(row.try_get_by_index::<i64>(1).unwrap()).unwrap();
+            let actual = if scope.is_empty() {
+                count_where(store, &format!("SELECT COUNT(*) FROM {table}"), vec![]).await
+            } else {
+                count_where(
+                    store,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE tenant_scope = ?1"),
+                    vec![scope.clone().into()],
+                )
+                .await
+            };
+            assert_eq!(used, actual, "{table} quota for scope {scope:?}");
+        }
+    }
+
+    async fn reserve_with_limits(
+        store: &BatchRuntimeStore,
+        tenant: &str,
+        key: &str,
+        limits: QuotaLimits,
+    ) -> DurableIdempotencyBegin {
+        store
+            .reserve_durable_idempotency_with_limits(
+                durable_idempotency_request(tenant, "job.create", key, key.as_bytes(), 100),
+                limits,
+            )
+            .await
+            .expect("reservation outcome")
+    }
+
+    /// DUR-F4: idempotency capacity is per tenant, with a global ceiling,
+    /// kept as counters by the transactions that insert and delete records.
+    #[tokio::test]
+    async fn durable_idempotency_quota_is_per_tenant_and_counted_incrementally() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        let limits = QuotaLimits {
+            global: 3,
+            per_tenant: 2,
+        };
+        let acquired = |outcome: &DurableIdempotencyBegin| {
+            matches!(outcome, DurableIdempotencyBegin::Acquired(_))
+        };
+
+        assert!(acquired(
+            &reserve_with_limits(&store, "tenant-a", "a1", limits).await
+        ));
+        let DurableIdempotencyBegin::Acquired(a2) =
+            reserve_with_limits(&store, "tenant-a", "a2", limits).await
+        else {
+            panic!("tenant-a has room for two records");
+        };
+        // A full tenant is refused without touching anyone else's capacity.
+        assert_eq!(
+            reserve_with_limits(&store, "tenant-a", "a3", limits).await,
+            DurableIdempotencyBegin::CapacityExceeded
+        );
+        assert!(acquired(
+            &reserve_with_limits(&store, "tenant-b", "b1", limits).await
+        ));
+        // Duplicates neither count nor need capacity.
+        assert!(matches!(
+            reserve_with_limits(&store, "tenant-a", "a1", limits).await,
+            DurableIdempotencyBegin::InProgress { .. }
+        ));
+        // The global ceiling holds across tenants.
+        assert_eq!(
+            reserve_with_limits(&store, "tenant-c", "c1", limits).await,
+            DurableIdempotencyBegin::CapacityExceeded
+        );
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::DurableIdempotency,
+            "durable_idempotency_keys_v2",
+        )
+        .await;
+
+        assert!(store.release_durable_idempotency(&a2).await.unwrap());
+        assert!(acquired(
+            &reserve_with_limits(&store, "tenant-c", "c1", limits).await
+        ));
+
+        // A tenant at its cap first gives back its own expired records.
+        clock.store(2_000, Ordering::SeqCst);
+        let roomy = QuotaLimits {
+            global: 16,
+            per_tenant: 2,
+        };
+        assert!(acquired(
+            &reserve_with_limits(&store, "tenant-b", "b2", roomy).await
+        ));
+        assert!(acquired(
+            &reserve_with_limits(&store, "tenant-b", "b3", roomy).await
+        ));
+        assert_eq!(
+            count_where(
+                &store,
+                "SELECT COUNT(*) FROM durable_idempotency_keys_v2 WHERE tenant_scope = 'tenant-a'",
+                vec![]
+            )
+            .await,
+            1,
+            "another tenant's expired records wait for the sweeper"
+        );
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::DurableIdempotency,
+            "durable_idempotency_keys_v2",
+        )
+        .await;
+
+        assert_eq!(
+            store.prune_expired_durable_idempotency(64).await.unwrap(),
+            2
+        );
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::DurableIdempotency,
+            "durable_idempotency_keys_v2",
+        )
+        .await;
+    }
+
+    /// DUR-F4: provider write reservations are capped per tenant and given
+    /// back by every path that deletes them.
+    #[tokio::test]
+    async fn provider_write_quota_is_per_tenant_and_released_by_cleanup() {
+        let (mut store, _root) = build_store();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        store.set_test_clock(clock.clone());
+        store.set_provider_write_limits_for_test(QuotaLimits {
+            global: 2,
+            per_tenant: 1,
+        });
+        let for_tenant = |tenant: &str| {
+            let mut input = test_provider_write_input(
+                MediaNamespace::Other("artifact-store".to_string()),
+                "artifact-store",
+                100,
+            );
+            input.tenant_scope = tenant.to_string();
+            input
+                .provider_request
+                .metadata
+                .insert("tenant_id".to_string(), tenant.to_string());
+            input
+        };
+
+        let first = store
+            .reserve_provider_write(for_tenant("tenant-a"))
+            .await
+            .expect("first reservation");
+        let error = store
+            .reserve_provider_write(for_tenant("tenant-a"))
+            .await
+            .expect_err("tenant-a is at its cap");
+        assert!(error.to_string().contains("capacity exhausted"));
+        store
+            .reserve_provider_write(for_tenant("tenant-b"))
+            .await
+            .expect("tenant-b has its own capacity");
+        assert!(store
+            .reserve_provider_write(for_tenant("tenant-c"))
+            .await
+            .is_err());
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::ProviderWrite,
+            "provider_write_reservations",
+        )
+        .await;
+
+        assert!(store
+            .abandon_provider_write(&first, "test abandon")
+            .await
+            .unwrap());
+        clock.store(2_000, Ordering::SeqCst);
+        let claimed = store.claim_due_provider_write_cleanup(64).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        for reservation in &claimed {
+            assert!(store
+                .complete_provider_write_cleanup(reservation)
+                .await
+                .unwrap());
+        }
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::ProviderWrite,
+            "provider_write_reservations",
+        )
+        .await;
+        store
+            .reserve_provider_write(for_tenant("tenant-a"))
+            .await
+            .expect("capacity returns after cleanup");
+    }
+
+    /// An upgrade creates the quota table and seeds it from the records that
+    /// already exist; later migrations leave the live counts alone.
+    #[tokio::test]
+    async fn quota_usage_is_backfilled_once_when_its_table_is_created() {
+        let (store, _root) = build_store();
+        for (tenant, key) in [("tenant-a", "a1"), ("tenant-a", "a2"), ("tenant-b", "b1")] {
+            assert!(matches!(
+                store
+                    .reserve_durable_idempotency(durable_idempotency_request(
+                        tenant,
+                        "job.create",
+                        key,
+                        key.as_bytes(),
+                        60_000,
+                    ))
+                    .await
+                    .unwrap(),
+                DurableIdempotencyBegin::Acquired(_)
+            ));
+        }
+        let db = store.connection().await.unwrap();
+        db.execute_unprepared("DROP TABLE runtime_quota_usage")
+            .await
+            .unwrap();
+        crate::db::migrator::Migrator::up(db).await.unwrap();
+        assert_quota_matches_records(
+            &store,
+            QuotaKind::DurableIdempotency,
+            "durable_idempotency_keys_v2",
+        )
+        .await;
+        assert_eq!(
+            count_where(
+                &store,
+                "SELECT used FROM runtime_quota_usage WHERE quota_kind = 'durable_idempotency' AND scope = ''",
+                vec![]
+            )
+            .await,
+            3
+        );
+
+        db.execute_unprepared(
+            "UPDATE runtime_quota_usage SET used = 7 WHERE quota_kind = 'durable_idempotency' AND scope = ''",
+        )
+        .await
+        .unwrap();
+        crate::db::migrator::Migrator::up(db).await.unwrap();
+        assert_eq!(
+            count_where(
+                &store,
+                "SELECT used FROM runtime_quota_usage WHERE quota_kind = 'durable_idempotency' AND scope = ''",
+                vec![]
+            )
+            .await,
+            7,
+            "an existing table is never re-seeded"
+        );
+    }
+
     #[tokio::test]
     async fn durable_idempotency_rejects_unbounded_or_unattached_records() {
         let (mut store, _root) = build_store();
@@ -10389,6 +10864,11 @@ mod tests {
         );
 
         clock.store(2_000, Ordering::SeqCst);
+        // Expired records of other keys wait for the retention sweeper.
+        assert_eq!(
+            store.prune_expired_durable_idempotency(64).await.unwrap(),
+            1
+        );
         let reservation = match store
             .reserve_durable_idempotency(durable_idempotency_request(
                 "tenant-a",

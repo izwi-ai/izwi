@@ -10,6 +10,7 @@ pub struct Migrator;
 impl Migrator {
     pub async fn up(db: &DatabaseConnection) -> anyhow::Result<()> {
         let backend = db.get_database_backend();
+        let quota_usage_existed = table_has_column(db, "runtime_quota_usage", "used").await?;
         for statement in BASELINE_SCHEMA {
             db.execute_unprepared(&dialect_ddl(backend, statement))
                 .await?;
@@ -22,6 +23,10 @@ impl Migrator {
         for statement in POST_COMPATIBILITY_SCHEMA {
             db.execute_unprepared(&dialect_ddl(backend, statement))
                 .await?;
+        }
+
+        if !quota_usage_existed {
+            backfill_quota_usage(db).await?;
         }
 
         ensure_default_voice_profile(db).await?;
@@ -730,7 +735,40 @@ const POST_COMPATIBILITY_SCHEMA: &[&str] = &[
     );
     "#,
     "CREATE INDEX IF NOT EXISTS idx_fleet_capacity_claims_worker ON fleet_capacity_claims(worker_id ASC, expires_at ASC);",
+    // Per-tenant and global (`scope = ''`) record counts for bounded tables,
+    // kept by the transactions that insert and delete those records.
+    r#"
+    CREATE TABLE IF NOT EXISTS runtime_quota_usage (
+        quota_kind TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(quota_kind, scope)
+    );
+    "#,
+    "CREATE INDEX IF NOT EXISTS idx_durable_idempotency_v2_tenant_expiry ON durable_idempotency_keys_v2(tenant_scope, expires_at ASC);",
 ];
+
+/// Seed quota usage from the records that exist when the usage table is
+/// first created. Later changes are counted in the record transactions.
+const QUOTA_USAGE_BACKFILL: &[&str] = &[
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'durable_idempotency', tenant_scope, COUNT(*) FROM durable_idempotency_keys_v2 WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'durable_idempotency', '', COUNT(*) FROM durable_idempotency_keys_v2 WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', tenant_scope, COUNT(*) FROM provider_write_reservations WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', '', COUNT(*) FROM provider_write_reservations WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+];
+
+async fn backfill_quota_usage(db: &DatabaseConnection) -> anyhow::Result<()> {
+    for statement in QUOTA_USAGE_BACKFILL {
+        let statement = match db.get_database_backend() {
+            DbBackend::MySql => statement
+                .replacen("INSERT INTO", "INSERT IGNORE INTO", 1)
+                .replace(" ON CONFLICT (quota_kind, scope) DO NOTHING", ""),
+            _ => statement.to_string(),
+        };
+        db.execute_unprepared(&statement).await?;
+    }
+    Ok(())
+}
 
 const COMPATIBILITY_COLUMNS: &[CompatibilityColumn] = &[
     CompatibilityColumn {
