@@ -24,7 +24,7 @@ use super::tensor_snapshots::{
     TensorSnapshotPrefixPolicy, TensorStateSnapshotIndex, tensor_snapshot_backing_bytes,
     tensor_snapshot_prefix_policy,
 };
-use crate::backends::BackendKind;
+use crate::backends::{BackendKind, DeviceThread};
 #[cfg(feature = "cuda")]
 use crate::backends::kv::CudaKvBackendRuntime;
 #[cfg(feature = "metal")]
@@ -1922,23 +1922,29 @@ impl ManagedKvCacheManager {
             let Some(arena_offload) = offload.arenas.get_mut(&arena_id) else {
                 continue;
             };
-            let mut steps = policy.max_in_flight_pages;
-            while steps > 0 {
-                if pressure(coordinator).is_none_or(|current| current <= policy.low_watermark) {
-                    break;
+            // A failure to reach the device thread demotes nothing.
+            let _ = on_device_thread(arena.as_ref(), || {
+                let mut steps = policy.max_in_flight_pages;
+                while steps > 0 {
+                    if pressure(coordinator)
+                        .is_none_or(|current| current <= policy.low_watermark)
+                    {
+                        break;
+                    }
+                    match offload::demote_step(
+                        coordinator,
+                        index,
+                        arena.as_ref(),
+                        arena_offload,
+                        telemetry,
+                    ) {
+                        Ok(DemoteOutcome::Demoted { .. }) => steps -= 1,
+                        Ok(_) => break,
+                        Err(_) => break,
+                    }
                 }
-                match offload::demote_step(
-                    coordinator,
-                    index,
-                    arena.as_ref(),
-                    arena_offload,
-                    telemetry,
-                ) {
-                    Ok(DemoteOutcome::Demoted { .. }) => steps -= 1,
-                    Ok(_) => break,
-                    Err(_) => break,
-                }
-            }
+                Ok(())
+            });
         }
     }
 
@@ -2529,7 +2535,7 @@ impl ManagedKvCacheManager {
                             ));
                         }
                     }
-                    arena.grow_resident_pages(growth)?;
+                    on_device_thread(arena.as_ref(), || arena.grow_resident_pages(growth))?;
                     state.allocation_ledger.reconcile_group_receipt(
                         runtime.allocation_plan(),
                         crate::kv::v2::StateGroupId::new(group.id.get()),
@@ -2564,7 +2570,9 @@ impl ManagedKvCacheManager {
                 let arena = runtime
                     .arena(group.arena)
                     .expect("resolved arena allocated");
-                if let Err(error) = arena.zero_pages(fresh).and_then(|fence| fence.wait()) {
+                if let Err(error) = on_device_thread(arena.as_ref(), || {
+                    arena.zero_pages(fresh).and_then(|fence| fence.wait())
+                }) {
                     let _ = coordinator.abort(txn_id);
                     abort_domains(state, txn_id, &domains);
                     return Err(error);
@@ -2575,10 +2583,11 @@ impl ManagedKvCacheManager {
                 let arena = runtime
                     .arena(group.arena)
                     .expect("resolved arena allocated");
-                if let Err(error) = arena
-                    .copy_pages(&prepared.page_copies)
-                    .and_then(|fence| fence.wait())
-                {
+                if let Err(error) = on_device_thread(arena.as_ref(), || {
+                    arena
+                        .copy_pages(&prepared.page_copies)
+                        .and_then(|fence| fence.wait())
+                }) {
                     let _ = coordinator.abort(txn_id);
                     abort_domains(state, txn_id, &domains);
                     return Err(error);
@@ -5037,6 +5046,16 @@ struct PromotedTail {
     record: Option<PendingPrefixPromotion>,
 }
 
+/// Run one core-side KV page operation (zero, copy, growth, offload capture
+/// or restore) on its arena's device thread instead of the tokio worker that
+/// prepares the step.
+fn on_device_thread<T: Send>(
+    arena: &dyn KvArena,
+    operation: impl FnOnce() -> Result<T> + Send,
+) -> Result<T> {
+    DeviceThread::for_location(arena.device_location())?.run_sync(operation)?
+}
+
 /// Restores a matched host tail into the fresh device pages the current
 /// transaction reserved for its span. The provisional table supplies one
 /// block per tail page; a shorter table truncates the promotion exactly like
@@ -5058,13 +5077,21 @@ fn promote_host_tail(
             None => break,
         }
     }
-    let copy = offload::promote_tail(
-        arena,
-        offload,
-        &blocks,
-        &tail.digests[..blocks.len()],
-        &tail.slots[..blocks.len()],
-    );
+    // A failure to reach the device thread restores nothing: the match
+    // falls back to its device-resident head.
+    let copy = on_device_thread(arena, || {
+        Ok(offload::promote_tail(
+            arena,
+            offload,
+            &blocks,
+            &tail.digests[..blocks.len()],
+            &tail.slots[..blocks.len()],
+        ))
+    })
+    .unwrap_or(offload::PromotionCopy {
+        restored_pages: 0,
+        latency_ns: 0,
+    });
     let restored_tokens = tail.device_end_tokens.saturating_add(
         u32::try_from(copy.restored_pages.saturating_mul(page)).unwrap_or(u32::MAX),
     );
@@ -8630,6 +8657,73 @@ mod tests {
                 )
                 .expect("commit");
         }
+    }
+
+    /// B3: page zeroing, host-offload capture and promotion restores of a
+    /// prepare run on the arena's device thread, not on the preparing thread.
+    #[test]
+    fn prepare_runs_kv_page_ops_on_the_device_thread() {
+        let model = ModelInstanceId::new(50);
+        let mut manager = ManagedKvCacheManager::with_prefix_cache_salt(None, Some([13; 32]));
+        manager.set_host_offload_policy(Some(HostOffloadPolicy {
+            budget_bytes: 4 << 20,
+            high_watermark: 0.85,
+            low_watermark: 0.70,
+            max_in_flight_pages: 8,
+            max_promotion_pages: 64,
+        }));
+        let runtime = manager
+            .bind_request(
+                model,
+                BackendKind::Cpu,
+                12,
+                32,
+                &CacheCapability::Managed(test_contract()),
+            )
+            .expect("bind")
+            .expect("runtime");
+        let tokens = (0..353).collect::<Vec<u32>>();
+        let watch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        crate::backends::device_thread::watch_off_thread_ops(Some(watch.clone()));
+
+        let source_session = SessionKey::new("b3-source".into(), 1);
+        let source = manager
+            .prepare(
+                &runtime,
+                51,
+                &source_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("source prepare")
+            .expect("source reservation");
+        manager
+            .finalize(
+                &source,
+                Some(&source.completed_write_receipt_for_test()),
+                true,
+            )
+            .expect("source commit");
+        manager.release_session(&source_session).expect("release");
+        let resumed_session = SessionKey::new("b3-resumed".into(), 1);
+        let resumed = manager
+            .prepare(
+                &runtime,
+                52,
+                &resumed_session,
+                &sequence_work(0, tokens.len()),
+                Some(&prefix_request(model, tokens.clone())),
+            )
+            .expect("resumed prepare")
+            .expect("resumed reservation");
+
+        crate::backends::device_thread::watch_off_thread_ops(None);
+        let telemetry = manager.telemetry_snapshot();
+        assert!(telemetry.pages_zeroed > 0);
+        assert_eq!(telemetry.demotions_total, 11);
+        assert_eq!(resumed.domains[0].execution_start_tokens, 352);
+        assert_eq!(watch.load(std::sync::atomic::Ordering::Relaxed), 0);
+        manager.finalize(&resumed, None, false).expect("abort");
     }
 
     #[test]
