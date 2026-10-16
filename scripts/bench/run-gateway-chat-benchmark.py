@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures
 import json
 import math
+import re
 import time
 import urllib.error
 import urllib.request
@@ -136,6 +137,25 @@ def conversation_turn_words(suffix_tokens, index, turn, vocab):
     user_words += _filler_words(max(1, suffix_tokens - len(user_words)),
                                 (index + 1) * 16 + turn, words)
     return user_words[:max(1, suffix_tokens)]
+
+
+SPECIAL_TOKEN_TEXT = re.compile(r"<\|[^|<>]*\|>")
+
+
+def replayable_reply(text, vocab):
+    """An assistant reply as the next turn's history, without special tokens.
+
+    Small random fixtures emit their special tokens (`<|pad|>`,
+    `<|image_pad|>`) as reply text. Replayed verbatim, an image placeholder
+    makes a text-only model reject the next turn with a 400, so the
+    conversation fails for a reason unrelated to routing. A reply that was
+    nothing but special tokens becomes the first vocabulary word, because an
+    empty assistant message is rejected too.
+    """
+    if text is None:
+        return None
+    words = SPECIAL_TOKEN_TEXT.sub(" ", text).split()
+    return " ".join(words) if words else (list(vocab) if vocab else BENCH_VOCAB)[0]
 
 
 def build_request(gateway, api_key, model, messages, max_tokens, stream, request_id):
@@ -289,7 +309,7 @@ def run_one(gateway, api_key, model, max_tokens, stream, index,
                 if ok or not rejected or attempt == max_retries:
                     break
                 time.sleep(min(0.025 * 2 ** attempt, 0.2))
-            history[-1][1] = reply
+            history[-1][1] = replayable_reply(reply, vocab)
             if not ok:
                 return (False, rejected, ttft_ms, latency_ms,
                         f"turn-{turn}:{detail}", None)
