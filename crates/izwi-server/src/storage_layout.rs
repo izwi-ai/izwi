@@ -14,7 +14,7 @@ const MAX_DATABASE_URL_BYTES: usize = 4096;
 /// Database backends the store layer can address by URL. SQLite paths stay
 /// the default resolution; the URL form exists for fleet deployments where
 /// the durable store lives in a shared server database (DS5).
-pub const DATABASE_URL_SCHEMES: &[&str] = &["postgres", "postgresql", "mysql", "sqlite"];
+pub const DATABASE_URL_SCHEMES: &[&str] = &["postgres", "postgresql", "sqlite"];
 
 /// Where the store database lives: a SQLite file path (the historical and
 /// default form) or a bounded database URL such as `postgres://...`.
@@ -488,6 +488,17 @@ fn normalize_relative_path(path: PathBuf) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_database_urls_are_rejected() {
+        let error = database_source_from_raw("mysql://izwi@db.internal/izwi")
+            .expect_err("MySQL is not a supported backend");
+        assert!(error.to_string().contains("postgres, postgresql, sqlite"), "{error}");
+        assert!(matches!(
+            database_source_from_raw("postgres://izwi@db.internal/izwi"),
+            Ok(DatabaseSource::Url(_))
+        ));
+    }
 
     #[test]
     fn database_urls_are_redacted_in_debug_output() {

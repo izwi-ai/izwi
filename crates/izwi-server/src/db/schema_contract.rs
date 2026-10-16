@@ -664,31 +664,6 @@ async fn load_unique_index_columns(
             )?)
             .await?
         }
-        DbBackend::MySql => {
-            db.query_all_raw(raw::statement(
-                db,
-                r#"
-                SELECT COLUMN_NAME
-                FROM information_schema.statistics
-                WHERE table_schema = DATABASE()
-                  AND table_name = ?1
-                  AND index_name = ?2
-                  AND NON_UNIQUE = 0
-                  AND SUB_PART IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM information_schema.statistics prefixed_part
-                      WHERE prefixed_part.table_schema = DATABASE()
-                        AND prefixed_part.table_name = ?1
-                        AND prefixed_part.index_name = ?2
-                        AND prefixed_part.SUB_PART IS NOT NULL
-                  )
-                ORDER BY SEQ_IN_INDEX
-                "#,
-                vec![table.into(), index.into()],
-            )?)
-            .await?
-        }
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     };
     if rows.is_empty() {
@@ -729,19 +704,6 @@ async fn load_table_columns(
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_schema = ANY (current_schemas(false))
-                  AND table_name = ?1
-                "#,
-                vec![table.into()],
-            )?)
-            .await?
-        }
-        DbBackend::MySql => {
-            db.query_all_raw(raw::statement(
-                db,
-                r#"
-                SELECT COLUMN_NAME
-                FROM information_schema.columns
-                WHERE table_schema = DATABASE()
                   AND table_name = ?1
                 "#,
                 vec![table.into()],

@@ -19,7 +19,7 @@ use crate::gateway_security::{
 };
 use hmac::{Hmac, Mac};
 use izwi_hooks::Principal;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::fmt;
@@ -330,24 +330,7 @@ async fn upsert_principal_key(
     record: &StoredPrincipalKey,
 ) -> anyhow::Result<()> {
     let now = current_timestamp_millis();
-    let assignments = match db.get_database_backend() {
-        DbBackend::MySql => {
-            r#"
-        INSERT INTO gateway_principal_keys (
-            principal_id, roles_json, tenant_id, key_salt, key_hash, created_at, updated_at
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-        AS new
-        ON DUPLICATE KEY UPDATE
-            roles_json = new.roles_json,
-            tenant_id = new.tenant_id,
-            key_salt = new.key_salt,
-            key_hash = new.key_hash,
-            updated_at = new.updated_at
-        "#
-        }
-        _ => {
-            r#"
+    let assignments = r#"
         INSERT INTO gateway_principal_keys (
             principal_id, roles_json, tenant_id, key_salt, key_hash, created_at, updated_at
         )
@@ -358,9 +341,7 @@ async fn upsert_principal_key(
             key_salt = excluded.key_salt,
             key_hash = excluded.key_hash,
             updated_at = excluded.updated_at
-        "#
-        }
-    };
+        "#;
     db.execute_raw(crate::db::raw::statement(
         db,
         assignments,

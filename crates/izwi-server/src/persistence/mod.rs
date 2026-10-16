@@ -272,7 +272,10 @@ fn validate_declared_backend(
 
 fn validate_supported_database_backend(backend: &DatabaseBackend) -> anyhow::Result<()> {
     match backend {
-        DatabaseBackend::Sqlite | DatabaseBackend::Postgres | DatabaseBackend::Mysql => Ok(()),
+        DatabaseBackend::Sqlite | DatabaseBackend::Postgres => Ok(()),
+        DatabaseBackend::Mysql => {
+            bail!("MySQL is not supported; use SQLite or PostgreSQL")
+        }
         DatabaseBackend::Other(name) => {
             bail!("Enterprise database backend {name:?} is not supported by this runtime")
         }
@@ -1770,7 +1773,7 @@ mod tests {
         )
         .is_ok());
         assert!(validate_migration_mode_for_backend(
-            &DatabaseBackend::Mysql,
+            &DatabaseBackend::Postgres,
             &DatabaseMigrationMode::Disabled,
         )
         .is_ok());
@@ -1780,7 +1783,7 @@ mod tests {
     fn supported_database_backends_accept_portable_store_sql() {
         assert!(validate_supported_database_backend(&DatabaseBackend::Sqlite).is_ok());
         assert!(validate_supported_database_backend(&DatabaseBackend::Postgres).is_ok());
-        assert!(validate_supported_database_backend(&DatabaseBackend::Mysql).is_ok());
+        assert!(validate_supported_database_backend(&DatabaseBackend::Mysql).is_err());
 
         let error =
             validate_supported_database_backend(&DatabaseBackend::Other("unsupported".to_string()))

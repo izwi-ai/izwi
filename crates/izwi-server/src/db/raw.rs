@@ -33,7 +33,6 @@ pub fn json_extract_text(
     Ok(match backend {
         DbBackend::Sqlite => format!("json_extract({expression}, '$.{key}')"),
         DbBackend::Postgres => format!("(({expression})::jsonb ->> '{key}')"),
-        DbBackend::MySql => format!("JSON_UNQUOTE(JSON_EXTRACT({expression}, '$.{key}'))"),
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     })
 }
@@ -41,7 +40,7 @@ pub fn json_extract_text(
 pub fn greatest(backend: DbBackend, left: &str, right: &str) -> anyhow::Result<String> {
     Ok(match backend {
         DbBackend::Sqlite => format!("MAX({left}, {right})"),
-        DbBackend::Postgres | DbBackend::MySql => format!("GREATEST({left}, {right})"),
+        DbBackend::Postgres => format!("GREATEST({left}, {right})"),
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     })
 }
@@ -63,7 +62,6 @@ fn rewrite_indexed_placeholders(
     match backend {
         DbBackend::Sqlite => Ok((sql, values)),
         DbBackend::Postgres => rewrite_postgres(sql, placeholders, values),
-        DbBackend::MySql => rewrite_mysql(sql, placeholders, values),
         _ => bail!("Unsupported SeaORM database backend: {backend:?}"),
     }
 }
@@ -151,27 +149,6 @@ fn rewrite_postgres(
     Ok((rewritten, values))
 }
 
-fn rewrite_mysql(
-    sql: String,
-    placeholders: Vec<Placeholder>,
-    values: Vec<Value>,
-) -> anyhow::Result<(String, Vec<Value>)> {
-    let mut rewritten = String::with_capacity(sql.len());
-    let mut rewritten_values = Vec::with_capacity(placeholders.len());
-    let mut cursor = 0;
-
-    for placeholder in placeholders {
-        ensure_value_exists(&values, placeholder.index)?;
-        rewritten.push_str(&sql[cursor..placeholder.start]);
-        rewritten.push('?');
-        rewritten_values.push(values[placeholder.index - 1].clone());
-        cursor = placeholder.end;
-    }
-
-    rewritten.push_str(&sql[cursor..]);
-    Ok((rewritten, rewritten_values))
-}
-
 fn ensure_value_exists(values: &[Value], placeholder_index: usize) -> anyhow::Result<()> {
     if placeholder_index > values.len() {
         bail!(
@@ -209,16 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn mysql_rewrites_indexed_placeholders_and_duplicates_reused_values() {
-        let values = vec!["first".into(), 2_i64.into()];
-        let statement = statement_for_backend(DbBackend::MySql, "SELECT ?1, ?2, ?1, '?2'", values)
-            .expect("statement should build");
-
-        assert_eq!(statement.sql, "SELECT ?, ?, ?, '?2'");
-        assert_eq!(statement.values.expect("values").0.len(), 3);
-    }
-
-    #[test]
     fn sqlite_keeps_indexed_placeholders() {
         let values = vec!["first".into()];
         let statement = statement_for_backend(DbBackend::Sqlite, "SELECT ?1", values)
@@ -248,10 +215,6 @@ mod tests {
             json_extract_text(DbBackend::Postgres, "project_json", "name").expect("postgres"),
             "((project_json)::jsonb ->> 'name')"
         );
-        assert_eq!(
-            json_extract_text(DbBackend::MySql, "project_json", "name").expect("mysql"),
-            "JSON_UNQUOTE(JSON_EXTRACT(project_json, '$.name'))"
-        );
     }
 
     #[test]
@@ -262,10 +225,6 @@ mod tests {
         );
         assert_eq!(
             greatest(DbBackend::Postgres, "confidence", "?1").expect("postgres"),
-            "GREATEST(confidence, ?1)"
-        );
-        assert_eq!(
-            greatest(DbBackend::MySql, "confidence", "?1").expect("mysql"),
             "GREATEST(confidence, ?1)"
         );
     }

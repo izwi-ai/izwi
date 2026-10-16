@@ -50,7 +50,7 @@ pub async fn connect_path(db_path: &Path) -> anyhow::Result<DatabaseConnection> 
 }
 
 /// Connect to a database by URL. SQLite URLs keep the file-mode options the
-/// path form provides; server backends (PostgreSQL, MySQL) connect with the
+/// path form provides; server backends (PostgreSQL) connect with the
 /// same bounded pool settings and no filesystem side effects.
 ///
 /// `statement_timeout`, when set, becomes a server-side statement and

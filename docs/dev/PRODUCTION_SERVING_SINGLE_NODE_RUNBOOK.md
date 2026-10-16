@@ -1088,9 +1088,7 @@ IZWI_TEST_FLEET_PG_URL=postgres://$(whoami)@localhost/izwi_ds5_test \
   cargo test -p izwi-server --features db-postgres --lib fleet_postgres
 ```
 
-MySQL dialect SQL remains written but unvalidated — it has never been
-executed against a live MySQL server, so MySQL-backed fleet coordination
-stays explicitly unsupported.
+MySQL is not supported: `mysql://` database URLs are rejected at startup.
 
 **Operator drain.** Configure `IZWI_GATEWAY_ADMIN_API_KEY_REF` to a bounded
 `env:VARIABLE` secret that differs from the inference key. Then
@@ -1129,7 +1127,7 @@ to unrelated local-engine tests elsewhere in the repository.
 | Real CUDA execution | The supervisor accepts, validates and launches CUDA assignments with the exact declared UUID (`multi_lane_launch.rs`); no NVIDIA device was available to execute on | Not established |
 | Physical multi-GPU | Parser/topology and scripted-runtime replica tests only | Not established |
 | Multi-machine | Worker binary terminates server-side TLS/mTLS from bounded file references (unit-tested parsing; plaintext non-loopback rejected). Client HTTPS trust, fleet topology policy, and v1 approvals exist. No separate-machine handshake, remote artifact/state path, or partition test was exercised | Not supported as an operational profile |
-| Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals with monotonic observations, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). MySQL coordination SQL is written but unvalidated. Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
+| Multi-gateway | Two real gateway processes over one shared coordination database (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes) prove atomic admission, partitioned quotas that are not multiplied, shared approvals with monotonic observations, claim steering, gateway-crash plus TTL recovery, and store-outage degradation; unit tests cover a hung store (status polls and dispatch proceed). Circuit state and accepted-work ownership stay per-gateway | Supported on the validated store lanes (SQLite on one host, PostgreSQL); not a production HA certificate. See the [support matrix](PRODUCTION_SERVING_SUPPORT_MATRIX.md) |
 | Soak/load/performance | Closed-loop gateway chat benchmark harness exists (`scripts/bench/run-gateway-chat-benchmark.py`) reporting TTFT/latency percentiles, throughput, and completed/rejected/failed rates; no hours-long soak or representative production load matrix has been run | Not established |
 
 Before any production claim, complete the open route, quota, observability,

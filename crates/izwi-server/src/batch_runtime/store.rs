@@ -956,7 +956,7 @@ impl BatchRuntimeStore {
     }
 
     /// Address the coordination store through a bounded database URL
-    /// (PostgreSQL/MySQL fleet profile, DS5).
+    /// (PostgreSQL fleet profile, DS5).
     pub fn initialize_with_database_url(url: String) -> Self {
         Self::initialize_with_database(StoreDatabase::from_url(url))
     }
@@ -1212,7 +1212,6 @@ impl BatchRuntimeStore {
         let lock_clause = match tx.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => " FOR UPDATE OF h, m",
-            DbBackend::MySql => " FOR UPDATE",
             backend => bail!("Unsupported speech-history database backend: {backend:?}"),
         };
         let relation_sql = format!(
@@ -1774,7 +1773,6 @@ impl BatchRuntimeStore {
         let lock_clause = match tx.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => " FOR UPDATE OF s, j",
-            DbBackend::MySql => " FOR UPDATE",
             backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
         };
         let ownership_sql = format!(
@@ -1907,7 +1905,6 @@ impl BatchRuntimeStore {
             DbBackend::Sqlite | DbBackend::Postgres => {
                 "ON CONFLICT(stage_id, producer_attempt_token, publication_key) DO NOTHING"
             }
-            DbBackend::MySql => "ON DUPLICATE KEY UPDATE id = id",
             backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
         };
         let insert_sql = format!(
@@ -2212,7 +2209,6 @@ impl BatchRuntimeStore {
         let lock_clause = match tx.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => " FOR UPDATE OF s, j, h",
-            DbBackend::MySql => " FOR UPDATE",
             backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
         };
         let owns_stage_sql = format!(
@@ -4325,7 +4321,7 @@ impl BatchRuntimeStore {
             };
             let row_lock = match tx.get_database_backend() {
                 DbBackend::Sqlite => "",
-                DbBackend::Postgres | DbBackend::MySql => " FOR UPDATE",
+                DbBackend::Postgres => " FOR UPDATE",
                 backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
             };
             for artifact_id in &output_artifact_ids {
@@ -5318,7 +5314,6 @@ impl BatchRuntimeStore {
             DbBackend::Sqlite | DbBackend::Postgres => {
                 "ON CONFLICT(stage_id, producer_attempt_token, publication_key) DO NOTHING"
             }
-            DbBackend::MySql => "ON DUPLICATE KEY UPDATE id = id",
             backend => bail!("Unsupported runtime artifact database backend: {backend:?}"),
         };
         let insert_sql = format!(
@@ -5999,16 +5994,6 @@ impl BatchRuntimeStore {
                 )
                 VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL)
                 ON CONFLICT(tenant_scope, operation, idempotency_key) DO NOTHING
-            "#
-            }
-            DbBackend::MySql => {
-                r#"
-                INSERT IGNORE INTO durable_idempotency_keys_v2 (
-                    tenant_scope, operation, idempotency_key, created_at,
-                    updated_at, expires_at, digest_version, request_digest,
-                    state, reservation_token, runtime_job_id, response_json
-                )
-                VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 'reserved', ?8, NULL, NULL)
             "#
             }
             backend => bail!("Unsupported durable idempotency database backend: {backend:?}"),
@@ -7204,9 +7189,6 @@ async fn lock_tts_admission_capacity<C: ConnectionTrait>(db: &C) -> anyhow::Resu
         DbBackend::Sqlite | DbBackend::Postgres => {
             "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1) ON CONFLICT (id) DO NOTHING"
         }
-        DbBackend::MySql => {
-            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('tts', 1)"
-        }
         backend => bail!("Unsupported TTS admission database backend: {backend:?}"),
     };
     db.execute_raw(raw::statement(db, insert_sql, vec![])?)
@@ -7226,9 +7208,6 @@ async fn lock_artifact_cleanup_capacity<C: ConnectionTrait>(db: &C) -> anyhow::R
     let insert_sql = match db.get_database_backend() {
         DbBackend::Sqlite | DbBackend::Postgres => {
             "INSERT INTO runtime_admission_locks (id, lock_value) VALUES ('artifact_cleanup', 1) ON CONFLICT (id) DO NOTHING"
-        }
-        DbBackend::MySql => {
-            "INSERT IGNORE INTO runtime_admission_locks (id, lock_value) VALUES ('artifact_cleanup', 1)"
         }
         backend => bail!("Unsupported artifact cleanup database backend: {backend:?}"),
     };
@@ -7296,9 +7275,6 @@ async fn ensure_quota_row_with<C: ConnectionTrait>(
     let sql = match db.get_database_backend() {
         DbBackend::Sqlite | DbBackend::Postgres => {
             "INSERT INTO runtime_quota_usage (quota_kind, scope, used) VALUES (?1, ?2, 0) ON CONFLICT (quota_kind, scope) DO NOTHING"
-        }
-        DbBackend::MySql => {
-            "INSERT IGNORE INTO runtime_quota_usage (quota_kind, scope, used) VALUES (?1, ?2, 0)"
         }
         backend => bail!("Unsupported quota database backend: {backend:?}"),
     };
@@ -7633,7 +7609,7 @@ fn provider_namespace_storage_value(namespace: &MediaNamespace) -> &str {
 fn provider_write_request_length_sql(backend: DbBackend) -> anyhow::Result<&'static str> {
     match backend {
         DbBackend::Sqlite => Ok("LENGTH(CAST(provider_request_json AS BLOB))"),
-        DbBackend::Postgres | DbBackend::MySql => Ok("OCTET_LENGTH(provider_request_json)"),
+        DbBackend::Postgres => Ok("OCTET_LENGTH(provider_request_json)"),
         backend => bail!("Unsupported provider write database backend: {backend:?}"),
     }
 }
@@ -8285,43 +8261,6 @@ fn worker_heartbeat_upsert_statement(
                 current_job_id = excluded.current_job_id,
                 current_stage_id = excluded.current_stage_id,
                 diagnostic_json = excluded.diagnostic_json
-            "#,
-            values,
-        ),
-        DbBackend::MySql => raw::statement(
-            db,
-            r#"
-            INSERT INTO runtime_worker_heartbeats (
-                worker_id,
-                started_at,
-                last_heartbeat_at,
-                status,
-                queue_names_json,
-                instance_id,
-                registration_version,
-                registration_json,
-                heartbeat_version,
-                available_slots,
-                heartbeat_details_json,
-                current_job_id,
-                current_stage_id,
-                diagnostic_json
-            )
-            VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            ON DUPLICATE KEY UPDATE
-                started_at = IF(instance_id <> VALUES(instance_id), VALUES(started_at), started_at),
-                last_heartbeat_at = VALUES(last_heartbeat_at),
-                status = VALUES(status),
-                queue_names_json = VALUES(queue_names_json),
-                instance_id = VALUES(instance_id),
-                registration_version = VALUES(registration_version),
-                registration_json = VALUES(registration_json),
-                heartbeat_version = VALUES(heartbeat_version),
-                available_slots = VALUES(available_slots),
-                heartbeat_details_json = VALUES(heartbeat_details_json),
-                current_job_id = VALUES(current_job_id),
-                current_stage_id = VALUES(current_stage_id),
-                diagnostic_json = VALUES(diagnostic_json)
             "#,
             values,
         ),
@@ -10187,7 +10126,7 @@ mod tests {
         // the same idempotency key. The conflict-tolerant insert must let
         // exactly one caller acquire; the loser observes the winner's exact
         // state instead of creating duplicate work. This holds on SQLite via
-        // the named admission lock and on PostgreSQL/MySQL via the
+        // the named admission lock and on PostgreSQL via the
         // ON CONFLICT/INSERT IGNORE key fence.
         let (mut store, _root) = build_store();
         let clock = Arc::new(AtomicI64::new(1_000));

@@ -18,7 +18,6 @@ cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda"]
 metal = ["izwi-core/metal"]
-db-mysql = ["sea-orm/sqlx-mysql"]
 db-postgres = ["sea-orm/sqlx-postgres"]
 
 [dependencies]

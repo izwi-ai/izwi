@@ -58,11 +58,6 @@ pub fn dialect_ddl(backend: DbBackend, sql: &str) -> String {
             let sql = replace_word(&sql, "INTEGER", "BIGINT");
             replace_word(&sql, "REAL", "DOUBLE PRECISION")
         }
-        DbBackend::MySql => {
-            let sql = replace_word(sql, "COLLATE NOCASE", "");
-            let sql = replace_word(&sql, "INTEGER", "BIGINT");
-            replace_word(&sql, "REAL", "DOUBLE")
-        }
         _ => sql.to_string(),
     }
 }
@@ -767,13 +762,7 @@ const QUOTA_USAGE_BACKFILL: &[&str] = &[
 
 async fn backfill_quota_usage(db: &DatabaseConnection) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
-        let statement = match db.get_database_backend() {
-            DbBackend::MySql => statement
-                .replacen("INSERT INTO", "INSERT IGNORE INTO", 1)
-                .replace(" ON CONFLICT (quota_kind, scope) DO NOTHING", ""),
-            _ => statement.to_string(),
-        };
-        db.execute_unprepared(&statement).await?;
+        db.execute_unprepared(statement).await?;
     }
     Ok(())
 }
@@ -1183,9 +1172,6 @@ async fn table_has_column(
                 DbBackend::Postgres => {
                     "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
                 }
-                DbBackend::MySql => {
-                    "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?1 AND column_name = ?2 LIMIT 1"
-                }
                 other => anyhow::bail!("Unsupported migration backend: {other:?}"),
             };
             let statement = raw::statement(db, sql, vec![table.into(), target.into()])?;
@@ -1311,6 +1297,5 @@ mod tests {
             dialect_ddl(DbBackend::Postgres, "REAL NULL"),
             "DOUBLE PRECISION NULL"
         );
-        assert_eq!(dialect_ddl(DbBackend::MySql, "INTEGER NULL"), "BIGINT NULL");
     }
 }
