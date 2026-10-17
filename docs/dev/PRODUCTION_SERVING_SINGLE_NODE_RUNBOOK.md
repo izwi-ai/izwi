@@ -107,7 +107,7 @@ scope, so two tenants never share a bucket even when they share a gateway.
 | `IZWI_GATEWAY_PRINCIPAL_KEYS_MANIFEST` | Bounded path to a JSON principals manifest; unset keeps the durable store untouched | unset |
 
 Manifest shape (all fields are validated fail-closed; unknown fields are
-rejected; `key_ref` must be a bounded `env:VARIABLE` or `file:PATH` reference —
+rejected; `key_ref` must be a bounded `env:VARIABLE` or absolute `file:/PATH` reference —
 inline key material is rejected):
 
 ```json

@@ -8,6 +8,7 @@ use izwi_serving_fence::{
     WORKER_MAX_CONTEXT_TOKENS_ENV, WORKER_MAX_OUTPUT_TOKENS_ENV, WORKER_MODEL_LOAD_LOCK_ENV,
     WORKER_MODEL_LOAD_SLOTS_ENV, WORKER_OWNERSHIP_LOCK_ENV, WORKER_PRECISION_ENV, WORKER_TASK_ENV,
 };
+use izwi_serving_protocol::secret_file::{file_reference_path, read_secret_file, SecretFile};
 use izwi_serving_protocol::*;
 use izwi_serving_worker::{
     warm_up_asr_runtime, warm_up_chat_runtime, warm_up_tts_runtime, RuntimeChatExecutor,
@@ -723,8 +724,15 @@ impl WorkerTlsConfig {
 
         match (cert_ref, key_ref) {
             (Some(cert_ref), Some(key_ref)) => {
-                let cert_bytes = load_pem_file(&cert_ref, "server certificate")?;
-                let key_bytes = load_pem_file(&key_ref, "server private key")?;
+                let cert_bytes = load_pem_file(&cert_ref, "server certificate")?.bytes;
+                let key_file = load_pem_file(&key_ref, "server private key")?;
+                if let Some(mode) = key_file.shared_mode {
+                    tracing::warn!(
+                        mode = format_args!("{mode:o}"),
+                        "the worker TLS private key file is readable by other users"
+                    );
+                }
+                let key_bytes = key_file.bytes;
                 let cert_items = rustls_pemfile::read_all(&mut cert_bytes.as_slice())
                     .map_err(|_| anyhow::anyhow!("server certificate PEM is invalid"))?;
                 let key_items = rustls_pemfile::read_all(&mut key_bytes.as_slice())
@@ -765,7 +773,7 @@ impl WorkerTlsConfig {
                     .context("server private key file contains no key PEM blocks")?;
 
                 let mut config = if let Some(ca_ref) = client_ca_ref {
-                    let ca_bytes = load_pem_file(&ca_ref, "client CA")?;
+                    let ca_bytes = load_pem_file(&ca_ref, "client CA")?.bytes;
                     let ca_items = rustls_pemfile::read_all(&mut ca_bytes.as_slice())
                         .map_err(|_| anyhow::anyhow!("client CA PEM is invalid"))?;
                     let client_certs: Vec<_> = ca_items
@@ -822,25 +830,12 @@ impl WorkerTlsConfig {
     }
 }
 
-fn load_pem_file(reference: &str, label: &str) -> anyhow::Result<Vec<u8>> {
-    let path = reference
-        .strip_prefix("file:")
-        .with_context(|| format!("{label} reference must be a file: path"))?;
-    let path = Path::new(path);
-    if !path.is_absolute() {
-        bail!("{label} reference must be an absolute file: path");
-    }
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("read {label} metadata at {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("{label} reference must point to a regular file");
-    }
-    if metadata.len() > MAX_TLS_PEM_FILE_BYTES {
-        bail!("{label} file exceeds {MAX_TLS_PEM_FILE_BYTES} bytes");
-    }
-    let bytes =
-        std::fs::read(path).with_context(|| format!("read {label} at {}", path.display()))?;
-    Ok(bytes)
+fn load_pem_file(reference: &str, label: &str) -> anyhow::Result<SecretFile> {
+    let path = file_reference_path(reference).map_err(|error| {
+        anyhow::anyhow!("{label} reference must be an absolute file: path ({error})")
+    })?;
+    read_secret_file(path, MAX_TLS_PEM_FILE_BYTES)
+        .map_err(|error| anyhow::anyhow!("read {label} at {}: {error}", path.display()))
 }
 
 /// How long a connecting client may take to complete its TLS handshake.

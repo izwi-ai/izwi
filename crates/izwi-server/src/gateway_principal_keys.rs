@@ -19,6 +19,9 @@ use crate::gateway_security::{
 };
 use hmac::{Hmac, Mac};
 use izwi_hooks::Principal;
+use izwi_serving_protocol::secret_file::{
+    file_reference_path, read_secret_file, SecretFileError, FILE_REFERENCE_PREFIX,
+};
 use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde::Deserialize;
 use sha2::Sha256;
@@ -41,7 +44,7 @@ const SALT_BYTES: usize = 16;
 const DIGEST_BYTES: usize = 32;
 const MAX_MANIFEST_PATH_BYTES: usize = 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-const MAX_KEY_FILE_BYTES: usize = 64 * 1024;
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_ENV_REF_BYTES: usize = 128;
 const CREDENTIAL_TYPE_ATTRIBUTE: &str = "api_key";
 const SOURCE_ATTRIBUTE: &str = "scoped_key_store";
@@ -204,10 +207,9 @@ fn valid_key_ref(key_ref: &str) -> bool {
     if let Some(variable) = key_ref.strip_prefix("env:") {
         return key_ref.len() <= MAX_ENV_REF_BYTES && valid_env_name(variable);
     }
-    if let Some(path) = key_ref.strip_prefix("file:") {
-        return !path.is_empty()
-            && key_ref.len() <= MAX_MANIFEST_PATH_BYTES
-            && !path.bytes().any(|byte| byte.is_ascii_control());
+    if file_reference_path(key_ref).is_ok() {
+        return key_ref.len() <= MAX_MANIFEST_PATH_BYTES
+            && !key_ref.bytes().any(|byte| byte.is_ascii_control());
     }
     false
 }
@@ -222,13 +224,27 @@ fn resolve_key_ref(key_ref: &str) -> Result<Arc<[u8]>, GatewayPrincipalKeysError
             .into_string()
             .map_err(|_| GatewayPrincipalKeysError::InvalidKeyMaterial)?
             .into_bytes()
-    } else if let Some(path) = key_ref.strip_prefix("file:") {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|_| GatewayPrincipalKeysError::MissingKeyMaterial)?;
-        if contents.len() > MAX_KEY_FILE_BYTES {
-            return Err(GatewayPrincipalKeysError::InvalidKeyMaterial);
+    } else if key_ref.starts_with(FILE_REFERENCE_PREFIX) {
+        let path = file_reference_path(key_ref)
+            .map_err(|_| GatewayPrincipalKeysError::InvalidKeyReference)?;
+        let file = read_secret_file(path, MAX_KEY_FILE_BYTES).map_err(|error| match error {
+            SecretFileError::NotFileReference | SecretFileError::NotAbsolute => {
+                GatewayPrincipalKeysError::InvalidKeyReference
+            }
+            SecretFileError::Unavailable
+            | SecretFileError::NotRegularFile
+            | SecretFileError::ReadFailed => GatewayPrincipalKeysError::MissingKeyMaterial,
+            SecretFileError::TooLarge(_) | SecretFileError::Empty => {
+                GatewayPrincipalKeysError::InvalidKeyMaterial
+            }
+        })?;
+        if let Some(mode) = file.shared_mode {
+            tracing::warn!(
+                mode = format_args!("{mode:o}"),
+                "a gateway principal key file is readable by other users"
+            );
         }
-        contents.trim().as_bytes().to_vec()
+        file.bytes.trim_ascii().to_vec()
     } else {
         return Err(GatewayPrincipalKeysError::InvalidKeyReference);
     };
@@ -720,6 +736,24 @@ mod tests {
         assert_eq!(
             resolve_key_ref("plain-secret").unwrap_err(),
             GatewayPrincipalKeysError::InvalidKeyReference
+        );
+    }
+
+    /// HYG-D7: a key file is read through the shared bounded loader, which
+    /// takes absolute paths only, like the worker and gateway TLS references.
+    #[test]
+    fn key_file_references_must_be_absolute_and_bounded() {
+        assert!(!valid_key_ref("file:alpha.key"));
+        assert_eq!(
+            resolve_key_ref("file:alpha.key").unwrap_err(),
+            GatewayPrincipalKeysError::InvalidKeyReference
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let oversized = dir.path().join("oversized.key");
+        std::fs::write(&oversized, "k".repeat(MAX_KEY_FILE_BYTES as usize + 1)).unwrap();
+        assert_eq!(
+            resolve_key_ref(&format!("file:{}", oversized.display())).unwrap_err(),
+            GatewayPrincipalKeysError::InvalidKeyMaterial
         );
     }
 

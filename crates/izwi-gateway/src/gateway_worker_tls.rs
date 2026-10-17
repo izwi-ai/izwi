@@ -1,11 +1,10 @@
 //! Bounded, reference-only TLS material loading for gateway worker clients.
 
 use izwi_serving_client::{WorkerClientTlsConfig, MAX_PRIVATE_CA_ROOTS, MAX_TLS_PEM_BYTES};
-use std::{
-    fs::{self, File},
-    io::Read,
-    path::Path,
+use izwi_serving_protocol::secret_file::{
+    file_reference_path, read_secret_file, SecretFile, SecretFileError,
 };
+use tracing::warn;
 
 const PRIVATE_CA_REFS_ENV: &str = "IZWI_GATEWAY_WORKER_TLS_CA_REFS";
 const CLIENT_CERT_REF_ENV: &str = "IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF";
@@ -31,17 +30,26 @@ pub fn worker_client_tls_from_env() -> Result<WorkerClientTlsConfig, GatewayWork
             if roots.len() == MAX_PRIVATE_CA_ROOTS {
                 return Err(GatewayWorkerTlsConfigError::TooManyPrivateCaRoots);
             }
-            roots.push(read_bounded_pem(reference.trim())?);
+            roots.push(read_bounded_pem(reference.trim())?.bytes);
         }
     }
 
     let certificate = certificate_ref
         .as_deref()
-        .map(read_bounded_pem)
+        .map(|reference| read_bounded_pem(reference).map(|file| file.bytes))
         .transpose()?;
     let private_key = private_key_ref
         .as_deref()
-        .map(read_bounded_pem)
+        .map(|reference| {
+            let file = read_bounded_pem(reference)?;
+            if let Some(mode) = file.shared_mode {
+                warn!(
+                    mode = format_args!("{mode:o}"),
+                    "the gateway worker TLS private key file is readable by other users"
+                );
+            }
+            Ok(file.bytes)
+        })
         .transpose()?;
 
     WorkerClientTlsConfig::from_pem(roots, certificate, private_key)
@@ -58,34 +66,21 @@ fn optional_env(name: &str) -> Result<Option<String>, GatewayWorkerTlsConfigErro
         .transpose()
 }
 
-fn read_bounded_pem(reference: &str) -> Result<Vec<u8>, GatewayWorkerTlsConfigError> {
+fn read_bounded_pem(reference: &str) -> Result<SecretFile, GatewayWorkerTlsConfigError> {
     if reference.is_empty() || reference.len() > MAX_REFERENCE_BYTES {
         return Err(GatewayWorkerTlsConfigError::InvalidReference);
     }
-    let path = reference
-        .strip_prefix("file:")
-        .map(Path::new)
-        .filter(|path| path.is_absolute())
-        .ok_or(GatewayWorkerTlsConfigError::InvalidReference)?;
-    let metadata = fs::metadata(path).map_err(|_| GatewayWorkerTlsConfigError::MissingPemFile)?;
-    if !metadata.is_file() {
-        return Err(GatewayWorkerTlsConfigError::InvalidReference);
-    }
-    if metadata.len() > MAX_TLS_PEM_BYTES as u64 {
-        return Err(GatewayWorkerTlsConfigError::PemFileTooLarge);
-    }
-    let file = File::open(path).map_err(|_| GatewayWorkerTlsConfigError::MissingPemFile)?;
-    let mut bytes = Vec::with_capacity(8192);
-    file.take((MAX_TLS_PEM_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| GatewayWorkerTlsConfigError::PemReadFailed)?;
-    if bytes.is_empty() {
-        return Err(GatewayWorkerTlsConfigError::EmptyPemFile);
-    }
-    if bytes.len() > MAX_TLS_PEM_BYTES {
-        return Err(GatewayWorkerTlsConfigError::PemFileTooLarge);
-    }
-    Ok(bytes)
+    let path = file_reference_path(reference)
+        .map_err(|_| GatewayWorkerTlsConfigError::InvalidReference)?;
+    read_secret_file(path, MAX_TLS_PEM_BYTES as u64).map_err(|error| match error {
+        SecretFileError::NotFileReference
+        | SecretFileError::NotAbsolute
+        | SecretFileError::NotRegularFile => GatewayWorkerTlsConfigError::InvalidReference,
+        SecretFileError::Unavailable => GatewayWorkerTlsConfigError::MissingPemFile,
+        SecretFileError::TooLarge(_) => GatewayWorkerTlsConfigError::PemFileTooLarge,
+        SecretFileError::Empty => GatewayWorkerTlsConfigError::EmptyPemFile,
+        SecretFileError::ReadFailed => GatewayWorkerTlsConfigError::PemReadFailed,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

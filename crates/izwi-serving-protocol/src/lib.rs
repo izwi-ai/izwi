@@ -9,6 +9,7 @@ mod approvals;
 mod identity;
 mod ndjson;
 mod realtime;
+pub mod secret_file;
 pub mod trace;
 mod types;
 
