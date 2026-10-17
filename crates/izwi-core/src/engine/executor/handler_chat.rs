@@ -241,9 +241,7 @@ impl NativeExecutor {
         let Some(super::ExecutorStateSlot::Ready { state, .. }) = states.get(session) else {
             return Ok(None);
         };
-        let Some(checkpoint) = state.state.replay_checkpoint()? else {
-            return Ok(None);
-        };
+        let checkpoint = state.state.replay_checkpoint()?;
         let tokens = checkpoint.replay_tokens();
         let mut suspended = self
             .suspended_chat_states
@@ -737,6 +735,7 @@ impl NativeExecutor {
                     model.continue_replay(
                         &mut active_state.state,
                         &request.prompt_tokens,
+                        prepared_chat_prompt,
                         start,
                         end,
                     )
@@ -2179,7 +2178,10 @@ mod tests {
                     break output;
                 }
             };
-            assert!(decoded > suspend_after, "the run ended before its suspension");
+            assert!(
+                decoded > suspend_after,
+                "the run ended before its suspension"
+            );
             streams.push((events, generated, terminal.text, terminal.tokens_processed));
         }
         assert_eq!(streams[1], streams[0]);
@@ -2211,6 +2213,26 @@ mod tests {
             ModelVariant::Gemma34BIt,
             &[0, 1, 2, 9, 4],
             6,
+        );
+    }
+
+    /// The hybrid LFM2 replay rebuilds its ShortConv tensor state through
+    /// the managed tensor-state reservation as well as its KV pages.
+    #[test]
+    fn replayed_hybrid_sessions_resume_their_streams_without_republishing() {
+        use crate::kv::InferenceStateContractProvider;
+        use crate::models::architectures::lfm2::chat::tiny_lfm_model_for_test;
+        use crate::models::registry::ChatModelLease;
+
+        let lfm2 = tiny_lfm_model_for_test(3);
+        let capability = lfm2.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Lfm2(lfm2));
+        assert_replay_resumes_the_stream(
+            &lease,
+            &capability,
+            ModelVariant::Lfm2512BInstructGguf,
+            &[1, 3, 4, 5, 6],
+            5,
         );
     }
 

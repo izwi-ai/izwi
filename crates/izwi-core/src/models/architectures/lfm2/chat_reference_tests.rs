@@ -772,3 +772,115 @@ fn lfm25_decode_matches_across_batch_widths_on_metal() {
     // Measured worst delta 0.0096 at widths 2, 4 and 8 (M1 Pro).
     run_width_parity_leg(profile, 0.05);
 }
+
+/// D3 on the real checkpoint: a session suspended after `SUSPEND_AT` greedy
+/// tokens and replayed in a fresh cache and ShortConv state (the prompt in
+/// one span, then one decode-shaped span per generated token) rebuilds the
+/// unpreempted run's state: next-step logits within `max_logit_delta` (exact
+/// on CPU) and the same greedy continuation for `CONTINUE` tokens wherever the
+/// unpreempted step is not a near tie.
+fn run_replay_leg(profile: DeviceProfile, max_logit_delta: f32) {
+    const SUSPEND_AT: usize = 12;
+    const CONTINUE: usize = 24;
+    let fixture = fixture();
+    for (key, model_fixture) in &fixture.models {
+        let dir = models_dir().join(&model_fixture.folder);
+        if !dir.exists() {
+            eprintln!("skipping {key}: {} is missing", dir.display());
+            continue;
+        }
+        let model = Lfm2ChatModel::load(&dir, variant(key), profile.clone()).unwrap();
+        let sessions = Sessions::new(&model);
+        for (name, prompt) in &model_fixture.prompts {
+            let ids = &prompt.prompt_ids;
+            let mut baseline = prefill(&model, ids, sessions.session(0), &[]);
+            let mut suspended = prefill(&model, ids, sessions.session(1), &[]);
+            for _ in 0..SUSPEND_AT {
+                let step = model.decode_step(&mut baseline).unwrap();
+                assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+            }
+            if baseline.finished {
+                continue;
+            }
+            let checkpoint = suspended.replay_checkpoint().unwrap();
+            drop(suspended);
+            let mut replayed = model
+                .begin_replay_managed(&checkpoint, sessions.session(2))
+                .unwrap();
+            model
+                .continue_replay(&mut replayed, ids, 0, ids.len())
+                .unwrap();
+            for start in ids.len()..checkpoint.replay_tokens() {
+                model
+                    .continue_replay(&mut replayed, ids, start, start + 1)
+                    .unwrap();
+            }
+            let mut worst = 0f32;
+            for step in 0..CONTINUE {
+                if baseline.finished {
+                    break;
+                }
+                // Both rows take the pending token's forward on the retained
+                // path, then sample their own logits.
+                let mut logits = Vec::new();
+                for state in [&mut baseline, &mut replayed] {
+                    let pending = state.pending_token.take().unwrap();
+                    let input =
+                        Tensor::from_slice(&[pending], (1, 1), &model.device.device).unwrap();
+                    let output = model
+                        .text_model
+                        .forward_tokens_retained(
+                            &input,
+                            state.position,
+                            &mut state.physical_kv,
+                            &mut state.shortconv,
+                            true,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    state.position += 1;
+                    logits.push(row(&output));
+                    state.unconsumed_output = Some(output);
+                }
+                let delta = logits[0]
+                    .iter()
+                    .zip(&logits[1])
+                    .map(|(lhs, rhs)| abs_err(*lhs, *rhs))
+                    .fold(0f32, f32::max);
+                worst = worst.max(delta);
+                let expected = model.decode_step(&mut baseline).unwrap();
+                let actual = model.decode_step(&mut replayed).unwrap();
+                if solo_step(&logits[0]).margin > NEAR_TIE {
+                    assert_eq!(actual.delta, expected.delta, "{key}/{name} step {step}");
+                } else if actual.delta != expected.delta {
+                    break;
+                }
+            }
+            eprintln!("{key}/{name}: replay worst logit delta {worst:.6}");
+            assert!(
+                worst <= max_logit_delta,
+                "{key}/{name}: replay logit delta {worst} exceeds {max_logit_delta}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_replay_rebuilds_the_unpreempted_state_on_cpu() {
+    run_replay_leg(DeviceProfile::cpu(), 0.0);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "needs the LFM2.5-1.2B GGUFs (IZWI_LFM25_MODELS_DIR)"]
+fn lfm25_replay_rebuilds_the_unpreempted_state_on_metal() {
+    use crate::backends::{BackendPreference, DeviceSelector};
+    use candle_core::Device;
+    let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
+    if !matches!(profile.device, Device::Metal(_)) {
+        eprintln!("skipping: no Metal device");
+        return;
+    }
+    run_replay_leg(profile, 0.05);
+}

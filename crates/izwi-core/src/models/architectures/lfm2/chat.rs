@@ -20,7 +20,9 @@ use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
 use crate::model::ModelVariant;
 use crate::models::shared::attention::mixed::{MixedRowLayout, MixedRowSpan};
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRole,
+};
 use crate::models::shared::sampling::{sample_chat_rows_guarded, ChatSampler};
 use crate::models::shared::telemetry::record_prefill_sequence_span;
 use crate::models::shared::weights::gguf::GgufLoader;
@@ -45,9 +47,35 @@ pub struct ChatDecodeState {
     finished: bool,
     position: usize,
     prefill_progress: usize,
+    /// Cache length a capacity replay is rebuilding; the state decodes again
+    /// once its cache and ShortConv state reach it.
+    replay_end: Option<usize>,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+}
+
+/// CPU continuation record of a session released for capacity: the
+/// generated-token journal (the prompt is the request's own) and the sampler
+/// and text state at a quantum boundary. It owns no tensors; the released KV
+/// pages and ShortConv state are rebuilt by replaying the prompt and every
+/// generated token but the pending one.
+#[derive(Clone)]
+pub(crate) struct Lfm2ChatReplayCheckpoint {
+    replay_tokens: usize,
+    pending_token: u32,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    decoder: IncrementalDecoder,
+    assembled: String,
+    max_new_tokens: usize,
+}
+
+impl Lfm2ChatReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.replay_tokens
+    }
 }
 
 pub(crate) struct Lfm2ChatDecodeCheckpoint {
@@ -90,6 +118,37 @@ impl ChatDecodeState {
 
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
+    }
+
+    /// The replay a capacity suspension still has to rebuild, if any.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay_end
+    }
+
+    /// Capture the CPU continuation record at a quantum boundary, before the
+    /// caller releases the KV pages and ShortConv state.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Lfm2ChatReplayCheckpoint> {
+        let replay_tokens = self.replay_end.unwrap_or(self.position);
+        let pending_token = self.pending_token.filter(|_| {
+            !self.finished
+                && self.unconsumed_output.is_none()
+                && replay_tokens + 1 == self.prefill_progress + self.generated_ids.len()
+        });
+        let Some(pending_token) = pending_token else {
+            return Err(Error::InvalidInput(
+                "an LFM2 session suspends only between decode quanta".into(),
+            ));
+        };
+        Ok(Lfm2ChatReplayCheckpoint {
+            replay_tokens,
+            pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            decoder: self.decoder.clone(),
+            assembled: self.assembled.clone(),
+            max_new_tokens: self.max_new_tokens,
+        })
     }
 
     pub(crate) fn begin_managed_quantum(
@@ -531,8 +590,85 @@ impl Lfm2ChatModel {
             finished: false,
             position: 0,
             prefill_progress: 0,
+            replay_end: None,
             pending_logprobs: Vec::new(),
         })
+    }
+
+    /// Start rebuilding a suspended session in an empty reservation and a
+    /// fresh ShortConv state. The state decodes again after
+    /// [`Self::continue_replay`] reaches the end of the checkpoint's replay.
+    pub(crate) fn begin_replay_managed(
+        &self,
+        saved: &Lfm2ChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0 || saved.replay_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "LFM2 replay requires an empty reservation and a non-empty journal".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            shortconv: self.text_model.new_shortconv_state(),
+            physical_kv: cache,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: Some(saved.pending_token),
+            generated_ids: saved.generated_ids.clone(),
+            sampler: saved.sampler.clone(),
+            decoder: saved.decoder.clone(),
+            stop_reason: None,
+            assembled: saved.assembled.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            position: 0,
+            prefill_progress: saved.prefill_progress,
+            replay_end: Some(saved.replay_tokens),
+            pending_logprobs: Vec::new(),
+        })
+    }
+
+    /// Write `[span_start, span_end)` of the replay journal (the prompt, then
+    /// the generated tokens) into the KV pages and ShortConv state without
+    /// sampling or emitting. Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let replay_end = state
+            .replay_end
+            .ok_or_else(|| Error::InvalidInput("LFM2 state has no pending replay".into()))?;
+        if span_start != state.position
+            || span_start != state.physical_kv.context_len()
+            || state.shortconv.cursor() != span_start as u64
+            || span_start >= span_end
+            || span_end > replay_end
+            || prompt_ids.len() != state.prefill_progress
+        {
+            return Err(Error::InvalidInput(format!(
+                "LFM2 replay span [{span_start},{span_end}) does not continue cursor {} of {replay_end}",
+                state.position
+            )));
+        }
+        record_prefill_sequence_span(span_end - span_start);
+        let ids = replay_journal_span(prompt_ids, &state.generated_ids, span_start, span_end)?;
+        let input = Tensor::from_vec(ids, (1, span_end - span_start), &self.device.device)?;
+        self.text_model.forward_tokens_retained(
+            &input,
+            span_start,
+            &mut state.physical_kv,
+            &mut state.shortconv,
+            false,
+        )?;
+        state.position = span_end;
+        let complete = span_end == replay_end;
+        if complete {
+            state.replay_end = None;
+        }
+        Ok(complete)
     }
 
     pub(crate) fn continue_resumable_prefill_managed(
@@ -580,6 +716,11 @@ impl Lfm2ChatModel {
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.replay_end.is_some() {
+            return Err(Error::InferenceError(
+                "LFM2 decode cannot run before its replay completes".into(),
+            ));
+        }
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             state.finished = true;
             let reason = *state.stop_reason.get_or_insert("length");
@@ -754,6 +895,7 @@ impl Lfm2ChatModel {
                 || state.generated_ids.len() >= state.max_new_tokens
                 || state.unconsumed_output.is_some()
                 || state.pending_token.is_none()
+                || state.replay_end.is_some()
                 || state.physical_kv.context_len() != state.position
                 || state.shortconv.cursor() != state.position as u64
             {
@@ -838,6 +980,7 @@ impl Lfm2ChatModel {
                 || state.generated_ids.len() >= state.max_new_tokens
                 || state.unconsumed_output.is_some()
                 || state.pending_token.is_none()
+                || state.replay_end.is_some()
                 || state.physical_kv.context_len() != state.position
                 || state.shortconv.cursor() != state.position as u64
             {

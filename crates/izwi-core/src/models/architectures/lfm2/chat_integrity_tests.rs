@@ -516,3 +516,134 @@ fn lfm2_mixed_steps_with_split_shapes_are_the_split_calls() {
         assert_eq!(summary(&split), summary(&mixed));
     }
 }
+
+/// Run the pending token's forward on the retained path and leave its logits
+/// for `decode_step` to sample, returning them.
+fn pending_logits(model: &Lfm2ChatModel, state: &mut ChatDecodeState) -> Vec<f32> {
+    let pending = state.pending_token.take().expect("pending token");
+    let input = Tensor::from_slice(&[pending], (1, 1), &Device::Cpu).unwrap();
+    let logits = model
+        .text_model
+        .forward_tokens_retained(
+            &input,
+            state.position,
+            &mut state.physical_kv,
+            &mut state.shortconv,
+            true,
+        )
+        .unwrap()
+        .expect("logits");
+    state.position += 1;
+    state.unconsumed_output = Some(logits.clone());
+    logits.flatten_all().unwrap().to_vec1().unwrap()
+}
+
+/// D3: a hybrid LFM2 session released for capacity mid-generation and
+/// rebuilt in a fresh cache and ShortConv state by replaying its prompt and
+/// generated tokens over the original span boundaries resumes exactly:
+/// bit-identical next-step logits (attention KV and ShortConv state both
+/// rebuilt) and the same greedy and seeded streams. A one-span replay runs
+/// other op shapes and is held to a tolerance.
+#[test]
+fn lfm2_replayed_session_resumes_exactly() {
+    const MAX_NEW_TOKENS: usize = 20;
+    const SUSPEND_AT: usize = 6;
+    let model = random_tiny_lfm_model(3);
+    let prompt = [1, 3, 4, 5];
+    let sampled = ChatGenerationConfig {
+        temperature: 1.,
+        seed: 97,
+        ..Default::default()
+    };
+    for config in [ChatGenerationConfig::default(), sampled] {
+        for one_span in [false, true] {
+            let mut caches = crate::models::shared::attention::physical::test_physical_caches_on(
+                &Device::Cpu,
+                1,
+                1,
+                4,
+                prompt.len() + MAX_NEW_TOKENS + 1,
+                3,
+            );
+            let fresh = caches.pop().unwrap();
+            let mut rows = caches
+                .into_iter()
+                .map(|cache| {
+                    let mut state = model
+                        .begin_resumable_prefill_state_managed(
+                            &prompt,
+                            MAX_NEW_TOKENS,
+                            &config,
+                            cache,
+                        )
+                        .unwrap();
+                    model
+                        .continue_resumable_prefill_managed(&mut state, &prompt, 0, prompt.len())
+                        .unwrap();
+                    state
+                })
+                .collect::<Vec<_>>();
+            let mut suspended = rows.pop().unwrap();
+            let mut baseline = rows.pop().unwrap();
+            for _ in 0..SUSPEND_AT {
+                let step = model.decode_step(&mut baseline).unwrap();
+                assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+            }
+            assert!(
+                !baseline.finished,
+                "the fixture ended before the suspension"
+            );
+            let checkpoint = suspended.replay_checkpoint().unwrap();
+            assert_eq!(checkpoint.replay_tokens(), prompt.len() + SUSPEND_AT - 1);
+            drop(suspended);
+            let mut replayed = model.begin_replay_managed(&checkpoint, fresh).unwrap();
+            assert!(model.decode_step(&mut replayed).is_err());
+            let spans = if one_span {
+                vec![(0, checkpoint.replay_tokens())]
+            } else {
+                std::iter::once((0, prompt.len()))
+                    .chain(
+                        (prompt.len()..checkpoint.replay_tokens()).map(|start| (start, start + 1)),
+                    )
+                    .collect()
+            };
+            for (index, (start, end)) in spans.iter().copied().enumerate() {
+                let complete = model
+                    .continue_replay(&mut replayed, &prompt, start, end)
+                    .unwrap();
+                assert_eq!(complete, index + 1 == spans.len());
+            }
+            assert_eq!(replayed.shortconv.cursor(), baseline.shortconv.cursor());
+            let expected = pending_logits(&model, &mut baseline);
+            let actual = pending_logits(&model, &mut replayed);
+            if one_span {
+                let error = expected
+                    .iter()
+                    .zip(&actual)
+                    .map(|(left, right)| abs_err(*left, *right))
+                    .fold(0.0, f32::max);
+                assert!(error < 1e-4, "one-span replay logits differ by {error}");
+                continue;
+            }
+            assert_eq!(actual, expected, "rebuilt next-step logits");
+            while !baseline.finished {
+                let step = model.decode_step(&mut baseline).unwrap();
+                let resumed = model.decode_step(&mut replayed).unwrap();
+                assert_eq!(resumed.delta, step.delta);
+                assert_eq!(resumed.text, step.text);
+            }
+            assert!(replayed.finished);
+            assert_eq!(replayed.generated_ids, baseline.generated_ids);
+        }
+    }
+}
+
+/// Non-finite differences saturate to infinity, so they can never pass.
+fn abs_err(lhs: f32, rhs: f32) -> f32 {
+    let error = (lhs - rhs).abs();
+    if error.is_finite() {
+        error
+    } else {
+        f32::INFINITY
+    }
+}

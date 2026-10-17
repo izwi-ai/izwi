@@ -40,7 +40,7 @@ fn trace_variant(name: &str) -> ModelVariant {
 
 /// One arena with room for `sequences` disjoint sequences, plus a physical
 /// cache per sequence. Batched decode requires the rows to share an arena.
-fn trace_caches(
+pub(super) fn trace_caches(
     config: &Qwen35TextConfig,
     device: &DeviceProfile,
     sequences: u32,

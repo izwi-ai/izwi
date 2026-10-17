@@ -4526,6 +4526,8 @@ pub(crate) enum NativeChatDecodeCheckpoint {
 pub(crate) enum NativeChatReplayCheckpoint {
     Qwen3(crate::models::architectures::qwen3::chat::ChatReplayCheckpoint),
     Gemma3(crate::models::architectures::gemma3::chat::ChatReplayCheckpoint),
+    Lfm2(crate::models::architectures::lfm2::chat::Lfm2ChatReplayCheckpoint),
+    Qwen35(crate::models::architectures::qwen35::chat::Qwen35ReplayCheckpoint),
     Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
     Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
 }
@@ -4536,6 +4538,8 @@ impl NativeChatReplayCheckpoint {
         match self {
             Self::Qwen3(checkpoint) => checkpoint.replay_tokens(),
             Self::Gemma3(checkpoint) => checkpoint.replay_tokens(),
+            Self::Lfm2(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen35(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
         }
@@ -4630,16 +4634,17 @@ impl NativeChatDecodeState {
     /// Capture the CPU continuation record of a session whose physical state
     /// is about to be released for capacity; `None` when the family cannot
     /// replay. The caller fences the last completed step first.
-    pub(crate) fn replay_checkpoint(&self) -> Result<Option<NativeChatReplayCheckpoint>> {
-        Ok(Some(match self {
+    pub(crate) fn replay_checkpoint(&self) -> Result<NativeChatReplayCheckpoint> {
+        Ok(match self {
             Self::Qwen3(state) => NativeChatReplayCheckpoint::Qwen3(state.replay_checkpoint()?),
             Self::Gemma3(state) => NativeChatReplayCheckpoint::Gemma3(state.replay_checkpoint()?),
+            Self::Lfm2(state) => NativeChatReplayCheckpoint::Lfm2(state.replay_checkpoint()?),
+            Self::Qwen35(state) => NativeChatReplayCheckpoint::Qwen35(state.replay_checkpoint()?),
             Self::Qwen38(state) => NativeChatReplayCheckpoint::Qwen38(state.replay_checkpoint()?),
             Self::Qwen36Moe(state) => {
                 NativeChatReplayCheckpoint::Qwen36Moe(state.replay_checkpoint()?)
             }
-            Self::Qwen35(_) | Self::Lfm2(_) => return Ok(None),
-        }))
+        })
     }
 
     /// Length of the replay still being rebuilt, or `None` once the state
@@ -4648,9 +4653,10 @@ impl NativeChatDecodeState {
         match self {
             Self::Qwen3(state) => state.replay_tokens(),
             Self::Gemma3(state) => state.replay_tokens(),
+            Self::Lfm2(state) => state.replay_tokens(),
+            Self::Qwen35(state) => state.replay_tokens(),
             Self::Qwen38(state) => state.replay_tokens(),
             Self::Qwen36Moe(state) => state.replay_tokens(),
-            Self::Qwen35(_) | Self::Lfm2(_) => None,
         }
     }
 
@@ -5240,8 +5246,10 @@ impl NativeChatModel {
     /// validation, so it does not declare one.
     pub fn replay_capability(&self) -> ReplayCapability {
         match self {
-            Self::Qwen3(_) | Self::Gemma3(_) | Self::Qwen38(_) => ReplayCapability::TokenReplay,
-            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Lfm2(_) => ReplayCapability::None,
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) | Self::Qwen38(_) => {
+                ReplayCapability::TokenReplay
+            }
+            Self::Qwen36Moe(_) => ReplayCapability::None,
         }
     }
 
@@ -5275,6 +5283,20 @@ impl NativeChatModel {
                     model.begin_replay_managed(checkpoint, cache)?,
                 ))
             }
+            (Self::Lfm2(model), NativeChatReplayCheckpoint::Lfm2(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Lfm2(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
+            (Self::Qwen35(model), NativeChatReplayCheckpoint::Qwen35(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Qwen35(
+                    model.begin_replay_state_physical(checkpoint, cache)?,
+                ))
+            }
             (Self::Qwen38(model), NativeChatReplayCheckpoint::Qwen38(checkpoint)) => {
                 Ok(NativeChatDecodeState::Qwen38(
                     model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
@@ -5298,14 +5320,29 @@ impl NativeChatModel {
         &self,
         state: &mut NativeChatDecodeState,
         prompt_ids: &[u32],
+        prepared: Option<&NativeChatPreparedPrompt>,
         span_start: usize,
         span_end: usize,
     ) -> Result<bool> {
         match (self, state) {
+            (Self::Qwen35(model), NativeChatDecodeState::Qwen35(state)) => {
+                let prepared = prepared
+                    .and_then(NativeChatPreparedPrompt::as_qwen35)
+                    .filter(|prepared| prepared.prompt_ids() == prompt_ids)
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "Qwen3.5 replay requires its sealed prepared prompt".into(),
+                        )
+                    })?;
+                model.continue_replay(state, prepared, span_start, span_end)
+            }
             (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
                 model.continue_replay(state, prompt_ids, span_start, span_end)
             }
             (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
+            (Self::Lfm2(model), NativeChatDecodeState::Lfm2(state)) => {
                 model.continue_replay(state, prompt_ids, span_start, span_end)
             }
             (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {

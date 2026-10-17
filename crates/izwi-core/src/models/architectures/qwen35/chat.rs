@@ -191,6 +191,9 @@ pub struct ChatDecodeState {
     /// This slot is drained before the state is returned to the executor.
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
+    /// Append-only journal of the emitted tokens, which a capacity replay
+    /// writes back after the prompt. Step rollback keeps only its length.
+    generated_ids: Vec<u32>,
     history_ids: Vec<u32>,
     /// Number of prompt tokens at the start of `history_ids`.
     penalty_prompt_len: usize,
@@ -215,6 +218,39 @@ pub struct ChatDecodeState {
     grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
     /// The loaded model's decode counters.
     telemetry: Arc<Qwen35Telemetry>,
+    /// Cache length a capacity replay is rebuilding; the state decodes again
+    /// once its KV pages and recurrent state reach it.
+    replay_end: Option<usize>,
+}
+
+/// CPU continuation record of a session released for capacity: the
+/// generated-token journal (the prompt is the request's prepared prompt) and
+/// the sampler, grammar and text state at a quantum boundary. It owns no
+/// tensors; the released KV pages and DeltaNet/convolution state are rebuilt
+/// by replaying the prompt and every generated token but the pending one.
+#[derive(Clone)]
+pub(crate) struct Qwen35ReplayCheckpoint {
+    replay_tokens: usize,
+    pending_token: u32,
+    generated_ids: Vec<u32>,
+    history_ids: Vec<u32>,
+    penalty_prompt_len: usize,
+    decoder: IncrementalDecoder,
+    tokens_generated: usize,
+    track_history: bool,
+    assembled: String,
+    max_new_tokens: usize,
+    next_text_position: usize,
+    prefill_progress: usize,
+    config: ChatGenerationConfig,
+    rng: SimpleRng,
+    grammar: Option<crate::models::shared::sampling::GrammarRuntime>,
+}
+
+impl Qwen35ReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.replay_tokens
+    }
 }
 
 impl ChatDecodeState {
@@ -224,6 +260,47 @@ impl ChatDecodeState {
 
     pub(crate) fn uses_physical_kv(&self) -> bool {
         true
+    }
+
+    /// The replay a capacity suspension still has to rebuild, if any.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay_end
+    }
+
+    /// Capture the CPU continuation record at a quantum boundary, before the
+    /// caller releases the KV pages and recurrent state.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Qwen35ReplayCheckpoint> {
+        let replay_tokens = self
+            .replay_end
+            .unwrap_or_else(|| self.physical_kv.context_len());
+        let pending_token = self.pending_token.filter(|_| {
+            !self.finished
+                && self.unconsumed_output.is_none()
+                && self.generated_ids.len() == self.tokens_generated
+                && replay_tokens + 1 == self.prefill_progress + self.tokens_generated
+        });
+        let Some(pending_token) = pending_token else {
+            return Err(Error::InvalidInput(
+                "a Qwen3.5 session suspends only between decode quanta".into(),
+            ));
+        };
+        Ok(Qwen35ReplayCheckpoint {
+            replay_tokens,
+            pending_token,
+            generated_ids: self.generated_ids.clone(),
+            history_ids: self.history_ids.clone(),
+            penalty_prompt_len: self.penalty_prompt_len,
+            decoder: self.decoder.clone(),
+            tokens_generated: self.tokens_generated,
+            track_history: self.track_history,
+            assembled: self.assembled.clone(),
+            max_new_tokens: self.max_new_tokens,
+            next_text_position: self.next_text_position,
+            prefill_progress: self.prefill_progress,
+            config: self.config.clone(),
+            rng: self.rng.clone(),
+            grammar: self.grammar.clone(),
+        })
     }
 
     pub(crate) fn install_physical_reservation(
@@ -264,6 +341,7 @@ impl ChatDecodeState {
             physical_kv: std::mem::replace(&mut self.physical_kv, cache),
             unconsumed_output: self.unconsumed_output.clone(),
             pending_token: self.pending_token,
+            generated_len: self.generated_ids.len(),
             history_ids: self.history_ids.clone(),
             decoder: self.decoder.clone(),
             tokens_generated: self.tokens_generated,
@@ -279,6 +357,7 @@ impl ChatDecodeState {
         self.physical_kv = checkpoint.physical_kv;
         self.unconsumed_output = checkpoint.unconsumed_output;
         self.pending_token = checkpoint.pending_token;
+        self.generated_ids.truncate(checkpoint.generated_len);
         self.history_ids = checkpoint.history_ids;
         self.decoder = checkpoint.decoder;
         self.tokens_generated = checkpoint.tokens_generated;
@@ -339,6 +418,7 @@ pub(crate) struct Qwen35SharedStepCheckpoint {
     physical_kv: PhysicalPagedKvCache,
     unconsumed_output: Option<Tensor>,
     pending_token: Option<u32>,
+    generated_len: usize,
     history_ids: Vec<u32>,
     decoder: IncrementalDecoder,
     tokens_generated: usize,
@@ -773,6 +853,7 @@ impl Qwen35ChatExec {
             physical_tensor_sequence: None,
             unconsumed_output: None,
             pending_token: None,
+            generated_ids: Vec::with_capacity(max_new_tokens.max(1)),
             history_ids: initial_penalty_history(
                 &prepared.prompt_ids,
                 max_new_tokens,
@@ -798,7 +879,116 @@ impl Qwen35ChatExec {
             rng: SimpleRng::new(config.seed),
             grammar: self.grammar_runtime(config),
             telemetry: self.text_model.telemetry().clone(),
+            replay_end: None,
         })
+    }
+
+    /// Start rebuilding a suspended session in an empty reservation and a
+    /// fresh recurrent state. The state decodes again after
+    /// [`Self::continue_replay`] reaches the end of the checkpoint's replay.
+    pub(crate) fn begin_replay_state_physical(
+        &self,
+        saved: &Qwen35ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0 || saved.replay_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Qwen3.5 replay requires an empty reservation and a non-empty journal".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            text_state: self.text_model.new_state(),
+            physical_kv: cache,
+            physical_tensor_sequence: None,
+            unconsumed_output: None,
+            pending_token: Some(saved.pending_token),
+            generated_ids: saved.generated_ids.clone(),
+            history_ids: saved.history_ids.clone(),
+            penalty_prompt_len: saved.penalty_prompt_len,
+            decoder: saved.decoder.clone(),
+            tokens_generated: saved.tokens_generated,
+            track_history: saved.track_history,
+            assembled: saved.assembled.clone(),
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            next_text_position: saved.next_text_position,
+            prefill_progress: saved.prefill_progress,
+            // The replayed prompt consumes its vision rows again.
+            prefill_vision_progress: 0,
+            config: saved.config.clone(),
+            rng: saved.rng.clone(),
+            pending_logprobs: Vec::new(),
+            grammar: saved.grammar.clone(),
+            telemetry: self.text_model.telemetry().clone(),
+            replay_end: Some(saved.replay_tokens),
+        })
+    }
+
+    /// Write `[span_start, span_end)` of the replay journal (the prepared
+    /// prompt, vision rows included, then the generated tokens at their text
+    /// positions) into the KV pages and recurrent state without sampling or
+    /// emitting. Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let replay_end = state
+            .replay_end
+            .ok_or_else(|| Error::InvalidInput("Qwen3.5 state has no pending replay".into()))?;
+        let prompt_len = prepared.prompt_ids.len();
+        if span_start != state.physical_kv.context_len()
+            || span_start >= span_end
+            || span_end > replay_end
+            || prompt_len != state.prefill_progress
+            || replay_end > prompt_len + state.generated_ids.len()
+        {
+            return Err(Error::InvalidInput(format!(
+                "Qwen3.5 replay span [{span_start},{span_end}) does not continue cursor {} of {replay_end}",
+                state.physical_kv.context_len()
+            )));
+        }
+        if span_start < prompt_len {
+            self.prefill_prompt_segments(
+                state,
+                prepared,
+                span_start,
+                span_end.min(prompt_len),
+                false,
+            )?;
+            if span_end >= prompt_len {
+                self.check_prompt_vision_consumed(state, prepared)?;
+            }
+        }
+        let chunk_size = qwen35_prefill_chunk_size();
+        let mut cursor = span_start.max(prompt_len);
+        while cursor < span_end {
+            let end = span_end.min(cursor.saturating_add(chunk_size));
+            let positions = (cursor..end)
+                .map(|index| [prepared.next_text_position + index - prompt_len; 3])
+                .collect::<Vec<_>>();
+            self.text_model.prefill_token_ids_physical(
+                &state.generated_ids[cursor - prompt_len..end - prompt_len],
+                &positions,
+                &mut state.text_state,
+                &mut state.physical_kv,
+                false,
+            )?;
+            cursor = end;
+        }
+        if state.physical_kv.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 replay committed physical cursor {} instead of {span_end}",
+                state.physical_kv.context_len()
+            )));
+        }
+        let complete = span_end == replay_end;
+        if complete {
+            state.replay_end = None;
+        }
+        Ok(complete)
     }
 
     /// DS9.2 grammar runtime for this request, or `None` when the request
@@ -847,6 +1037,35 @@ impl Qwen35ChatExec {
             )));
         }
         let complete = span_end == prepared.prompt_ids.len();
+        let logits =
+            self.prefill_prompt_segments(state, prepared, span_start, span_end, complete)?;
+        if state.physical_kv.context_len() != span_end {
+            return Err(Error::InferenceError(format!(
+                "Qwen3.5 resumable prefill committed physical cursor {} instead of {span_end}",
+                state.physical_kv.context_len()
+            )));
+        }
+        state.prefill_progress = span_end;
+        if complete {
+            self.check_prompt_vision_consumed(state, prepared)?;
+            state.unconsumed_output = Some(logits.ok_or_else(|| {
+                Error::InferenceError("Qwen3.5 final prefill span produced no logits".into())
+            })?);
+        }
+        Ok(complete)
+    }
+
+    /// Prefill `[span_start, span_end)` of the prepared prompt, image
+    /// placeholders from their vision rows, in chunks; logits only for the
+    /// span's last token and only when `logits_at_end`.
+    fn prefill_prompt_segments(
+        &self,
+        state: &mut ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+        span_start: usize,
+        span_end: usize,
+        logits_at_end: bool,
+    ) -> Result<Option<Tensor>> {
         let mut logits = None;
         let mut cursor = span_start;
         let chunk_size = qwen35_prefill_chunk_size();
@@ -867,7 +1086,7 @@ impl Qwen35ChatExec {
                     .embeddings
                     .narrow(0, state.prefill_vision_progress, image_count)?
                     .reshape((1, image_count, self.text_model.hidden_size()))?;
-                let compute_logits = complete && segment_end == span_end;
+                let compute_logits = logits_at_end && segment_end == span_end;
                 logits = self.text_model.prefill_input_embeddings_physical(
                     &embeddings,
                     &prepared.prompt_positions[cursor..segment_end],
@@ -879,7 +1098,7 @@ impl Qwen35ChatExec {
                 cursor = segment_end;
                 continue;
             }
-            let compute_logits = complete && segment_end == span_end;
+            let compute_logits = logits_at_end && segment_end == span_end;
             logits = self.text_model.prefill_token_ids_physical(
                 &prepared.prompt_ids[cursor..segment_end],
                 &prepared.prompt_positions[cursor..segment_end],
@@ -889,34 +1108,35 @@ impl Qwen35ChatExec {
             )?;
             cursor = segment_end;
         }
-        if state.physical_kv.context_len() != span_end {
+        Ok(logits)
+    }
+
+    fn check_prompt_vision_consumed(
+        &self,
+        state: &ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+    ) -> Result<()> {
+        let prepared_vision_rows = prepared
+            .vision_inputs
+            .as_ref()
+            .map(|vision| vision.embeddings.dim(0))
+            .transpose()?
+            .unwrap_or(0);
+        if state.prefill_vision_progress != prepared_vision_rows {
             return Err(Error::InferenceError(format!(
-                "Qwen3.5 resumable prefill committed physical cursor {} instead of {span_end}",
-                state.physical_kv.context_len()
+                "Qwen3.5 prefill consumed {} of {prepared_vision_rows} prepared vision rows",
+                state.prefill_vision_progress
             )));
         }
-        state.prefill_progress = span_end;
-        if complete {
-            let prepared_vision_rows = prepared
-                .vision_inputs
-                .as_ref()
-                .map(|vision| vision.embeddings.dim(0))
-                .transpose()?
-                .unwrap_or(0);
-            if state.prefill_vision_progress != prepared_vision_rows {
-                return Err(Error::InferenceError(format!(
-                    "Qwen3.5 prefill consumed {} of {prepared_vision_rows} prepared vision rows",
-                    state.prefill_vision_progress
-                )));
-            }
-            state.unconsumed_output = Some(logits.ok_or_else(|| {
-                Error::InferenceError("Qwen3.5 final prefill span produced no logits".into())
-            })?);
-        }
-        Ok(complete)
+        Ok(())
     }
 
     pub(crate) fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.replay_end.is_some() {
+            return Err(Error::InferenceError(
+                "Qwen3.5 decode cannot run before its replay completes".into(),
+            ));
+        }
         if state.finished || state.tokens_generated >= state.max_new_tokens {
             state.finished = true;
             let delta = self.tokenizer.finish_decode(&mut state.decoder)?;
@@ -1007,6 +1227,7 @@ impl Qwen35ChatExec {
         if state.track_history {
             state.history_ids.push(next);
         }
+        state.generated_ids.push(next);
         state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
         state.pending_token = Some(next);
@@ -1045,6 +1266,7 @@ impl Qwen35ChatExec {
                 || state.tokens_generated >= state.max_new_tokens
                 || state.unconsumed_output.is_some()
                 || state.pending_token.is_none()
+                || state.replay_end.is_some()
                 || state.physical_kv.context_len() != expected_physical_cursor
             {
                 return Err(Error::InvalidInput(
@@ -1156,6 +1378,7 @@ impl Qwen35ChatExec {
         let mut delta = self
             .tokenizer
             .decode_token_delta(&mut state.decoder, token)?;
+        state.generated_ids.push(token);
         state.tokens_generated = state.tokens_generated.saturating_add(1);
         state.assembled.push_str(&delta);
         if state.tokens_generated >= state.max_new_tokens {
@@ -1441,6 +1664,25 @@ impl Qwen35ChatModel {
     ) -> Result<bool> {
         self.exec
             .continue_resumable_prefill_physical(state, prepared, span_start, span_end)
+    }
+
+    pub(crate) fn begin_replay_state_physical(
+        &self,
+        saved: &Qwen35ReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        self.exec.begin_replay_state_physical(saved, cache)
+    }
+
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prepared: &Qwen35PreparedPrompt,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        self.exec
+            .continue_replay(state, prepared, span_start, span_end)
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
@@ -3223,6 +3465,306 @@ mod tests {
             ]
         );
         assert_eq!(next_text_position, 4);
+    }
+
+    /// A tiny synthetic Qwen3.5 text trunk: four layers (DeltaNet 0 and 2,
+    /// gated full attention 1 and 3) with dense feed-forwards, written as a
+    /// `qwen35` GGUF and loaded through the production loader, plus the
+    /// synthetic byte-level tokenizer.
+    fn tiny_exec(device: &candle_core::Device) -> Qwen35ChatExec {
+        use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+
+        const HIDDEN: usize = 32;
+        const FF: usize = 16;
+        let mut seed = 0x5135_8A0E_u64;
+        let mut tensors = Vec::<(String, QTensor)>::new();
+        let mut push = |name: String, shape: Vec<usize>| {
+            let values = (0..shape.iter().product::<usize>())
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.2
+                })
+                .collect::<Vec<_>>();
+            let tensor = Tensor::from_vec(values, shape, &candle_core::Device::Cpu).unwrap();
+            tensors.push((name, QTensor::quantize(&tensor, GgmlDType::F32).unwrap()));
+        };
+        let tokenizer = synthetic_qwen35_tokenizer();
+        push(
+            "token_embd.weight".into(),
+            vec![tokenizer.vocab_size, HIDDEN],
+        );
+        push("output_norm.weight".into(), vec![HIDDEN]);
+        for layer in 0..4 {
+            let prefix = format!("blk.{layer}");
+            push(format!("{prefix}.attn_norm.weight"), vec![HIDDEN]);
+            push(format!("{prefix}.post_attention_norm.weight"), vec![HIDDEN]);
+            push(format!("{prefix}.ffn_gate.weight"), vec![FF, HIDDEN]);
+            push(format!("{prefix}.ffn_up.weight"), vec![FF, HIDDEN]);
+            push(format!("{prefix}.ffn_down.weight"), vec![HIDDEN, FF]);
+            if layer % 2 == 1 {
+                // Gated attention: q fuses the per-head output gate.
+                push(format!("{prefix}.attn_q.weight"), vec![64, HIDDEN]);
+                push(format!("{prefix}.attn_k.weight"), vec![16, HIDDEN]);
+                push(format!("{prefix}.attn_v.weight"), vec![16, HIDDEN]);
+                push(format!("{prefix}.attn_output.weight"), vec![HIDDEN, HIDDEN]);
+                push(format!("{prefix}.attn_q_norm.weight"), vec![8]);
+                push(format!("{prefix}.attn_k_norm.weight"), vec![8]);
+            } else {
+                // DeltaNet: 2 key heads of state 8 (q and k), 4 value heads.
+                push(format!("{prefix}.attn_qkv.weight"), vec![64, HIDDEN]);
+                push(format!("{prefix}.attn_gate.weight"), vec![32, HIDDEN]);
+                push(format!("{prefix}.ssm_beta.weight"), vec![4, HIDDEN]);
+                push(format!("{prefix}.ssm_alpha.weight"), vec![4, HIDDEN]);
+                push(format!("{prefix}.ssm_dt.bias"), vec![4]);
+                push(format!("{prefix}.ssm_a"), vec![4]);
+                push(format!("{prefix}.ssm_conv1d.weight"), vec![64, 4]);
+                push(format!("{prefix}.ssm_norm.weight"), vec![8]);
+                push(format!("{prefix}.ssm_out.weight"), vec![HIDDEN, 32]);
+            }
+        }
+        let value = |value: u64| gguf_file::Value::U64(value);
+        let metadata = [
+            (
+                "general.architecture",
+                gguf_file::Value::String("qwen35".into()),
+            ),
+            ("qwen35.block_count", value(4)),
+            ("qwen35.context_length", value(256)),
+            ("qwen35.embedding_length", value(HIDDEN as u64)),
+            ("qwen35.feed_forward_length", value(FF as u64)),
+            ("qwen35.attention.head_count", value(4)),
+            ("qwen35.attention.head_count_kv", value(2)),
+            ("qwen35.attention.key_length", value(8)),
+            ("qwen35.attention.value_length", value(8)),
+            (
+                "qwen35.attention.layer_norm_rms_epsilon",
+                gguf_file::Value::F64(1e-5),
+            ),
+            (
+                "qwen35.rope.dimension_sections",
+                gguf_file::Value::Array(vec![value(2), value(2), value(2)]),
+            ),
+            ("qwen35.rope.dimension_count", value(8)),
+            ("qwen35.rope.freq_base", gguf_file::Value::F64(10_000.0)),
+            ("qwen35.ssm.conv_kernel", value(4)),
+            ("qwen35.ssm.state_size", value(8)),
+            ("qwen35.ssm.group_count", value(2)),
+            ("qwen35.ssm.time_step_rank", value(4)),
+            ("qwen35.ssm.inner_size", value(32)),
+            ("qwen35.full_attention_interval", value(2)),
+        ];
+        let directory =
+            std::env::temp_dir().join(format!("izwi-qwen35-replay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("tiny-qwen35.gguf");
+        let mut file = std::fs::File::create(&path).unwrap();
+        gguf_file::write(
+            &mut file,
+            &metadata
+                .iter()
+                .map(|(name, value)| (*name, value))
+                .collect::<Vec<_>>(),
+            &tensors
+                .iter()
+                .map(|(name, tensor)| (name.as_str(), tensor))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        drop(file);
+        let backend = if device.is_metal() {
+            BackendKind::Metal
+        } else {
+            BackendKind::Cpu
+        };
+        let loader = GgufLoader::from_path_with_backend(&path, backend).unwrap();
+        let text_config = parse_text_config(&loader).unwrap();
+        let text_model = Qwen35TextModel::load(&loader, &text_config, device).unwrap();
+        drop(loader);
+        std::fs::remove_dir_all(directory).unwrap();
+        Qwen35ChatExec {
+            variant: ModelVariant::Qwen3508BGguf,
+            tokenizer,
+            text_config,
+            text_model,
+        }
+    }
+
+    /// Run the pending token's forward as `decode_step` does and return the
+    /// logits it leaves for sampling.
+    fn pending_logits(exec: &Qwen35ChatExec, state: &mut ChatDecodeState) -> Vec<f32> {
+        let pending = state.pending_token.take().expect("pending token");
+        let logits = exec
+            .text_model
+            .forward_token_id_at_physical(
+                pending,
+                [state.next_text_position; 3],
+                &mut state.text_state,
+                &mut state.physical_kv,
+            )
+            .unwrap();
+        state.next_text_position += 1;
+        state.unconsumed_output = Some(logits.clone());
+        logits
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
+
+    /// D3: a hybrid Qwen3.5 session (DeltaNet recurrence, convolution ring
+    /// and full-attention KV) released for capacity mid-generation and
+    /// rebuilt in a fresh cache and recurrent state by replaying its prompt
+    /// and generated tokens over the original span boundaries resumes
+    /// exactly: bit-identical next-step logits and the same greedy and
+    /// seeded streams. A one-span replay runs other op shapes and is held to
+    /// a tolerance.
+    fn assert_replay_resumes_exactly(device: &candle_core::Device) {
+        const MAX_NEW_TOKENS: usize = 24;
+        const SUSPEND_AT: usize = 7;
+        let exec = tiny_exec(device);
+        let prompt_ids = vec![104u32, 101, 108, 108, 111, 33];
+        let prepared = Qwen35PreparedPrompt {
+            prompt_positions: (0..prompt_ids.len()).map(|index| [index; 3]).collect(),
+            next_text_position: prompt_ids.len(),
+            prompt_ids: prompt_ids.clone(),
+            vision_inputs: None,
+        };
+        let profile = DeviceProfile {
+            device: device.clone(),
+            kind: if device.is_metal() {
+                crate::backends::DeviceKind::Metal
+            } else {
+                crate::backends::DeviceKind::Cpu
+            },
+            capabilities: Default::default(),
+            memory_pool: None,
+        };
+        let sampled = ChatGenerationConfig {
+            temperature: 1.5,
+            seed: 11,
+            ..ChatGenerationConfig::default()
+        };
+        for config in [ChatGenerationConfig::default(), sampled] {
+            for one_span in [false, true] {
+                let mut caches = super::trace_tests::trace_caches(&exec.text_config, &profile, 3);
+                let fresh = caches.pop().unwrap();
+                let mut rows = caches
+                    .into_iter()
+                    .map(|cache| {
+                        let mut state = exec
+                            .begin_resumable_prefill_state_physical(
+                                &prepared,
+                                MAX_NEW_TOKENS,
+                                &config,
+                                cache,
+                            )
+                            .unwrap();
+                        exec.continue_resumable_prefill_physical(
+                            &mut state,
+                            &prepared,
+                            0,
+                            prompt_ids.len(),
+                        )
+                        .unwrap();
+                        state
+                    })
+                    .collect::<Vec<_>>();
+                let mut suspended = rows.pop().unwrap();
+                let mut baseline = rows.pop().unwrap();
+                // After the prefill's own token the suspended row decodes
+                // through the continuous batch, so both token-publishing
+                // paths keep the replay journal.
+                for step in 0..SUSPEND_AT {
+                    let expected = exec.decode_step(&mut baseline).unwrap();
+                    let actual = if step == 0 {
+                        exec.decode_step(&mut suspended).unwrap()
+                    } else {
+                        exec.decode_step_batch(&mut [&mut suspended])
+                            .unwrap()
+                            .remove(0)
+                    };
+                    assert_eq!(actual.delta, expected.delta);
+                }
+                assert!(
+                    !baseline.finished,
+                    "the fixture ended before the suspension"
+                );
+                let checkpoint = suspended.replay_checkpoint().unwrap();
+                assert_eq!(
+                    checkpoint.replay_tokens(),
+                    prompt_ids.len() + SUSPEND_AT - 1
+                );
+                drop(suspended);
+                let mut replayed = exec
+                    .begin_replay_state_physical(&checkpoint, fresh)
+                    .unwrap();
+                assert!(exec.decode_step(&mut replayed).is_err());
+                let spans = if one_span {
+                    vec![(0, checkpoint.replay_tokens())]
+                } else {
+                    std::iter::once((0, prompt_ids.len()))
+                        .chain(
+                            (prompt_ids.len()..checkpoint.replay_tokens())
+                                .map(|start| (start, start + 1)),
+                        )
+                        .collect()
+                };
+                for (index, (start, end)) in spans.iter().copied().enumerate() {
+                    let complete = exec
+                        .continue_replay(&mut replayed, &prepared, start, end)
+                        .unwrap();
+                    assert_eq!(complete, index + 1 == spans.len());
+                }
+                assert_eq!(replayed.next_text_position, baseline.next_text_position);
+                let expected = pending_logits(&exec, &mut baseline);
+                let actual = pending_logits(&exec, &mut replayed);
+                if one_span {
+                    let error = expected
+                        .iter()
+                        .zip(&actual)
+                        .map(|(left, right)| {
+                            let error = (left - right).abs();
+                            if error.is_finite() {
+                                error
+                            } else {
+                                f32::INFINITY
+                            }
+                        })
+                        .fold(0.0, f32::max);
+                    assert!(error < 1e-3, "one-span replay logits differ by {error}");
+                    continue;
+                }
+                assert_eq!(actual, expected, "rebuilt next-step logits");
+                while !baseline.finished {
+                    let step = exec.decode_step(&mut baseline).unwrap();
+                    let resumed = exec.decode_step(&mut replayed).unwrap();
+                    assert_eq!(resumed.delta, step.delta);
+                    assert_eq!(resumed.text, step.text);
+                }
+                assert!(replayed.finished);
+                assert_eq!(replayed.generated_ids, baseline.generated_ids);
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_session_resumes_exactly_on_cpu() {
+        assert_replay_resumes_exactly(&candle_core::Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn replayed_session_resumes_exactly_on_metal() {
+        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+            "qwen35 replayed_session_resumes_exactly_on_metal",
+        ) else {
+            return;
+        };
+        assert_replay_resumes_exactly(&device);
     }
 }
 
