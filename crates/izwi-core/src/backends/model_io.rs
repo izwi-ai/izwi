@@ -164,18 +164,13 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::env_test_lock;
 
     fn temp_test_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock drift")
-            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "izwi-gguf-reader-{name}-{}-{ts}.bin",
-            std::process::id()
+            "izwi-gguf-reader-{name}-{}.bin",
+            uuid::Uuid::new_v4()
         ));
         let mut file = File::create(&path).expect("create temp file");
         file.write_all(bytes).expect("write temp file");

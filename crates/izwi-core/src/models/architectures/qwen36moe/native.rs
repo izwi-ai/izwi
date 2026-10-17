@@ -3663,13 +3663,9 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen36moe-native-{label}-{}-{nonce}",
-                std::process::id()
+                "izwi-qwen36moe-native-{label}-{}",
+                uuid::Uuid::new_v4()
             ));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)

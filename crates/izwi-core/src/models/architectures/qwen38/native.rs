@@ -2057,8 +2057,6 @@ fn decode_e4m3fn(bits: u8) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use candle_core::Module;
     use safetensors::tensor::TensorView;
     use serde_json::json;
@@ -2069,13 +2067,9 @@ mod tests {
 
     impl TestDir {
         pub(super) fn new(label: &str) -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen38-native-{label}-{}-{nonce}",
-                std::process::id()
+                "izwi-qwen38-native-{label}-{}",
+                uuid::Uuid::new_v4()
             ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
