@@ -2,9 +2,12 @@ use izwi_serving_protocol::{
     ArtifactRevision, CancellationBehavior, CredentialId, DeploymentId, DeviceAssignment, DeviceId,
     InputFormat, ModelAlias, ModelGeneration, NodeId, OutputFormat, TaskKind,
 };
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 
+#[cfg(unix)]
 use super::autoscale_driver::poll_deployment;
 use super::cli::{parse_cpu_ids, parse_cuda_devices, parse_metal_devices};
 use super::diagnostics::{
