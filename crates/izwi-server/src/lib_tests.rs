@@ -1,12 +1,40 @@
-use super::*;
-use crate::test_support::env_lock;
-use izwi_core::ModelVariant;
+use izwi_core::backends::{BackendKind, BackendPreference};
+use izwi_core::{ModelVariant, ServeRuntimeConfigOverrides};
+use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
-    IncarnationId, ModelAlias, NodeId, WorkerDescriptor, WorkerId, WorkerStatus,
+    DeploymentId, IncarnationId, ModelAlias, ModelGeneration, NdjsonLimits, NodeId, TaskKind,
+    WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
+
+use super::*;
+use crate::batch_runtime::types::{DeviceClass, ResourceTarget, RuntimeBackendClass};
+use crate::cli::{resolve_serve_runtime_config_with_env, GatewayTopology};
+use crate::logging::LogFormat;
+use crate::roles::gateway::{
+    configured_gateway_worker_approvals, gateway_state, gateway_worker_client_config,
+    serve_gateway, validate_gateway_limits, validate_gateway_topology_policy,
+    validate_gateway_topology_source, GatewayShutdownPlan, MAX_CONFIGURED_GATEWAY_WORKERS,
+};
+use crate::roles::gateway_workers::{
+    approve_gateway_worker, configured_worker_capacity, initial_gateway_worker_expectation,
+    jittered_poll_interval, poll_jitter_seed, refresh_gateway_worker_status,
+    validate_gateway_worker_endpoint_policy, validate_status_cadence, GatewayWorkerExpectation,
+};
+use crate::roles::local::{
+    asr_warmup_duration_ms, batch_stage_execution_timeout, batch_worker_concurrency,
+    batch_worker_drain_timeout, configured_preload_models, http_shutdown_grace_timeout,
+    local_batch_worker_queue_names, local_batch_worker_resources, serve_local,
+    warmup_preloaded_models_enabled,
+};
+use crate::shutdown::{
+    await_http_server_shutdown, shutdown_worker_then_cleanup, wait_for_owner_pipe_close,
+};
+use crate::test_support::env_lock;
 
 fn local_test_state() -> (AppState, ServeRuntimeConfig, tempfile::TempDir) {
     let temp_dir = tempfile::tempdir().expect("temp dir");
