@@ -77,9 +77,8 @@ fn chunk_max_chars() -> usize {
 }
 
 fn configured_chunk_max_chars() -> Option<usize> {
-    std::env::var("IZWI_TTS_LONG_FORM_CHUNK_MAX_CHARS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    crate::env_config::tuning()
+        .tts_long_form_chunk_max_chars
         .map(|value| value.clamp(CHUNK_MAX_CHARS_MIN, CHUNK_MAX_CHARS_MAX))
 }
 
@@ -168,16 +167,7 @@ impl SpeechTextPlan {
         // Blank layout alone is not an inference segment. Byte ranges still
         // identify original content for durable progress and recovery.
         segments.retain(|range| !text[range.clone()].trim().is_empty());
-        let long_form_enabled = match std::env::var("IZWI_FISH_LONG_FORM_ENABLED").as_deref() {
-            Ok("false" | "0") => false,
-            Ok("true" | "1") | Err(std::env::VarError::NotPresent) => true,
-            _ => {
-                return Err(izwi_core::Error::InvalidInput(
-                    "Invalid IZWI_FISH_LONG_FORM_ENABLED configuration".into(),
-                ))
-            }
-        };
-        if segments.len() > 1 && !long_form_enabled {
+        if segments.len() > 1 && !crate::env_config::tuning().fish_long_form_enabled {
             return Err(izwi_core::Error::InvalidInput(
                 "Fish long-form generation is disabled by this deployment".into(),
             ));
@@ -200,10 +190,8 @@ impl SpeechTextPlan {
         } else {
             estimated_frames
         };
-        let max_pcm_bytes = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        let max_pcm_bytes = crate::env_config::tuning()
+            .tts_stream_max_pcm_bytes
             .unwrap_or(u32::MAX as usize - 44)
             .min(u32::MAX as usize - 44);
         if estimated_frames
@@ -618,13 +606,7 @@ pub(crate) async fn generate_speech_plan_stream_with_progress(
         let _abort = AbortSpeechTask(task.abort_handle());
         // A progress deadline, not a wall clock: a segment fails only when
         // it publishes nothing for this long (TPIPE-6).
-        let stall_timeout = std::time::Duration::from_secs(
-            std::env::var("IZWI_TTS_SEGMENT_TIMEOUT_SECS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(1800),
-        );
+        let stall_timeout = crate::env_config::tuning().tts_segment_timeout;
         let mut deadline = tokio::time::Instant::now() + stall_timeout;
         let mut segment_duration = 0.0;
         let mut emitted = false;

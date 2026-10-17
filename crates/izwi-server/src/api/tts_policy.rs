@@ -13,11 +13,7 @@ use izwi_core::ModelVariant;
 /// (`IZWI_TTS_MAX_TEXT_BYTES`, default 1 MiB). Long form splits text into
 /// model-sized calls, so this bounds only the request itself (TPIPE-14).
 pub(crate) fn tts_max_text_bytes() -> usize {
-    std::env::var("IZWI_TTS_MAX_TEXT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1024 * 1024)
+    crate::env_config::tuning().tts_max_text_bytes
 }
 
 /// The voice a speech request asks for, as the routes read it.

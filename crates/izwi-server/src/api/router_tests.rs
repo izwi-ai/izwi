@@ -1259,14 +1259,17 @@ async fn text_only_tts_idempotency_replays_and_conflicts_without_duplicate_work(
 
     // Replays must bypass fresh admission: the original request itself
     // fills this one-job capacity limit.
-    let _env = env_lock();
-    std::env::set_var("IZWI_TTS_MAX_ACTIVE_JOBS", "1");
+    state
+        .batch_runtime_store
+        .set_tts_admission_limits_for_test(Some((1, 32)));
     let replay = send_request(
         app.clone(),
         build_request_with_idempotency(&body, "tts-request-1"),
     )
     .await;
-    std::env::remove_var("IZWI_TTS_MAX_ACTIVE_JOBS");
+    state
+        .batch_runtime_store
+        .set_tts_admission_limits_for_test(None);
     assert_eq!(replay.status(), StatusCode::ACCEPTED);
     assert_eq!(
         read_json(replay).await["id"].as_str(),
@@ -1627,8 +1630,9 @@ async fn text_only_tts_admission_rejection_leaves_no_failed_placeholder() {
     .await;
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 
-    let _env = env_lock();
-    std::env::set_var("IZWI_TTS_MAX_ACTIVE_JOBS", "1");
+    state
+        .batch_runtime_store
+        .set_tts_admission_limits_for_test(Some((1, 32)));
     let rejected = send_request(
         app,
         build_request(
@@ -1644,7 +1648,9 @@ async fn text_only_tts_admission_rejection_leaves_no_failed_placeholder() {
         ),
     )
     .await;
-    std::env::remove_var("IZWI_TTS_MAX_ACTIVE_JOBS");
+    state
+        .batch_runtime_store
+        .set_tts_admission_limits_for_test(None);
     assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
     let (records, _) = state
         .speech_history_store

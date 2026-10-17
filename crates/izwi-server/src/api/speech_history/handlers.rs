@@ -68,7 +68,6 @@ use izwi_core::{
 use izwi_hooks::Principal;
 
 const HISTORY_LIST_LIMIT: usize = 200;
-const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 const STREAM_CLIENT_DISCONNECTED_MESSAGE: &str = "Streaming client disconnected before completion";
 pub(crate) const BATCH_TTS_STAGE_KIND: &str = "tts_synthesize";
 const REFERENCE_AUDIO_UPLOAD_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -269,21 +268,14 @@ fn stream_pcm_byte_allowance(
 
 fn stream_pcm_byte_limit(variant: ModelVariant, sample_rate: u32, request_count: usize) -> usize {
     let limit = stream_pcm_byte_allowance(variant, sample_rate, request_count);
-    let configured = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value >= 2);
-    configured
+    crate::env_config::tuning()
+        .tts_stream_max_pcm_bytes
         .map_or(limit, |configured| configured.min(limit))
         .min(u32::MAX as usize - 44)
 }
 
 fn stream_event_queue_capacity() -> usize {
-    std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
+    crate::env_config::tuning().audio_stream_event_queue_capacity
 }
 
 struct BudgetedStreamEvent {
@@ -370,13 +362,8 @@ async fn send_stream_event(
         _global_reservation: global_reservation,
         _stream_reservation: stream_reservation,
     };
-    let timeout_secs = std::env::var("IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(30);
     tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
+        crate::env_config::tuning().audio_stream_stall_timeout,
         event_tx.sender.send(event),
     )
     .await
@@ -1975,11 +1962,7 @@ async fn stream_record_creation(
     let admission_state = state.clone();
 
     let (sender, event_rx) = mpsc::channel::<BudgetedStreamEvent>(stream_event_queue_capacity());
-    let byte_limit = std::env::var("IZWI_AUDIO_STREAM_MAX_EVENT_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4 * 1024 * 1024);
+    let byte_limit = crate::env_config::tuning().audio_stream_max_event_bytes;
     let event_tx = StreamEventSender {
         sender,
         budget: crate::speech_resource_budget::ByteBudget::new(byte_limit),

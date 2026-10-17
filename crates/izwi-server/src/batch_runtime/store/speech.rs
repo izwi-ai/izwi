@@ -692,19 +692,17 @@ impl BatchRuntimeStore {
 
     pub(super) fn tts_admission_limits(&self) -> (usize, usize) {
         #[cfg(test)]
-        if let Some(limits) = self.test_tts_admission_limits {
+        if let Some(limits) = *self
+            .test_tts_admission_limits
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+        {
             return limits;
         }
-        let read = |key, default| {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(default)
-        };
+        let tuning = crate::env_config::tuning();
         (
-            read("IZWI_TTS_MAX_ACTIVE_JOBS", 256),
-            read("IZWI_TTS_MAX_ACTIVE_JOBS_PER_TENANT", 32),
+            tuning.tts_max_active_jobs,
+            tuning.tts_max_active_jobs_per_tenant,
         )
     }
 

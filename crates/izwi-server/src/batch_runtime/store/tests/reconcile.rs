@@ -235,7 +235,7 @@ async fn reconcile_fails_jobs_orphaned_without_stages_and_releases_admission() {
     let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
-    store.test_tts_admission_limits = Some((1, 1));
+    store.set_tts_admission_limits_for_test(Some((1, 1)));
     let orphan = store.create_job(admission_job(1)).await.expect("job");
     assert!(store.create_job(admission_job(2)).await.is_err());
 

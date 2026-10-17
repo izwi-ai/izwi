@@ -24,7 +24,6 @@ use izwi_core::{
     TtsStopReason, WorkloadClass,
 };
 
-const DEFAULT_STREAM_EVENT_QUEUE_CAPACITY: usize = 32;
 const SPEECH_RESPONSE_EXPOSED_HEADERS: &str = "X-Generation-Time-Ms, X-Audio-Duration-Secs, X-RTF, X-RTF-Basis, X-Wall-Time-Ms, X-Wall-RTF, X-Tokens-Generated, X-Audio-Sample-Rate, X-Stop-Reason, X-Output-Truncated, X-Izwi-Tts-Diagnostics, X-Requested-Response-Format, X-Actual-Response-Format, X-Response-Format-Fallback";
 
 /// OpenAI-compatible speech synthesis request.
@@ -149,11 +148,7 @@ fn openai_stream_payload(event: &SpeechStreamEvent) -> String {
 }
 
 fn stream_event_queue_capacity() -> usize {
-    std::env::var("IZWI_AUDIO_STREAM_EVENT_QUEUE_CAPACITY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_STREAM_EVENT_QUEUE_CAPACITY)
+    crate::env_config::tuning().audio_stream_event_queue_capacity
 }
 
 /// Send one SSE event, failing a reader that has stalled past the stall
@@ -165,12 +160,8 @@ async fn send_stream_event(
     event: SpeechStreamEvent,
 ) -> Result<(), ()> {
     let payload = openai_stream_payload(&event);
-    let stall_secs = std::env::var("IZWI_AUDIO_STREAM_STALL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(30);
-    tokio::time::timeout(Duration::from_secs(stall_secs), event_tx.send(payload))
+    let stall_timeout = crate::env_config::tuning().audio_stream_stall_timeout;
+    tokio::time::timeout(stall_timeout, event_tx.send(payload))
         .await
         .map_err(|_| ())?
         .map_err(|_| ())

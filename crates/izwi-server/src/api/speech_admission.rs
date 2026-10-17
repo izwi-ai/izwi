@@ -59,16 +59,9 @@ pub(super) fn acquire(
 ) -> Result<Permit, axum::http::StatusCode> {
     static ADMISSION: OnceLock<Arc<Admission>> = OnceLock::new();
     let global = global.max(1);
-    let per_tenant = match std::env::var("IZWI_MAX_SPEECH_REQUESTS_PER_TENANT") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|v| *v > 0)
-            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?
-            .min(global),
-        Err(std::env::VarError::NotPresent) => global,
-        Err(_) => return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE),
-    };
+    let per_tenant = crate::env_config::tuning()
+        .max_speech_requests_per_tenant
+        .map_or(global, |limit| limit.min(global));
     // Distinguish namespaces so a principal ID cannot collide with a tenant ID.
     let tenant = super::principal_namespace(principal);
     ADMISSION

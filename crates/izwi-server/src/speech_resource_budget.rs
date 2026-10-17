@@ -80,29 +80,20 @@ impl Drop for ByteReservation {
     }
 }
 
-fn configured_budget(name: &str, default: usize) -> Arc<ByteBudget> {
-    let limit = std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 44)
-        .unwrap_or(default);
-    ByteBudget::new(limit)
-}
-
 pub(crate) fn spool_budget() -> &'static Arc<ByteBudget> {
     static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
-    BUDGET.get_or_init(|| configured_budget("IZWI_TTS_TOTAL_SPOOL_BYTES", 1024 * 1024 * 1024))
+    BUDGET.get_or_init(|| ByteBudget::new(crate::env_config::tuning().tts_total_spool_bytes))
 }
 
 pub(crate) fn upload_budget() -> &'static Arc<ByteBudget> {
     static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
-    BUDGET.get_or_init(|| configured_budget("IZWI_TTS_TOTAL_UPLOAD_BYTES", 256 * 1024 * 1024))
+    BUDGET.get_or_init(|| ByteBudget::new(crate::env_config::tuning().tts_total_upload_bytes))
 }
 
 pub(crate) fn event_budget() -> &'static Arc<ByteBudget> {
     static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
     BUDGET
-        .get_or_init(|| configured_budget("IZWI_AUDIO_STREAM_TOTAL_EVENT_BYTES", 64 * 1024 * 1024))
+        .get_or_init(|| ByteBudget::new(crate::env_config::tuning().audio_stream_total_event_bytes))
 }
 
 #[cfg(test)]

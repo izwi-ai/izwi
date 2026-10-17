@@ -110,8 +110,8 @@ async fn manual_speech_replay_deletion_fences_concurrent_retry() {
 
 #[tokio::test]
 async fn speech_admission_preflight_has_no_reservation_and_rejects_overload() {
-    let (mut store, _root) = build_store().await;
-    store.test_tts_admission_limits = Some((1, 1));
+    let (store, _root) = build_store().await;
+    store.set_tts_admission_limits_for_test(Some((1, 1)));
     store
         .preflight_speech_admission(Some([1; 32]))
         .await
@@ -136,8 +136,8 @@ async fn speech_admission_preflight_has_no_reservation_and_rejects_overload() {
 
 #[tokio::test]
 async fn speech_admission_serializes_concurrent_enqueue_and_terminal_releases_capacity() {
-    let (mut store, _root) = build_store().await;
-    store.test_tts_admission_limits = Some((2, 2));
+    let (store, _root) = build_store().await;
+    store.set_tts_admission_limits_for_test(Some((2, 2)));
     store.connection().await.unwrap();
     let mut tasks = Vec::new();
     for tenant in 0..8 {
@@ -175,8 +175,8 @@ async fn speech_admission_serializes_concurrent_enqueue_and_terminal_releases_ca
 
 #[tokio::test]
 async fn speech_admission_separates_tenants_and_retry_obeys_the_same_capacity() {
-    let (mut store, _root) = build_store().await;
-    store.test_tts_admission_limits = Some((3, 1));
+    let (store, _root) = build_store().await;
+    store.set_tts_admission_limits_for_test(Some((3, 1)));
     let first = store.create_job(admission_job(1)).await.unwrap();
     assert!(store.create_job(admission_job(1)).await.is_err());
     let other = store.create_job(admission_job(2)).await.unwrap();

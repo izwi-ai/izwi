@@ -22,7 +22,7 @@ const fn var(name: &'static str, default: &'static str, description: &'static st
 }
 
 /// The gateway variables read outside clap.
-static GATEWAY_ENV: &[EnvVar] = &[
+pub(crate) static GATEWAY_ENV: &[EnvVar] = &[
     // Public perimeter (gateway_security.rs)
     var(
         "IZWI_GATEWAY_API_KEY_REF",

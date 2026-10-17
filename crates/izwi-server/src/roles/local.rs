@@ -52,7 +52,8 @@ pub(crate) async fn run_local(
     local_security::validate_local_bind(
         &serve_config.host,
         api_key.as_ref(),
-        args.allow_unauthenticated_network,
+        args.allow_unauthenticated_network
+            || crate::env_config::tuning().allow_unauthenticated_network,
     )?;
     if api_key.is_some() {
         info!("Local API key required on /v1 and /internal routes");

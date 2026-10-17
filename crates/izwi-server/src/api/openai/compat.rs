@@ -19,45 +19,14 @@ impl OpenAiCompatibilityProfile {
     }
 }
 
-/// Resolve the OpenAI compatibility profile from environment.
-///
-/// `IZWI_OPENAI_COMPAT_PROFILE` accepted values:
-/// - `strict` (default)
-/// - `relaxed`
+/// The OpenAI compatibility profile, `IZWI_OPENAI_COMPAT_PROFILE`: `strict`
+/// (the default) or `relaxed`.
 pub fn compatibility_profile() -> OpenAiCompatibilityProfile {
-    parse_profile(std::env::var("IZWI_OPENAI_COMPAT_PROFILE").ok().as_deref())
+    crate::env_config::tuning().openai_compat_profile
 }
 
 pub fn strict_guardrail_message(feature: &str) -> String {
     format!(
         "`{feature}` is not supported in strict OpenAI compatibility mode (`IZWI_OPENAI_COMPAT_PROFILE=strict`)."
     )
-}
-
-fn parse_profile(raw: Option<&str>) -> OpenAiCompatibilityProfile {
-    match raw
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("relaxed") => OpenAiCompatibilityProfile::Relaxed,
-        _ => OpenAiCompatibilityProfile::Strict,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_defaults_to_strict() {
-        assert_eq!(parse_profile(None), OpenAiCompatibilityProfile::Strict);
-    }
-
-    #[test]
-    fn profile_accepts_relaxed() {
-        assert_eq!(
-            parse_profile(Some("relaxed")),
-            OpenAiCompatibilityProfile::Relaxed
-        );
-    }
 }

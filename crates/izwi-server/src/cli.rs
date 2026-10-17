@@ -33,8 +33,10 @@ pub(crate) struct ServerArgs {
     pub(crate) host: Option<String>,
 
     /// Serve a non-loopback local-role bind without an API key. Anyone who
-    /// can reach the port can then manage models and read history.
-    #[arg(long, env = "IZWI_ALLOW_UNAUTHENTICATED_NETWORK")]
+    /// can reach the port can then manage models and read history. Also
+    /// IZWI_ALLOW_UNAUTHENTICATED_NETWORK, read with the shared boolean
+    /// vocabulary so a mistyped value is an error rather than `true`.
+    #[arg(long)]
     pub(crate) allow_unauthenticated_network: bool,
 
     /// Port to listen on

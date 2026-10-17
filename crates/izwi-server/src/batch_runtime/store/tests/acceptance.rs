@@ -206,7 +206,7 @@ async fn durable_job_acceptance_rejects_partial_graphs_and_lost_reservations() {
     ));
     assert_eq!(durable_job_row_counts(&store).await, [0, 0, 0, 0, 1]);
 
-    store.test_tts_admission_limits = Some((1, 1));
+    store.set_tts_admission_limits_for_test(Some((1, 1)));
     store
         .accept_durable_job(durable_speech_job_acceptance(&media, None))
         .await

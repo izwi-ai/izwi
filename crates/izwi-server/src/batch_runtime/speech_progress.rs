@@ -64,9 +64,6 @@ pub fn pcm_publication_key(sequence: u64) -> String {
     format!("speech-pcm/{sequence:020}")
 }
 
-const DEFAULT_PCM_PUBLISH_INTERVAL_MS: u64 = 250;
-const DEFAULT_PCM_PUBLISH_MAX_CHUNKS: usize = 8;
-
 /// Merges consecutive PCM chunks of one segment into fewer journal entries.
 /// Each entry costs a provider write (file and directory fsync) and metadata
 /// transactions, so chunks are published at most every `min_interval`, or
@@ -95,17 +92,12 @@ impl PcmPublicationBuffer {
 
     /// `IZWI_TTS_PCM_PUBLISH_INTERVAL_MS` (250; 0 publishes every chunk) and
     /// `IZWI_TTS_PCM_PUBLISH_MAX_CHUNKS` (8).
-    pub fn from_env() -> Self {
-        let interval_ms = std::env::var("IZWI_TTS_PCM_PUBLISH_INTERVAL_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_PCM_PUBLISH_INTERVAL_MS);
-        let max_chunks = std::env::var("IZWI_TTS_PCM_PUBLISH_MAX_CHUNKS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_PCM_PUBLISH_MAX_CHUNKS);
-        Self::new(Duration::from_millis(interval_ms), max_chunks)
+    pub fn configured() -> Self {
+        let tuning = crate::env_config::tuning();
+        Self::new(
+            tuning.tts_pcm_publish_interval,
+            tuning.tts_pcm_publish_max_chunks,
+        )
     }
 
     /// Buffer `chunk`. Returns the waiting batch when `chunk` would push it

@@ -780,7 +780,7 @@ async fn abandoned_cancellation_settles_only_after_owner_stops_renewing_and_hear
     let (mut store, _root) = build_store().await;
     let clock = Arc::new(AtomicI64::new(1_000));
     store.set_test_clock(clock.clone());
-    store.test_tts_admission_limits = Some((1, 1));
+    store.set_tts_admission_limits_for_test(Some((1, 1)));
     let (job, stage) = create_test_job_and_stage(&store, 0, "fake_stage", 2).await;
     record_test_worker_heartbeat(&store, "worker-1").await;
     let claimed = store

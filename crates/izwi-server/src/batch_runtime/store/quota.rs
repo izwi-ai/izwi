@@ -27,22 +27,6 @@ pub(crate) struct QuotaLimits {
     pub(crate) per_tenant: u64,
 }
 
-impl QuotaLimits {
-    pub(super) fn from_env(global_key: &str, global: u64, tenant_key: &str, per_tenant: u64) -> Self {
-        let read = |key: &str, default: u64| {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(default)
-        };
-        Self {
-            global: read(global_key, global),
-            per_tenant: read(tenant_key, per_tenant),
-        }
-    }
-}
-
 /// The scope of the row that counts every tenant; tenant scopes are never
 /// empty.
 pub(super) const GLOBAL_QUOTA_SCOPE: &str = "";

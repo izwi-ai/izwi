@@ -74,10 +74,6 @@ impl From<ProviderWriteRequestV1> for MediaWriteRequest {
     }
 }
 
-pub(super) const DEFAULT_PROVIDER_WRITE_RESERVATIONS: u64 = 65_536;
-
-pub(super) const DEFAULT_PROVIDER_WRITE_RESERVATIONS_PER_TENANT: u64 = 16_384;
-
 pub(super) const MAX_PROVIDER_WRITE_CLEANUP_BATCH: usize = 64;
 
 pub(super) const MAX_PROVIDER_WRITE_NAMESPACE_BYTES: usize = 128;
@@ -1150,11 +1146,6 @@ impl BatchRuntimeStore {
         if let Some(limits) = self.test_provider_write_limits {
             return limits;
         }
-        QuotaLimits::from_env(
-            "IZWI_PROVIDER_WRITE_MAX_RESERVATIONS",
-            DEFAULT_PROVIDER_WRITE_RESERVATIONS,
-            "IZWI_PROVIDER_WRITE_MAX_RESERVATIONS_PER_TENANT",
-            DEFAULT_PROVIDER_WRITE_RESERVATIONS_PER_TENANT,
-        )
+        crate::env_config::tuning().provider_write_limits
     }
 }

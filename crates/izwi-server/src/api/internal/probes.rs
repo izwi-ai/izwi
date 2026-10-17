@@ -13,8 +13,6 @@ use crate::media_ingest::MediaIngestLaneSnapshot;
 use crate::state::{AppState, RealtimeSessionAdmissionSnapshot, RequestAdmissionSnapshot};
 use izwi_core::RuntimeHealth;
 
-const DEFAULT_BATCH_HEARTBEAT_STALE_SECS: u64 = 5;
-
 #[derive(Debug, Serialize)]
 pub struct ProbeCheck {
     pub name: &'static str,
@@ -280,12 +278,7 @@ async fn readiness_response(state: &AppState) -> ReadyResponse {
 }
 
 pub(super) fn resolve_batch_heartbeat_stale_after_ms() -> u64 {
-    std::env::var("IZWI_BATCH_WORKER_HEARTBEAT_STALE_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_BATCH_HEARTBEAT_STALE_SECS)
-        .saturating_mul(1_000)
+    crate::env_config::tuning().batch_worker_heartbeat_stale_ms
 }
 
 fn now_saturating_sub(started_at: u64) -> u64 {

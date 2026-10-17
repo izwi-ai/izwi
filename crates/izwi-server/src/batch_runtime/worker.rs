@@ -1,8 +1,7 @@
 use super::{
     store::{
         validate_stage_output_artifact_ids, BatchRuntimeStore, NewStageOutputArtifact,
-        RegisteredWorkerHeartbeatUpdate, RetentionPolicy, StageClaimFilter,
-        DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
+        RegisteredWorkerHeartbeatUpdate, StageClaimFilter, DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT,
     },
     types::{
         ClaimedStage, QueueClass, RuntimeArtifact, RuntimeJobKind, RuntimeWorkerHeartbeatDetails,
@@ -1193,7 +1192,7 @@ impl BatchWorkerRunner {
         }
         // Expired objects go first, so the jobs that owned them can be swept
         // in the same pass.
-        let retention = RetentionPolicy::from_env();
+        let retention = crate::env_config::tuning().retention;
         if let Some(artifact_store) = self.artifact_store.as_ref() {
             artifact_store
                 .expire_retained(retention, self.config.maintenance_batch_limit)

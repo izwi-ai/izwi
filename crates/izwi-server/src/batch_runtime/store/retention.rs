@@ -3,7 +3,8 @@
 use super::*;
 
 /// How long terminal and dead durable state is kept before the retention
-/// sweeper deletes it. Each value is read from the environment in seconds.
+/// sweeper deletes it. The server's start-up configuration
+/// (`env_config::ServerTuning`) reads each value in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// Terminal jobs, their stages, artifact rows and text inputs
@@ -25,23 +26,9 @@ pub struct RetentionPolicy {
 }
 
 impl RetentionPolicy {
-    pub fn from_env() -> Self {
-        let read = |key: &str, default_secs: u64| {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(default_secs)
-                .saturating_mul(1_000)
-        };
-        Self {
-            terminal_job_ms: read("IZWI_JOB_RETENTION_SECONDS", 30 * 24 * 60 * 60),
-            ephemeral_artifact_ms: read("IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS", 60 * 60),
-            worker_heartbeat_ms: read("IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS", 24 * 60 * 60),
-            media_tombstone_ms: read("IZWI_MEDIA_TOMBSTONE_RETENTION_SECONDS", 24 * 60 * 60),
-            legacy_idempotency_ms: MAX_DURABLE_IDEMPOTENCY_RETENTION_MS,
-        }
-    }
+    /// The legacy idempotency table's rows live as long as the longest
+    /// durable idempotency record could.
+    pub(crate) const LEGACY_IDEMPOTENCY_MS: u64 = MAX_DURABLE_IDEMPOTENCY_RETENTION_MS;
 }
 
 const EXPIRED_MEDIA_COLUMNS: &str = "SELECT DISTINCT m.id, m.created_at, m.updated_at, m.asset_kind, m.storage_namespace, m.storage_key, m.content_type, m.filename, m.size_bytes, m.sha256, m.duration_secs, m.sample_rate_hz, m.channel_count, m.peak_amplitude, m.rms_amplitude, m.source_asset_id, m.canonical_profile_version, m.scan_status, m.retention_policy, m.deleted_at, m.metadata_json";

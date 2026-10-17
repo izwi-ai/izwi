@@ -15,14 +15,7 @@ pub(crate) struct DurableSpeechProgress {
 }
 
 fn opaque_final_audio_enabled() -> bool {
-    matches!(
-        std::env::var("IZWI_TTS_OPAQUE_FINAL_WAV_ENABLED")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    crate::env_config::tuning().tts_opaque_final_wav_enabled
 }
 
 impl DurableSpeechProgress {
@@ -38,11 +31,7 @@ impl DurableSpeechProgress {
             None => SpeechCheckpoint::new(
                 identity,
                 u32::try_from(total)?,
-                std::env::var("IZWI_TTS_MAX_JOURNAL_BYTES")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(8 * 1024 * 1024 * 1024),
+                crate::env_config::tuning().tts_max_journal_bytes,
             )?,
         };
         checkpoint.save(attempt).await?;
@@ -51,7 +40,7 @@ impl DurableSpeechProgress {
             attempt: attempt.clone(),
             artifact_tenant: crate::artifact_store::ArtifactTenant::from_scheduling_key(tenant_key),
             checkpoint,
-            publications: PcmPublicationBuffer::from_env(),
+            publications: PcmPublicationBuffer::configured(),
         })
     }
     pub(crate) fn artifact_fingerprint(&self) -> Option<&str> {
@@ -284,10 +273,8 @@ pub(super) async fn synthesize_fish_record(
                 .checkpoint
                 .sample_rate
                 .context("Speech completed without a sample rate")?;
-            let limit = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
+            let limit = crate::env_config::tuning()
+                .tts_stream_max_pcm_bytes
                 .unwrap_or(u32::MAX as usize - 44)
                 .min(u32::MAX as usize - 44);
             spool = Some(SpeechWavSpool::new_reserved(sample_rate, limit, exact_pcm_bytes).await?);
@@ -481,11 +468,7 @@ pub(super) async fn synthesize_fish_record(
         .context("Speech attempt lost ownership before completion")?;
         Ok::<_, anyhow::Error>((record, output_artifact))
     };
-    let max_secs = std::env::var("IZWI_TTS_MAX_JOB_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(24 * 3600);
+    let max_secs = crate::env_config::tuning().tts_max_job_seconds;
     let elapsed_secs = claimed
         .map(|claimed| {
             let now_ms = std::time::SystemTime::now()
@@ -528,10 +511,8 @@ async fn append_samples(
     rate: u32,
 ) -> anyhow::Result<()> {
     if spool.is_none() {
-        let limit = std::env::var("IZWI_TTS_STREAM_MAX_PCM_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
+        let limit = crate::env_config::tuning()
+            .tts_stream_max_pcm_bytes
             .unwrap_or(u32::MAX as usize - 44)
             .min(u32::MAX as usize - 44);
         *spool = Some(SpeechWavSpool::new(rate, limit)?);
@@ -798,11 +779,7 @@ async fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
 }
 
 pub(super) async fn cleanup_expired_replay(state: &AppState) -> anyhow::Result<()> {
-    let retention = std::env::var("IZWI_TTS_REPLAY_RETENTION_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(86400);
+    let retention = crate::env_config::tuning().tts_replay_retention.as_secs();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;

@@ -24,6 +24,7 @@ mod cli;
 mod db;
 mod diarization_store;
 mod entity;
+mod env_config;
 mod error;
 mod gateway;
 mod gateway_fleet;
@@ -94,6 +95,7 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 
 async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     validate_role_topology(args.role, args.gateway_topology)?;
+    env_config::init()?;
     let serve_config = resolve_serve_runtime_config(&args)?;
     match args.role {
         ServerRole::Gateway => run_gateway(args, serve_config, enterprise_hooks).await,

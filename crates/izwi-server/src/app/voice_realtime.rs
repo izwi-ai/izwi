@@ -89,9 +89,6 @@ const DEFAULT_BARGE_IN_MIN_SPEECH_MS: u32 = 300;
 /// assumes the client paused without `input_stream_stop`. Silence is measured
 /// in audio time, so this only has to cover network stalls and jitter.
 const CLIENT_PAUSE_STALL_ALLOWANCE_MS: u64 = 1_500;
-const WS_OUTBOUND_QUEUE_CAPACITY: usize = 256;
-const WS_OUTBOUND_AUDIO_MAX_BYTES: usize = 4 * 1024 * 1024;
-const WS_OUTBOUND_AUDIO_MAX_MS: u64 = 5_000;
 const TURN_CANCELLATION_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_ACTOR_TICK: Duration = Duration::from_millis(100);
 /// Assistant audio sent this long after the audio already sent had finished
@@ -388,30 +385,12 @@ impl OutboundTx {
 }
 
 fn voice_outbound_limits() -> OutboundLimits {
+    let tuning = crate::env_config::tuning();
     OutboundLimits {
-        max_items: env_usize("IZWI_VOICE_WS_OUTBOUND_ITEMS", WS_OUTBOUND_QUEUE_CAPACITY),
-        max_audio_bytes: env_usize(
-            "IZWI_VOICE_WS_OUTBOUND_AUDIO_BYTES",
-            WS_OUTBOUND_AUDIO_MAX_BYTES,
-        ),
-        max_audio_ms: env_u64("IZWI_VOICE_WS_OUTBOUND_AUDIO_MS", WS_OUTBOUND_AUDIO_MAX_MS),
+        max_items: tuning.voice_ws_outbound_items,
+        max_audio_bytes: tuning.voice_ws_outbound_audio_bytes,
+        max_audio_ms: tuning.voice_ws_outbound_audio_ms,
     }
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }
 
 #[derive(Debug, Deserialize)]

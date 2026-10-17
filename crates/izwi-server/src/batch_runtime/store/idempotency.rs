@@ -59,10 +59,6 @@ pub const MAX_DURABLE_IDEMPOTENCY_RESERVATION_TTL_MS: u64 = 10 * 60 * 1_000;
 
 pub const MAX_DURABLE_IDEMPOTENCY_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
-pub(super) const DEFAULT_DURABLE_IDEMPOTENCY_RECORDS: u64 = 1_048_576;
-
-pub(super) const DEFAULT_DURABLE_IDEMPOTENCY_RECORDS_PER_TENANT: u64 = 65_536;
-
 pub(super) const DEFAULT_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 64;
 
 pub(super) const MAX_DURABLE_IDEMPOTENCY_PRUNE_LIMIT: usize = 512;
@@ -472,12 +468,7 @@ pub(super) async fn prune_expired_durable_idempotency_with<C: ConnectionTrait>(
 
 impl BatchRuntimeStore {
     pub(super) fn durable_idempotency_limits(&self) -> QuotaLimits {
-        QuotaLimits::from_env(
-            "IZWI_IDEMPOTENCY_MAX_RECORDS",
-            DEFAULT_DURABLE_IDEMPOTENCY_RECORDS,
-            "IZWI_IDEMPOTENCY_MAX_RECORDS_PER_TENANT",
-            DEFAULT_DURABLE_IDEMPOTENCY_RECORDS_PER_TENANT,
-        )
+        crate::env_config::tuning().idempotency_limits
     }
 
     /// Reserve one tenant-scoped durable create operation.

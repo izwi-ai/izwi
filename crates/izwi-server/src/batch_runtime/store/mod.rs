@@ -76,7 +76,7 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_clock: Option<Arc<AtomicI64>>,
     #[cfg(test)]
-    test_tts_admission_limits: Option<(usize, usize)>,
+    test_tts_admission_limits: Arc<std::sync::RwLock<Option<(usize, usize)>>>,
     #[cfg(test)]
     test_artifact_cleanup_limits: Option<QuotaLimits>,
     #[cfg(test)]
@@ -152,7 +152,7 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_clock: None,
             #[cfg(test)]
-            test_tts_admission_limits: None,
+            test_tts_admission_limits: Arc::default(),
             #[cfg(test)]
             test_artifact_cleanup_limits: None,
             #[cfg(test)]
@@ -169,6 +169,16 @@ impl BatchRuntimeStore {
     #[cfg(test)]
     pub(crate) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
         self.test_clock = Some(clock);
+    }
+
+    /// TTS admission limits in place of the configured ones, through a
+    /// shared store (the router tests hold it inside the app state).
+    #[cfg(test)]
+    pub(crate) fn set_tts_admission_limits_for_test(&self, limits: Option<(usize, usize)>) {
+        *self
+            .test_tts_admission_limits
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = limits;
     }
 
     #[cfg(test)]
