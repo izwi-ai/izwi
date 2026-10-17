@@ -11,6 +11,7 @@
 
 use super::golden_tests::GoldenArena;
 use super::*;
+use crate::models::architectures::qwen38::fast_path::counters_lock;
 use crate::models::architectures::qwen38::mtp::tests::{write_fp8_geometry_checkpoint, TestDir};
 use crate::models::architectures::qwen38::native::{pinned_27b_config, Qwen38NativeCheckpoint};
 use crate::models::architectures::qwen38::residency::{
@@ -38,6 +39,9 @@ fn fixture() -> (TestDir, Qwen38NativeCheckpoint) {
 /// The FP8-geometry trunk (3 DeltaNet layers, then attention) under native
 /// block FP8 with F16 activations, every fused fast path resolved against
 /// the CPU references.
+///
+/// Its fused paths count in the process-wide fast-path counters, so tests
+/// hold `counters_lock` while they run it.
 fn fused_model(checkpoint: &Qwen38NativeCheckpoint) -> Qwen38TextModel {
     let _forced = force_cpu_native_fp8_for_tests();
     let performance = PerformanceConfig::default();
@@ -126,6 +130,7 @@ fn decode_rows(
 /// must reproduce the standard batched decode exactly, step after step.
 #[test]
 fn segmented_decode_matches_the_standard_batched_path() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let standard = fused_model(&checkpoint);
@@ -175,6 +180,7 @@ fn segmented_decode_matches_the_standard_batched_path() {
 /// segments need: each refusal names its reason.
 #[test]
 fn graph_decode_resolution_reports_why_it_stays_off() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let mut model = fused_model(&checkpoint);
@@ -255,6 +261,7 @@ fn graph_decode_resolution_reports_why_it_stays_off() {
 /// cannot nest inside another.
 #[test]
 fn resolved_graph_decode_retires_the_tensor_islands() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let mut model = fused_model(&checkpoint);
@@ -276,6 +283,7 @@ fn resolved_graph_decode_retires_the_tensor_islands() {
 /// pools instead of the region caches.
 #[test]
 fn graph_decode_plan_and_reservation_follow_the_switches() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let text = pinned_27b_config().text;
     assert_eq!(graph_decode_slab_bytes(&text).unwrap(), 156_893_184);
@@ -390,6 +398,7 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
 /// captured.)
 #[test]
 fn whole_step_decode_matches_the_standard_batched_path() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let standard = fused_model(&checkpoint);
@@ -425,6 +434,7 @@ fn whole_step_decode_matches_the_standard_batched_path() {
 /// still resolve and take every step.
 #[test]
 fn whole_step_plan_reports_why_it_stays_off() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let mut model = fused_model(&checkpoint);
@@ -457,6 +467,7 @@ fn cuda_graph_decode_reaches_replay_and_tracks_the_eager_decode() {
     let Some(device) = crate::kernels::cuda::cuda_test_device() else {
         return;
     };
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::BF16;
@@ -530,6 +541,7 @@ fn cuda_whole_step_graph_reaches_replay_and_tracks_the_eager_decode() {
     let Some(device) = crate::kernels::cuda::cuda_test_device() else {
         return;
     };
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::BF16;
@@ -601,6 +613,7 @@ fn cuda_whole_step_graph_recaptures_after_kv_growth() {
     let Some(device) = crate::kernels::cuda::cuda_test_device() else {
         return;
     };
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let target = ProjectionMaterialization::BF16;
@@ -733,6 +746,7 @@ fn cuda_whole_step_graph_recaptures_after_kv_growth() {
 /// its position matches too.
 #[test]
 fn queued_steps_with_device_tokens_match_the_standard_decode() {
+    let _counters = counters_lock();
     let _env = env_lock();
     let (_dir, checkpoint) = fixture();
     let standard = fused_model(&checkpoint);

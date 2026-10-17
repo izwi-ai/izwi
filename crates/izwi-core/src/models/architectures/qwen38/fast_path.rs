@@ -247,8 +247,10 @@ pub(crate) fn compare_values(
     Ok(())
 }
 
-/// Serializes the tests that execute fused paths and read the process-wide
+/// Serializes the tests that execute fused paths or read the process-wide
 /// fast-path counters, so a counter delta belongs to the test observing it.
+/// Every test that runs a model with fast paths resolved holds it, before
+/// `env_test_lock`.
 #[cfg(test)]
 pub(crate) fn counters_lock() -> std::sync::MutexGuard<'static, ()> {
     static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
