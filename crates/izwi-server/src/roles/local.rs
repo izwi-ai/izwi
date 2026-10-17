@@ -72,13 +72,12 @@ pub(crate) async fn run_local(
         build_git_sha = option_env!("IZWI_BUILD_GIT_SHA").unwrap_or("unknown"),
         effective_runtime_config, "Resolved effective server runtime configuration"
     );
-    let config = serve_config.engine_config();
+    let mut config = serve_config.engine_config();
     info!("Models directory: {:?}", config.models_dir);
-
-    // Create runtime service
-    let runtime = RuntimeService::new(config)?;
+    // The Granite diagnostics flags reach the engine through its config; the
+    // engine falls back to IZWI_GRANITE_DECODE_PROFILE / _SPEECH_DTYPE.
     if args.granite_decode_profile {
-        std::env::set_var("IZWI_GRANITE_DECODE_PROFILE", "1");
+        config.granite_speech.decode_profile = true;
         info!("Granite ASR decode profiling enabled");
     }
     if let Some(dtype) = args
@@ -87,9 +86,12 @@ pub(crate) async fn run_local(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        std::env::set_var("IZWI_GRANITE_SPEECH_DTYPE", dtype);
+        config.granite_speech.speech_dtype = Some(dtype.to_string());
         info!(dtype, "Granite ASR dtype override enabled");
     }
+
+    // Create runtime service
+    let runtime = RuntimeService::new(config)?;
     let persistence = PersistenceContext::resolve(&enterprise_hooks).await?;
     info!(
         database_backend = ?persistence.database.backend(),

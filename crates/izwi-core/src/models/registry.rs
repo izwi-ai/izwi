@@ -131,7 +131,14 @@ use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage};
 use crate::runtime::{DiarizationConfig, DiarizationResult};
 
-type AsrLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAsrModel>;
+/// ASR loaders also take the engine's Granite overrides (only Granite reads
+/// them).
+type AsrLoaderFn = fn(
+    &Path,
+    ModelVariant,
+    DeviceProfile,
+    &crate::config::GraniteSpeechOptions,
+) -> Result<NativeAsrModel>;
 type AudioChatLoaderFn = fn(&Path, ModelVariant, DeviceProfile) -> Result<NativeAudioChatModel>;
 type ChatLoaderFn = fn(
     &Path,
@@ -222,6 +229,7 @@ fn load_qwen_forced_aligner_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Qwen3(Qwen3AsrModel::load(
         model_dir, variant, device,
@@ -232,6 +240,7 @@ fn load_qwen_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Qwen3(Qwen3AsrModel::load(
         model_dir, variant, device,
@@ -242,6 +251,7 @@ fn load_parakeet_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Parakeet(ParakeetAsrModel::load(
         model_dir, variant, device,
@@ -252,6 +262,7 @@ fn load_nemotron_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::Nemotron(NemotronAsrModel::load(
         model_dir, variant, device,
@@ -262,6 +273,7 @@ fn load_whisper_asr_model(
     model_dir: &Path,
     _variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::WhisperTurbo(WhisperTurboAsrModel::load(
         model_dir, device,
@@ -272,6 +284,7 @@ fn load_vibevoice_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    _granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::VibeVoice(VibeVoiceAsrModel::load(
         model_dir, variant, device,
@@ -282,9 +295,10 @@ fn load_granite_speech_asr_model(
     model_dir: &Path,
     variant: ModelVariant,
     device: DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<NativeAsrModel> {
     Ok(NativeAsrModel::GraniteSpeech(GraniteSpeechAsrModel::load(
-        model_dir, variant, device,
+        model_dir, variant, device, granite,
     )?))
 }
 
@@ -6215,6 +6229,7 @@ impl NativeChatModel {
 pub struct ModelRegistry {
     performance: crate::performance::PerformanceConfig,
     prefix_reuse: PrefixReuseMode,
+    granite_speech: crate::config::GraniteSpeechOptions,
     models_dir: PathBuf,
     device: DeviceProfile,
     asr_models: Arc<RwLock<HashMap<ModelVariant, Arc<TrackedModelEntry<NativeAsrModel>>>>>,
@@ -6510,6 +6525,7 @@ impl ModelRegistry {
         Self {
             performance: performance.snapshot_env(),
             prefix_reuse: PrefixReuseMode::default(),
+            granite_speech: crate::config::GraniteSpeechOptions::default().with_env_fallback(),
             models_dir,
             device,
             asr_models: Arc::new(RwLock::new(HashMap::new())),
@@ -6545,6 +6561,16 @@ impl ModelRegistry {
     /// The prefix-reuse decision mode this registry's loads apply.
     pub(crate) fn prefix_reuse_mode(&self) -> PrefixReuseMode {
         self.prefix_reuse
+    }
+
+    /// Pin the Granite speech overrides (already resolved against the
+    /// environment) for every Granite model this registry loads.
+    pub fn with_granite_speech(
+        mut self,
+        granite_speech: crate::config::GraniteSpeechOptions,
+    ) -> Self {
+        self.granite_speech = granite_speech;
+        self
     }
 
     /// Record the page size and storage dtype of every paged domain a loaded
@@ -6968,9 +6994,10 @@ impl ModelRegistry {
                 let model_dir = model_dir.to_path_buf();
                 let device = self.device.clone();
                 let loader = registration.loader;
+                let granite_speech = self.granite_speech.clone();
                 move || async move {
                     DeviceThread::for_device(&device.device)?.submit(move || {
-                        let model = loader(&model_dir, variant, device)?;
+                        let model = loader(&model_dir, variant, device, &granite_speech)?;
                         Ok::<NativeAsrModel, Error>(model)
                     })
                     .await

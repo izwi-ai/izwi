@@ -181,6 +181,8 @@ pub struct GraniteSpeechRuntime {
     encoder: GraniteSpeechEncoder,
     projector: GraniteSpeechProjector,
     text_model: GraniteLanguageModel,
+    /// Per-invocation decode-profile diagnostics (resolved engine config).
+    decode_profile: bool,
 }
 
 struct GraniteSpeechDecodeProfiler {
@@ -188,8 +190,8 @@ struct GraniteSpeechDecodeProfiler {
 }
 
 impl GraniteSpeechDecodeProfiler {
-    fn from_env(layer_count: usize) -> Option<Self> {
-        granite_decode_profile_enabled().then(|| Self {
+    fn when(enabled: bool, layer_count: usize) -> Option<Self> {
+        enabled.then(|| Self {
             profile: GraniteSpeechDecodeProfile {
                 timing_kind: "host_wall_clock_no_device_sync",
                 steps: 0,
@@ -247,17 +249,6 @@ impl GraniteSpeechDecodeProfiler {
     fn finish(self) -> GraniteSpeechDecodeProfile {
         self.profile
     }
-}
-
-/// Read at the first decode, not at static init, so a binary can still set it
-/// before the engine runs.
-fn granite_decode_profile_enabled() -> bool {
-    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
-        crate::env::flag("IZWI_GRANITE_DECODE_PROFILE")
-            .or_else(|| crate::env::flag("IZWI_GRANITE_DECODE_PROFILING"))
-            .unwrap_or(false)
-    });
-    ENABLED.get()
 }
 
 fn granite_projection_fusion_enabled(device: &Device) -> bool {
@@ -437,15 +428,12 @@ fn granite_chunked_stop_check_interval(max_new_tokens: usize) -> usize {
 }
 
 /// Where the selective F16 LM switches default on: Metal, unless F32 is
-/// pinned by `IZWI_GRANITE_SPEECH_DTYPE=f32` or (with no family override)
-/// `IZWI_METAL_DTYPE=f32`, the escape hatches from every lower-precision
+/// pinned by the Granite speech dtype override (`IZWI_GRANITE_SPEECH_DTYPE`,
+/// resolved into the engine config) or, with no family override, by
+/// `IZWI_METAL_DTYPE=f32`: the escape hatches from every lower-precision
 /// Metal policy. Each `IZWI_GRANITE_F16_*` switch still overrides.
-fn granite_selective_f16_default(device: &Device) -> bool {
-    device.is_metal()
-        && !granite_f32_pinned(
-            std::env::var("IZWI_GRANITE_SPEECH_DTYPE").ok().as_deref(),
-            MetalDTypeOverride::from_env(),
-        )
+fn granite_selective_f16_default(device: &Device, speech_dtype: Option<&str>) -> bool {
+    device.is_metal() && !granite_f32_pinned(speech_dtype, MetalDTypeOverride::from_env())
 }
 
 fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool {
@@ -455,13 +443,9 @@ fn granite_f32_pinned(family: Option<&str>, global: MetalDTypeOverride) -> bool 
     }
 }
 
-fn granite_f16_lm_head_enabled(device: &Device, dtype: DType) -> bool {
+fn granite_f16_lm_head_enabled(selective_default: bool, dtype: DType) -> bool {
     let override_enabled = crate::env::flag("IZWI_GRANITE_F16_LM_HEAD");
-    granite_f16_lm_head_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+    granite_f16_lm_head_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_lm_head_policy(
@@ -507,27 +491,19 @@ fn granite_cached_linear_t_policy(is_metal: bool, override_enabled: Option<bool>
     override_enabled.unwrap_or(is_metal)
 }
 
-fn granite_f16_qkv_enabled(device: &Device, dtype: DType) -> bool {
+fn granite_f16_qkv_enabled(selective_default: bool, dtype: DType) -> bool {
     let override_enabled = crate::env::flag("IZWI_GRANITE_F16_QKV");
-    granite_f16_qkv_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+    granite_f16_qkv_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_qkv_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_attention_core_enabled(device: &Device, dtype: DType) -> bool {
+fn granite_f16_attention_core_enabled(selective_default: bool, dtype: DType) -> bool {
     let override_enabled = crate::env::flag("IZWI_GRANITE_F16_ATTENTION_CORE")
         .or_else(|| crate::env::flag("IZWI_GRANITE_F16_ATTN_CORE"));
-    granite_f16_attention_core_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+    granite_f16_attention_core_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_attention_core_policy(
@@ -538,27 +514,19 @@ fn granite_f16_attention_core_policy(
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_mlp_enabled(device: &Device, dtype: DType) -> bool {
+fn granite_f16_mlp_enabled(selective_default: bool, dtype: DType) -> bool {
     let override_enabled = crate::env::flag("IZWI_GRANITE_F16_MLP");
-    granite_f16_mlp_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+    granite_f16_mlp_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_mlp_policy(is_metal: bool, dtype: DType, override_enabled: Option<bool>) -> bool {
     override_enabled.unwrap_or(is_metal && dtype == DType::F32)
 }
 
-fn granite_f16_attention_output_enabled(device: &Device, dtype: DType) -> bool {
+fn granite_f16_attention_output_enabled(selective_default: bool, dtype: DType) -> bool {
     let override_enabled = crate::env::flag("IZWI_GRANITE_F16_ATTENTION_OUTPUT")
         .or_else(|| crate::env::flag("IZWI_GRANITE_F16_O_PROJ"));
-    granite_f16_attention_output_policy(
-        granite_selective_f16_default(device),
-        dtype,
-        override_enabled,
-    )
+    granite_f16_attention_output_policy(selective_default, dtype, override_enabled)
 }
 
 fn granite_f16_attention_output_policy(
@@ -593,15 +561,18 @@ impl GraniteTextExecutionPlan {
         self != Self::BASE_DTYPE
     }
 
-    fn for_device(device: &Device, dtype: DType) -> Self {
-        let selective_f16_qkv = granite_f16_qkv_enabled(device, dtype);
+    /// `speech_dtype` is the resolved Granite dtype override: f32 pins every
+    /// projection to the base dtype on Metal.
+    fn for_device(device: &Device, dtype: DType, speech_dtype: Option<&str>) -> Self {
+        let selective = granite_selective_f16_default(device, speech_dtype);
+        let selective_f16_qkv = granite_f16_qkv_enabled(selective, dtype);
         Self {
-            selective_f16_lm_head: granite_f16_lm_head_enabled(device, dtype),
+            selective_f16_lm_head: granite_f16_lm_head_enabled(selective, dtype),
             selective_f16_qkv,
             f16_attention_core: selective_f16_qkv
-                && granite_f16_attention_core_enabled(device, dtype),
-            selective_f16_mlp: granite_f16_mlp_enabled(device, dtype),
-            selective_f16_attention_output: granite_f16_attention_output_enabled(device, dtype),
+                && granite_f16_attention_core_enabled(selective, dtype),
+            selective_f16_mlp: granite_f16_mlp_enabled(selective, dtype),
+            selective_f16_attention_output: granite_f16_attention_output_enabled(selective, dtype),
         }
     }
 }
@@ -659,8 +630,9 @@ pub(crate) struct GraniteLoadRepresentation {
 pub(crate) fn granite_load_representation(
     device: &Device,
     dtype: DType,
+    speech_dtype: Option<&str>,
 ) -> GraniteLoadRepresentation {
-    let plan = GraniteTextExecutionPlan::for_device(device, dtype);
+    let plan = GraniteTextExecutionPlan::for_device(device, dtype, speech_dtype);
     GraniteLoadRepresentation {
         f16_lm_head: plan.selective_f16_lm_head,
         f16_qkv: plan.selective_f16_qkv,
@@ -712,6 +684,7 @@ impl GraniteSpeechRuntime {
         device: &DeviceProfile,
         dtype: DType,
         encoder_precision: &DTypeSelection,
+        granite: &crate::config::GraniteSpeechOptions,
     ) -> Result<Self> {
         // Reject malformed text geometry before mapping a potentially large
         // checkpoint and before any head-dimension division occurs.
@@ -766,7 +739,11 @@ impl GraniteSpeechRuntime {
         let projector_elapsed = projector_started.elapsed();
 
         let language_model_started = Instant::now();
-        let lm_plan = GraniteTextExecutionPlan::for_device(&device.device, dtype);
+        let lm_plan = GraniteTextExecutionPlan::for_device(
+            &device.device,
+            dtype,
+            granite.speech_dtype.as_deref(),
+        );
         let lm_selection = granite_lm_precision(dtype, lm_plan, device);
         let load_lm = |loaded: DType| {
             if loaded == lm_selection.dtype {
@@ -841,6 +818,7 @@ impl GraniteSpeechRuntime {
             encoder,
             projector,
             text_model,
+            decode_profile: granite.decode_profile,
         })
     }
 
@@ -1128,7 +1106,8 @@ impl GraniteSpeechRuntime {
         let dense_decode_cache_enabled = false;
         let dense_head_decode_enabled = false;
         let cuda_device_argmax = self.device.is_cuda();
-        let mut profiler = GraniteSpeechDecodeProfiler::from_env(self.text_model.num_layers());
+        let mut profiler =
+            GraniteSpeechDecodeProfiler::when(self.decode_profile, self.text_model.num_layers());
         let profiling = profiler.is_some();
         let prefill_start = Instant::now();
         let rope_cache = self
@@ -2593,11 +2572,6 @@ struct GraniteLanguageModel {
 }
 
 impl GraniteLanguageModel {
-    fn load(config: &GraniteTextConfig, tie_word_embeddings: bool, vb: VarBuilder) -> Result<Self> {
-        let execution_plan = GraniteTextExecutionPlan::for_device(vb.device(), vb.dtype());
-        Self::load_with_execution_plan(config, tie_word_embeddings, vb, execution_plan)
-    }
-
     fn load_with_execution_plan(
         config: &GraniteTextConfig,
         tie_word_embeddings: bool,
@@ -5966,6 +5940,6 @@ mod tests {
         assert!(!granite_f32_pinned(Some("f16"), F32));
         assert!(granite_f32_pinned(Some("f32"), F16));
         assert!(granite_f32_pinned(Some(" "), F32));
-        assert!(!granite_selective_f16_default(&Device::Cpu));
+        assert!(!granite_selective_f16_default(&Device::Cpu, None));
     }
 }

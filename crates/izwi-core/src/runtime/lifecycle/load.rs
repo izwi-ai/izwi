@@ -649,6 +649,7 @@ fn checkpoint_resource_plan(
     variant: ModelVariant,
     model_path: &Path,
     device: &crate::backends::DeviceProfile,
+    granite: &crate::config::GraniteSpeechOptions,
 ) -> Result<Option<ModelResourcePlan>> {
     if variant == ModelVariant::FishAudioS2Pro {
         let memory = crate::models::architectures::fish_s2::weights::fish_s2_model_memory(
@@ -658,7 +659,7 @@ fn checkpoint_resource_plan(
     }
     // ASR, TTS and LFM2.5 chat price what their loader allocates on every
     // backend; the catalog figure stays a display value for them.
-    if let Some(plan) = asr_memory::resource_plan(variant, model_path, device)? {
+    if let Some(plan) = asr_memory::resource_plan(variant, model_path, device, granite)? {
         return Ok(Some(plan));
     }
     if variant.family() == crate::catalog::ModelFamily::Lfm2Chat {
@@ -677,16 +678,20 @@ fn checkpoint_resource_plan(
 /// these checkpoints use the per-backend representation estimate that load
 /// admission prices instead. A planned checkpoint (`checkpoint`: its path and
 /// the load device; Fish, ASR and TTS) is judged by the plan first admission
-/// priced ([`checkpoint_resource_plan`]).
+/// priced ([`checkpoint_resource_plan`], with the engine's Granite overrides).
 fn retry_load_peak_bytes(
     variant: ModelVariant,
     backend: BackendKind,
     performance: &crate::performance::PerformanceConfig,
-    checkpoint: Option<(&Path, &crate::backends::DeviceProfile)>,
+    checkpoint: Option<(
+        &Path,
+        &crate::backends::DeviceProfile,
+        &crate::config::GraniteSpeechOptions,
+    )>,
 ) -> u64 {
     let catalog = || model_memory_estimate(variant).load_peak_bytes;
-    if let Some((model_path, device)) = checkpoint {
-        if let Ok(Some(plan)) = checkpoint_resource_plan(variant, model_path, device) {
+    if let Some((model_path, device, granite)) = checkpoint {
+        if let Ok(Some(plan)) = checkpoint_resource_plan(variant, model_path, device, granite) {
             if let ResourceAmount::Known(bytes) =
                 load_domain_bytes(plan.load_authorization, backend)
             {
@@ -1814,9 +1819,12 @@ impl ModelLifecycleController {
             }
             return qwen36moe_memory::resource_plan(backend, &self.config.performance);
         }
-        if let Some(plan) =
-            checkpoint_resource_plan(variant, model_path, &self.backend_router.context().device)?
-        {
+        if let Some(plan) = checkpoint_resource_plan(
+            variant,
+            model_path,
+            &self.backend_router.context().device,
+            &self.config.granite_speech,
+        )? {
             return Ok(plan);
         }
         let estimate = if backend == BackendKind::Cuda {
@@ -2240,7 +2248,9 @@ impl ModelLifecycleController {
             variant,
             backend,
             &self.config.performance,
-            model_path.as_deref().map(|path| (path, &context.device)),
+            model_path
+                .as_deref()
+                .map(|path| (path, &context.device, &self.config.granite_speech)),
         );
         self.coordinator
             .resource_authority()

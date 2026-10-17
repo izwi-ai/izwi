@@ -655,6 +655,43 @@ pub struct RealtimeAsrSessionConfig {
     pub idle_timeout_secs: Option<u64>,
 }
 
+/// Granite speech ASR overrides. Each unset field falls back to its
+/// environment variable when the runtime is built
+/// ([`GraniteSpeechOptions::with_env_fallback`]); model loads and admission
+/// read the resolved value, never the environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraniteSpeechOptions {
+    /// Per-invocation decode-profile diagnostics
+    /// (`IZWI_GRANITE_DECODE_PROFILE`, alias `IZWI_GRANITE_DECODE_PROFILING`).
+    #[serde(default)]
+    pub decode_profile: bool,
+    /// Weight dtype override after backend selection: `f32`, `f16` or
+    /// `bf16` (`IZWI_GRANITE_SPEECH_DTYPE`).
+    #[serde(default)]
+    pub speech_dtype: Option<String>,
+}
+
+impl GraniteSpeechOptions {
+    /// These options, with the environment filling what is unset: a profile
+    /// asked for by either side is on, and an explicit dtype wins over the
+    /// variable.
+    pub fn with_env_fallback(&self) -> Self {
+        Self {
+            decode_profile: self.decode_profile
+                || crate::env::flag("IZWI_GRANITE_DECODE_PROFILE")
+                    .or_else(|| crate::env::flag("IZWI_GRANITE_DECODE_PROFILING"))
+                    .unwrap_or(false),
+            speech_dtype: self
+                .speech_dtype
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .or_else(|| crate::env::value("IZWI_GRANITE_SPEECH_DTYPE")),
+        }
+    }
+}
+
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -714,6 +751,11 @@ pub struct EngineConfig {
     /// Realtime ASR session quota, lifetime and idle timeout.
     #[serde(default)]
     pub asr_realtime: RealtimeAsrSessionConfig,
+
+    /// Granite ASR diagnostics and dtype overrides (the server's
+    /// `--granite-decode-profile` and `--granite-speech-dtype`).
+    #[serde(default)]
+    pub granite_speech: GraniteSpeechOptions,
 
     /// Memory kept outside fitted model/state plans for allocator and backend
     /// command-buffer overhead.
@@ -822,6 +864,7 @@ impl Default for EngineConfig {
             max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
             asr_realtime: RealtimeAsrSessionConfig::default(),
+            granite_speech: GraniteSpeechOptions::default(),
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),

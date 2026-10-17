@@ -3585,6 +3585,7 @@ impl RuntimeService {
             config.managed_prefix_cache_salt = None;
         }
         configure_runtime_threading(config.num_threads.max(1));
+        config.granite_speech = config.granite_speech.with_env_fallback();
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
         let device = backend_context.device.clone();
@@ -3619,7 +3620,8 @@ impl RuntimeService {
                 device.clone(),
                 config.performance.clone(),
             )
-            .with_prefix_reuse_mode(prefix_reuse_mode),
+            .with_prefix_reuse_mode(prefix_reuse_mode)
+            .with_granite_speech(config.granite_speech.clone()),
         );
 
         let mut core_config = EngineCoreConfig::for_qwen3_tts();

@@ -472,14 +472,14 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "IZWI_GRANITE_DECODE_PROFILE",
         Flag,
         "false",
-        Once,
-        "Enables Granite per-step and per-layer decode profiling; IZWI_GRANITE_DECODE_PROFILING is an alias.",
+        Startup,
+        "Enables Granite per-step and per-layer decode profiling (or the server's --granite-decode-profile); IZWI_GRANITE_DECODE_PROFILING is an alias.",
     ),
     CoreEnvVar::new(
         "IZWI_GRANITE_DECODE_PROFILING",
         Flag,
         "false",
-        Once,
+        Startup,
         "Alias of IZWI_GRANITE_DECODE_PROFILE, consulted only when that variable is unset.",
     ),
     CoreEnvVar::new(
@@ -661,8 +661,8 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "IZWI_GRANITE_SPEECH_DTYPE",
         Choice,
         "auto (family/backend default)",
-        Load,
-        "Forces the Granite Speech dtype (f32, f16, bf16 and aliases); f32 also disables Metal F16 encoder and selective F16 LM paths.",
+        Startup,
+        "Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths.",
     ),
     CoreEnvVar::new(
         "IZWI_GRANITE_TOKEN_DEBUG",

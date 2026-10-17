@@ -76,8 +76,8 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_CACHED_LINEAR_T` | flag | on for Metal, off elsewhere | model load | Caches a transposed copy of each Granite LM linear weight at load. |
 | `IZWI_GRANITE_CHUNKED_STOP_CHECK` | flag | on for Metal (when no deltas/stop sequences) | first use | Checks for the Granite stop token once per interval instead of every decode step. |
 | `IZWI_GRANITE_CHUNKED_STOP_INTERVAL` | integer | `8` | first use | Sets decode steps between Granite stop-token checks when chunked stop checking is on; clamped to 1..max_new_tokens. |
-| `IZWI_GRANITE_DECODE_PROFILE` | flag | `false` | first use | Enables Granite per-step and per-layer decode profiling; IZWI_GRANITE_DECODE_PROFILING is an alias. |
-| `IZWI_GRANITE_DECODE_PROFILING` | flag | `false` | first use | Alias of IZWI_GRANITE_DECODE_PROFILE, consulted only when that variable is unset. |
+| `IZWI_GRANITE_DECODE_PROFILE` | flag | `false` | startup | Enables Granite per-step and per-layer decode profiling (or the server's --granite-decode-profile); IZWI_GRANITE_DECODE_PROFILING is an alias. |
+| `IZWI_GRANITE_DECODE_PROFILING` | flag | `false` | startup | Alias of IZWI_GRANITE_DECODE_PROFILE, consulted only when that variable is unset. |
 | `IZWI_GRANITE_DEFER_STOP_CHECK` | flag | `false` | first use | Defers Granite stop-token checks to the end of decode, running the whole token budget (opt-in). |
 | `IZWI_GRANITE_F16_ATTENTION_CORE` | flag | on for Metal with F32 weights unless F32 pinned; needs F16 QKV | model load | Runs the Granite attention core in F16; IZWI_GRANITE_F16_ATTN_CORE is an alias. |
 | `IZWI_GRANITE_F16_ATTENTION_OUTPUT` | flag | on for Metal with F32 weights unless F32 pinned | model load | Loads the Granite attention output projection as F16; IZWI_GRANITE_F16_O_PROJ is an alias. |
@@ -103,7 +103,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_GRANITE_SAA_CHUNK_TARGET_SECS` | number | `240` | first use | Sets the preferred chunk length in seconds for Granite speaker-attributed ASR long-form planning. |
 | `IZWI_GRANITE_SAA_MAX_NEW_TOKENS` | integer | 256 + 8 per audio second, clamped 800..2500 | first use | Overrides the max new tokens per Granite speaker-attributed ASR chunk (positive integer). |
 | `IZWI_GRANITE_SAA_PREFIX_MODE` | choice | `none` | first use | Selects the prefix fed to each Granite SAA chunk: full, full_transcript or legacy = full transcript; anything else = none. |
-| `IZWI_GRANITE_SPEECH_DTYPE` | choice | auto (family/backend default) | model load | Forces the Granite Speech dtype (f32, f16, bf16 and aliases); f32 also disables Metal F16 encoder and selective F16 LM paths. |
+| `IZWI_GRANITE_SPEECH_DTYPE` | choice | auto (family/backend default) | startup | Forces the Granite Speech dtype (f32, f16, bf16 and aliases; --granite-speech-dtype wins); f32 also disables the Metal F16 encoder and LM paths. |
 | `IZWI_GRANITE_TOKEN_DEBUG` | flag | `false` | first use | Adds per-token debug detail to Granite diagnostics; IZWI_GRANITE_TOKEN_DIAGNOSTICS is an alias. |
 | `IZWI_GRANITE_TOKEN_DIAGNOSTICS` | flag | `false` | first use | Alias of IZWI_GRANITE_TOKEN_DEBUG, consulted only when that variable is unset. |
 | `IZWI_HOST` | text | `127.0.0.1` | startup | Sets the HTTP server bind address. |
