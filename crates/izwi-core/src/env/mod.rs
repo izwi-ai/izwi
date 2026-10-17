@@ -245,6 +245,42 @@ impl<T: Clone> ReadOnce<T> {
     }
 }
 
+/// The thread-count variables of the CPU compute libraries the engine links:
+/// rayon and Candle (`RAYON_NUM_THREADS`) and the native BLAS/OpenMP
+/// runtimes.
+const THREAD_HINTS: [&str; 5] = [
+    "RAYON_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+];
+
+/// Sizes the CPU compute libraries to `num_threads` (at least 1): each
+/// thread-count variable the operator has not set is set to it.
+///
+/// These are environment variables because the libraries read nothing else:
+/// Candle's CPU matmul reads `RAYON_NUM_THREADS` on every call (to split the
+/// gemm), rayon reads it when its global pool starts, and the BLAS/OpenMP
+/// runtimes read theirs when they initialise. Building a rayon pool would not
+/// remove the variable, because Candle would still read it. A binary calls
+/// this once, from its synchronous `main` before it starts a runtime; the
+/// engine itself never writes the environment.
+///
+/// # Safety
+///
+/// Call it while the process is still single-threaded (before any Tokio
+/// runtime, thread pool or other thread starts): writing the environment is
+/// not synchronised with another thread reading it.
+pub unsafe fn configure_process_threads(num_threads: usize) {
+    let value = num_threads.max(1).to_string();
+    for key in THREAD_HINTS {
+        if std::env::var(key).is_err() {
+            std::env::set_var(key, &value);
+        }
+    }
+}
+
 /// Renders `docs/dev/env/core.md` from [`CORE_ENV`].
 pub fn render_reference() -> String {
     let mut out = String::from(

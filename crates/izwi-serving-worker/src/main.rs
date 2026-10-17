@@ -48,13 +48,30 @@ fn init_tracing(env: &EnvSnapshot) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Synchronous so the process-wide startup that writes the environment runs
+/// before any other thread exists: the Tokio runtime and the OTLP exporter
+/// start after it.
+fn main() -> anyhow::Result<()> {
     // Every IZWI_* variable this worker reads, read once.
     let env = env_config::capture();
-    init_tracing(&env)?;
-
     let process = WorkerProcessConfig::from_env(&env)?;
+    // SAFETY: no runtime or other thread has started yet.
+    unsafe { izwi_core::env::configure_process_threads(process.thread_budget()) };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the Tokio runtime")?
+        .block_on(run(env, process))
+}
+
+async fn run(env: EnvSnapshot, process: WorkerProcessConfig) -> anyhow::Result<()> {
+    init_tracing(&env)?;
+    if process.insecure_plaintext_bind() {
+        tracing::warn!(
+            address = %process.bind,
+            "binding plaintext worker to non-loopback address via IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND"
+        );
+    }
     let managed_locks = managed_lock_context(&env, &process)?;
     let _fences = acquire_managed_worker_fences(&process, managed_locks.as_ref())?;
     if let DeviceAssignment::Cpu { affinity, .. } = &process.assignment {
@@ -790,12 +807,6 @@ impl WorkerProcessConfig {
                  IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND=1"
             );
         }
-        if allow_insecure_plaintext && !bind.ip().is_loopback() {
-            tracing::warn!(
-                address = %bind,
-                "binding plaintext worker to non-loopback address via IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND"
-            );
-        }
         Ok(Self {
             bind,
             tls,
@@ -856,6 +867,12 @@ impl WorkerProcessConfig {
             exit_on_runtime_failure: env.flag_or("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
             declared: DeclaredDeployment::from_env(env)?,
         })
+    }
+
+    /// Plaintext on a non-loopback address, which `from_env` accepts only
+    /// with IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND.
+    fn insecure_plaintext_bind(&self) -> bool {
+        self.tls.is_none() && !self.bind.ip().is_loopback()
     }
 
     fn thread_budget(&self) -> usize {

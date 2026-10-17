@@ -1,6 +1,7 @@
-//! Izwi server binary for the community build.
+//! Izwi server binary for the community build. The entry point is
+//! synchronous: `run_from_cli_blocking` starts the Tokio runtime after the
+//! process-wide startup that must happen while the process is single-threaded.
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    izwi_server::run_from_cli(izwi_hooks::EnterpriseHooks::noop()).await
+fn main() -> anyhow::Result<()> {
+    izwi_server::run_from_cli_blocking(izwi_hooks::EnterpriseHooks::noop())
 }

@@ -3,6 +3,14 @@
 //! The open-source build uses the no-op implementations in this crate. A private
 //! enterprise repository can depend on these traits, implement them, and pass an
 //! [`EnterpriseHooks`] bundle into the reusable server entry point.
+//!
+//! Prefer `izwi_server::run_from_cli_blocking(hooks)` from a synchronous
+//! `fn main`: it sizes the engine's CPU thread pools before any thread starts,
+//! then runs the server on its own Tokio runtime. The async
+//! `izwi_server::run_from_cli(hooks).await` stays supported for a
+//! `#[tokio::main]` binary and behaves as before. To migrate, drop
+//! `#[tokio::main]`, make `main` synchronous, build the hooks without
+//! `.await`, and call `run_from_cli_blocking`.
 
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;

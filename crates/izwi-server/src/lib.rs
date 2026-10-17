@@ -12,6 +12,7 @@
 // the stricter lint enabled.
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
+use anyhow::Context as _;
 use clap::Parser;
 
 mod api;
@@ -88,15 +89,58 @@ pub fn create_local_router(
     Ok(api::create_router(state, serve_config))
 }
 
-pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
-    let args = ServerArgs::parse();
-    run_with_args(args, enterprise_hooks).await
+/// Runs the server from the command line on a Tokio runtime of its own:
+/// the entry point for a synchronous `main`.
+///
+/// The configuration is resolved first, while the process is still
+/// single-threaded, so the local role sizes the engine's CPU compute
+/// libraries through their environment variables
+/// ([`izwi_core::env::configure_process_threads`]) before any thread that
+/// might read the environment exists.
+pub fn run_from_cli_blocking(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    let (args, serve_config) = resolve_cli()?;
+    if matches!(args.role, ServerRole::Local) {
+        // SAFETY: no runtime or other thread has started yet.
+        unsafe { izwi_core::env::configure_process_threads(serve_config.num_threads) };
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start the Tokio runtime")?
+        .block_on(run(args, serve_config, enterprise_hooks))
 }
 
-async fn run_with_args(args: ServerArgs, enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+/// Runs the server from the command line inside the caller's Tokio runtime
+/// (`#[tokio::main] async fn main`).
+///
+/// The legacy async entry, kept for binaries that already own a runtime.
+/// It sets the same CPU thread hints as [`run_from_cli_blocking`], but by
+/// then the runtime's worker threads exist, so the environment write can
+/// race a concurrent read, as it always has on this path. New binaries
+/// should call [`run_from_cli_blocking`] from a synchronous `main`.
+pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    let (args, serve_config) = resolve_cli()?;
+    if matches!(args.role, ServerRole::Local) {
+        // SAFETY: not guaranteed (see above); this path has always written
+        // the hints after the runtime started, so it is no worse than before.
+        unsafe { izwi_core::env::configure_process_threads(serve_config.num_threads) };
+    }
+    run(args, serve_config, enterprise_hooks).await
+}
+
+fn resolve_cli() -> anyhow::Result<(ServerArgs, ServeRuntimeConfig)> {
+    let args = ServerArgs::parse();
     validate_role_topology(args.role, args.gateway_topology)?;
     env_config::init()?;
     let serve_config = resolve_serve_runtime_config(&args)?;
+    Ok((args, serve_config))
+}
+
+async fn run(
+    args: ServerArgs,
+    serve_config: ServeRuntimeConfig,
+    enterprise_hooks: EnterpriseHooks,
+) -> anyhow::Result<()> {
     match args.role {
         ServerRole::Gateway => run_gateway(args, serve_config, enterprise_hooks).await,
         ServerRole::Local => run_local(args, serve_config, enterprise_hooks).await,

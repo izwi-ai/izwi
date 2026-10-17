@@ -3584,7 +3584,9 @@ impl RuntimeService {
             config.enable_prefix_caching = false;
             config.managed_prefix_cache_salt = None;
         }
-        configure_runtime_threading(config.num_threads.max(1));
+        // The engine never writes the process environment: binaries size the
+        // CPU compute libraries once, single-threaded, through
+        // `crate::env::configure_process_threads`.
         config.granite_speech = config.granite_speech.with_env_fallback();
         let model_manager = Arc::new(ModelManager::new(config.clone())?);
 
@@ -8466,22 +8468,6 @@ izwi_inference_coordinator_poisoned {}\n",
                 RuntimeStageOutcome::Observed,
             ));
     }
-}
-
-fn configure_runtime_threading(num_threads: usize) {
-    let value = num_threads.max(1).to_string();
-    for key in [
-        "RAYON_NUM_THREADS",
-        "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ] {
-        if std::env::var(key).is_err() {
-            std::env::set_var(key, &value);
-        }
-    }
-    debug!("Configured runtime threading hints to {} threads", value);
 }
 
 fn positive_usize_env(key: &str) -> Option<usize> {
