@@ -35,43 +35,32 @@
     clippy::type_complexity
 )]
 
-// Dead-code analysis is restored module by module. Every module below that
-// still carries `#[allow(dead_code)]` has not been audited yet; remove the
-// attribute once a module compiles warning-free on every feature lane.
-#[allow(dead_code)]
+// Dead-code analysis is restored module by module: every module without an
+// attribute below is checked by the compiler (and so by `clippy -D warnings`).
+// `backends`, `kernels` and `models` still opt out: much of their code is
+// reachable only from CUDA builds, which this gate cannot compile on every
+// lane. Remove an attribute once its module compiles warning-free on every
+// feature lane, including `cargo-cuda-compile`.
 pub mod artifacts;
-#[allow(dead_code)]
 pub mod audio;
 #[allow(dead_code)]
 pub mod backends;
-#[allow(dead_code)]
 pub mod catalog;
-#[allow(dead_code)]
 pub mod codecs;
-#[allow(dead_code)]
 pub mod config;
-#[allow(dead_code)]
 pub mod engine;
-#[allow(dead_code)]
 pub mod error;
 #[allow(dead_code)]
 pub mod kernels;
 pub mod kv;
-#[allow(dead_code)]
 pub mod model;
 #[allow(dead_code)]
 mod models;
-#[allow(dead_code)]
 pub mod performance;
-#[allow(dead_code)]
 pub mod residency;
-#[allow(dead_code)]
 pub mod runtime;
-#[allow(dead_code)]
 pub mod runtime_models;
-#[allow(dead_code)]
 pub mod serve_runtime;
-#[allow(dead_code)]
 pub mod tokenizer;
 
 // Re-export main types from the new engine module
