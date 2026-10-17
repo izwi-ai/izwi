@@ -152,10 +152,23 @@ pub enum FleetPartitionError {
 /// A bounded fleet coordination database reference: a SQLite file path
 /// (the historical form) or a bounded database URL such as `postgres://`
 /// for a shared server-backed coordination store (DS5).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum FleetDatabase {
     Path(std::path::PathBuf),
     Url(String),
+}
+
+/// A URL's credentials never reach Debug output (DUR-F11).
+impl std::fmt::Debug for FleetDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+            Self::Url(url) => f
+                .debug_tuple("Url")
+                .field(&crate::storage_layout::redact_database_url(url))
+                .finish(),
+        }
+    }
 }
 
 /// Resolve the shared fleet coordination database reference, if configured.
@@ -391,6 +404,15 @@ mod tests {
             Err(FleetPartitionError::InvalidDbPath)
         );
         std::env::remove_var("IZWI_GATEWAY_FLEET_DB_PATH");
+    }
+
+    #[test]
+    fn fleet_database_debug_redacts_url_credentials() {
+        let database =
+            FleetDatabase::Url("postgres://fleet:hunter2@db.internal:5432/izwi_fleet".to_string());
+        let debug = format!("{database:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("db.internal"), "{debug}");
     }
 
     #[test]
