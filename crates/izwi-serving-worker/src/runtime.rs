@@ -256,7 +256,8 @@ fn chat_request(
         ),
         None => (ceiling, ChatTruncation::Auto, None),
     };
-    let params = sampling.into_generation_params(
+    let params = GenerationParams::for_chat(
+        sampling,
         max_tokens,
         ChatGenerationControls {
             seed: parameters.seed,
@@ -870,18 +871,18 @@ mod tests {
         assert_eq!(chat_config.tools, parameters.tools);
         assert_eq!(ceiling, Some(64));
 
-        let expected = resolve_chat_sampling(
-            VARIANT,
-            None,
-            ChatSamplingRequest {
-                temperature: Some(0.5),
-                top_p: Some(0.75),
-                top_k: Some(9),
-                repetition_penalty: Some(1.25),
-                presence_penalty: Some(-0.5),
-            },
-        )
-        .into_generation_params(
+        let expected = GenerationParams::for_chat(
+            resolve_chat_sampling(
+                VARIANT,
+                None,
+                ChatSamplingRequest {
+                    temperature: Some(0.5),
+                    top_p: Some(0.75),
+                    top_k: Some(9),
+                    repetition_penalty: Some(1.25),
+                    presence_penalty: Some(-0.5),
+                },
+            ),
             16,
             ChatGenerationControls {
                 seed: Some(7),

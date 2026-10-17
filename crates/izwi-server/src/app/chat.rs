@@ -78,7 +78,8 @@ impl ChatExecutionRequest {
     }
 
     fn resolved_generation_params(&self) -> GenerationParams {
-        self.resolved_sampling().into_generation_params(
+        GenerationParams::for_chat(
+            self.resolved_sampling(),
             self.resolved_max_new_tokens(),
             ChatGenerationControls {
                 seed: self.seed,
