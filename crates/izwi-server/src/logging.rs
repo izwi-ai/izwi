@@ -19,9 +19,14 @@ impl LogFormat {
     }
 }
 
+/// The log filter when `RUST_LOG` is unset: warnings from every Izwi crate
+/// whose code runs in this process, and from the HTTP layer.
+const DEFAULT_LOG_FILTER: &str =
+    "izwi_server=warn,izwi_gateway=warn,izwi_db=warn,izwi_core=warn,tower_http=warn";
+
 pub fn init_tracing(log_format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "izwi_server=warn,izwi_db=warn,izwi_core=warn,tower_http=warn".into());
+        .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into());
 
     // Request spans go to an OTLP collector only when one is configured.
     let otlp = izwi_serving_client::otlp::otlp_layer_from_env(SERVICE_NAME);
@@ -53,4 +58,27 @@ where
         .with_current_span(true)
         .with_span_list(true)
         .with_writer(writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+    use tracing::Level;
+    use tracing_subscriber::filter::Targets;
+
+    /// Code moved between crates keeps its warnings: each crate that runs in
+    /// the server process logs at warn, and nothing more, by default.
+    #[test]
+    fn default_filter_keeps_every_crates_warnings() {
+        let filter: Targets = DEFAULT_LOG_FILTER.parse().expect("valid directives");
+        for target in [
+            "izwi_server::roles::gateway",
+            "izwi_gateway::gateway_worker_tls",
+            "izwi_db::sqlite",
+            "izwi_core::runtime",
+        ] {
+            assert!(filter.would_enable(target, &Level::WARN), "{target}");
+            assert!(!filter.would_enable(target, &Level::INFO), "{target}");
+        }
+    }
 }
