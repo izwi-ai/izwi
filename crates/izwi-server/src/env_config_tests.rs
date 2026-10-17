@@ -1,6 +1,5 @@
 use super::*;
 use crate::cli::ServerArgs;
-use crate::roles::gateway_env::GATEWAY_ENV;
 use clap::CommandFactory;
 use izwi_serving_protocol::env::{production_env_names, render_reference};
 use std::collections::BTreeSet;
@@ -9,11 +8,7 @@ use std::path::{Path, PathBuf};
 const REFERENCE: &str = "docs/dev/env/server.md";
 
 /// Names that only test modules read; the source scan sees their files.
-const TEST_ONLY: &[&str] = &[
-    "IZWI_TEST_FLEET_PG_URL",
-    "IZWI_TEST_STORE_PG_URL",
-    "IZWI_UPDATE_SSE_GOLDENS",
-];
+const TEST_ONLY: &[&str] = &["IZWI_TEST_STORE_PG_URL", "IZWI_UPDATE_GATEWAY_OPENAPI"];
 
 /// Compile-time variables: baked into the binary by the build, never read
 /// from the running process's environment.
@@ -90,13 +85,12 @@ fn crate_src() -> PathBuf {
 }
 
 /// Every `IZWI_*` name in this crate's source is documented: in this
-/// registry, the gateway's, or a clap flag.
+/// registry or as a clap flag (izwi-gateway documents the gateway's).
 #[test]
 fn every_variable_in_the_source_is_documented() {
     let documented: BTreeSet<String> = SERVER_ENV
         .iter()
         .chain(BUILD_ENV)
-        .chain(GATEWAY_ENV)
         .map(|var| var.name.to_string())
         .chain(env_flags().into_iter().map(|(env, ..)| env))
         .chain(TEST_ONLY.iter().map(|name| name.to_string()))

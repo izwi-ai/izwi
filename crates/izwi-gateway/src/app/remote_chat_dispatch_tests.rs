@@ -10,8 +10,8 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
-use izwi_core::{ChatMessage, ChatRequestConfig, ChatRole};
 use izwi_hooks::Principal;
+use izwi_model_catalog::{ChatMessage, ChatRequestConfig, ChatRole};
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
     ArtifactRevision, BackendKind, Capability, CapacitySnapshot, ChatContextPolicy,
@@ -20,12 +20,12 @@ use izwi_serving_protocol::{
     IncarnationId, InvocationAdmissionUnknown, InvocationEvent, InvocationEventKind,
     InvocationInput, InvocationRejection, InvocationRequest, LoadedDeployment, ModelGeneration,
     ModelReadiness, NodeId, SchemaVersion, ServiceBearerToken, ServiceCredentials, Usage,
-    WorkerDescriptor, WorkerFeature, WorkerId, WorkerProcessState, WorkerStatus,
-    INVOCATIONS_PATH, NDJSON_MEDIA_TYPE,
+    WorkerDescriptor, WorkerFeature, WorkerId, WorkerProcessState, WorkerStatus, INVOCATIONS_PATH,
+    NDJSON_MEDIA_TYPE,
 };
 
-use crate::gateway_fleet::FleetStore;
 use crate::db::StoreDatabase;
+use crate::gateway_fleet::FleetStore;
 
 use crate::worker_registry::{
     ApprovedDeployment, ApprovedWorker, RoutingConfig, WorkerRegistryConfig,
@@ -688,10 +688,8 @@ fn every_control() -> ChatExecutionRequest {
 /// runs on an older worker, at its minor and without the context policy.
 #[tokio::test]
 async fn controls_route_only_to_workers_that_advertise_them() {
-    let older =
-        ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
-    let newer =
-        ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+    let older = ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
+    let newer = ScriptedWorker::spawn(ScriptedResponse::Success("ok".into()), Duration::ZERO).await;
     let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
     register_minor3(&registry, "worker-a", "inc-a", client(&older.endpoint()));
     register(&registry, "worker-b", "inc-b", client(&newer.endpoint()), 1);
@@ -763,8 +761,7 @@ async fn controls_route_only_to_workers_that_advertise_them() {
 
 #[tokio::test]
 async fn unknown_admission_is_a_busy_worker_not_a_circuit_strike() {
-    let worker =
-        ScriptedWorker::spawn(ScriptedResponse::AdmissionUnknown, Duration::ZERO).await;
+    let worker = ScriptedWorker::spawn(ScriptedResponse::AdmissionUnknown, Duration::ZERO).await;
     let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
     register(
         &registry,
@@ -840,8 +837,7 @@ const BURST_DELTAS: usize = 192;
 #[tokio::test]
 async fn paused_public_reader_receives_every_worker_delta() {
     let count = BURST_DELTAS;
-    let worker =
-        ScriptedWorker::spawn(ScriptedResponse::ManyDeltas(count), Duration::ZERO).await;
+    let worker = ScriptedWorker::spawn(ScriptedResponse::ManyDeltas(count), Duration::ZERO).await;
     let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
     register(
         &registry,
@@ -983,17 +979,12 @@ async fn fleet_coordinator() -> (
     tempfile::TempDir,
 ) {
     let root = tempfile::tempdir().unwrap();
-    let store = FleetStore::new(StoreDatabase::new(
-        root.path().join("fleet.sqlite3"),
-    ));
+    let store = FleetStore::new(StoreDatabase::new(root.path().join("fleet.sqlite3")));
     (
         Arc::new(
-            crate::app::fleet_coordinator::FleetCoordinator::new(
-                store,
-                "gateway-test".to_string(),
-            )
-            .opened()
-            .await,
+            crate::app::fleet_coordinator::FleetCoordinator::new(store, "gateway-test".to_string())
+                .opened()
+                .await,
         ),
         root,
     )
@@ -1093,9 +1084,7 @@ async fn accepted_work_releases_its_fleet_claim_so_free_credits_stay_dispatchabl
     }
     // Both gateways' next status polls report the two accepted streams.
     let status = worker_status("worker-a", "inc-a", 2, 4, 2);
-    for (registry, coordinator) in
-        [(&registry_a, &coordinator_a), (&registry_b, &coordinator_b)]
-    {
+    for (registry, coordinator) in [(&registry_a, &coordinator_a), (&registry_b, &coordinator_b)] {
         registry.observe_status(status.clone()).unwrap();
         coordinator.refresh_peer_claims(&status).await;
     }
@@ -1133,9 +1122,7 @@ async fn hung_fleet_store_costs_at_most_the_claim_timeout() {
         1,
     );
     let root = tempfile::tempdir().unwrap();
-    let mut store = FleetStore::new(StoreDatabase::new(
-        root.path().join("fleet.sqlite3"),
-    ));
+    let mut store = FleetStore::new(StoreDatabase::new(root.path().join("fleet.sqlite3")));
     let faults = Arc::new(crate::gateway_fleet::FleetFaults::default());
     store.set_faults_for_test(Arc::clone(&faults));
     faults.hang_fleet_calls();

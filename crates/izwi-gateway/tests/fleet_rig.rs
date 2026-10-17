@@ -1,4 +1,4 @@
-//! DS5.2 multi-process fleet rig: two real `izwi-server` gateway processes
+//! DS5.2 multi-process fleet rig: two real `izwi-gateway` processes
 //! (distinct `IZWI_GATEWAY_ID`s, one shared coordination database) route
 //! chat through test workers over real loopback TCP, proving the
 //! multi-gateway profile with processes rather than in-process doubles:
@@ -27,9 +27,8 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-
-use izwi_core::ModelVariant;
-use izwi_server::FleetStore;
+use izwi_gateway::FleetStore;
+use izwi_model_catalog::ModelVariant;
 use izwi_serving_protocol::{ModelAlias, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 use izwi_test_process::ProcessGuard;
@@ -137,11 +136,9 @@ async fn spawn_gateway_once(
     extra_env: Vec<(&'static str, String)>,
 ) -> GatewayProcess {
     let port = reserve_port().await;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-server"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-gateway"));
     command
         .args([
-            "--role",
-            "gateway",
             "--host",
             "127.0.0.1",
             "--port",

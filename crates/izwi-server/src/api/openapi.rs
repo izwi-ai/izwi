@@ -107,26 +107,6 @@ pub async fn openapi_json() -> Json<Value> {
     Json(document())
 }
 
-pub async fn gateway_openapi_json() -> Json<Value> {
-    let mut doc = document();
-    if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
-        paths.retain(|path, _| {
-            matches!(
-                path.as_str(),
-                "/livez"
-                    | "/readyz"
-                    | "/openapi.json"
-                    | "/docs"
-                    | "/docs/scalar.js"
-                    | "/v1/chat/completions"
-                    | "/v1/models"
-                    | "/v1/models/{model}"
-            )
-        });
-    }
-    Json(doc)
-}
-
 pub fn document() -> Value {
     let mut doc = serde_json::to_value(IzwiOpenApi::openapi())
         .expect("generated OpenAPI document should serialize");
@@ -2267,7 +2247,51 @@ pub struct ServerSentEvent {
 #[cfg(test)]
 mod tests {
     use super::document;
+    use serde_json::Value;
     use std::collections::HashSet;
+
+    /// The gateway's document: this one restricted to the routes the gateway
+    /// serves.
+    fn gateway_document() -> Value {
+        let mut doc = document();
+        if let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) {
+            paths.retain(|path, _| {
+                matches!(
+                    path.as_str(),
+                    "/livez"
+                        | "/readyz"
+                        | "/openapi.json"
+                        | "/docs"
+                        | "/docs/scalar.js"
+                        | "/v1/chat/completions"
+                        | "/v1/models"
+                        | "/v1/models/{model}"
+                )
+            });
+        }
+        doc
+    }
+
+    /// izwi-gateway serves the gateway document from a checked-in copy, since
+    /// the schema annotations live on this crate's handlers. Run with
+    /// `IZWI_UPDATE_GATEWAY_OPENAPI=1` to rewrite it.
+    #[test]
+    fn gateway_openapi_document_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../izwi-gateway/src/api/gateway-openapi.json");
+        let expected = gateway_document();
+        if std::env::var_os("IZWI_UPDATE_GATEWAY_OPENAPI").is_some() {
+            let mut text = serde_json::to_string_pretty(&expected).unwrap();
+            text.push('\n');
+            std::fs::write(&path, text).unwrap();
+        }
+        assert_eq!(
+            izwi_gateway::api::openapi::gateway_document(),
+            &expected,
+            "{} is stale; rerun with IZWI_UPDATE_GATEWAY_OPENAPI=1 (and rebuild izwi-gateway)",
+            path.display()
+        );
+    }
 
     #[test]
     fn openapi_documents_realtime_session_admission_in_readiness() {

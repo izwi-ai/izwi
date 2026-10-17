@@ -3,11 +3,9 @@ use crate::api::openai::chat::dto::OpenAiChatChunk;
 
 fn reasoning_mode_for(body: serde_json::Value) -> Result<Option<bool>, ApiError> {
     let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-    let ctx = RequestContext::new(
-        "reasoning".into(),
-        izwi_hooks::Principal::local_anonymous(),
-    );
-    prepare_execution_request(&req, &ctx).map(|(_, format)| format.reasoning)
+    let ctx = RequestContext::new("reasoning".into(), izwi_hooks::Principal::local_anonymous());
+    prepare_execution_request(&req, &ctx, OpenAiCompatibilityProfile::Strict)
+        .map(|(_, format)| format.reasoning)
 }
 
 #[test]
@@ -15,8 +13,10 @@ fn reasoning_format_is_opt_in_and_knows_who_opens_the_block() {
     let user = serde_json::json!([{"role": "user", "content": "hi"}]);
     // Default: reasoning stays in `content`.
     assert_eq!(
-        reasoning_mode_for(serde_json::json!({"model": "LFM2.5-1.2B-Thinking-GGUF", "messages": user}))
-            .unwrap(),
+        reasoning_mode_for(
+            serde_json::json!({"model": "LFM2.5-1.2B-Thinking-GGUF", "messages": user})
+        )
+        .unwrap(),
         None
     );
     // LFM2.5 Thinking writes its own `<think>`.
@@ -91,13 +91,15 @@ async fn parsed_reasoning_fills_reasoning_content_and_keeps_tool_calls() {
         format(None, None),
     ))
     .await;
-    assert!(raw["choices"][0]["message"].get("reasoning_content").is_none());
+    assert!(raw["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
     assert_eq!(raw["choices"][0]["message"]["content"], "<think>r</think>A");
 }
 
 #[test]
 fn budget_termination_is_length_without_overriding_tool_calls() {
-    use izwi_core::engine::OutputFinishReason::{MaxTokens, StopToken};
+    use izwi_model_catalog::FinishReason::{MaxTokens, StopToken};
     assert_eq!(finish_reason(false, Some(MaxTokens)), "length");
     assert_eq!(finish_reason(false, Some(StopToken)), "stop");
     assert_eq!(finish_reason(true, Some(MaxTokens)), "tool_calls");
@@ -105,13 +107,12 @@ fn budget_termination_is_length_without_overriding_tool_calls() {
 
 #[test]
 fn json_and_sse_preserve_independent_timing_and_omit_absent_extensions() {
-    let timing: izwi_core::engine::LatencyBreakdown =
-        serde_json::from_value(serde_json::json!({
-            "queue_wait_ms": 10.0, "prefill_ms": 20.0, "decode_ms": 30.0,
-            "decode_wall_ms": 50.0, "decode_tokens": 3, "post_first_token_ms": 50.0,
-            "ttft_ms": 30.0, "total_ms": 90.0, "prefill_steps": 1, "decode_steps": 2
-        }))
-        .unwrap();
+    let timing: izwi_model_catalog::LatencyBreakdown = serde_json::from_value(serde_json::json!({
+        "queue_wait_ms": 10.0, "prefill_ms": 20.0, "decode_ms": 30.0,
+        "decode_wall_ms": 50.0, "decode_tokens": 3, "post_first_token_ms": 50.0,
+        "ttft_ms": 30.0, "total_ms": 90.0, "prefill_steps": 1, "decode_steps": 2
+    }))
+    .unwrap();
     let json = OpenAiChatCompletionResponse {
         id: "timing".into(),
         object: "chat.completion",
@@ -266,17 +267,17 @@ fn json_object_is_rejected_on_models_without_a_grammar_aware_sampler() {
 
 #[test]
 fn logprob_entries_render_openai_shape() {
-    let entries = vec![izwi_core::engine::TokenLogprob {
+    let entries = vec![izwi_model_catalog::TokenLogprob {
         token: " hello".to_string(),
         logprob: -0.25,
         bytes: b" hello".to_vec(),
         top_logprobs: vec![
-            izwi_core::engine::TopTokenLogprob {
+            izwi_model_catalog::TopTokenLogprob {
                 token: " hello".to_string(),
                 logprob: -0.25,
                 bytes: b" hello".to_vec(),
             },
-            izwi_core::engine::TopTokenLogprob {
+            izwi_model_catalog::TopTokenLogprob {
                 token: " hi".to_string(),
                 logprob: -1.5,
                 bytes: b" hi".to_vec(),

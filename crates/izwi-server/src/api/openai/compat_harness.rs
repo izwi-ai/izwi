@@ -27,7 +27,11 @@ const OPENAI_MOD_SRC: &str = include_str!("mod.rs");
 const OPENAI_AUDIO_MOD_SRC: &str = include_str!("audio/mod.rs");
 const OPENAI_CHAT_MOD_SRC: &str = include_str!("chat/mod.rs");
 const OPENAI_RESPONSES_MOD_SRC: &str = include_str!("responses/mod.rs");
-const OPENAI_CHAT_STREAM_SRC: &str = include_str!("chat/stream.rs");
+// The chat stream renderer is izwi-gateway's, shared by both roles.
+const OPENAI_CHAT_STREAM_SRC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../izwi-gateway/src/api/openai/chat/stream.rs"
+));
 const OPENAI_RESPONSES_HANDLERS_SRC: &str = include_str!("responses/handlers.rs");
 
 #[derive(Debug, Deserialize)]

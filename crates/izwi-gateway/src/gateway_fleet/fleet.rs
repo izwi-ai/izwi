@@ -55,18 +55,18 @@ pub struct FleetStore {
 /// answering on an established connection.
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(crate) struct FleetFaults {
+pub struct FleetFaults {
     hung: AtomicBool,
     answers: tokio::sync::Notify,
 }
 
 #[cfg(test)]
 impl FleetFaults {
-    pub(crate) fn hang_fleet_calls(&self) {
+    pub fn hang_fleet_calls(&self) {
         self.hung.store(true, Ordering::SeqCst);
     }
 
-    pub(crate) fn answer_fleet_calls(&self) {
+    pub fn answer_fleet_calls(&self) {
         self.hung.store(false, Ordering::SeqCst);
         self.answers.notify_waiters();
     }
@@ -110,12 +110,12 @@ impl FleetStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
+    pub fn set_test_clock(&mut self, clock: Arc<AtomicI64>) {
         self.test_clock = Some(clock);
     }
 
     #[cfg(test)]
-    pub(crate) fn set_faults_for_test(&mut self, faults: Arc<FleetFaults>) {
+    pub fn set_faults_for_test(&mut self, faults: Arc<FleetFaults>) {
         self.test_faults = Some(faults);
     }
 

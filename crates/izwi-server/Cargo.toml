@@ -20,6 +20,7 @@ flash-attn = ["cuda"]
 metal = ["izwi-core/metal"]
 db-postgres = [
     "izwi-db/db-postgres",
+    "izwi-gateway/db-postgres",
     "sea-orm/sqlx-postgres",
     "sea-orm/runtime-tokio-rustls",
 ]

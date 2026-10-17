@@ -12,11 +12,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use izwi_core::runtime::prometheus::{buckets, CounterFamily, HistogramFamily};
-use izwi_core::{ChatGeneration, ServeRuntimeConfig};
 use izwi_hooks::{
     EnterpriseAction, EnterpriseHooks, HookMetadata, QuotaRequest, ResourceDescriptor,
 };
+use izwi_model_catalog::ChatGeneration;
+use izwi_prometheus::{buckets, CounterFamily, HistogramFamily};
 use serde::Serialize;
 use std::fmt::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,12 +28,14 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{field, info, info_span, warn, Span};
 
+use crate::api::openai::compat::OpenAiCompatibilityProfile;
 use crate::api::request_context::RequestContext;
 use crate::api::request_context::{
     attach_gateway_request_context, attach_gateway_request_id, RequestTrace,
 };
 use crate::app::chat::{ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver};
 use crate::app::remote_chat_dispatch::RemoteChatDispatcher;
+use crate::config::GatewayServeConfig;
 use crate::error::ApiError;
 use crate::gateway_rate_quota::{
     GatewayRateDecision, GatewayRateQuota, GatewayRateQuotaConfig, RateLimitSnapshot,
@@ -44,22 +46,22 @@ use crate::gateway_tenant_concurrency::{
     GatewayTenantConcurrency, GatewayTenantConcurrencyConfig, TenantWorkAdmissionError,
     UnboundTenantWorkLease,
 };
-use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
-use crate::state::ServerLifecycle;
+use crate::lifecycle::ServerLifecycle;
+use crate::logging::{service_name, SERVICE_VERSION};
 
 const CHAT_COMPLETIONS_RESOURCE: &str = "/v1/chat/completions";
 const MAX_GATEWAY_QUOTA_HOOK_TIME: Duration = Duration::from_secs(2);
 /// Default deadline for reading a chat request body.
-pub(crate) const DEFAULT_GATEWAY_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_GATEWAY_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct GatewayState {
     /// One dispatcher per public chat model, the primary model first.
-    pub(crate) chat_dispatchers: Vec<RemoteChatDispatcher>,
-    pub(crate) enterprise_hooks: EnterpriseHooks,
-    pub(crate) lifecycle: ServerLifecycle,
-    pub(crate) perimeter: GatewayPerimeterConfig,
-    pub(crate) principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
+    pub chat_dispatchers: Vec<RemoteChatDispatcher>,
+    pub enterprise_hooks: EnterpriseHooks,
+    pub lifecycle: ServerLifecycle,
+    pub perimeter: GatewayPerimeterConfig,
+    pub principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
     pub request_timeout_secs: u64,
     request_admission: Arc<Semaphore>,
     rate_quota: GatewayRateQuota,
@@ -71,8 +73,7 @@ pub struct GatewayState {
     metrics: GatewayMetrics,
     /// Realtime relay surface (DS3.6). `None` keeps the gateway
     /// byte-identical to the pre-realtime shape.
-    pub(crate) realtime_relay:
-        Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
+    pub realtime_relay: Option<std::sync::Arc<crate::app::realtime_relay::GatewayRealtimeRelay>>,
     /// The adopted approvals view, for the admin status route.
     approvals: Option<crate::gateway_shared_approvals::GatewayApprovalsReporter>,
     /// Set during the pre-stop window: readiness reports draining while
@@ -80,6 +81,9 @@ pub struct GatewayState {
     prestop: Arc<std::sync::atomic::AtomicBool>,
     /// Ends every live chat stream with a terminal event.
     stream_shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+    /// The OpenAI compatibility profile chat requests are checked and
+    /// answered under (`IZWI_OPENAI_COMPAT_PROFILE`).
+    pub compat_profile: OpenAiCompatibilityProfile,
 }
 
 impl GatewayState {
@@ -113,17 +117,24 @@ impl GatewayState {
             approvals: None,
             prestop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream_shutdown,
+            compat_profile: OpenAiCompatibilityProfile::Strict,
         }
     }
 
-    pub(crate) fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
+    /// Check and answer chat requests under `profile` (strict by default).
+    pub fn with_compat_profile(mut self, profile: OpenAiCompatibilityProfile) -> Self {
+        self.compat_profile = profile;
+        self
+    }
+
+    pub fn with_body_read_timeout(mut self, timeout: Duration) -> Self {
         self.body_read_timeout = timeout;
         self
     }
 
     /// Reads and decodes a chat request body within the body-read deadline
     /// and the configured size limit.
-    pub(crate) async fn read_chat_body(
+    pub async fn read_chat_body(
         &self,
         headers: &HeaderMap,
         body: axum::body::Body,
@@ -169,7 +180,7 @@ impl GatewayState {
     }
 
     /// Serve one more public chat model. Requests route by their `model`.
-    pub(crate) fn with_chat_model(mut self, dispatcher: RemoteChatDispatcher) -> Self {
+    pub fn with_chat_model(mut self, dispatcher: RemoteChatDispatcher) -> Self {
         self.chat_dispatchers
             .push(dispatcher.with_shutdown(self.stream_shutdown.subscribe()));
         self
@@ -177,10 +188,7 @@ impl GatewayState {
 
     /// The dispatcher serving public model `model`, or the OpenAI 404 for a
     /// model this gateway does not serve.
-    pub(crate) fn chat_dispatcher_for(
-        &self,
-        model: &str,
-    ) -> Result<&RemoteChatDispatcher, ApiError> {
+    pub fn chat_dispatcher_for(&self, model: &str) -> Result<&RemoteChatDispatcher, ApiError> {
         let variant = crate::app::chat::parse_chat_model(model).ok();
         self.chat_dispatchers
             .iter()
@@ -190,7 +198,7 @@ impl GatewayState {
 
     /// Install the adopted-approvals reporter behind
     /// `GET /internal/admin/approvals`.
-    pub(crate) fn with_approvals_reporter(
+    pub fn with_approvals_reporter(
         mut self,
         reporter: crate::gateway_shared_approvals::GatewayApprovalsReporter,
     ) -> Self {
@@ -206,7 +214,7 @@ impl GatewayState {
         self
     }
 
-    pub(crate) fn with_tenant_concurrency_config(
+    pub fn with_tenant_concurrency_config(
         mut self,
         config: GatewayTenantConcurrencyConfig,
     ) -> Self {
@@ -219,7 +227,7 @@ impl GatewayState {
     /// scoped-key feature existed.
     /// Install the realtime relay surface (DS3.6). Absent keeps the public
     /// surface unchanged.
-    pub(crate) fn with_realtime_relay(
+    pub fn with_realtime_relay(
         mut self,
         relay: crate::app::realtime_relay::GatewayRealtimeRelay,
     ) -> Self {
@@ -227,7 +235,7 @@ impl GatewayState {
         self
     }
 
-    pub(crate) fn with_principal_keys(
+    pub fn with_principal_keys(
         mut self,
         principal_keys: crate::gateway_principal_keys::GatewayPrincipalDirectory,
     ) -> Self {
@@ -239,7 +247,7 @@ impl GatewayState {
     /// quota hook: local limits are checked first so a request they refuse
     /// is never charged by the hook. Returns the meter that settles the
     /// request's tokens and reports its usage when it completes.
-    pub(crate) async fn enforce_chat_rate_quota(
+    pub async fn enforce_chat_rate_quota(
         &self,
         context: &crate::api::request_context::RequestContext,
         request: &ChatExecutionRequest,
@@ -345,7 +353,7 @@ impl GatewayState {
         })
     }
 
-    pub(crate) fn begin_tenant_work(
+    pub fn begin_tenant_work(
         &self,
         context: &crate::api::request_context::RequestContext,
     ) -> Result<UnboundTenantWorkLease, ApiError> {
@@ -378,12 +386,12 @@ impl GatewayState {
 
     /// Starts the pre-stop window: readiness turns unready, requests are
     /// still admitted.
-    pub(crate) fn begin_prestop(&self) {
+    pub fn begin_prestop(&self) {
         self.prestop.store(true, Ordering::Release);
     }
 
     /// Ends every live chat stream with a terminal "shutting down" event.
-    pub(crate) fn end_streams(&self) {
+    pub fn end_streams(&self) {
         self.stream_shutdown.send_replace(true);
     }
 
@@ -398,7 +406,7 @@ impl GatewayState {
 
 /// Settles one chat request's usage: the token reservation against what the
 /// worker reported, and the enterprise quota hook's usage commit.
-pub(crate) struct ChatUsageMeter {
+pub struct ChatUsageMeter {
     quotas: Arc<dyn izwi_hooks::QuotaLimiter>,
     principal: izwi_hooks::Principal,
     correlation_id: String,
@@ -447,10 +455,10 @@ impl ChatUsageMeter {
 /// The tenant concurrent-work lease taken before global admission, handed
 /// to the chat handler through the request extensions.
 #[derive(Clone)]
-pub(crate) struct PreAdmittedTenantWork(Arc<std::sync::Mutex<Option<UnboundTenantWorkLease>>>);
+pub struct PreAdmittedTenantWork(Arc<std::sync::Mutex<Option<UnboundTenantWorkLease>>>);
 
 impl PreAdmittedTenantWork {
-    pub(crate) fn take(&self) -> Result<UnboundTenantWorkLease, ApiError> {
+    pub fn take(&self) -> Result<UnboundTenantWorkLease, ApiError> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -460,7 +468,7 @@ impl PreAdmittedTenantWork {
 }
 
 #[derive(Clone)]
-pub(crate) struct GatewayAdmissionGuard {
+pub struct GatewayAdmissionGuard {
     _permit: Arc<OwnedSemaphorePermit>,
     _active_request: Arc<GatewayActiveRequestGuard>,
 }
@@ -468,18 +476,18 @@ pub(crate) struct GatewayAdmissionGuard {
 /// Chat through the worker registry for one admitted public request. The
 /// backend owns the request's global admission and tenant lease and counts
 /// its dispatch in the gateway metrics.
-pub(crate) struct GatewayChat<'a> {
-    pub(crate) state: &'a GatewayState,
-    pub(crate) dispatcher: &'a RemoteChatDispatcher,
-    pub(crate) context: &'a RequestContext,
-    pub(crate) admission: GatewayAdmissionGuard,
-    pub(crate) tenant_work: UnboundTenantWorkLease,
-    pub(crate) usage: ChatUsageMeter,
+pub struct GatewayChat<'a> {
+    pub state: &'a GatewayState,
+    pub dispatcher: &'a RemoteChatDispatcher,
+    pub context: &'a RequestContext,
+    pub admission: GatewayAdmissionGuard,
+    pub tenant_work: UnboundTenantWorkLease,
+    pub usage: ChatUsageMeter,
 }
 
 /// Holds a streaming response's admission and stream metrics until its body
 /// ends.
-pub(crate) struct GatewayChatStream {
+pub struct GatewayChatStream {
     _admission: GatewayAdmissionGuard,
     metrics: GatewayStreamMetricsGuard,
     usage: Option<ChatUsageMeter>,
@@ -1356,7 +1364,7 @@ async fn bounded_gateway_admission(
     next.run(request).await
 }
 
-pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeConfig) -> Router {
+pub fn create_gateway_router(state: GatewayState, serve_config: &GatewayServeConfig) -> Router {
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &Request| {
             // Resolved by the request-id middleware outside this layer.
@@ -1364,7 +1372,7 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             let request_id = crate::api::request_context::gateway_trace_request_id(request);
             info_span!(
                 "http_request",
-                service = SERVICE_NAME,
+                service = service_name(),
                 version = SERVICE_VERSION,
                 method = %request.method(),
                 path = %request.uri().path(),
@@ -1384,7 +1392,7 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
             span.record("latency_ms", latency_ms);
             info!(
                 parent: span,
-                service = SERVICE_NAME,
+                service = service_name(),
                 version = SERVICE_VERSION,
                 status,
                 latency_ms,
@@ -1398,7 +1406,7 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
                 span.record("error", field::display(&failure));
                 warn!(
                     parent: span,
-                    service = SERVICE_NAME,
+                    service = service_name(),
                     version = SERVICE_VERSION,
                     error = %failure,
                     latency_ms,
@@ -1494,7 +1502,7 @@ pub fn create_gateway_router(state: GatewayState, serve_config: &ServeRuntimeCon
         ))
 }
 
-fn apply_gateway_cors(app: Router, serve_config: &ServeRuntimeConfig) -> Router {
+fn apply_gateway_cors(app: Router, serve_config: &GatewayServeConfig) -> Router {
     if !serve_config.cors_enabled {
         return app;
     }

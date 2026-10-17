@@ -13,20 +13,20 @@ use tracing::{debug, info, warn};
 use crate::cli::GatewayTopology;
 use crate::{app, gateway_deployments, worker_registry};
 
-pub(crate) struct GatewayWorkerStatusPoller {
-    pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
+pub struct GatewayWorkerStatusPoller {
+    pub tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Boot-time poller count. Runtime adoption mutates the live poller pool;
     /// this snapshot pins the boot-sized pool for diagnostics and tests.
-    pub(crate) poller_count: usize,
+    pub poller_count: usize,
 }
 
 #[derive(Clone)]
-pub(crate) struct GatewayWorkerExpectation {
-    pub(crate) client: WorkerClient,
-    pub(crate) worker_id: WorkerId,
-    pub(crate) node_id: NodeId,
-    pub(crate) deployment: worker_registry::ApprovedDeployment,
-    pub(crate) validated_capacity: u32,
+pub struct GatewayWorkerExpectation {
+    pub client: WorkerClient,
+    pub worker_id: WorkerId,
+    pub node_id: NodeId,
+    pub deployment: worker_registry::ApprovedDeployment,
+    pub validated_capacity: u32,
 }
 
 impl Drop for GatewayWorkerStatusPoller {
@@ -49,7 +49,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 /// drawn from the worker identity so co-configured pollers de-synchronize
 /// (serving plan §5.2 "status every 2 seconds with jitter") while the exact
 /// cadence stays reproducible under test.
-pub(crate) fn jittered_poll_interval(base: Duration, seed: u64) -> Duration {
+pub fn jittered_poll_interval(base: Duration, seed: u64) -> Duration {
     let mut state = seed | 1;
     let draw = splitmix64(&mut state);
     let per_mille = 90 + (draw % 21);
@@ -57,7 +57,7 @@ pub(crate) fn jittered_poll_interval(base: Duration, seed: u64) -> Duration {
     Duration::from_millis(millis as u64).max(Duration::from_millis(1))
 }
 
-pub(crate) fn poll_jitter_seed(worker_id: &WorkerId, node_id: &NodeId) -> u64 {
+pub fn poll_jitter_seed(worker_id: &WorkerId, node_id: &NodeId) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     worker_id.hash(&mut hasher);
@@ -67,7 +67,7 @@ pub(crate) fn poll_jitter_seed(worker_id: &WorkerId, node_id: &NodeId) -> u64 {
 
 /// The widest jittered cadence (110% of the poll interval) must stay below the
 /// freshness TTL, or a healthy worker would flap expired between observations.
-pub(crate) fn validate_status_cadence(ttl: Duration, poll: Duration) -> anyhow::Result<()> {
+pub fn validate_status_cadence(ttl: Duration, poll: Duration) -> anyhow::Result<()> {
     if poll.is_zero() {
         anyhow::bail!("--gateway-worker-status-poll-ms must be non-zero");
     }
@@ -80,7 +80,7 @@ pub(crate) fn validate_status_cadence(ttl: Duration, poll: Duration) -> anyhow::
     Ok(())
 }
 
-pub(crate) fn initial_gateway_worker_expectation(
+pub fn initial_gateway_worker_expectation(
     client: WorkerClient,
     descriptor: &WorkerDescriptor,
     status: &WorkerStatus,
@@ -130,7 +130,7 @@ pub(crate) fn initial_gateway_worker_expectation(
     })
 }
 
-pub(crate) fn validate_gateway_worker_endpoint_policy(
+pub fn validate_gateway_worker_endpoint_policy(
     topology: GatewayTopology,
     uses_https: bool,
     uses_numeric_loopback_http: bool,
@@ -147,7 +147,7 @@ pub(crate) fn validate_gateway_worker_endpoint_policy(
     Ok(())
 }
 
-pub(crate) fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
+pub fn configured_worker_capacity(status: &WorkerStatus) -> anyhow::Result<u32> {
     status
         .capacity
         .max_active_invocations
@@ -198,7 +198,7 @@ fn validate_gateway_worker_status(
     Ok(status)
 }
 
-pub(crate) fn approve_gateway_worker(
+pub fn approve_gateway_worker(
     registry: &worker_registry::WorkerRegistry,
     expected: &GatewayWorkerExpectation,
     descriptor: WorkerDescriptor,
@@ -230,7 +230,7 @@ pub(crate) fn approve_gateway_worker(
 /// runtime by the shared-approvals adoption path.
 /// Builds the private client for one approval and applies the topology's
 /// endpoint policy. Its errors are configuration errors no retry can fix.
-pub(crate) fn gateway_worker_client(
+pub fn gateway_worker_client(
     approval: &gateway_deployments::GatewayWorkerApproval,
     credentials: &ServiceCredentials,
     client_config: &WorkerClientConfig,
@@ -252,35 +252,35 @@ pub(crate) fn gateway_worker_client(
 /// Two approved endpoints answered as the same logical worker.
 #[derive(Debug, thiserror::Error)]
 #[error("endpoint {endpoint} reports worker {worker_id}, already adopted at another endpoint")]
-pub(crate) struct DuplicateGatewayWorker {
-    pub(crate) endpoint: String,
-    pub(crate) worker_id: WorkerId,
+pub struct DuplicateGatewayWorker {
+    pub endpoint: String,
+    pub worker_id: WorkerId,
 }
 
 /// One adopted worker: its logical identity and its status poller.
-pub(crate) struct AdoptedGatewayWorker {
-    pub(crate) worker_id: WorkerId,
-    pub(crate) poller: tokio::task::JoinHandle<()>,
+pub struct AdoptedGatewayWorker {
+    pub worker_id: WorkerId,
+    pub poller: tokio::task::JoinHandle<()>,
 }
 
 /// Adopts approved workers into the registry and starts their pollers. Boot
 /// and the runtime reconcile loop share it, so a worker that is down at boot
 /// is adopted exactly as one a shared approvals view adds later.
 #[derive(Clone)]
-pub(crate) struct GatewayWorkerAdopter {
-    pub(crate) registry: worker_registry::WorkerRegistry,
-    pub(crate) deployment_table: Arc<std::sync::Mutex<gateway_deployments::GatewayDeploymentTable>>,
-    pub(crate) credentials: ServiceCredentials,
-    pub(crate) client_config: WorkerClientConfig,
-    pub(crate) topology: GatewayTopology,
-    pub(crate) fleet: Option<Arc<app::fleet_coordinator::FleetCoordinator>>,
-    pub(crate) polling_interval: Duration,
+pub struct GatewayWorkerAdopter {
+    pub registry: worker_registry::WorkerRegistry,
+    pub deployment_table: Arc<std::sync::Mutex<gateway_deployments::GatewayDeploymentTable>>,
+    pub credentials: ServiceCredentials,
+    pub client_config: WorkerClientConfig,
+    pub topology: GatewayTopology,
+    pub fleet: Option<Arc<app::fleet_coordinator::FleetCoordinator>>,
+    pub polling_interval: Duration,
 }
 
 impl GatewayWorkerAdopter {
     /// Adopts every approval whose endpoint has no adopted worker yet and
     /// returns the ones that could not be adopted, with why.
-    pub(crate) async fn adopt_missing(
+    pub async fn adopt_missing(
         &self,
         approvals: &[gateway_deployments::GatewayWorkerApproval],
         adopted: &mut BTreeMap<String, AdoptedGatewayWorker>,
@@ -472,7 +472,7 @@ fn spawn_gateway_worker_poller(
 /// publisher. The registry observation is what keeps the worker fresh, so it
 /// never waits on the coordination store; the publisher shares it with peer
 /// gateways in the background.
-pub(crate) async fn refresh_gateway_worker_status(
+pub async fn refresh_gateway_worker_status(
     registry: &worker_registry::WorkerRegistry,
     expected: &GatewayWorkerExpectation,
     fleet: Option<&app::fleet_coordinator::FleetStatusPublisher>,

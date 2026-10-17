@@ -21,7 +21,7 @@ mod fleet;
 mod fleet_postgres_execution;
 
 #[cfg(test)]
-pub(crate) use fleet::FleetFaults;
+pub use fleet::FleetFaults;
 pub use fleet::FleetStore;
 
 const FLEET_PARTITION_ENV: &str = "IZWI_GATEWAY_FLEET_PARTITION";

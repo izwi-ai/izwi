@@ -1,4 +1,5 @@
-//! OpenAI-compatible model resource handlers.
+//! OpenAI-compatible model resource handlers for this process's runtime.
+//! The resource types are izwi-gateway's, which the gateway's routes share.
 
 use std::time::UNIX_EPOCH;
 
@@ -6,42 +7,12 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use izwi_core::{ModelInfo, ModelStatus, ModelVariant};
-use serde::Serialize;
+use izwi_core::{ModelInfo, ModelStatus};
+
+pub(crate) use izwi_gateway::api::openai::models::handlers::*;
 
 use crate::error::ApiError;
-use crate::gateway::GatewayState;
 use crate::state::AppState;
-
-/// `owned_by` for every model this server lists.
-const OWNER: &str = "izwi";
-
-#[derive(Debug, Serialize)]
-pub struct OpenAiModelsResponse {
-    pub object: &'static str,
-    pub data: Vec<OpenAiModel>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct OpenAiModel {
-    pub id: String,
-    pub object: &'static str,
-    /// When the model's files arrived on this host (seconds since the
-    /// epoch); `0` when unknown.
-    pub created: u64,
-    pub owned_by: &'static str,
-}
-
-impl OpenAiModel {
-    fn new(variant: ModelVariant, created: u64) -> Self {
-        Self {
-            id: variant.dir_name().to_string(),
-            object: "model",
-            created,
-            owned_by: OWNER,
-        }
-    }
-}
 
 /// A model this server can run now: enabled, and downloaded or loaded.
 fn is_available(model: &ModelInfo) -> bool {
@@ -60,10 +31,6 @@ fn listed(model: &ModelInfo) -> OpenAiModel {
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_secs());
     OpenAiModel::new(model.variant, created)
-}
-
-fn model_not_found(model: &str) -> ApiError {
-    ApiError::model_not_found(format!("The model `{model}` does not exist"))
 }
 
 pub async fn list_models_openai(
@@ -99,37 +66,10 @@ pub async fn get_model_openai(
         .ok_or_else(|| model_not_found(&model))
 }
 
-/// The gateway lists the one model its deployment serves.
-pub async fn gateway_list_models(State(state): State<GatewayState>) -> Json<OpenAiModelsResponse> {
-    Json(OpenAiModelsResponse {
-        object: "list",
-        data: state
-            .chat_dispatchers
-            .iter()
-            .map(|dispatcher| OpenAiModel::new(dispatcher.public_model(), 0))
-            .collect(),
-    })
-}
-
-pub async fn gateway_get_model(
-    State(state): State<GatewayState>,
-    Path(model): Path<String>,
-) -> Result<Json<OpenAiModel>, ApiError> {
-    let served = state
-        .chat_dispatchers
-        .iter()
-        .map(|dispatcher| dispatcher.public_model());
-    match izwi_core::parse_model_variant(&model) {
-        Ok(variant) if served.into_iter().any(|public| public == variant) => {
-            Ok(Json(OpenAiModel::new(variant, 0)))
-        }
-        _ => Err(model_not_found(&model)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_core::ModelVariant;
 
     #[test]
     fn only_enabled_downloaded_or_loaded_models_are_listed() {
@@ -167,14 +107,5 @@ mod tests {
                 "owned_by": "izwi",
             })
         );
-    }
-
-    #[test]
-    fn unknown_models_are_openai_model_not_found() {
-        let error = model_not_found("gpt-imaginary");
-        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
-        let body = error.openai_body();
-        assert_eq!(body["error"]["code"], "model_not_found");
-        assert_eq!(body["error"]["param"], "model");
     }
 }

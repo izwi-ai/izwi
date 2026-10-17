@@ -44,10 +44,9 @@ use crate::app::realtime_relay::{
     RelayStage, SessionGuard, SessionRegistration, SessionRegistryError, WorkerSide,
     REGISTRATION_TTL,
 };
-use crate::app::realtime_transport::now_unix_millis;
-use crate::app::transcription_realtime::{
-    negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
-    TranscriptionWireProtocol, LEGACY_REALTIME_PROTOCOL,
+use crate::app::realtime_wire::{
+    negotiate_transcription_protocol, now_unix_millis, parse_binary_message, BinaryMessageKind,
+    ClientEvent, TranscriptionWireProtocol, LEGACY_REALTIME_PROTOCOL,
 };
 use crate::gateway::GatewayState;
 use crate::gateway_tenant_concurrency::BoundTenantWorkLease;
@@ -285,7 +284,7 @@ fn detect_audio_gap(last_accepted: Option<u32>, frame_seq: u32) -> Option<(u64, 
 /// Entry point used by the gateway route when the client does not offer the
 /// `izwi-realtime-v1` subprotocol: the socket speaks the public
 /// transcription-realtime envelope instead.
-pub(crate) async fn run_translate_session(
+pub async fn run_translate_session(
     state: GatewayState,
     relay: Arc<GatewayRealtimeRelay>,
     socket: WebSocket,

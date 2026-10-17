@@ -1,10 +1,11 @@
 //! The gateway role's environment reference (HYG-E1).
 //!
-//! The gateway reads two kinds of variables, all once at startup in
-//! `run_gateway`: command-line flags that clap also takes from an
-//! environment variable (`env = "IZWI_GATEWAY_..."` on `ServerArgs`), and the
-//! variables below, which the perimeter, fleet, quota, approvals, TLS and
-//! principal-key configurations read through their `from_env` constructors.
+//! The gateway reads two kinds of variables, all once at startup:
+//! command-line flags that clap also takes from an environment variable
+//! (`env = "IZWI_..."` on `GatewayCli`; `izwi-server --role gateway` takes
+//! the same `GatewayArgs`), and the variables below, which the listener,
+//! perimeter, fleet, quota, approvals, TLS and principal-key configurations
+//! read through their `from_env` constructors.
 //! Every value is validated and fails closed; booleans use the shared
 //! `izwi_serving_protocol::env::parse_bool` vocabulary.
 //! `docs/dev/env/gateway.md` is rendered from both, and the tests keep it in
@@ -22,7 +23,29 @@ const fn var(name: &'static str, default: &'static str, description: &'static st
 }
 
 /// The gateway variables read outside clap.
-pub(crate) static GATEWAY_ENV: &[EnvVar] = &[
+pub static GATEWAY_ENV: &[EnvVar] = &[
+    // Listener (config.rs; izwi-server's gateway role reads them through
+    // its runtime configuration)
+    var(
+        "IZWI_TIMEOUT",
+        "300",
+        "Deadline of one request in seconds (legacy REQUEST_TIMEOUT_SECS).",
+    ),
+    var(
+        "IZWI_CORS",
+        "false",
+        "Allow cross-origin browser requests from IZWI_CORS_ORIGINS.",
+    ),
+    var(
+        "IZWI_CORS_ORIGINS",
+        "*",
+        "Comma-separated allowed origins; the gateway refuses a wildcard while CORS is on.",
+    ),
+    var(
+        "IZWI_OPENAI_COMPAT_PROFILE",
+        "strict",
+        "OpenAI compatibility profile: `strict` or `relaxed`.",
+    ),
     // Public perimeter (gateway_security.rs)
     var(
         "IZWI_GATEWAY_API_KEY_REF",
@@ -173,7 +196,7 @@ pub(crate) static GATEWAY_ENV: &[EnvVar] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ServerArgs;
+    use crate::cli::GatewayCli;
     use clap::CommandFactory;
     use izwi_serving_protocol::env::{production_env_names, render_reference};
     use std::collections::BTreeSet;
@@ -181,43 +204,45 @@ mod tests {
 
     const REFERENCE: &str = "docs/dev/env/gateway.md";
 
-    /// Flags clap also reads from an environment variable, for the gateway
-    /// role: (variable, flag, default, help).
+    /// Names that only test modules read; the source scan sees their files.
+    const TEST_ONLY: &[&str] = &["IZWI_TEST_FLEET_PG_URL", "IZWI_UPDATE_SSE_GOLDENS"];
+
+    /// Flags clap also reads from an environment variable: (variable,
+    /// flag, default, help).
     fn gateway_flags() -> Vec<(String, String, String, String)> {
-        ServerArgs::command()
+        GatewayCli::command()
             .get_arguments()
             .filter_map(|arg| {
                 let env = arg.get_env()?.to_str()?.to_string();
-                let gateway = env.starts_with("IZWI_GATEWAY_")
-                    || matches!(env.as_str(), "IZWI_SERVER_ROLE" | "IZWI_LOG_FORMAT");
-                gateway.then(|| {
-                    let defaults: Vec<_> = arg
-                        .get_default_values()
-                        .iter()
-                        .filter_map(|value| value.to_str())
-                        .collect();
-                    let default = if defaults.is_empty() {
-                        "unset".to_string()
-                    } else {
-                        format!("`{}`", defaults.join(","))
-                    };
-                    let help = arg
-                        .get_help()
-                        .map(|help| help.to_string().replace('\n', " ").replace('|', "\\|"))
-                        .unwrap_or_default();
-                    let flag = format!("`--{}`", arg.get_long().unwrap_or_default());
-                    (env, flag, default, help)
-                })
+                let defaults: Vec<_> = arg
+                    .get_default_values()
+                    .iter()
+                    .filter_map(|value| value.to_str())
+                    .collect();
+                let default = if defaults.is_empty() {
+                    "unset".to_string()
+                } else {
+                    format!("`{}`", defaults.join(","))
+                };
+                let help = arg
+                    .get_help()
+                    .map(|help| help.to_string().replace('\n', " ").replace('|', "\\|"))
+                    .unwrap_or_default();
+                let flag = format!("`--{}`", arg.get_long().unwrap_or_default());
+                Some((env, flag, default, help))
             })
             .collect()
     }
 
     fn reference() -> String {
         let mut doc = render_reference(
-            "izwi-server gateway role environment",
-            "The gateway role (`izwi-server --role gateway`) reads these variables once, \
-             at startup. Every value is validated and a bad one stops the gateway with an \
-             error. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`.",
+            "izwi-gateway environment",
+            "The gateway (`izwi-gateway`, or `izwi-server --role gateway`) reads these \
+             variables once, at startup. Every value is validated and a bad one stops the \
+             gateway with an error. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, \
+             `on` or `off`. `izwi-server --role gateway` takes the listener variables \
+             (`IZWI_HOST`, `IZWI_PORT`, `IZWI_TIMEOUT`, `IZWI_CORS*`) through its runtime \
+             configuration, and the role from `--role` or `IZWI_SERVER_ROLE`.",
             GATEWAY_ENV,
         );
         doc.push_str(
@@ -243,6 +268,7 @@ mod tests {
             .iter()
             .map(|var| var.name.to_string())
             .chain(gateway_flags().into_iter().map(|(env, ..)| env))
+            .chain(TEST_ONLY.iter().map(|name| name.to_string()))
             .collect()
     }
 

@@ -1,7 +1,7 @@
 //! DS6 (T37 gateway half): the gateway adopts rollout approval views at
 //! runtime and cuts over generations with zero dropped requests.
 //!
-//! One real `izwi-server` gateway process reads its worker approvals from a
+//! One real `izwi-gateway` process reads its worker approvals from a
 //! shared approvals file; two `TestWorker`s serve generation 1 and
 //! generation 2 of the same deployment on real loopback TCP. The test
 //! drives the coordinator's view transitions by rewriting the file exactly
@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use izwi_core::ModelVariant;
+use izwi_model_catalog::ModelVariant;
 use izwi_serving_protocol::{ModelAlias, ModelGeneration, NodeId, WorkerId};
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 use izwi_test_process::ProcessGuard;
@@ -98,11 +98,9 @@ impl GatewayProcess {
 async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
     for attempt in 0..3 {
         let port = reserve_port().await;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-server"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_izwi-gateway"));
         command
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--port",
@@ -130,7 +128,7 @@ async fn spawn_gateway(approvals_path: &std::path::Path) -> GatewayProcess {
                 "IZWI_GATEWAY_SHARED_APPROVALS_PATH",
                 approvals_path.display().to_string(),
             )
-            .env("RUST_LOG", "izwi_server=debug,izwi_serving_client=debug");
+            .env("RUST_LOG", "izwi_gateway=debug,izwi_serving_client=debug");
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = ProcessGuard::spawn(&mut command).expect("gateway binary spawns");
         let stderr_buffer = Arc::new(std::sync::Mutex::new(String::new()));

@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use izwi_core::ModelVariant;
+use izwi_model_catalog::ModelVariant;
 use izwi_serving_protocol::ModelAlias;
 use izwi_serving_worker::test_support::{TestWorker, TestWorkerConfig};
 use izwi_test_process::ProcessGuard;
@@ -34,7 +34,7 @@ struct GatewayProcess {
 impl GatewayProcess {
     fn spawn(command: &mut Command) -> Self {
         if !command.get_envs().any(|(key, _)| key == "RUST_LOG") {
-            command.env("RUST_LOG", "izwi_server=info");
+            command.env("RUST_LOG", "izwi_gateway=info");
         }
         let mut child = ProcessGuard::spawn(
             command
@@ -154,10 +154,8 @@ async fn gateway_process_serves_probes_and_remote_inference_without_an_engine() 
     );
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -314,10 +312,8 @@ async fn gateway_process_authenticates_scoped_principal_keys_from_the_durable_st
     );
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -501,10 +497,8 @@ async fn gateway_realtime_relay_relays_v1_sessions_through_the_real_binary() {
     );
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -706,9 +700,9 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     use futures::{SinkExt, StreamExt};
     use izwi_serving_protocol::{
         decode_realtime_audio_frame, AttemptId, CallerId, GatewayAttestedCallerContext,
-        InvocationEventKind, ModelGeneration, PermittedAction, PolicyRevision,
-        RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeStageInput,
-        RequestId, ServiceClass, SessionId, TaskKind, TenantId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
+        InvocationEventKind, ModelGeneration, PermittedAction, PolicyRevision, RealtimeClientFrame,
+        RealtimeServerFrame, RealtimeSessionAdmit, RealtimeStageInput, RequestId, ServiceClass,
+        SessionId, TaskKind, TenantId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
     };
     use std::collections::BTreeSet;
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
@@ -742,10 +736,8 @@ async fn gateway_realtime_relay_relays_tts_stage_sessions_through_the_real_binar
     .expect("test tts worker binds");
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -1019,10 +1011,8 @@ async fn gateway_realtime_translate_serves_public_v2_transcription_clients() {
     .expect("test realtime worker binds");
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -1225,10 +1215,8 @@ async fn gateway_realtime_translate_serves_public_v3_typed_clients() {
     .expect("test realtime worker binds");
 
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -1477,10 +1465,8 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
         model.dir_name()
     );
     let mut gateway = GatewayProcess::spawn(
-        Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
             .args([
-                "--role",
-                "gateway",
                 "--host",
                 "127.0.0.1",
                 "--public-model",
@@ -1489,7 +1475,7 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
                 &approval,
             ])
             .env("IZWI_LOG_FORMAT", "json")
-            .env("RUST_LOG", "izwi_server=info")
+            .env("RUST_LOG", "izwi_gateway=info")
             .env("IZWI_GATEWAY_API_KEY", GATEWAY_API_KEY)
             .env("IZWI_GATEWAY_WORKER_CREDENTIAL_ID", "test-credential-1")
             .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", "test-secret-token")

@@ -26,10 +26,6 @@ mod diarization_store;
 mod entity;
 mod env_config;
 mod error;
-mod gateway;
-mod gateway_fleet;
-mod gateway_principal_keys;
-mod gateway_security;
 mod local_security;
 mod logging;
 pub mod media_ingest;
@@ -58,24 +54,30 @@ use izwi_core::{RuntimeService, ServeRuntimeConfig};
 use izwi_db as db;
 use izwi_db::{storage_layout, voice_defaults};
 use izwi_hooks::EnterpriseHooks;
-// The gateway's accelerator-free components live in izwi-gateway; these
-// aliases keep their `crate::` paths for the gateway role still hosted here.
-use izwi_gateway::{
-    gateway_deployments, gateway_rate_quota, gateway_shared_approvals, gateway_tenant_concurrency,
-    gateway_worker_tls, ids,
-};
-use roles::{gateway::run_gateway, local::run_local};
+// The gateway role and the HTTP foundations both roles share live in
+// izwi-gateway; these aliases keep their `crate::` paths.
+use izwi_gateway::{gateway_security, ids};
+use roles::local::run_local;
 use state::AppState;
 
-pub use app::remote_chat_dispatch::{RemoteChatDispatchConfig, RemoteChatDispatcher};
-pub use gateway::{create_gateway_router, GatewayState};
-pub use gateway_fleet::{FleetPartition, FleetPartitionError, FleetStore};
-pub use gateway_rate_quota::{GatewayRateQuotaConfig, GatewayRateQuotaConfigError};
-pub use gateway_security::{GatewayPerimeterConfig, GatewayPerimeterConfigError};
-pub use gateway_tenant_concurrency::{
-    GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError,
-};
 pub use izwi_gateway::worker_registry;
+pub use izwi_gateway::{
+    FleetPartition, FleetPartitionError, FleetStore, GatewayPerimeterConfig,
+    GatewayPerimeterConfigError, GatewayRateQuotaConfig, GatewayRateQuotaConfigError, GatewayState,
+    GatewayTenantConcurrencyConfig, GatewayTenantConcurrencyConfigError, RemoteChatDispatchConfig,
+    RemoteChatDispatcher,
+};
+
+/// The gateway's router with the listener settings of `serve_config`.
+///
+/// Kept for callers that hold the server's runtime configuration; the
+/// gateway itself takes [`izwi_gateway::GatewayServeConfig`].
+pub fn create_gateway_router(
+    state: GatewayState,
+    serve_config: &ServeRuntimeConfig,
+) -> axum::Router {
+    izwi_gateway::create_gateway_router(state, &cli::gateway_serve_config(serve_config))
+}
 
 /// The local role's HTTP API over an already started runtime, without the
 /// listener, preload and persistence lifecycle of `izwi serve`. Integration
@@ -131,7 +133,7 @@ pub async fn run_from_cli(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<(
 
 fn resolve_cli() -> anyhow::Result<(ServerArgs, ServeRuntimeConfig)> {
     let args = ServerArgs::parse();
-    validate_role_topology(args.role, args.gateway_topology)?;
+    validate_role_topology(args.role, args.gateway.gateway_topology)?;
     env_config::init()?;
     let serve_config = resolve_serve_runtime_config(&args)?;
     Ok((args, serve_config))
@@ -143,7 +145,13 @@ async fn run(
     enterprise_hooks: EnterpriseHooks,
 ) -> anyhow::Result<()> {
     match args.role {
-        ServerRole::Gateway => run_gateway(args, serve_config, enterprise_hooks).await,
+        // The role izwi-gateway runs, kept for deployments that start the
+        // server with `--role gateway`.
+        ServerRole::Gateway => {
+            logging::init_tracing(args.log_format);
+            let config = cli::gateway_config(args, &serve_config);
+            izwi_gateway::run_gateway(config, enterprise_hooks).await
+        }
         ServerRole::Local => run_local(args, serve_config, enterprise_hooks).await,
     }
 }

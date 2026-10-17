@@ -1,11 +1,15 @@
-# izwi-server gateway role environment
+# izwi-gateway environment
 
 <!-- Generated from the binary's environment registry; the crate's env_reference test keeps it current. -->
 
-The gateway role (`izwi-server --role gateway`) reads these variables once, at startup. Every value is validated and a bad one stops the gateway with an error. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`.
+The gateway (`izwi-gateway`, or `izwi-server --role gateway`) reads these variables once, at startup. Every value is validated and a bad one stops the gateway with an error. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`. `izwi-server --role gateway` takes the listener variables (`IZWI_HOST`, `IZWI_PORT`, `IZWI_TIMEOUT`, `IZWI_CORS*`) through its runtime configuration, and the role from `--role` or `IZWI_SERVER_ROLE`.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `IZWI_TIMEOUT` | `300` | Deadline of one request in seconds (legacy REQUEST_TIMEOUT_SECS). |
+| `IZWI_CORS` | `false` | Allow cross-origin browser requests from IZWI_CORS_ORIGINS. |
+| `IZWI_CORS_ORIGINS` | `*` | Comma-separated allowed origins; the gateway refuses a wildcard while CORS is on. |
+| `IZWI_OPENAI_COMPAT_PROFILE` | `strict` | OpenAI compatibility profile: `strict` or `relaxed`. |
 | `IZWI_GATEWAY_API_KEY_REF` | `env:IZWI_GATEWAY_API_KEY` | `env:VARIABLE` naming the public inference API key (16-4096 printable bytes). |
 | `IZWI_GATEWAY_METRICS_API_KEY_REF` | unset | `env:VARIABLE` naming the /metrics key; unset turns /metrics off. Must differ from the inference key. |
 | `IZWI_GATEWAY_ADMIN_API_KEY_REF` | unset | `env:VARIABLE` naming the admin API key; unset turns the admin API off. Must differ from the inference key. |
@@ -41,7 +45,9 @@ Each of these flags can also be set through its variable; the flag wins when bot
 
 | Variable | Flag | Default | Meaning |
 |---|---|---|---|
-| `IZWI_SERVER_ROLE` | `--role` | `local` | Process role: local inference server or hardware-independent gateway |
+| `IZWI_HOST` | `--host` | unset | Host to bind to (default 127.0.0.1). A non-loopback plaintext bind requires IZWI_GATEWAY_TRUSTED_INGRESS_TLS |
+| `IZWI_PORT` | `--port` | unset | Port to listen on (default 8080) |
+| `IZWI_BACKEND` | `--backend` | unset | Worker backends chat may route to (`auto`, `cpu`, `metal`, `cuda`) |
 | `IZWI_LOG_FORMAT` | `--log-format` | `text` | Log output format (`text`, `json`) |
 | `IZWI_GATEWAY_WORKER_ENDPOINT` | `--worker-endpoint` | unset | Legacy one-worker form of `--gateway-worker-endpoint`: the gateway routes to this worker through the same registry as an endpoint list |
 | `IZWI_GATEWAY_TOPOLOGY` | `--gateway-topology` | `standalone` | Worker-network policy (`standalone` or `fleet-one-gateway`) |

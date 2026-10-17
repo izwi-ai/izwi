@@ -1,11 +1,11 @@
 use super::*;
 use axum::{body::Body, http::Request};
 use futures::StreamExt;
-use izwi_core::ModelVariant;
 use izwi_hooks::{
     AuthorizationDecision, AuthorizationRequest, EnterpriseAction, HookError, HookResult,
     PolicyEngine, QuotaDecision, QuotaLimiter, QuotaRequest,
 };
+use izwi_model_catalog::ModelVariant;
 use izwi_serving_client::{WorkerClient, WorkerClientConfig};
 use izwi_serving_protocol::{
     DeploymentId, ModelAlias, ModelGeneration, PolicyRevision, WorkerStatus,
@@ -177,8 +177,7 @@ fn fixed_gateway_metrics_track_lifetimes_latency_and_status_classes() {
     assert_eq!(metrics.snapshot().routing_dispatch_failures, 2);
 
     let text = metrics.render_prometheus(0);
-    let counts = izwi_core::runtime::prometheus::check_histograms(&text)
-        .expect("valid histogram exposition");
+    let counts = izwi_prometheus::check_histograms(&text).expect("valid histogram exposition");
     let duration = |outcome: &str| {
         counts[&format!(
             "izwi_gateway_chat_request_duration_seconds{{model=\"model-a\",outcome=\"{outcome}\",stream=\"true\"}}"
@@ -230,7 +229,7 @@ fn gateway_metrics_stay_bounded_under_label_churn() {
         "{} bytes",
         text.len()
     );
-    let counts = izwi_core::runtime::prometheus::check_histograms(&text).unwrap();
+    let counts = izwi_prometheus::check_histograms(&text).unwrap();
     // Unknown paths share one route label; extra label sets share `other`.
     assert!(!text.contains("/v1/unknown/path"));
     assert!(counts
@@ -272,7 +271,7 @@ async fn registry_gateway_state_with_config(
 async fn public_chat_nonstream_and_stream_use_registry_dispatcher() {
     let model = ModelVariant::Qwen354BGguf;
     let (state, _worker) = registry_gateway_state(model).await;
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     assert_eq!(
         send(app.clone(), get("/readyz")).await.status(),
@@ -355,7 +354,7 @@ async fn gateway_streams_worker_tool_markup_as_tool_calls() {
         },
     )
     .await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -419,7 +418,7 @@ async fn gateway_stream_errors_keep_the_worker_error_type() {
         },
     )
     .await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let request = chat_request(json!({
         "model": model.dir_name(),
         "messages": [{"role": "user", "content": "fail"}],
@@ -452,7 +451,7 @@ async fn gateway_stream_errors_keep_the_worker_error_type() {
 async fn gateway_lists_its_public_model_behind_the_api_key() {
     let model = ModelVariant::Qwen354BGguf;
     let (state, _worker) = registry_gateway_state(model).await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let response = send(app.clone(), get("/v1/models")).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -490,7 +489,7 @@ async fn gateway_lists_its_public_model_behind_the_api_key() {
 async fn gateway_chat_histograms_count_every_dispatched_request() {
     let model = ModelVariant::Qwen354BGguf;
     let (state, _worker) = registry_gateway_state(model).await;
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let body = |stream: bool| {
         json!({
             "model": model.dir_name(),
@@ -513,8 +512,7 @@ async fn gateway_chat_histograms_count_every_dispatched_request() {
     }
 
     let text = state.metrics.render_prometheus(0);
-    let counts = izwi_core::runtime::prometheus::check_histograms(&text)
-        .expect("valid histogram exposition");
+    let counts = izwi_prometheus::check_histograms(&text).expect("valid histogram exposition");
     let model = model.dir_name();
     let duration = |stream: &str| {
         counts[&format!(
@@ -536,7 +534,7 @@ async fn gateway_chat_histograms_count_every_dispatched_request() {
         3
     );
     let tokens = |name: &str| {
-        izwi_core::runtime::prometheus::parse_exposition(&text)
+        izwi_prometheus::parse_exposition(&text)
             .unwrap()
             .into_iter()
             .find(|sample| sample.name == name)
@@ -581,7 +579,7 @@ async fn wait_for_active(worker: &TestWorker, expected: usize) {
 #[tokio::test]
 async fn public_chat_answers_404_for_a_model_it_does_not_serve() {
     let (state, worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     for model in [ModelVariant::Qwen359BGguf.dir_name(), "no-such-model"] {
         let response = send(
             app.clone(),
@@ -623,16 +621,14 @@ async fn gateway_routes_each_request_to_its_models_workers() {
         )
         .await;
         state = Some(match state {
-            None => {
-                GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4)
-            }
+            None => GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4),
             Some(state) => state.with_chat_model(dispatcher),
         });
         workers.push(worker);
     }
     let state = state.unwrap();
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let listed = json_body(send(app.clone(), get("/v1/models")).await).await;
     let ids: Vec<&str> = listed["data"]
@@ -670,7 +666,7 @@ async fn gateway_routes_each_request_to_its_models_workers() {
 #[tokio::test]
 async fn out_of_range_sampling_values_are_rejected_at_the_edge() {
     let (state, worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     for (field, value) in [
         ("temperature", json!(2.5)),
         ("temperature", json!(-0.1)),
@@ -730,7 +726,7 @@ async fn public_chat_timeout_requests_cancel_without_early_capacity_release() {
     let dispatcher = single_worker_dispatcher_with_client(model, client).await;
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let response = send(app, valid_chat_request(32)).await;
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
@@ -750,7 +746,7 @@ async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
         },
     )
     .await;
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let response = send(app, valid_chat_request(32)).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -760,8 +756,7 @@ async fn public_chat_reports_accepted_then_interrupted_as_unknown_failure() {
     assert_eq!(body["error"]["code"], "bad_gateway");
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.starts_with(crate::error::SERVER_FAULT_MESSAGE)
-            && message.contains("request ID"),
+        message.starts_with(crate::error::SERVER_FAULT_MESSAGE) && message.contains("request ID"),
         "{message}"
     );
 }
@@ -785,7 +780,7 @@ async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
             GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
         );
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let stream_request = || {
         Request::builder()
@@ -821,8 +816,7 @@ async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
     assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
 
     for _ in 0..100 {
-        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
-        {
+        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -834,8 +828,7 @@ async fn tenant_work_survives_stream_disconnect_until_exact_worker_teardown() {
     assert_eq!(admitted_again.status(), StatusCode::OK);
     drop(admitted_again);
     for _ in 0..100 {
-        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
-        {
+        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -868,7 +861,7 @@ async fn gateway_crash_cannot_duplicate_execution_and_recovery_is_explicit() {
                         GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
                     );
             state.lifecycle.mark_ready();
-            let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+            let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
             (app, state)
         }
     };
@@ -949,7 +942,7 @@ async fn registry_stream_disconnect_releases_only_after_exact_worker_teardown() 
     let state = state.with_tenant_concurrency_config(
         GatewayTenantConcurrencyConfig::new(1, 2).expect("test tenant limit"),
     );
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let request = || {
         Request::builder()
             .method("POST")
@@ -982,8 +975,7 @@ async fn registry_stream_disconnect_releases_only_after_exact_worker_teardown() 
     );
 
     for _ in 0..100 {
-        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0
-        {
+        if worker.active_invocations() == 0 && state.tenant_concurrency.active_owned_work() == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1044,9 +1036,7 @@ async fn realtime_relay_forwards_a_cancel_while_the_client_is_not_reading() {
         REALTIME_SUBPROTOCOL,
     };
     use izwi_serving_worker::test_support::TestTtsStage;
-    use tokio_tungstenite::tungstenite::{
-        client::IntoClientRequest, http::HeaderValue, Message,
-    };
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
 
     let model = ModelVariant::Qwen354BGguf;
     let alias = ModelAlias::new(model.dir_name()).expect("static model alias");
@@ -1089,7 +1079,7 @@ async fn realtime_relay_forwards_a_cancel_while_the_client_is_not_reading() {
     .unwrap();
     let app = create_gateway_router(
         state.with_realtime_relay(relay),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1107,9 +1097,8 @@ async fn realtime_relay_forwards_a_cancel_while_the_client_is_not_reading() {
         HeaderValue::from_str(&format!("Bearer {TEST_API_KEY}")).unwrap(),
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    let control = |frame: &RealtimeClientFrame| {
-        Message::Text(serde_json::to_string(frame).unwrap().into())
-    };
+    let control =
+        |frame: &RealtimeClientFrame| Message::Text(serde_json::to_string(frame).unwrap().into());
     let admit = RealtimeSessionAdmit {
         schema_version: PROTOCOL_V1,
         session_id: "relay-cancel-session".try_into().unwrap(),
@@ -1195,8 +1184,7 @@ async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
         RemoteChatDispatchConfig {
             public_model_variant: model,
             deployment_id,
-            policy_revision: PolicyRevision::new("test-policy-v1")
-                .expect("static policy revision"),
+            policy_revision: PolicyRevision::new("test-policy-v1").expect("static policy revision"),
             backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(1),
             max_output_tokens: 128,
@@ -1208,7 +1196,7 @@ async fn gateway_worker_loss_fails_over_to_replacement_incarnation() {
     .expect("dispatcher should initialize");
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 5, 2);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let chat = || {
         Request::builder()
             .method("POST")
@@ -1297,8 +1285,8 @@ async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_withou
     let worker_b = TestWorker::spawn(replica("b", "replica-b-only"))
         .await
         .expect("second test replica should bind");
-    let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
-        .expect("registry should initialize");
+    let registry =
+        WorkerRegistry::new(WorkerRegistryConfig::default()).expect("registry should initialize");
 
     for worker in [&worker_a, &worker_b] {
         let client = WorkerClient::new(
@@ -1339,8 +1327,7 @@ async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_withou
         RemoteChatDispatchConfig {
             public_model_variant: model,
             deployment_id,
-            policy_revision: PolicyRevision::new("test-policy-v1")
-                .expect("static policy revision"),
+            policy_revision: PolicyRevision::new("test-policy-v1").expect("static policy revision"),
             backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(1),
             max_output_tokens: 128,
@@ -1352,7 +1339,7 @@ async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_withou
     .expect("dispatcher should initialize");
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 5, 2);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let stream_request = |prompt: &str| {
         Request::builder()
             .method("POST")
@@ -1413,8 +1400,7 @@ async fn public_chat_routes_concurrent_requests_to_distinct_http_replicas_withou
         first_bytes.extend_from_slice(&chunk);
     }
     let first_text = String::from_utf8(first_bytes).expect("first SSE should be UTF-8");
-    let second_text =
-        String::from_utf8(second_bytes.to_vec()).expect("second SSE should be UTF-8");
+    let second_text = String::from_utf8(second_bytes.to_vec()).expect("second SSE should be UTF-8");
 
     assert_eq!(first_text.matches("replica-a-only").count(), 1);
     assert!(!first_text.contains("replica-b-only"));
@@ -1440,13 +1426,7 @@ async fn gateway_router_uses_only_the_remote_worker_and_hides_local_routes() {
     let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(
-        state,
-        &ServeRuntimeConfig {
-            ui_enabled: true,
-            ..ServeRuntimeConfig::default()
-        },
-    );
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     assert_eq!(
         send(app.clone(), get("/livez")).await.status(),
@@ -1560,8 +1540,8 @@ async fn gateway_readiness_rejects_a_stale_model_generation() {
     let mut approved = ApprovedDeployment::from_loaded(&status.deployments[0]);
     approved.model_generation = ModelGeneration::new(2).expect("non-zero stale generation");
     let deployment_id = approved.deployment_id.clone();
-    let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
-        .expect("registry should initialize");
+    let registry =
+        WorkerRegistry::new(WorkerRegistryConfig::default()).expect("registry should initialize");
     registry
         .approve(ApprovedWorker {
             descriptor,
@@ -1576,8 +1556,7 @@ async fn gateway_readiness_rejects_a_stale_model_generation() {
         RemoteChatDispatchConfig {
             public_model_variant: model,
             deployment_id,
-            policy_revision: PolicyRevision::new("test-policy-v1")
-                .expect("static policy revision"),
+            policy_revision: PolicyRevision::new("test-policy-v1").expect("static policy revision"),
             backend_policy: BackendPolicy::ANY,
             max_queue_wait: Duration::from_secs(1),
             max_output_tokens: 128,
@@ -1589,7 +1568,7 @@ async fn gateway_readiness_rejects_a_stale_model_generation() {
     .expect("dispatcher should initialize");
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 4);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     assert_eq!(
         send(app, get("/readyz")).await.status(),
@@ -1606,7 +1585,7 @@ async fn gateway_admission_rejects_instead_of_queueing() {
         .clone()
         .try_acquire_owned()
         .expect("test should occupy the only gateway permit");
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -1631,7 +1610,7 @@ async fn gateway_admission_rejects_instead_of_queueing() {
 async fn gateway_admission_rejects_after_lifecycle_drain() {
     let state = unreachable_gateway_state(test_perimeter());
     state.begin_drain();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let request = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -1663,7 +1642,7 @@ async fn gateway_admission_rejects_after_lifecycle_drain() {
 async fn gateway_admission_rejects_before_lifecycle_ready() {
     let mut state = unreachable_gateway_state(test_perimeter());
     state.lifecycle = ServerLifecycle::new();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     let response = send(
         app,
         Request::builder()
@@ -1709,7 +1688,7 @@ async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
     let dispatcher = single_worker_dispatcher(model, &worker.endpoint(), credentials).await;
     let state = GatewayState::new(dispatcher, EnterpriseHooks::noop(), test_perimeter(), 2, 1);
     state.lifecycle.mark_ready();
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let stream_request = || {
         Request::builder()
             .method("POST")
@@ -1770,7 +1749,7 @@ async fn gateway_admission_is_held_for_the_stream_body_lifetime() {
 #[tokio::test]
 async fn gateway_v1_requires_api_key_while_probes_and_docs_remain_public() {
     let state = unreachable_gateway_state(test_perimeter());
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     for path in ["/livez", "/readyz", "/openapi.json", "/docs"] {
         assert_ne!(
@@ -1811,7 +1790,7 @@ async fn gateway_v1_requires_api_key_while_probes_and_docs_remain_public() {
 async fn gateway_metrics_are_absent_without_a_separate_credential() {
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     for path in ["/internal/metrics", "/internal/metrics/prometheus"] {
         assert_eq!(
@@ -1827,7 +1806,7 @@ async fn gateway_metrics_require_their_own_key_and_have_fixed_redacted_cardinali
         .with_metrics_api_key_for_test(TEST_METRICS_API_KEY)
         .unwrap();
     let state = unreachable_gateway_state(perimeter);
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     assert_eq!(
         send_raw(app.clone(), get("/internal/metrics"))
@@ -1859,13 +1838,11 @@ async fn gateway_metrics_require_their_own_key_and_have_fixed_redacted_cardinali
     assert!(body.contains("izwi_gateway_auth_rejections_total 2"));
     assert_eq!(body.matches("# TYPE ").count(), 23);
     // Labels are the gateway's own fixed vocabulary, never caller text.
-    let samples =
-        izwi_core::runtime::prometheus::parse_exposition(&body).expect("valid exposition");
+    let samples = izwi_prometheus::parse_exposition(&body).expect("valid exposition");
     for sample in &samples {
         for label in sample.labels.keys() {
             assert!(
-                ["route", "status", "le", "model", "stream", "outcome"]
-                    .contains(&label.as_str()),
+                ["route", "status", "le", "model", "stream", "outcome"].contains(&label.as_str()),
                 "{label}"
             );
         }
@@ -1892,7 +1869,7 @@ async fn gateway_metrics_require_their_own_key_and_have_fixed_redacted_cardinali
 #[tokio::test]
 async fn gateway_conformance_error_envelopes_and_advertised_surface() {
     let state = unreachable_gateway_state(test_perimeter());
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     // The OpenAPI document must expose exactly the advertised gateway
     // surface: text-only chat plus public probes/docs. Any unmigrated
@@ -1984,7 +1961,7 @@ async fn gateway_conformance_error_envelopes_and_advertised_surface() {
 #[tokio::test]
 async fn enabled_gateway_chat_route_eliminates_raw_local_path_assumptions() {
     let state = unreachable_gateway_state(test_perimeter());
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     // Attempting to inject file path references or media content in chat request
     // must fail closed at the gateway perimeter before reaching any execution.
@@ -2035,7 +2012,7 @@ async fn error_envelope(response: Response) -> serde_json::Value {
 async fn admin_drain_endpoint_requires_its_own_key_and_404s_without_it() {
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     assert_eq!(
         send_raw(app.clone(), post("/internal/admin/drain"))
@@ -2065,7 +2042,7 @@ async fn admin_approvals_status_reports_the_adopted_view_to_the_admin_key_only()
 
     let without_admin =
         unreachable_gateway_state(test_perimeter()).with_approvals_reporter(reporter.clone());
-    let app = create_gateway_router(without_admin, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(without_admin, &GatewayServeConfig::default());
     assert_eq!(
         send_raw(app, get("/internal/admin/approvals"))
             .await
@@ -2078,7 +2055,7 @@ async fn admin_approvals_status_reports_the_adopted_view_to_the_admin_key_only()
         .with_admin_api_key_for_test(TEST_ADMIN_API_KEY)
         .unwrap();
     let state = unreachable_gateway_state(perimeter).with_approvals_reporter(reporter);
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
     assert_eq!(
         send_raw(
             app.clone(),
@@ -2122,7 +2099,7 @@ async fn admin_drain_endpoint_rejects_inference_key_and_accepts_admin_key() {
         .with_admin_api_key_for_test(TEST_ADMIN_API_KEY)
         .unwrap();
     let state = unreachable_gateway_state(perimeter);
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     assert_eq!(
         send_raw(
             app.clone(),
@@ -2191,7 +2168,7 @@ async fn scoped_principal_key_authenticates_the_inference_route() {
 
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()).with_principal_keys(directory),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let response = send_raw(app, chat_request_with_bearer(TEST_SCOPED_INFERENCE_KEY, 4)).await;
     assert_ne!(
@@ -2218,7 +2195,7 @@ async fn scoped_principal_without_inference_role_is_forbidden_on_chat() {
 
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()).with_principal_keys(directory),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let response = send_raw(app, chat_request_with_bearer(TEST_SCOPED_OPS_KEY, 4)).await;
     assert_eq!(
@@ -2243,7 +2220,7 @@ async fn scoped_role_keys_open_internal_endpoints_without_dedicated_credentials(
     std::env::remove_var("IZWI_TEST_GW_SCOPED_B");
 
     let state = unreachable_gateway_state(test_perimeter()).with_principal_keys(directory);
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let metrics = send_raw(
         app.clone(),
@@ -2288,7 +2265,7 @@ async fn scoped_role_keys_open_internal_endpoints_without_dedicated_credentials(
 async fn internal_endpoints_stay_not_found_without_any_role_capability() {
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     assert_eq!(
         send_raw(app.clone(), get("/internal/metrics"))
@@ -2321,7 +2298,7 @@ async fn scoped_principal_tenant_scope_partitions_the_rate_quota() {
     let state = unreachable_gateway_state(test_perimeter())
         .with_rate_quota_config(GatewayRateQuotaConfig::new(1, 1, 4).unwrap())
         .with_principal_keys(directory);
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let tenant_a_first = send_raw(
         app.clone(),
@@ -2358,7 +2335,7 @@ async fn scoped_principal_tenant_scope_partitions_the_rate_quota() {
 #[tokio::test]
 async fn gateway_dispatch_failure_and_latency_are_counted_without_dynamic_dimensions() {
     let state = unreachable_gateway_state(test_perimeter());
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let response = send(app, valid_chat_request(4)).await;
     assert_ne!(response.status(), StatusCode::OK);
     let snapshot = state.metrics.snapshot();
@@ -2373,9 +2350,9 @@ async fn gateway_dispatch_failure_and_latency_are_counted_without_dynamic_dimens
 async fn gateway_disabled_cors_does_not_inherit_desktop_origins() {
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()),
-        &ServeRuntimeConfig {
+        &GatewayServeConfig {
             cors_enabled: false,
-            ..ServeRuntimeConfig::default()
+            ..GatewayServeConfig::default()
         },
     );
     let response = send_raw(
@@ -2397,7 +2374,7 @@ async fn gateway_disabled_cors_does_not_inherit_desktop_origins() {
 async fn gateway_chat_body_limit_rejects_before_json_decode_with_uniform_error() {
     let perimeter = GatewayPerimeterConfig::new_for_test(TEST_API_KEY, 1024).unwrap();
     let state = unreachable_gateway_state(perimeter);
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let response = send(
         app,
         Request::builder()
@@ -2426,7 +2403,7 @@ async fn gateway_chat_body_limit_rejects_before_json_decode_with_uniform_error()
 #[tokio::test]
 async fn gateway_request_id_is_bounded_and_validated_before_tracing() {
     let state = unreachable_gateway_state(test_perimeter());
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let response = send_raw(
         app,
         Request::builder()
@@ -2454,7 +2431,7 @@ async fn gateway_request_id_is_bounded_and_validated_before_tracing() {
 async fn gateway_headers_are_bounded_before_policy_evaluation() {
     let app = create_gateway_router(
         unreachable_gateway_state(test_perimeter()),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let response = send_raw(
         app,
@@ -2496,7 +2473,7 @@ async fn gateway_enterprise_policy_is_additional_to_server_authored_inference_id
     hooks.policy = policy.clone();
     let app = create_gateway_router(
         unreachable_gateway_state_with_hooks(test_perimeter(), hooks),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let response = send_raw(
         app,
@@ -2558,7 +2535,7 @@ async fn gateway_quota_hook_receives_server_identity_and_effective_output_units(
     hooks.quotas = quota.clone();
     let state = unreachable_gateway_state_with_hooks(test_perimeter(), hooks)
         .with_rate_quota_config(GatewayRateQuotaConfig::new(60, 4, 8).unwrap());
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
     let mut request = valid_chat_request(100);
     request.headers_mut().insert(
         "x-principal-id",
@@ -2605,7 +2582,7 @@ fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
 async fn chat_responses_carry_rate_limit_headers_and_429s_a_retry_after() {
     let (state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
     let state = state.with_rate_quota_config(GatewayRateQuotaConfig::new(2, 1, 8).unwrap());
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let served = send(app.clone(), valid_chat_request(4)).await;
     assert_eq!(served.status(), StatusCode::OK);
@@ -2631,7 +2608,7 @@ async fn token_quota_admits_by_estimate_and_settles_to_reported_usage() {
             .with_tokens_per_minute(Some(60))
             .unwrap(),
     );
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let served = send(app.clone(), valid_chat_request(16)).await;
     assert_eq!(served.status(), StatusCode::OK);
@@ -2683,7 +2660,7 @@ async fn completed_chat_commits_its_usage_to_the_quota_hook() {
     let (mut state, _worker) = registry_gateway_state(ModelVariant::Qwen354BGguf).await;
     let quota = Arc::new(MeteringQuota::default());
     state.enterprise_hooks.quotas = quota.clone();
-    let app = create_gateway_router(state, &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state, &GatewayServeConfig::default());
 
     let body = json_body(send(app.clone(), valid_chat_request(16)).await).await;
     let stream = send(
@@ -2748,7 +2725,7 @@ async fn gateway_quota_hook_failure_fails_closed_with_stable_error() {
     hooks.quotas = Arc::new(FailingQuota);
     let app = create_gateway_router(
         unreachable_gateway_state_with_hooks(test_perimeter(), hooks),
-        &ServeRuntimeConfig::default(),
+        &GatewayServeConfig::default(),
     );
     let response = send(app, valid_chat_request(4)).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2777,7 +2754,7 @@ async fn local_tenant_rate_limit_runs_only_after_validated_chat_input() {
     let tenant_key = RequestContext::new("quota-test".into(), principal)
         .tenant_key()
         .expect("gateway principal has a tenant key");
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let invalid = send(
         app.clone(),
@@ -2818,8 +2795,8 @@ fn unreachable_gateway_state_sized(
     hooks: EnterpriseHooks,
     max_in_flight: usize,
 ) -> GatewayState {
-    let registry = WorkerRegistry::new(WorkerRegistryConfig::default())
-        .expect("registry should initialize");
+    let registry =
+        WorkerRegistry::new(WorkerRegistryConfig::default()).expect("registry should initialize");
     let dispatcher = RemoteChatDispatcher::new(
         registry,
         RemoteChatDispatchConfig {
@@ -2867,7 +2844,7 @@ async fn wait_for_permits(state: &GatewayState, available: usize) {
 async fn a_tenant_at_its_limit_is_refused_before_taking_a_global_permit() {
     let state = unreachable_gateway_state_sized(test_perimeter(), EnterpriseHooks::noop(), 2)
         .with_tenant_concurrency_config(GatewayTenantConcurrencyConfig::new(1, 2).unwrap());
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let first = tokio::spawn(send_raw(app.clone(), stalled_body_chat_request()));
     wait_for_permits(&state, 1).await;
@@ -2888,7 +2865,7 @@ async fn a_tenant_at_its_limit_is_refused_before_taking_a_global_permit() {
 async fn a_body_that_does_not_arrive_in_time_is_refused_and_frees_admission() {
     let state = unreachable_gateway_state_sized(test_perimeter(), EnterpriseHooks::noop(), 2)
         .with_body_read_timeout(Duration::from_millis(100));
-    let app = create_gateway_router(state.clone(), &ServeRuntimeConfig::default());
+    let app = create_gateway_router(state.clone(), &GatewayServeConfig::default());
 
     let response = tokio::time::timeout(
         Duration::from_secs(2),

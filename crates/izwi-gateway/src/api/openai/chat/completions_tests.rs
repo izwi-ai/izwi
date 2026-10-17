@@ -150,10 +150,8 @@ async fn streamed_tool_calls_never_leak_markup_into_content() {
             assert_eq!(calls[0]["type"], "function");
             assert_eq!(calls[0]["name"], "get_weather");
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(
-                    calls[0]["arguments"].as_str().unwrap()
-                )
-                .unwrap(),
+                serde_json::from_str::<serde_json::Value>(calls[0]["arguments"].as_str().unwrap())
+                    .unwrap(),
                 json!({"city": "Paris"})
             );
             assert_eq!(finish, "tool_calls");
@@ -166,7 +164,7 @@ async fn streamed_tool_calls_never_leak_markup_into_content() {
 /// `chatcmpl-` ids shared by every chunk.
 #[tokio::test]
 async fn stream_chunks_have_the_openai_wire_shape() {
-    let entry = izwi_core::engine::TokenLogprob {
+    let entry = izwi_model_catalog::TokenLogprob {
         token: "Hi".to_string(),
         logprob: -0.5,
         bytes: b"Hi".to_vec(),
@@ -291,8 +289,7 @@ fn lfm25_tool_turns_use_the_lfm_wire_format() {
         text("tool", "{\"temperature_c\": 21}"),
     ];
     let (lfm, _) =
-        to_core_messages_with_media(ModelVariant::Lfm2512BInstructGguf, messages.clone())
-            .unwrap();
+        to_core_messages_with_media(ModelVariant::Lfm2512BInstructGguf, messages.clone()).unwrap();
     assert_eq!(
         lfm[1].content,
         "<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>"

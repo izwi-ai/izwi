@@ -18,15 +18,15 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
-use izwi_core::ChatMessage;
+use izwi_model_catalog::ChatMessage;
 
 use crate::error::ApiError;
 use crate::worker_registry::{PrefixAffinity, WorkerInstanceKey};
 
 /// Upper bounds for operator configuration.
-pub(crate) const MAX_PREFIX_BLOCK_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_PREFIX_BLOCKS: usize = 4_096;
-pub(crate) const MAX_PREFIX_ENTRIES_PER_WORKER: usize = 1_048_576;
+pub const MAX_PREFIX_BLOCK_BYTES: usize = 64 * 1024;
+pub const MAX_PREFIX_BLOCKS: usize = 4_096;
+pub const MAX_PREFIX_ENTRIES_PER_WORKER: usize = 1_048_576;
 /// Worker incarnations whose history is kept. Replaced incarnations age out
 /// once this many newer ones were routed to.
 const MAX_TRACKED_WORKERS: usize = 1_024;
@@ -55,7 +55,7 @@ impl Default for PrefixAffinityConfig {
 }
 
 impl PrefixAffinityConfig {
-    pub(crate) fn validate(&self) -> Result<(), ApiError> {
+    pub fn validate(&self) -> Result<(), ApiError> {
         if self.block_bytes == 0
             || self.block_bytes > MAX_PREFIX_BLOCK_BYTES
             || self.max_blocks == 0
@@ -73,7 +73,7 @@ impl PrefixAffinityConfig {
 
 /// The chained block hashes of one prompt, shortest prefix first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PromptBlocks(Vec<u64>);
+pub struct PromptBlocks(Vec<u64>);
 
 #[cfg(test)]
 impl PromptBlocks {
@@ -84,7 +84,7 @@ impl PromptBlocks {
 
 /// Bounded per-worker memory of routed prompt prefixes.
 #[derive(Debug)]
-pub(crate) struct PrefixRouter {
+pub struct PrefixRouter {
     config: PrefixAffinityConfig,
     workers: Mutex<WorkerHistories>,
 }
@@ -96,7 +96,7 @@ struct WorkerHistories {
 }
 
 impl PrefixRouter {
-    pub(crate) fn new(config: PrefixAffinityConfig) -> Self {
+    pub fn new(config: PrefixAffinityConfig) -> Self {
         Self {
             config,
             workers: Mutex::new(WorkerHistories::default()),
@@ -105,7 +105,7 @@ impl PrefixRouter {
 
     /// Hashes the role-tagged message stream in full blocks. A trailing
     /// partial block is not hashed: it cannot be shared by a longer prompt.
-    pub(crate) fn blocks(&self, messages: &[ChatMessage]) -> PromptBlocks {
+    pub fn blocks(&self, messages: &[ChatMessage]) -> PromptBlocks {
         let block_bytes = self.config.block_bytes;
         let mut blocks = Vec::new();
         let mut chain = 0_u64;
@@ -138,7 +138,7 @@ impl PrefixRouter {
     }
 
     /// Remembers that `worker` now holds every prefix of `blocks`.
-    pub(crate) fn record(&self, worker: &WorkerInstanceKey, blocks: &PromptBlocks) {
+    pub fn record(&self, worker: &WorkerInstanceKey, blocks: &PromptBlocks) {
         if blocks.0.is_empty() {
             return;
         }
@@ -170,11 +170,7 @@ impl PrefixRouter {
     }
 
     /// Leading blocks of `blocks` that `worker` was recently routed.
-    pub(crate) fn matched_blocks(
-        &self,
-        worker: &WorkerInstanceKey,
-        blocks: &PromptBlocks,
-    ) -> usize {
+    pub fn matched_blocks(&self, worker: &WorkerInstanceKey, blocks: &PromptBlocks) -> usize {
         let workers = self.lock();
         let Some((_, history)) = workers.by_worker.get(worker) else {
             return 0;
@@ -194,9 +190,9 @@ impl PrefixRouter {
 }
 
 /// One request's prompt blocks, answering the registry's affinity question.
-pub(crate) struct RequestPrefix<'a> {
-    pub(crate) router: &'a PrefixRouter,
-    pub(crate) blocks: &'a PromptBlocks,
+pub struct RequestPrefix<'a> {
+    pub router: &'a PrefixRouter,
+    pub blocks: &'a PromptBlocks,
 }
 
 impl PrefixAffinity for RequestPrefix<'_> {
@@ -252,7 +248,7 @@ impl BlockLru {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use izwi_core::ChatRole;
+    use izwi_model_catalog::ChatRole;
     use izwi_serving_protocol::{IncarnationId, WorkerId};
 
     fn worker(name: &str) -> WorkerInstanceKey {

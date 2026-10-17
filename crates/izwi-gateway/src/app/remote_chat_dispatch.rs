@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use izwi_core::{ChatGeneration, ModelVariant};
+use izwi_model_catalog::{ChatGeneration, ModelVariant};
 use izwi_serving_client::{DeadlinePhase, InvocationStream, WorkerClientError};
 use izwi_serving_protocol::{
     CancellationBehavior, DeploymentId, InputFormat, ModelAlias, OutputFormat, PolicyRevision,
@@ -110,7 +110,7 @@ impl RemoteChatDispatcher {
 
     /// End live streams with a terminal "shutting down" event once
     /// `shutdown` turns `true`.
-    pub(crate) fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn with_shutdown(mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Self {
         self.shutdown = Some(shutdown);
         self
     }
@@ -119,12 +119,12 @@ impl RemoteChatDispatcher {
         &self.registry
     }
 
-    pub(crate) const fn max_output_tokens(&self) -> u32 {
+    pub const fn max_output_tokens(&self) -> u32 {
         self.config.max_output_tokens
     }
 
     /// The model this deployment serves under its public name.
-    pub(crate) const fn public_model(&self) -> ModelVariant {
+    pub const fn public_model(&self) -> ModelVariant {
         self.config.public_model_variant
     }
 
@@ -162,7 +162,7 @@ impl RemoteChatDispatcher {
         Ok(())
     }
 
-    pub(crate) async fn generate(
+    pub async fn generate(
         &self,
         request_timeout_secs: u64,
         context: &RequestContext,
@@ -196,7 +196,7 @@ impl RemoteChatDispatcher {
     /// Returns only after the selected worker has emitted a contract-valid
     /// accepted event. The forwarding task owns the local dispatch reservation
     /// through terminal delivery or public-consumer disconnect.
-    pub(crate) async fn stream(
+    pub async fn stream(
         &self,
         request_timeout_secs: u64,
         context: &RequestContext,

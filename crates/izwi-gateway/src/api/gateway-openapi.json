@@ -1,0 +1,2560 @@
+{
+  "components": {
+    "schemas": {
+      "AdminChatModelCapabilities": {
+        "properties": {
+          "default_reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_thinking_enabled": {
+            "type": "boolean"
+          },
+          "reasoning_efforts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "supports_preserve_thinking": {
+            "type": "boolean"
+          },
+          "supports_thinking": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supports_thinking",
+          "default_thinking_enabled",
+          "reasoning_efforts",
+          "supports_preserve_thinking"
+        ],
+        "type": "object"
+      },
+      "AdminModelActionResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "message"
+        ],
+        "type": "object"
+      },
+      "AdminModelBatchCapabilities": {
+        "properties": {
+          "artifacts": {
+            "type": "boolean"
+          },
+          "batch_asr": {
+            "type": "boolean"
+          },
+          "batch_tts": {
+            "type": "boolean"
+          },
+          "cancellation": {
+            "type": "boolean"
+          },
+          "durable_jobs": {
+            "type": "boolean"
+          },
+          "requires_voice_permission": {
+            "type": "boolean"
+          },
+          "retry": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "batch_asr",
+          "batch_tts",
+          "durable_jobs",
+          "artifacts",
+          "cancellation",
+          "retry",
+          "requires_voice_permission"
+        ],
+        "type": "object"
+      },
+      "AdminModelDownloadProgressEvent": {
+        "properties": {
+          "current_file": {
+            "type": "string"
+          },
+          "current_file_downloaded": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "current_file_total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "downloaded_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files_completed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files_total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "percent": {
+            "format": "float",
+            "type": "number"
+          },
+          "status": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "variant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant",
+          "downloaded_bytes",
+          "total_bytes",
+          "current_file",
+          "current_file_downloaded",
+          "current_file_total",
+          "files_completed",
+          "files_total",
+          "percent",
+          "status"
+        ],
+        "type": "object"
+      },
+      "AdminModelInfo": {
+        "properties": {
+          "batch_capabilities": {
+            "$ref": "#/components/schemas/AdminModelBatchCapabilities"
+          },
+          "chat_capabilities": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdminChatModelCapabilities"
+              }
+            ]
+          },
+          "cuda_operators": {},
+          "cuda_quantization": {},
+          "cuda_support": {},
+          "deployment_state": {
+            "type": "string"
+          },
+          "download_progress": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "license": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "local_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modalities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pinned": {
+            "description": "Explicitly loaded in this session: survives budget and memory-pressure\neviction until explicitly unloaded.",
+            "type": "boolean"
+          },
+          "route_capabilities": {
+            "$ref": "#/components/schemas/AdminModelRouteCapabilities"
+          },
+          "runtime_diagnostics": {},
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "speech_capabilities": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdminSpeechModelCapabilities"
+              }
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "variant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant",
+          "enabled",
+          "status",
+          "deployment_state",
+          "modalities",
+          "route_capabilities",
+          "batch_capabilities",
+          "cuda_support",
+          "cuda_quantization",
+          "cuda_operators"
+        ],
+        "type": "object"
+      },
+      "AdminModelRouteCapabilities": {
+        "properties": {
+          "diarization_records": {
+            "type": "boolean"
+          },
+          "forced_alignment": {
+            "type": "boolean"
+          },
+          "openai_audio_speech": {
+            "type": "boolean"
+          },
+          "openai_audio_transcriptions": {
+            "type": "boolean"
+          },
+          "openai_chat_completions": {
+            "type": "boolean"
+          },
+          "openai_responses": {
+            "type": "boolean"
+          },
+          "saved_voice_reuse": {
+            "type": "boolean"
+          },
+          "speech_to_text_jobs": {
+            "type": "boolean"
+          },
+          "speech_to_text_realtime": {
+            "type": "boolean"
+          },
+          "studio_projects": {
+            "type": "boolean"
+          },
+          "text_to_speech_records": {
+            "type": "boolean"
+          },
+          "tokenizer": {
+            "type": "boolean"
+          },
+          "voice_clone_records": {
+            "type": "boolean"
+          },
+          "voice_design_records": {
+            "type": "boolean"
+          },
+          "voice_realtime_modular_asr": {
+            "type": "boolean"
+          },
+          "voice_realtime_modular_tts": {
+            "type": "boolean"
+          },
+          "voice_realtime_text_model": {
+            "type": "boolean"
+          },
+          "voice_realtime_unified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "openai_chat_completions",
+          "openai_responses",
+          "openai_audio_speech",
+          "openai_audio_transcriptions",
+          "speech_to_text_jobs",
+          "speech_to_text_realtime",
+          "diarization_records",
+          "text_to_speech_records",
+          "voice_design_records",
+          "voice_clone_records",
+          "saved_voice_reuse",
+          "studio_projects",
+          "voice_realtime_text_model",
+          "voice_realtime_modular_asr",
+          "voice_realtime_modular_tts",
+          "voice_realtime_unified",
+          "forced_alignment",
+          "tokenizer"
+        ],
+        "type": "object"
+      },
+      "AdminModelsResponse": {
+        "description": "Response for model list",
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/AdminModelInfo"
+            },
+            "type": "array"
+          },
+          "removed_models": {
+            "description": "Downloads of variants whose support was removed, still on disk. They\nare never deleted automatically; `DELETE /v1/admin/models/{variant}`\nwith the listed `variant` reclaims the space.",
+            "items": {
+              "$ref": "#/components/schemas/AdminRemovedModelInfo"
+            },
+            "type": "array"
+          },
+          "residency": {
+            "$ref": "#/components/schemas/AdminResidencySummary",
+            "description": "Residency snapshot for the `ollama ps`-style observability surface."
+          }
+        },
+        "required": [
+          "models"
+        ],
+        "type": "object"
+      },
+      "AdminRemovedModelInfo": {
+        "description": "A leftover download of a removed variant.",
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "local_path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "replacement": {
+            "description": "The supported variant to use instead.",
+            "type": "string"
+          },
+          "size_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "description": "Always `removed`.",
+            "type": "string"
+          },
+          "variant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant",
+          "display_name",
+          "status",
+          "local_path",
+          "size_bytes",
+          "replacement",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "AdminResidencySummary": {
+        "properties": {
+          "max_loaded_models": {
+            "description": "Residency budget (`None` = unbounded).",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model_keep_alive_secs": {
+            "description": "Idle keep-alive for transient residents in seconds (0 = reaper off).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resident_count": {
+            "description": "Models currently tracked as resident (loading or ready).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "resident_count",
+          "model_keep_alive_secs"
+        ],
+        "type": "object"
+      },
+      "AdminSpeechModelCapabilities": {
+        "properties": {
+          "built_in_voice_count": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "streaming_mode": {
+            "description": "What a streaming request delivers on this server (TPIPE-3):\n`chunked` (audio as the model commits it) or `unsupported`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supports_auto_long_form": {
+            "type": "boolean"
+          },
+          "supports_builtin_voices": {
+            "type": "boolean"
+          },
+          "supports_reference_voice": {
+            "type": "boolean"
+          },
+          "supports_speed_control": {
+            "type": "boolean"
+          },
+          "supports_streaming": {
+            "type": "boolean"
+          },
+          "supports_voice_description": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supports_builtin_voices",
+          "supports_reference_voice",
+          "supports_voice_description",
+          "supports_streaming",
+          "supports_speed_control",
+          "supports_auto_long_form"
+        ],
+        "type": "object"
+      },
+      "AlignmentJsonRequest": {
+        "properties": {
+          "audio_base64": {
+            "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "audio_base64",
+          "text"
+        ],
+        "type": "object"
+      },
+      "AlignmentMultipartRequest": {
+        "properties": {
+          "audio_base64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "format": "binary",
+            "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "text"
+        ],
+        "type": "object"
+      },
+      "AlignmentResponse": {
+        "properties": {
+          "alignments": {
+            "items": {
+              "$ref": "#/components/schemas/AlignmentWord"
+            },
+            "type": "array"
+          },
+          "duration": {
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "alignments",
+          "duration"
+        ],
+        "type": "object"
+      },
+      "AlignmentWord": {
+        "properties": {
+          "end": {
+            "format": "float",
+            "type": "number"
+          },
+          "start": {
+            "format": "float",
+            "type": "number"
+          },
+          "word": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "word",
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "ApiErrorBody": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "param": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "type",
+          "code"
+        ],
+        "type": "object"
+      },
+      "ApiErrorEnvelope": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ApiErrorBody"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionChoice": {
+        "properties": {
+          "finish_reason": {
+            "type": "string"
+          },
+          "index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "$ref": "#/components/schemas/ChatCompletionMessage"
+          }
+        },
+        "required": [
+          "index",
+          "message",
+          "finish_reason"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionChunk": {
+        "properties": {
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionDelta"
+            },
+            "type": "array"
+          },
+          "created": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usage"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionDelta": {
+        "properties": {
+          "delta": {
+            "$ref": "#/components/schemas/ChatCompletionMessage"
+          },
+          "finish_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index",
+          "delta"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionMessage": {
+        "properties": {
+          "content": {},
+          "role": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "items": {},
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionRequest": {
+        "properties": {
+          "chat_template_kwargs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatTemplateKwargs"
+              }
+            ]
+          },
+          "enable_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_completion_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionMessage"
+            },
+            "type": "array"
+          },
+          "model": {
+            "type": "string"
+          },
+          "presence_penalty": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "preserve_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatReasoningEffort"
+              }
+            ]
+          },
+          "repetition_penalty": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "seed": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "skip_special_tokens": {
+            "description": "vLLM extension: `false` keeps special tokens in the reply text.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "stop": {},
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "stream_options": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatCompletionStreamOptions"
+              }
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tool_choice": {},
+          "tools": {
+            "items": {},
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "top_k": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_p": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "truncation": {
+            "description": "`\"disabled\"` (default) or `\"auto\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionResponse": {
+        "properties": {
+          "choices": {
+            "items": {
+              "$ref": "#/components/schemas/ChatCompletionChoice"
+            },
+            "type": "array"
+          },
+          "created": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "izwi_generation_time_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "izwi_timing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatTiming",
+                "description": "Engine request phases; absent under strict OpenAI compatibility."
+              }
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created",
+          "model",
+          "choices",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "ChatCompletionStreamOptions": {
+        "properties": {
+          "include_usage": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ChatReasoningEffort": {
+        "enum": [
+          "xhigh",
+          "medium",
+          "low"
+        ],
+        "type": "string"
+      },
+      "ChatTemplateKwargs": {
+        "properties": {
+          "enable_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "preserve_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatReasoningEffort"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ChatTiming": {
+        "properties": {
+          "codec_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "decode_ms": {
+            "description": "Sum of physical batch service time, not wall time.",
+            "format": "double",
+            "type": "number"
+          },
+          "decode_steps": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "decode_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decode_wall_ms": {
+            "description": "First entered decode dispatch registration to last durable token commit.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "media_decode_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "normalization_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "post_first_token_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "postprocess_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "prefill_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "prefill_steps": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queue_wait_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "sampling_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "total_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "ttft_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "queue_wait_ms",
+          "prefill_ms",
+          "decode_ms",
+          "total_ms",
+          "prefill_steps",
+          "decode_steps"
+        ],
+        "type": "object"
+      },
+      "CursorPagination": {
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "limit": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "has_more",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "CursorPaginationQuery": {
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "InputTokensDetails": {
+        "properties": {
+          "cached_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cached_tokens"
+        ],
+        "type": "object"
+      },
+      "LiveResponse": {
+        "properties": {
+          "runtime_failure": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_poisoned": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          },
+          "uptime_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "uptime_secs"
+        ],
+        "type": "object"
+      },
+      "MediaIngestLaneSnapshot": {
+        "properties": {
+          "active": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "available": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "capacity": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "active",
+          "available",
+          "queued"
+        ],
+        "type": "object"
+      },
+      "OpenAiModel": {
+        "properties": {
+          "created": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "owned_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created",
+          "owned_by"
+        ],
+        "type": "object"
+      },
+      "OpenAiModelsResponse": {
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/OpenAiModel"
+            },
+            "type": "array"
+          },
+          "object": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "data"
+        ],
+        "type": "object"
+      },
+      "ProbeCheck": {
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "ok"
+        ],
+        "type": "object"
+      },
+      "PromptTokensDetails": {
+        "properties": {
+          "cached_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cached_tokens"
+        ],
+        "type": "object"
+      },
+      "ReadyResponse": {
+        "properties": {
+          "batch_runtime": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RuntimeQueueHealthSnapshot"
+              }
+            ]
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/ProbeCheck"
+            },
+            "type": "array"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "media_ingest": {
+            "$ref": "#/components/schemas/MediaIngestLaneSnapshot"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "realtime_session_admission": {
+            "$ref": "#/components/schemas/RealtimeSessionAdmissionSnapshot"
+          },
+          "request_admission": {
+            "$ref": "#/components/schemas/RequestAdmissionSnapshot"
+          },
+          "startup_warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "status": {
+            "type": "string"
+          },
+          "uptime_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "ready",
+          "phase",
+          "draining",
+          "uptime_secs",
+          "request_admission",
+          "realtime_session_admission",
+          "media_ingest",
+          "checks",
+          "startup_warnings"
+        ],
+        "type": "object"
+      },
+      "RealtimeSessionAdmissionSnapshot": {
+        "properties": {
+          "active": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "available": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "capacity": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "active",
+          "available"
+        ],
+        "type": "object"
+      },
+      "RequestAdmissionClassSnapshot": {
+        "properties": {
+          "available": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "capacity": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity",
+          "available"
+        ],
+        "type": "object"
+      },
+      "RequestAdmissionSnapshot": {
+        "properties": {
+          "background": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "batch": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "global": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "interactive": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "online": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "realtime": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          },
+          "streaming": {
+            "$ref": "#/components/schemas/RequestAdmissionClassSnapshot"
+          }
+        },
+        "required": [
+          "global",
+          "realtime",
+          "interactive",
+          "streaming",
+          "online",
+          "batch",
+          "background"
+        ],
+        "type": "object"
+      },
+      "ResponseDeletedObject": {
+        "properties": {
+          "deleted": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "ResponseInputItemsList": {
+        "properties": {
+          "data": {
+            "items": {},
+            "type": "array"
+          },
+          "object": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object",
+          "data"
+        ],
+        "type": "object"
+      },
+      "ResponseObject": {
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiErrorBody"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "metadata": {},
+          "model": {
+            "type": "string"
+          },
+          "object": {
+            "type": "string"
+          },
+          "output": {
+            "items": {},
+            "type": "array"
+          },
+          "status": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ResponseUsage"
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "created_at",
+          "status",
+          "model",
+          "output",
+          "usage"
+        ],
+        "type": "object"
+      },
+      "ResponseUsage": {
+        "properties": {
+          "input_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_tokens_details": {
+            "$ref": "#/components/schemas/InputTokensDetails"
+          },
+          "output_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens",
+          "input_tokens_details"
+        ],
+        "type": "object"
+      },
+      "ResponsesCreateRequest": {
+        "properties": {
+          "chat_template_kwargs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatTemplateKwargs"
+              }
+            ]
+          },
+          "enable_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "input": {},
+          "instructions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "model": {
+            "type": "string"
+          },
+          "presence_penalty": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "preserve_thinking": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChatReasoningEffort"
+              }
+            ]
+          },
+          "repetition_penalty": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "skip_special_tokens": {
+            "description": "vLLM extension: `false` keeps special tokens in the reply text.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "store": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "tool_choice": {},
+          "tools": {
+            "items": {},
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "top_k": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_p": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "type": "object"
+      },
+      "RuntimeQueueClass": {
+        "enum": [
+          "interactive_asr",
+          "batch_asr",
+          "long_form_asr",
+          "batch_tts",
+          "streaming_tts",
+          "diarization",
+          "export",
+          "evaluation",
+          "batch"
+        ],
+        "type": "string"
+      },
+      "RuntimeQueueDepth": {
+        "properties": {
+          "count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "oldest_age_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queue_class": {
+            "$ref": "#/components/schemas/RuntimeQueueClass"
+          }
+        },
+        "required": [
+          "queue_class",
+          "count",
+          "oldest_age_ms"
+        ],
+        "type": "object"
+      },
+      "RuntimeQueueHealthSnapshot": {
+        "properties": {
+          "active_workers": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "healthy_workers": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "heartbeat_stale_after_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queues": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeQueueDepth"
+            },
+            "type": "array"
+          },
+          "stale_workers": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "uncovered_queue_classes": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeQueueClass"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "heartbeat_stale_after_ms",
+          "active_workers",
+          "healthy_workers",
+          "stale_workers",
+          "queues",
+          "uncovered_queue_classes"
+        ],
+        "type": "object"
+      },
+      "ServerSentEvent": {
+        "properties": {
+          "data": {},
+          "event": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "type": "object"
+      },
+      "SpeechRequest": {
+        "properties": {
+          "allow_format_fallback": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "input": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "reference_audio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reference_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "saved_voice_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "speed": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "stream_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "top_k": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "voice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "input"
+        ],
+        "type": "object"
+      },
+      "SpeechStreamEvent": {
+        "properties": {
+          "audio_base64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audio_duration_secs": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "audio_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "event": {
+            "type": "string"
+          },
+          "generation_time_ms": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "is_final": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rtf": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sample_count": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sample_rate": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sequence": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tokens_generated": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "event"
+        ],
+        "type": "object"
+      },
+      "TranscriptionJsonRequest": {
+        "properties": {
+          "aligner_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audio_base64": {
+            "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "timestamp_granularities": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "audio_base64"
+        ],
+        "type": "object"
+      },
+      "TranscriptionMultipartRequest": {
+        "properties": {
+          "aligner_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audio_base64": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "file": {
+            "format": "binary",
+            "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "timestamp_granularities": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
+      "TranscriptionResponse": {
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "TranscriptionTimestampSegment": {
+        "properties": {
+          "end": {
+            "format": "float",
+            "type": "number"
+          },
+          "id": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "format": "float",
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "start",
+          "end",
+          "text"
+        ],
+        "type": "object"
+      },
+      "TranscriptionTimestampWord": {
+        "properties": {
+          "end": {
+            "format": "float",
+            "type": "number"
+          },
+          "start": {
+            "format": "float",
+            "type": "number"
+          },
+          "word": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "word",
+          "start",
+          "end"
+        ],
+        "type": "object"
+      },
+      "Usage": {
+        "properties": {
+          "completion_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_tokens_details": {
+            "$ref": "#/components/schemas/PromptTokensDetails"
+          },
+          "total_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens",
+          "prompt_tokens_details"
+        ],
+        "type": "object"
+      },
+      "VerboseAlignmentResponse": {
+        "properties": {
+          "alignments": {
+            "items": {
+              "$ref": "#/components/schemas/AlignmentWord"
+            },
+            "type": "array"
+          },
+          "duration": {
+            "format": "float",
+            "type": "number"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "processing_time_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "word_count": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "alignments",
+          "duration",
+          "word_count",
+          "processing_time_ms"
+        ],
+        "type": "object"
+      },
+      "VerboseTranscriptionResponse": {
+        "properties": {
+          "duration": {
+            "format": "float",
+            "type": "number"
+          },
+          "izwi_asr_diagnostics": {},
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "processing_time_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "rtf": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "segments": {
+            "items": {
+              "$ref": "#/components/schemas/TranscriptionTimestampSegment"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "words": {
+            "items": {
+              "$ref": "#/components/schemas/TranscriptionTimestampWord"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "text",
+          "duration",
+          "processing_time_ms"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Local HTTP API for the Izwi runtime, OpenAI-compatible endpoints, and first-party workflow surfaces.",
+    "license": {
+      "identifier": "Apache-2.0",
+      "name": "Apache-2.0"
+    },
+    "title": "Izwi API",
+    "version": "0.1.0-beta-18"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/docs": {
+      "get": {
+        "description": "Open the local Scalar API reference UI.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "Get API reference",
+        "tags": [
+          "Reference"
+        ]
+      }
+    },
+    "/docs/scalar.js": {
+      "get": {
+        "description": "Fetch the bundled Scalar API reference JavaScript asset.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "Get Scalar JavaScript",
+        "tags": [
+          "Reference"
+        ]
+      }
+    },
+    "/livez": {
+      "get": {
+        "operationId": "livez",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            },
+            "description": "Server process is alive"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            },
+            "description": "Inference runtime failed permanently; restart the process"
+          }
+        },
+        "summary": "Check liveness",
+        "tags": [
+          "Runtime"
+        ]
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "description": "Fetch the generated OpenAPI document for the local server.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        },
+        "summary": "Get OpenAPI document",
+        "tags": [
+          "Reference"
+        ]
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            },
+            "description": "Server is ready to serve requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            },
+            "description": "Server is alive but not ready"
+          }
+        },
+        "summary": "Check readiness",
+        "tags": [
+          "Runtime"
+        ]
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "operationId": "create_chat_completion",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatCompletionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCompletionResponse"
+                }
+              }
+            },
+            "description": "Chat completion JSON when stream is false; server-sent events when stream is true"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error"
+          }
+        },
+        "summary": "Create chat completion",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "list_models",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiModelsResponse"
+                }
+              }
+            },
+            "description": "List locally available OpenAI-compatible models"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Server error"
+          }
+        },
+        "summary": "List models",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    },
+    "/v1/models/{model}": {
+      "get": {
+        "operationId": "get_model",
+        "parameters": [
+          {
+            "description": "Model identifier",
+            "in": "path",
+            "name": "model",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiModel"
+                }
+              }
+            },
+            "description": "Retrieve a locally available OpenAI-compatible model"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unknown or unavailable model (`model_not_found`)"
+          }
+        },
+        "summary": "Get model",
+        "tags": [
+          "OpenAI Compatible"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Local Izwi server",
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "description": "Runtime health, readiness, and operational probes",
+      "name": "Runtime"
+    },
+    {
+      "description": "OpenAI-compatible API surface, including preview compatibility routes",
+      "name": "OpenAI Compatible"
+    },
+    {
+      "description": "Local administrative API surface",
+      "name": "Admin"
+    },
+    {
+      "description": "Preview persisted transcription workflows",
+      "name": "Speech to Text"
+    },
+    {
+      "description": "Durable batch runtime job management",
+      "name": "Jobs"
+    },
+    {
+      "description": "Preview speaker diarization and speaker-labeling workflows",
+      "name": "Diarization"
+    },
+    {
+      "description": "Preview persisted speech generation and saved voice workflows",
+      "name": "Text to Speech"
+    },
+    {
+      "description": "Preview Studio project workflow APIs",
+      "name": "Studio"
+    },
+    {
+      "description": "Preview chat thread and agent session APIs",
+      "name": "Chat"
+    },
+    {
+      "description": "Preview voice profile, memory, and session APIs",
+      "name": "Voice"
+    },
+    {
+      "description": "Preview local media serving APIs",
+      "name": "Media"
+    },
+    {
+      "description": "Preview onboarding and user preference APIs",
+      "name": "Preferences"
+    },
+    {
+      "description": "Preview WebSocket realtime APIs",
+      "name": "Realtime"
+    },
+    {
+      "description": "Local API reference and OpenAPI document routes",
+      "name": "Reference"
+    }
+  ]
+}

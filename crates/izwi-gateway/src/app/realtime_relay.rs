@@ -53,16 +53,16 @@ const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames queued toward one peer while its writer is busy.
 const RELAY_QUEUE_FRAMES: usize = 64;
 /// How long an unused registration slot is held before TTL eviction.
-pub(crate) const REGISTRATION_TTL: Duration = Duration::from_secs(3600);
+pub const REGISTRATION_TTL: Duration = Duration::from_secs(3600);
 /// Client control frames are tiny; anything larger is refused before parse.
 const RELAY_CONTROL_FRAME_BYTES: usize = 64 * 1024;
 /// Upper bound for the relay's configured session capacity.
-pub(crate) const MAX_RELAY_SESSIONS: usize = 4_096;
+pub const MAX_RELAY_SESSIONS: usize = 4_096;
 
 /// Bounded configuration for the relay, resolved once at gateway boot. Each
 /// stage pool is optional; boot fails closed only when both are absent.
 #[derive(Clone)]
-pub(crate) struct RealtimeRelayConfig {
+pub struct RealtimeRelayConfig {
     /// Approved speech_to_text deployment for ASR-stream sessions.
     pub deployment_id: Option<DeploymentId>,
     /// Optional second stage: the approved text_to_speech deployment serving
@@ -80,7 +80,7 @@ pub(crate) struct RealtimeRelayConfig {
 /// The resolved worker pool for one relayed session, keyed by the admit's
 /// task.
 #[derive(Debug, Clone)]
-pub(crate) struct RelayStage {
+pub struct RelayStage {
     pub deployment_id: DeploymentId,
     pub task: TaskKind,
     pub input_format: InputFormat,
@@ -90,12 +90,12 @@ pub(crate) struct RelayStage {
 /// One live relayed session as observed by the gateway: when it was
 /// registered, so a session whose cleanup never ran expires.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionRegistration {
+pub struct SessionRegistration {
     pub created_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionRegistryError {
+pub enum SessionRegistryError {
     DuplicateSession,
     Full,
 }
@@ -103,7 +103,7 @@ pub(crate) enum SessionRegistryError {
 /// Bounded live-session registry: session id -> registration, with TTL
 /// eviction of abandoned entries on insert. Mirrors the conversation pin
 /// table's bounded-map discipline.
-pub(crate) struct RealtimeSessionRegistry {
+pub struct RealtimeSessionRegistry {
     entries: Mutex<RegistryState>,
     max_sessions: usize,
 }
@@ -124,7 +124,7 @@ impl RealtimeSessionRegistry {
         }
     }
 
-    pub(crate) fn active(&self) -> usize {
+    pub fn active(&self) -> usize {
         self.entries
             .lock()
             .expect("registry poisoned")
@@ -132,7 +132,7 @@ impl RealtimeSessionRegistry {
             .len()
     }
 
-    pub(crate) fn insert(
+    pub fn insert(
         &self,
         session_id: SessionId,
         registration: SessionRegistration,
@@ -164,7 +164,7 @@ impl RealtimeSessionRegistry {
         Ok(())
     }
 
-    pub(crate) fn remove(&self, session_id: &SessionId) -> bool {
+    pub fn remove(&self, session_id: &SessionId) -> bool {
         let mut state = self.entries.lock().expect("registry poisoned");
         if state.by_session.remove(session_id).is_some() {
             state.order.retain(|id| id != session_id);
@@ -220,21 +220,21 @@ impl GatewayRealtimeRelay {
         })
     }
 
-    pub(crate) fn sessions(&self) -> &RealtimeSessionRegistry {
+    pub fn sessions(&self) -> &RealtimeSessionRegistry {
         &self.sessions
     }
 
-    pub(crate) fn config(&self) -> &RealtimeRelayConfig {
+    pub fn config(&self) -> &RealtimeRelayConfig {
         &self.config
     }
 
-    pub(crate) fn registry(&self) -> &WorkerRegistry {
+    pub fn registry(&self) -> &WorkerRegistry {
         &self.registry
     }
 
     /// Dials an admitted worker session over the shared serving-client
     /// dialer, with the gateway's worker TLS.
-    pub(crate) async fn dial_worker(
+    pub async fn dial_worker(
         &self,
         endpoint: &str,
         admit: &RealtimeSessionAdmit,
@@ -273,7 +273,7 @@ fn offers_realtime_subprotocol(headers: &HeaderMap) -> bool {
 /// stack. Clients offering the worker subprotocol get the byte-identical
 /// passthrough relay; everyone else gets the public transcription-realtime
 /// translator, so a single-node client can repoint at the gateway unchanged.
-pub(crate) async fn relay_socket(
+pub async fn relay_socket(
     State(state): State<GatewayState>,
     Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
@@ -707,13 +707,13 @@ async fn forward_worker_frames(
 }
 
 /// Holds the registry entry until the session ends on any path.
-pub(crate) struct SessionGuard {
+pub struct SessionGuard {
     relay: Arc<GatewayRealtimeRelay>,
     session_id: SessionId,
 }
 
 impl SessionGuard {
-    pub(crate) fn new(relay: Arc<GatewayRealtimeRelay>, session_id: SessionId) -> Self {
+    pub fn new(relay: Arc<GatewayRealtimeRelay>, session_id: SessionId) -> Self {
         Self { relay, session_id }
     }
 }
@@ -724,7 +724,7 @@ impl Drop for SessionGuard {
     }
 }
 
-pub(crate) fn realtime_selection_request(
+pub fn realtime_selection_request(
     config: &RealtimeRelayConfig,
     stage: &RelayStage,
 ) -> WorkerSelectionRequest {
@@ -746,7 +746,7 @@ pub(crate) fn realtime_selection_request(
     }
 }
 
-pub(crate) fn attested_caller(
+pub fn attested_caller(
     relay: &GatewayRealtimeRelay,
     context: &RequestContext,
 ) -> GatewayAttestedCallerContext {
@@ -850,14 +850,14 @@ fn error_message(
     serde_json::to_string(&RealtimeServerFrame::Event { event }).expect("error event encodes")
 }
 
-pub(crate) async fn close_client(
+pub async fn close_client(
     client_sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     code: Option<RealtimeSessionCloseCode>,
 ) {
     let _ = client_sink.send(close_message(code)).await;
 }
 
-pub(crate) async fn reject_client(
+pub async fn reject_client(
     client_sink: &mut futures::stream::SplitSink<WebSocket, Message>,
     status: StatusCode,
     message: &str,
@@ -877,7 +877,7 @@ pub(crate) async fn reject_client(
 }
 
 /// Worker-side session transport with the admitted echo already consumed.
-pub(crate) struct WorkerSide {
+pub struct WorkerSide {
     pub sink: futures::stream::SplitSink<WorkerSocket, WireMessage>,
     pub source: futures::stream::SplitStream<WorkerSocket>,
     pub admitted_message: Message,

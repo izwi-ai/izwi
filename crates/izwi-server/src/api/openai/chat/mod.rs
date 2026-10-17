@@ -1,8 +1,7 @@
 //! OpenAI-compatible chat resources.
 
 pub mod completions;
-pub use izwi_gateway::api::openai::chat::{dto, reasoning};
-mod stream;
+pub use izwi_gateway::api::openai::chat::dto;
 
 use axum::{routing::post, Router};
 

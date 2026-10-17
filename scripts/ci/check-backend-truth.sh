@@ -382,22 +382,24 @@ run_cargo_serving() {
 
     # Every serving crate's unit and integration tests (the client's contract
     # suites run in the worker crate, against the real worker), plus the
-    # gateway process suites and the process harness they spawn through. The
-    # fleet rig's gateway pairs share one coordination database per test, so
-    # it runs serially.
+    # gateway's own tests and process suites and the process harness they
+    # spawn through. The fleet rig's gateway pairs share one coordination
+    # database per test, so it runs serially.
     cargo test --locked --no-fail-fast \
         -p izwi-test-process \
         -p izwi-env \
-        -p izwi-gateway \
         -p izwi-serving-protocol \
         -p izwi-serving-client \
         -p izwi-serving-fence \
         -p izwi-serving-supervisor \
         -p izwi-serving-worker
-    cargo test --locked --no-fail-fast -p izwi-server \
+    cargo test --locked --no-fail-fast -p izwi-gateway \
+        --lib --bins \
         --test gateway_only_process \
         --test rollout_gateway
-    cargo test --locked -p izwi-server --test fleet_rig -- --test-threads=1
+    cargo test --locked -p izwi-gateway --test fleet_rig -- --test-threads=1
+    # `izwi-server --role gateway` delegates to the same gateway.
+    cargo test --locked -p izwi-server --test gateway_role_process
 }
 
 run_cargo_fleet_stores() {
@@ -411,7 +413,7 @@ run_cargo_fleet_stores() {
         exit 1
     fi
 
-    cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
+    cargo test --locked -p izwi-gateway --features db-postgres --lib fleet_postgres
 
     # The durable store suite (migrations and the shipped schema in izwi-db;
     # jobs, stages, claims, leases, idempotency, artifacts and retention), the batch
@@ -438,7 +440,7 @@ run_fleet_rig_postgres() {
         exit 1
     fi
 
-    cargo test --locked -p izwi-server --features db-postgres --test fleet_rig -- --test-threads=1
+    cargo test --locked -p izwi-gateway --features db-postgres --test fleet_rig -- --test-threads=1
 }
 
 run_cargo_metal() {

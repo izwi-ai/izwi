@@ -39,11 +39,11 @@ use crate::{
 
 /// Bounded batch size for one maintenance-sweep pass, matching the store's
 /// bounded reap helper.
-pub(crate) const FLEET_MAINTENANCE_BATCH: usize = 1024;
+pub const FLEET_MAINTENANCE_BATCH: usize = 1024;
 
 /// Cadence of the background maintenance sweep. Slow by design: the reader
 /// side already ignores expired rows, so the sweep only reclaims space.
-pub(crate) const FLEET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+pub const FLEET_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Bound on one background status publish (one upsert plus one count). The
 /// publisher runs off the status poller, so this only keeps a hung store
@@ -174,14 +174,14 @@ impl FleetCoordinator {
     }
 
     #[cfg(test)]
-    pub(crate) fn store(&self) -> &FleetStore {
+    pub fn store(&self) -> &FleetStore {
         &self.store
     }
 
     /// Opens (and migrates) the store up front, as gateway boot does, so the
     /// first claim is not measured against the lazy first open.
     #[cfg(test)]
-    pub(crate) async fn opened(self) -> Self {
+    pub async fn opened(self) -> Self {
         self.store.connection().await.expect("fleet store opens");
         self
     }
@@ -322,9 +322,8 @@ mod tests {
 
     async fn coordinator() -> (Arc<FleetCoordinator>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        let mut store = FleetStore::new(StoreDatabase::new(
-            root.path().join("fleet-coord.sqlite3"),
-        ));
+        let mut store =
+            FleetStore::new(StoreDatabase::new(root.path().join("fleet-coord.sqlite3")));
         store.set_test_clock(Arc::new(AtomicI64::new(1_000)));
         (
             Arc::new(
@@ -342,9 +341,8 @@ mod tests {
         claim_ttl: Duration,
     ) -> (Arc<FleetCoordinator>, Arc<AtomicI64>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
-        let mut store = FleetStore::new(StoreDatabase::new(
-            root.path().join("fleet-coord.sqlite3"),
-        ));
+        let mut store =
+            FleetStore::new(StoreDatabase::new(root.path().join("fleet-coord.sqlite3")));
         let clock = Arc::new(AtomicI64::new(1_000));
         store.set_test_clock(clock.clone());
         (
@@ -482,9 +480,8 @@ mod tests {
     #[tokio::test]
     async fn hung_store_claims_degrade_to_none_and_late_claims_release() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = FleetStore::new(StoreDatabase::new(
-            root.path().join("fleet-coord.sqlite3"),
-        ));
+        let mut store =
+            FleetStore::new(StoreDatabase::new(root.path().join("fleet-coord.sqlite3")));
         let faults = Arc::new(crate::gateway_fleet::FleetFaults::default());
         store.set_faults_for_test(Arc::clone(&faults));
         let coordinator = Arc::new(

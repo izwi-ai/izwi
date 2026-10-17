@@ -5,11 +5,12 @@
 //! command-line arguments or part of a derived `Debug` representation.
 
 use axum::http::{header, HeaderMap};
-use izwi_core::ServeRuntimeConfig;
 use izwi_hooks::{HookMetadata, Principal};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
+
+use crate::config::GatewayServeConfig;
 
 pub const DEFAULT_GATEWAY_MAX_CHAT_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_GATEWAY_CHAT_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -210,7 +211,7 @@ impl GatewayPerimeterConfig {
         })
     }
 
-    pub(crate) fn authenticate(&self, headers: &HeaderMap) -> Option<Principal> {
+    pub fn authenticate(&self, headers: &HeaderMap) -> Option<Principal> {
         if !authenticate_bearer(headers, self.api_key.as_ref()) {
             return None;
         }
@@ -220,7 +221,7 @@ impl GatewayPerimeterConfig {
     /// Constant-time membership test of `candidate` against every perimeter
     /// credential. Scoped key provisioning uses this to reject material that
     /// would alias a perimeter credential.
-    pub(crate) fn contains_credential(&self, candidate: &[u8]) -> bool {
+    pub fn contains_credential(&self, candidate: &[u8]) -> bool {
         let matches_api_key = constant_time_eq(candidate, self.api_key.as_ref());
         let matches_metrics_key = self
             .metrics_api_key
@@ -233,21 +234,21 @@ impl GatewayPerimeterConfig {
         matches_api_key || matches_metrics_key || matches_admin_key
     }
 
-    pub(crate) fn metrics_enabled(&self) -> bool {
+    pub fn metrics_enabled(&self) -> bool {
         self.metrics_api_key.is_some()
     }
 
-    pub(crate) fn authenticate_metrics(&self, headers: &HeaderMap) -> bool {
+    pub fn authenticate_metrics(&self, headers: &HeaderMap) -> bool {
         self.metrics_api_key
             .as_deref()
             .is_some_and(|expected| authenticate_bearer(headers, expected))
     }
 
-    pub(crate) fn admin_enabled(&self) -> bool {
+    pub fn admin_enabled(&self) -> bool {
         self.admin_api_key.is_some()
     }
 
-    pub(crate) fn authenticate_admin(&self, headers: &HeaderMap) -> bool {
+    pub fn authenticate_admin(&self, headers: &HeaderMap) -> bool {
         self.admin_api_key
             .as_deref()
             .is_some_and(|expected| authenticate_bearer(headers, expected))
@@ -259,7 +260,7 @@ impl GatewayPerimeterConfig {
 
     pub fn validate_public_ingress(
         &self,
-        serve_config: &ServeRuntimeConfig,
+        serve_config: &GatewayServeConfig,
     ) -> Result<(), GatewayPerimeterConfigError> {
         if serve_config.cors_enabled
             && (serve_config.cors_origins.is_empty()
@@ -289,7 +290,7 @@ impl GatewayPerimeterConfig {
 /// without comparing it to any expectation. The token charset is restricted
 /// exactly as [`authenticate_bearer`] so downstream hash comparisons operate
 /// on the same accepted language.
-pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
     let value = authorization_values
         .next()
@@ -403,7 +404,7 @@ fn optional_admin_credential_from_env(
     Ok(Some((secret, secret_ref)))
 }
 
-pub(crate) fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
+pub fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfigError> {
     if !(MIN_API_KEY_BYTES..=MAX_API_KEY_BYTES).contains(&secret.len())
         || !secret.as_bytes().iter().all(|byte| byte.is_ascii_graphic())
     {
@@ -414,7 +415,7 @@ pub(crate) fn validate_secret(secret: &str) -> Result<(), GatewayPerimeterConfig
 
 /// Shared bounded-identity policy for principal and tenant identifiers:
 /// `[A-Za-z0-9_-.:]`, 1..=128 bytes.
-pub(crate) fn valid_identity(value: &str) -> bool {
+pub fn valid_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_IDENTITY_BYTES
         && value
@@ -422,7 +423,7 @@ pub(crate) fn valid_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-pub(crate) fn valid_env_name(name: &str) -> bool {
+pub fn valid_env_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_SECRET_REF_BYTES.saturating_sub(4)
         && name.bytes().enumerate().all(|(index, byte)| {
@@ -468,7 +469,7 @@ fn bool_from_env(name: &str) -> Result<bool, GatewayPerimeterConfigError> {
     }
 }
 
-pub(crate) fn is_loopback_host(host: &str) -> bool {
+pub fn is_loopback_host(host: &str) -> bool {
     let host = host.trim().trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -476,7 +477,7 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut difference = left.len() ^ right.len();
     for index in 0..MAX_API_KEY_BYTES {
         difference |= usize::from(
@@ -666,8 +667,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let defaults = ServeRuntimeConfig::default();
-        let wildcard_cors = ServeRuntimeConfig {
+        let defaults = GatewayServeConfig::default();
+        let wildcard_cors = GatewayServeConfig {
             cors_enabled: true,
             cors_origins: vec!["*".to_string()],
             ..defaults.clone()
@@ -677,7 +678,7 @@ mod tests {
             Err(GatewayPerimeterConfigError::WildcardCors)
         );
 
-        let explicit_cors = ServeRuntimeConfig {
+        let explicit_cors = GatewayServeConfig {
             host: "0.0.0.0".to_string(),
             cors_enabled: true,
             cors_origins: vec!["https://api.example.test".to_string()],
@@ -703,7 +704,7 @@ mod tests {
             .validate_public_ingress(&explicit_cors)
             .unwrap();
 
-        let loopback = ServeRuntimeConfig {
+        let loopback = GatewayServeConfig {
             host: "127.0.0.1".to_string(),
             ..explicit_cors
         };

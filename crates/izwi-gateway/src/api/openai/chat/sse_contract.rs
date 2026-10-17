@@ -437,14 +437,14 @@ fn stream_body(extra: Value) -> Value {
     body
 }
 
-fn logprob(token: &str, alternatives: &[(&str, f32)]) -> izwi_core::engine::TokenLogprob {
-    izwi_core::engine::TokenLogprob {
+fn logprob(token: &str, alternatives: &[(&str, f32)]) -> izwi_model_catalog::TokenLogprob {
+    izwi_model_catalog::TokenLogprob {
         token: token.to_string(),
         logprob: alternatives.first().map_or(-0.5, |(_, logprob)| *logprob),
         bytes: token.as_bytes().to_vec(),
         top_logprobs: alternatives
             .iter()
-            .map(|(token, logprob)| izwi_core::engine::TopTokenLogprob {
+            .map(|(token, logprob)| izwi_model_catalog::TopTokenLogprob {
                 token: token.to_string(),
                 logprob: *logprob,
                 bytes: token.as_bytes().to_vec(),

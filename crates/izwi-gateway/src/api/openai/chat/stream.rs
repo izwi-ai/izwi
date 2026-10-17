@@ -15,7 +15,7 @@ use crate::api::request_context::StreamOutcome;
 use crate::app::chat::{ChatStreamEvent, ChatStreamObserver};
 use crate::error::{ApiError, ErrorScope};
 use crate::ids::new_prefixed_id;
-use izwi_core::ChatGeneration;
+use izwi_model_catalog::ChatGeneration;
 
 const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
 
@@ -25,7 +25,7 @@ fn openai_chat_stream_error_payload(scope: &ErrorScope, error: &ApiError) -> Str
     scope.openai_body(error).to_string()
 }
 
-pub(crate) fn openai_chat_stream_interruption_payload(
+pub fn openai_chat_stream_interruption_payload(
     scope: &ErrorScope,
     saw_terminal: bool,
 ) -> Option<String> {
@@ -35,9 +35,9 @@ pub(crate) fn openai_chat_stream_interruption_payload(
 }
 
 /// Tells the request audit how a stream ended in-band.
-pub(crate) struct AuditedStream<O> {
-    pub(crate) observer: O,
-    pub(crate) outcome: StreamOutcome,
+pub struct AuditedStream<O> {
+    pub observer: O,
+    pub outcome: StreamOutcome,
 }
 
 impl<O: ChatStreamObserver> ChatStreamObserver for AuditedStream<O> {
@@ -126,7 +126,7 @@ fn answer_delta(reasoning: String, parsed: ParsedOutput) -> OpenAiDelta {
     }
 }
 
-pub(crate) fn render_chat_stream(
+pub fn render_chat_stream(
     req: ChatCompletionRequest,
     model_id: String,
     mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,

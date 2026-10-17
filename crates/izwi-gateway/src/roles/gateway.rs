@@ -2,8 +2,8 @@
 //! workers and serves it.
 
 use anyhow::Context;
-use izwi_core::{parse_model_variant, ServeRuntimeConfig};
 use izwi_hooks::EnterpriseHooks;
+use izwi_model_catalog::parse_model_variant;
 use izwi_serving_client::WorkerClientConfig;
 use izwi_serving_protocol::{
     render_approvals_text, CredentialId, DeploymentId, ModelAlias, ModelGeneration, NdjsonLimits,
@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-use crate::cli::{BackendArg, GatewayTopology, ServerArgs};
-use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
+use crate::cli::{BackendArg, GatewayArgs, GatewayTopology};
+use crate::config::GatewayConfig;
+use crate::logging::{service_name, SERVICE_VERSION};
 use crate::roles::gateway_workers::{
     gateway_worker_client, validate_status_cadence, AdoptedGatewayWorker, DuplicateGatewayWorker,
     GatewayWorkerAdopter, GatewayWorkerStatusPoller,
@@ -24,12 +25,12 @@ use crate::shutdown::{
     gateway_shutdown_requested, serve_with_shutdown_plan, ShutdownPhases, ShutdownPlan,
 };
 use crate::{
-    app, gateway, gateway_deployments, gateway_shared_approvals, gateway_worker_tls, logging,
+    app, gateway, gateway_deployments, gateway_shared_approvals, gateway_worker_tls,
     worker_registry, GatewayPerimeterConfig, GatewayRateQuotaConfig,
     GatewayTenantConcurrencyConfig,
 };
 
-pub(crate) const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
+pub const MAX_CONFIGURED_GATEWAY_WORKERS: usize = 256;
 const MAX_GATEWAY_STATUS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_GATEWAY_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_GATEWAY_STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -79,17 +80,17 @@ fn apply_fleet_partition(
     (rate_quota, tenant_concurrency)
 }
 
-pub(crate) async fn run_gateway(
-    args: ServerArgs,
-    serve_config: ServeRuntimeConfig,
+/// Serves the gateway role until shutdown. The caller has set up logging.
+pub async fn run_gateway(
+    config: GatewayConfig,
     enterprise_hooks: EnterpriseHooks,
 ) -> anyhow::Result<()> {
-    logging::init_tracing(args.log_format);
+    let args = &config.args;
     let perimeter = GatewayPerimeterConfig::from_env()?;
     let fleet_partition = crate::gateway_fleet::FleetPartition::from_env()?;
     if let Some(partition) = fleet_partition {
         info!(
-            service = SERVICE_NAME,
+            service = service_name(),
             version = SERVICE_VERSION,
             partition = partition.index(),
             fleet_size = partition.size(),
@@ -99,7 +100,7 @@ pub(crate) async fn run_gateway(
     if let Ok(Some(shared)) = crate::gateway_shared_approvals::SharedApprovalsConfig::from_env() {
         match crate::gateway_shared_approvals::SharedApprovalsView::load(shared) {
             Ok(view) => info!(
-                service = SERVICE_NAME,
+                service = service_name(),
                 version = SERVICE_VERSION,
                 approvals = view.approvals().len(),
                 "Shared fleet approvals loaded: all gateways reading this file approve the same worker set"
@@ -111,7 +112,7 @@ pub(crate) async fn run_gateway(
     let tenant_concurrency = GatewayTenantConcurrencyConfig::from_env(args.gateway_max_in_flight)?;
     let (rate_quota, tenant_concurrency) =
         apply_fleet_partition(rate_quota, tenant_concurrency, fleet_partition);
-    perimeter.validate_public_ingress(&serve_config)?;
+    perimeter.validate_public_ingress(&config.serve)?;
     // DS0.5 scoped credentials: the manifest is the only activation switch.
     // Unset keeps the durable store untouched and authentication byte-identical.
     let principal_keys = match crate::gateway_principal_keys::manifest_path_from_env()? {
@@ -124,7 +125,7 @@ pub(crate) async fn run_gateway(
             )
             .await?;
             info!(
-                service = SERVICE_NAME,
+                service = service_name(),
                 version = SERVICE_VERSION,
                 principals = directory.len(),
                 "Gateway scoped principal keys loaded from the durable store"
@@ -133,8 +134,7 @@ pub(crate) async fn run_gateway(
         }
         None => crate::gateway_principal_keys::GatewayPrincipalDirectory::empty(),
     };
-    let (state, _status_poller) =
-        gateway_state(&args, &serve_config, enterprise_hooks, perimeter).await?;
+    let (state, _status_poller) = gateway_state(&config, enterprise_hooks, perimeter).await?;
     let state = state
         .with_rate_quota_config(rate_quota)
         .with_tenant_concurrency_config(tenant_concurrency)
@@ -143,12 +143,12 @@ pub(crate) async fn run_gateway(
     state.lifecycle.mark_ready();
 
     info!(
-        service = SERVICE_NAME,
+        service = service_name(),
         version = SERVICE_VERSION,
         "Starting Izwi public API gateway"
     );
-    let app = gateway::create_gateway_router(state.clone(), &serve_config);
-    let addr = format!("{}:{}", serve_config.host, serve_config.port);
+    let app = gateway::create_gateway_router(state.clone(), &config.serve);
+    let addr = format!("{}:{}", config.serve.host, config.serve.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Gateway listening on http://{}", listener.local_addr()?);
 
@@ -159,7 +159,7 @@ pub(crate) async fn run_gateway(
     serve_gateway(listener, app, state, gateway_shutdown_requested(), plan).await
 }
 
-pub(crate) async fn serve_gateway<S>(
+pub async fn serve_gateway<S>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     state: gateway::GatewayState,
@@ -204,12 +204,12 @@ impl ShutdownPhases for gateway::GatewayState {
     }
 }
 
-pub(crate) async fn gateway_state(
-    args: &ServerArgs,
-    serve_config: &ServeRuntimeConfig,
+pub async fn gateway_state(
+    config: &GatewayConfig,
     enterprise_hooks: EnterpriseHooks,
     perimeter: GatewayPerimeterConfig,
 ) -> anyhow::Result<(gateway::GatewayState, GatewayWorkerStatusPoller)> {
+    let args = &config.args;
     validate_gateway_topology_source(args)?;
     if args.worker_endpoint.is_some()
         && !(args.gateway_worker_endpoints.is_empty() && args.gateway_worker_approvals.is_empty())
@@ -225,7 +225,7 @@ pub(crate) async fn gateway_state(
             );
         }
         warn!(
-            service = SERVICE_NAME,
+            service = service_name(),
             version = SERVICE_VERSION,
             "--worker-incarnation is ignored: the gateway fences every attempt to the worker incarnation it observed and adopts a restarted worker"
         );
@@ -364,7 +364,7 @@ pub(crate) async fn gateway_state(
                     public_model_variant,
                     deployment_id,
                     policy_revision: policy_revision.clone(),
-                    backend_policy: gateway_backend_policy(args.backend.as_ref()),
+                    backend_policy: gateway_backend_policy(config.backend.as_ref()),
                     max_queue_wait: Duration::from_millis(args.gateway_worker_queue_wait_ms),
                     max_output_tokens: 4096,
                     max_output_bytes: 512 * 1024,
@@ -399,9 +399,7 @@ pub(crate) async fn gateway_state(
                     crate::db::StoreDatabase::from_coordination_url(url)
                 }
             };
-            let store = crate::gateway_fleet::FleetStore::new(
-                store_database,
-            );
+            let store = crate::gateway_fleet::FleetStore::new(store_database);
             // Two fleet gateways booting simultaneously race the SQLite
             // journal-mode setup before the busy timeout is in play, so the
             // first open retries briefly before failing closed.
@@ -427,7 +425,7 @@ pub(crate) async fn gateway_state(
             );
             let released = coordinator.release_own_claims().await;
             info!(
-                service = SERVICE_NAME,
+                service = service_name(),
                 version = SERVICE_VERSION,
                 gateway_id = coordinator.gateway_id(),
                 released_own_claims = released,
@@ -456,7 +454,7 @@ pub(crate) async fn gateway_state(
                     let reaped = maintenance_coordinator.maintenance_sweep().await;
                     if reaped > 0 {
                         debug!(
-                            service = SERVICE_NAME,
+                            service = service_name(),
                             reaped_claims = reaped,
                             "Fleet coordination maintenance sweep"
                         );
@@ -553,7 +551,7 @@ pub(crate) async fn gateway_state(
                                     refresh_reporter.record(Some(view.file_digest()), &effective);
                                     last_applied = Some(rendered);
                                     info!(
-                                        service = SERVICE_NAME,
+                                        service = service_name(),
                                         version = SERVICE_VERSION,
                                         approvals = effective.len(),
                                         added_generations = outcome.added.len(),
@@ -609,12 +607,14 @@ pub(crate) async fn gateway_state(
             primary,
             enterprise_hooks,
             perimeter,
-            serve_config.request_timeout_secs,
+            config.serve.request_timeout_secs,
             args.gateway_max_in_flight,
         ),
         gateway::GatewayState::with_chat_model,
     );
-    let state = state.with_approvals_reporter(approvals_reporter);
+    let state = state
+        .with_approvals_reporter(approvals_reporter)
+        .with_compat_profile(config.compat_profile);
     let state = if args.gateway_realtime == "on" {
         // Stage pools resolve per approved task for the public model; boot
         // fails closed only when no realtime stage can be served at all. A
@@ -648,7 +648,7 @@ pub(crate) async fn gateway_state(
                 tts_deployment_id,
                 public_model: public_model.clone(),
                 policy_revision: policy_revision.clone(),
-                backend_policy: gateway_backend_policy(args.backend.as_ref()),
+                backend_policy: gateway_backend_policy(config.backend.as_ref()),
                 max_sessions: args.gateway_realtime_max_sessions,
                 session_budget: Duration::from_millis(args.gateway_realtime_session_budget_ms),
             },
@@ -657,7 +657,7 @@ pub(crate) async fn gateway_state(
         )
         .map_err(|error| anyhow::anyhow!(error))?;
         info!(
-            service = SERVICE_NAME,
+            service = service_name(),
             version = SERVICE_VERSION,
             asr_stage = relay.config().deployment_id.is_some(),
             tts_stage = relay.config().tts_deployment_id.is_some(),
@@ -673,7 +673,7 @@ pub(crate) async fn gateway_state(
         tasks,
     };
     info!(
-        service = SERVICE_NAME,
+        service = service_name(),
         version = SERVICE_VERSION,
         pollers = poller.poller_count,
         interval_ms = polling_interval.as_millis() as u64,
@@ -682,8 +682,8 @@ pub(crate) async fn gateway_state(
     Ok((state, poller))
 }
 
-pub(crate) fn configured_gateway_worker_approvals(
-    args: &ServerArgs,
+pub fn configured_gateway_worker_approvals(
+    args: &GatewayArgs,
     legacy_public_model: &ModelAlias,
 ) -> anyhow::Result<(
     Vec<gateway_deployments::GatewayWorkerApproval>,
@@ -754,7 +754,7 @@ pub(crate) fn configured_gateway_worker_approvals(
     Ok((cli_only, merged, shared_view))
 }
 
-pub(crate) fn validate_gateway_topology_policy(
+pub fn validate_gateway_topology_policy(
     topology: GatewayTopology,
     approvals: &[gateway_deployments::GatewayWorkerApproval],
     tls: &izwi_serving_client::WorkerClientTlsConfig,
@@ -789,7 +789,7 @@ pub(crate) fn validate_gateway_topology_policy(
     Ok(())
 }
 
-pub(crate) fn validate_gateway_topology_source(args: &ServerArgs) -> anyhow::Result<()> {
+pub fn validate_gateway_topology_source(args: &GatewayArgs) -> anyhow::Result<()> {
     if args.gateway_topology == GatewayTopology::FleetOneGateway
         && args.gateway_worker_approvals.is_empty()
     {
@@ -808,7 +808,7 @@ fn required_gateway_value<'a>(value: &'a Option<String>, name: &str) -> anyhow::
         .ok_or_else(|| anyhow::anyhow!("gateway mode requires {name}"))
 }
 
-fn gateway_worker_credentials(args: &ServerArgs) -> anyhow::Result<ServiceCredentials> {
+fn gateway_worker_credentials(args: &GatewayArgs) -> anyhow::Result<ServiceCredentials> {
     Ok(ServiceCredentials {
         credential_id: CredentialId::new(required_gateway_value(
             &args.worker_credential_id,
@@ -830,7 +830,7 @@ fn gateway_backend_policy(backend: Option<&BackendArg>) -> worker_registry::Back
     }
 }
 
-pub(crate) fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
+pub fn validate_gateway_limits(args: &GatewayArgs) -> anyhow::Result<()> {
     if args.gateway_max_in_flight == 0
         || args.gateway_max_in_flight > tokio::sync::Semaphore::MAX_PERMITS
     {
@@ -926,7 +926,7 @@ pub(crate) fn validate_gateway_limits(args: &ServerArgs) -> anyhow::Result<()> {
 
 /// Parses and bounds-checks the routing knobs. Fail-closed on any
 /// out-of-range or non-`on|off` value so typos never silently change routing.
-fn validate_router_args(args: &ServerArgs) -> anyhow::Result<()> {
+fn validate_router_args(args: &GatewayArgs) -> anyhow::Result<()> {
     match args.gateway_router_prefix_affinity.as_str() {
         "on" | "off" => {}
         other => {
@@ -954,7 +954,7 @@ fn validate_router_args(args: &ServerArgs) -> anyhow::Result<()> {
 }
 
 /// Parses and bounds-checks the realtime relay knobs (DS3.6).
-fn validate_realtime_relay_args(args: &ServerArgs) -> anyhow::Result<()> {
+fn validate_realtime_relay_args(args: &GatewayArgs) -> anyhow::Result<()> {
     match args.gateway_realtime.as_str() {
         "on" | "off" => {}
         other => anyhow::bail!("--gateway-realtime must be `on` or `off`, got `{other}`"),
@@ -979,7 +979,7 @@ fn validate_realtime_relay_args(args: &ServerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prefix_affinity_config(args: &ServerArgs) -> Option<app::prefix_router::PrefixAffinityConfig> {
+fn prefix_affinity_config(args: &GatewayArgs) -> Option<app::prefix_router::PrefixAffinityConfig> {
     (args.gateway_router_prefix_affinity == "on").then_some(
         app::prefix_router::PrefixAffinityConfig {
             block_bytes: args.gateway_router_prefix_block_bytes,
@@ -989,8 +989,8 @@ fn prefix_affinity_config(args: &ServerArgs) -> Option<app::prefix_router::Prefi
     )
 }
 
-pub(crate) fn gateway_worker_client_config(
-    args: &ServerArgs,
+pub fn gateway_worker_client_config(
+    args: &GatewayArgs,
     tls: izwi_serving_client::WorkerClientTlsConfig,
 ) -> WorkerClientConfig {
     WorkerClientConfig {
@@ -1011,3 +1011,7 @@ pub(crate) fn gateway_worker_client_config(
         ..WorkerClientConfig::default()
     }
 }
+
+#[cfg(test)]
+#[path = "gateway_tests.rs"]
+mod tests;

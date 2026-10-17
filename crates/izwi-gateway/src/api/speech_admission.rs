@@ -56,12 +56,11 @@ impl Admission {
 pub(super) fn acquire(
     principal: &izwi_hooks::Principal,
     global: usize,
+    per_tenant: Option<usize>,
 ) -> Result<Permit, axum::http::StatusCode> {
     static ADMISSION: OnceLock<Arc<Admission>> = OnceLock::new();
     let global = global.max(1);
-    let per_tenant = crate::env_config::tuning()
-        .max_speech_requests_per_tenant
-        .map_or(global, |limit| limit.min(global));
+    let per_tenant = per_tenant.map_or(global, |limit| limit.min(global));
     // Distinguish namespaces so a principal ID cannot collide with a tenant ID.
     let tenant = super::principal_namespace(principal);
     ADMISSION

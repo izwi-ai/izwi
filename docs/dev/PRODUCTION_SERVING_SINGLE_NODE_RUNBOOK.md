@@ -1354,7 +1354,7 @@ To run it locally against a disposable Homebrew PostgreSQL database:
 brew services start postgresql@18
 createdb izwi_ds5_test
 IZWI_TEST_FLEET_PG_URL=postgres://$(whoami)@localhost/izwi_ds5_test \
-  cargo test -p izwi-server --features db-postgres --lib fleet_postgres
+  cargo test -p izwi-gateway --features db-postgres --lib fleet_postgres
 ```
 
 MySQL is not supported: `mysql://` database URLs are rejected at startup.
