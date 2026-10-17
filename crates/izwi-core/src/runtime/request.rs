@@ -178,6 +178,14 @@ pub(crate) struct TtsRuntimeRequest {
 /// rather than failed when the engine's small queue fills (TPIPE-13).
 const TTS_STREAM_SEND_DEADLINE_MS: u64 = 30_000;
 
+/// Speech-to-speech audio waits for its reader like TTS (SPK-F5): a voice
+/// session's audio queue grants credit as the client plays it back, so a
+/// reply generated faster than real time is held back, not failed.
+const SPEECH_TO_SPEECH_STREAM_POLICY: RuntimeStreamPolicy =
+    RuntimeStreamPolicy::BlockWithDeadline {
+        timeout_ms: TTS_STREAM_SEND_DEADLINE_MS,
+    };
+
 impl TtsRuntimeRequest {
     pub(crate) fn from_generation(
         request: GenerationRequest,
@@ -371,7 +379,8 @@ impl AudioChatRuntimeRequest {
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
                 .with_correlation_id(correlation_id)
-                .with_runtime_context(runtime_context),
+                .with_runtime_context(runtime_context)
+                .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
             params,
@@ -393,7 +402,8 @@ impl AudioChatRuntimeRequest {
         Ok(Self {
             envelope: RequestEnvelope::new(CapabilityKind::SpeechToSpeech, model_variant)
                 .with_correlation_id(correlation_id)
-                .with_runtime_context(runtime_context),
+                .with_runtime_context(runtime_context)
+                .with_stream_policy(SPEECH_TO_SPEECH_STREAM_POLICY),
             audio,
             messages,
             params,
@@ -784,6 +794,13 @@ mod tests {
         assert_eq!(core_request.system_prompt.as_deref(), Some("helpful voice"));
         assert_eq!(core_request.correlation_id.as_deref(), Some("corr-audio"));
         assert_eq!(core_request.chat_messages.as_ref().map(Vec::len), Some(1));
+        // SPK-F5: a slow reader holds the reply back instead of failing it.
+        assert_eq!(
+            core_request.stream_policy,
+            EngineStreamPolicy::BlockWithDeadline {
+                timeout_ms: TTS_STREAM_SEND_DEADLINE_MS
+            }
+        );
     }
 
     #[test]

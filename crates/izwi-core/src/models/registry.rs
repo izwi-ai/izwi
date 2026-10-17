@@ -3497,6 +3497,7 @@ impl NativeAudioChatModel {
         stream_config: &Lfm25AudioStreamConfig,
         decode_partial_audio: bool,
         leases: &mut InvocationWorkspaceLeaseSetV2,
+        should_stop: &mut dyn FnMut() -> bool,
         on_text_delta: &mut dyn FnMut(&str),
         on_audio_samples: &mut dyn FnMut(&[f32]),
     ) -> Result<NativeAudioChatGeneration> {
@@ -3519,6 +3520,7 @@ impl NativeAudioChatModel {
                     attention.paged_cache_mut()?,
                     shortconv.typed_mut::<InvocationTensorLease>()?,
                     depthformer.paged_cache_mut()?,
+                    should_stop,
                     on_text_delta,
                     on_audio_samples,
                 )?;

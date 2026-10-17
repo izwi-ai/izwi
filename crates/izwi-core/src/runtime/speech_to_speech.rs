@@ -276,7 +276,7 @@ impl RuntimeService {
         params: GenerationParams,
         system_prompt: Option<&str>,
         correlation_id: Option<&str>,
-        on_chunk: F,
+        mut on_chunk: F,
     ) -> Result<SpeechToSpeechGeneration>
     where
         F: FnMut(StreamingOutput) + Send + 'static,
@@ -289,13 +289,23 @@ impl RuntimeService {
             system_prompt,
             correlation_id,
             RuntimeRequestContext::default(),
-            on_chunk,
+            move |chunk| {
+                on_chunk(chunk);
+                std::future::ready(Ok(()))
+            },
         )
         .await
     }
 
+    /// Stream a speech-to-speech reply into `on_chunk`, awaiting each chunk
+    /// before the next is taken: a consumer that waits for its client (a
+    /// voice session's audio credit) holds generation back, and an error
+    /// from it cancels the reply at its next token (SPK-F5).
     #[allow(clippy::too_many_arguments)]
-    pub async fn speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context<F>(
+    pub async fn speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context<
+        F,
+        Fut,
+    >(
         &self,
         variant: ModelVariant,
         audio_bytes: &[u8],
@@ -307,7 +317,8 @@ impl RuntimeService {
         mut on_chunk: F,
     ) -> Result<SpeechToSpeechGeneration>
     where
-        F: FnMut(StreamingOutput) + Send + 'static,
+        F: FnMut(StreamingOutput) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send,
     {
         let admitted = self
             .build_speech_to_speech_request(
@@ -333,8 +344,7 @@ impl RuntimeService {
                     streamed_sample_rate = chunk.sample_rate.max(1);
                     streamed_samples.extend_from_slice(&chunk.samples);
                 }
-                on_chunk(chunk);
-                std::future::ready(Ok(()))
+                on_chunk(chunk)
             })
             .await?;
 
@@ -438,5 +448,84 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(Error::Timeout(_))));
+    }
+
+    /// SPK-F5 live: a consumer that gives up at the reply's first audio
+    /// stops it at the next token. The model used to run the reply to its
+    /// end on the device, so the next turn queued behind the abandoned one.
+    /// The device is now free again well within the time the reply took to
+    /// reach its first audio.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_reply_stops_generating_at_once_if_env_set() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let Some(models_dir) = std::env::var_os("IZWI_LFM25_AUDIO_MODELS_DIR") else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "IZWI_LFM25_AUDIO_MODELS_DIR unset; not run"
+            );
+            return;
+        };
+        let runtime = RuntimeService::new(crate::config::EngineConfig {
+            models_dir: models_dir.into(),
+            ..Default::default()
+        })
+        .expect("runtime");
+        let variant = ModelVariant::Lfm25Audio15BGguf;
+        runtime.load_model(variant).await.expect("load LFM2.5 Audio");
+        let audio = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav"),
+        )
+        .expect("fixture");
+        let started = Instant::now();
+        let first_audio = std::sync::Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let result = runtime
+            .speech_to_speech_generate_streaming_bytes_with_variant_and_runtime_context(
+                variant,
+                &audio,
+                Vec::new(),
+                GenerationParams {
+                    max_tokens: 1024,
+                    ..Default::default()
+                },
+                Some("Retell what you heard as a long, detailed story."),
+                None,
+                RuntimeRequestContext::default(),
+                {
+                    let first_audio = first_audio.clone();
+                    move |chunk| {
+                        if chunk.samples.is_empty() {
+                            return std::future::ready(Ok(()));
+                        }
+                        first_audio.lock().unwrap().get_or_insert_with(Instant::now);
+                        std::future::ready(Err(Error::Cancelled("client went away".into())))
+                    }
+                },
+            )
+            .await;
+        assert!(result.is_err(), "the reply was cancelled");
+        let to_first_audio = first_audio
+            .lock()
+            .unwrap()
+            .expect("the reply produced audio")
+            .duration_since(started);
+        let cancelled_at = Instant::now();
+        while runtime.coordinator_snapshot().active_executions > 0 {
+            assert!(
+                cancelled_at.elapsed() < to_first_audio * 4,
+                "still generating {:?} after the cancel (first audio after {to_first_audio:?})",
+                cancelled_at.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let stopped_after = cancelled_at.elapsed();
+        let _ = writeln!(
+            std::io::stderr(),
+            "first audio after {to_first_audio:?}; device free {stopped_after:?} after the cancel"
+        );
+        assert!(
+            stopped_after < to_first_audio,
+            "device busy {stopped_after:?} after the cancel (first audio after {to_first_audio:?})"
+        );
     }
 }

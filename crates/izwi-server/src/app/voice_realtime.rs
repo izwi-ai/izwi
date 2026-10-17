@@ -242,24 +242,6 @@ impl OutboundTx {
         self.report(result)
     }
 
-    /// Queue assistant audio without waiting: the unified speech-to-speech
-    /// callback cannot wait, so audio past the queue's limits closes the
-    /// session as before.
-    fn try_send_audio(
-        &self,
-        generation: u64,
-        message: Message,
-        bytes: usize,
-        duration_ms: u64,
-    ) -> Result<(), OutboundEnqueueError> {
-        self.note_audio_chunk(&message);
-        self.enqueue(
-            message,
-            OutboundClass::Audio { bytes, duration_ms },
-            Some(generation),
-        )
-    }
-
     /// Remember the chunk sequence of an assistant audio frame for the typed
     /// protocol's `assistant_audio_completed`.
     fn note_audio_chunk(&self, message: &Message) {
@@ -3110,8 +3092,12 @@ async fn stream_unified_s2s_to_socket(
                 let mut text_snapshot = String::new();
                 let runtime = state.runtime.clone();
                 move |chunk| {
+                    // A cancelled turn stops the reply at its next token
+                    // instead of letting it run to its end (SPK-F5).
+                    let cancelled =
+                        || izwi_core::Error::Cancelled("unified voice turn cancelled".to_string());
                     if control.is_cancelled() {
-                        return;
+                        return futures::future::Either::Left(std::future::ready(Err(cancelled())));
                     }
                     if let Some(delta) = chunk.text.as_deref() {
                         if !delta.is_empty() {
@@ -3130,6 +3116,7 @@ async fn stream_unified_s2s_to_socket(
                         }
                     }
 
+                    let mut frame = None;
                     if !chunk.samples.is_empty() {
                         let encoded = match encoder.as_mut() {
                             Some(encoder) => encoder.encode(&chunk.samples),
@@ -3144,35 +3131,22 @@ async fn stream_unified_s2s_to_socket(
                             Ok(encoded) => {
                                 let chunk_seq = u32::try_from(chunk.sequence).unwrap_or(u32::MAX);
                                 let model_rate = chunk.sample_rate.max(1);
-                                let frame = encode_assistant_audio_binary_frame(
-                                    output_format,
-                                    utterance_seq,
-                                    chunk_seq,
-                                    output_format.wire_rate(model_rate),
-                                    chunk.is_final,
-                                    &encoded,
-                                );
                                 let duration_ms = (chunk.samples.len() as u64)
                                     .saturating_mul(1_000)
                                     .checked_div(u64::from(model_rate))
                                     .unwrap_or(0);
-                                match out_tx.try_send_audio(
-                                    output_generation,
-                                    Message::Binary(frame.into()),
+                                frame = Some((
+                                    encode_assistant_audio_binary_frame(
+                                        output_format,
+                                        utterance_seq,
+                                        chunk_seq,
+                                        output_format.wire_rate(model_rate),
+                                        chunk.is_final,
+                                        &encoded,
+                                    ),
                                     encoded.len(),
                                     duration_ms,
-                                ) {
-                                    Ok(()) => control
-                                        .audio_sent(&runtime, Duration::from_millis(duration_ms)),
-                                    Err(err) => {
-                                        *delivery_error
-                                            .lock()
-                                            .unwrap_or_else(|poison| poison.into_inner()) = Some(
-                                            format!("Outbound audio delivery failed: {err:?}"),
-                                        );
-                                        control.cancel("outbound_audio_saturated");
-                                    }
-                                }
+                                ));
                             }
                             Err(err) => {
                                 send_turn_error(
@@ -3185,6 +3159,40 @@ async fn stream_unified_s2s_to_socket(
                             }
                         }
                     }
+                    let Some((frame, bytes, duration_ms)) = frame else {
+                        return futures::future::Either::Left(std::future::ready(Ok(())));
+                    };
+                    // Audio waits for the client's playback credit, as the
+                    // cascaded pipeline's does (SPK-F11): a reply generated
+                    // faster than real time is held back, not dropped.
+                    let out_tx = out_tx.clone();
+                    let control = control.clone();
+                    let delivery_error = delivery_error.clone();
+                    let runtime = runtime.clone();
+                    futures::future::Either::Right(async move {
+                        match out_tx
+                            .send_audio(
+                                output_generation,
+                                Message::Binary(frame.into()),
+                                bytes,
+                                duration_ms,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                control.audio_sent(&runtime, Duration::from_millis(duration_ms));
+                                Ok(())
+                            }
+                            Err(err) => {
+                                *delivery_error
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) =
+                                    Some(format!("Outbound audio delivery failed: {err:?}"));
+                                control.cancel("socket_closed");
+                                Err(cancelled())
+                            }
+                        }
+                    })
                 }
             },
         )
