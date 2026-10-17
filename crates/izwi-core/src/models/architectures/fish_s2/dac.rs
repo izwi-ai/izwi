@@ -1876,6 +1876,16 @@ mod tests {
         FishS2DacDecoder::load(config, vb).unwrap()
     }
 
+    /// TPIPE-22: the catalog announces Fish's realtime rate before the codec
+    /// loads; it must be the codec's real output rate.
+    #[test]
+    fn catalog_sample_rate_hint_is_the_codec_rate() {
+        assert_eq!(
+            crate::catalog::ModelVariant::FishAudioS2Pro.tts_output_sample_rate_hint(),
+            Some(FishS2DacConfig::current().sample_rate)
+        );
+    }
+
     #[test]
     fn incremental_codec_matches_full_decode_and_rolls_back_cancelled_push() {
         check_incremental_codec_partitions(&Device::Cpu);

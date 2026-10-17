@@ -1219,12 +1219,13 @@ mod tests {
     use super::{ChatReasoningEffort, ModelVariant, SpeechModelCapabilities};
 
     /// TPIPE-22: the announced realtime rate is each family's real output
-    /// rate (Fish's codec runs at 44.1 kHz).
+    /// rate (Fish's codec runs at 44.1 kHz; izwi-core checks the hint
+    /// against the codec's own configuration).
     #[test]
     fn tts_output_sample_rate_hints_match_the_model_codecs() {
         assert_eq!(
             ModelVariant::FishAudioS2Pro.tts_output_sample_rate_hint(),
-            Some(crate::models::architectures::fish_s2::FishS2DacConfig::current().sample_rate)
+            Some(44_100)
         );
         assert_eq!(
             ModelVariant::Lfm25Audio15BGguf.tts_output_sample_rate_hint(),

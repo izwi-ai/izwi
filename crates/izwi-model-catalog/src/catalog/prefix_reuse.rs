@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{ModelFamily, ModelVariant};
-use crate::backends::BackendKind;
+use crate::BackendKind;
 
 /// How the serving stack decides whether committed prefix reuse engages for
 /// a loaded model. The registry default is fail-closed; product surfaces opt
