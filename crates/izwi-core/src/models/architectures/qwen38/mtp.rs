@@ -795,12 +795,16 @@ pub(crate) mod tests {
 
     impl TestDir {
         pub(crate) fn new(label: &str) -> Self {
+            // The clock alone is not unique: macOS reports microseconds, so
+            // two tests starting together would share (and delete) a fixture.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "izwi-qwen38-mtp-{label}-{}-{nonce}",
+                "izwi-qwen38-mtp-{label}-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).unwrap();
