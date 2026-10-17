@@ -6,9 +6,10 @@
 #
 #   Client ---> [gateway:8080] ---> [worker 127.0.0.1:9470]
 #
-# The gateway is hardware-independent and never loads models or constructs an
-# inference engine. The worker (`izwi-serving-worker`) is an isolated process
-# hosting RuntimeService, model weights, and device context.
+# The gateway (`izwi-gateway`, the slim `production-gateway` image) is
+# hardware-independent: it links no inference engine and never loads models.
+# The worker (`izwi-serving-worker`) is an isolated process hosting
+# RuntimeService, model weights, and device context.
 #
 # This is the single-node `standalone` gateway topology: the gateway accepts
 # only numeric-loopback HTTP worker endpoints, so the gateway container shares
@@ -96,7 +97,11 @@ services:
   # worker's network namespace and reaches it over loopback.
   # ---------------------------------------------------------------------------
   gateway:
-    image: izwi:serving-latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: production-gateway
+    image: izwi:gateway-latest
     container_name: izwi-gateway
     restart: unless-stopped
     network_mode: "service:worker"
@@ -112,9 +117,7 @@ services:
       - IZWI_GATEWAY_PRESTOP_SECS=0
       - IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
     command:
-      - "izwi-server"
-      - "--role"
-      - "gateway"
+      - "izwi-gateway"
       - "--host"
       - "0.0.0.0"
       - "--port"

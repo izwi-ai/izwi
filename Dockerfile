@@ -43,6 +43,19 @@ COPY crates/ crates/
 RUN cargo build --release --locked --bin izwi-server --bin izwi-serving-supervisor --bin izwi-serving-worker --features izwi-server/db-postgres
 
 # -----------------------------------------------------------------------------
+# Stage 2b: Build the standalone gateway. It links no inference engine, so this
+# stage builds none of the model or accelerator code.
+# -----------------------------------------------------------------------------
+FROM rust:1.88-bookworm AS rust-builder-gateway
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN cargo build --release --locked -p izwi-gateway --features db-postgres
+
+# -----------------------------------------------------------------------------
 # Stage 3: Build the Rust backend (CUDA)
 # -----------------------------------------------------------------------------
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS rust-builder-cuda
@@ -208,3 +221,36 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
 
 # Start the server
 CMD ["izwi-server"]
+
+# -----------------------------------------------------------------------------
+# Stage 6: Public API gateway (slim). The same image serves CPU, Metal and CUDA
+# worker fleets: the gateway never runs a model.
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS production-gateway
+
+LABEL org.opencontainers.image.title="Izwi Gateway"
+LABEL org.opencontainers.image.description="Izwi public API gateway: OpenAI-compatible routing to approved inference workers"
+LABEL org.opencontainers.image.vendor="Agentem"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 izwi
+
+COPY --from=rust-builder-gateway /app/target/release/izwi-gateway /usr/local/bin/izwi-gateway
+
+# The container must listen on all interfaces; the gateway then refuses to
+# start unless IZWI_GATEWAY_TRUSTED_INGRESS_TLS=1 asserts that TLS terminates
+# in front of it.
+ENV IZWI_HOST=0.0.0.0
+
+EXPOSE 8080
+
+USER izwi
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/readyz || exit 1
+
+CMD ["izwi-gateway"]

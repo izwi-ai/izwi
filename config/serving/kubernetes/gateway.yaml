@@ -84,11 +84,11 @@ spec:
       terminationGracePeriodSeconds: 40
       containers:
         - name: gateway
-          image: izwi:serving
+          # The slim image (Dockerfile target production-gateway): the
+          # gateway links no inference engine.
+          image: izwi:gateway
           args:
-            - izwi-server
-            - --role
-            - gateway
+            - izwi-gateway
             - --host
             - 0.0.0.0
             - --port

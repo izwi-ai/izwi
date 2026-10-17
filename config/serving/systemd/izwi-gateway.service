@@ -37,8 +37,9 @@ Environment=IZWI_GATEWAY_SHARED_APPROVALS_TTL_MS=5000
 # A loopback gateway has no load balancer to drain from: no pre-stop window.
 Environment=IZWI_GATEWAY_PRESTOP_SECS=0
 Environment=IZWI_GATEWAY_SHUTDOWN_BUDGET_SECS=25
-ExecStart=/usr/local/bin/izwi-server \
-    --role gateway \
+# izwi-gateway links no inference engine. `izwi-server --role gateway` with
+# the same flags still works.
+ExecStart=/usr/local/bin/izwi-gateway \
     --host 127.0.0.1 \
     --port 8080 \
     --public-model LFM2.5-1.2B-Instruct-GGUF
