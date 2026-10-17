@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     batch_runtime::{
-        store::{NewJobStage, NewRuntimeJob},
+        store::{NewJobStage, NewRuntimeJob, QuotaLimits},
         types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
     },
     db::StoreDatabase,
@@ -10,6 +10,7 @@ use crate::{
     storage_layout,
 };
 use izwi_hooks::{HookResult, MediaObjectMetadata, StoredMediaObject, StoredMediaStream};
+use sea_orm::ConnectionTrait;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Cursor,
@@ -2799,6 +2800,134 @@ async fn cleanup_capacity_failure_happens_before_second_tombstone() {
         Err(ArtifactStoreError::Metadata(_))
     ));
     assert_eq!(store.stat(&tenant, &second.id).await.unwrap(), second);
+}
+
+/// The cleanup quota rows equal the pending intents, per tenant and in
+/// total.
+async fn assert_cleanup_quota_matches_intents(metadata: &BatchRuntimeStore) {
+    let db = metadata.connection().await.unwrap();
+    let rows = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT q.scope, q.used, (SELECT COUNT(*) FROM artifact_cleanup_intents c WHERE q.scope = '' OR c.tenant_scope = q.scope) FROM runtime_quota_usage q WHERE q.quota_kind = 'artifact_cleanup'",
+        ))
+        .await
+        .unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        let scope: String = row.try_get_by_index(0).unwrap();
+        let used: i64 = row.try_get_by_index(1).unwrap();
+        let pending: i64 = row.try_get_by_index(2).unwrap();
+        assert_eq!(used, pending, "cleanup quota of scope {scope:?}");
+    }
+}
+
+/// DUR-F4 for cleanup intents: pending intents are counted per tenant and
+/// in total, a tenant at its cap cannot use up the global cap, and a
+/// completed cleanup gives its unit back.
+#[tokio::test]
+async fn cleanup_quota_is_per_tenant_and_released_on_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(1_000));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        root.path().join("artifacts.sqlite3"),
+    ));
+    metadata.set_test_clock(clock.clone());
+    metadata.set_artifact_cleanup_limits_for_test(QuotaLimits {
+        global: 2,
+        per_tenant: 1,
+    });
+    let metadata = Arc::new(metadata);
+    let provider = Arc::new(MemoryMediaProvider::default());
+    provider.set_now_unix_ms(1_000);
+    let store = ArtifactStore::new(
+        metadata.clone(),
+        provider.clone(),
+        ArtifactStoreLimits::default(),
+    )
+    .unwrap();
+    let tenant_a = ArtifactTenant::parse("tenant-a").unwrap();
+    let tenant_b = ArtifactTenant::parse("tenant-b").unwrap();
+    let tenant_c = ArtifactTenant::parse("tenant-c").unwrap();
+    let a1 = put_test_artifact(&store, &tenant_a, "a1").await;
+    let a2 = put_test_artifact(&store, &tenant_a, "a2").await;
+    let b1 = put_test_artifact(&store, &tenant_b, "b1").await;
+    let c1 = put_test_artifact(&store, &tenant_c, "c1").await;
+    provider.fail_deletes.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        store.delete(&tenant_a, &a1.id).await,
+        Err(ArtifactStoreError::DeleteIncomplete)
+    ));
+    assert!(
+        matches!(
+            store.delete(&tenant_a, &a2.id).await,
+            Err(ArtifactStoreError::Metadata(_))
+        ),
+        "tenant-a is at its cap"
+    );
+    assert!(matches!(
+        store.delete(&tenant_b, &b1.id).await,
+        Err(ArtifactStoreError::DeleteIncomplete)
+    ));
+    assert!(
+        matches!(
+            store.delete(&tenant_c, &c1.id).await,
+            Err(ArtifactStoreError::Metadata(_))
+        ),
+        "the global cap is reached"
+    );
+    assert_eq!(store.stat(&tenant_a, &a2.id).await.unwrap(), a2);
+    assert_cleanup_quota_matches_intents(&metadata).await;
+
+    // A repeated delete shares the pending intent and takes no new unit.
+    assert!(matches!(
+        store.delete(&tenant_a, &a1.id).await,
+        Err(ArtifactStoreError::DeleteIncomplete)
+    ));
+    assert_cleanup_quota_matches_intents(&metadata).await;
+
+    provider.fail_deletes.store(false, Ordering::SeqCst);
+    // Past the longest retry backoff.
+    clock.store(1_000 + 60 * 60 * 1000, Ordering::SeqCst);
+    assert_eq!(store.cleanup_due(64).await.unwrap().completed, 2);
+    assert_cleanup_quota_matches_intents(&metadata).await;
+    assert!(store.delete(&tenant_a, &a2.id).await.unwrap());
+    assert!(store.delete(&tenant_c, &c1.id).await.unwrap());
+    assert_cleanup_quota_matches_intents(&metadata).await;
+}
+
+/// Migration 3 seeds the cleanup quota from the intents that exist.
+#[tokio::test]
+async fn cleanup_quota_is_seeded_from_existing_intents_on_upgrade() {
+    let root = tempfile::tempdir().unwrap();
+    let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
+        StoreDatabase::new(root.path().join("artifacts.sqlite3")),
+    ));
+    let provider = Arc::new(MemoryMediaProvider::default());
+    let store = ArtifactStore::new(
+        metadata.clone(),
+        provider.clone(),
+        ArtifactStoreLimits::default(),
+    )
+    .unwrap();
+    let tenant_a = ArtifactTenant::parse("tenant-a").unwrap();
+    let tenant_b = ArtifactTenant::parse("tenant-b").unwrap();
+    provider.fail_deletes.store(true, Ordering::SeqCst);
+    for (tenant, label) in [(&tenant_a, "a1"), (&tenant_a, "a2"), (&tenant_b, "b1")] {
+        let artifact = put_test_artifact(&store, tenant, label).await;
+        assert!(store.delete(tenant, &artifact.id).await.is_err());
+    }
+    let db = metadata.connection().await.unwrap();
+    // A database from before migration 3: intents but no cleanup counts.
+    for sql in [
+        "DELETE FROM runtime_quota_usage WHERE quota_kind = 'artifact_cleanup'",
+        "DELETE FROM schema_migrations WHERE component = 'app' AND version = 3",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+    crate::db::migrator::Migrator::up(db).await.unwrap();
+    assert_cleanup_quota_matches_intents(&metadata).await;
 }
 
 #[tokio::test]

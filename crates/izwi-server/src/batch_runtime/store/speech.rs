@@ -57,7 +57,6 @@ impl BatchRuntimeStore {
             .await
             .context("Failed to start opaque speech-history deletion transaction")?;
         lock_named(&tx, TTS_ADMISSION_LOCK).await?;
-        lock_named(&tx, ARTIFACT_CLEANUP_LOCK).await?;
         let lock_clause = match tx.get_database_backend() {
             DbBackend::Sqlite => "",
             DbBackend::Postgres => " FOR UPDATE OF h, m",
@@ -215,7 +214,7 @@ impl BatchRuntimeStore {
             media_asset_id,
             tenant_scope,
             ArtifactCleanupReason::ArtifactDeleted,
-            self.artifact_cleanup_capacity(),
+            self.artifact_cleanup_limits(),
             self.now_millis(),
         )
         .await?

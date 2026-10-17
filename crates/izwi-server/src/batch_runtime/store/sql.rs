@@ -212,8 +212,6 @@ pub(super) async fn lock_named<C: ConnectionTrait>(db: &C, name: &str) -> anyhow
 
 pub(super) const TTS_ADMISSION_LOCK: &str = "tts";
 
-pub(super) const ARTIFACT_CLEANUP_LOCK: &str = "artifact_cleanup";
-
 pub(super) fn map_media_asset(row: &QueryResult) -> anyhow::Result<MediaAsset> {
     Ok(MediaAsset {
         id: col(row, "id")?,

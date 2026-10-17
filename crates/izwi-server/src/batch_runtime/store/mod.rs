@@ -78,7 +78,7 @@ pub struct BatchRuntimeStore {
     #[cfg(test)]
     test_tts_admission_limits: Option<(usize, usize)>,
     #[cfg(test)]
-    test_artifact_cleanup_capacity: Option<u64>,
+    test_artifact_cleanup_limits: Option<QuotaLimits>,
     #[cfg(test)]
     test_provider_write_limits: Option<QuotaLimits>,
     #[cfg(test)]
@@ -154,7 +154,7 @@ impl BatchRuntimeStore {
             #[cfg(test)]
             test_tts_admission_limits: None,
             #[cfg(test)]
-            test_artifact_cleanup_capacity: None,
+            test_artifact_cleanup_limits: None,
             #[cfg(test)]
             test_provider_write_limits: None,
             #[cfg(test)]
@@ -173,7 +173,15 @@ impl BatchRuntimeStore {
 
     #[cfg(test)]
     pub(crate) fn set_artifact_cleanup_capacity_for_test(&mut self, capacity: u64) {
-        self.test_artifact_cleanup_capacity = Some(capacity);
+        self.set_artifact_cleanup_limits_for_test(QuotaLimits {
+            global: capacity,
+            per_tenant: capacity,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_artifact_cleanup_limits_for_test(&mut self, limits: QuotaLimits) {
+        self.test_artifact_cleanup_limits = Some(limits);
     }
 
     #[cfg(test)]

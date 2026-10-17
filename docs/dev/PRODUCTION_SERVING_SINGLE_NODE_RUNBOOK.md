@@ -688,9 +688,12 @@ original record (202). The same key with a different body, or while the
 first request is still being accepted, is a 409. A streaming request with a
 key is a 400. Results are replayable for 24 hours.
 
-Idempotency records and provider write reservations are counted per tenant
-and in total by counters kept in the same transactions as the records; a
-full tenant is refused (503 for idempotency) without affecting others.
+Idempotency records, provider write reservations and pending artifact
+cleanup intents are counted per tenant and in total by counters kept in the
+same transactions as the records; a full tenant is refused (503 for
+idempotency) without affecting others. Cleanup intents are capped at 16,384
+per tenant and 65,536 in total; a delete past the cap fails before it hides
+the artifact.
 
 | Setting | Default | Meaning |
 |---|---|---|

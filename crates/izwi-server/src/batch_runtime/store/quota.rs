@@ -7,6 +7,7 @@ use super::*;
 pub(super) enum QuotaKind {
     DurableIdempotency,
     ProviderWrite,
+    ArtifactCleanup,
 }
 
 impl QuotaKind {
@@ -14,6 +15,7 @@ impl QuotaKind {
         match self {
             Self::DurableIdempotency => "durable_idempotency",
             Self::ProviderWrite => "provider_write",
+            Self::ArtifactCleanup => "artifact_cleanup",
         }
     }
 }

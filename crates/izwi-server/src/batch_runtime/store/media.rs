@@ -69,6 +69,10 @@ pub struct NewTextAsset {
 
 pub(super) const MAX_ARTIFACT_CLEANUP_INTENTS: u64 = 65_536;
 
+/// Pending cleanup intents one tenant may hold, so one tenant's backlog
+/// cannot block every other tenant's deletes.
+pub(super) const MAX_ARTIFACT_CLEANUP_INTENTS_PER_TENANT: u64 = 16_384;
+
 pub(super) const MAX_ARTIFACT_CLEANUP_BATCH: usize = 64;
 
 pub(super) const MAX_ARTIFACT_CLEANUP_STORAGE_KEY_BYTES: usize = 2 * 1024;
@@ -131,7 +135,7 @@ pub(super) async fn tombstone_media_asset_with_cleanup_in<C: ConnectionTrait>(
     id: &str,
     tenant_scope: &str,
     reason: ArtifactCleanupReason,
-    capacity: u64,
+    limits: QuotaLimits,
     now: i64,
 ) -> anyhow::Result<Option<(bool, ArtifactCleanupIntent)>> {
     let history_reference = db
@@ -172,76 +176,65 @@ pub(super) async fn tombstone_media_asset_with_cleanup_in<C: ConnectionTrait>(
     validate_artifact_cleanup_storage_key(&storage_key)?;
     let already_deleted = asset.try_get_by_index::<Option<i64>>(1)?.is_some();
 
-    let existing = db
-        .query_one_raw(raw::statement(
-            db,
-            r#"
-            SELECT id, created_at, updated_at, available_at, storage_key,
-                   tenant_scope, reason, attempt_count, last_error
-            FROM artifact_cleanup_intents
-            WHERE storage_key = ?1
-            "#,
-            vec![storage_key.clone().into()],
-        )?)
-        .await
-        .context("Failed to inspect existing artifact cleanup intent")?;
-    let intent = match existing.as_ref() {
-        Some(row) => {
-            let intent = map_artifact_cleanup_intent(row)?;
-            anyhow::ensure!(
-                intent.tenant_scope == tenant_scope,
-                "Artifact cleanup key is already owned by another tenant"
-            );
-            intent
-        }
+    let intent = match artifact_cleanup_intent_with(db, &storage_key).await? {
+        Some(intent) => intent,
         None => {
-            let count = db
-                .query_one_raw(raw::statement(
-                    db,
-                    "SELECT COUNT(*) FROM artifact_cleanup_intents",
-                    vec![],
-                )?)
-                .await
-                .context("Failed to count artifact cleanup intents")?
-                .ok_or_else(|| anyhow!("Artifact cleanup count returned no row"))?
-                .try_get_by_index::<i64>(0)?;
             anyhow::ensure!(
-                u64::try_from(count)? < capacity,
-                "Artifact cleanup capacity exhausted ({capacity} pending intents)"
+                acquire_quota_with(db, QuotaKind::ArtifactCleanup, tenant_scope, limits).await?,
+                "Artifact cleanup capacity exhausted ({} pending intents, {} per tenant)",
+                limits.global,
+                limits.per_tenant
             );
             let intent_id = new_uuid();
-            db.execute_raw(raw::statement(
-                db,
-                r#"
-                INSERT INTO artifact_cleanup_intents (
-                    id, created_at, updated_at, available_at, storage_key,
-                    tenant_scope, reason, attempt_count, last_error
-                )
-                VALUES (?1, ?2, ?2, ?2, ?3, ?4, ?5, 0, NULL)
-                "#,
-                vec![
-                    intent_id.clone().into(),
-                    now.into(),
-                    storage_key.clone().into(),
-                    tenant_scope.into(),
-                    reason.as_db_value().into(),
-                ],
-            )?)
-            .await
-            .context("Failed to persist artifact cleanup intent")?;
-            ArtifactCleanupIntent {
-                id: intent_id,
-                created_at: u64::try_from(now)?,
-                updated_at: u64::try_from(now)?,
-                available_at: u64::try_from(now)?,
-                storage_key: storage_key.clone(),
-                tenant_scope: tenant_scope.to_string(),
-                reason,
-                attempt_count: 0,
-                last_error: None,
+            let inserted = db
+                .execute_raw(raw::statement(
+                    db,
+                    r#"
+                    INSERT INTO artifact_cleanup_intents (
+                        id, created_at, updated_at, available_at, storage_key,
+                        tenant_scope, reason, attempt_count, last_error
+                    )
+                    VALUES (?1, ?2, ?2, ?2, ?3, ?4, ?5, 0, NULL)
+                    ON CONFLICT (storage_key) DO NOTHING
+                    "#,
+                    vec![
+                        intent_id.clone().into(),
+                        now.into(),
+                        storage_key.clone().into(),
+                        tenant_scope.into(),
+                        reason.as_db_value().into(),
+                    ],
+                )?)
+                .await
+                .context("Failed to persist artifact cleanup intent")?
+                .rows_affected()
+                == 1;
+            if inserted {
+                ArtifactCleanupIntent {
+                    id: intent_id,
+                    created_at: u64::try_from(now)?,
+                    updated_at: u64::try_from(now)?,
+                    available_at: u64::try_from(now)?,
+                    storage_key: storage_key.clone(),
+                    tenant_scope: tenant_scope.to_string(),
+                    reason,
+                    attempt_count: 0,
+                    last_error: None,
+                }
+            } else {
+                // A concurrent delete of the same object committed its
+                // intent first: give the unit back and share that intent.
+                release_quota_with(db, QuotaKind::ArtifactCleanup, tenant_scope, 1).await?;
+                artifact_cleanup_intent_with(db, &storage_key)
+                    .await?
+                    .ok_or_else(|| anyhow!("Conflicting artifact cleanup intent disappeared"))?
             }
         }
     };
+    anyhow::ensure!(
+        intent.tenant_scope == tenant_scope,
+        "Artifact cleanup key is already owned by another tenant"
+    );
 
     let newly_deleted = if already_deleted {
         false
@@ -261,6 +254,27 @@ pub(super) async fn tombstone_media_asset_with_cleanup_in<C: ConnectionTrait>(
             == 1
     };
     Ok(Some((newly_deleted, intent)))
+}
+
+async fn artifact_cleanup_intent_with<C: ConnectionTrait>(
+    db: &C,
+    storage_key: &str,
+) -> anyhow::Result<Option<ArtifactCleanupIntent>> {
+    db.query_one_raw(raw::statement(
+        db,
+        r#"
+        SELECT id, created_at, updated_at, available_at, storage_key,
+               tenant_scope, reason, attempt_count, last_error
+        FROM artifact_cleanup_intents
+        WHERE storage_key = ?1
+        "#,
+        vec![storage_key.into()],
+    )?)
+    .await
+    .context("Failed to load artifact cleanup intent")?
+    .as_ref()
+    .map(map_artifact_cleanup_intent)
+    .transpose()
 }
 
 impl BatchRuntimeStore {
@@ -367,8 +381,8 @@ impl BatchRuntimeStore {
     }
 
     /// Atomically hide one opaque artifact and retain its provider key for
-    /// idempotent physical deletion. Capacity is checked under a durable lock
-    /// before the tombstone changes visibility.
+    /// idempotent physical deletion. Capacity is taken from the tenant's and
+    /// the global cleanup quota before the tombstone changes visibility.
     pub(crate) async fn tombstone_media_asset_with_cleanup(
         &self,
         id: &str,
@@ -381,13 +395,12 @@ impl BatchRuntimeStore {
             .begin_with_options(write_transaction_options())
             .await
             .context("Failed to start artifact cleanup transaction")?;
-        lock_named(&tx, ARTIFACT_CLEANUP_LOCK).await?;
         let Some((newly_deleted, _)) = tombstone_media_asset_with_cleanup_in(
             &tx,
             id,
             tenant_scope,
             reason,
-            self.artifact_cleanup_capacity(),
+            self.artifact_cleanup_limits(),
             self.now_millis(),
         )
         .await?
@@ -442,22 +455,11 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<Option<ArtifactCleanupIntent>> {
         validate_artifact_cleanup_storage_key(storage_key)?;
         let db = self.db.connection().await?;
-        let row = db
-            .query_one_raw(raw::statement(
-                db,
-                r#"
-                SELECT id, created_at, updated_at, available_at, storage_key,
-                       tenant_scope, reason, attempt_count, last_error
-                FROM artifact_cleanup_intents
-                WHERE storage_key = ?1
-                "#,
-                vec![storage_key.into()],
-            )?)
-            .await
-            .context("Failed to load artifact cleanup intent")?;
-        row.as_ref().map(map_artifact_cleanup_intent).transpose()
+        artifact_cleanup_intent_with(db, storage_key).await
     }
 
+    /// Delete a completed intent and give its unit back to the tenant's and
+    /// the global cleanup quota.
     pub(crate) async fn complete_artifact_cleanup(
         &self,
         id: &str,
@@ -465,15 +467,37 @@ impl BatchRuntimeStore {
     ) -> anyhow::Result<bool> {
         validate_artifact_cleanup_storage_key(storage_key)?;
         let db = self.db.connection().await?;
-        let result = db
+        let tx = db
+            .begin_with_options(write_transaction_options())
+            .await
+            .context("Failed to start artifact cleanup completion")?;
+        let Some(intent) = artifact_cleanup_intent_with(&tx, storage_key)
+            .await?
+            .filter(|intent| intent.id == id)
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let deleted = tx
             .execute_raw(raw::statement(
-                db,
+                &tx,
                 "DELETE FROM artifact_cleanup_intents WHERE id = ?1 AND storage_key = ?2",
                 vec![id.into(), storage_key.into()],
             )?)
             .await
-            .context("Failed to complete artifact cleanup intent")?;
-        Ok(result.rows_affected() == 1)
+            .context("Failed to complete artifact cleanup intent")?
+            .rows_affected();
+        release_quota_with(
+            &tx,
+            QuotaKind::ArtifactCleanup,
+            &intent.tenant_scope,
+            deleted,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("Failed to commit artifact cleanup completion")?;
+        Ok(deleted == 1)
     }
 
     pub(crate) async fn defer_artifact_cleanup(
@@ -515,12 +539,15 @@ impl BatchRuntimeStore {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(super) fn artifact_cleanup_capacity(&self) -> u64 {
+    pub(super) fn artifact_cleanup_limits(&self) -> QuotaLimits {
         #[cfg(test)]
-        if let Some(capacity) = self.test_artifact_cleanup_capacity {
-            return capacity;
+        if let Some(limits) = self.test_artifact_cleanup_limits {
+            return limits;
         }
-        MAX_ARTIFACT_CLEANUP_INTENTS
+        QuotaLimits {
+            global: MAX_ARTIFACT_CLEANUP_INTENTS,
+            per_tenant: MAX_ARTIFACT_CLEANUP_INTENTS_PER_TENANT,
+        }
     }
 
     pub async fn get_media_asset_by_storage_key(

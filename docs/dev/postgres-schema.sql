@@ -776,6 +776,10 @@ ALTER TABLE job_stages ADD COLUMN IF NOT EXISTS resource_hints_version BIGINT NO
 
 CREATE INDEX IF NOT EXISTS idx_job_stages_claimable ON job_stages(queue_class, available_at) WHERE status IN ('queued', 'retrying');
 
+INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', tenant_scope, COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING;
+
+INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', '', COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     component TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -787,6 +791,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 1, 'baseline', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 2, 'stage claim columns', 0) ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 3, 'artifact cleanup quota', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ('voice_profile_default', 'Primary Voice Profile', 'You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.', 1, 0, 0) ON CONFLICT (id) DO NOTHING;
 

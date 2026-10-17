@@ -32,7 +32,11 @@ impl Schema {
             // Version 1 is the schema every earlier unversioned release
             // created. Its statements are idempotent, so a database those
             // releases left behind upgrades by running it once.
-            Self::App => &[(1, "baseline"), (2, "stage claim columns")],
+            Self::App => &[
+                (1, "baseline"),
+                (2, "stage claim columns"),
+                (3, "artifact cleanup quota"),
+            ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
                 (2, "drop the write-only worker observations"),
@@ -149,6 +153,11 @@ async fn apply_migration<C: ConnectionTrait>(
             for statement in STAGE_CLAIM_SCHEMA {
                 db.execute_unprepared(&dialect_ddl(backend, statement))
                     .await?;
+            }
+        }
+        (Schema::App, 3) => {
+            for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
+                db.execute_unprepared(statement).await?;
             }
         }
         (Schema::Fleet, 1) => {
@@ -913,6 +922,14 @@ const QUOTA_USAGE_BACKFILL: &[&str] = &[
     "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'provider_write', '', COUNT(*) FROM provider_write_reservations WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
 ];
 
+/// Migration 3: pending artifact cleanup intents are counted in
+/// `runtime_quota_usage` from now on; seed the counts from the intents that
+/// exist when it runs.
+const ARTIFACT_CLEANUP_QUOTA_BACKFILL: &[&str] = &[
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', tenant_scope, COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 GROUP BY tenant_scope ON CONFLICT (quota_kind, scope) DO NOTHING",
+    "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', '', COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
+];
+
 async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
         db.execute_unprepared(statement).await?;
@@ -1428,6 +1445,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     for statement in STAGE_CLAIM_SCHEMA {
         push(statement);
     }
+    // Migration 3.
+    for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
+        push(statement);
+    }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {
         push(&format!(
@@ -1483,7 +1504,7 @@ mod tests {
         Migrator::up(db).await.expect("a second run is a no-op");
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
-            2
+            Schema::App.migrations().len() as i64
         );
         assert!(has_table(db, "runtime_jobs").await);
         assert!(
@@ -1528,7 +1549,7 @@ mod tests {
         Migrator::up(db).await.expect("unversioned database upgrades");
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations WHERE component = 'app'").await,
-            2
+            Schema::App.migrations().len() as i64
         );
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM chat_threads WHERE id = 'kept'").await,
@@ -1644,7 +1665,7 @@ mod tests {
         let db = &connections[0];
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM schema_migrations").await,
-            2
+            Schema::App.migrations().len() as i64
         );
         assert_eq!(
             count(db, "SELECT COUNT(*) FROM voice_profiles").await,
