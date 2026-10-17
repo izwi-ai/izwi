@@ -17,3 +17,4 @@ pub mod chat;
 
 pub use backend::BackendKind;
 pub use catalog::*;
+pub use chat::*;

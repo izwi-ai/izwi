@@ -2,7 +2,7 @@
 //! routes: message content, and past tool calls and tool results in the
 //! prompt format of the model family that reads them.
 
-use izwi_core::{ChatMessage, ChatRole, ModelFamily, ModelVariant};
+use izwi_model_catalog::{ChatMessage, ChatRole, ModelFamily, ModelVariant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -41,7 +41,7 @@ pub struct InboundContentPart {
 }
 
 /// Flatten message content into prompt text plus the media it references.
-pub(crate) fn flatten_content(
+pub fn flatten_content(
     content: Option<InboundContent>,
 ) -> Result<FlattenedMultimodalContent, ApiError> {
     match content {
@@ -65,7 +65,7 @@ pub(crate) fn flatten_content(
 
 /// Append an assistant turn's past `tool_calls` to its text, in the format
 /// the model family writes them.
-pub(crate) fn append_assistant_tool_calls(
+pub fn append_assistant_tool_calls(
     variant: ModelVariant,
     content: &mut String,
     tool_calls: &[Value],
@@ -88,7 +88,7 @@ pub(crate) fn append_assistant_tool_calls(
 
 /// A tool result turn. LFM2.5 has a native `tool` role; the Qwen templates
 /// read results as a user turn wrapped in `<tool_response>`.
-pub(crate) fn tool_result_message(variant: ModelVariant, content: String) -> ChatMessage {
+pub fn tool_result_message(variant: ModelVariant, content: String) -> ChatMessage {
     if variant.family() == ModelFamily::Lfm2Chat {
         ChatMessage {
             role: ChatRole::Tool,

@@ -11,6 +11,7 @@
 #![allow(clippy::type_complexity)]
 
 pub mod api;
+pub mod app;
 pub mod error;
 pub mod gateway_deployments;
 pub mod gateway_rate_quota;

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::openai::convert::InboundContent;
 use crate::api::openai::tool_calls::{ToolCall, ToolCallDelta};
-use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
+use izwi_model_catalog::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -103,81 +103,81 @@ pub struct OpenAiInboundMessage {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiChatCompletionResponse {
-    pub(crate) id: String,
-    pub(crate) object: &'static str,
-    pub(crate) created: u64,
-    pub(crate) model: String,
-    pub(crate) choices: Vec<OpenAiChoice>,
-    pub(crate) usage: OpenAiUsage,
+pub struct OpenAiChatCompletionResponse {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<OpenAiChoice>,
+    pub usage: OpenAiUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) izwi_generation_time_ms: Option<f64>,
+    pub izwi_generation_time_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
+    pub izwi_timing: Option<izwi_model_catalog::LatencyBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiChoice {
-    pub(crate) index: usize,
-    pub(crate) message: OpenAiAssistantMessage,
-    pub(crate) finish_reason: &'static str,
+pub struct OpenAiChoice {
+    pub index: usize,
+    pub message: OpenAiAssistantMessage,
+    pub finish_reason: &'static str,
     /// DS9.3: per-token logprobs; absent unless the request asked for them.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) logprobs: Option<OpenAiChoiceLogprobs>,
+    pub logprobs: Option<OpenAiChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiAssistantMessage {
-    pub(crate) role: &'static str,
+pub struct OpenAiAssistantMessage {
+    pub role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reasoning_content: Option<String>,
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) content: Option<String>,
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiUsage {
-    pub(crate) prompt_tokens: usize,
-    pub(crate) completion_tokens: usize,
-    pub(crate) total_tokens: usize,
+pub struct OpenAiUsage {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
     /// DS9.1: OpenAI-shape prompt token details. Always present with usage;
     /// `cached_tokens` is 0 when the serving runtime did not measure prefix
     /// reuse.
-    pub(crate) prompt_tokens_details: OpenAiPromptTokensDetails,
+    pub prompt_tokens_details: OpenAiPromptTokensDetails,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiPromptTokensDetails {
-    pub(crate) cached_tokens: u64,
+pub struct OpenAiPromptTokensDetails {
+    pub cached_tokens: u64,
 }
 
 /// DS9.3: OpenAI-shape per-choice logprobs wrapper.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiChoiceLogprobs {
-    pub(crate) content: Vec<OpenAiTokenLogprob>,
+pub struct OpenAiChoiceLogprobs {
+    pub content: Vec<OpenAiTokenLogprob>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiTokenLogprob {
-    pub(crate) token: String,
-    pub(crate) logprob: f32,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) top_logprobs: Vec<OpenAiTopTokenLogprob>,
+pub struct OpenAiTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<OpenAiTopTokenLogprob>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiTopTokenLogprob {
-    pub(crate) token: String,
-    pub(crate) logprob: f32,
-    pub(crate) bytes: Vec<u8>,
+pub struct OpenAiTopTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
 }
 
 /// DS9.3: map core logprob entries into the OpenAI response shape. `None`
 /// when the request did not collect logprobs.
-pub(crate) fn openai_logprobs(
-    entries: &[izwi_core::engine::TokenLogprob],
+pub fn openai_logprobs(
+    entries: &[izwi_model_catalog::TokenLogprob],
 ) -> Option<OpenAiChoiceLogprobs> {
     if entries.is_empty() {
         return None;
@@ -204,46 +204,46 @@ pub(crate) fn openai_logprobs(
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiChatChunk {
-    pub(crate) id: String,
-    pub(crate) object: &'static str,
-    pub(crate) created: u64,
-    pub(crate) model: String,
-    pub(crate) choices: Vec<OpenAiChunkChoice>,
+pub struct OpenAiChatChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<OpenAiChunkChoice>,
     /// With `stream_options.include_usage`: `null` on every chunk but the
     /// last, which carries the usage and no choices.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) usage: Option<Option<OpenAiUsage>>,
+    pub usage: Option<Option<OpenAiUsage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) izwi_generation_time_ms: Option<f64>,
+    pub izwi_generation_time_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
+    pub izwi_timing: Option<izwi_model_catalog::LatencyBreakdown>,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiChunkChoice {
-    pub(crate) index: usize,
-    pub(crate) delta: OpenAiDelta,
+pub struct OpenAiChunkChoice {
+    pub index: usize,
+    pub delta: OpenAiDelta,
     /// DS9.3: the logprobs of this chunk's tokens; absent unless requested.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) logprobs: Option<OpenAiChoiceLogprobs>,
-    pub(crate) finish_reason: Option<&'static str>,
+    pub logprobs: Option<OpenAiChoiceLogprobs>,
+    pub finish_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OpenAiDelta {
+pub struct OpenAiDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) role: Option<&'static str>,
+    pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reasoning_content: Option<String>,
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) content: Option<String>,
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tool_calls: Option<Vec<ToolCallDelta>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InboundMessageRole {
+pub enum InboundMessageRole {
     System,
     User,
     Assistant,
@@ -251,7 +251,7 @@ pub(crate) enum InboundMessageRole {
 }
 
 impl OpenAiDelta {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.role.is_none()
             && self.reasoning_content.is_none()
             && self.content.is_none()

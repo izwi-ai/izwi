@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::stream::SplitSink;
@@ -18,14 +18,13 @@ use futures::SinkExt;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use tokio::sync::Notify;
 
+pub(crate) use izwi_gateway::app::realtime_wire::{
+    now_unix_millis, parse_client_pcm16_frame, ClientPcm16Frame, WS_BIN_VERSION,
+};
+
 /// How long the writer waits for the socket to take one message before it
 /// treats the peer as gone.
 pub(crate) const WS_WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bytes in the client PCM16 frame header: magic, version, kind, two
-/// reserved bytes, sample rate and frame sequence.
-pub(crate) const WS_BIN_CLIENT_HEADER_LEN: usize = 16;
-pub(crate) const WS_BIN_VERSION: u8 = 1;
-pub(crate) const WS_BIN_KIND_CLIENT_PCM16: u8 = 1;
 
 /// How the mailbox treats one outbound message when the socket is slow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,40 +329,6 @@ pub(crate) fn spawn_writer(
     })
 }
 
-/// One client PCM16 audio frame.
-#[derive(Debug)]
-pub(crate) struct ClientPcm16Frame {
-    pub(crate) frame_seq: u32,
-    pub(crate) sample_rate: u32,
-    pub(crate) payload: Vec<u8>,
-}
-
-/// Parse a client PCM16 frame carrying `magic`; `endpoint` names the
-/// endpoint in the error for a frame without the header.
-pub(crate) fn parse_client_pcm16_frame(
-    data: &[u8],
-    magic: &[u8; 4],
-    endpoint: &str,
-) -> Result<ClientPcm16Frame, String> {
-    if data.len() < WS_BIN_CLIENT_HEADER_LEN || &data[..4] != magic {
-        return Err(format!(
-            "Unexpected binary message (missing {endpoint} frame header)"
-        ));
-    }
-    let version = data[4];
-    if version != WS_BIN_VERSION {
-        return Err(format!("Unsupported binary frame version {version}"));
-    }
-    match data[5] {
-        WS_BIN_KIND_CLIENT_PCM16 => Ok(ClientPcm16Frame {
-            sample_rate: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            frame_seq: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            payload: data[WS_BIN_CLIENT_HEADER_LEN..].to_vec(),
-        }),
-        other => Err(format!("Unsupported binary frame kind {other}")),
-    }
-}
-
 pub(crate) fn pcm16_bytes_to_i16(bytes: &[u8]) -> Vec<i16> {
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.as_chunks::<2>().0 {
@@ -391,16 +356,10 @@ pub(crate) fn wav_bytes_from_pcm16_mono(
         .map_err(|err| format!("Failed to encode streamed WAV: {err}"))
 }
 
-pub(crate) fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izwi_gateway::app::realtime_wire::WS_BIN_KIND_CLIENT_PCM16;
 
     fn audio(byte: u8, bytes: usize, duration_ms: u64) -> OutboundItem {
         OutboundItem {

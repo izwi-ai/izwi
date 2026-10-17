@@ -13,7 +13,7 @@ const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
 /// Split a complete output into `(reasoning, content)`.
-pub(super) fn split_reasoning(text: &str, opened_in_prompt: bool) -> (Option<String>, String) {
+pub fn split_reasoning(text: &str, opened_in_prompt: bool) -> (Option<String>, String) {
     let mut splitter = ReasoningSplitter::new(opened_in_prompt);
     let (mut reasoning, mut content) = splitter.push(text);
     let (tail_reasoning, tail_content) = splitter.finish();
@@ -35,14 +35,14 @@ enum Phase {
 
 /// Incremental splitter for streamed deltas. Text that could still be the
 /// beginning of a tag is held back until the next delta decides it.
-pub(super) struct ReasoningSplitter {
+pub struct ReasoningSplitter {
     phase: Phase,
     pending: String,
     saw_reasoning: bool,
 }
 
 impl ReasoningSplitter {
-    pub(super) fn new(opened_in_prompt: bool) -> Self {
+    pub fn new(opened_in_prompt: bool) -> Self {
         Self {
             phase: if opened_in_prompt {
                 Phase::Reasoning
@@ -55,7 +55,7 @@ impl ReasoningSplitter {
     }
 
     /// Feed one delta; returns the `(reasoning, content)` text now final.
-    pub(super) fn push(&mut self, delta: &str) -> (String, String) {
+    pub fn push(&mut self, delta: &str) -> (String, String) {
         self.pending.push_str(delta);
         let mut reasoning = String::new();
         let mut content = String::new();
@@ -109,7 +109,7 @@ impl ReasoningSplitter {
     }
 
     /// Flush what is held back at the end of the output.
-    pub(super) fn finish(&mut self) -> (String, String) {
+    pub fn finish(&mut self) -> (String, String) {
         let pending = std::mem::take(&mut self.pending);
         match self.phase {
             Phase::Reasoning => (pending, String::new()),

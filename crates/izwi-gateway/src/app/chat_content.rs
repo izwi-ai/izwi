@@ -1,4 +1,4 @@
-use izwi_core::{ChatMediaInput, ChatMediaKind, ModelVariant};
+use izwi_model_catalog::{ChatMediaInput, ChatMediaKind, ModelVariant};
 use serde_json::Value;
 
 pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";

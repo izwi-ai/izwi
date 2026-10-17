@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures::StreamExt;
 use izwi_core::{RuntimeAsrRealtimeEvent, RuntimeAsrRealtimeStream, RuntimeService, WorkloadClass};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -19,16 +19,14 @@ use crate::app::realtime_protocol::{
 #[cfg(test)]
 use crate::app::realtime_transport::MailboxOutput;
 use crate::app::realtime_transport::{
-    now_unix_millis, parse_client_pcm16_frame, pcm16_bytes_to_i16, pcm16_i16_to_f32, spawn_writer,
-    wav_bytes_from_pcm16_mono, ClientPcm16Frame, OutboundClass, OutboundEnqueueError, OutboundItem,
-    OutboundLimits, OutboundMailbox,
+    now_unix_millis, pcm16_bytes_to_i16, pcm16_i16_to_f32, spawn_writer, wav_bytes_from_pcm16_mono,
+    OutboundClass, OutboundEnqueueError, OutboundItem, OutboundLimits, OutboundMailbox,
 };
 use crate::state::AppState;
-
-pub(crate) const LEGACY_REALTIME_PROTOCOL: &str = "transcription_realtime_v2";
-pub(crate) const TYPED_REALTIME_PROTOCOL: &str = "transcription_realtime";
-
-pub(crate) const WS_BIN_MAGIC: &[u8; 4] = b"ITRW";
+pub(crate) use izwi_gateway::app::realtime_wire::{
+    negotiate_transcription_protocol, parse_binary_message, BinaryMessageKind, ClientEvent,
+    TranscriptionWireProtocol, LEGACY_REALTIME_PROTOCOL,
+};
 
 const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_STREAM_BUFFER_SECS: f32 = 32.0;
@@ -121,37 +119,6 @@ impl OutboundTx {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ClientEvent {
-    SessionStart {
-        #[serde(default)]
-        model_id: Option<String>,
-        #[serde(default)]
-        language: Option<String>,
-        #[serde(default)]
-        protocol: Option<String>,
-        #[serde(default)]
-        version: Option<u16>,
-        #[serde(default)]
-        resume_from_event_id: Option<u64>,
-    },
-    SessionStop,
-    Ping {
-        #[serde(default)]
-        timestamp_ms: Option<u64>,
-    },
-}
-
-#[derive(Debug)]
-pub(crate) enum BinaryMessageKind {
-    ClientPcm16Frame {
-        frame_seq: u32,
-        sample_rate: u32,
-        payload: Vec<u8>,
-    },
-}
-
 #[derive(Debug)]
 enum WorkerCommand {
     SessionStart {
@@ -170,12 +137,6 @@ enum WorkerCommand {
     ProtocolError(String),
     SessionStop,
     Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptionWireProtocol {
-    LegacyV2,
-    TypedV3,
 }
 
 struct TypedTranscriptionSession {
@@ -582,31 +543,6 @@ fn handle_text_message(
         ClientEvent::Ping { timestamp_ms } => {
             let _ = send_worker_command(worker_tx, WorkerCommand::Ping { timestamp_ms });
             false
-        }
-    }
-}
-
-pub(crate) fn negotiate_transcription_protocol(
-    protocol: Option<&str>,
-    version: Option<u16>,
-    resume_from_event_id: Option<u64>,
-) -> Result<TranscriptionWireProtocol, String> {
-    match (protocol.map(str::trim), version) {
-        (None, None) => Ok(TranscriptionWireProtocol::LegacyV2),
-        (Some(TYPED_REALTIME_PROTOCOL), Some(TRANSCRIPTION_REALTIME_VERSION)) => {
-            if resume_from_event_id.is_some() {
-                return Err(
-                    "transcription_realtime v3 sessions are process-owned and non-resumable"
-                        .to_string(),
-                );
-            }
-            Ok(TranscriptionWireProtocol::TypedV3)
-        }
-        (Some(protocol), Some(version)) => Err(format!(
-            "Unsupported realtime protocol negotiation `{protocol}` version {version}"
-        )),
-        _ => {
-            Err("Realtime protocol negotiation requires both `protocol` and `version`".to_string())
         }
     }
 }
@@ -1943,19 +1879,6 @@ fn normalize_word(token: &str) -> String {
     token
         .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '\'')
         .to_lowercase()
-}
-
-pub(crate) fn parse_binary_message(data: &[u8]) -> Result<BinaryMessageKind, String> {
-    let ClientPcm16Frame {
-        frame_seq,
-        sample_rate,
-        payload,
-    } = parse_client_pcm16_frame(data, WS_BIN_MAGIC, "transcription")?;
-    Ok(BinaryMessageKind::ClientPcm16Frame {
-        frame_seq,
-        sample_rate,
-        payload,
-    })
 }
 
 fn send_json(tx: &OutboundTx, value: serde_json::Value) {

@@ -8,7 +8,7 @@
 //! Qwen call is sent as soon as its name is known and its arguments one
 //! parameter at a time, and a block that does not parse is released as text.
 
-use izwi_core::{chat_supports_tools, ModelFamily, ModelVariant};
+use izwi_model_catalog::{chat_supports_tools, ModelFamily, ModelVariant};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -25,7 +25,7 @@ const PARAMETER_CLOSE: &str = "</parameter>";
 
 /// How a model family writes tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolCallFormat {
+pub enum ToolCallFormat {
     /// The Qwen3.5 family: `<tool_call><function=f><parameter=k>v</parameter>
     /// </function></tool_call>`. A JSON `{"name", "arguments"}` body is
     /// accepted too.
@@ -36,7 +36,7 @@ pub(crate) enum ToolCallFormat {
 
 impl ToolCallFormat {
     /// The format of a model whose chat template renders tools.
-    pub(crate) fn of(variant: ModelVariant) -> Option<Self> {
+    pub fn of(variant: ModelVariant) -> Option<Self> {
         if !chat_supports_tools(variant) {
             return None;
         }
@@ -57,18 +57,18 @@ impl ToolCallFormat {
 
 /// How a request's `tools` and `tool_choice` apply.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct ToolPolicy {
+pub struct ToolPolicy {
     /// The tool definitions rendered into the prompt.
-    pub(crate) tools: Vec<Value>,
+    pub tools: Vec<Value>,
     /// The format tool calls are parsed in; `None` leaves the answer text.
-    pub(crate) format: Option<ToolCallFormat>,
+    pub format: Option<ToolCallFormat>,
 }
 
 /// Resolve OpenAI `tools` and `tool_choice` for `variant`. `"auto"` (the
 /// default) offers the tools and parses calls; `"none"` does neither. Forcing
 /// a call (`"required"` or a named function) needs constrained decoding,
 /// which no chat template here provides, so it is refused.
-pub(crate) fn resolve_tool_policy(
+pub fn resolve_tool_policy(
     variant: ModelVariant,
     tools: Option<&[Value]>,
     tool_choice: Option<&Value>,
@@ -130,47 +130,47 @@ fn is_function_tool(tool: &Value) -> bool {
 
 /// A complete tool call (OpenAI `message.tool_calls[]`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ToolCall {
-    pub(crate) id: String,
+pub struct ToolCall {
+    pub id: String,
     #[serde(rename = "type")]
-    pub(crate) kind: &'static str,
-    pub(crate) function: ToolCallFunction,
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ToolCallFunction {
-    pub(crate) name: String,
-    pub(crate) arguments: String,
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// A fragment of a streamed tool call (OpenAI `delta.tool_calls[]`): the
 /// first carries the id, type and name; the arguments concatenate.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ToolCallDelta {
-    pub(crate) index: usize,
+pub struct ToolCallDelta {
+    pub index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<String>,
+    pub id: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub(crate) kind: Option<&'static str>,
-    pub(crate) function: ToolCallDeltaFunction,
+    pub kind: Option<&'static str>,
+    pub function: ToolCallDeltaFunction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ToolCallDeltaFunction {
+pub struct ToolCallDeltaFunction {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<String>,
-    pub(crate) arguments: String,
+    pub name: Option<String>,
+    pub arguments: String,
 }
 
 /// Answer text and tool-call fragments the parser has made final.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct ParsedOutput {
-    pub(crate) content: String,
-    pub(crate) tool_calls: Vec<ToolCallDelta>,
+pub struct ParsedOutput {
+    pub content: String,
+    pub tool_calls: Vec<ToolCallDelta>,
 }
 
 impl ParsedOutput {
-    pub(crate) fn extend(&mut self, other: ParsedOutput) {
+    pub fn extend(&mut self, other: ParsedOutput) {
         self.content.push_str(&other.content);
         for delta in other.tool_calls {
             self.push_delta(delta);
@@ -230,7 +230,7 @@ enum State {
 }
 
 /// Incremental tool-call parser over a model's answer text.
-pub(crate) struct ToolCallParser {
+pub struct ToolCallParser {
     format: ToolCallFormat,
     state: State,
     /// Input not yet decided.
@@ -243,7 +243,7 @@ pub(crate) struct ToolCallParser {
 }
 
 impl ToolCallParser {
-    pub(crate) fn new(format: ToolCallFormat) -> Self {
+    pub fn new(format: ToolCallFormat) -> Self {
         Self {
             format,
             state: State::Text,
@@ -254,12 +254,12 @@ impl ToolCallParser {
     }
 
     /// Whether the answer has started a tool call.
-    pub(crate) fn saw_tool_calls(&self) -> bool {
+    pub fn saw_tool_calls(&self) -> bool {
         self.calls > 0
     }
 
     /// Feed one delta; returns what it made final.
-    pub(crate) fn push(&mut self, delta: &str) -> ParsedOutput {
+    pub fn push(&mut self, delta: &str) -> ParsedOutput {
         self.pending.push_str(delta);
         let mut out = ParsedOutput::default();
         while self.step(&mut out) {}
@@ -268,7 +268,7 @@ impl ToolCallParser {
 
     /// Flush the end of the answer. An unterminated block is released as
     /// text; a Qwen call cut inside its parameters closes its arguments.
-    pub(crate) fn finish(&mut self) -> ParsedOutput {
+    pub fn finish(&mut self) -> ParsedOutput {
         let mut out = ParsedOutput::default();
         let pending = std::mem::take(&mut self.pending);
         match self.state {
@@ -499,7 +499,7 @@ fn partial_tag_suffix(text: &str, tag: &str) -> usize {
 
 /// Parse a whole answer: its text (trimmed when it made calls, `None` when
 /// that leaves nothing) and its calls.
-pub(crate) fn parse_answer(format: ToolCallFormat, text: &str) -> (Option<String>, Vec<ToolCall>) {
+pub fn parse_answer(format: ToolCallFormat, text: &str) -> (Option<String>, Vec<ToolCall>) {
     let mut parser = ToolCallParser::new(format);
     let mut parsed = parser.push(text);
     parsed.extend(parser.finish());

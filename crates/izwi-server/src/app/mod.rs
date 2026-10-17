@@ -1,9 +1,9 @@
 pub mod chat;
-pub mod chat_content;
+pub use izwi_gateway::app::chat_content;
 pub mod fleet_coordinator;
 pub mod prefix_router;
 pub mod realtime_codec;
-pub mod realtime_protocol;
+pub use izwi_gateway::app::realtime_protocol;
 pub mod realtime_relay;
 pub mod realtime_transport;
 pub mod realtime_translate;
