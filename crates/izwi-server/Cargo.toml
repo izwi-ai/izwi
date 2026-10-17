@@ -18,7 +18,11 @@ cuda = ["cuda-base", "izwi-core/flash-attn"]
 cudnn = ["cuda", "izwi-core/cudnn"]
 flash-attn = ["cuda"]
 metal = ["izwi-core/metal"]
-db-postgres = ["sea-orm/sqlx-postgres", "sea-orm/runtime-tokio-rustls"]
+db-postgres = [
+    "izwi-db/db-postgres",
+    "sea-orm/sqlx-postgres",
+    "sea-orm/runtime-tokio-rustls",
+]
 
 [dependencies]
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
@@ -59,6 +63,7 @@ izwi-hooks = { path = "../izwi-hooks" }
 izwi-agent = { path = "../izwi-agent" }
 izwi-vad = { path = "../izwi-vad" }
 rubato = { workspace = true }
+izwi-db = { path = "../izwi-db" }
 izwi-gateway = { path = "../izwi-gateway" }
 izwi-serving-client = { path = "../izwi-serving-client" }
 izwi-serving-protocol = { path = "../izwi-serving-protocol" }
@@ -93,6 +98,7 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [dev-dependencies]
+izwi-db = { path = "../izwi-db", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 izwi-serving-worker = { path = "../izwi-serving-worker", features = ["test-support"] }
 izwi-test-process = { path = "../izwi-test-process" }

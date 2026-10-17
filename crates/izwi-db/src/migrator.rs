@@ -1,11 +1,10 @@
-use crate::db::{raw, write_transaction_options};
 use crate::voice_defaults::{
     DEFAULT_VOICE_AGENT_SYSTEM_PROMPT, DEFAULT_VOICE_PROFILE_ID, DEFAULT_VOICE_PROFILE_NAME,
 };
+use crate::{current_timestamp_millis, raw, write_transaction_options};
 use anyhow::Context;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Migrator;
 
@@ -1415,8 +1414,8 @@ async fn ensure_default_voice_profile<C: ConnectionTrait>(db: &C) -> anyhow::Res
 pub(crate) fn postgres_schema_sql() -> String {
     let mut sql = String::from(
         "-- Izwi application schema for PostgreSQL (provider-managed migrations).\n\
-         -- Generated from crates/izwi-server/src/db/migrator.rs: do not edit. Regenerate with\n\
-         --   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-server --lib postgres_schema\n\
+         -- Generated from crates/izwi-db/src/migrator.rs: do not edit. Regenerate with\n\
+         --   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-db --lib postgres_schema\n\
          -- Apply it to an empty schema. It records the migrations it contains in\n\
          -- schema_migrations, so Izwi applies nothing further when it starts.\n\n\
          BEGIN;\n\n",
@@ -1488,17 +1487,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     sql
 }
 
-fn current_timestamp_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::test_database::TestDatabase;
+    use crate::test_database::TestDatabase;
 
     async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
         db.query_one_raw(Statement::from_string(db.get_database_backend(), sql))
@@ -1597,7 +1589,7 @@ mod tests {
         assert!(
             shipped == generated,
             "docs/dev/postgres-schema.sql is stale; regenerate it with \
-             IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-server --lib postgres_schema"
+             IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-db --lib postgres_schema"
         );
     }
 

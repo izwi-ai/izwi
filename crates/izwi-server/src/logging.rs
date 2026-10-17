@@ -21,7 +21,7 @@ impl LogFormat {
 
 pub fn init_tracing(log_format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "izwi_server=warn,izwi_core=warn,tower_http=warn".into());
+        .unwrap_or_else(|_| "izwi_server=warn,izwi_db=warn,izwi_core=warn,tower_http=warn".into());
 
     // Request spans go to an OTLP collector only when one is configured.
     let otlp = izwi_serving_client::otlp::otlp_layer_from_env(SERVICE_NAME);

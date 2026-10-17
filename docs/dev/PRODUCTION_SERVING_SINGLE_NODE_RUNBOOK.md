@@ -772,9 +772,10 @@ creates its own schema in it):
 
 ```
 createdb izwi_store_test
-IZWI_TEST_STORE_PG_URL=postgres://$(whoami)@localhost/izwi_store_test \
-  cargo test -p izwi-server --features db-postgres --lib -- \
-  batch_runtime artifact_store db::migrator saved_voice_store
+export IZWI_TEST_STORE_PG_URL=postgres://$(whoami)@localhost/izwi_store_test
+cargo test -p izwi-db --features db-postgres
+cargo test -p izwi-server --features db-postgres --lib -- \
+  batch_runtime artifact_store saved_voice_store
 ```
 
 ## Route migration gates

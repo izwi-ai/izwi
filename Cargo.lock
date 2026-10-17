@@ -3758,6 +3758,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "izwi-db"
+version = "0.1.0-beta-18"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "sea-orm",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "izwi-desktop"
 version = "0.1.0-beta-18"
 dependencies = [
@@ -3847,6 +3860,7 @@ dependencies = [
  "http-body-util",
  "izwi-agent",
  "izwi-core",
+ "izwi-db",
  "izwi-gateway",
  "izwi-hooks",
  "izwi-serving-client",

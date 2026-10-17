@@ -10,7 +10,7 @@ use super::StoreDatabase;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-pub(crate) const STORE_PG_URL_ENV: &str = "IZWI_TEST_STORE_PG_URL";
+pub const STORE_PG_URL_ENV: &str = "IZWI_TEST_STORE_PG_URL";
 
 #[derive(Debug, Clone)]
 enum Location {
@@ -19,19 +19,19 @@ enum Location {
     Postgres(String),
 }
 
-pub(crate) struct TestDatabase {
+pub struct TestDatabase {
     location: Location,
     _root: TempDir,
 }
 
 impl TestDatabase {
-    pub(crate) async fn new() -> Self {
+    pub async fn new() -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let location = match postgres_url() {
             #[cfg(feature = "db-postgres")]
             Some(url) => Location::Postgres(fresh_schema(&url).await),
             #[cfg(not(feature = "db-postgres"))]
-            Some(_) => panic!("{STORE_PG_URL_ENV} needs izwi-server's db-postgres feature"),
+            Some(_) => panic!("{STORE_PG_URL_ENV} needs the db-postgres feature"),
             None => Location::Sqlite(root.path().join("runtime.sqlite")),
         };
         Self {
@@ -41,7 +41,7 @@ impl TestDatabase {
     }
 
     /// A new connection pool on this test's database that runs no migrations.
-    pub(crate) async fn connect_unmigrated(&self) -> sea_orm::DatabaseConnection {
+    pub async fn connect_unmigrated(&self) -> sea_orm::DatabaseConnection {
         match &self.location {
             Location::Sqlite(path) => super::sqlite::connect_path(path)
                 .await
@@ -54,7 +54,7 @@ impl TestDatabase {
     }
 
     /// A new handle, with its own pool, on this test's database.
-    pub(crate) fn database(&self) -> StoreDatabase {
+    pub fn database(&self) -> StoreDatabase {
         match &self.location {
             Location::Sqlite(path) => StoreDatabase::new(path.clone()),
             #[cfg(feature = "db-postgres")]

@@ -1,6 +1,6 @@
 -- Izwi application schema for PostgreSQL (provider-managed migrations).
--- Generated from crates/izwi-server/src/db/migrator.rs: do not edit. Regenerate with
---   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-server --lib postgres_schema
+-- Generated from crates/izwi-db/src/migrator.rs: do not edit. Regenerate with
+--   IZWI_WRITE_POSTGRES_SCHEMA=1 cargo test -p izwi-db --lib postgres_schema
 -- Apply it to an empty schema. It records the migrations it contains in
 -- schema_migrations, so Izwi applies nothing further when it starts.
 

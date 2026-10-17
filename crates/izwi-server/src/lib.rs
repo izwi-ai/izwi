@@ -22,7 +22,6 @@ pub mod artifact_store;
 pub mod batch_runtime;
 mod chat_store;
 mod cli;
-mod db;
 mod diarization_store;
 mod entity;
 mod env_config;
@@ -44,18 +43,21 @@ mod speech_history_store;
 mod speech_resource_budget;
 mod speech_spool;
 mod state;
-mod storage_layout;
 mod studio_project_store;
 #[cfg(test)]
 mod test_support;
 mod transcription_store;
-mod voice_defaults;
 mod voice_memory;
 mod voice_observation_store;
 mod voice_store;
 
 use cli::{resolve_serve_runtime_config, validate_role_topology, ServerArgs, ServerRole};
 use izwi_core::{RuntimeService, ServeRuntimeConfig};
+// The durable store lives in izwi-db, shared with the gateway; these aliases
+// keep its `crate::db`, `crate::storage_layout` and `crate::voice_defaults`
+// paths.
+use izwi_db as db;
+use izwi_db::{storage_layout, voice_defaults};
 use izwi_hooks::EnterpriseHooks;
 // The gateway's accelerator-free components live in izwi-gateway; these
 // aliases keep their `crate::` paths for the gateway role still hosted here.

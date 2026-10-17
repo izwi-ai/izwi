@@ -1,0 +1,32 @@
+[package]
+name = "izwi-db"
+description = "Izwi's durable store: SQLite/PostgreSQL connections, schema migrations, raw statement helpers and the storage layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+db-postgres = ["sea-orm/sqlx-postgres", "sea-orm/runtime-tokio-rustls"]
+# The disposable test databases and clock skew hook other crates' store tests use.
+test-support = ["dep:tempfile"]
+
+[dependencies]
+anyhow = { workspace = true }
+dirs = { workspace = true }
+sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+    "macros",
+    "runtime-tokio",
+    "sqlx-sqlite",
+    "sqlite-use-returning-for-3_35",
+    "with-json",
+    "with-uuid",
+] }
+tempfile = { version = "3.10", optional = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

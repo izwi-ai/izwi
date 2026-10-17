@@ -413,16 +413,17 @@ run_cargo_fleet_stores() {
 
     cargo test --locked -p izwi-server --features db-postgres --lib fleet_postgres
 
-    # The durable store suite (jobs, stages, claims, leases, idempotency,
-    # artifacts, retention, migrations and the shipped schema), the batch
+    # The durable store suite (migrations and the shipped schema in izwi-db;
+    # jobs, stages, claims, leases, idempotency, artifacts and retention), the batch
     # worker, the artifact store and the saved-voice name constraint on
     # PostgreSQL. Each test creates its own schema in this disposable database.
     if [[ -z "${IZWI_TEST_STORE_PG_URL:-}" ]]; then
         echo "IZWI_TEST_STORE_PG_URL must point at a disposable PostgreSQL database" >&2
         exit 1
     fi
+    cargo test --locked --no-fail-fast -p izwi-db --features db-postgres
     cargo test --locked --no-fail-fast -p izwi-server --features db-postgres --lib -- \
-        batch_runtime artifact_store db::migrator saved_voice_store
+        batch_runtime artifact_store saved_voice_store
 }
 
 run_fleet_rig_postgres() {

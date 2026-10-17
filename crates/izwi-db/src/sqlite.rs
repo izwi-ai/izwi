@@ -1,5 +1,5 @@
 use crate::{
-    db::migrator::{Migrator, Schema},
+    migrator::{Migrator, Schema},
     storage_layout,
 };
 use anyhow::Context;
@@ -23,7 +23,7 @@ const DEFAULT_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 /// hung peer, and must not hold the worker's advisory lock for everyone else.
 const COORDINATION_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn initialize_default() -> anyhow::Result<DatabaseConnection> {
     let db = connect_default().await?;
     Migrator::up(&db)
@@ -175,7 +175,7 @@ const DATABASE_CLOCK_RESYNC: Duration = Duration::from_secs(30);
 #[derive(Debug, Default)]
 struct DatabaseClock {
     sample: std::sync::Mutex<Option<(i64, Instant)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     wall_clock_skew_ms: std::sync::atomic::AtomicI64,
 }
 
@@ -194,8 +194,8 @@ impl DatabaseClock {
     }
 
     fn wall_clock_millis(&self) -> i64 {
-        let now = crate::batch_runtime::store::current_timestamp_millis();
-        #[cfg(test)]
+        let now = crate::current_timestamp_millis();
+        #[cfg(any(test, feature = "test-support"))]
         let now = now + self.wall_clock_skew_ms.load(std::sync::atomic::Ordering::SeqCst);
         now
     }
@@ -339,8 +339,8 @@ impl StoreDatabase {
     }
 
     /// Skew this process's wall clock, which the database clock replaces.
-    #[cfg(test)]
-    pub(crate) fn skew_wall_clock_for_test(&self, skew_ms: i64) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn skew_wall_clock_for_test(&self, skew_ms: i64) {
         self.clock
             .wall_clock_skew_ms
             .store(skew_ms, std::sync::atomic::Ordering::SeqCst);

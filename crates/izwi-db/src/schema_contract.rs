@@ -1,4 +1,4 @@
-use crate::{db::raw, voice_defaults::DEFAULT_VOICE_PROFILE_ID};
+use crate::{raw, voice_defaults::DEFAULT_VOICE_PROFILE_ID};
 use anyhow::{bail, Context};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
 use std::collections::HashSet;
