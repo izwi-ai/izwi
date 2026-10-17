@@ -387,6 +387,7 @@ run_cargo_serving() {
     # it runs serially.
     cargo test --locked --no-fail-fast \
         -p izwi-test-process \
+        -p izwi-env \
         -p izwi-gateway \
         -p izwi-serving-protocol \
         -p izwi-serving-client \

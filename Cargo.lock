@@ -3723,6 +3723,7 @@ dependencies = [
  "image",
  "indicatif 0.17.11",
  "izwi-asr-toolkit",
+ "izwi-env",
  "izwi-vad",
  "memmap2",
  "objc2 0.6.3",
@@ -3774,6 +3775,13 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "izwi-env"
+version = "0.1.0-beta-18"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3892,6 +3900,7 @@ dependencies = [
 name = "izwi-serving-protocol"
 version = "0.1.0-beta-18"
 dependencies = [
+ "izwi-env",
  "serde",
  "serde_json",
  "sha2",

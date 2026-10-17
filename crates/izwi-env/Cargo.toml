@@ -1,0 +1,10 @@
+[package]
+name = "izwi-env"
+description = "One environment-variable policy for Izwi: a documented registry per crate, a strict boolean parser and a snapshot read once at startup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

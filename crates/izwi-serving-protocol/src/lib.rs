@@ -6,7 +6,6 @@
 //! the gateway's responsibility.
 
 mod approvals;
-pub mod env;
 mod identity;
 mod ndjson;
 mod realtime;
@@ -16,6 +15,8 @@ mod types;
 
 pub use approvals::*;
 pub use identity::*;
+/// The shared environment-variable policy (re-exported for the serving crates).
+pub use izwi_env as env;
 pub use ndjson::*;
 pub use realtime::*;
 pub use trace::{TraceContext, TRACEPARENT_HEADER};

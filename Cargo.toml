@@ -4,6 +4,7 @@ members = [
     "crates/izwi-asr-toolkit",
     "crates/izwi-agent",
     "crates/izwi-core",
+    "crates/izwi-env",
     "crates/izwi-hooks",
     "crates/izwi-vad",
     "crates/izwi-server",

@@ -1,15 +1,20 @@
-//! One environment-variable policy for the serving binaries (HYG-E1).
+//! One environment-variable policy for Izwi (HYG-E1).
 //!
-//! Each binary declares every `IZWI_*` variable it reads in one registry of
-//! [`EnvVar`]s, captures their values once at startup into an
-//! [`EnvSnapshot`], and builds its typed configuration from that snapshot,
-//! so no request path reads the process environment. Every binary parses
-//! values the same way and fails closed: a boolean accepts `true`, `false`,
-//! `1`, `0`, `yes`, `no`, `on` or `off` (any case) and nothing else, and a
-//! value that does not parse is an error naming the variable, never a silent
-//! default. The registry also renders each binary's environment reference
-//! (`docs/dev/env/`), and a test per crate checks that every `IZWI_*` name
-//! in its source is registered, so a new variable cannot go undocumented.
+//! Each binary, and the engine library, declares every `IZWI_*` variable it
+//! reads in one registry of [`EnvVar`]s. A binary captures their values once
+//! at startup into an [`EnvSnapshot`] and builds its typed configuration from
+//! that snapshot, so no request path reads the process environment. Every
+//! crate parses booleans the same way and fails closed: a boolean accepts
+//! `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off` (any case) and
+//! nothing else, and a value that does not parse is an error naming the
+//! variable, never a silent default. The registry also renders each crate's
+//! environment reference (`docs/dev/env/`), and a test per crate checks that
+//! every `IZWI_*` name in its source is registered, so a new variable cannot
+//! go undocumented.
+//!
+//! This crate has no dependencies beyond `thiserror`, so the engine
+//! (`izwi-core`) and the accelerator-free serving crates share it without
+//! either depending on the other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
