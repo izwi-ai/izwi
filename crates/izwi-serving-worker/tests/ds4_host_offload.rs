@@ -49,6 +49,10 @@ async fn run_chat(
                 top_p: 1.0,
                 repetition_penalty: 1.0,
                 max_tokens,
+                // The fixture's random weights emit the tokens its config
+                // declares special; keep them so the compared outputs carry
+                // every generated token.
+                skip_special_tokens: false,
                 ..GenerationParams::default()
             },
             chat_config: Default::default(),

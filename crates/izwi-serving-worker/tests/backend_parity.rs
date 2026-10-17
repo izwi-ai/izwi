@@ -422,6 +422,10 @@ async fn collect_prefix_lane_with_env(
                         top_p: Some(1.0),
                         seed: Some(0),
                         stop: Vec::new(),
+                        // The fixture's random weights emit the tokens its
+                        // config declares special; keep them so the compared
+                        // outputs carry every generated token.
+                        skip_special_tokens: Some(false),
                         ..ChatParameters::default()
                     },
                 },
