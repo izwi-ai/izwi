@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     batch_runtime::{
         store::{NewJobStage, NewRuntimeJob, QuotaLimits},
-        types::{RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
+        types::{MediaAsset, RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
     },
     db::StoreDatabase,
     persistence::LocalMediaStorageProvider,
@@ -2800,6 +2800,199 @@ async fn cleanup_capacity_failure_happens_before_second_tombstone() {
         Err(ArtifactStoreError::Metadata(_))
     ));
     assert_eq!(store.stat(&tenant, &second.id).await.unwrap(), second);
+}
+
+/// A `default`-labelled local input object and its media row, optionally
+/// derived from `source`.
+async fn input_media(
+    metadata: &BatchRuntimeStore,
+    provider: &MemoryMediaProvider,
+    label: &str,
+    source: Option<&MediaAsset>,
+) -> MediaAsset {
+    let stored = provider
+        .put(
+            MediaWriteRequest {
+                namespace: MediaNamespace::Other("transcription_upload".to_string()),
+                record_id: label.to_string(),
+                preferred_filename: None,
+                content_type: "audio/wav".to_string(),
+                metadata: HookMetadata::new(),
+            },
+            label.as_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+    metadata
+        .create_media_asset(NewMediaAsset {
+            asset_kind: if source.is_some() {
+                "audio_canonical"
+            } else {
+                "audio_original"
+            }
+            .to_string(),
+            storage_namespace: "transcription_upload".to_string(),
+            storage_key: stored.key.key,
+            content_type: "audio/wav".to_string(),
+            filename: None,
+            size_bytes: label.len() as u64,
+            sha256: None,
+            duration_secs: None,
+            sample_rate_hz: None,
+            channel_count: None,
+            peak_amplitude: None,
+            rms_amplitude: None,
+            source_asset_id: source.map(|source| source.id.clone()),
+            canonical_profile_version: source.map(|_| "asr-16k".to_string()),
+            scan_status: "not_scanned".to_string(),
+            retention_policy: "default".to_string(),
+            metadata_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap()
+}
+
+async fn execute_sql(metadata: &BatchRuntimeStore, sql: &str, values: Vec<sea_orm::Value>) {
+    let db = metadata.connection().await.unwrap();
+    db.execute_raw(crate::db::raw::statement(db, sql, values).unwrap())
+        .await
+        .unwrap();
+}
+
+/// Input media labelled `default` expires once nothing uses it any more,
+/// and only then: media a job, a transcription, a saved voice or a
+/// speech-history item uses is kept, and so is the canonical copy of a
+/// saved voice, which every speech request with that voice reuses.
+#[tokio::test]
+async fn unreferenced_input_media_expires_and_referenced_media_is_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(1_000));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
+        root.path().join("artifacts.sqlite3"),
+    ));
+    metadata.set_test_clock(clock.clone());
+    let metadata = Arc::new(metadata);
+    let provider = Arc::new(MemoryMediaProvider::default());
+    let store = ArtifactStore::new(
+        metadata.clone(),
+        provider.clone(),
+        ArtifactStoreLimits::default(),
+    )
+    .unwrap();
+    let policy = RetentionPolicy {
+        terminal_job_ms: 10_000,
+        ephemeral_artifact_ms: 5_000,
+        worker_heartbeat_ms: 10_000,
+        media_tombstone_ms: 1_000,
+        legacy_idempotency_ms: 10_000,
+    };
+
+    let orphan = input_media(&metadata, &provider, "orphan", None).await;
+    let orphan_canonical =
+        input_media(&metadata, &provider, "orphan-canonical", Some(&orphan)).await;
+    let record = input_media(&metadata, &provider, "record", None).await;
+    let record_canonical =
+        input_media(&metadata, &provider, "record-canonical", Some(&record)).await;
+    execute_sql(
+        &metadata,
+        "INSERT INTO transcription_records (id, created_at, processing_time_ms, audio_mime_type, audio_storage_path, transcription) VALUES ('record', 1000, 0, 'audio/wav', ?1, '')",
+        vec![record.storage_key.clone().into()],
+    )
+    .await;
+    let voice = input_media(&metadata, &provider, "voice", None).await;
+    let voice_canonical = input_media(&metadata, &provider, "voice-canonical", Some(&voice)).await;
+    execute_sql(
+        &metadata,
+        "INSERT INTO saved_voices (id, created_at, updated_at, name, reference_text, audio_mime_type, audio_storage_path) VALUES ('voice', 1000, 1000, 'voice', 'hello', 'audio/wav', ?1)",
+        vec![voice.storage_key.clone().into()],
+    )
+    .await;
+    let history = input_media(&metadata, &provider, "history", None).await;
+    execute_sql(
+        &metadata,
+        "INSERT INTO speech_history_records (id, created_at, route_kind, input_text, generation_time_ms, audio_mime_type, audio_storage_path) VALUES ('history', 1000, 'text_to_speech', 'hello', 0, 'audio/wav', ?1)",
+        vec![history.storage_key.clone().into()],
+    )
+    .await;
+    let job_input = input_media(&metadata, &provider, "job", None).await;
+    metadata
+        .create_job(NewRuntimeJob {
+            job_kind: RuntimeJobKind::AsrTranscription,
+            status: RuntimeJobStatus::Completed,
+            priority: 0,
+            model_id: None,
+            capability: Some("asr".into()),
+            route_record_kind: None,
+            route_record_id: None,
+            input_media_asset_id: Some(job_input.id.clone()),
+            input_text_asset_id: None,
+            request_json: serde_json::json!({}),
+            model_snapshot_json: serde_json::json!({}),
+            retry_policy_json: serde_json::json!({}),
+            max_attempts: 1,
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .unwrap();
+    clock.store(7_000, Ordering::SeqCst);
+    let young = input_media(&metadata, &provider, "young", None).await;
+    let kept = [
+        &record,
+        &voice,
+        &voice_canonical,
+        &history,
+        &job_input,
+        &young,
+    ];
+
+    // Derivatives go first; a source once its derivatives are gone.
+    let first = store.expire_retained(policy, 64).await.unwrap();
+    assert_eq!((first.inspected, first.completed), (2, 2));
+    let second = store.expire_retained(policy, 64).await.unwrap();
+    assert_eq!((second.inspected, second.completed), (1, 1));
+    assert_eq!(
+        store.expire_retained(policy, 64).await.unwrap(),
+        ArtifactCleanupReport::default()
+    );
+    for gone in [&orphan, &orphan_canonical, &record_canonical] {
+        assert!(metadata.get_media_asset(&gone.id).await.unwrap().is_none());
+    }
+    assert_eq!(provider.object_count(), kept.len());
+    for asset in kept {
+        assert_eq!(
+            metadata.get_media_asset(&asset.id).await.unwrap().as_ref(),
+            Some(asset)
+        );
+    }
+
+    // Deleting the record frees its upload; a failed object delete leaves
+    // the row for the next pass.
+    execute_sql(
+        &metadata,
+        "DELETE FROM transcription_records WHERE id = 'record'",
+        vec![],
+    )
+    .await;
+    provider.fail_deletes.store(true, Ordering::SeqCst);
+    let failed = store.expire_retained(policy, 64).await.unwrap();
+    assert_eq!((failed.inspected, failed.deferred), (1, 1));
+    assert!(metadata
+        .get_media_asset(&record.id)
+        .await
+        .unwrap()
+        .is_some());
+    provider.fail_deletes.store(false, Ordering::SeqCst);
+    assert_eq!(
+        store.expire_retained(policy, 64).await.unwrap().completed,
+        1
+    );
+    assert!(metadata
+        .get_media_asset(&record.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(provider.object_count(), kept.len() - 1);
 }
 
 /// The cleanup quota rows equal the pending intents, per tenant and in

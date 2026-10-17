@@ -889,6 +889,9 @@ impl ArtifactStore {
     /// objects past their retention and job objects of jobs past job
     /// retention. Durable objects are never expired here. An object whose
     /// provider delete fails stays tombstoned for `cleanup_due` to retry.
+    /// Then delete `default`-labelled input media nothing uses any more
+    /// (see `BatchRuntimeStore::expired_input_media`); a failed delete
+    /// leaves that row visible for the next pass.
     pub async fn expire_retained(
         &self,
         policy: RetentionPolicy,
@@ -912,6 +915,45 @@ impl ArtifactStore {
                 Ok(_) => report.completed += 1,
                 Err(ArtifactStoreError::DeleteIncomplete) => report.deferred += 1,
                 Err(error) => return Err(error),
+            }
+        }
+        let remaining = limit.min(64).saturating_sub(report.inspected);
+        if remaining == 0 {
+            return Ok(report);
+        }
+        let inputs = self
+            .metadata
+            .expired_input_media(policy, remaining)
+            .await
+            .map_err(ArtifactStoreError::Metadata)?;
+        for asset in inputs {
+            report.inspected += 1;
+            if !self
+                .metadata
+                .claim_expired_input_media(&asset.id, policy)
+                .await
+                .map_err(ArtifactStoreError::Metadata)?
+            {
+                report.deferred += 1;
+                continue;
+            }
+            let deleted =
+                crate::persistence::delete_media_object(&self.provider, Some(&asset.storage_key))
+                    .await;
+            if let Err(error) = &deleted {
+                tracing::warn!(
+                    media_asset_id = %asset.id,
+                    "Expired input media object was not deleted; retrying next pass: {error:#}"
+                );
+            }
+            self.metadata
+                .settle_expired_input_media(&asset.id, deleted.is_ok())
+                .await
+                .map_err(ArtifactStoreError::Metadata)?;
+            if deleted.is_ok() {
+                report.completed += 1;
+            } else {
+                report.deferred += 1;
             }
         }
         Ok(report)

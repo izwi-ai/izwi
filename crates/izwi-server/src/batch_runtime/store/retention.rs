@@ -11,7 +11,8 @@ pub struct RetentionPolicy {
     /// with its job.
     pub terminal_job_ms: u64,
     /// Ephemeral-retention media, from creation
-    /// (`IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS`, 1 hour).
+    /// (`IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS`, 1 hour). Unreferenced
+    /// `default`-labelled input media must be at least this old too.
     pub ephemeral_artifact_ms: u64,
     /// Heartbeat rows of workers that stopped heartbeating
     /// (`IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS`, 1 day).
@@ -42,6 +43,8 @@ impl RetentionPolicy {
         }
     }
 }
+
+const EXPIRED_MEDIA_COLUMNS: &str = "SELECT DISTINCT m.id, m.created_at, m.updated_at, m.asset_kind, m.storage_namespace, m.storage_key, m.content_type, m.filename, m.size_bytes, m.sha256, m.duration_secs, m.sample_rate_hz, m.channel_count, m.peak_amplitude, m.rms_amplitude, m.source_asset_id, m.canonical_profile_version, m.scan_status, m.retention_policy, m.deleted_at, m.metadata_json";
 
 /// Rows one retention pass deleted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -258,7 +261,7 @@ impl BatchRuntimeStore {
         let now = self.now_millis();
         let db = self.db.connection().await?;
         let opaque = "m.asset_kind = 'opaque_artifact' AND m.storage_namespace = 'artifact_store_v1' AND m.deleted_at IS NULL";
-        let columns = "SELECT DISTINCT m.id, m.created_at, m.updated_at, m.asset_kind, m.storage_namespace, m.storage_key, m.content_type, m.filename, m.size_bytes, m.sha256, m.duration_secs, m.sample_rate_hz, m.channel_count, m.peak_amplitude, m.rms_amplitude, m.source_asset_id, m.canonical_profile_version, m.scan_status, m.retention_policy, m.deleted_at, m.metadata_json";
+        let columns = EXPIRED_MEDIA_COLUMNS;
         let mut rows = db
             .query_all_raw(raw::statement(
                 db,
@@ -302,5 +305,135 @@ impl BatchRuntimeStore {
             );
         }
         rows.iter().map(map_media_asset).collect()
+    }
+}
+
+/// What keeps local media with alias `m` alive: a job's input, an artifact
+/// row, or the audio of a transcription, diarization, speech-history item
+/// or saved voice.
+fn media_in_use(m: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM runtime_jobs j WHERE j.input_media_asset_id = {m}.id) \
+         OR EXISTS (SELECT 1 FROM runtime_artifacts a WHERE a.media_asset_id = {m}.id) \
+         OR EXISTS (SELECT 1 FROM transcription_records t WHERE t.audio_storage_path = {m}.storage_key) \
+         OR EXISTS (SELECT 1 FROM diarization_records d WHERE d.audio_storage_path = {m}.storage_key) \
+         OR {reused})",
+        reused = reused_by_voices(m)
+    )
+}
+
+/// Audio of a saved voice or a speech-history item: every speech request
+/// that reuses it as a reference takes up its canonical copy again.
+fn reused_by_voices(m: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM speech_history_records h WHERE h.audio_media_asset_id = {m}.id) \
+         OR EXISTS (SELECT 1 FROM speech_history_records h WHERE h.audio_storage_path = {m}.storage_key) \
+         OR EXISTS (SELECT 1 FROM saved_voices v WHERE v.audio_storage_path = {m}.storage_key))"
+    )
+}
+
+/// Live `default`-labelled local media (uploads, canonical WAVs, TTS
+/// references and outputs) older than `?1` that nothing keeps: no job,
+/// artifact row or product record uses it, no live derivative was made
+/// from it, and it is not the canonical copy of a saved voice's or a
+/// history item's audio, which lives as long as that audio does.
+fn expired_input_media_predicate() -> String {
+    format!(
+        "m.retention_policy = 'default' \
+         AND m.asset_kind <> 'opaque_artifact' \
+         AND m.deleted_at IS NULL \
+         AND m.created_at < ?1 \
+         AND NOT {in_use} \
+         AND NOT EXISTS (SELECT 1 FROM media_assets derived WHERE derived.source_asset_id = m.id AND derived.deleted_at IS NULL) \
+         AND NOT EXISTS (SELECT 1 FROM media_assets s WHERE s.id = m.source_asset_id AND {source_reused})",
+        in_use = media_in_use("m"),
+        source_reused = reused_by_voices("s"),
+    )
+}
+
+impl BatchRuntimeStore {
+    /// `default`-labelled input media that has outlived everything that
+    /// used it: its job (swept after job retention) and its product record
+    /// (deleted by the user). A transcription's canonical WAV goes with its
+    /// job while the record keeps the upload. Media no record ever took up
+    /// (an upload whose job was never accepted) goes once it is older than
+    /// the ephemeral retention. Media a saved voice, a history item or
+    /// another record still uses, and the canonical copy of a saved voice's
+    /// or history item's audio, is never returned.
+    pub(crate) async fn expired_input_media(
+        &self,
+        policy: RetentionPolicy,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaAsset>> {
+        let limit = i64::try_from(bounded_maintenance_batch_limit(limit))?;
+        let db = self.db.connection().await?;
+        let rows = db
+            .query_all_raw(raw::statement(
+                db,
+                format!(
+                    "{} FROM media_assets AS m WHERE {} ORDER BY m.created_at ASC, m.id ASC LIMIT ?2",
+                    EXPIRED_MEDIA_COLUMNS,
+                    expired_input_media_predicate()
+                ),
+                vec![self.input_media_cutoff(policy)?.into(), limit.into()],
+            )?)
+            .await
+            .context("Failed to select expired input media")?;
+        rows.iter().map(map_media_asset).collect()
+    }
+
+    /// Hide one expired input media row while its object is deleted, if it
+    /// is still expired. Lookups skip hidden rows, so nothing can take it up
+    /// again meanwhile.
+    pub(crate) async fn claim_expired_input_media(
+        &self,
+        id: &str,
+        policy: RetentionPolicy,
+    ) -> anyhow::Result<bool> {
+        let db = self.db.connection().await?;
+        let claimed = db
+            .execute_raw(raw::statement(
+                db,
+                format!(
+                    "UPDATE media_assets SET deleted_at = ?3, updated_at = ?3 WHERE id = ?2 AND id IN (SELECT m.id FROM media_assets AS m WHERE m.id = ?2 AND {})",
+                    expired_input_media_predicate()
+                ),
+                vec![
+                    self.input_media_cutoff(policy)?.into(),
+                    id.into(),
+                    self.now_millis().into(),
+                ],
+            )?)
+            .await
+            .context("Failed to claim expired input media")?
+            .rows_affected();
+        Ok(claimed == 1)
+    }
+
+    /// Settle a claimed input media row once its object is deleted (`true`:
+    /// the row goes, or stays a tombstone for the tombstone sweep while a
+    /// tombstoned derivative still points at it) or could not be (`false`:
+    /// the row is visible again and the next pass retries).
+    pub(crate) async fn settle_expired_input_media(
+        &self,
+        id: &str,
+        object_deleted: bool,
+    ) -> anyhow::Result<()> {
+        let db = self.db.connection().await?;
+        let sql = if object_deleted {
+            "DELETE FROM media_assets WHERE id = ?1 AND deleted_at IS NOT NULL AND retention_policy = 'default' AND NOT EXISTS (SELECT 1 FROM media_assets derived WHERE derived.source_asset_id = ?1)"
+        } else {
+            "UPDATE media_assets SET deleted_at = NULL WHERE id = ?1 AND retention_policy = 'default'"
+        };
+        db.execute_raw(raw::statement(db, sql, vec![id.into()])?)
+            .await
+            .context("Failed to settle expired input media")?;
+        Ok(())
+    }
+
+    fn input_media_cutoff(&self, policy: RetentionPolicy) -> anyhow::Result<i64> {
+        Ok(self
+            .now_millis()
+            .saturating_sub(i64::try_from(policy.ephemeral_artifact_ms)?))
     }
 }

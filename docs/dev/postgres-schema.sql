@@ -780,6 +780,16 @@ INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_clean
 
 INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', '', COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING;
 
+CREATE INDEX IF NOT EXISTS idx_runtime_jobs_input_media ON runtime_jobs(input_media_asset_id);
+
+CREATE INDEX IF NOT EXISTS idx_transcription_records_audio_path ON transcription_records(audio_storage_path);
+
+CREATE INDEX IF NOT EXISTS idx_diarization_records_audio_path ON diarization_records(audio_storage_path);
+
+CREATE INDEX IF NOT EXISTS idx_speech_history_audio_path ON speech_history_records(audio_storage_path);
+
+CREATE INDEX IF NOT EXISTS idx_saved_voices_audio_path ON saved_voices(audio_storage_path);
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     component TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -793,6 +803,8 @@ INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('ap
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 2, 'stage claim columns', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 3, 'artifact cleanup quota', 0) ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 4, 'media reference indexes', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ('voice_profile_default', 'Primary Voice Profile', 'You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.', 1, 0, 0) ON CONFLICT (id) DO NOTHING;
 

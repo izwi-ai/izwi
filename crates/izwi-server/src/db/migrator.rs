@@ -36,6 +36,7 @@ impl Schema {
                 (1, "baseline"),
                 (2, "stage claim columns"),
                 (3, "artifact cleanup quota"),
+                (4, "media reference indexes"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -158,6 +159,12 @@ async fn apply_migration<C: ConnectionTrait>(
         (Schema::App, 3) => {
             for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
                 db.execute_unprepared(statement).await?;
+            }
+        }
+        (Schema::App, 4) => {
+            for statement in MEDIA_REFERENCE_INDEXES {
+                db.execute_unprepared(&dialect_ddl(backend, statement))
+                    .await?;
             }
         }
         (Schema::Fleet, 1) => {
@@ -930,6 +937,17 @@ const ARTIFACT_CLEANUP_QUOTA_BACKFILL: &[&str] = &[
     "INSERT INTO runtime_quota_usage (quota_kind, scope, used) SELECT 'artifact_cleanup', '', COUNT(*) FROM artifact_cleanup_intents WHERE 1 = 1 ON CONFLICT (quota_kind, scope) DO NOTHING",
 ];
 
+/// Migration 4: the lookups that decide whether `default`-labelled input
+/// media is still used, which the retention sweeper runs for every
+/// candidate.
+const MEDIA_REFERENCE_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_runtime_jobs_input_media ON runtime_jobs(input_media_asset_id);",
+    "CREATE INDEX IF NOT EXISTS idx_transcription_records_audio_path ON transcription_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_diarization_records_audio_path ON diarization_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_speech_history_audio_path ON speech_history_records(audio_storage_path);",
+    "CREATE INDEX IF NOT EXISTS idx_saved_voices_audio_path ON saved_voices(audio_storage_path);",
+];
+
 async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
         db.execute_unprepared(statement).await?;
@@ -1447,6 +1465,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     }
     // Migration 3.
     for statement in ARTIFACT_CLEANUP_QUOTA_BACKFILL {
+        push(statement);
+    }
+    // Migration 4.
+    for statement in MEDIA_REFERENCE_INDEXES {
         push(statement);
     }
     push(SCHEMA_MIGRATIONS_DDL);

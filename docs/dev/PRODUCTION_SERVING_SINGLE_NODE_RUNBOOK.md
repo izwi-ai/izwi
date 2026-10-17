@@ -709,10 +709,21 @@ retention:
 | Setting | Default | What expires |
 |---|---|---|
 | `IZWI_JOB_RETENTION_SECONDS` | 2,592,000 (30 days) | Terminal jobs with their stages, artifact rows and text inputs, measured from the job's last update. Opaque objects labelled `job` expire with their job. A job that still owns live job- or ephemeral-labelled objects waits until they are deleted. |
-| `IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS` | 3,600 | Opaque objects labelled `ephemeral`, from creation. Objects labelled `durable` (speech-history audio) never expire here. |
+| `IZWI_ARTIFACT_EPHEMERAL_RETENTION_SECONDS` | 3,600 | Opaque objects labelled `ephemeral`, from creation. Objects labelled `durable` (speech-history audio) never expire here. Also the minimum age of unreferenced input media (below). |
 | `IZWI_TTS_REPLAY_RETENTION_SECONDS` | 86,400 | Replay PCM of terminal speech jobs (unchanged). |
 | `IZWI_WORKER_HEARTBEAT_RETENTION_SECONDS` | 86,400 | Heartbeat rows of workers that stopped heartbeating. |
 | `IZWI_MEDIA_TOMBSTONE_RETENTION_SECONDS` | 86,400 | Media rows tombstoned after their object was deleted and that nothing references. |
+
+Local input media labelled `default` (uploads, canonical WAVs, TTS reference
+and output audio) has no clock of its own: it is deleted, object and row, once
+nothing uses it and it is older than the ephemeral retention. It is in use while
+a job takes it as input or an artifact row points at it (so it lives at least as
+long as its job), or while a transcription, diarization, speech-history item or
+saved voice holds its audio. A transcription's canonical WAV therefore goes with
+its job while the record keeps the upload; the canonical copy of a saved voice's
+or history item's audio is kept as long as that audio, since every speech
+request with that voice reuses it. A failed object delete leaves the row for the
+next pass.
 
 Expired idempotency records go on every pass; rows of the retired legacy
 `idempotency_keys` table (no longer written) go after seven days.
