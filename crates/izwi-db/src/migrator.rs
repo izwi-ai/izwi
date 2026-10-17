@@ -36,6 +36,7 @@ impl Schema {
                 (2, "stage claim columns"),
                 (3, "artifact cleanup quota"),
                 (4, "media reference indexes"),
+                (5, "diarization alignment and node ownership"),
             ],
             Self::Fleet => &[
                 (1, "fleet coordination"),
@@ -164,6 +165,11 @@ async fn apply_migration<C: ConnectionTrait>(
             for statement in MEDIA_REFERENCE_INDEXES {
                 db.execute_unprepared(&dialect_ddl(backend, statement))
                     .await?;
+            }
+        }
+        (Schema::App, 5) => {
+            for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
+                ensure_column(db, column).await?;
             }
         }
         (Schema::Fleet, 1) => {
@@ -947,6 +953,48 @@ const MEDIA_REFERENCE_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_saved_voices_audio_path ON saved_voices(audio_storage_path);",
 ];
 
+/// Migration 5: forced-alignment warnings on transcriptions; the warnings,
+/// ASR language and VAD gate of a diarization job; and the node that runs a
+/// record's in-process task, so a restart fails only its own interrupted
+/// records on a shared database. Existing rows keep no owner.
+const ALIGNMENT_AND_OWNERSHIP_COLUMNS: &[CompatibilityColumn] = &[
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "alignment_warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "transcription_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "warnings_json",
+        definition: "TEXT NOT NULL DEFAULT '[]'",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "language",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "vad_gate",
+        definition: "INTEGER NULL",
+    },
+    CompatibilityColumn {
+        table: "diarization_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+    CompatibilityColumn {
+        table: "speech_history_records",
+        column: "owner_node_id",
+        definition: "TEXT NULL",
+    },
+];
+
 async fn backfill_quota_usage<C: ConnectionTrait>(db: &C) -> anyhow::Result<()> {
     for statement in QUOTA_USAGE_BACKFILL {
         db.execute_unprepared(statement).await?;
@@ -1469,6 +1517,10 @@ pub(crate) fn postgres_schema_sql() -> String {
     // Migration 4.
     for statement in MEDIA_REFERENCE_INDEXES {
         push(statement);
+    }
+    // Migration 5.
+    for column in ALIGNMENT_AND_OWNERSHIP_COLUMNS {
+        push(&add_column(column));
     }
     push(SCHEMA_MIGRATIONS_DDL);
     for (version, name) in Schema::App.migrations() {

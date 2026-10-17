@@ -160,6 +160,10 @@ pub struct DiarizationTranscriptResult {
     pub alignment_coverage: f32,
     pub unattributed_words: usize,
     pub llm_refined: bool,
+    /// Degraded steps the transcript went through (aligner windows with
+    /// interval timings, a missing aligner, a truncated ASR decode).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +176,24 @@ pub struct DiarizationConfig {
     pub min_speech_duration_ms: Option<f32>,
     #[serde(default)]
     pub min_silence_duration_ms: Option<f32>,
+    /// Clip Sortformer segments to padded external VAD speech regions.
+    /// `None` defers to `IZWI_SORTFORMER_VAD_GATE` (default off): NeMo has
+    /// no such gate, and it only helps on noisy input.
+    #[serde(default)]
+    pub vad_gate: Option<bool>,
+}
+
+/// Per-job controls of the diarization transcript pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct DiarizationPipelineOptions {
+    /// Polish the speaker transcript with the pipeline LLM.
+    pub enable_llm_refinement: bool,
+    /// Language hint for the pipeline ASR; `None` lets it detect the
+    /// language of each chunk.
+    pub language: Option<String>,
+    /// Stops the pipeline at its next stage (between ASR chunks and aligner
+    /// windows) once cancelled.
+    pub cancellation: crate::runtime::coordinator::JobCancellation,
 }
 
 #[derive(Debug, Clone)]

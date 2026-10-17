@@ -61,6 +61,12 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "3000",
         "How long a request waits for a database connection.",
     ),
+    // Node identity (node_identity.rs), read at start-up.
+    var(
+        "IZWI_NODE_ID",
+        "local",
+        "This node's id on a shared database (1-128 ASCII letters, digits, `-`, `_`); startup fails only the in-process jobs it owns.",
+    ),
     // Security and start-up (local_security.rs, roles/local.rs, shutdown.rs).
     var(
         "IZWI_API_KEY",

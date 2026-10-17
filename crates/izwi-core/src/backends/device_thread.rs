@@ -216,6 +216,24 @@ impl JobQueue {
             }
         }
     }
+
+    /// Run one queued control job, waiting up to `timeout` for one.
+    fn serve_control_job(&self, timeout: Duration) {
+        let job = {
+            let mut arbiter = self.lock();
+            if arbiter.control.is_empty() {
+                arbiter = self
+                    .ready
+                    .wait_timeout(arbiter, timeout)
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .0;
+            }
+            arbiter.control.pop_front()
+        };
+        if let Some(job) = job {
+            job();
+        }
+    }
 }
 
 /// An owned OS thread that runs every job for one device.
@@ -233,6 +251,8 @@ thread_local! {
     /// The id of the device thread (or a scope delegated by one) this thread
     /// is running device work for.
     static CURRENT_DEVICE_THREAD: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The queue of the device thread this thread is.
+    static CURRENT_QUEUE: RefCell<Option<Arc<JobQueue>>> = const { RefCell::new(None) };
     /// Test-only sink that attributes off-thread device ops to one test.
     static OFF_THREAD_WATCH: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) };
 }
@@ -270,6 +290,7 @@ impl DeviceThread {
             .name(key.thread_name())
             .spawn(move || {
                 CURRENT_DEVICE_THREAD.with(|current| current.set(Some(id)));
+                CURRENT_QUEUE.with(|queue| *queue.borrow_mut() = Some(jobs.clone()));
                 jobs.serve();
             })
             .map_err(|error| {
@@ -506,6 +527,29 @@ pub fn probe_device_op(op: &'static str) {
     );
 }
 
+/// Wait for `reply` without stalling the device: `None` when its sender is
+/// dropped. On a device thread the wait keeps serving the device's control
+/// jobs (loads, frees, KV page ops), so a device job that waits on async work
+/// which itself needs the device (a load whose precision-reload admission
+/// evicts another model) cannot deadlock its own thread. Model dispatches
+/// stay queued until the job returns. Elsewhere it is a blocking receive.
+pub fn recv_serving_device<T>(mut reply: oneshot::Receiver<T>) -> Option<T> {
+    let Some(queue) = CURRENT_QUEUE.with(|queue| queue.borrow().clone()) else {
+        return reply.blocking_recv().ok();
+    };
+    loop {
+        match reply.try_recv() {
+            Ok(value) => return Some(value),
+            Err(oneshot::error::TryRecvError::Closed) => return None,
+            // The reply does not notify the queue; the bounded wait is only
+            // paid while a job is waiting, on a rare path.
+            Err(oneshot::error::TryRecvError::Empty) => {
+                queue.serve_control_job(Duration::from_millis(1))
+            }
+        }
+    }
+}
+
 /// Device operations that ran off a device thread since process start.
 pub fn device_ops_off_thread_total() -> u64 {
     DEVICE_OPS_OFF_THREAD.load(Ordering::Relaxed)
@@ -553,6 +597,43 @@ mod tests {
             })
             .expect("outer job");
         assert_eq!(nested, 7);
+    }
+
+    /// A device job that waits for a reply produced by a control job queued
+    /// behind it (a load waiting on an admission that evicts a model) serves
+    /// that job instead of deadlocking its own thread.
+    #[tokio::test]
+    async fn a_waiting_job_keeps_serving_control_jobs() {
+        let thread = test_thread();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let waiter = thread.submit(move || {
+            started_tx.send(()).unwrap();
+            recv_serving_device(reply_rx)
+        });
+        started_rx.recv().unwrap();
+        let replier = thread.clone();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let sent = replier.run_sync(move || reply_tx.send(7).is_ok());
+            let _ = sent_tx.send(sent);
+        });
+        let reply = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the waiting job deadlocked its device thread")
+            .unwrap();
+        assert_eq!(reply, Some(7));
+        assert!(sent_rx.recv().unwrap().unwrap());
+        // A dropped sender ends the wait.
+        let (reply_tx, reply_rx) = oneshot::channel::<u8>();
+        drop(reply_tx);
+        assert_eq!(
+            thread
+                .submit(move || recv_serving_device(reply_rx))
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

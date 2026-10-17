@@ -608,9 +608,7 @@ impl DeviceProfile {
                     })
                 }
             }
-            ModelFamily::KokoroTts
-            | ModelFamily::ParakeetAsr
-            | ModelFamily::SortformerDiarization => Some(DTypeSelection {
+            ModelFamily::KokoroTts | ModelFamily::ParakeetAsr => Some(DTypeSelection {
                 dtype: DType::F32,
                 reason: "model family policy keeps CUDA default in F32".into(),
             }),
@@ -1957,10 +1955,6 @@ mod tests {
         );
         assert_eq!(
             cuda_profile.select_model_dtype(ModelFamily::ParakeetAsr, None),
-            DType::F32
-        );
-        assert_eq!(
-            cuda_profile.select_model_dtype(ModelFamily::SortformerDiarization, None),
             DType::F32
         );
         assert_eq!(

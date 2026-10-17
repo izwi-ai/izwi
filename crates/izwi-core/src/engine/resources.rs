@@ -165,7 +165,8 @@ impl ResourceVector {
         })
     }
 
-    fn positive_growth_over(self, current: Self) -> Result<Self> {
+    /// Per domain, how far `self` exceeds `current` (zero where it does not).
+    pub(crate) fn positive_growth_over(self, current: Self) -> Result<Self> {
         Ok(Self {
             host_bytes: self.host_bytes.positive_growth_over(current.host_bytes)?,
             device_bytes: self
@@ -274,6 +275,22 @@ impl ResourceLedger {
         }
         self.reservations.insert(id, resources);
         self.used = used;
+        Ok(true)
+    }
+
+    /// Replace a reservation with one no larger in any domain. Shrinking only
+    /// lowers `used`, so it holds whatever the current capacity is.
+    fn shrink(&mut self, id: ReservationId, resources: ResourceVector) -> Result<bool> {
+        let Some(current) = self.reservations.get(&id).copied() else {
+            return Ok(false);
+        };
+        if !resources.is_fully_known() || !resources.fits_within(current) {
+            return Err(Error::InvalidInput(
+                "a reservation shrink must be known and no larger than the reservation".to_string(),
+            ));
+        }
+        self.used = self.used.checked_sub(current)?.checked_add(resources)?;
+        self.reservations.insert(id, resources);
         Ok(true)
     }
 
@@ -1114,6 +1131,33 @@ impl ResourceAuthority {
         Ok(())
     }
 
+    /// Return part of a reservation. It never consults live headroom or the
+    /// ledger capacity, since it only gives capacity back, but it cannot
+    /// drop below what the lease has materialized.
+    fn shrink(&self, id: ReservationId, resources: ResourceVector) -> Result<()> {
+        let resources = normalize_resource_domains(resources, self.domain_policy)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::InferenceError("resource authority mutex poisoned".to_string()))?;
+        let materialized = state
+            .materialized
+            .get(&id)
+            .copied()
+            .unwrap_or_else(ResourceVector::zero);
+        if !materialized.fits_within(resources) {
+            return Err(Error::InvalidInput(
+                "resource shrink would drop authorization below materialized usage".to_string(),
+            ));
+        }
+        if !state.ledger.shrink(id, resources)? {
+            return Err(Error::InferenceError(
+                "resource lease is no longer active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn record_materialized_usage(
         &self,
         id: ReservationId,
@@ -1239,8 +1283,22 @@ pub(crate) fn capacity_shortfall_reason(
     )
 }
 
+/// Whether `error` refuses memory that admitted work holds now and gives
+/// back when it finishes: the live-memory check or the reservation ledger.
+/// A request too large for the machine, a full job queue or a draining
+/// runtime is not such a refusal.
+pub(crate) fn is_held_capacity_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Overloaded(message)
+            if message.starts_with("insufficient live")
+                || message == "requested resources exceed available capacity"
+    )
+}
+
 /// The short reason a client sees when live memory refuses a claim: the
-/// first domain where `need` plus what is already held for admitted work
+/// first domain where `need` plus what is already reserved but not yet
+/// allocated (admitted requests and loaded models' pending claims)
 /// exceeds `available`, in GB. The full vectors are logged by the caller.
 fn live_capacity_reason(
     need: ResourceVector,
@@ -1274,7 +1332,7 @@ fn live_capacity_reason(
         }
         let gb = |bytes: u64| bytes as f64 / 1e9;
         return format!(
-            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB held for admitted work)",
+            "insufficient live {label}: needs {:.2} GB, {:.2} GB available ({:.2} GB reserved, not yet allocated)",
             gb(need),
             gb(free),
             gb(held)
@@ -1380,6 +1438,18 @@ impl ResourceLease {
             Error::InferenceError("resource lease is no longer active".to_string())
         })?;
         self.authority.resize(id, resources)?;
+        self.resources = resources;
+        Ok(())
+    }
+
+    /// Give back part of the authorization once it can no longer be used.
+    /// Unlike [`Self::resize`] it never consults live headroom, so it
+    /// succeeds whenever the materialized usage still fits.
+    pub fn shrink(&mut self, resources: ResourceVector) -> Result<()> {
+        let id = self.id.ok_or_else(|| {
+            Error::InferenceError("resource lease is no longer active".to_string())
+        })?;
+        self.authority.shrink(id, resources)?;
         self.resources = resources;
         Ok(())
     }
@@ -1725,7 +1795,7 @@ mod tests {
                 unified(104_000_000),
                 unified(2_304_168_748)
             ),
-            "insufficient live memory: needs 3.34 GB, 2.20 GB available (0.10 GB held for admitted work)"
+            "insufficient live memory: needs 3.34 GB, 2.20 GB available (0.10 GB reserved, not yet allocated)"
         );
     }
 
@@ -1826,6 +1896,42 @@ mod tests {
         assert!(growth_message.len() < 160);
         assert_eq!(authority.snapshot(), before);
         drop((cache, requests));
+    }
+
+    /// A shrink only gives capacity back: it succeeds when a guarded resize
+    /// to the same size is refused on live headroom, it never grows a lease
+    /// and it never drops below what the lease has materialized.
+    #[test]
+    fn lease_shrink_returns_capacity_without_a_live_check() {
+        let provider = Arc::new(LiveProvider {
+            capacity: 10,
+            available: AtomicU64::new(10),
+        });
+        let authority = Arc::new(ResourceAuthority::new(provider.clone()));
+        let mut job = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "job"),
+                slots(6),
+            )
+            .unwrap();
+        job.record_materialized_usage(slots(2)).unwrap();
+        let _other = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "other"),
+                slots(3),
+            )
+            .unwrap();
+        provider.set_available(1);
+
+        assert!(matches!(job.resize(slots(4)), Err(Error::Overloaded(_))));
+        job.shrink(slots(4)).unwrap();
+        assert_eq!(job.resources(), slots(4));
+        assert_eq!(authority.snapshot().reserved, slots(7));
+        assert!(matches!(job.shrink(slots(5)), Err(Error::InvalidInput(_))));
+        assert!(matches!(job.shrink(slots(1)), Err(Error::InvalidInput(_))));
+        assert_eq!(authority.snapshot().reserved, slots(7));
+        drop(job);
+        assert_eq!(authority.snapshot().reserved, slots(3));
     }
 
     #[test]

@@ -394,12 +394,24 @@ fn try_fused_self_attention_with_options_and_scale(
                 let use_f16_cast = allow_metal_f32_prefill_f16_cast
                     && mask.is_none()
                     && should_use_metal_sdpa_f16_cast(q.dtype(), q_seq);
-                let sdpa_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pad = metal_causal_sdpa_pad_rows(q_seq, causal, masked);
+                let run = |q: &Tensor, k: &Tensor, v: &Tensor| {
                     if use_f16_cast {
                         run_metal_sdpa_with_f16_inputs(q, k, v, mask, causal, scale)
                     } else {
                         candle_nn::ops::sdpa(q, k, v, mask, causal, scale, 1.0)
                     }
+                };
+                let sdpa_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if pad == 0 {
+                        return run(q, k, v);
+                    }
+                    run(
+                        &q.pad_with_zeros(2, 0, pad)?,
+                        &k.pad_with_zeros(2, 0, pad)?,
+                        &v.pad_with_zeros(2, 0, pad)?,
+                    )?
+                    .narrow(2, 0, q_seq)
                 }));
                 match sdpa_result {
                     Ok(Ok(out)) => {
@@ -744,6 +756,27 @@ fn run_metal_sdpa_with_f16_inputs(
     out.to_dtype(q.dtype())
 }
 
+/// Query rows of one Candle Metal steel-attention block (`BQ`) for every head
+/// dim `metal_sdpa_shape_supported` routes to SDPA.
+const METAL_SDPA_QUERY_BLOCK: usize = 32;
+
+/// Zero rows to append to Q, K and V before a causal Metal SDPA call.
+///
+/// Candle 0.11's steel attention kernel does not clamp the causal `kb_lim` to
+/// `NK` (MLX does: `kb_lim = min(NK, kb_lim)`), so the last partial query block
+/// can read K/V blocks past `kL`; `0 * NaN` there turns real rows into NaN.
+/// Padding Q and K/V by the same count keeps `qL_off = kL - qL` and makes every
+/// block's last query row `<= kL'`, so `kb_lim <= NK`. The padded keys sit
+/// above the diagonal of every real row, so the narrowed output is exact for
+/// any `q_seq <= k_seq`. `q_seq == 1` takes the vector kernel, which is safe.
+/// Drop this once the pinned Candle clamps `kb_lim`.
+fn metal_causal_sdpa_pad_rows(q_seq: usize, causal: bool, masked: bool) -> usize {
+    if !causal || masked || q_seq <= 1 {
+        return 0;
+    }
+    (METAL_SDPA_QUERY_BLOCK - q_seq % METAL_SDPA_QUERY_BLOCK) % METAL_SDPA_QUERY_BLOCK
+}
+
 fn should_use_metal_sdpa_f16_cast(dtype: DType, q_seq: usize) -> bool {
     q_seq > 8 && dtype == DType::F32 && metal_sdpa_f32_prefill_cast_enabled()
 }
@@ -1067,5 +1100,147 @@ mod tests {
 
         let bad_dims = Tensor::zeros((2, 8, 32, 32), DType::F32, &device).expect("mask");
         assert!(!metal_sdpa_mask_shape_supported(&bad_dims, 1, 8, 32, 32).expect("shape check"));
+    }
+
+    #[test]
+    fn metal_causal_sdpa_pad_covers_whole_query_blocks() {
+        use super::metal_causal_sdpa_pad_rows;
+
+        assert_eq!(metal_causal_sdpa_pad_rows(77, true, false), 19);
+        assert_eq!(metal_causal_sdpa_pad_rows(65, true, false), 31);
+        assert_eq!(metal_causal_sdpa_pad_rows(96, true, false), 0);
+        // The vector kernel (one query row), non-causal calls and explicit
+        // masks never take the over-reading causal block limit.
+        assert_eq!(metal_causal_sdpa_pad_rows(1, true, false), 0);
+        assert_eq!(metal_causal_sdpa_pad_rows(77, false, false), 0);
+        assert_eq!(metal_causal_sdpa_pad_rows(77, true, true), 0);
+    }
+
+    /// F32 causal attention on the host; `q` is `[heads, q_len, d]`, `k`/`v`
+    /// are `[kv_heads, k_len, d]`, and query `i` sits at key `i + k_len - q_len`.
+    #[cfg(feature = "metal")]
+    fn causal_attention_reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        (heads, kv_heads, q_len, k_len, d): (usize, usize, usize, usize, usize),
+    ) -> Vec<f32> {
+        let scale = 1.0 / (d as f32).sqrt();
+        let offset = k_len - q_len;
+        let mut out = vec![0f32; heads * q_len * d];
+        for h in 0..heads {
+            let kv = h / (heads / kv_heads);
+            for i in 0..q_len {
+                let q_row = &q[(h * q_len + i) * d..][..d];
+                let visible = i + offset + 1;
+                let scores: Vec<f32> = (0..visible)
+                    .map(|j| {
+                        let k_row = &k[(kv * k_len + j) * d..][..d];
+                        scale * q_row.iter().zip(k_row).map(|(a, b)| a * b).sum::<f32>()
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                let total: f32 = weights.iter().sum();
+                let out_row = &mut out[(h * q_len + i) * d..][..d];
+                for (j, w) in weights.iter().enumerate() {
+                    let v_row = &v[(kv * k_len + j) * d..][..d];
+                    for (o, x) in out_row.iter_mut().zip(v_row) {
+                        *o += w / total * x;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Candle 0.11's causal steel attention reads one K/V block past `kL` for
+    /// the last partial query block (`L % 32` in 1..=16 at head dim 128). K/V
+    /// here are views of buffers that are NaN past `kL`, so any over-read shows
+    /// up as NaN rows; head dim 64 (32-row K blocks) is the control.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_causal_sdpa_never_reads_past_kv_len() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_values};
+
+        // Hold the env lock so the F32 leg keeps the default F16-cast route.
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_causal_sdpa_never_reads_past_kv_len")
+        else {
+            return;
+        };
+        const HEADS: usize = 16;
+        const KV_HEADS: usize = 8;
+        const POISON_ROWS: usize = 64;
+
+        // (dtype, head_dim, q_len, k_len)
+        let mut cases = Vec::new();
+        for len in [65, 70, 77, 80, 97, 112, 64, 81, 96] {
+            cases.push((DType::F16, 128, len, len));
+        }
+        cases.extend([(DType::F16, 128, 45, 77), (DType::F16, 128, 13, 77)]);
+        for len in [65, 77, 80] {
+            cases.push((DType::F16, 64, len, len));
+        }
+        // F32 prefill casts to F16 inside the fused call; cover pad + cast.
+        cases.push((DType::F32, 128, 77, 77));
+
+        let mut failures = Vec::new();
+        for (case, &(dtype, d, q_len, k_len)) in cases.iter().enumerate() {
+            let seed = case as u64 * 3;
+            let to_f16 = |values: Vec<f32>, shape: (usize, usize, usize, usize)| {
+                Tensor::from_vec(values, shape, &Device::Cpu)
+                    .and_then(|t| t.to_dtype(DType::F16))
+                    .expect("host tensor")
+            };
+            let q = to_f16(
+                xorshift_values(HEADS * q_len * d, seed, 1.0),
+                (1, HEADS, q_len, d),
+            );
+            let poisoned = |seed| {
+                let rows = k_len + POISON_ROWS;
+                let mut values = xorshift_values(KV_HEADS * rows * d, seed, 1.0);
+                for (index, value) in values.iter_mut().enumerate() {
+                    if (index / d) % rows >= k_len {
+                        *value = f32::NAN;
+                    }
+                }
+                to_f16(values, (1, KV_HEADS, rows, d))
+            };
+            let k_full = poisoned(seed + 1);
+            let v_full = poisoned(seed + 2);
+
+            let clean = |t: &Tensor| {
+                host_f32(&t.narrow(2, 0, k_len).unwrap().contiguous().unwrap()).unwrap()
+            };
+            let want = causal_attention_reference(
+                &host_f32(&q).unwrap(),
+                &clean(&k_full),
+                &clean(&v_full),
+                (HEADS, KV_HEADS, q_len, k_len, d),
+            );
+
+            let on_device = |t: &Tensor| t.to_dtype(dtype).unwrap().to_device(&device).unwrap();
+            let q_dev = on_device(&q);
+            let k_dev = on_device(&k_full).narrow(2, 0, k_len).unwrap();
+            let v_dev = on_device(&v_full).narrow(2, 0, k_len).unwrap();
+            let out = super::try_fused_self_attention(&q_dev, &k_dev, &v_dev, None, d, true)
+                .expect("fused attention")
+                .expect("Metal SDPA must engage for this shape");
+            let got = host_f32(&out).unwrap();
+            let non_finite = got.iter().filter(|value| !value.is_finite()).count();
+            let err = max_abs_diff(&got, &want);
+            eprintln!(
+                "{dtype:?} d={d} qL={q_len} kL={k_len}: non-finite={non_finite} max|d|={err:e}"
+            );
+            if non_finite > 0 || err >= 2e-3 {
+                failures.push(format!(
+                    "{dtype:?} d={d} qL={q_len} kL={k_len}: {non_finite} non-finite, \
+                     max|d|={err:e}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "causal Metal SDPA: {failures:#?}");
     }
 }

@@ -5,7 +5,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct DiarizeArgs {
     pub file: PathBuf,
@@ -17,7 +17,6 @@ pub struct DiarizeArgs {
     pub asr_model: String,
 }
 
-const DIARIZATION_POLL_TIMEOUT_SECS: u64 = 600;
 const DIARIZATION_POLL_INTERVAL_MS: u64 = 500;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -170,6 +169,9 @@ pub async fn execute(args: DiarizeArgs, server: &str) -> Result<()> {
         .json::<DiarizationJobRecord>()
         .await
         .map_err(|e| CliError::Other(e.to_string()))?;
+    // The server keeps working whatever happens to this client, so the job id
+    // is the way back to the result (PIPE-16).
+    eprintln!("{}", job_resume_hint(server, &created.id));
     let completed = wait_for_diarization_job(&client, server, created).await?;
     let result = format_diarization_output(&completed, format)?;
 
@@ -195,20 +197,20 @@ async fn wait_for_diarization_job(
         client,
         server,
         record,
-        Duration::from_secs(DIARIZATION_POLL_TIMEOUT_SECS),
         Duration::from_millis(DIARIZATION_POLL_INTERVAL_MS),
     )
     .await
 }
 
+/// Polls until the job is terminal. There is no client-side deadline (PIPE-16):
+/// a long recording legitimately runs for many minutes, and the server, not
+/// the client, owns the job's lifetime.
 async fn wait_for_diarization_job_with_polling(
     client: &reqwest::Client,
     server: &str,
     mut record: DiarizationJobRecord,
-    timeout: Duration,
     poll_interval: Duration,
 ) -> Result<DiarizationJobRecord> {
-    let started = Instant::now();
     loop {
         match record.processing_status.as_str() {
             "ready" => return Ok(record),
@@ -228,19 +230,14 @@ async fn wait_for_diarization_job_with_polling(
             }
         }
 
-        if started.elapsed() >= timeout {
-            return Err(CliError::Other(format!(
-                "Timed out waiting for diarization job {}",
-                record.id
-            )));
-        }
-
         tokio::time::sleep(poll_interval).await;
         let response = client
             .get(diarization_job_url(server, &record.id))
             .send()
             .await
-            .map_err(|e| CliError::ConnectionError(e.to_string()))?;
+            .map_err(|e| {
+                CliError::ConnectionError(format!("{e} ({})", job_resume_hint(server, &record.id)))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -262,6 +259,13 @@ fn create_diarization_job_url(server: &str) -> String {
     format!(
         "{}/v1/speech-to-text/jobs?job_kind=diarization",
         server.trim_end_matches('/')
+    )
+}
+
+fn job_resume_hint(server: &str, record_id: &str) -> String {
+    format!(
+        "Diarization job {record_id}; fetch it with GET {}",
+        diarization_job_url(server, record_id)
     )
 }
 
@@ -375,7 +379,7 @@ mod tests {
         execute(
             DiarizeArgs {
                 file: audio_path,
-                model: "nvidia/sortformer".to_string(),
+                model: "diar_streaming_sortformer_4spk-v2.1".to_string(),
                 num_speakers: Some(2),
                 format: TranscriptFormat::Json,
                 output: Some(output_path.clone()),
@@ -394,7 +398,7 @@ mod tests {
         );
         let request_json: Value =
             serde_json::from_str(&requests[0].body).expect("valid request json");
-        assert_eq!(request_json["model"], "nvidia/sortformer");
+        assert_eq!(request_json["model"], "diar_streaming_sortformer_4spk-v2.1");
         assert_eq!(request_json["asr_model"], "distil-whisper");
         assert_eq!(request_json["audio_filename"], "sample.wav");
         assert_eq!(request_json["audio_mime_type"], "audio/wav");
@@ -440,24 +444,40 @@ mod tests {
         }
     }
 
+    /// PIPE-16: a job that stays queued or processing is polled until it is
+    /// terminal; there is no client-side deadline.
     #[tokio::test]
-    async fn wait_for_diarization_job_times_out_pending_records() {
+    async fn wait_for_diarization_job_polls_until_the_job_is_terminal() {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
             .expect("client");
-        let err = wait_for_diarization_job_with_polling(
+        let (server, server_task) = spawn_flow_server(vec![
+            http_json_response("200 OK", &sample_record("job-long", "processing")),
+            http_json_response("200 OK", &sample_record("job-long", "processing")),
+            http_json_response("200 OK", &ready_record("job-long")),
+        ])
+        .await;
+
+        let record = wait_for_diarization_job_with_polling(
             &client,
-            "http://127.0.0.1:1",
-            sample_record("job-timeout", "pending"),
-            Duration::ZERO,
+            &server,
+            sample_record("job-long", "pending"),
             Duration::ZERO,
         )
         .await
-        .expect_err("pending records should time out");
+        .expect("a long job completes");
 
-        assert!(
-            matches!(err, CliError::Other(message) if message == "Timed out waiting for diarization job job-timeout")
+        assert_eq!(record.processing_status, "ready");
+        assert_eq!(server_task.await.expect("server task").len(), 3);
+    }
+
+    #[test]
+    fn job_resume_hint_names_the_job_and_its_url() {
+        assert_eq!(
+            job_resume_hint("http://localhost:8080/", "abc"),
+            "Diarization job abc; fetch it with GET \
+             http://localhost:8080/v1/speech-to-text/jobs/abc?job_kind=diarization"
         );
     }
 

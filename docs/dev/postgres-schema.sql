@@ -790,6 +790,20 @@ CREATE INDEX IF NOT EXISTS idx_speech_history_audio_path ON speech_history_recor
 
 CREATE INDEX IF NOT EXISTS idx_saved_voices_audio_path ON saved_voices(audio_storage_path);
 
+ALTER TABLE transcription_records ADD COLUMN IF NOT EXISTS alignment_warnings_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE transcription_records ADD COLUMN IF NOT EXISTS owner_node_id TEXT NULL;
+
+ALTER TABLE diarization_records ADD COLUMN IF NOT EXISTS warnings_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE diarization_records ADD COLUMN IF NOT EXISTS language TEXT NULL;
+
+ALTER TABLE diarization_records ADD COLUMN IF NOT EXISTS vad_gate BIGINT NULL;
+
+ALTER TABLE diarization_records ADD COLUMN IF NOT EXISTS owner_node_id TEXT NULL;
+
+ALTER TABLE speech_history_records ADD COLUMN IF NOT EXISTS owner_node_id TEXT NULL;
+
 CREATE TABLE IF NOT EXISTS schema_migrations (
     component TEXT NOT NULL,
     version BIGINT NOT NULL,
@@ -805,6 +819,8 @@ INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('ap
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 3, 'artifact cleanup quota', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 4, 'media reference indexes', 0) ON CONFLICT DO NOTHING;
+
+INSERT INTO schema_migrations (component, version, name, applied_at) VALUES ('app', 5, 'diarization alignment and node ownership', 0) ON CONFLICT DO NOTHING;
 
 INSERT INTO voice_profiles (id, name, system_prompt, observational_memory_enabled, created_at, updated_at) VALUES ('voice_profile_default', 'Primary Voice Profile', 'You are a helpful voice assistant. Reply with concise spoken-friendly language. Avoid markdown. Do not output <think> tags or internal reasoning. Return only the final spoken answer. Keep responses brief unless asked for details.', 1, 0, 0) ON CONFLICT (id) DO NOTHING;
 

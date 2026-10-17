@@ -501,6 +501,12 @@ impl InvocationPagedKvLease {
             .expect("live invocation paged lease must retain its cache")
     }
 
+    /// Wait until device work that can still reference this arena (including
+    /// work a failed operation queued) has completed. The slot stays leased.
+    pub(crate) fn fence(&self) -> Result<()> {
+        self.inner.arena.drain()
+    }
+
     /// Release the slot. Fails unless every backend-sealed write completion
     /// authenticates slots belonging to this exact lease generation.
     pub(crate) fn release(mut self) -> Result<InvocationPagedKvCompletion> {

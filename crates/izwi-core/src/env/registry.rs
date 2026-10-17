@@ -322,6 +322,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Sets the share (0,1] of the post-weight CUDA budget retained recurrent state may take; the rest backs KV pages.",
     ),
     CoreEnvVar::new(
+        "IZWI_DIARIZATION_CAPACITY_WAIT_SECS",
+        Duration,
+        "120",
+        Once,
+        "Sets how long a diarization job waits for memory other admitted work holds (at admission and per stage) before failing; 0 fails at once.",
+    ),
+    CoreEnvVar::new(
         "IZWI_ENABLE_CHUNKED_PREFILL",
         Flag,
         "false",
@@ -1946,13 +1953,6 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16).",
     ),
     CoreEnvVar::new(
-        "IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME",
-        Flag,
-        "false",
-        Once,
-        "Drops the final mel frame before the Qwen3-ASR audio tower (reference-parity knob).",
-    ),
-    CoreEnvVar::new(
         "IZWI_QWEN_ASR_STREAM_CHARS_PER_TOKEN",
         Int,
         "4 (clamped 1..12)",
@@ -2077,6 +2077,13 @@ pub static CORE_ENV: &[CoreEnvVar] = &[
         "model",
         Load,
         "Selects the Sortformer streaming chunk profile: model, low_latency (low), high_latency (high); unknown values ignored.",
+    ),
+    CoreEnvVar::new(
+        "IZWI_SORTFORMER_VAD_GATE",
+        Flag,
+        "false",
+        Once,
+        "Gates Sortformer diarization output by a VAD speech mask when the request does not set vad_gate.",
     ),
     CoreEnvVar::new(
         "IZWI_STREAM_AUDIO_QUEUE_CAPACITY",

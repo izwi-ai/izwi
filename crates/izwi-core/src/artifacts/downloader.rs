@@ -2327,7 +2327,8 @@ impl ModelDownloader {
                     ModelVariant::Qwen306B => 1_520_000_000,
                     ModelVariant::Qwen306B4Bit => 800_000_000,
                     ModelVariant::Qwen317B4Bit => 1_115_000_000,
-                    ModelVariant::Qwen3ForcedAligner06B4Bit => 703_000_000,
+                    ModelVariant::Qwen3ForcedAligner06B => 1_835_544_544,
+                    ModelVariant::Qwen3ForcedAligner06B4Bit => 971_305_827,
                     ModelVariant::Qwen314BGguf => 9_200_000_000,
                     ModelVariant::Qwen3508BGguf => 685_000_000,
                     ModelVariant::Qwen352BGguf => 1_850_000_000,
@@ -2348,8 +2349,8 @@ impl ModelDownloader {
             match variant {
                 ModelVariant::ParakeetTdt06BV3 => 2_509_332_480,
                 ModelVariant::Nemotron35AsrStreaming06B => 2_368_284_501,
-                ModelVariant::DiarStreamingSortformer4SpkV21 => 510_000_000,
-                ModelVariant::Nemotron3Diarization => 200_000_000,
+                ModelVariant::DiarStreamingSortformer4SpkV21 => 471_367_680,
+                ModelVariant::Nemotron3Diarization => 198_676_480,
                 _ => 4_000_000_000,
             }
         } else if file.contains("tokenizer") && file.contains("safetensors") {
@@ -2747,6 +2748,34 @@ mod tests {
         let (downloader, temp_dir) = test_downloader();
         let files = downloader.get_model_files(ModelVariant::Nemotron3Diarization);
         assert_eq!(files, vec!["Nemotron-3-Diarization.nemo".to_string()]);
+        std::fs::remove_dir_all(temp_dir).ok();
+    }
+
+    /// NDZ-5: the diarizers download the `.nemo` revision their loader was
+    /// verified against, not mutable `main`.
+    #[test]
+    fn sortformer_diarizers_download_their_pinned_revision() {
+        let (downloader, temp_dir) = test_downloader();
+        for (variant, revision) in [
+            (
+                ModelVariant::DiarStreamingSortformer4SpkV21,
+                ModelVariant::SORTFORMER_4SPK_V21_ARTIFACT_REVISION,
+            ),
+            (
+                ModelVariant::Nemotron3Diarization,
+                ModelVariant::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION,
+            ),
+        ] {
+            let specs = downloader.get_model_file_specs(variant);
+            assert!(!specs.is_empty(), "{variant}");
+            for spec in specs {
+                assert_eq!(
+                    spec.source_revision, revision,
+                    "{variant} {}",
+                    spec.source_file
+                );
+            }
+        }
         std::fs::remove_dir_all(temp_dir).ok();
     }
 

@@ -295,10 +295,11 @@ can lower that window but cannot raise it above 60 minutes. See the
 [Voxtral deployment](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/voxtral_tts.yaml),
 and [VibeVoice ASR model card](https://huggingface.co/microsoft/VibeVoice-ASR).
 
-Qwen3 ASR accepts up to 1,200 seconds per CUDA transcription chunk, while the
-forced-aligner route accepts up to 180 seconds and rejects longer inputs
-explicitly. CPU and Metal retain the checkpoint preprocessor window. Neither
-CUDA route silently truncates audio at the portable preprocessor limit.
+Qwen3 ASR accepts up to 1,200 seconds per CUDA transcription chunk; CPU and
+Metal retain the checkpoint preprocessor window, and the CUDA route does not
+silently truncate audio at that limit. The Qwen3 forced aligner takes one
+window of up to 180 seconds on every backend, so its timings do not depend on
+the backend; longer audio is aligned in sub-windows cut at quiet points.
 
 Voxtral Realtime CUDA offline decoding uses the loaded model position range
 (131,072 tokens in the current checkpoint) instead of the portable 1,024-frame

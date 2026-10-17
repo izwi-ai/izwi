@@ -41,9 +41,10 @@ pub use nemo::{ensure_nemotron_artifacts, NemotronArtifacts, NEMOTRON_NEMO_FILEN
 pub(crate) use nemo::{nemotron_checkpoint_paths, nemotron_native_artifacts_complete};
 pub(crate) use network::NEMOTRON_MODEL_MEMO_MAX_BYTES;
 use network::{
-    causal_subsampled_len, default_realtime_state_shape, resample_linear, NemotronEncodeProfile,
-    NemotronNetwork, NemotronRealtimeStateShape, NemotronRnntStreamState,
-    NemotronStreamingEncoderState, NemotronStreamingFeatureState, NemotronStreamingPreEncodeState,
+    causal_subsampled_len, default_realtime_state_shape, resample_linear,
+    resample_linear_output_len, NemotronEncodeProfile, NemotronNetwork, NemotronRealtimeStateShape,
+    NemotronRnntStreamState, NemotronStreamingEncoderState, NemotronStreamingFeatureState,
+    NemotronStreamingPreEncodeState,
 };
 pub(crate) use physical::NemotronOfflinePhysicalStateSpec;
 
@@ -2087,6 +2088,7 @@ impl NemotronAsrModel {
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<String> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        self.ensure_offline_physical_capacity(&request, acoustic)?;
         let source_identity = nemotron_offline_source_identity(audio, sample_rate, &request);
         let output = self.decode_offline(
             audio,
@@ -2122,6 +2124,7 @@ impl NemotronAsrModel {
         acoustic: &mut InvocationTensorLease,
     ) -> Result<NemotronAsrTranscriptionOutput> {
         let request = self.prepare_decode_request(audio, sample_rate, language, prompt)?;
+        self.ensure_offline_physical_capacity(&request, acoustic)?;
         let source_identity = nemotron_offline_source_identity(audio, sample_rate, &request);
         self.decode_offline_final(
             audio,
@@ -2674,6 +2677,27 @@ impl NemotronAsrModel {
             "native_forward_status": "enabled_offline_fastconformer_rnnt",
             "supports_realtime_cache_decode": true,
         }))
+    }
+
+    /// Fails before resampling or encoding when the request would encode to
+    /// more frames than the leased offline acoustic state accepts.
+    fn ensure_offline_physical_capacity(
+        &self,
+        request: &NemotronDecodeRequest,
+        acoustic: &InvocationTensorLease,
+    ) -> Result<()> {
+        let samples_16khz = resample_linear_output_len(
+            request.samples,
+            request.input_sample_rate,
+            request.target_sample_rate,
+        );
+        physical::ensure_offline_acoustic_capacity(
+            acoustic,
+            physical::nemotron_offline_encoded_frames(
+                samples_16khz,
+                self.network.realtime_state_shape(),
+            ),
+        )
     }
 
     fn prepare_decode_request(

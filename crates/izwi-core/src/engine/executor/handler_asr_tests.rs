@@ -609,6 +609,92 @@ fn audio_chat_asr_without_a_long_form_route_fails_closed_before_registry_lookup(
     }
 }
 
+/// Mirrors the coordinator's failed-invocation fence test for the
+/// executor's own lease helpers: every lease of a failed operation is
+/// fenced before the helper returns, and the operation's error wins.
+#[test]
+fn failed_invocation_operation_fences_every_lease_before_returning() {
+    use crate::engine::{
+        AdapterAbiRevision, AdapterInstanceId, ExecutionAdapterBinding, ExecutionGroupId,
+        ExecutionMode, ExecutionProfile, ModelInstanceId, NativeBatchMode, StageDescriptor,
+        StageId, StageWorkSelector,
+    };
+    use crate::error::{Error, Result};
+
+    let variant = ModelVariant::VibeVoiceAsr;
+    let profile = ExecutionProfile::fail_closed(
+        crate::backends::BackendKind::Cpu,
+        Some(variant),
+        ExecutionMode::Atomic,
+    );
+    let mut stage = StageDescriptor::from_execution_profile(
+        StageId::new(0),
+        "asr.atomic",
+        &profile,
+        NativeBatchMode::None,
+    );
+    stage.selector = StageWorkSelector::Atomic;
+    let execution = ExecutionAdapterBinding {
+        execution_group_id: ExecutionGroupId::new(1),
+        model_instance_id: ModelInstanceId::new(9),
+        adapter_instance_id: AdapterInstanceId::new(2),
+        adapter_abi_revision: AdapterAbiRevision::new(1),
+        model_variant: variant,
+        capability_id: "asr".to_string(),
+        stages: Arc::from([stage]),
+    };
+    let scheduled = |request: &EngineCoreRequest| ScheduledRequest {
+        plan_id: 1,
+        request_id: request.id.clone(),
+        sequence_id: 1,
+        num_tokens: 1,
+        is_prefill: true,
+        num_computed_tokens: 0,
+        work: WorkUnit::AtomicJob { kind: "asr".into() },
+    };
+
+    for (fail_operation, fail_fence) in [(false, false), (true, false), (true, true)] {
+        // VibeVoice's helper expects exactly three state domains.
+        let (state, probe) = crate::kv::v2::fence_probe::fence_probe_state_runtime(&execution, 3);
+        probe.fail_fence.store(fail_fence, Ordering::Release);
+        let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3]).with_model_variant(variant);
+        request.bind_execution_adapter(execution.clone()).unwrap();
+        request
+            .bind_v2_state_runtime(
+                state.clone(),
+                state.state_fingerprint,
+                crate::backends::BackendKind::Cpu,
+            )
+            .unwrap();
+
+        let result = super::vibevoice::with_vibevoice_invocation_state(
+            &request,
+            &scheduled(&request),
+            |_leases| -> Result<()> {
+                if fail_operation {
+                    return Err(Error::InvalidInput("enqueued work then failed".into()));
+                }
+                Ok(())
+            },
+        );
+
+        if fail_operation {
+            let error = result.expect_err("the operation error must propagate");
+            assert!(
+                matches!(&error, Error::InvalidInput(message)
+                    if message == "enqueued work then failed"),
+                "the original operation error must win over the fence: {error:?}"
+            );
+            assert_eq!(probe.fences.load(Ordering::Acquire), 3);
+            assert_eq!(probe.aborts.load(Ordering::Acquire), 3);
+        } else {
+            result.expect("a successful operation releases its leases");
+            assert_eq!(probe.fences.load(Ordering::Acquire), 0);
+            assert_eq!(probe.aborts.load(Ordering::Acquire), 0);
+        }
+    }
+}
+
 #[test]
 fn lfm_long_form_asr_passes_only_a_caller_set_max_tokens() {
     let mut request = EngineCoreRequest::asr_bytes(vec![1, 2, 3])

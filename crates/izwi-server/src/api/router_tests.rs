@@ -216,6 +216,43 @@ async fn disabled_ui_returns_not_found_for_unknown_routes() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// PIPE-7: cancelling a running diarization stops its pipeline (the
+/// job's cancellation fires), and the record reports the cancel.
+#[tokio::test]
+async fn diarization_cancel_stops_the_running_pipeline() {
+    let (state, _temp_dir) = test_state("diarization_cancel_stops_the_running_pipeline", false);
+    state.lifecycle.mark_ready();
+    let mut pending = crate::diarization_store::tests::sample_record();
+    pending.processing_status = crate::diarization_store::DiarizationProcessingStatus::Processing;
+    let record = state
+        .diarization_store
+        .create_record(pending)
+        .await
+        .expect("record should be created");
+    let job = state.diarization_jobs.register(&record.id);
+    let serve_config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &serve_config);
+
+    let response = send_request(
+        app,
+        build_request(
+            Method::POST,
+            &format!("/v1/diarizations/{}/cancel", record.id),
+            None,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["processing_status"], "failed");
+    assert_eq!(body["processing_error"], "Cancelled by user.");
+    assert!(job.cancellation().is_cancelled());
+}
+
 #[tokio::test]
 async fn canonical_history_routes_still_resolve() {
     let (app, temp_dir) = test_api_app("canonical_history_routes_still_resolve", true);
@@ -848,6 +885,63 @@ async fn unified_transcription_job_mutation_routes_support_both_job_kinds() {
     )
     .await;
     assert_eq!(canonical_diarization_create.status(), StatusCode::ACCEPTED);
+
+    drop(temp_dir);
+}
+
+#[tokio::test]
+async fn diarization_create_rejects_pipeline_models_it_cannot_run() {
+    let (app, temp_dir) = test_api_app(
+        "diarization_create_rejects_pipeline_models_it_cannot_run",
+        true,
+    );
+    for (field, expected) in [
+        (r#""asr_model":"bogus""#, "Unknown diarization ASR model id"),
+        (
+            r#""asr_model":"LFM2.5-Audio-1.5B-GGUF""#,
+            "cannot transcribe in the diarization pipeline",
+        ),
+        (
+            r#""aligner_model":"bogus""#,
+            "is not a forced aligner model",
+        ),
+        (
+            r#""aligner_model":"Parakeet-TDT-0.6B-v3""#,
+            "is not a forced aligner model",
+        ),
+    ] {
+        let body = tiny_audio_json_body_with_fields(field);
+        let response = send_request(
+            app.clone(),
+            build_request(Method::POST, "/v1/diarizations", Some(body.as_str())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        let payload = read_json(response).await;
+        let message = payload["error"]["message"]
+            .as_str()
+            .expect("error message should exist");
+        assert!(message.contains(expected), "{field}: {message}");
+    }
+
+    let accepted = send_request(
+        app,
+        build_request(
+            Method::POST,
+            "/v1/diarizations",
+            Some(
+                tiny_audio_json_body_with_fields(
+                    r#""asr_model":"parakeet-tdt-0.6b-v3","aligner_model":"Qwen3-ForcedAligner-0.6B""#,
+                )
+                .as_str(),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let record = read_json(accepted).await;
+    assert_eq!(record["asr_model_id"], "Parakeet-TDT-0.6B-v3");
+    assert_eq!(record["aligner_model_id"], "Qwen3-ForcedAligner-0.6B");
 
     drop(temp_dir);
 }

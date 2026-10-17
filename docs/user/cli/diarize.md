@@ -33,7 +33,7 @@ Analyzes audio to identify different speakers and when they spoke. Optionally in
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-m, --model <MODEL>` | Diarization model | `sortformer-4spk` |
+| `-m, --model <MODEL>` | Diarization model | `diar_streaming_sortformer_4spk-v2.1` |
 | `-n, --num-speakers <N>` | Expected number of speakers | Auto-detect |
 | `-f, --format <FORMAT>` | Output format: `text`, `json`, `verbose_json` | `text` |
 | `-o, --output <PATH>` | Output file (default: stdout) | — |
@@ -130,8 +130,8 @@ izwi diarize interview.wav \
 
 | Model | Description |
 |-------|-------------|
-| `sortformer-4spk` | Alias for `diar_streaming_sortformer_4spk-v2.1` (default) |
-| `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID |
+| `sortformer-4spk` | Alias for `diar_streaming_sortformer_4spk-v2.1` |
+| `diar_streaming_sortformer_4spk-v2.1` | Canonical Sortformer model ID (default) |
 
 ---
 

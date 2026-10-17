@@ -55,6 +55,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_CUDA_RUNTIME_BINARY` | path | unset (search next to the executable and lib/izwi/runtime/cuda) | startup | Path to the private CUDA runtime binary, tried first before the built-in search locations. |
 | `IZWI_CUDA_SPLIT_DECODE` | flag | `true` | model load | Enables the CUDA grouped-query split-decode attention kernel; read once per KV arena. |
 | `IZWI_CUDA_STATE_BUDGET_FRACTION` | number | `0.25` | startup | Sets the share (0,1] of the post-weight CUDA budget retained recurrent state may take; the rest backs KV pages. |
+| `IZWI_DIARIZATION_CAPACITY_WAIT_SECS` | duration | `120` | first use | Sets how long a diarization job waits for memory other admitted work holds (at admission and per stage) before failing; 0 fails at once. |
 | `IZWI_ENABLE_CHUNKED_PREFILL` | flag | `false` | startup | Enables chunked prefill in the scheduler. |
 | `IZWI_ENABLE_PREFIX_CACHING` | flag | false (catalog auto prefix reuse applies) | startup | Explicitly enables or kills prefix caching; any valid value also turns off catalog-auto prefix reuse. |
 | `IZWI_FISH_NATIVE_BATCHING` | flag | `false` | model load | Enables native batched decoding for Fish S2 TTS when the model loads. |
@@ -283,7 +284,6 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING` | flag | Metal: true when hidden_size<=1024; always false off Metal | model load | Packs quantized Qwen3 Q/K/V and gate/up projections into one QMatMul each on Metal. |
 | `IZWI_QWEN3_ROPE_KERNEL` | flag | true on Metal/CUDA, false on CPU | model load | Toggles the custom RoPE kernel for Qwen3 attention. |
 | `IZWI_QWEN_ASR_AUDIO_DTYPE` | choice | backend default (GGUF: text dtype) | model load | Overrides the Qwen3-ASR audio tower dtype (e.g. f32, f16, bf16). |
-| `IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME` | flag | `false` | first use | Drops the final mel frame before the Qwen3-ASR audio tower (reference-parity knob). |
 | `IZWI_QWEN_ASR_STREAM_CHARS_PER_TOKEN` | integer | 4 (clamped 1..12) | first use | Sets chars per rollback token used to derive streaming ASR text holdback when HOLDBACK_CHARS is unset (all families). |
 | `IZWI_QWEN_ASR_STREAM_HOLDBACK_CHARS` | integer | ROLLBACK_TOKENS x CHARS_PER_TOKEN = 20 | first use | Sets characters of streamed ASR chunk text held back as unstable before emission (applies to all families). |
 | `IZWI_QWEN_ASR_STREAM_ROLLBACK_TOKENS` | integer | 5 (max 32) | first use | Sets rollback tokens used to derive streaming ASR text holdback when HOLDBACK_CHARS is unset (all families). |
@@ -302,6 +302,7 @@ Booleans (`flag`) accept `true`, `1`, `yes`, `on` or `false`, `0`, `no`, `off`, 
 | `IZWI_SORTFORMER_PP_PAD_ONSET` | number | 0.0 (model preset) | first use | Overrides seconds of padding added before each Sortformer speech segment (floored at 0). |
 | `IZWI_SORTFORMER_PP_PRESET` | choice | `model` | first use | Selects Sortformer post-processing preset: model, callhome/callhome_v2, dihard3/dihard3_v2, legacy/legacy_model (unknown=model). |
 | `IZWI_SORTFORMER_STREAMING_PROFILE` | choice | `model` | model load | Selects the Sortformer streaming chunk profile: model, low_latency (low), high_latency (high); unknown values ignored. |
+| `IZWI_SORTFORMER_VAD_GATE` | flag | `false` | first use | Gates Sortformer diarization output by a VAD speech mask when the request does not set vad_gate. |
 | `IZWI_STREAM_AUDIO_QUEUE_CAPACITY` | integer | 8 (TTS) / 64 (speech-to-speech) | first use | Sets the engine streaming queue depth for TTS and speech-to-speech; overrides IZWI_STREAM_QUEUE_CAPACITY. |
 | `IZWI_STREAM_QUEUE_CAPACITY` | integer | per task: TTS 8, S2S 64, ASR 4096, chat 64 | first use | Sets the fallback engine streaming queue depth for every task without a task-specific override (positive integer). |
 | `IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS` | duration | 30000 (30 s) | first use | Sets how long streamed text output may wait on a stalled consumer before the invocation fails, in milliseconds. |

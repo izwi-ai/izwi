@@ -50,6 +50,26 @@ impl RuntimeAdapterRegistry {
             .collect()
     }
 
+    /// Weight-free check that a model's long-form graph can run as one
+    /// blocking stage: builds the adapter a load would build and reads its
+    /// long-form contract, so a pipeline can refuse the model before any work.
+    pub(crate) fn supports_atomic_long_form(
+        &self,
+        capability: CapabilityKind,
+        model_variant: ModelVariant,
+        backend_kind: BackendKind,
+    ) -> Result<bool> {
+        let metadata = *self.require(capability, model_variant)?;
+        let adapter = self.create_loaded_adapter(
+            ExecutionGroupId::new(0),
+            ModelInstanceId::new(0),
+            metadata,
+            backend_kind,
+        )?;
+        let contract = adapter.contract(StreamingRequirements::NONE.with_asr_long_form(true))?;
+        Ok(contract_supports_atomic_blocking(&contract))
+    }
+
     pub(super) fn create_loaded_adapter(
         &self,
         execution_group_id: ExecutionGroupId,

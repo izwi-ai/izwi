@@ -8,7 +8,7 @@
 //! This module dequantizes those tensors into dense weights so existing Candle
 //! layers can be reused without model-specific branching.
 
-use candle_core::{DType, Tensor};
+use candle_core::{DType, Device, Tensor, WithDType};
 use candle_nn::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Embedding, Linear, VarBuilder};
 
 use crate::error::{Error, Result};
@@ -137,13 +137,13 @@ fn quant_bits_from_packing(
     Ok(bits)
 }
 
-fn dequantize_affine_u32(
+fn dequantize_affine_u32<T: WithDType>(
     packed: Vec<Vec<u32>>,
     scales: Vec<Vec<f32>>,
     biases: Option<Vec<Vec<f32>>>,
     out_dim: usize,
     in_dim: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<T>> {
     if packed.len() != out_dim {
         return Err(Error::ModelLoadError(format!(
             "Quantized weight rows mismatch: expected out_dim={out_dim}, packed_rows={}",
@@ -165,7 +165,7 @@ fn dequantize_affine_u32(
     let (scales, biases, groups) = normalize_affine_params(scales, biases, out_dim, in_dim)?;
     let group_size = in_dim / groups;
 
-    let mut out = vec![0f32; out_dim * in_dim];
+    let mut out = vec![T::zero(); out_dim * in_dim];
     for row in 0..out_dim {
         for pcol in 0..packed_in {
             let word = packed[row][pcol];
@@ -177,20 +177,21 @@ fn dequantize_affine_u32(
                 }
                 let q = ((word >> (pi * bits)) & mask) as f32;
                 let g = col / group_size;
-                out[row * in_dim + col] = q * scales[row][g] + biases[row][g];
+                out[row * in_dim + col] =
+                    T::from_f64(f64::from(q * scales[row][g] + biases[row][g]));
             }
         }
     }
     Ok(out)
 }
 
-fn dequantize_affine_u8(
+fn dequantize_affine_u8<T: WithDType>(
     packed: Vec<Vec<u8>>,
     scales: Vec<Vec<f32>>,
     biases: Option<Vec<Vec<f32>>>,
     out_dim: usize,
     in_dim: usize,
-) -> Result<Vec<f32>> {
+) -> Result<Vec<T>> {
     if packed.len() != out_dim {
         return Err(Error::ModelLoadError(format!(
             "Quantized weight rows mismatch: expected out_dim={out_dim}, packed_rows={}",
@@ -208,7 +209,7 @@ fn dequantize_affine_u8(
     let (scales, biases, groups) = normalize_affine_params(scales, biases, out_dim, in_dim)?;
     let group_size = in_dim / groups;
 
-    let mut out = vec![0f32; out_dim * in_dim];
+    let mut out = vec![T::zero(); out_dim * in_dim];
     for row in 0..out_dim {
         for pcol in 0..packed_in {
             let word = packed[row][pcol] as u32;
@@ -220,7 +221,8 @@ fn dequantize_affine_u8(
                 }
                 let q = ((word >> (pi * bits)) & mask) as f32;
                 let g = col / group_size;
-                out[row * in_dim + col] = q * scales[row][g] + biases[row][g];
+                out[row * in_dim + col] =
+                    T::from_f64(f64::from(q * scales[row][g] + biases[row][g]));
             }
         }
     }
@@ -243,12 +245,10 @@ pub fn load_weight(vb: &VarBuilder, out_dim: usize, in_dim: usize) -> Result<Ten
         None
     };
 
-    let weight = if let Ok(w_u32) = vb.get_unchecked_dtype("weight", DType::U32) {
-        let packed = w_u32.to_vec2::<u32>()?;
-        dequantize_affine_u32(packed, scales, biases, out_dim, in_dim)?
+    let packed = if let Ok(w_u32) = vb.get_unchecked_dtype("weight", DType::U32) {
+        PackedWords::U32(w_u32.to_vec2::<u32>()?)
     } else if let Ok(w_u8) = vb.get_unchecked_dtype("weight", DType::U8) {
-        let packed = w_u8.to_vec2::<u8>()?;
-        dequantize_affine_u8(packed, scales, biases, out_dim, in_dim)?
+        PackedWords::U8(w_u8.to_vec2::<u8>()?)
     } else {
         return Err(Error::ModelLoadError(
             "MLX quantized tensor has unsupported packed dtype for `weight` (expected U32 or U8)"
@@ -256,8 +256,46 @@ pub fn load_weight(vb: &VarBuilder, out_dim: usize, in_dim: usize) -> Result<Ten
         ));
     };
 
-    let t = Tensor::from_vec(weight, (out_dim, in_dim), vb.device())?;
-    t.to_dtype(vb.dtype()).map_err(Error::from)
+    // Dequantize on the host straight into the requested dtype and upload the
+    // result once, at its exact size. An F32 buffer uploaded and cast on the
+    // device kept two F32 copies of the largest weight in flight (the 4-bit
+    // forced aligner's embedding: 0.58 GiB on the host, 0.58 GiB uploaded)
+    // and rounded the cast up to a power of two.
+    let (shape, device) = ((out_dim, in_dim), vb.device());
+    match vb.dtype() {
+        DType::F16 => packed.dequantize::<half::f16>(scales, biases, shape, device),
+        DType::BF16 => packed.dequantize::<half::bf16>(scales, biases, shape, device),
+        DType::F32 => packed.dequantize::<f32>(scales, biases, shape, device),
+        dtype => packed
+            .dequantize::<f32>(scales, biases, shape, device)?
+            .to_dtype(dtype)
+            .map_err(Error::from),
+    }
+}
+
+/// The packed words of an MLX affine-quantized weight.
+enum PackedWords {
+    U32(Vec<Vec<u32>>),
+    U8(Vec<Vec<u8>>),
+}
+
+impl PackedWords {
+    /// The dense `shape` weight at `T`, on `device`.
+    fn dequantize<T: WithDType>(
+        self,
+        scales: Vec<Vec<f32>>,
+        biases: Option<Vec<Vec<f32>>>,
+        (out_dim, in_dim): (usize, usize),
+        device: &Device,
+    ) -> Result<Tensor> {
+        let values = match self {
+            Self::U32(packed) => {
+                dequantize_affine_u32::<T>(packed, scales, biases, out_dim, in_dim)?
+            }
+            Self::U8(packed) => dequantize_affine_u8::<T>(packed, scales, biases, out_dim, in_dim)?,
+        };
+        Tensor::from_vec(values, (out_dim, in_dim), device).map_err(Error::from)
+    }
 }
 
 pub fn load_linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
@@ -312,6 +350,20 @@ pub fn load_conv2d(
             "Conv2d weight shape mismatch: got={dims:?}, expected OIHW={expected_oihw:?} or OHWI={expected_ohwi:?}"
         )));
     }
+    // Candle 0.11's Metal and non-cudnn CUDA im2col conv2d copy a strided
+    // kernel to a contiguous buffer and then multiply the original one. Both
+    // the permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = if ws.is_contiguous() {
+        ws
+    } else {
+        let contiguous = ws.contiguous()?;
+        // Free the strided original now: until a synchronization Candle
+        // pools it and hands it to the next allocation it fits, so the small
+        // bias read next would keep the whole kernel's buffer resident.
+        drop(ws);
+        contiguous.device().synchronize()?;
+        contiguous
+    };
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get(out_channels, "bias")?)
@@ -360,6 +412,10 @@ pub fn load_conv1d_no_bias(
             "Conv1d weight must be a 2D/3D tensor".to_string(),
         ));
     }
+    // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a strided
+    // kernel to a contiguous buffer and then multiply the original. Both the
+    // permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = ws.contiguous()?;
 
     Ok(Conv1d::new(ws, None, cfg))
 }
@@ -403,6 +459,10 @@ pub fn load_conv1d(
             "Conv1d weight must be a 2D/3D tensor".to_string(),
         ));
     }
+    // Candle 0.11's CPU, Metal and non-cudnn CUDA im2col conv1d copy a strided
+    // kernel to a contiguous buffer and then multiply the original. Both the
+    // permute above and a Fortran-ordered `.pth` tensor are strided.
+    let ws = ws.contiguous()?;
 
     let bias = if vb.contains_tensor("bias") {
         Some(vb.get_unchecked_dtype("bias", vb.dtype())?)
@@ -422,7 +482,7 @@ mod tests {
         let packed = vec![vec![0x7654_3210]];
         let scales = vec![vec![0.1, 0.2]];
         let biases = vec![vec![-1.0, 0.5]];
-        let out = dequantize_affine_u32(packed, scales, Some(biases), 1, 8).unwrap();
+        let out = dequantize_affine_u32::<f32>(packed, scales, Some(biases), 1, 8).unwrap();
 
         let expected = [
             -1.0 + 0.0 * 0.1,
@@ -444,7 +504,7 @@ mod tests {
         let packed = vec![vec![1u8, 2, 3, 4]];
         let scales = vec![vec![0.5, 2.0]];
         let biases = vec![vec![0.0, -1.0]];
-        let out = dequantize_affine_u8(packed, scales, Some(biases), 1, 4).unwrap();
+        let out = dequantize_affine_u8::<f32>(packed, scales, Some(biases), 1, 4).unwrap();
 
         let expected = [0.5, 1.0, 5.0, 7.0];
         for (a, b) in out.iter().zip(expected.iter()) {
@@ -456,7 +516,7 @@ mod tests {
     fn dequantize_u32_affine_no_biases() {
         let packed = vec![vec![0x7654_3210]];
         let scales = vec![vec![0.1, 0.2]];
-        let out = dequantize_affine_u32(packed, scales, None, 1, 8).unwrap();
+        let out = dequantize_affine_u32::<f32>(packed, scales, None, 1, 8).unwrap();
 
         let expected = [
             0.0 * 0.1,
@@ -477,11 +537,290 @@ mod tests {
     fn dequantize_u8_affine_no_biases() {
         let packed = vec![vec![1u8, 2, 3, 4]];
         let scales = vec![vec![0.5, 2.0]];
-        let out = dequantize_affine_u8(packed, scales, None, 1, 4).unwrap();
+        let out = dequantize_affine_u8::<f32>(packed, scales, None, 1, 4).unwrap();
 
         let expected = [0.5, 1.0, 6.0, 8.0];
         for (a, b) in out.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6);
         }
+    }
+
+    /// The host dequantization into the requested dtype matches the F32
+    /// dequantization cast to it, bit for bit, at the exact shape.
+    #[test]
+    fn load_weight_dequantizes_into_the_requested_dtype() {
+        let device = Device::Cpu;
+        let (out_dim, in_dim) = (3, 16);
+        let words: Vec<u32> = (0..out_dim * in_dim / 8)
+            .map(|i| 0x9E37_79B9u32.wrapping_mul(i as u32 + 1))
+            .collect();
+        let scales: Vec<f32> = (0..out_dim * 2).map(|i| 0.013 * (i as f32 + 1.0)).collect();
+        let biases: Vec<f32> = (0..out_dim * 2).map(|i| -0.07 * i as f32).collect();
+        let weights = std::collections::HashMap::from([
+            (
+                "weight".to_string(),
+                Tensor::from_vec(words, (out_dim, in_dim / 8), &device).unwrap(),
+            ),
+            (
+                "scales".to_string(),
+                Tensor::from_vec(scales, (out_dim, 2), &device).unwrap(),
+            ),
+            (
+                "biases".to_string(),
+                Tensor::from_vec(biases, (out_dim, 2), &device).unwrap(),
+            ),
+        ]);
+        let vb = |dtype| VarBuilder::from_tensors(weights.clone(), dtype, &device);
+        let reference = load_weight(&vb(DType::F32), out_dim, in_dim).unwrap();
+        for dtype in [DType::F16, DType::BF16, DType::F32, DType::F64] {
+            let weight = load_weight(&vb(dtype), out_dim, in_dim).unwrap();
+            assert_eq!(
+                (weight.dtype(), weight.dims2().unwrap()),
+                (dtype, (out_dim, in_dim))
+            );
+            let expected = reference.to_dtype(dtype).unwrap();
+            let bits = |t: &Tensor| {
+                t.flatten_all()
+                    .unwrap()
+                    .to_dtype(DType::F64)
+                    .unwrap()
+                    .to_vec1::<f64>()
+                    .unwrap()
+            };
+            assert_eq!(bits(&weight), bits(&expected), "{dtype:?}");
+        }
+    }
+
+    /// MLX OHWI / OKI conv weights for the loaders, with a bias.
+    fn mlx_conv_weights(
+        out_channels: usize,
+        kernel: &[usize],
+        in_channels: usize,
+    ) -> std::collections::HashMap<String, Tensor> {
+        use crate::kernels::numeric_check::xorshift_tensor;
+
+        let mut shape = vec![out_channels];
+        shape.extend_from_slice(kernel);
+        shape.push(in_channels);
+        let device = candle_core::Device::Cpu;
+        std::collections::HashMap::from([
+            (
+                "weight".to_string(),
+                xorshift_tensor(&shape, 9, 0.05, &device).expect("weight"),
+            ),
+            (
+                "bias".to_string(),
+                xorshift_tensor(&[out_channels], 11, 0.5, &device).expect("bias"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn mlx_conv_loaders_return_contiguous_oihw_kernels() {
+        let device = candle_core::Device::Cpu;
+        let vb = |weights| VarBuilder::from_tensors(weights, DType::F32, &device);
+        let conv2d = load_conv2d(
+            8,
+            6,
+            3,
+            Conv2dConfig::default(),
+            vb(mlx_conv_weights(6, &[3, 3], 8)),
+        )
+        .expect("conv2d");
+        assert_eq!(conv2d.weight().dims(), &[6, 8, 3, 3]);
+        assert!(conv2d.weight().is_contiguous());
+
+        let weights = mlx_conv_weights(6, &[3], 8);
+        let conv1d =
+            load_conv1d(8, 6, 3, Conv1dConfig::default(), vb(weights.clone())).expect("conv1d");
+        let no_bias = load_conv1d_no_bias(8, 6, 3, Conv1dConfig::default(), vb(weights))
+            .expect("conv1d without bias");
+        for weight in [conv1d.weight(), no_bias.weight()] {
+            assert_eq!(weight.dims(), &[6, 8, 3]);
+            assert!(weight.is_contiguous());
+        }
+    }
+
+    /// Candle 0.11's Metal im2col conv multiplies the caller's strided kernel
+    /// instead of its own contiguous copy, so a permuted MLX kernel was read in
+    /// the wrong layout (relative error ~1 in the 4-bit aligner's audio CNN);
+    /// its CPU conv1d ignores kernel strides too. The reference is a CPU conv
+    /// over an explicitly contiguous OIHW/OIK kernel; Metal legs run when present.
+    #[test]
+    fn mlx_conv2d_ohwi_kernel_matches_cpu() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+        use candle_core::{Device, Module};
+
+        let cpu = Device::Cpu;
+        // The Metal leg holds the shared device's test lease throughout.
+        #[cfg(feature = "metal")]
+        let metal =
+            crate::backends::metal_test_device_or_skip("mlx_conv2d_ohwi_kernel_matches_cpu");
+        #[cfg(not(feature = "metal"))]
+        let metal: Option<(Device, ())> = None;
+        let devices = std::iter::once(("cpu", cpu.clone()))
+            .chain(metal.as_ref().map(|(metal, _)| ("metal", metal.clone())))
+            .collect::<Vec<_>>();
+
+        let conv2d_weights = mlx_conv_weights(480, &[3, 3], 480);
+        let conv2d_input = xorshift_tensor(&[2, 480, 32, 25], 7, 1.0, &cpu).unwrap();
+        let conv2d_cfg = Conv2dConfig {
+            padding: 1,
+            stride: 2,
+            ..Default::default()
+        };
+        let conv2d_on = |device: &Device| {
+            let vb = VarBuilder::from_tensors(conv2d_weights.clone(), DType::F32, device);
+            let conv = load_conv2d(480, 480, 3, conv2d_cfg, vb).expect("conv2d");
+            host_f32(
+                &conv
+                    .forward(&conv2d_input.to_device(device).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let oihw = conv2d_weights["weight"].permute((0, 3, 1, 2)).unwrap();
+        let conv2d_reference = Conv2d::new(
+            oihw.contiguous().unwrap(),
+            Some(conv2d_weights["bias"].clone()),
+            conv2d_cfg,
+        );
+        let conv2d_want = host_f32(&conv2d_reference.forward(&conv2d_input).unwrap()).unwrap();
+
+        let conv1d_weights = mlx_conv_weights(256, &[3], 128);
+        let conv1d_input = xorshift_tensor(&[2, 128, 50], 5, 1.0, &cpu).unwrap();
+        let conv1d_cfg = Conv1dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let conv1d_on = |device: &Device| {
+            let vb = VarBuilder::from_tensors(conv1d_weights.clone(), DType::F32, device);
+            let conv = load_conv1d(128, 256, 3, conv1d_cfg, vb).expect("conv1d");
+            host_f32(
+                &conv
+                    .forward(&conv1d_input.to_device(device).unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let oik = conv1d_weights["weight"].permute((0, 2, 1)).unwrap();
+        let conv1d_reference = Conv1d::new(
+            oik.contiguous().unwrap(),
+            Some(conv1d_weights["bias"].clone()),
+            conv1d_cfg,
+        );
+        let conv1d_want = host_f32(&conv1d_reference.forward(&conv1d_input).unwrap()).unwrap();
+
+        let mut failures = Vec::new();
+        for (device_name, device) in &devices {
+            for (conv, want, got) in [
+                ("conv2d", &conv2d_want, conv2d_on(device)),
+                ("conv1d", &conv1d_want, conv1d_on(device)),
+            ] {
+                let err = max_abs_diff(&got, want);
+                eprintln!("{conv} {device_name}: max|d|={err:e} vs contiguous-kernel reference");
+                if err >= 1e-3 {
+                    failures.push(format!("{conv} {device_name}: max|d|={err:e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "MLX conv loaders: {failures:?}");
+    }
+
+    /// Pins Candle 0.11's strided-kernel bug and izwi's guard against it.
+    /// Candle's CPU im2col conv1d copies a strided kernel to a contiguous
+    /// buffer and then multiplies the original storage as if it were row-major
+    /// (Metal and non-cudnn CUDA do the same for conv1d and conv2d). If the
+    /// first assertion fails, a Candle upgrade changed that: re-audit before
+    /// relying on it. Every izwi conv loader must hand Candle contiguous
+    /// kernels, from MLX OKI/OHWI layouts and from Fortran-ordered `.pth`.
+    #[test]
+    fn candle_conv_strided_kernel_canary() {
+        use crate::kernels::numeric_check::{host_f32, max_abs_diff, xorshift_tensor};
+        use crate::models::shared::weights::pytorch::test_support::write_f32_state_dict;
+        use candle_core::{Device, Module};
+
+        let cpu = Device::Cpu;
+        let input = xorshift_tensor(&[2, 8, 20], 5, 1.0, &cpu).unwrap();
+        let oki = xorshift_tensor(&[6, 3, 8], 9, 0.05, &cpu).unwrap();
+        let strided = oki.permute((0, 2, 1)).unwrap();
+        assert!(!strided.is_contiguous());
+        let oik = strided.contiguous().unwrap();
+        let cfg = Conv1dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let want = host_f32(&Conv1d::new(oik.clone(), None, cfg).forward(&input).unwrap()).unwrap();
+        let buggy = host_f32(&Conv1d::new(strided, None, cfg).forward(&input).unwrap()).unwrap();
+        assert!(
+            max_abs_diff(&buggy, &want) > 1e-2,
+            "Candle CPU conv1d now honours strided kernels; re-audit report 09"
+        );
+
+        let dir = std::env::temp_dir().join(format!("izwi-conv-canary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fortran_vb = |name: &str, weight: &Tensor| {
+            let path = dir.join(format!("{name}.pth"));
+            write_f32_state_dict(&path, "weight", weight, true);
+            VarBuilder::from_pth(path, DType::F32, &cpu).unwrap()
+        };
+        let mlx_vb = |weight: &Tensor| {
+            let weights = std::collections::HashMap::from([("weight".to_string(), weight.clone())]);
+            VarBuilder::from_tensors(weights, DType::F32, &cpu)
+        };
+
+        // Candle's own `.pth` reader returns a Fortran tensor as a strided view.
+        let raw = fortran_vb("raw", &oik).get((6, 8, 3), "weight").unwrap();
+        assert!(!raw.is_contiguous());
+
+        let mut failures = Vec::new();
+        let conv1d_layouts = [
+            ("oki", mlx_vb(&oki)),
+            ("fortran-oik", fortran_vb("oik", &oik)),
+        ];
+        for (layout, vb) in conv1d_layouts {
+            for (loader, conv) in [
+                (
+                    "load_conv1d",
+                    load_conv1d(8, 6, 3, cfg, vb.clone()).unwrap(),
+                ),
+                (
+                    "load_conv1d_no_bias",
+                    load_conv1d_no_bias(8, 6, 3, cfg, vb).unwrap(),
+                ),
+            ] {
+                let err = max_abs_diff(&host_f32(&conv.forward(&input).unwrap()).unwrap(), &want);
+                if !conv.weight().is_contiguous() || err > 1e-6 {
+                    failures.push(format!("{loader} {layout}: max|d|={err:e}"));
+                }
+            }
+        }
+
+        let ohwi = xorshift_tensor(&[6, 3, 3, 8], 13, 0.05, &cpu).unwrap();
+        let oihw = ohwi.permute((0, 3, 1, 2)).unwrap().contiguous().unwrap();
+        let image = xorshift_tensor(&[1, 8, 9, 7], 17, 1.0, &cpu).unwrap();
+        let cfg2d = Conv2dConfig {
+            padding: 1,
+            ..Default::default()
+        };
+        let want2d = host_f32(
+            &Conv2d::new(oihw.clone(), None, cfg2d)
+                .forward(&image)
+                .unwrap(),
+        )
+        .unwrap();
+        let conv2d_layouts = [
+            ("ohwi", mlx_vb(&ohwi)),
+            ("fortran-oihw", fortran_vb("oihw", &oihw)),
+        ];
+        for (layout, vb) in conv2d_layouts {
+            let conv = load_conv2d(8, 6, 3, cfg2d, vb).unwrap();
+            let err = max_abs_diff(&host_f32(&conv.forward(&image).unwrap()).unwrap(), &want2d);
+            if !conv.weight().is_contiguous() || err > 1e-6 {
+                failures.push(format!("load_conv2d {layout}: max|d|={err:e}"));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(failures.is_empty(), "strided conv kernels: {failures:?}");
     }
 }

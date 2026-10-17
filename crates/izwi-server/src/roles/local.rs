@@ -120,18 +120,51 @@ pub(crate) async fn run_local(
             "Failed to reconcile durable runtime jobs during startup: {err}"
         ));
     }
+    // Streamed speech, diarization jobs and streamed transcriptions run as
+    // tasks of the node that accepted them; fail the ones this node left
+    // running. On a shared database only its own (P1V-1).
+    let mut unscoped_recovery = false;
     match state
         .speech_history_store
         .reconcile_stale_processing_records()
         .await
     {
-        Ok(reconciled) if reconciled > 0 => {
+        Ok(Some(reconciled)) if reconciled > 0 => {
             info!(reconciled, "Reconciled stale speech history records");
         }
-        Ok(_) => {}
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
         Err(err) => startup_warnings.push(format!(
             "Failed to reconcile speech history records during startup: {err}"
         )),
+    }
+    match state.diarization_store.fail_interrupted_records().await {
+        Ok(Some(failed)) if failed > 0 => {
+            info!(failed, "Failed diarization jobs interrupted by a shutdown");
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted diarization jobs during startup: {err}"
+        )),
+    }
+    match state.transcription_store.fail_interrupted_records().await {
+        Ok(Some(failed)) if failed > 0 => {
+            info!(failed, "Failed transcriptions interrupted by a shutdown");
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => unscoped_recovery = true,
+        Err(err) => startup_warnings.push(format!(
+            "Failed to recover interrupted transcriptions during startup: {err}"
+        )),
+    }
+    if unscoped_recovery {
+        // A configuration gap, not a readiness failure: the node serves.
+        warn!(
+            "Skipped failing interrupted jobs: this database may be shared by several nodes. \
+             Set {} to a stable id unique to this node to recover the jobs it left running.",
+            crate::node_identity::NODE_ID_ENV
+        );
     }
     match state
         .artifact_store

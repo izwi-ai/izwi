@@ -73,3 +73,5 @@ pub(crate) use runtime::{
 pub(crate) use capacity::{WorkspaceAxis, WorkspaceDimensionBound};
 #[cfg(test)]
 pub(crate) use contract::test_contract;
+#[cfg(test)]
+pub(crate) use runtime::fence_probe;

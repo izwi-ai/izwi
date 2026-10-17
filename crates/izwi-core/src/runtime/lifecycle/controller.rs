@@ -286,6 +286,34 @@ impl ModelLifecycleController {
         Ok(model_instance_id)
     }
 
+    /// Grows a Loading slot's authorization to also cover
+    /// `load_authorization`, before the load allocates beyond what it was
+    /// admitted for. Unlike a shrink this is a guarded grow: the authority
+    /// checks the growth against its capacity (and live headroom when
+    /// guarded), and a refusal leaves the authorization unchanged.
+    pub(super) fn grow_loading_slot_authorization(
+        &self,
+        variant: ModelVariant,
+        load_authorization: ResourceVector,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let slot = state
+            .residents
+            .get_mut(&variant)
+            .filter(|slot| slot.phase == ResidentPhase::Loading)
+            .ok_or_else(|| {
+                Error::ModelLoadError(format!(
+                    "model {variant} has no loading slot to grow its authorization"
+                ))
+            })?;
+        let current = slot.resource_lease.resources();
+        let grown = current.checked_add(load_authorization.positive_growth_over(current)?)?;
+        if grown != current {
+            slot.resource_lease.resize(grown)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn mark_slot_ready(&self, variant: ModelVariant) -> Result<()> {
         let model_instance_id = self.resident_instance_id(variant).ok_or_else(|| {

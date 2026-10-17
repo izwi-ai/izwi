@@ -288,12 +288,45 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
                 metadata.model_variant
             )));
         }
-        // Parakeet does not implement the long-form atomic graph: its
-        // retained predictor state and the scratch atomic workspace must be
-        // published as separate load-sealed publications (parakeet physical
-        // spec), which the single-publication load path does not support yet.
-        // The flag is therefore ignored here and the pipeline's atomic
-        // requirement fails closed at load with a capability error.
+        // The long-form (pipeline) graph runs one whole transcription as an
+        // atomic stage that leases invocation predictor tensors; it is
+        // published beside the retained sequence graphs (parakeet physical
+        // spec), so ordinary requests keep their retained route.
+        if streaming.asr_long_form {
+            let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
+            execution_profile.mode = ExecutionMode::Atomic;
+            execution_profile.prefill = PrefillMode::None;
+            execution_profile.incremental_decode = false;
+            execution_profile.cache_mode = CacheMode::None;
+            execution_profile.cache_namespace = None;
+            execution_profile.kv_dtype = "none".to_string();
+            execution_profile.concurrency = ConcurrencyClass::Exclusive;
+            execution_profile.max_batch_size = 1;
+            execution_profile.resolved_from_loaded_model = true;
+            let mut stage = StageDescriptor::from_execution_profile(
+                StageId::new(3),
+                "asr.long_form.atomic",
+                &execution_profile,
+                NativeBatchMode::None,
+            );
+            stage.selector = StageWorkSelector::Atomic;
+            stage.shape_policy = StageShapePolicy::Exact;
+            stage.output_visibility = output_visibility_for(
+                streaming.transport_output,
+                execution_profile.mode,
+                NativeBatchMode::None,
+            );
+            stage.validate()?;
+            return Ok(LoadedExecutionContract {
+                execution_group_id: self.execution_group_id,
+                model_instance_id: self.model_instance_id,
+                adapter_instance_id: self.adapter_instance_id(),
+                adapter_abi_revision: self.adapter_abi_revision(),
+                metadata,
+                execution_profile,
+                stages: Arc::from([stage]),
+            });
+        }
         let width = u64::try_from(self.max_batch_size)
             .map_err(|_| Error::Overloaded("Parakeet batch width exceeds u64".into()))?;
         let workspace_per_row =

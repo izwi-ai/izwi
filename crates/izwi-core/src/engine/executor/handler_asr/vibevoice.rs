@@ -30,7 +30,8 @@ pub(super) fn with_vibevoice_invocation_state<T>(
     run: impl FnOnce(&mut crate::kv::v2::InvocationWorkspaceLeaseSetV2) -> Result<T>,
 ) -> Result<T> {
     let mut leases = super::super::invocation_workspace_leases_for_atomic_scalar_row(request, scheduled)?;
-    let output = run(&mut leases)?;
+    let result = run(&mut leases);
+    let output = leases.fence_on_error(result)?;
     let completions = leases.release()?;
     if completions.len() != 3 {
         return Err(Error::InferenceError(

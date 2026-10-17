@@ -549,33 +549,23 @@ impl ModelLifecycleController {
                             )
                         })?,
                     )?;
-                    let retained_uses = contracts
-                        .iter()
-                        .map(|contract| {
-                            let graph = stage_graph_fingerprint(&contract.stages)?;
-                            if contract.execution_profile.mode
-                                != crate::engine::ExecutionMode::Sequence
-                            {
-                                return Err(Error::ModelLoadError(
-                                    "Parakeet retained graph has an incompatible execution mode"
-                                        .into(),
-                                ));
-                            }
-                            Ok((graph, RetainedStateUseV2::Inactive))
-                        })
-                        .collect::<Result<HashMap<_, _>>>()?;
-                    if physical_spec.invocation.is_some() {
-                        return Err(Error::ModelLoadError(
-                            "Parakeet sequence graph unexpectedly published invocation predictor state"
-                                .into(),
-                        ));
-                    }
-                    let publication = self.load_scratch_only_workspace_publication(
-                        &contracts,
-                        physical_spec.descriptor,
-                        Some(retained.into()),
-                        retained_uses,
-                    )?;
+                    let invocation_contract =
+                        physical_spec.invocation.as_ref().ok_or_else(|| {
+                            Error::ModelLoadError(
+                                "Parakeet long-form graph did not author invocation predictor state"
+                                    .into(),
+                            )
+                        })?;
+                    let publication = self
+                        .load_invocation_workspace_publication(
+                            model_instance_id,
+                            &contracts,
+                            physical_spec.descriptor,
+                            invocation_contract,
+                            Some(retained.into()),
+                            parakeet_retained_uses(&contracts)?,
+                        )
+                        .await?;
                     state_publications.insert(CapabilityKind::Asr, publication);
                 } else if publication_route
                     == LoadedAsrStatePublicationRoute::NemotronOffline

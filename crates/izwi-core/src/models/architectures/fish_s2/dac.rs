@@ -1448,7 +1448,10 @@ fn load_conv1d_weight(
         .checked_div(groups)
         .ok_or_else(|| Error::ConfigError("Fish S2 DAC invalid conv1d group count".to_string()))?;
     let weight = if vb.contains_tensor("weight") {
+        // Candle 0.11's im2col conv1d misreads a strided (for example a
+        // Fortran-ordered `.pth`) kernel; the weight-norm paths compute fresh.
         vb.get((out_channels, in_per_group, kernel_size), "weight")?
+            .contiguous()?
     } else if vb.contains_tensor("weight_g") && vb.contains_tensor("weight_v") {
         let weight_g = vb.get((out_channels, 1, 1), "weight_g")?;
         let weight_v = vb.get((out_channels, in_per_group, kernel_size), "weight_v")?;
@@ -2526,5 +2529,29 @@ mod tests {
         let audio = codec.decode_vq_codes(&codes).unwrap();
         assert_eq!(audio.len(), 3);
         assert!(audio.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// The plain-weight branch must not hand Candle a strided kernel, whatever
+    /// the VarBuilder backend (Candle's `.pth` reader returns Fortran views).
+    #[test]
+    fn plain_conv1d_from_fortran_pth_is_contiguous() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::shared::weights::pytorch::test_support::write_f32_state_dict;
+
+        let device = Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("izwi-fish-conv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conv.pth");
+        let oik = xorshift_tensor(&[6, 8, 3], 9, 0.05, &device).unwrap();
+        write_f32_state_dict(&path, "weight", &oik, true);
+        let vb = VarBuilder::from_pth(&path, DType::F32, &device).unwrap();
+        let conv = load_conv1d_weight(8, 6, 3, 1, Conv1dConfig::default(), vb).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(conv.weight().is_contiguous());
+        assert_eq!(
+            conv.weight().to_vec3::<f32>().unwrap(),
+            oik.to_vec3::<f32>().unwrap()
+        );
     }
 }

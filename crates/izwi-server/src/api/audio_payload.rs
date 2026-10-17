@@ -4,7 +4,8 @@ use axum::{
 };
 use base64::Engine;
 use izwi_core::audio::{
-    inspect_audio_bytes, inspect_audio_bytes_canonical, AudioInspection,
+    decode_and_inspect_audio_bytes_canonical, inspect_audio_bytes, inspect_audio_bytes_canonical,
+    AudioInspection,
 };
 use serde::Serialize;
 use tracing::info;
@@ -169,6 +170,32 @@ pub(crate) fn inspect_audio_payload_canonical_with_diagnostics(
     let inspection = inspect_audio_payload_canonical(payload)?;
     AudioIngestDiagnostics::from_payload_resampler(route, payload, &inspection, "fft_16k").emit();
     Ok(inspection)
+}
+
+/// Strictly decode `payload` to canonical 16 kHz mono samples on a blocking
+/// thread, for a route that keeps the samples (PIPE-14): the decode that
+/// validates the upload is the job's only decode. The payload is handed back.
+pub(crate) async fn decode_audio_payload_canonical_with_diagnostics(
+    route: &'static str,
+    payload: AudioPayload,
+) -> Result<(AudioPayload, Vec<f32>), ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let decoded = decode_and_inspect_audio_bytes_canonical(&payload.bytes).map_err(|err| {
+            ApiError::bad_request(format!(
+                "Invalid audio payload: failed to decode audio metadata: {err}"
+            ))
+        })?;
+        AudioIngestDiagnostics::from_payload_resampler(
+            route,
+            &payload,
+            &decoded.inspection,
+            "fft_16k",
+        )
+        .emit();
+        Ok((payload, decoded.mono_samples))
+    })
+    .await
+    .map_err(|err| ApiError::internal(format!("Audio decode task failed: {err}")))?
 }
 
 pub(crate) fn inspect_audio_payload_bytes(bytes: &[u8]) -> Result<AudioInspection, ApiError> {

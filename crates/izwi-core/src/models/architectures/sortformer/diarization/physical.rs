@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn zero_fifo_model_profile_omits_empty_tensor_components() {
         let cfg = super::super::resolve_streaming_config(
-            crate::catalog::ModelVariant::DiarStreamingSortformer4SpkV21,
+            super::super::SortformerStreamingProfile::Model,
             &super::super::SortformerModulesConfig::default(),
             512,
             4,

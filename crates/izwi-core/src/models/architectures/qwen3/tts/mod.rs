@@ -6275,4 +6275,46 @@ pub(crate) mod tests {
         );
         assert_eq!(raw_codec_token(19, 3, 151_936, 2048), 19);
     }
+
+    /// The MLX Base voice-clone checkpoints store the speaker encoder's conv
+    /// kernels OKI (same BF16 values as the dense Base checkpoints, which are
+    /// OIK). Loads only the encoders, on CPU, from the local model store and
+    /// requires the MLX encoder to reproduce the dense one's embedding.
+    #[test]
+    #[ignore = "needs local Qwen3-TTS-12Hz-{0.6B,1.7B}-Base{,-4bit} checkpoints"]
+    fn mlx_base_checkpoint_speaker_encoder_matches_the_dense_checkpoint() {
+        let models = dirs::data_dir()
+            .expect("data dir")
+            .join("izwi")
+            .join("models");
+        let embed = |name: &str| {
+            let model_dir = models.join(name);
+            let config: Qwen3TtsConfig = serde_json::from_str(
+                &std::fs::read_to_string(model_dir.join("config.json")).unwrap(),
+            )
+            .unwrap();
+            let encoder =
+                load_speaker_encoder(&config, &model_dir.join("model.safetensors"), &Device::Cpu)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .unwrap_or_else(|| panic!("{name} ships a speaker encoder"));
+            let mel_dim = encoder.config().mel_dim;
+            let mel = (0..64 * mel_dim)
+                .map(|index| (index * 37 % 101) as f32 / 50.0 - 1.0)
+                .collect::<Vec<_>>();
+            let mel = Tensor::from_vec(mel, (1, 64, mel_dim), &Device::Cpu).unwrap();
+            let embedding = encoder.forward(&mel).unwrap();
+            assert_eq!(embedding.dims(), &[1, config.talker_config.hidden_size]);
+            embedding.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        };
+        for size in ["0.6B", "1.7B"] {
+            let dense = embed(&format!("Qwen3-TTS-12Hz-{size}-Base"));
+            let mlx = embed(&format!("Qwen3-TTS-12Hz-{size}-Base-4bit"));
+            let error = crate::kernels::numeric_check::max_abs_diff(&mlx, &dense);
+            let scale = dense.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(
+                scale > 0.0 && error <= 1e-4 * scale,
+                "{size}: MLX speaker embedding differs from dense by {error} (scale {scale})"
+            );
+        }
+    }
 }

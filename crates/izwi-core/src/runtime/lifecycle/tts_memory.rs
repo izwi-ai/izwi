@@ -678,7 +678,10 @@ mod tests {
                 observed,
                 reserved: 0,
             };
-            assert!(super::super::reconciles_device_usage(variant));
+            assert!(super::super::reconciles_device_usage(
+                variant,
+                BackendKind::Metal
+            ));
             super::super::reconcile_observed_growth(
                 variant,
                 "weight load",

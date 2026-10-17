@@ -327,6 +327,7 @@ export function NewDiarizationModal({
                 audio_filename: uploadFilename,
                 model_id: selectedModel || undefined,
                 llm_model_id: pipelineLlmModelId || undefined,
+                generate_summary: true,
               }
             : {
                 audio_file: uploadedBlob,
@@ -335,6 +336,7 @@ export function NewDiarizationModal({
                 asr_model_id: pipelineAsrModelId || undefined,
                 aligner_model_id: pipelineAlignerModelId || undefined,
                 llm_model_id: pipelineLlmModelId || undefined,
+                generate_summary: true,
                 min_speakers: captureSettings.minSpeakers,
                 max_speakers: captureSettings.maxSpeakers,
                 min_speech_duration_ms: captureSettings.minSpeechMs,

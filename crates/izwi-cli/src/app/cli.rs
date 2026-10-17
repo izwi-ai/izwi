@@ -476,7 +476,7 @@ pub enum Commands {
         file: PathBuf,
 
         /// Diarization model to use
-        #[arg(short, long, default_value = "sortformer-4spk")]
+        #[arg(short, long, default_value = "diar_streaming_sortformer_4spk-v2.1")]
         model: String,
 
         /// Expected number of speakers (optional, auto-detect if not specified)
@@ -948,6 +948,29 @@ mod tests {
     fn bench_throughput_is_not_a_command() {
         assert!(Cli::try_parse_from(["izwi", "bench", "throughput"]).is_err());
         assert!(Cli::try_parse_from(["izwi", "bench", "chat"]).is_ok());
+    }
+
+    /// PIPE-3: the server validates the diarization and ASR ids strictly, so
+    /// the defaults `izwi diarize` sends must resolve under those rules.
+    #[test]
+    fn diarize_defaults_are_ids_the_server_accepts() {
+        let cli = Cli::try_parse_from(["izwi", "diarize", "call.wav"])
+            .expect("diarize with defaults parses");
+        match cli.command {
+            Commands::Diarize {
+                model, asr_model, ..
+            } => {
+                assert_eq!(
+                    izwi_core::resolve_diarization_model_variant_strict(&model),
+                    Ok(izwi_core::ModelVariant::DiarStreamingSortformer4SpkV21)
+                );
+                assert!(
+                    izwi_core::resolve_diarization_asr_model_variant(Some(&asr_model)).is_ok(),
+                    "{asr_model}"
+                );
+            }
+            _ => panic!("expected diarize command"),
+        }
     }
 
     #[test]

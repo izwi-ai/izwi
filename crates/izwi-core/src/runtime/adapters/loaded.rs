@@ -191,6 +191,17 @@ const fn scalar_row_policy_without_concurrency_evidence() -> (usize, PhysicalLau
     (1, launch_policy_without_concurrency_evidence())
 }
 
+/// Whether a contract can run one whole job as a blocking stage: the
+/// long-form ASR graph that the diarization pipeline requires.
+pub(crate) fn contract_supports_atomic_blocking(contract: &LoadedExecutionContract) -> bool {
+    contract.stages.iter().any(|stage| {
+        matches!(
+            stage.selector,
+            StageWorkSelector::Atomic | StageWorkSelector::Any
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedExecutionContract {
     pub(crate) execution_group_id: ExecutionGroupId,

@@ -286,6 +286,7 @@ impl RuntimeService {
             step_driver_task: Mutex::new(None),
             step_driver_wakeup: Arc::new(Notify::new()),
             step_driver_started: AtomicBool::new(false),
+            diarization_audio_decodes: Arc::new(AtomicU64::new(0)),
             loaded_tts_variant,
             max_loaded_models,
             model_lifecycle,

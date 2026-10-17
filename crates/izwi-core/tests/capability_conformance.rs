@@ -196,8 +196,10 @@ fn model_owned_qwen_cache_and_materializing_pages_are_gone() {
             "paged.rs must not reintroduce the materializing `{legacy}` path"
         );
     }
+    // The aligner scores only its timestamp rows (QFA-9) through the
+    // row-gathering variant of the same cache-free forward.
     assert!(
-        qwen_asr.contains(".forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())"),
+        qwen_asr.contains(".forward_stateless_rows_with_embeds("),
         "cacheless forced-alignment work must not acquire a model-owned cache"
     );
 }

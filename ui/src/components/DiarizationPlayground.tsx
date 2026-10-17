@@ -311,6 +311,7 @@ export function DiarizationPlayground({
           asr_model_id: pipelineAsrModelId || undefined,
           aligner_model_id: pipelineAlignerModelId || undefined,
           llm_model_id: pipelineLlmModelId || undefined,
+          generate_summary: true,
           min_speakers: captureSettings.minSpeakers,
           max_speakers: captureSettings.maxSpeakers,
           min_speech_duration_ms: captureSettings.minSpeechMs,

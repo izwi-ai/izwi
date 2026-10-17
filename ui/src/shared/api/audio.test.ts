@@ -935,6 +935,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
           aligner_model: undefined,
           llm_model: undefined,
           enable_llm_refinement: true,
+          generate_summary: false,
           min_speakers: undefined,
           max_speakers: undefined,
           min_speech_duration_ms: undefined,
@@ -963,6 +964,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
         aligner_model_id: "Qwen3-ForcedAligner-0.6B",
         min_speakers: 1,
         max_speakers: 4,
+        generate_summary: true,
       },
       { onUploadProgress },
     );
@@ -984,6 +986,7 @@ describe("AudioApiClient.updateDiarizationRecord", () => {
     expect(form.get("asr_model")).toBe("Whisper-Large-v3-Turbo");
     expect(form.get("aligner_model")).toBe("Qwen3-ForcedAligner-0.6B");
     expect(form.get("enable_llm_refinement")).toBe("true");
+    expect(form.get("generate_summary")).toBe("true");
 
     xhr.emitUploadProgress(5, 10);
     xhr.respond(

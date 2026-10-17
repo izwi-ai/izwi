@@ -1383,8 +1383,12 @@ fn upsample_nearest_2x_1d(x: &Tensor) -> Result<Tensor> {
 }
 
 pub(crate) fn load_plain_conv1d(vb: VarBuilder, cfg: Conv1dConfig) -> Result<Conv1d> {
+    // Candle's `.pth` reader returns a Fortran-ordered tensor as a strided
+    // view, and Candle 0.11's im2col conv1d misreads a strided kernel.
     let w = vb
         .get_unchecked_dtype("weight", DType::F32)
+        .map_err(Error::from)?
+        .contiguous()
         .map_err(Error::from)?;
     let b = if vb.contains_tensor("bias") {
         Some(
@@ -1874,5 +1878,29 @@ mod tests {
         for (got, expected) in fused.iter().zip(reference.iter()) {
             assert!((got - expected).abs() < 1e-5, "{got} != {expected}");
         }
+    }
+
+    /// `noise_convs`, `F0_proj` and `N_proj` load plain kernels through
+    /// Candle's `.pth` reader, which returns a Fortran tensor strided.
+    #[test]
+    fn plain_conv1d_from_fortran_pth_is_contiguous() {
+        use crate::kernels::numeric_check::xorshift_tensor;
+        use crate::models::shared::weights::pytorch::test_support::write_f32_state_dict;
+
+        let device = candle_core::Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("izwi-kokoro-conv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conv.pth");
+        let oik = xorshift_tensor(&[6, 8, 3], 9, 0.05, &device).unwrap();
+        write_f32_state_dict(&path, "weight", &oik, true);
+        let vb = VarBuilder::from_pth(&path, DType::F32, &device).unwrap();
+        let conv = load_plain_conv1d(vb, Conv1dConfig::default()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert!(conv.weight().is_contiguous());
+        assert_eq!(
+            conv.weight().to_vec3::<f32>().unwrap(),
+            oik.to_vec3::<f32>().unwrap()
+        );
     }
 }

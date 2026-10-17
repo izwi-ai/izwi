@@ -46,6 +46,61 @@ pub struct JobSpec {
     pub resources: ResourceEstimate,
 }
 
+/// A caller's request to stop an admitted job. Once cancelled, the job's next
+/// stage fails with [`Error::Cancelled`] before it runs, so a long pipeline
+/// stops at its next stage boundary (between ASR chunks and aligner windows)
+/// and releases its leases instead of finishing work nobody will read.
+#[derive(Debug, Clone, Default)]
+pub struct JobCancellation(Arc<AtomicBool>);
+
+impl JobCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Retry `attempt` while it is refused memory that admitted work holds
+/// (P1V-2, ADM-8): back off from 250 ms to 5 s between attempts until `wait`
+/// has passed, then fail with the last refusal and how long it waited. Any
+/// other outcome returns at once, so a cancel or a request too large for the
+/// machine is not delayed.
+pub(crate) async fn wait_for_held_capacity<T, F, Fut>(wait: Duration, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    const FIRST_BACKOFF: Duration = Duration::from_millis(250);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        let error = match attempt().await {
+            Err(error) if crate::engine::resources::is_held_capacity_refusal(&error) => error,
+            result => return result,
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            let Error::Overloaded(message) = error else {
+                return Err(error);
+            };
+            return Err(Error::Overloaded(format!(
+                "{message}; still refused after waiting {:.0} s for memory to free",
+                wait.as_secs_f64()
+            )));
+        }
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PreparationCancellation {
     state: Arc<AtomicU8>,
@@ -163,6 +218,9 @@ pub struct CoordinatorSnapshot {
     pub admitted_total: u64,
     pub rejected_total: u64,
     pub expired_total: u64,
+    /// Stages of host-resident models an accelerator coordinator ran on its
+    /// host-model lane instead of the device permit (D4: Sortformer on Metal).
+    pub host_model_stages_total: u64,
     pub draining: bool,
     pub poisoned: bool,
 }
@@ -555,6 +613,16 @@ impl Drop for PhysicalExecutionLease {
     }
 }
 
+/// Waits for device work that a failed loaded stage may still have queued.
+#[derive(Clone)]
+struct StageDeviceFence(Arc<dyn Fn() -> Result<()> + Send + Sync>);
+
+impl std::fmt::Debug for StageDeviceFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StageDeviceFence")
+    }
+}
+
 #[derive(Debug)]
 pub struct InferenceCoordinator {
     execution_group_id: ExecutionGroupId,
@@ -562,6 +630,11 @@ pub struct InferenceCoordinator {
     backend: BackendKind,
     jobs: Arc<Semaphore>,
     host_work: Arc<Semaphore>,
+    /// One stage at a time of a model whose weights and compute live in host
+    /// memory while this coordinator owns an accelerator. Separate from
+    /// `host_work`, so a long model stage does not queue request preparation.
+    host_models: Arc<Semaphore>,
+    host_model_stages_total: AtomicU64,
     execution: PhysicalExecutionAdmission,
     resources: Arc<ResourceAuthority>,
     /// Runs direct inference stages; `None` only for device-less test
@@ -576,6 +649,8 @@ pub struct InferenceCoordinator {
     rejected_total: AtomicU64,
     expired_total: AtomicU64,
     draining: AtomicBool,
+    /// Present for a Metal or CUDA device; CPU work is complete on return.
+    failed_stage_fence: Option<StageDeviceFence>,
 }
 
 impl InferenceCoordinator {
@@ -602,6 +677,11 @@ impl InferenceCoordinator {
     ) -> Result<Self> {
         let location = validate_device_identity(backend, &device)?;
         let device_thread = DeviceThread::for_device(&device.device)?;
+        let failed_stage_fence =
+            matches!(backend, BackendKind::Metal | BackendKind::Cuda).then(|| {
+                let device = device.device.clone();
+                StageDeviceFence(Arc::new(move || device.synchronize().map_err(Error::from)))
+            });
         let provider = Arc::new(DeviceCapacityProvider::new(backend, device)?);
         let resources = shared_resource_authority(location, provider)?;
         let mut coordinator = Self::with_resource_authority(
@@ -611,6 +691,7 @@ impl InferenceCoordinator {
             resources,
         );
         coordinator.device_thread = Some(device_thread);
+        coordinator.failed_stage_fence = failed_stage_fence;
         Ok(coordinator)
     }
 
@@ -635,6 +716,8 @@ impl InferenceCoordinator {
             backend,
             jobs: Arc::new(Semaphore::new(max_queued_jobs.max(capacity).max(1))),
             host_work: Arc::new(Semaphore::new(capacity)),
+            host_models: Arc::new(Semaphore::new(1)),
+            host_model_stages_total: AtomicU64::new(0),
             execution: PhysicalExecutionAdmission::with_idle(
                 Some(execution_group_id),
                 capacity,
@@ -651,6 +734,7 @@ impl InferenceCoordinator {
             rejected_total: AtomicU64::new(0),
             expired_total: AtomicU64::new(0),
             draining: AtomicBool::new(false),
+            failed_stage_fence: None,
         }
     }
 
@@ -727,6 +811,7 @@ impl InferenceCoordinator {
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
             expired_total: self.expired_total.load(Ordering::Relaxed),
+            host_model_stages_total: self.host_model_stages_total.load(Ordering::Relaxed),
             draining: self.draining.load(Ordering::Acquire),
             // The shared resource authority poisons alongside the execution
             // guard on backend-fatal errors (Metal command-buffer OOM at a
@@ -736,10 +821,18 @@ impl InferenceCoordinator {
         }
     }
 
-    /// Latch `error` as a fatal device fault when it is one, exactly as
-    /// device execution does. Returns whether the runtime is now poisoned.
-    pub(crate) fn latch_fatal_device_fault(&self, error: &Error) -> bool {
-        latch_fatal_device_fault(error, &self.execution, &self.resources)
+    /// Latch `error` as a fatal device fault when it is one, with the
+    /// classification device execution uses, on this runtime's execution
+    /// admission only: the resource authority is shared by every runtime in
+    /// the process, and an injected fault must not fail the others. Returns
+    /// whether the runtime is now poisoned.
+    pub(crate) fn latch_fatal_device_fault_for_test(&self, error: &Error) -> bool {
+        let Some(fault) = fatal_device_fault(error) else {
+            return false;
+        };
+        self.execution
+            .poison(format!("fatal device fault ({fault}) during inference"));
+        true
     }
 
     /// Execution admission poison is permanent for this process; a resource
@@ -811,7 +904,7 @@ impl InferenceCoordinator {
                     .to_string(),
             ));
         }
-        let JobLease { _inner, spec } = preparation;
+        let JobLease { _inner, spec, .. } = preparation;
         let inner = Arc::try_unwrap(_inner).map_err(|_| {
             Error::InferenceError("preparation admission became shared during handoff".to_string())
         })?;
@@ -835,7 +928,11 @@ impl InferenceCoordinator {
             coordinator,
             admitted_at,
             preparation_spec: spec,
-            reservation: Some(reservation),
+            reservation: Some(
+                reservation
+                    .into_inner()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            ),
         })
     }
 
@@ -927,12 +1024,13 @@ impl InferenceCoordinator {
                 coordinator: self.clone(),
                 admitted_at: bridge.admitted_at,
                 _permit: permit,
-                reservation,
+                reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
                     coordinator: self.clone(),
                 },
             }),
             spec: execution,
+            cancellation: None,
         })
     }
 
@@ -987,12 +1085,13 @@ impl InferenceCoordinator {
                 coordinator: self.clone(),
                 admitted_at: Instant::now(),
                 _permit: permit,
-                reservation,
+                reservation: Mutex::new(reservation),
                 active: ActiveJobGuard {
                     coordinator: self.clone(),
                 },
             }),
             spec,
+            cancellation: None,
         })
     }
 
@@ -1028,6 +1127,29 @@ impl InferenceCoordinator {
         deadline: Option<Instant>,
     ) -> Result<PhysicalExecutionLease> {
         self.acquire_execution_units(1, deadline).await
+    }
+
+    /// Reserve one pipeline stage's working set beside its job, priced by the
+    /// model the stage runs (not by the job's worst case). The claim is a
+    /// request claim, so the live-memory check applies, and it is released
+    /// when the returned lease drops at the end of the stage.
+    pub(crate) fn reserve_stage_workspace(
+        &self,
+        job: &JobLease,
+        stage: &str,
+        workspace: JobResourceObservation,
+    ) -> Result<StageWorkspaceLease> {
+        let owner = ReservationOwner::new(
+            ReservationClass::Request,
+            format!("{}:{stage}", job.spec.request_id),
+        );
+        let lease = self
+            .resources
+            .reserve(owner, observed_resources(workspace, self.backend)?)?;
+        Ok(StageWorkspaceLease {
+            backend: self.backend,
+            lease,
+        })
     }
 
     /// Reserve scratch memory for one physical tensor dispatch. This does not
@@ -1243,6 +1365,61 @@ impl InferenceCoordinator {
             .await
     }
 
+    /// Execute one scalar stage of a loaded model whose weights and compute
+    /// live in host memory (D4: Sortformer runs on CPU on Metal). On an
+    /// accelerator coordinator the stage issues no device work, so it takes
+    /// the host-model lane instead of the device execution permit, and
+    /// interactive device work is not queued behind it. On a CPU coordinator
+    /// the host is the device: the stage takes the execution permit as any
+    /// loaded stage does. Cancellation, the deadline and the job lease apply
+    /// either way.
+    pub(crate) async fn run_loaded_host_model_stage<T, F>(
+        self: &Arc<Self>,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        work: WorkUnit,
+        operation: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        if self.backend == BackendKind::Cpu {
+            return self
+                .run_loaded_blocking_stage(job, contract, work, operation)
+                .await;
+        }
+        let binding = self.validate_loaded_execution_contract(&contract)?;
+        let stage = binding.stage_for_work(&work)?;
+        if stage.domain != ExecutionDomain::ExecutionGroup
+            || stage.batch_mode != NativeBatchMode::None
+        {
+            return Err(Error::InvalidInput(
+                "a host-model stage must be a scalar execution-group stage".to_string(),
+            ));
+        }
+        let acquire = self.host_models.clone().acquire_owned();
+        let permit = match job.spec.deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), acquire)
+                .await
+                .map_err(|_| {
+                    self.expired_total.fetch_add(1, Ordering::Relaxed);
+                    Error::Timeout(job.spec.request_id.clone())
+                })?
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+            None => acquire
+                .await
+                .map_err(|_| Error::Overloaded("coordinator closed".to_string()))?,
+        };
+        self.host_model_stages_total.fetch_add(1, Ordering::Relaxed);
+        self.run_blocking_task(job, permit, "host model", move || {
+            let _contract = contract;
+            let _work = work;
+            operation()
+        })
+        .await
+    }
+
     /// Execute one independently scheduled scalar row through an exact loaded
     /// adapter. `max_batch_size` bounds concurrent rows for scalar adapters; it
     /// does not imply that this call receives a native tensor batch.
@@ -1272,6 +1449,7 @@ impl InferenceCoordinator {
             ));
         }
         let launch_policy = stage.physical_launch_policy;
+        let failed_stage_fence = self.failed_stage_fence.clone();
 
         self.run_blocking_stage_inner_with_policy(
             job,
@@ -1281,7 +1459,19 @@ impl InferenceCoordinator {
             move || {
                 let _contract = contract;
                 let _work = work;
-                operation()
+                let result = operation();
+                if let (Err(error), Some(fence)) = (&result, &failed_stage_fence) {
+                    // A failed stage may have queued device work; wait for it
+                    // while this task still holds the execution permit and job.
+                    if let Err(fence_error) = (fence.0)() {
+                        tracing::warn!(
+                            error = %fence_error,
+                            operation_error = %error,
+                            "failed to fence the device after a failed loaded stage"
+                        );
+                    }
+                }
+                result
             },
         )
         .await
@@ -1710,7 +1900,10 @@ impl InferenceCoordinator {
                 let mut leases = capability
                     .state
                     .lease_complete_invocation_workspace_set(stage_id)?;
-                let output = operation(&mut leases)?;
+                // A failed operation may have queued device work; fence it
+                // while this task still holds the execution permit and the job.
+                let result = operation(&mut leases);
+                let output = leases.fence_on_error(result)?;
                 let _completions = leases.release()?;
                 Ok(output)
             },
@@ -1763,7 +1956,10 @@ impl InferenceCoordinator {
                 let mut leases = capability
                     .state
                     .lease_complete_invocation_paged_set(stage_id)?;
-                let output = operation(&mut leases)?;
+                // A failed operation may have queued device work; fence it
+                // while this task still holds the execution permit and the job.
+                let result = operation(&mut leases);
+                let output = leases.fence_on_error(result)?;
                 let _completions = leases.release()?;
                 Ok(output)
             },
@@ -1831,6 +2027,15 @@ impl InferenceCoordinator {
         F: FnOnce() -> Result<T> + Send + 'static,
         G: Send + 'static,
     {
+        // A cancelled job runs no further stage: check before waiting on the
+        // blocking pool and again once the stage holds its permits.
+        job.ensure_not_cancelled()?;
+        let stage_job = job.clone();
+        let operation = move || {
+            stage_job.ensure_not_cancelled()?;
+            drop(stage_job);
+            operation()
+        };
         self.run_blocking_task_with_deadline(job, job.spec.deadline, guard, task_kind, operation)
             .await
     }
@@ -2200,6 +2405,7 @@ fn shared_resource_authority(
 pub struct JobLease {
     _inner: Arc<JobLeaseInner>,
     pub spec: JobSpec,
+    cancellation: Option<JobCancellation>,
 }
 
 impl JobLease {
@@ -2208,14 +2414,35 @@ impl JobLease {
         self._inner.admitted_at
     }
 
-    /// Reconcile observed physical usage against this job's immutable
-    /// authorization. Future authorized growth remains pending. Observations
-    /// are monotonic; the runtime restores pending claims before dropping or
-    /// replacing temporary physical allocations.
+    /// Stop this job's stages once `cancellation` fires.
+    pub(crate) fn with_cancellation(mut self, cancellation: JobCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Fails with [`Error::Cancelled`] once the job's caller has cancelled it.
+    pub(crate) fn ensure_not_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(JobCancellation::is_cancelled)
+        {
+            let request_id: String = self.spec.request_id.chars().take(128).collect();
+            return Err(Error::Cancelled(format!(
+                "job {request_id:?} was cancelled"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reconcile observed physical usage against this job's authorization,
+    /// which is fixed at admission and can only shrink. Future authorized
+    /// growth remains pending. Observations are monotonic; the runtime
+    /// restores pending claims before dropping or replacing temporary
+    /// physical allocations.
     pub fn record_materialized_usage(&self, observation: JobResourceObservation) -> Result<()> {
         let resources = observed_resources(observation, self._inner.coordinator.backend)?;
-        self._inner
-            .reservation
+        self.reservation()
             .record_materialized_usage(resources)
             .map_err(|error| match error {
                 Error::InferenceError(message) => {
@@ -2239,9 +2466,51 @@ impl JobLease {
         observation: JobResourceObservation,
     ) -> Result<()> {
         let resources = observed_resources(observation, self._inner.coordinator.backend)?;
+        self.reservation().prepare_materialized_release(resources)
+    }
+
+    /// Give back the part of this job's authorization it can no longer use
+    /// (a decode allowance after decode). It never grows the job and never
+    /// drops below its materialized usage.
+    pub(crate) fn shrink_authorization(&self, resources: ResourceVector) -> Result<()> {
+        let resources = effective_resources(resources, self._inner.coordinator.backend)?;
+        self.reservation().shrink(resources)
+    }
+
+    fn reservation(&self) -> std::sync::MutexGuard<'_, ResourceLease> {
         self._inner
             .reservation
-            .prepare_materialized_release(resources)
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// One pipeline stage's working-set reservation. Dropping it releases the
+/// claim, so nothing stage-sized outlives the stage.
+#[derive(Debug)]
+pub(crate) struct StageWorkspaceLease {
+    backend: BackendKind,
+    lease: ResourceLease,
+}
+
+impl StageWorkspaceLease {
+    /// Record the stage's allocation once it exists (see
+    /// [`JobLease::record_materialized_usage`]).
+    pub(crate) fn record_materialized_usage(
+        &self,
+        observation: JobResourceObservation,
+    ) -> Result<()> {
+        self.lease
+            .record_materialized_usage(observed_resources(observation, self.backend)?)
+    }
+
+    /// Restore the pending claim before the stage frees its allocation.
+    pub(crate) fn prepare_materialized_release(
+        &self,
+        observation: JobResourceObservation,
+    ) -> Result<()> {
+        self.lease
+            .prepare_materialized_release(observed_resources(observation, self.backend)?)
     }
 }
 
@@ -2271,7 +2540,8 @@ struct JobLeaseInner {
     /// handoff keeps the original admission.
     admitted_at: Instant,
     _permit: OwnedSemaphorePermit,
-    reservation: ResourceLease,
+    // Locked only to shrink the authorization; observations take it briefly.
+    reservation: Mutex<ResourceLease>,
     active: ActiveJobGuard,
 }
 
@@ -5290,6 +5560,196 @@ Pages free: 10.\n";
         assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
+    /// A Kokoro TTS contract bound to `coordinator`'s execution group, with
+    /// one typed invocation tensor domain published through a fence probe
+    /// that samples the coordinator's active executions at each fence.
+    fn fence_probe_invocation_binding(
+        coordinator: &Arc<InferenceCoordinator>,
+    ) -> (
+        LoadedExecutionContract,
+        crate::runtime::adapters::LoadedCapabilityBinding,
+        Arc<crate::kv::v2::fence_probe::FenceProbe>,
+    ) {
+        let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 2).unwrap();
+        let bundle = LoadedModelBundle::bind(
+            &adapters,
+            coordinator.execution_group_id(),
+            ModelInstanceId::new(71),
+            ModelVariant::Kokoro82M,
+            BackendKind::Cpu,
+        )
+        .unwrap();
+        // Keep only Kokoro's scalar atomic stage: typed invocation state needs
+        // an all-atomic, unbatched graph.
+        let mut contract = bundle.contract(CapabilityKind::Tts, false).unwrap();
+        let mut scalar = contract
+            .stages
+            .iter()
+            .find(|stage| stage.batch_mode == NativeBatchMode::None)
+            .cloned()
+            .expect("Kokoro scalar stage");
+        scalar.selector = crate::engine::StageWorkSelector::Atomic;
+        contract.stages = Arc::from([scalar]);
+        let execution = contract.adapter_binding().unwrap();
+        let (state, probe) = crate::kv::v2::fence_probe::fence_probe_state_runtime(&execution, 1);
+        let observed = Arc::downgrade(coordinator);
+        *probe.observer.lock().unwrap() = Some(Box::new(move || {
+            observed
+                .upgrade()
+                .map_or(0, |coordinator| coordinator.snapshot().active_executions)
+        }));
+        let capability = crate::runtime::adapters::LoadedCapabilityBinding { execution, state };
+        (contract, capability, probe)
+    }
+
+    #[tokio::test]
+    async fn failed_invocation_stage_fences_the_device_before_releasing_its_permit() {
+        for fail_fence in [false, true] {
+            let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
+            let job = coordinator.admit(job("fenced-invocation")).await.unwrap();
+            let (contract, capability, probe) = fence_probe_invocation_binding(&coordinator);
+            probe.fail_fence.store(fail_fence, Ordering::Release);
+
+            let error = coordinator
+                .run_loaded_blocking_stage_with_invocation_workspace(
+                    &job,
+                    contract,
+                    capability,
+                    WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    move |_leases| -> Result<()> {
+                        Err(Error::InvalidInput("enqueued work then failed".to_string()))
+                    },
+                )
+                .await
+                .expect_err("the operation error must propagate");
+
+            assert!(
+                matches!(&error, Error::InvalidInput(message) if message == "enqueued work then failed"),
+                "the original operation error must win over the fence: {error:?}"
+            );
+            assert_eq!(probe.fences.load(Ordering::Acquire), 1);
+            assert_eq!(
+                probe.observed_during_fence.load(Ordering::Acquire),
+                1,
+                "the fence must run while the stage still holds its execution permit"
+            );
+            assert_eq!(probe.aborts.load(Ordering::Acquire), 1);
+            assert_eq!(coordinator.snapshot().active_executions, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_loaded_stage_fences_the_device_before_releasing_its_permit() {
+        // CPU work is complete on return, so a CPU coordinator has no fence.
+        let cpu = InferenceCoordinator::new_with_device(
+            BackendKind::Cpu,
+            crate::backends::DeviceProfile::cpu(),
+            1,
+            4,
+        )
+        .unwrap();
+        assert!(cpu.failed_stage_fence.is_none());
+
+        for (fail_operation, fail_fence) in [(false, false), (true, false), (true, true)] {
+            let observed = Arc::new(OnceLock::<Weak<InferenceCoordinator>>::new());
+            let fences = Arc::new(AtomicUsize::new(0));
+            let active_during_fence = Arc::new(AtomicUsize::new(usize::MAX));
+            let mut coordinator = InferenceCoordinator::new(BackendKind::Cpu, 2, 4);
+            coordinator.failed_stage_fence = Some(StageDeviceFence(Arc::new({
+                let observed = observed.clone();
+                let fences = fences.clone();
+                let active_during_fence = active_during_fence.clone();
+                move || {
+                    let active = observed
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .map_or(0, |coordinator| coordinator.snapshot().active_executions);
+                    active_during_fence.store(active, Ordering::Release);
+                    fences.fetch_add(1, Ordering::AcqRel);
+                    if fail_fence {
+                        return Err(Error::InferenceError("injected fence failure".into()));
+                    }
+                    Ok(())
+                }
+            })));
+            let coordinator = Arc::new(coordinator);
+            observed.set(Arc::downgrade(&coordinator)).unwrap();
+            let job = coordinator.admit(job("fenced-loaded-stage")).await.unwrap();
+            let adapters = RuntimeAdapterRegistry::built_in_with_execution_limits(1, 4).unwrap();
+            let contract = LoadedModelBundle::bind(
+                &adapters,
+                coordinator.execution_group_id(),
+                crate::engine::ModelInstanceId::new(1),
+                ModelVariant::Kokoro82M,
+                BackendKind::Cpu,
+            )
+            .unwrap()
+            .contract(CapabilityKind::StreamingTts, false)
+            .unwrap();
+
+            let result = coordinator
+                .run_loaded_blocking_stage(
+                    &job,
+                    contract,
+                    WorkUnit::AtomicJob {
+                        kind: "tts".to_string(),
+                    },
+                    move || -> Result<()> {
+                        if fail_operation {
+                            return Err(Error::InvalidInput("enqueued work then failed".into()));
+                        }
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if fail_operation {
+                let error = result.expect_err("the operation error must propagate");
+                assert!(
+                    matches!(&error, Error::InvalidInput(message)
+                        if message == "enqueued work then failed"),
+                    "the original operation error must win over the fence: {error:?}"
+                );
+                assert_eq!(fences.load(Ordering::Acquire), 1);
+                assert_eq!(
+                    active_during_fence.load(Ordering::Acquire),
+                    1,
+                    "the fence must run while the stage still holds its execution permit"
+                );
+            } else {
+                result.expect("a successful stage needs no fence");
+                assert_eq!(fences.load(Ordering::Acquire), 0);
+            }
+            assert_eq!(coordinator.snapshot().active_executions, 0);
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_coordinator_fences_its_own_device_after_a_failed_loaded_stage() {
+        let Some((_device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_coordinator_fences_its_own_device_after_a_failed_loaded_stage",
+        ) else {
+            return;
+        };
+        let profile = crate::backends::DeviceSelector::detect_for_preference(
+            crate::backends::BackendPreference::Metal,
+        )
+        .expect("device profile");
+        if profile.kind != DeviceKind::Metal {
+            return;
+        }
+        let coordinator =
+            InferenceCoordinator::new_with_device(BackendKind::Metal, profile, 1, 4).unwrap();
+        let fence = coordinator
+            .failed_stage_fence
+            .as_ref()
+            .expect("a Metal coordinator must fence failed stages");
+        (fence.0)().expect("synchronizing an idle Metal device succeeds");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_loaded_stage_and_engine_dispatch_share_physical_capacity() {
         let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 2, 4));
@@ -5667,6 +6127,165 @@ Pages free: 10.\n";
         host.await.unwrap().unwrap();
         drop((host_job, device_job));
         assert_eq!(coordinator.snapshot().active_jobs, 0);
+    }
+
+    /// P1V-2: a stage reservation refused memory another job holds waits and
+    /// succeeds once that job gives it back. It fails, saying how long it
+    /// waited, only when the wait runs out, and other errors are not retried.
+    #[tokio::test]
+    async fn held_capacity_refusals_wait_for_memory_to_free() {
+        let provider = cuda_provider(1_000, 1_000);
+        let authority = Arc::new(ResourceAuthority::new(provider));
+        let coordinator = Arc::new(InferenceCoordinator::with_resource_authority(
+            BackendKind::Cuda,
+            1,
+            4,
+            authority.clone(),
+        ));
+        let mut spec = job("waits-for-capacity");
+        spec.resources = cuda_resources(100, 0);
+        let job = coordinator.admit(spec).await.unwrap();
+        let held = authority
+            .reserve(
+                ReservationOwner::new(ReservationClass::Request, "other-job"),
+                cuda_resources(800, 0),
+            )
+            .unwrap();
+        let workspace = JobResourceObservation::host(500);
+        let reserve = || coordinator.reserve_stage_workspace(&job, "stage", workspace);
+        let refusal = reserve().unwrap_err();
+        assert!(
+            crate::engine::resources::is_held_capacity_refusal(&refusal),
+            "{refusal}"
+        );
+
+        let exhausted = wait_for_held_capacity(Duration::ZERO, || async { reserve() }).await;
+        assert!(
+            matches!(&exhausted, Err(Error::Overloaded(message))
+                if message.contains("still refused after waiting")),
+            "{exhausted:?}"
+        );
+        let attempts = AtomicUsize::new(0);
+        let cancelled = wait_for_held_capacity(Duration::from_secs(60), || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(Error::Cancelled("cancelled".to_string())) }
+        })
+        .await;
+        assert!(matches!(cancelled, Err(Error::Cancelled(_))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let job = job.clone();
+            let attempts = attempts.clone();
+            async move {
+                wait_for_held_capacity(Duration::from_secs(60), || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let lease = coordinator.reserve_stage_workspace(&job, "stage", workspace);
+                    async move { lease }
+                })
+                .await
+                .map(drop)
+            }
+        });
+        // Free the memory only once the waiter has been refused.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while attempts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(30), waiter)
+            .await
+            .expect("the waiter succeeds once memory frees")
+            .unwrap()
+            .unwrap();
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// PIPE-7: a cancelled job runs no further stage. The stage after the
+    /// cancel never runs, neither does one that was waiting for the device
+    /// when the cancel arrived, and the job's leases are released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_job_runs_no_further_stage() {
+        let coordinator = Arc::new(InferenceCoordinator::new(BackendKind::Cpu, 1, 4));
+        let cancellation = JobCancellation::new();
+        let pipeline = coordinator
+            .admit(job("cancelled-pipeline"))
+            .await
+            .unwrap()
+            .with_cancellation(cancellation.clone());
+        let stages = Arc::new(AtomicUsize::new(0));
+        let stage = |stages: &Arc<AtomicUsize>| {
+            let stages = stages.clone();
+            move || {
+                stages.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        coordinator
+            .run_host_blocking_stage(&pipeline, stage(&stages))
+            .await
+            .unwrap();
+        coordinator
+            .run_blocking_stage(&pipeline, stage(&stages))
+            .await
+            .unwrap();
+        assert_eq!(stages.load(Ordering::SeqCst), 2);
+
+        // Another job holds the only device permit, so the pipeline's next
+        // chunk waits for it while the cancel arrives.
+        let holder = coordinator.admit(job("device-holder")).await.unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let task_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let held = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let holder = holder.clone();
+            async move {
+                coordinator
+                    .run_blocking_stage(&holder, move || {
+                        let _ = started_tx.send(());
+                        let (lock, wake) = &*task_release;
+                        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+                        while !*released {
+                            released = wake
+                                .wait(released)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        started_rx.await.unwrap();
+        let waiting = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let pipeline = pipeline.clone();
+            let next_chunk = stage(&stages);
+            async move { coordinator.run_blocking_stage(&pipeline, next_chunk).await }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        {
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+            wake.notify_all();
+        }
+        held.await.unwrap().unwrap();
+        assert!(matches!(waiting.await.unwrap(), Err(Error::Cancelled(_))));
+        let later = coordinator
+            .run_host_blocking_stage(&pipeline, stage(&stages))
+            .await;
+        assert!(matches!(later, Err(Error::Cancelled(_))), "{later:?}");
+        assert_eq!(stages.load(Ordering::SeqCst), 2);
+
+        drop((pipeline, holder));
+        assert_eq!(coordinator.snapshot().active_jobs, 0);
+        assert_eq!(coordinator.snapshot().active_executions, 0);
     }
 
     #[test]

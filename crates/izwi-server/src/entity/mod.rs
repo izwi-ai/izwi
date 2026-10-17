@@ -195,11 +195,13 @@ pub mod transcription_records {
         pub speaker_turns_json: String,
         pub saa_status: String,
         pub saa_warnings_json: String,
+        pub alignment_warnings_json: String,
         pub summary_status: String,
         pub summary_model_id: Option<String>,
         pub summary_text: Option<String>,
         pub summary_error: Option<String>,
         pub summary_updated_at: Option<i64>,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }
@@ -233,6 +235,9 @@ pub mod diarization_records {
         pub asr_text: String,
         pub raw_transcript: String,
         pub transcript: String,
+        pub warnings_json: String,
+        pub language: Option<String>,
+        pub vad_gate: Option<i64>,
         pub summary_status: String,
         pub summary_model_id: Option<String>,
         pub summary_text: Option<String>,
@@ -245,6 +250,7 @@ pub mod diarization_records {
         pub audio_mime_type: String,
         pub audio_filename: Option<String>,
         pub audio_storage_path: String,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }
@@ -280,6 +286,7 @@ pub mod speech_history_records {
         pub audio_media_asset_id: Option<String>,
         pub audio_artifact_tenant: Option<String>,
         pub stop_reason: Option<String>,
+        pub owner_node_id: Option<String>,
     }
     empty_relation!();
 }

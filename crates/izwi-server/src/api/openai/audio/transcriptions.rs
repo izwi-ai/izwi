@@ -25,11 +25,12 @@ use crate::api::audio_payload::{
 };
 use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
+use crate::api::transcript_alignment::align_transcript;
 use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::{
-    parse_model_variant, resolve_asr_model_variant, validate_asr_language, AsrTranscription,
-    WorkloadClass,
+    parse_model_variant, resolve_asr_model_variant, validate_asr_language, AlignmentSource,
+    AsrTranscription, WindowedAlignment, WorkloadClass,
 };
 
 const TRANSCRIPTION_STREAM_CAPACITY: usize = 64;
@@ -250,17 +251,19 @@ pub async fn transcriptions(
         "OpenAI transcription request: {} source bytes",
         audio.bytes.len()
     );
+    // Reject a format the response cannot take before spending ASR on it.
+    let response_format = req
+        .response_format
+        .as_deref()
+        .unwrap_or("json")
+        .to_ascii_lowercase();
+    validate_transcription_response_format(&response_format)?;
 
     if req.stream {
         return transcriptions_stream(state, req, audio, ctx.correlation_id).await;
     }
     let audio_bytes = audio.bytes;
 
-    let response_format = req
-        .response_format
-        .as_deref()
-        .unwrap_or("json")
-        .to_ascii_lowercase();
     let timestamp_request =
         TimestampGranularityRequest::parse(req.timestamp_granularities.as_deref())?;
     if timestamp_request.any() && response_format != "verbose_json" {
@@ -295,6 +298,7 @@ pub async fn transcriptions(
     let mut segments = None;
     let mut subtitle_segments = None;
     let mut alignment_error = None;
+    let mut alignment_report = None;
     let chunk_boundaries = extract_chunk_segment_boundaries(output.asr_diagnostics.as_ref());
     let model_words = extract_model_timestamp_words(output.asr_diagnostics.as_ref());
     let model_segments = extract_model_timestamp_segments(output.asr_diagnostics.as_ref());
@@ -314,18 +318,18 @@ pub async fn transcriptions(
     {
         // The transcription already succeeded; an aligner failure costs the
         // word timings, not the transcript.
-        match state
-            .runtime
-            .force_align_bytes_with_model_and_language(
-                audio_bytes.as_slice(),
-                output.text.as_str(),
-                output.language.as_deref().or(req.language.as_deref()),
-                req.aligner_model.as_deref(),
-            )
-            .await
+        match align_transcription_words(
+            &state,
+            audio_bytes.as_slice(),
+            &output,
+            req.language.as_deref(),
+            req.aligner_model.as_deref(),
+        )
+        .await
         {
-            Ok(alignments) => {
-                let timestamp_words = alignments_to_timestamp_words(alignments);
+            Ok(alignment) => {
+                let timestamp_words = alignments_to_timestamp_words(alignment.words());
+                alignment_report = Some(AlignmentReport::from(&alignment));
                 if timestamp_request.words && words.is_none() {
                     words = Some(timestamp_words.clone());
                 }
@@ -349,18 +353,18 @@ pub async fn transcriptions(
             subtitle_segments = Some(build_timestamp_segments(&model_words, &chunk_boundaries));
         }
         if subtitle_segments.is_none() {
-            match state
-                .runtime
-                .force_align_bytes_with_model_and_language(
-                    audio_bytes.as_slice(),
-                    output.text.as_str(),
-                    output.language.as_deref().or(req.language.as_deref()),
-                    req.aligner_model.as_deref(),
-                )
-                .await
+            match align_transcription_words(
+                &state,
+                audio_bytes.as_slice(),
+                &output,
+                req.language.as_deref(),
+                req.aligner_model.as_deref(),
+            )
+            .await
             {
-                Ok(alignments) => {
-                    let timestamp_words = alignments_to_timestamp_words(alignments);
+                Ok(alignment) => {
+                    let timestamp_words = alignments_to_timestamp_words(alignment.words());
+                    alignment_report = Some(AlignmentReport::from(&alignment));
                     let built_segments =
                         build_timestamp_segments(&timestamp_words, &chunk_boundaries);
                     if !built_segments.is_empty() {
@@ -392,7 +396,10 @@ pub async fn transcriptions(
             &chunk_boundaries,
         ));
     }
-    let asr_diagnostics = with_alignment_error(output.asr_diagnostics, alignment_error);
+    let asr_diagnostics = with_alignment_report(
+        with_alignment_error(output.asr_diagnostics, alignment_error),
+        alignment_report,
+    );
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
@@ -445,10 +452,66 @@ pub async fn transcriptions(
                 subtitle_segments.as_deref(),
             )))
             .unwrap()),
-        other => Err(ApiError::bad_request(format!(
-            "Unsupported response_format: {}. Supported: json, verbose_json, text, srt, vtt",
-            other
+        _ => unreachable!("response format validated before transcription"),
+    }
+}
+
+const SUPPORTED_TRANSCRIPTION_FORMATS: &str = "json, verbose_json, text, srt, vtt";
+
+fn validate_transcription_response_format(response_format: &str) -> Result<(), ApiError> {
+    match response_format {
+        "json" | "verbose_json" | "text" | "srt" | "vtt" => Ok(()),
+        "diarized_json" => Err(ApiError::bad_request(format!(
+            "response_format \"diarized_json\" is not supported by /v1/audio/transcriptions; create a speaker-attributed transcript with POST /v1/diarizations. Supported: {SUPPORTED_TRANSCRIPTION_FORMATS}"
         ))),
+        other => Err(ApiError::bad_request(format!(
+            "Unsupported response_format: {other}. Supported: {SUPPORTED_TRANSCRIPTION_FORMATS}"
+        ))),
+    }
+}
+
+/// Word timings for a finished transcription: each long-form chunk's text
+/// is aligned against its own range, so long audio is never one forward.
+async fn align_transcription_words(
+    state: &AppState,
+    audio_bytes: &[u8],
+    output: &AsrTranscription,
+    requested_language: Option<&str>,
+    aligner_model: Option<&str>,
+) -> izwi_core::Result<WindowedAlignment> {
+    let language = output.language.as_deref().or(requested_language);
+    align_transcript(
+        &output.text,
+        output.duration_secs,
+        output.asr_diagnostics.as_ref(),
+        |windows| {
+            state
+                .runtime
+                .force_align_windows_bytes_with_model_and_language(
+                    audio_bytes,
+                    windows,
+                    language,
+                    aligner_model,
+                )
+        },
+    )
+    .await
+}
+
+/// Where a response's word timings came from, and the windows that fell
+/// back to interval timings.
+#[derive(Debug, Clone, PartialEq)]
+struct AlignmentReport {
+    source: AlignmentSource,
+    warnings: Vec<String>,
+}
+
+impl From<&WindowedAlignment> for AlignmentReport {
+    fn from(alignment: &WindowedAlignment) -> Self {
+        Self {
+            source: alignment.source(),
+            warnings: alignment.warnings(),
+        }
     }
 }
 
@@ -954,6 +1017,32 @@ fn with_alignment_error(
     Some(serde_json::Value::Object(diagnostics))
 }
 
+/// Add the alignment source and its warnings to the diagnostics.
+fn with_alignment_report(
+    diagnostics: Option<serde_json::Value>,
+    report: Option<AlignmentReport>,
+) -> Option<serde_json::Value> {
+    let Some(report) = report else {
+        return diagnostics;
+    };
+    let mut diagnostics = match diagnostics {
+        Some(serde_json::Value::Object(root)) => root,
+        Some(other) => serde_json::Map::from_iter([("model_diagnostics".to_string(), other)]),
+        None => serde_json::Map::new(),
+    };
+    diagnostics.insert(
+        "alignment_source".to_string(),
+        serde_json::json!(report.source),
+    );
+    if !report.warnings.is_empty() {
+        diagnostics.insert(
+            "alignment_warnings".to_string(),
+            serde_json::json!(report.warnings),
+        );
+    }
+    Some(serde_json::Value::Object(diagnostics))
+}
+
 fn timestamp_segment_crosses_chunk_boundary(
     segment_start: f32,
     word_end: f32,
@@ -1137,7 +1226,17 @@ fn push_timestamp_segment(
     end: f32,
     words: &[String],
 ) {
-    let text = words.join(" ").trim().to_string();
+    // Aligner words are surface spans: Chinese and Japanese words join
+    // without spaces, as the transcript writes them.
+    let text = words
+        .iter()
+        .fold(String::new(), |mut text, word| {
+            text.push_str(izwi_core::spacing_between(&text, word));
+            text.push_str(word);
+            text
+        })
+        .trim()
+        .to_string();
     if text.is_empty() {
         return;
     }
@@ -1635,6 +1734,29 @@ mod tests {
         assert_eq!(segments[1].text, "again");
     }
 
+    /// Chinese and Japanese aligner words make segment text without spaces;
+    /// spaced scripts keep theirs.
+    #[test]
+    fn timestamp_segments_join_cjk_words_without_spaces() {
+        let word = |word: &str, start: f32| TranscriptionTimestampWord {
+            word: word.to_string(),
+            start,
+            end: start + 0.2,
+        };
+        let chinese = build_timestamp_segments(
+            &[word("我们", 0.0), word("明天", 0.2), word("见面。", 0.4)],
+            &[],
+        );
+        assert_eq!(chinese[0].text, "我们明天见面。");
+        let japanese = build_timestamp_segments(&[word("今日は", 0.0), word("晴れ", 0.2)], &[]);
+        assert_eq!(japanese[0].text, "今日は晴れ");
+        let mixed = build_timestamp_segments(
+            &[word("Hello,", 0.0), word("world", 0.2), word("你好", 0.4)],
+            &[],
+        );
+        assert_eq!(mixed[0].text, "Hello, world你好");
+    }
+
     #[test]
     fn groups_verbose_timestamp_segments_by_punctuation() {
         let words = vec![
@@ -1869,6 +1991,35 @@ mod tests {
         );
 
         assert!(fallback_timestamp_segments("  ", 3.0, None, Vec::new(), &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn alignment_source_and_warnings_are_reported_in_the_diagnostics() {
+        assert_eq!(with_alignment_report(None, None), None);
+        let diagnostics = with_alignment_report(
+            Some(serde_json::json!({"chunking": {}})),
+            Some(AlignmentReport {
+                source: AlignmentSource::Heuristic,
+                warnings: vec!["Words in 30.00-60.00 s use evenly spaced timings".into()],
+            }),
+        )
+        .expect("diagnostics");
+        assert_eq!(diagnostics["alignment_source"], "heuristic");
+        assert_eq!(
+            diagnostics["alignment_warnings"].as_array().unwrap().len(),
+            1
+        );
+        assert!(diagnostics.get("chunking").is_some());
+        let model = with_alignment_report(
+            None,
+            Some(AlignmentReport {
+                source: AlignmentSource::Model,
+                warnings: Vec::new(),
+            }),
+        )
+        .expect("diagnostics");
+        assert_eq!(model["alignment_source"], "model");
+        assert!(model.get("alignment_warnings").is_none());
     }
 
     #[test]

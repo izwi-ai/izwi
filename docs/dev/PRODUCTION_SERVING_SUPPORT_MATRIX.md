@@ -302,6 +302,9 @@ state/key masking rather than a compressed-FSM grammar compiler; the
 The only remotely advertised inference route in gateway mode is text-only
 `POST /v1/chat/completions`, including its existing JSON and SSE response forms.
 Every other route family remains explicitly local-only or absent.
+Diarization and forced alignment have no worker task kind: they run only in
+the full server (`--role local`), never on an `izwi-serving-*` worker (runbook,
+"Route migration gates").
 
 ## Gateway failure semantics
 

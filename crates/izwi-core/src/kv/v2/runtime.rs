@@ -241,6 +241,22 @@ impl InvocationPagedLeaseSetV2 {
             })
     }
 
+    /// Pass an operation's result through. On error, first wait for device
+    /// work the failed operation may still have queued against these leases,
+    /// then abandon them all; see [`fence_failed_invocation`].
+    pub(crate) fn fence_on_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            let mut first_error = None;
+            for (_, lease) in std::mem::take(&mut self.leases) {
+                if let Err(fence_error) = lease.fence() {
+                    first_error.get_or_insert(fence_error);
+                }
+            }
+            fence_failed_invocation(first_error.map_or(Ok(()), Err), error);
+        }
+        result
+    }
+
     /// Release every domain even if one completion fails authentication. A
     /// failed set never exposes a partial collection of completions.
     pub(crate) fn release(mut self) -> Result<Vec<InvocationPagedDomainCompletionV2>> {
@@ -262,6 +278,21 @@ impl InvocationPagedLeaseSetV2 {
             Some(error) => Err(error),
             None => Ok(completions),
         }
+    }
+}
+
+/// A failed invocation operation can leave Metal/CUDA work queued against its
+/// state. Callers fence while they still hold the execution permit, so the slot
+/// and permit are not reused under running work. Every lease is abandoned even
+/// when its fence fails; that failure is logged and the operation's own error
+/// is what the caller returns.
+fn fence_failed_invocation(fenced: Result<()>, operation_error: &Error) {
+    if let Err(fence_error) = fenced {
+        tracing::warn!(
+            error = %fence_error,
+            operation_error = %operation_error,
+            "failed to fence the device after a failed invocation stage"
+        );
     }
 }
 
@@ -488,6 +519,11 @@ pub(crate) trait InvocationWorkspacePhysicalLeaseV2: std::fmt::Debug + Send {
     /// to the load-owned pool. Runtime-owned guards invoke this on every
     /// partial acquisition, operation error, and unwind path.
     fn abort(&mut self);
+
+    /// Wait for device work a failed operation may still have queued against
+    /// this state, then abort. The slot is abandoned even when the fence
+    /// fails; the fence error is returned.
+    fn abort_and_fence(&mut self) -> Result<()>;
 }
 
 /// A load-owned physical backing published for one typed invocation domain.
@@ -616,6 +652,15 @@ impl InvocationWorkspacePhysicalLeaseV2 for InvocationPagedWorkspacePhysicalLeas
 
     fn abort(&mut self) {
         drop(self.lease.take());
+    }
+
+    fn abort_and_fence(&mut self) -> Result<()> {
+        let fenced = self
+            .lease
+            .as_ref()
+            .map_or(Ok(()), InvocationPagedKvLease::fence);
+        self.abort();
+        fenced
     }
 }
 
@@ -931,6 +976,24 @@ impl InvocationWorkspaceLeaseSetV2 {
             Some(error) => Err(error),
             None => Ok(completions),
         }
+    }
+
+    /// Pass an operation's result through. On error, first wait for device
+    /// work the failed operation may still have queued against these leases,
+    /// then abort them all; see [`fence_failed_invocation`].
+    pub(crate) fn fence_on_error<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            let mut first_error = None;
+            for (_, mut lease) in std::mem::take(&mut self.leases) {
+                if let Some(mut physical) = lease.physical.take() {
+                    if let Err(fence_error) = physical.abort_and_fence() {
+                        first_error.get_or_insert(fence_error);
+                    }
+                }
+            }
+            fence_failed_invocation(first_error.map_or(Ok(()), Err), error);
+        }
+        result
     }
 
     fn into_paged(self) -> Result<InvocationPagedLeaseSetV2> {
@@ -1951,6 +2014,231 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidInput(message.into())
 }
 
+/// A typed invocation backing whose error-path fence records each call, for
+/// tests that pin where callers fence a failed operation.
+#[cfg(test)]
+pub(crate) mod fence_probe {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use super::*;
+
+    type FenceObserver = Box<dyn Fn() -> usize + Send>;
+
+    pub(crate) struct FenceProbe {
+        pub(crate) fences: AtomicUsize,
+        pub(crate) aborts: AtomicUsize,
+        pub(crate) fail_fence: AtomicBool,
+        /// Sampled into `observed_during_fence` at every fence.
+        pub(crate) observer: Mutex<Option<FenceObserver>>,
+        pub(crate) observed_during_fence: AtomicUsize,
+    }
+
+    impl std::fmt::Debug for FenceProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FenceProbe")
+                .field("fences", &self.fences)
+                .field("aborts", &self.aborts)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FenceProbeBacking {
+        identity: InvocationWorkspaceBackingIdentityV2,
+        workspace_domain: InvocationWorkspaceDomain,
+        probe: Arc<FenceProbe>,
+    }
+
+    #[derive(Debug)]
+    struct FenceProbeLease {
+        identity: InvocationWorkspaceBackingIdentityV2,
+        probe: Arc<FenceProbe>,
+    }
+
+    impl InvocationWorkspaceBackingV2 for FenceProbeBacking {
+        fn identity(&self) -> InvocationWorkspaceBackingIdentityV2 {
+            self.identity
+        }
+
+        fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
+            &self.workspace_domain
+        }
+
+        fn validate_live(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn lease(&self) -> Result<Box<dyn InvocationWorkspacePhysicalLeaseV2>> {
+            Ok(Box::new(FenceProbeLease {
+                identity: self.identity,
+                probe: self.probe.clone(),
+            }))
+        }
+
+        fn authenticate_completion(
+            &self,
+            _completion: &InvocationWorkspacePhysicalCompletionV2,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl InvocationWorkspacePhysicalLeaseV2 for FenceProbeLease {
+        fn backing_identity(&self) -> InvocationWorkspaceBackingIdentityV2 {
+            self.identity
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+
+        fn complete(&mut self) -> Result<InvocationWorkspacePhysicalCompletionV2> {
+            Ok(InvocationWorkspacePhysicalCompletionV2::Typed {
+                backing: self.identity,
+                authentication: [0x5a; 32],
+            })
+        }
+
+        fn abort(&mut self) {
+            self.probe.aborts.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn abort_and_fence(&mut self) -> Result<()> {
+            let observed = self
+                .probe
+                .observer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |observe| observe());
+            self.probe
+                .observed_during_fence
+                .store(observed, Ordering::Release);
+            self.probe.fences.fetch_add(1, Ordering::AcqRel);
+            self.abort();
+            if self.probe.fail_fence.load(Ordering::Acquire) {
+                return Err(Error::InferenceError("injected fence failure".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    /// Seal `execution`'s all-atomic scalar stages with `domains` typed tensor
+    /// invocation domains, each published through one shared fence probe.
+    pub(crate) fn fence_probe_state_runtime(
+        execution: &ExecutionAdapterBinding,
+        domains: u32,
+    ) -> (Arc<CapabilityStateRuntimeV2>, Arc<FenceProbe>) {
+        use crate::kv::v2::{
+            BoundedShape, CheckpointPolicy, InferenceStateContract, PlacementPolicy, PrefixPolicy,
+            ShapeAxis, ShapeDimension, ShapeExtent, StateClock, StateComponentId, StateDType,
+            StateDomainHeader, StateDomainSpec, StateGroupId, StateGroupSpec, StateScope,
+            TensorComponentSpec, TensorRole, TensorStateDomainSpec, CURRENT_INFERENCE_STATE_ABI,
+        };
+
+        let ids = (1..=domains).map(StateDomainId::new).collect::<Vec<_>>();
+        let state = InferenceStateContract {
+            abi: CURRENT_INFERENCE_STATE_ABI,
+            domains: ids
+                .iter()
+                .map(|&id| {
+                    StateDomainSpec::Tensor(TensorStateDomainSpec {
+                        header: StateDomainHeader {
+                            id,
+                            scope: StateScope::Invocation,
+                            clock: StateClock::DecoderTokens,
+                            placement: PlacementPolicy::BackendLocal,
+                            prefix: PrefixPolicy::Disabled,
+                            checkpoint: CheckpointPolicy::None,
+                        },
+                        components: vec![TensorComponentSpec {
+                            id: StateComponentId::new(1),
+                            role: TensorRole::Control,
+                            shape: BoundedShape {
+                                dimensions: vec![ShapeDimension {
+                                    axis: ShapeAxis::Hidden,
+                                    extent: ShapeExtent::Fixed { value: 4 },
+                                }],
+                            },
+                            accepted_dtypes: vec![StateDType::F32],
+                        }],
+                    })
+                })
+                .collect(),
+            groups: vec![StateGroupSpec {
+                id: StateGroupId::new(1),
+                domains: ids,
+                prefix_shareable: false,
+            }],
+        };
+        let descriptor = crate::models::shared::state::typed_invocation_descriptor(
+            &[execution.stages.as_ref()],
+            &state,
+        )
+        .unwrap();
+        let InvocationWorkspaceSet::Bounded { profiles } = &descriptor.invocation else {
+            panic!("typed invocation descriptor must be bounded");
+        };
+        let probe = Arc::new(FenceProbe {
+            fences: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+            fail_fence: AtomicBool::new(false),
+            observer: Mutex::new(None),
+            observed_during_fence: AtomicUsize::new(usize::MAX),
+        });
+        let bindings = profiles[0]
+            .stages
+            .iter()
+            .flat_map(|stage| {
+                stage.domains.iter().map(|workspace_domain| {
+                    let domain = workspace_domain.id();
+                    let backing: Arc<dyn InvocationWorkspaceBackingV2> =
+                        Arc::new(FenceProbeBacking {
+                            identity: InvocationWorkspaceBackingIdentityV2::Typed {
+                                kind: InvocationStateBackingKindV2::Tensor,
+                                model_instance: execution.model_instance_id,
+                                backend: BackendKind::Cpu,
+                                domain,
+                                allocation_generation: 1,
+                            },
+                            workspace_domain: workspace_domain.clone(),
+                            probe: probe.clone(),
+                        });
+                    InvocationWorkspaceBindingV2 {
+                        key: InvocationWorkspaceKeyV2 {
+                            stage_graph: profiles[0].stage_graph_fingerprint,
+                            stage: stage.stage,
+                            domain,
+                        },
+                        backing,
+                    }
+                })
+            })
+            .collect();
+        let runtime = InvocationWorkspaceRuntimeV2::new(bindings).unwrap();
+        let sealed = InvocationCapabilityRuntimeV2::seal_with_invocation_workspace(
+            BackendKind::Cpu,
+            execution,
+            descriptor,
+            runtime,
+        )
+        .unwrap();
+        (
+            Arc::new(CapabilityStateRuntimeV2::invocation(sealed)),
+            probe,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2273,6 +2561,11 @@ mod tests {
         fn abort(&mut self) {
             self.finish();
         }
+
+        fn abort_and_fence(&mut self) -> Result<()> {
+            self.abort();
+            Ok(())
+        }
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -2425,6 +2718,11 @@ mod tests {
 
         fn abort(&mut self) {
             self.abort_once();
+        }
+
+        fn abort_and_fence(&mut self) -> Result<()> {
+            self.abort();
+            Ok(())
         }
     }
 

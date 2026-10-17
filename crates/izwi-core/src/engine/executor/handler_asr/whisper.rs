@@ -99,8 +99,9 @@ pub(super) fn with_whisper_invocation_state<T>(
         )?;
         let cache = paged.paged_cache_mut()?;
         let cross = cross.typed_mut::<crate::engine::InvocationStaticAttentionLease>()?;
-        run(cache, cross)?
+        run(cache, cross)
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 2 {
         return Err(Error::InferenceError(

@@ -215,6 +215,7 @@ impl NativeExecutor {
             )?;
             Ok(Self::complete_chunked_asr(&chunk_plan, chunked))
         });
+        let transcription = leases.fence_on_error(transcription);
         let Some(transcription) = settle_atomic_asr_cancellation(request, transcription)? else {
             return Ok(ModelSessionResult::cancelled(ExecutorOutput::cancelled(
                 request.id.clone(),

@@ -32,6 +32,7 @@ interface DiarizationQualityPanelProps {
     | "min_speech_duration_ms"
     | "speaker_count"
     | "unattributed_words"
+    | "warnings"
   > | null;
   isRerunning?: boolean;
   error?: string | null;
@@ -186,6 +187,12 @@ export function DiarizationQualityPanel({
         description: "The transcript was configured to use refinement, but the saved result remained unrefined. Review the raw speaker turns before exporting.",
       });
     }
+    for (const warning of record.warnings ?? []) {
+      nextWarnings.push({
+        title: "Pipeline warning",
+        description: warning,
+      });
+    }
     return nextWarnings;
   }, [record]);
 
@@ -284,7 +291,7 @@ export function DiarizationQualityPanel({
             <div className="grid gap-2.5">
               {warnings.map((warning) => (
                 <div
-                  key={warning.title}
+                  key={`${warning.title}:${warning.description}`}
                   className="rounded-lg border border-[var(--warning-border)] bg-[var(--warning-bg)] px-4 py-3 text-[var(--warning-text)]"
                 >
                   <div className="flex items-start gap-3">

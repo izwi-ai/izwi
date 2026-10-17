@@ -19,7 +19,7 @@ use crate::api::audio_payload::{
 use crate::api::speech_text_upload::multipart_upload_api_error;
 use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
-use izwi_core::WorkloadClass;
+use izwi_core::{AlignmentSource, WindowedAlignment, WorkloadClass};
 
 #[derive(Debug, Default)]
 struct AlignmentRequest {
@@ -60,17 +60,31 @@ pub struct AlignmentWord {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AlignmentResponse {
     pub alignments: Vec<AlignmentWord>,
+    /// Duration of the aligned audio in seconds.
     pub duration: f32,
+    /// `model` when every word was timed by the aligner; `heuristic` when
+    /// some windows fell back to evenly spaced timings (see `warnings`).
+    #[schema(value_type = String, example = "model")]
+    pub alignment_source: AlignmentSource,
+    /// One entry per alignment window whose timings are not the model's.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VerboseAlignmentResponse {
     pub alignments: Vec<AlignmentWord>,
+    /// Duration of the aligned audio in seconds.
     pub duration: f32,
     pub model: Option<String>,
     pub language: Option<String>,
     pub word_count: usize,
     pub processing_time_ms: f64,
+    #[schema(value_type = String, example = "model")]
+    pub alignment_source: AlignmentSource,
+    pub warnings: Vec<String>,
+    /// Aligner windows the audio was split into (each at most the aligner's
+    /// audio limit).
+    pub alignment_windows: usize,
 }
 
 pub async fn align(
@@ -104,9 +118,11 @@ pub async fn align(
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
     let started = Instant::now();
-    let raw_alignments = state
+    // Audio longer than the aligner's window is aligned in sub-windows,
+    // never as one forward.
+    let alignment = state
         .runtime
-        .force_align_bytes_with_model_and_language(
+        .force_align_bytes_windowed_with_model_and_language(
             audio.bytes.as_slice(),
             text.as_str(),
             req.language.as_deref(),
@@ -115,14 +131,20 @@ pub async fn align(
         .await
         .map_err(core_api_error)?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
-
-    let alignments = alignment_words(raw_alignments);
-    let duration = alignment_duration(&alignments);
+    let AlignmentOutcome {
+        alignments,
+        duration,
+        alignment_source,
+        warnings,
+        windows,
+    } = alignment_outcome(alignment).map_err(core_api_error)?;
 
     match response_format.as_str() {
         "json" => json_response(&AlignmentResponse {
             alignments,
             duration,
+            alignment_source,
+            warnings,
         }),
         "verbose_json" => json_response(&VerboseAlignmentResponse {
             word_count: alignments.len(),
@@ -131,6 +153,9 @@ pub async fn align(
             model: req.model,
             language: req.language,
             processing_time_ms,
+            alignment_source,
+            warnings,
+            alignment_windows: windows,
         }),
         "text" => Ok(Response::builder()
             .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
@@ -303,8 +328,35 @@ fn millis_to_secs(ms: u32) -> f32 {
     (ms as f32) / 1000.0
 }
 
-fn alignment_duration(words: &[AlignmentWord]) -> f32 {
-    words.iter().map(|word| word.end).fold(0.0, f32::max)
+struct AlignmentOutcome {
+    alignments: Vec<AlignmentWord>,
+    duration: f32,
+    alignment_source: AlignmentSource,
+    warnings: Vec<String>,
+    windows: usize,
+}
+
+/// The response view of a windowed alignment. When no window could be
+/// aligned every timing would be invented, so the first window error is
+/// returned instead.
+fn alignment_outcome(alignment: WindowedAlignment) -> izwi_core::Result<AlignmentOutcome> {
+    let alignment_source = alignment.source();
+    if alignment_source == AlignmentSource::Failed {
+        return Err(alignment
+            .windows
+            .into_iter()
+            .find_map(|window| window.error)
+            .unwrap_or_else(|| {
+                izwi_core::Error::InferenceError("forced alignment failed".into())
+            }));
+    }
+    Ok(AlignmentOutcome {
+        alignments: alignment_words(alignment.words()),
+        duration: millis_to_secs(alignment.duration_ms),
+        alignment_source,
+        warnings: alignment.warnings(),
+        windows: alignment.windows.len(),
+    })
 }
 
 fn format_alignment_text(words: &[AlignmentWord]) -> String {
@@ -383,6 +435,86 @@ mod tests {
         assert_eq!(words[0].word, "hello");
         assert!((words[0].start - 0.12).abs() < f32::EPSILON);
         assert!((words[0].end - 0.98).abs() < f32::EPSILON);
+    }
+
+    fn window(
+        start_ms: u32,
+        end_ms: u32,
+        source: AlignmentSource,
+        words: &[(&str, u32, u32)],
+    ) -> izwi_core::AlignedWindow {
+        izwi_core::AlignedWindow {
+            start_ms,
+            end_ms,
+            source,
+            words: words
+                .iter()
+                .map(|(word, start, end)| (word.to_string(), *start, *end))
+                .collect(),
+            detail: (source != AlignmentSource::Model).then(|| "rejected".to_string()),
+            error: (source == AlignmentSource::Failed)
+                .then(|| izwi_core::Error::InvalidInput("window too long".into())),
+        }
+    }
+
+    #[test]
+    fn long_alignment_reports_audio_duration_source_and_window_warnings() {
+        let outcome = alignment_outcome(WindowedAlignment {
+            windows: vec![
+                window(0, 29_000, AlignmentSource::Model, &[("one", 100, 400)]),
+                window(
+                    29_000,
+                    58_000,
+                    AlignmentSource::Heuristic,
+                    &[("two", 29_000, 58_000)],
+                ),
+                window(
+                    58_000,
+                    61_000,
+                    AlignmentSource::Model,
+                    &[("three", 58_500, 58_900)],
+                ),
+            ],
+            duration_ms: 62_500,
+        })
+        .expect("mixed windows still answer");
+        assert_eq!(
+            outcome.duration, 62.5,
+            "duration is the audio, not the last word"
+        );
+        assert_eq!(outcome.alignment_source, AlignmentSource::Heuristic);
+        assert_eq!(outcome.windows, 3);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("29.00-58.00 s"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert_eq!(outcome.alignments.len(), 3);
+        let json = serde_json::to_value(AlignmentResponse {
+            alignments: outcome.alignments,
+            duration: outcome.duration,
+            alignment_source: outcome.alignment_source,
+            warnings: outcome.warnings,
+        })
+        .unwrap();
+        assert_eq!(json["alignment_source"], "heuristic");
+    }
+
+    #[test]
+    fn alignment_with_no_aligned_window_is_an_error() {
+        let result = alignment_outcome(WindowedAlignment {
+            windows: vec![window(
+                0,
+                30_000,
+                AlignmentSource::Failed,
+                &[("one", 0, 30_000)],
+            )],
+            duration_ms: 30_000,
+        });
+        assert!(
+            matches!(result, Err(izwi_core::Error::InvalidInput(message)) if message == "window too long")
+        );
     }
 
     #[test]

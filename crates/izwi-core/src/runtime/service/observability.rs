@@ -346,6 +346,12 @@ impl RuntimeService {
         self.coordinator.snapshot()
     }
 
+    /// Uploads the diarization pipeline has decoded itself; a job given
+    /// decoded samples adds none (PIPE-14).
+    pub fn diarization_audio_decodes(&self) -> u64 {
+        self.diarization_audio_decodes.load(Ordering::Relaxed)
+    }
+
     /// Physical execution health: admission poison and latched device faults.
     /// Cheap enough for liveness and worker status polling.
     pub fn health(&self) -> RuntimeHealth {
@@ -353,10 +359,12 @@ impl RuntimeService {
     }
 
     /// Fault injection for probe and status tests in dependent crates: latch
-    /// `error` through the same classification device execution uses.
+    /// `error` through the same classification device execution uses. It
+    /// fails this runtime only, never the process-wide resource authority
+    /// that runtimes running alongside it share.
     #[doc(hidden)]
     pub fn latch_device_fault_for_test(&self, error: &Error) -> bool {
-        self.coordinator.latch_fatal_device_fault(error)
+        self.coordinator.latch_fatal_device_fault_for_test(error)
     }
 
     pub(super) async fn engine_telemetry_snapshot(&self) -> EngineRuntimeTelemetrySnapshot {

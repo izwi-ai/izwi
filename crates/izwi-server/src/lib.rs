@@ -14,6 +14,7 @@
 
 use anyhow::Context as _;
 use clap::Parser;
+use std::time::Duration;
 
 mod api;
 mod app;
@@ -29,6 +30,7 @@ mod error;
 mod local_security;
 mod logging;
 pub mod media_ingest;
+mod node_identity;
 mod onboarding_store;
 mod persistence;
 mod roles;
@@ -92,6 +94,11 @@ pub fn create_local_router(
     Ok(api::create_router(state, serve_config))
 }
 
+/// How long blocking work still running after shutdown cleanup (for example a
+/// model unload waiting in `Device::synchronize` on queued GPU work) may delay
+/// process exit. Cleanup itself is bounded by its own timeout first.
+pub const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// Runs the server from the command line on a Tokio runtime of its own:
 /// the entry point for a synchronous `main`.
 ///
@@ -99,18 +106,39 @@ pub fn create_local_router(
 /// single-threaded, so the local role sizes the engine's CPU compute
 /// libraries through their environment variables
 /// ([`izwi_core::env::configure_process_threads`]) before any thread that
-/// might read the environment exists.
+/// might read the environment exists. The runtime's shutdown is bounded by
+/// [`PROCESS_EXIT_GRACE`], so SIGTERM exits after the cleanup budget instead
+/// of waiting on a stuck GPU drain.
 pub fn run_from_cli_blocking(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
     let (args, serve_config) = resolve_cli()?;
     if matches!(args.role, ServerRole::Local) {
         // SAFETY: no runtime or other thread has started yet.
         unsafe { izwi_core::env::configure_process_threads(serve_config.num_threads) };
     }
-    tokio::runtime::Builder::new_multi_thread()
+    run_with_bounded_exit(
+        run(args, serve_config, enterprise_hooks),
+        PROCESS_EXIT_GRACE,
+    )
+}
+
+/// The name an earlier community binary's `main` called; the same as
+/// [`run_from_cli_blocking`].
+pub fn run_server_process(enterprise_hooks: EnterpriseHooks) -> anyhow::Result<()> {
+    run_from_cli_blocking(enterprise_hooks)
+}
+
+fn run_with_bounded_exit<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+    exit_grace: Duration,
+) -> anyhow::Result<T> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to start the Tokio runtime")?
-        .block_on(run(args, serve_config, enterprise_hooks))
+        .context("failed to start the Tokio runtime")?;
+    let result = runtime.block_on(future);
+    // Dropping a runtime waits for every blocking task without limit.
+    runtime.shutdown_timeout(exit_grace);
+    result
 }
 
 /// Runs the server from the command line inside the caller's Tokio runtime

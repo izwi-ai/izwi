@@ -11,6 +11,7 @@ use tokenizers::decoders::byte_fallback::ByteFallback;
 use tokenizers::decoders::sequence::Sequence as DecoderSequence;
 use tokenizers::decoders::DecoderWrapper;
 use tokenizers::models::bpe::BPE;
+use tokenizers::normalizers::unicode::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence as PreTokenizerSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
@@ -113,6 +114,9 @@ fn text_after_shared_prefix(previous: &str, current: &str) -> String {
     current.get(shared..).unwrap_or_default().to_owned()
 }
 
+/// The split regex transformers' `Qwen2Converter` gives `Qwen2TokenizerFast`
+/// (unlike [`QWEN2_PRETOKENIZER_REGEX`], letters do not absorb marks).
+const QWEN2_HF_PRETOKENIZER_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 const QWEN2_PRETOKENIZER_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
 impl Tokenizer {
@@ -241,8 +245,20 @@ impl Tokenizer {
             .as_ref()
             .and_then(|cfg| cfg.add_prefix_space)
             .unwrap_or(true);
-        let byte_level = ByteLevel::new(add_prefix_space, true, true);
-        inner.with_pre_tokenizer(Some(byte_level));
+        let qwen2 = config
+            .as_ref()
+            .and_then(|cfg| cfg.tokenizer_class.as_deref())
+            == Some("Qwen2Tokenizer");
+        let byte_level = if qwen2 {
+            // As transformers builds Qwen2TokenizerFast from these files
+            // (`Qwen2Converter`): NFC, then the Qwen2 split regex.
+            inner.with_normalizer(Some(NFC));
+            qwen_split_pre_tokenizer(&mut inner, QWEN2_HF_PRETOKENIZER_REGEX, add_prefix_space)?
+        } else {
+            let byte_level = ByteLevel::new(add_prefix_space, true, true);
+            inner.with_pre_tokenizer(Some(byte_level));
+            byte_level
+        };
         let decoder = DecoderWrapper::Sequence(DecoderSequence::new(vec![
             DecoderWrapper::ByteFallback(ByteFallback::new()),
             DecoderWrapper::ByteLevel(byte_level),
@@ -373,19 +389,7 @@ impl Tokenizer {
         let mut inner = HfTokenizer::new(bpe);
 
         let byte_level = if matches!(pre_tokenizer, Some("qwen2" | "qwen35")) {
-            let split = Split::new(
-                SplitPattern::Regex(QWEN2_PRETOKENIZER_REGEX.to_string()),
-                SplitDelimiterBehavior::Isolated,
-                false,
-            )
-            .map_err(|e| Error::TokenizationError(format!("Invalid Qwen2 split regex: {e}")))?;
-            let byte_level = ByteLevel::new(add_prefix_space, false, false);
-            let sequence = PreTokenizerSequence::new(vec![
-                PreTokenizerWrapper::Split(split),
-                PreTokenizerWrapper::ByteLevel(byte_level),
-            ]);
-            inner.with_pre_tokenizer(Some(sequence));
-            byte_level
+            qwen_split_pre_tokenizer(&mut inner, QWEN2_PRETOKENIZER_REGEX, add_prefix_space)?
         } else {
             let byte_level = ByteLevel::new(add_prefix_space, true, true);
             inner.with_pre_tokenizer(Some(byte_level));
@@ -634,6 +638,8 @@ struct TokenizerConfigFile {
     #[serde(default)]
     add_prefix_space: Option<bool>,
     #[serde(default)]
+    tokenizer_class: Option<String>,
+    #[serde(default)]
     added_tokens_decoder: HashMap<String, AddedTokenConfig>,
 }
 
@@ -660,6 +666,27 @@ impl AddedTokenConfig {
             .rstrip(self.rstrip)
             .normalized(self.normalized)
     }
+}
+
+/// Pre-tokenize with a Qwen split `regex`, then byte-level without its own
+/// regex. Returns the byte-level step for the decoder.
+fn qwen_split_pre_tokenizer(
+    inner: &mut HfTokenizer,
+    regex: &str,
+    add_prefix_space: bool,
+) -> Result<ByteLevel> {
+    let split = Split::new(
+        SplitPattern::Regex(regex.to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(|e| Error::TokenizationError(format!("Invalid Qwen2 split regex: {e}")))?;
+    let byte_level = ByteLevel::new(add_prefix_space, false, false);
+    inner.with_pre_tokenizer(Some(PreTokenizerSequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        PreTokenizerWrapper::ByteLevel(byte_level),
+    ])));
+    Ok(byte_level)
 }
 
 fn load_tokenizer_config(model_dir: &Path) -> Result<Option<TokenizerConfigFile>> {
@@ -702,6 +729,61 @@ mod tests {
             .iter()
             .map(|byte| byte_level_char(*byte))
             .collect()
+    }
+
+    /// QFA-6: vocab.json + merges.txt with `tokenizer_class: Qwen2Tokenizer`
+    /// (the aligner and Qwen3-TTS ship no tokenizer.json) tokenize like
+    /// Qwen2TokenizerFast: NFC first, then the Qwen2 split, which keeps a
+    /// leading `-` or `'T` with the letters after it. Without the class the
+    /// GPT-2 split stays.
+    #[test]
+    fn qwen2_tokenizer_class_uses_the_qwen2_split_and_nfc() {
+        let byte_ids = (0..=u8::MAX)
+            .map(|byte| (byte_level_char(byte).to_string(), u32::from(byte)))
+            .collect::<HashMap<_, _>>();
+        let mut vocab = byte_ids.clone();
+        vocab.insert("'T".to_string(), 256);
+        vocab.insert("-k".to_string(), 257);
+        let merges = "#version: 0.2\n' T\n- k\n";
+        let bytes = |text: &str| {
+            text.bytes()
+                .map(|byte| byte_ids[&byte_level_char(byte).to_string()])
+                .collect::<Vec<_>>()
+        };
+        let load = |class: Option<&str>| {
+            let dir = std::env::temp_dir().join(format!("izwi-tokenizer-qwen2-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("vocab.json"), serde_json::to_vec(&vocab).unwrap()).unwrap();
+            fs::write(dir.join("merges.txt"), merges).unwrap();
+            let mut config = serde_json::json!({ "add_prefix_space": false });
+            if let Some(class) = class {
+                config["tokenizer_class"] = class.into();
+            }
+            fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+            let tokenizer = Tokenizer::from_path(&dir).expect("vocab + merges tokenizer");
+            let _ = fs::remove_dir_all(&dir);
+            tokenizer
+        };
+
+        let qwen2 = load(Some("Qwen2Tokenizer"));
+        assert_eq!(
+            qwen2.encode("DON'T").unwrap(),
+            [bytes("DON"), vec![256]].concat()
+        );
+        assert_eq!(
+            qwen2.encode("well-known").unwrap(),
+            [bytes("well"), vec![257], bytes("nown")].concat()
+        );
+        assert_eq!(
+            qwen2.encode("cafe\u{301}").unwrap(),
+            bytes("caf\u{e9}"),
+            "NFD input is composed first"
+        );
+
+        let generic = load(None);
+        assert_eq!(generic.encode("DON'T").unwrap(), bytes("DON'T"));
+        assert_eq!(generic.encode("well-known").unwrap(), bytes("well-known"));
+        assert_eq!(generic.encode("cafe\u{301}").unwrap(), bytes("cafe\u{301}"));
     }
 
     #[test]

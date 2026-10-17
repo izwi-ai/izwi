@@ -336,6 +336,26 @@ impl InvocationTensorArena {
         self.maximum_bytes
     }
 
+    /// The contract's upper bound for `axis` of `component`, so a model can
+    /// reject over-bound input before doing the work that would produce it.
+    pub(crate) fn component_axis_max(
+        &self,
+        component: StateComponentId,
+        axis: &crate::kv::v2::ShapeAxis,
+    ) -> Option<u64> {
+        let backing = self
+            .components
+            .iter()
+            .find(|backing| backing.semantic.id == component)?;
+        backing
+            .semantic
+            .shape
+            .dimensions
+            .iter()
+            .find(|dimension| dimension.axis == *axis)
+            .map(|dimension| dimension.extent.max())
+    }
+
     pub(crate) fn apply_intent(
         &mut self,
         intent: &DomainStepIntent,
@@ -504,6 +524,13 @@ impl InvocationTensorArena {
 
     pub(crate) fn reset_for_reuse(&mut self) -> Result<()> {
         self.reset()
+    }
+
+    /// Wait for device work a failed operation may still have queued against
+    /// this arena, and mark it dirty so it is reset before any reuse.
+    pub(crate) fn fence_after_error(&mut self) -> Result<()> {
+        self.dirty = true;
+        self.device.synchronize().map_err(Error::from)
     }
 
     /// Fence every write issued through this exact arena before the pool
@@ -1808,6 +1835,20 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn fence_after_error_leaves_the_arena_dirty_until_reset() {
+        let mut arena = arena(StateDomainSpec::Tensor(TensorStateDomainSpec {
+            header: header(1),
+            components: vec![fixed_component(4)],
+        }));
+        arena.fence_after_error().unwrap();
+        assert!(arena.is_dirty());
+        assert!(arena.prepare_completion().is_err());
+        arena.reset_for_reuse().unwrap();
+        assert!(!arena.is_dirty());
+        arena.prepare_completion().unwrap();
     }
 
     #[test]

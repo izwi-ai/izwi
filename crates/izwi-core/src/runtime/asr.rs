@@ -40,6 +40,12 @@ use crate::runtime::audio_io::{
     validate_base64_audio_source_size, MAX_AUDIO_SOURCE_BYTES,
 };
 use crate::runtime::coordinator::{InferenceCoordinator, JobLease, JobResourceObservation};
+use crate::runtime::diarization::samples_to_ms;
+use crate::runtime::forced_alignment::{
+    align_under_stage_lease, align_window_checked, forced_alignment_window_workspace,
+    sample_windows, AlignedWindow, AlignmentWindow, LongTextPlanner, SampleWindow,
+    WindowedAlignment,
+};
 use crate::runtime::request::AsrRuntimeRequest;
 #[cfg(test)]
 use crate::runtime::service::retained_engine_request_input_bytes;
@@ -674,11 +680,12 @@ impl RuntimeService {
     ) -> Result<Vec<(String, u32, u32)>> {
         self.force_align_input(
             AsrAudioInput::Base64(audio_base64),
-            reference_text,
+            ForcedAlignmentText::Whole(reference_text),
             language,
             model_id,
         )
-        .await
+        .await?
+        .into_words_or_error()
     }
 
     pub async fn force_align_bytes_with_model_and_language(
@@ -690,7 +697,47 @@ impl RuntimeService {
     ) -> Result<Vec<(String, u32, u32)>> {
         self.force_align_input(
             AsrAudioInput::Bytes(audio_bytes),
-            reference_text,
+            ForcedAlignmentText::Whole(reference_text),
+            language,
+            model_id,
+        )
+        .await?
+        .into_words_or_error()
+    }
+
+    /// Align one transcript against the whole audio. Audio longer than the
+    /// aligner's window is aligned in sub-windows (see [`LongTextPlanner`]);
+    /// each reports where its timings came from.
+    pub async fn force_align_bytes_windowed_with_model_and_language(
+        &self,
+        audio_bytes: &[u8],
+        reference_text: &str,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<WindowedAlignment> {
+        self.force_align_input(
+            AsrAudioInput::Bytes(audio_bytes),
+            ForcedAlignmentText::Whole(reference_text),
+            language,
+            model_id,
+        )
+        .await
+    }
+
+    /// Align each window's text against its own range of the audio, one
+    /// coordinator stage per window, with times rebased to the whole file.
+    /// A window the aligner cannot align keeps interval timings and reports
+    /// it in its source; only admission, decode or load failures error.
+    pub async fn force_align_windows_bytes_with_model_and_language(
+        &self,
+        audio_bytes: &[u8],
+        windows: Vec<AlignmentWindow>,
+        language: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<WindowedAlignment> {
+        self.force_align_input(
+            AsrAudioInput::Bytes(audio_bytes),
+            ForcedAlignmentText::Windows(windows),
             language,
             model_id,
         )
@@ -700,10 +747,10 @@ impl RuntimeService {
     async fn force_align_input(
         &self,
         audio_input: AsrAudioInput<'_>,
-        reference_text: &str,
+        text: ForcedAlignmentText<'_>,
         language: Option<&str>,
         model_id: Option<&str>,
-    ) -> Result<Vec<(String, u32, u32)>> {
+    ) -> Result<WindowedAlignment> {
         let variant = resolve_forced_aligner_variant(model_id)?;
         if audio_input.input_bytes() == 0 {
             return Err(Error::InvalidInput(
@@ -711,7 +758,7 @@ impl RuntimeService {
             ));
         }
         audio_input.validate_retained_size()?;
-        if reference_text.trim().is_empty() {
+        if text.is_blank() {
             return Err(Error::InvalidInput(
                 "Forced alignment request missing transcript".to_string(),
             ));
@@ -723,7 +770,7 @@ impl RuntimeService {
         )?;
         let input_bytes = audio_input
             .input_bytes()
-            .checked_add(reference_text.len())
+            .checked_add(text.input_bytes())
             .and_then(|bytes| bytes.checked_add(language.map(str::len).unwrap_or_default()))
             .ok_or_else(|| Error::Overloaded("forced alignment input overflowed".to_string()))?;
         let context = RuntimeRequestContext::default();
@@ -738,12 +785,16 @@ impl RuntimeService {
             .admit_observed(spec, host_input_observation(input_bytes)?)
             .await?;
         let audio_input = audio_input.into_owned_for_job(&job).await?;
-        let reference_text =
-            copy_preparation_string(&job, reference_text, "forced alignment transcript").await?;
+        let windows = match text {
+            ForcedAlignmentText::Whole(text) => ForcedAlignmentOwnedText::Whole(
+                copy_preparation_string(&job, text, "forced alignment transcript").await?,
+            ),
+            ForcedAlignmentText::Windows(windows) => ForcedAlignmentOwnedText::Windows(windows),
+        };
         let language =
             copy_optional_preparation_string(&job, language, "forced alignment language").await?;
-        let owned_metadata_bytes = reference_text
-            .capacity()
+        let owned_metadata_bytes = windows
+            .retained_bytes()
             .checked_add(language.as_ref().map(String::capacity).unwrap_or_default())
             .ok_or_else(|| {
                 Error::Overloaded("forced alignment metadata storage overflowed".to_string())
@@ -768,37 +819,217 @@ impl RuntimeService {
             .await
             .ok_or_else(|| Error::ModelNotFound(variant.to_string()))?;
         let observation_job = job.clone();
-        self.coordinator
-            .run_loaded_blocking_stage(
+        let (samples, sample_rate) = self
+            .coordinator
+            .run_host_blocking_stage(&job, move || {
+                let retained_audio_bytes = audio_input.retained_bytes();
+                let (samples, sample_rate) = audio_input.decode()?;
+                let retained_bytes =
+                    input_bytes
+                        .checked_add(owned_metadata_bytes)
+                        .ok_or_else(|| {
+                            Error::Overloaded(
+                                "forced alignment retained storage overflowed".to_string(),
+                            )
+                        })?;
+                let steady_usage = decoded_audio_observation(retained_bytes, samples.capacity())?;
+                observation_job.record_materialized_usage(add_retained_host_bytes(
+                    steady_usage,
+                    retained_audio_bytes,
+                )?)?;
+                observation_job.prepare_materialized_release(steady_usage)?;
+                drop(audio_input);
+                Ok((Arc::<[f32]>::from(samples), sample_rate))
+            })
+            .await?;
+        let windows = match windows {
+            ForcedAlignmentOwnedText::Whole(text) => vec![SampleWindow::new(
+                0,
+                samples.len(),
+                text,
+                language.as_deref(),
+            )],
+            ForcedAlignmentOwnedText::Windows(windows) => {
+                sample_windows(windows, sample_rate, samples.len(), language.as_deref())?
+            }
+        };
+        let duration_ms = samples_to_ms(samples.len(), sample_rate);
+        let windows = self
+            .align_sample_windows(
                 &job,
                 execution_contract,
+                model,
+                samples,
+                sample_rate,
+                windows,
+                "asr.forced_alignment",
+            )
+            .await?;
+        drop(residency_lease);
+        Ok(WindowedAlignment {
+            windows,
+            duration_ms,
+        })
+    }
+
+    /// Run each window as its own aligner stage, so other jobs interleave
+    /// between windows. A window longer than the aligner's limit is split by
+    /// [`LongTextPlanner`] into sub-windows, each its own stage. Shared by the
+    /// alignment API and the diarization pipeline; the caller holds the
+    /// aligner's residency lease. The windows carry their word units.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn align_sample_windows(
+        &self,
+        job: &JobLease,
+        contract: LoadedExecutionContract,
+        model: Arc<NativeAsrModel>,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        windows: Vec<SampleWindow>,
+        stage_kind: &str,
+    ) -> Result<Vec<AlignedWindow>> {
+        let max_window = model
+            .max_audio_seconds_hint()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (f64::from(seconds) * f64::from(sample_rate)).floor() as usize);
+        let mut aligned = Vec::with_capacity(windows.len());
+        for window in windows {
+            let Some(max_window) = max_window
+                .filter(|max| window.end_sample.saturating_sub(window.start_sample) > *max)
+            else {
+                aligned.push(
+                    self.align_window_stage(
+                        job,
+                        &contract,
+                        &model,
+                        &samples,
+                        sample_rate,
+                        window,
+                        stage_kind,
+                        true,
+                    )
+                    .await?,
+                );
+                continue;
+            };
+            // The energy scan covers the whole window: run it off the
+            // async workers.
+            let planner_samples = samples.clone();
+            let mut planner = self
+                .coordinator
+                .run_host_blocking_stage(job, move || {
+                    Ok(LongTextPlanner::new(
+                        &planner_samples,
+                        sample_rate,
+                        &window,
+                        max_window,
+                    ))
+                })
+                .await?;
+            while let Some(planned) = planner.next_window(&samples) {
+                let sub_window = self
+                    .align_window_stage(
+                        job,
+                        &contract,
+                        &model,
+                        &samples,
+                        sample_rate,
+                        planned.window.clone(),
+                        stage_kind,
+                        false,
+                    )
+                    .await?;
+                aligned.push(planner.absorb(&planned, sub_window));
+            }
+        }
+        Ok(aligned)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn align_window_stage(
+        &self,
+        job: &JobLease,
+        contract: &LoadedExecutionContract,
+        model: &Arc<NativeAsrModel>,
+        samples: &Arc<[f32]>,
+        sample_rate: u32,
+        window: SampleWindow,
+        stage_kind: &str,
+        check_plausibility: bool,
+    ) -> Result<AlignedWindow> {
+        // The aligner adapter is stateless, so the window's forward working
+        // set is reserved here, for this stage only (ADM-5).
+        let workspace = forced_alignment_window_workspace(
+            contract.metadata.model_variant,
+            self.backend_router.context().backend_kind,
+            &window,
+            sample_rate,
+        )?;
+        let lease = self
+            .coordinator
+            .reserve_stage_workspace(job, stage_kind, workspace)?;
+        let model = model.clone();
+        let samples = samples.clone();
+        self.coordinator
+            .run_loaded_blocking_stage(
+                job,
+                contract.clone(),
                 WorkUnit::AtomicJob {
-                    kind: "asr.forced_alignment".to_string(),
+                    kind: stage_kind.to_string(),
                 },
                 move || {
-                    let _residency_lease = residency_lease;
-                    let retained_audio_bytes = audio_input.retained_bytes();
-                    let (samples, sample_rate) = audio_input.decode()?;
-                    let retained_bytes =
-                        input_bytes
-                            .checked_add(owned_metadata_bytes)
-                            .ok_or_else(|| {
-                                Error::Overloaded(
-                                    "forced alignment retained storage overflowed".to_string(),
-                                )
-                            })?;
-                    let steady_usage =
-                        decoded_audio_observation(retained_bytes, samples.capacity())?;
-                    observation_job.record_materialized_usage(add_retained_host_bytes(
-                        steady_usage,
-                        retained_audio_bytes,
-                    )?)?;
-                    observation_job.prepare_materialized_release(steady_usage)?;
-                    drop(audio_input);
-                    model.force_align(&samples, sample_rate, &reference_text, language.as_deref())
+                    align_under_stage_lease(&lease, workspace, || {
+                        align_window_checked(
+                            &samples,
+                            sample_rate,
+                            &window,
+                            check_plausibility,
+                            |audio, units| model.force_align_units(audio, sample_rate, units),
+                        )
+                    })
                 },
             )
             .await
+    }
+}
+
+/// The transcript of a forced alignment request: one text for the whole
+/// audio, or the text of each window.
+enum ForcedAlignmentText<'a> {
+    Whole(&'a str),
+    Windows(Vec<AlignmentWindow>),
+}
+
+impl ForcedAlignmentText<'_> {
+    fn is_blank(&self) -> bool {
+        match self {
+            Self::Whole(text) => text.trim().is_empty(),
+            Self::Windows(windows) => windows.iter().all(|window| window.text.trim().is_empty()),
+        }
+    }
+
+    fn input_bytes(&self) -> usize {
+        match self {
+            Self::Whole(text) => text.len(),
+            Self::Windows(windows) => windows.iter().map(|window| window.text.len()).sum(),
+        }
+    }
+}
+
+enum ForcedAlignmentOwnedText {
+    Whole(String),
+    Windows(Vec<AlignmentWindow>),
+}
+
+impl ForcedAlignmentOwnedText {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Whole(text) => text.capacity(),
+            Self::Windows(windows) => windows
+                .iter()
+                .map(|window| window.text.capacity() + std::mem::size_of::<AlignmentWindow>())
+                .sum(),
+        }
     }
 }
 

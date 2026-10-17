@@ -16,6 +16,7 @@ use crate::engine::{
     ResourceAmount, ResourceLease, ResourceVector, StageDescriptor, StateFitReserve,
 };
 use crate::error::{Error, Result};
+use crate::kernels::numeric_check::PrecisionReloadGate;
 use crate::kv::v2::{
     stage_graph_fingerprint, CapabilityStateDescriptorV2, InferenceStateContract,
     InvocationStateCapacity, InvocationWorkspaceBindingV2, InvocationWorkspaceDomain,
@@ -65,10 +66,13 @@ use checkpoint::{
 #[cfg(test)]
 use checkpoint::{
     checkpoint_census, estimate_from_tensor_inventory, fish_s2_resource_plan,
-    qwen38_representation_memory_estimate,
+    qwen38_representation_memory_estimate, CheckpointCensus,
 };
 #[cfg(test)]
-use invocation::{plan_invocation_allocations, validate_scratch_only_invocation_publication};
+use invocation::{
+    plan_invocation_allocations, validate_physical_publication_backing,
+    validate_scratch_only_invocation_publication,
+};
 
 pub(super) fn now_unix_millis() -> u64 {
     SystemTime::now()
@@ -137,6 +141,28 @@ fn loaded_asr_state_publication_route(variant: ModelVariant) -> LoadedAsrStatePu
         crate::catalog::ModelFamily::NemotronAsr => LoadedAsrStatePublicationRoute::NemotronOffline,
         _ => LoadedAsrStatePublicationRoute::LegacyCache,
     }
+}
+
+/// Parakeet's retained predictor is owned by the exact executor session, so
+/// no graph activates managed retained state: sequence graphs read it through
+/// their session and the atomic long-form graph leases invocation tensors.
+fn parakeet_retained_uses(
+    contracts: &[LoadedExecutionContract],
+) -> Result<HashMap<[u8; 32], RetainedStateUseV2>> {
+    contracts
+        .iter()
+        .map(|contract| {
+            let graph = stage_graph_fingerprint(&contract.stages)?;
+            match contract.execution_profile.mode {
+                crate::engine::ExecutionMode::Sequence | crate::engine::ExecutionMode::Atomic => {
+                    Ok((graph, RetainedStateUseV2::Inactive))
+                }
+                _ => Err(Error::ModelLoadError(
+                    "Parakeet graph has an incompatible execution mode".into(),
+                )),
+            }
+        })
+        .collect()
 }
 
 fn uses_asr_model_registry(variant: ModelVariant) -> bool {
@@ -387,6 +413,44 @@ fn load_domain_bytes(authorization: ResourceVector, backend: BackendKind) -> Res
     }
 }
 
+/// A loading thread's request to admit a precision fallback's reload
+/// ([`PrecisionReloadGate`]): the lifecycle answers once it has grown the
+/// load's authorization, or refused.
+struct PrecisionReloadRequest {
+    component: String,
+    dtype: candle_core::DType,
+    reply: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+/// A [`PrecisionReloadGate`] for a loading thread, and the requests it sends
+/// to the load task, which owns admission. The gate blocks its thread until
+/// the reply, so the reload allocates only once it is authorized. Loads run
+/// on the device thread, which keeps serving control jobs while it waits:
+/// the admission may evict a model, and that model's drop runs there.
+fn precision_reload_gate() -> (
+    PrecisionReloadGate,
+    tokio::sync::mpsc::UnboundedReceiver<PrecisionReloadRequest>,
+) {
+    let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Box::new(move |component: &str, dtype| {
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let ended = || {
+            Error::ModelLoadError(format!(
+                "the load ended before admitting the {component} reload at {dtype:?}"
+            ))
+        };
+        requests
+            .send(PrecisionReloadRequest {
+                component: component.to_string(),
+                dtype,
+                reply,
+            })
+            .map_err(|_| ended())?;
+        crate::backends::recv_serving_device(outcome).ok_or_else(ended)?
+    });
+    (gate, receiver)
+}
+
 /// `(retained, staged)` rows of ASR retained state (ADM-6). Automatic engine
 /// rows are sized for chat (on CUDA one per 256 MiB of device memory, about
 /// 320 on an H100), and every ASR retained row owns a prepared-input tensor
@@ -408,13 +472,17 @@ fn asr_state_rows(
     (retained, engine_staged_rows.min(retained).max(1))
 }
 
-/// Whether a load of `variant` is reconciled against the device observer:
-/// the families whose admission is a residency plan (ASR and TTS), so an
-/// observed excess means the plan under-prices the loader.
-fn reconciles_device_usage(variant: ModelVariant) -> bool {
-    asr_memory::is_asr_variant(variant)
+/// Whether a load of `variant` on `backend` is reconciled against the device
+/// observer: the families whose admission is a residency plan (ASR, the
+/// forced aligner, the Sortformer diarizers, TTS and LFM2 chat), so an
+/// observed excess means the plan under-prices the loader, as long as the
+/// weights land where the observer looks (Sortformer on Metal loads into host
+/// memory).
+fn reconciles_device_usage(variant: ModelVariant, backend: BackendKind) -> bool {
+    (asr_memory::has_plan(variant)
         || tts_memory::has_plan(variant)
-        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat
+        || variant.family() == crate::catalog::ModelFamily::Lfm2Chat)
+        && asr_memory::weights_on_backend_device(variant, backend)
 }
 
 /// One observed-usage checkpoint of a load (ADM-8): the device observer's
@@ -688,7 +756,27 @@ impl ModelLifecycleController {
             // are both installed above.
             let weights_started = Instant::now();
             let usage_before_weights = self.sample_device_usage(variant);
-            let instantiated = self.instantiate_model(acquired).await?;
+            // Admission priced the selected precision. A component whose
+            // load-time probe fails reloads at F32 only once this task has
+            // grown the authorization for it.
+            let model_path = acquired.model_path.clone();
+            let (reload_gate, mut reload_requests) = precision_reload_gate();
+            let instantiate = self.instantiate_model(acquired, reload_gate);
+            tokio::pin!(instantiate);
+            let instantiated = loop {
+                tokio::select! {
+                    instantiated = &mut instantiate => break instantiated?,
+                    Some(request) = reload_requests.recv() => {
+                        let admitted = self
+                            .admit_precision_reload(variant, &model_path, &resource_plan, &request)
+                            .await;
+                        if let Ok(Some(reload)) = admitted {
+                            resource_plan = reload;
+                        }
+                        let _ = request.reply.send(admitted.map(|_| ()));
+                    }
+                }
+            };
             let weights_ms = weights_started.elapsed().as_secs_f64() * 1000.0;
             let preparation_started = Instant::now();
             if variant.family() == crate::catalog::ModelFamily::Qwen3Asr {
@@ -850,7 +938,7 @@ impl ModelLifecycleController {
             // (ADM-4): the fits spend headroom less pending claims, so held
             // here, one full chunk per execution slot is still free when the
             // first request runs beside the fitted state.
-            if reconciles_device_usage(variant) {
+            if reconciles_device_usage(variant, backend) {
                 // The cached live sample can predate the fence that released
                 // the load's staging; the state fits read a fresh one.
                 self.coordinator

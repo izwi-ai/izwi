@@ -32,8 +32,8 @@ pub use device::{
     METAL_DTYPE_ENV, METAL_PAGED_ATTENTION_SUPPORTS_BF16,
 };
 pub use device_thread::{
-    device_ops_off_thread_total, probe_device_op, DeviceJobTag, DeviceScope, DeviceThread,
-    DeviceThreadKey,
+    device_ops_off_thread_total, probe_device_op, recv_serving_device, DeviceJobTag, DeviceScope,
+    DeviceThread, DeviceThreadKey,
 };
 pub use model_io::{
     auto_gguf_mmap_for_backend, backend_kind_for_device, gguf_mmap_enabled,

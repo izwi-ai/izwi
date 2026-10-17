@@ -24,6 +24,7 @@ use crate::api::idempotency::{
     replay_record_id, reservation_lost, DurableIdempotencyStart, DURABLE_IDEMPOTENCY_RETENTION_MS,
 };
 use crate::api::request_context::RequestContext;
+use crate::api::transcript_alignment::align_transcript;
 use crate::batch_runtime::{
     store::{
         canonical_request_digest, sha256_hex, BatchRuntimeStore, DurableIdempotencyRequest,
@@ -55,7 +56,7 @@ use izwi_core::runtime::SpeakerAttributedAsrStatus as RuntimeSpeakerAttributedAs
 use izwi_core::{
     parse_chat_model_variant, parse_model_variant, AsrProgress, AsrProgressPhase, ChatMessage,
     ChatRequestConfig, ChatRole, ChatTruncation, GenerationParams, ModelVariant,
-    RuntimeRequestContext, RuntimeService, WorkloadClass,
+    RuntimeRequestContext, RuntimeService, WindowedAlignment, WorkloadClass,
 };
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
@@ -229,6 +230,7 @@ struct GeneratedTranscriptionArtifacts {
     speaker_turns: Vec<SpeakerAttributedTurnRecord>,
     saa_status: SpeakerAttributedAsrStatus,
     saa_warnings: Vec<String>,
+    alignment_warnings: Vec<String>,
 }
 
 pub async fn delete_record(
@@ -1257,6 +1259,7 @@ async fn process_transcription_record_inner(
         speaker_turns: artifacts.speaker_turns,
         saa_status: artifacts.saa_status,
         saa_warnings: artifacts.saa_warnings,
+        alignment_warnings: artifacts.alignment_warnings,
         summary_status,
         summary_model_id,
         summary_text: None,
@@ -1342,27 +1345,40 @@ where
         .clone()
         .or_else(|| requested_language.map(|value| value.to_string()));
 
-    let (aligner_model_id, words, segments) =
+    let (aligner_model_id, words, segments, alignment_warnings) =
         if include_timestamps && !output.text.trim().is_empty() {
             if let Ok(mut callback) = progress_callback.lock() {
                 callback(transcription_aligning_progress(input_duration_secs));
             }
             let resolved_aligner_model_id =
                 aligner_model_id.unwrap_or(DEFAULT_TRANSCRIPTION_ALIGNER_MODEL);
-            let alignments = runtime
-                .force_align_bytes_with_model_and_language(
-                    audio_bytes,
-                    output.text.as_str(),
-                    resolved_language.as_deref(),
-                    Some(resolved_aligner_model_id),
-                )
-                .await
-                .map_err(core_api_error)?;
-            let words = alignments_to_word_records(&alignments);
-            let segments = build_segment_records(output.text.as_str(), &words);
-            (Some(resolved_aligner_model_id.to_string()), words, segments)
+            // Each long-form chunk's text is aligned against its own range.
+            // The transcript already succeeded: an aligner failure costs the
+            // word timings and is reported as a warning, not a job failure.
+            let alignment = align_transcript(
+                output.text.as_str(),
+                output.duration_secs,
+                output.asr_diagnostics.as_ref(),
+                |windows| {
+                    runtime.force_align_windows_bytes_with_model_and_language(
+                        audio_bytes,
+                        windows,
+                        resolved_language.as_deref(),
+                        Some(resolved_aligner_model_id),
+                    )
+                },
+            )
+            .await;
+            let (words, segments, warnings) =
+                transcription_alignment_artifacts(output.text.as_str(), alignment);
+            (
+                Some(resolved_aligner_model_id.to_string()),
+                words,
+                segments,
+                warnings,
+            )
         } else {
-            (None, Vec::new(), Vec::new())
+            (None, Vec::new(), Vec::new(), Vec::new())
         };
 
     Ok(GeneratedTranscriptionArtifacts {
@@ -1377,7 +1393,40 @@ where
         speaker_turns: Vec::new(),
         saa_status: SpeakerAttributedAsrStatus::NotRequested,
         saa_warnings: Vec::new(),
+        alignment_warnings,
     })
+}
+
+/// Word and segment records from a windowed alignment, with one warning per
+/// window that fell back to interval timings, or the failure that left the
+/// transcript without word timestamps.
+fn transcription_alignment_artifacts(
+    text: &str,
+    alignment: izwi_core::Result<WindowedAlignment>,
+) -> (
+    Vec<TranscriptionWordRecord>,
+    Vec<TranscriptionSegmentRecord>,
+    Vec<String>,
+) {
+    match alignment {
+        Ok(alignment) => {
+            let words = alignments_to_word_records(&alignment.words());
+            let segments = build_segment_records(text, &words);
+            (words, segments, alignment.warnings())
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Forced alignment failed; transcript kept without word timestamps: {err}"
+            );
+            (
+                Vec::new(),
+                Vec::new(),
+                vec![format!(
+                    "Word timestamps unavailable: forced alignment failed: {err}"
+                )],
+            )
+        }
+    }
 }
 
 async fn generate_speaker_attributed_asr_artifacts<P>(
@@ -1435,6 +1484,7 @@ where
         speaker_turns,
         saa_status,
         saa_warnings: output.warnings,
+        alignment_warnings: Vec::new(),
     })
 }
 
@@ -2164,6 +2214,55 @@ mod tests {
     };
     use izwi_core::RuntimeService;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn long_transcripts_get_timestamps_per_chunk_window() {
+        use crate::api::transcript_alignment::align_transcript;
+        use crate::api::transcript_alignment::tests::{
+            chunked_diagnostics, stub_windowed_alignment,
+        };
+
+        let diagnostics = chunked_diagnostics(&[
+            (0.0, 29.99, "first chunk words"),
+            (27.0, 56.99, "second chunk words"),
+            (54.0, 70.0, "third chunk"),
+        ]);
+        let text = "first chunk words second chunk words third chunk";
+        let mut window_calls = 0;
+        let alignment = align_transcript(text, 70.0, Some(&diagnostics), |windows| {
+            window_calls = windows.len();
+            let mut alignment = stub_windowed_alignment(&windows, 70.0);
+            alignment.windows[2].source = izwi_core::AlignmentSource::Failed;
+            alignment.windows[2].detail = Some("aligner rejected the window".into());
+            async move { Ok(alignment) }
+        })
+        .await;
+        let (words, segments, warnings) = super::transcription_alignment_artifacts(text, alignment);
+
+        assert!(window_calls >= 2, "one aligner window per chunk");
+        assert_eq!(words.len(), 8);
+        assert!(words.iter().any(|word| word.start > 30.0), "{words:?}");
+        assert!(words.windows(2).all(|pair| pair[1].start >= pair[0].end));
+        assert!(!segments.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("54.00-70.00 s"), "{warnings:?}");
+    }
+
+    #[test]
+    fn alignment_failure_is_a_warning_not_a_job_failure() {
+        let (words, segments, warnings) = super::transcription_alignment_artifacts(
+            "kept transcript",
+            Err(izwi_core::Error::ModelNotFound(
+                "Qwen3-ForcedAligner-0.6B".into(),
+            )),
+        );
+        assert!(words.is_empty() && segments.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("forced alignment failed"),
+            "{warnings:?}"
+        );
+    }
 
     fn wav_bytes() -> Vec<u8> {
         AudioEncoder::new(16_000, 1)

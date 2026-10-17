@@ -343,3 +343,35 @@ async fn speech_unknown_model_returns_openai_error_envelope() {
         .unwrap_or_default()
         .contains("Unsupported TTS model"));
 }
+
+#[tokio::test]
+async fn transcriptions_reject_unsupported_formats_before_asr() {
+    let (app, _temp_dir) = test_api_app("transcriptions-unsupported-format");
+    for (format, expected) in [
+        ("diarized_json", "POST /v1/diarizations"),
+        ("xml", "Unsupported response_format: xml"),
+    ] {
+        let body = serde_json::json!({
+            "audio_base64": valid_wav_base64(),
+            "model": "Parakeet-TDT-0.6B-v3",
+            "response_format": format,
+        })
+        .to_string();
+        let response = send_request(
+            app.clone(),
+            build_json_request(Method::POST, "/v1/audio/transcriptions", body.as_str()),
+        )
+        .await;
+
+        // No model is downloaded here, so a response about the format proves
+        // it was rejected before transcription ran.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{format}");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("error response should be json");
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(expected), "{format}: {message}");
+    }
+}

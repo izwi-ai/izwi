@@ -1,23 +1,31 @@
 mod nemo;
+#[cfg(test)]
+mod parity_tests;
 mod physical;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::ops;
 use candle_nn::{
     batch_norm, layer_norm, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, LayerNorm, Linear, Module,
-    ModuleT, VarBuilder,
+    VarBuilder,
 };
 use izwi_vad::{speech_mask_for_frames_f32, VadRegionConfig};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
 use crate::backends::state::{InvocationTensorComponentValue, InvocationTensorUpdateV2};
-use crate::backends::{DeviceKind, DeviceProfile};
+use crate::backends::{BackendKind, DeviceProfile};
 use crate::engine::{InvocationTensorLease, StageDescriptor};
 use crate::error::{Error, Result};
+use crate::kernels::depthwise_conv::{
+    batch_norm_affine, depthwise_conv1d, depthwise_conv2d, fold_channel_affine,
+    DepthwiseConv1dSpec, DepthwiseConv2dSpec,
+};
 use crate::kv::v2::{
     ComponentShapeInstantiation, DomainStepIntent, ShapeAxis, ShapeDimensionValue,
     StateComponentId, StateUpdateKind,
@@ -26,7 +34,10 @@ use crate::model::ModelVariant;
 use crate::models::shared::weights::mlx;
 use crate::runtime::{DiarizationConfig, DiarizationResult, DiarizationSegment};
 
-use nemo::{ensure_sortformer_artifacts, SortformerArtifacts};
+use nemo::SortformerArtifacts;
+pub(crate) use nemo::{
+    ensure_sortformer_artifacts, sortformer_checkpoint_paths, sortformer_extraction_is_current,
+};
 pub(crate) use physical::SortformerPhysicalStateSpec;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -61,15 +72,20 @@ const NEMOTRON3_ROPE_LAYERS: usize = 31;
 const NEMOTRON3_ROPE_D_MODEL: usize = 512;
 const NEMOTRON3_ROPE_FF_DIM: usize = 2048;
 const NEMOTRON3_ROPE_HEADS: usize = 8;
-const NEMOTRON3_ROPE_THETA: f32 = 10_000.0;
 const NEMOTRON3_ROPE_MAX_POSITIONS: usize = 5_000;
-const NEMOTRON3_MAX_CHUNK_LEN: usize = 264;
+const NEMOTRON3_MAX_CHUNK_LEN: usize = 340;
+const NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT: usize = 40;
 const NEMOTRON3_MAX_SPKCACHE_LEN: usize = 264;
+const NEMOTRON3_MAX_FIFO_LEN: usize = 264;
 const NEMOTRON3_HEAD_D_MODEL: usize = 192;
 // The formulas below explicitly count the largest live tensors in each
-// model stage. Keep a factor of two for allocator/kernel workspaces which are
-// backend implementation details rather than Candle tensors visible here.
-const SORTFORMER_TENSOR_SAFETY_FACTOR: u64 = 2;
+// model stage. A 1.5x factor covers what they cannot see: allocator retention
+// and kernel scratch. Measured on the real checkpoints (CPU, release, one
+// diarize call that fills the cache and runs full chunks; see
+// `sortformer_workspace_measured_peak_per_profile`), the process footprint
+// grew 3.8x the live malloc bytes on v2.1 (allocator retention), and the
+// estimate is 1.1-1.25x that footprint for every v2.1 profile.
+const SORTFORMER_WORKSPACE_SAFETY_PERCENT: u128 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortformerWorkspaceEstimate {
@@ -140,8 +156,16 @@ struct SortformerModelConfig {
     sample_rate: Option<u32>,
     max_num_of_spks: Option<usize>,
     streaming_mode: Option<bool>,
+    /// NeMo `SortformerEncLabelModel`: probability rows at 10 ms instead of
+    /// the encoded rate (absent: false).
+    high_resolution: Option<bool>,
+    /// Output frame period in 10 ms units (absent: the encoder's
+    /// subsampling factor).
+    output_subsampling_factor: Option<usize>,
+    async_streaming: Option<bool>,
     preprocessor: Option<SortformerPreprocessorConfig>,
     encoder: Option<SortformerEncoderConfig>,
+    transformer_encoder: Option<SortformerTransformerConfig>,
     sortformer_modules: Option<SortformerModulesConfig>,
 }
 
@@ -155,12 +179,45 @@ struct SortformerPreprocessorConfig {
     normalize: Option<String>,
 }
 
+/// The graph-defining fields of the `encoder` section: NeMo's
+/// `ConformerEncoder` (v2.1) or `TransformerEncoder` (Nemotron-3). An absent
+/// field takes that class's default, which is what NeMo builds.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SortformerEncoderConfig {
     #[serde(rename = "_target_")]
     target: Option<String>,
+    n_heads: Option<usize>,
     xscaling: Option<bool>,
     subsampling: Option<String>,
+    subsampling_factor: Option<usize>,
+    self_attention_model: Option<String>,
+    causal_downsampling: Option<bool>,
+    att_context_size: Option<serde_yaml::Value>,
+    conv_norm_type: Option<String>,
+    conv_context_size: Option<serde_yaml::Value>,
+    untie_biases: Option<bool>,
+    use_bias: Option<bool>,
+    global_tokens: Option<usize>,
+    reduction: Option<serde_yaml::Value>,
+    qkv_bias: Option<bool>,
+    qk_norm: Option<bool>,
+    pre_block_norm: Option<bool>,
+    attn_mode: Option<String>,
+    rope_base: Option<f64>,
+    rotary_fraction: Option<f64>,
+    causal_tail_len: Option<usize>,
+}
+
+/// v2.1's `transformer_encoder` section (NeMo
+/// `transformer_encoders.TransformerEncoder`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SortformerTransformerConfig {
+    #[serde(rename = "_target_")]
+    target: Option<String>,
+    num_attention_heads: Option<usize>,
+    hidden_act: Option<String>,
+    pre_ln: Option<bool>,
+    mask_future: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,32 +226,271 @@ enum SortformerEncoderKind {
     FeatureStackingRope,
 }
 
-/// Discriminates the acoustic graph from the checkpoint's encoder section.
-/// An absent section keeps the historical Conformer default; anything that is
-/// not one of the two served graphs fails closed.
-fn resolve_encoder_kind(cfg: Option<&SortformerEncoderConfig>) -> Result<SortformerEncoderKind> {
-    let Some(cfg) = cfg else {
-        return Ok(SortformerEncoderKind::Conformer);
-    };
+/// The graph a checkpoint yaml defines, checked against the one izwi runs
+/// (SRT-8, NDZ-4): a field outside the served set fails the load instead
+/// of loading same-shaped weights into a different graph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SortformerGraphSpec {
+    /// v2.1: `dw_striding` subsampling, a relative-position Conformer and a
+    /// post-LN ReLU transformer at the encoded rate.
+    Conformer {
+        heads: usize,
+        xscaling: bool,
+        transformer_heads: usize,
+    },
+    /// Nemotron-3: feature stacking, a pre-norm RoPE transformer with full
+    /// attention, and the subpixel upsampler to 10 ms rows.
+    FeatureStackingRope {
+        heads: usize,
+        stacking_factor: usize,
+        rope_base: f32,
+    },
+}
+
+impl SortformerGraphSpec {
+    fn encoder_kind(self) -> SortformerEncoderKind {
+        match self {
+            Self::Conformer { .. } => SortformerEncoderKind::Conformer,
+            Self::FeatureStackingRope { .. } => SortformerEncoderKind::FeatureStackingRope,
+        }
+    }
+}
+
+/// Discriminates the acoustic graph from the encoder's `_target_`; anything
+/// that is not one of the two served encoders fails closed.
+fn resolve_encoder_kind(cfg: &SortformerEncoderConfig) -> Result<SortformerEncoderKind> {
     let target = cfg
         .target
         .as_deref()
         .and_then(|value| value.rsplit('.').next())
         .unwrap_or("");
-    match (target, cfg.subsampling.as_deref()) {
-        ("ConformerEncoder", _) | ("", None) => Ok(SortformerEncoderKind::Conformer),
-        ("TransformerEncoder", Some("feature_stacking")) => {
-            Ok(SortformerEncoderKind::FeatureStackingRope)
-        }
+    match target {
+        "ConformerEncoder" => Ok(SortformerEncoderKind::Conformer),
+        "TransformerEncoder" => Ok(SortformerEncoderKind::FeatureStackingRope),
         _ => Err(Error::ModelLoadError(format!(
-            "unsupported Sortformer encoder target {:?} with subsampling {:?}",
-            cfg.target, cfg.subsampling
+            "unsupported Sortformer encoder target {:?}",
+            cfg.target
         ))),
+    }
+}
+
+/// Fails the load unless the yaml's `field` holds the `served` value.
+fn require_config<T: PartialEq + std::fmt::Debug>(field: &str, value: T, served: T) -> Result<()> {
+    if value == served {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "unsupported Sortformer config {field} = {value:?}; izwi serves only {served:?}"
+    )))
+}
+
+/// The Conformer conv module folds an inference BatchNorm into its depthwise
+/// kernel at load; any other normalization fails closed.
+fn validate_conv_norm_type(cfg: Option<&SortformerEncoderConfig>) -> Result<()> {
+    match cfg.and_then(|cfg| cfg.conv_norm_type.as_deref()) {
+        None | Some("batch_norm") => Ok(()),
+        Some(other) => Err(Error::ModelLoadError(format!(
+            "unsupported Sortformer conv_norm_type {other:?}; only batch_norm is served"
+        ))),
+    }
+}
+
+/// Full-context attention: NeMo's default `att_context_size` (absent or
+/// null) or `[-1, -1]`. A limited or multi-lookahead context fails closed.
+fn validate_full_attention_context(value: Option<&serde_yaml::Value>) -> Result<()> {
+    let full = match value {
+        None | Some(serde_yaml::Value::Null) => true,
+        Some(serde_yaml::Value::Sequence(items)) => {
+            items.len() == 2 && items.iter().all(|item| item.as_i64() == Some(-1))
+        }
+        Some(_) => false,
+    };
+    if full {
+        return Ok(());
+    }
+    Err(Error::ModelLoadError(format!(
+        "unsupported Sortformer config encoder.att_context_size = {value:?}; izwi serves only [-1, -1]"
+    )))
+}
+
+/// Reads and validates every graph-defining field of a Sortformer checkpoint
+/// yaml. Shape-defining values (layers, widths) come from the tensors and
+/// the production topology pins; these are the flags the tensors cannot
+/// show. Head counts and the RoPE base are taken from the yaml.
+fn resolve_graph_spec(config: &SortformerModelConfig) -> Result<SortformerGraphSpec> {
+    let encoder = config.encoder.as_ref().ok_or_else(|| {
+        Error::ModelLoadError("Sortformer config has no encoder section".to_string())
+    })?;
+    let modules = config.sortformer_modules.clone().unwrap_or_default();
+    require_config(
+        "async_streaming",
+        config.async_streaming.unwrap_or(false),
+        false,
+    )?;
+    let high_resolution = config.high_resolution.unwrap_or(false);
+    let learnable_silence = modules.use_learnable_sil_emb.unwrap_or(false);
+    match resolve_encoder_kind(encoder)? {
+        SortformerEncoderKind::Conformer => {
+            // NeMo `ConformerEncoder` defaults: striding x4, rel_pos, 4 heads.
+            require_config(
+                "encoder.subsampling",
+                encoder.subsampling.as_deref().unwrap_or("striding"),
+                "dw_striding",
+            )?;
+            let factor = encoder.subsampling_factor.unwrap_or(4);
+            require_config(
+                "encoder.subsampling_factor",
+                factor,
+                TS_VAD_UNIT_FRAME_COUNT,
+            )?;
+            require_config(
+                "encoder.causal_downsampling",
+                encoder.causal_downsampling.unwrap_or(false),
+                false,
+            )?;
+            require_config(
+                "encoder.self_attention_model",
+                encoder.self_attention_model.as_deref().unwrap_or("rel_pos"),
+                "rel_pos",
+            )?;
+            validate_full_attention_context(encoder.att_context_size.as_ref())?;
+            validate_conv_norm_type(Some(encoder))?;
+            require_config(
+                "encoder.conv_context_size",
+                encoder.conv_context_size.as_ref(),
+                None,
+            )?;
+            require_config(
+                "encoder.untie_biases",
+                encoder.untie_biases.unwrap_or(true),
+                true,
+            )?;
+            require_config("encoder.use_bias", encoder.use_bias.unwrap_or(true), true)?;
+            require_config(
+                "encoder.global_tokens",
+                encoder.global_tokens.unwrap_or(0),
+                0,
+            )?;
+            require_config("encoder.reduction", encoder.reduction.as_ref(), None)?;
+            require_config("high_resolution", high_resolution, false)?;
+            require_config(
+                "output_subsampling_factor",
+                config.output_subsampling_factor.unwrap_or(factor),
+                factor,
+            )?;
+            require_config(
+                "sortformer_modules.use_learnable_sil_emb",
+                learnable_silence,
+                false,
+            )?;
+            let transformer = config.transformer_encoder.as_ref().ok_or_else(|| {
+                Error::ModelLoadError(
+                    "Sortformer Conformer config has no transformer_encoder section".to_string(),
+                )
+            })?;
+            require_config(
+                "transformer_encoder._target_",
+                transformer
+                    .target
+                    .as_deref()
+                    .and_then(|value| value.rsplit('.').next()),
+                Some("TransformerEncoder"),
+            )?;
+            // NeMo `TransformerEncoder` defaults: ReLU, post-LN, one head.
+            require_config(
+                "transformer_encoder.hidden_act",
+                transformer.hidden_act.as_deref().unwrap_or("relu"),
+                "relu",
+            )?;
+            require_config(
+                "transformer_encoder.pre_ln",
+                transformer.pre_ln.unwrap_or(false),
+                false,
+            )?;
+            require_config(
+                "transformer_encoder.mask_future",
+                transformer.mask_future.unwrap_or(false),
+                false,
+            )?;
+            Ok(SortformerGraphSpec::Conformer {
+                heads: encoder.n_heads.unwrap_or(4),
+                xscaling: encoder.xscaling.unwrap_or(true),
+                transformer_heads: transformer.num_attention_heads.unwrap_or(1),
+            })
+        }
+        SortformerEncoderKind::FeatureStackingRope => {
+            // NeMo `TransformerEncoder` defaults: feature stacking x4,
+            // rel_pos, no xscaling, pre-block norm, full attention.
+            require_config(
+                "encoder.subsampling",
+                encoder.subsampling.as_deref().unwrap_or("feature_stacking"),
+                "feature_stacking",
+            )?;
+            let factor = encoder.subsampling_factor.unwrap_or(4);
+            require_config(
+                "encoder.self_attention_model",
+                encoder.self_attention_model.as_deref().unwrap_or("rel_pos"),
+                "rope",
+            )?;
+            require_config("encoder.xscaling", encoder.xscaling.unwrap_or(false), false)?;
+            require_config("encoder.qkv_bias", encoder.qkv_bias.unwrap_or(false), false)?;
+            require_config("encoder.qk_norm", encoder.qk_norm.unwrap_or(false), false)?;
+            require_config(
+                "encoder.pre_block_norm",
+                encoder.pre_block_norm.unwrap_or(true),
+                true,
+            )?;
+            require_config(
+                "encoder.attn_mode",
+                encoder.attn_mode.as_deref().unwrap_or("full"),
+                "full",
+            )?;
+            require_config(
+                "encoder.rotary_fraction",
+                encoder.rotary_fraction.unwrap_or(1.0),
+                1.0,
+            )?;
+            require_config(
+                "encoder.causal_tail_len",
+                encoder.causal_tail_len.unwrap_or(0),
+                0,
+            )?;
+            let rope_base = encoder.rope_base.unwrap_or(10_000.0);
+            if !(rope_base.is_finite() && rope_base > 1.0) {
+                return Err(Error::ModelLoadError(format!(
+                    "unsupported Sortformer config encoder.rope_base = {rope_base}"
+                )));
+            }
+            require_config("high_resolution", high_resolution, true)?;
+            require_config(
+                "output_subsampling_factor",
+                config.output_subsampling_factor.unwrap_or(factor),
+                1,
+            )?;
+            require_config(
+                "sortformer_modules.use_learnable_sil_emb",
+                learnable_silence,
+                true,
+            )?;
+            if config.transformer_encoder.is_some() {
+                return Err(Error::ModelLoadError(
+                    "unsupported Sortformer config: a transformer_encoder beside the RoPE encoder"
+                        .to_string(),
+                ));
+            }
+            Ok(SortformerGraphSpec::FeatureStackingRope {
+                heads: encoder.n_heads.unwrap_or(8),
+                stacking_factor: factor,
+                rope_base: rope_base as f32,
+            })
+        }
     }
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SortformerModulesConfig {
+    num_spks: Option<usize>,
+    use_learnable_sil_emb: Option<bool>,
     fc_d_model: Option<usize>,
     subsampling_factor: Option<usize>,
     spkcache_len: Option<usize>,
@@ -212,11 +508,72 @@ struct SortformerModulesConfig {
     min_pos_scores_rate: Option<f32>,
 }
 
+/// Streaming geometry a loaded checkpoint runs, chosen once per process
+/// with `IZWI_SORTFORMER_STREAMING_PROFILE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortformerStreamingProfile {
+    /// The checkpoint yaml's `sortformer_modules` values (NeMo's
+    /// `from_pretrained` default; Nemotron-3's training geometry).
     Model,
+    /// The model card's low-latency profile.
     LowLatency,
-    HighLatency,
+    /// The model card's very-high-latency (offline) profile: the
+    /// configuration NVIDIA benchmarks, and the default for file
+    /// diarization, which never streams output to the client.
+    VeryHighLatency,
+}
+
+impl SortformerStreamingProfile {
+    const DEFAULT: Self = Self::VeryHighLatency;
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::LowLatency => "low_latency",
+            Self::VeryHighLatency => "very_high_latency",
+        }
+    }
+
+    /// The model card geometry this profile sets for `encoder_kind`, in
+    /// 80 ms frames; `None` keeps the checkpoint yaml's values.
+    fn card_geometry(self, encoder_kind: SortformerEncoderKind) -> Option<SortformerCardGeometry> {
+        let geometry = |chunk_len, chunk_right_context, fifo_len, update_period, spkcache_len| {
+            Some(SortformerCardGeometry {
+                chunk_len,
+                chunk_right_context,
+                fifo_len,
+                spkcache_update_period: update_period,
+                spkcache_len,
+            })
+        };
+        match (encoder_kind, self) {
+            (_, Self::Model) => None,
+            // diar_streaming_sortformer_4spk-v2.1 card: 6/7/188/144/188 and
+            // 340/40/40/300/188 (chunk / right context / FIFO / update /
+            // cache); the left context stays the yaml's 1.
+            (SortformerEncoderKind::Conformer, Self::LowLatency) => geometry(6, 7, 188, 144, 188),
+            (SortformerEncoderKind::Conformer, Self::VeryHighLatency) => {
+                geometry(340, 40, 40, 300, 188)
+            }
+            // Nemotron-3-Diarization card and HF config.json: low 9/4/264/
+            // 222/264 and offline 340/40/40/300/264, left context 0.
+            (SortformerEncoderKind::FeatureStackingRope, Self::LowLatency) => {
+                geometry(9, 4, 264, 222, 264)
+            }
+            (SortformerEncoderKind::FeatureStackingRope, Self::VeryHighLatency) => {
+                geometry(340, 40, 40, 300, 264)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortformerCardGeometry {
+    chunk_len: usize,
+    chunk_right_context: usize,
+    fifo_len: usize,
+    spkcache_update_period: usize,
+    spkcache_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -413,9 +770,9 @@ const NEMOTRON3_PRODUCTION_PROFILE: SortformerProductionProfile = SortformerProd
     topology: SortformerWorkspaceTopology::nemotron3_production(),
     max_chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
     max_chunk_left_context: 0,
-    max_chunk_right_context: 0,
+    max_chunk_right_context: NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT,
     max_spkcache_len: NEMOTRON3_MAX_SPKCACHE_LEN,
-    max_fifo_len: 0,
+    max_fifo_len: NEMOTRON3_MAX_FIFO_LEN,
 };
 
 const PRODUCTION_PROFILES: [SortformerProductionProfile; 2] =
@@ -443,9 +800,20 @@ fn production_workspace_streaming_config() -> SortformerStreamingConfig {
     }
 }
 
-/// Largest streaming profile the Nemotron-3 checkpoint may claim, pinned to
-/// its trained sortformer_modules values.
+/// Largest streaming envelope the Nemotron-3 checkpoint may claim: the card
+/// offline chunk and right context with the card low-latency FIFO.
 fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
+    SortformerStreamingConfig {
+        chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
+        chunk_right_context: NEMOTRON3_MAX_CHUNK_RIGHT_CONTEXT,
+        fifo_len: NEMOTRON3_MAX_FIFO_LEN,
+        spkcache_update_period: 300,
+        ..nemotron3_checkpoint_streaming_config()
+    }
+}
+
+/// The Nemotron-3 checkpoint yaml's trained sortformer_modules values.
+fn nemotron3_checkpoint_streaming_config() -> SortformerStreamingConfig {
     SortformerStreamingConfig {
         fc_d_model: NEMOTRON3_ROPE_D_MODEL,
         num_speakers: 8,
@@ -453,8 +821,8 @@ fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
         output_frames_per_encoded_frame: TS_VAD_UNIT_FRAME_COUNT,
         spkcache_len: NEMOTRON3_MAX_SPKCACHE_LEN,
         fifo_len: 0,
-        chunk_len: NEMOTRON3_MAX_CHUNK_LEN,
-        spkcache_update_period: NEMOTRON3_MAX_CHUNK_LEN,
+        chunk_len: 264,
+        spkcache_update_period: 264,
         chunk_left_context: 0,
         chunk_right_context: 0,
         spkcache_sil_frames_per_spk: 1,
@@ -467,10 +835,11 @@ fn nemotron3_workspace_streaming_config() -> SortformerStreamingConfig {
     }
 }
 
-/// Immutable pre-admission ceiling for the supported production checkpoints.
-/// The estimate uses each checkpoint's largest supported streaming profile
-/// and admits the larger of the two, while the loaded model later reports
-/// its exact profile-shaped peak.
+/// Immutable refusal ceiling for the supported production checkpoints. The
+/// estimate uses each checkpoint's largest supported streaming profile and
+/// takes the larger of the two. It is never reserved: a diarize stage
+/// reserves the loaded model's own profile-shaped estimate and refuses one
+/// above this ceiling.
 pub fn production_workspace_authorization(
     target_sample_count: usize,
     separate_device_memory: bool,
@@ -491,6 +860,48 @@ pub fn production_workspace_authorization(
         host_bytes: v21.host_bytes.max(nemotron3.host_bytes),
         accelerator_bytes: v21.accelerator_bytes.max(nemotron3.accelerator_bytes),
     })
+}
+
+/// The workspace `variant` estimates once loaded under the default
+/// streaming profile, so tests can price a request without the checkpoint.
+/// v2.1's `model_config.yaml` pins chunk 188, left and right context 1,
+/// FIFO 0 and update period 188 before the profile applies.
+#[cfg(test)]
+pub(crate) fn default_profile_workspace_estimate(
+    variant: ModelVariant,
+    target_sample_count: usize,
+    separate_device_memory: bool,
+) -> Result<SortformerWorkspaceEstimate> {
+    let (topology, checkpoint, encoder_kind) = match variant {
+        ModelVariant::DiarStreamingSortformer4SpkV21 => (
+            SortformerWorkspaceTopology::v21_production(),
+            SortformerStreamingConfig {
+                chunk_len: 188,
+                chunk_left_context: 1,
+                chunk_right_context: 1,
+                fifo_len: 0,
+                spkcache_update_period: 188,
+                ..production_workspace_streaming_config()
+            },
+            SortformerEncoderKind::Conformer,
+        ),
+        ModelVariant::Nemotron3Diarization => (
+            SortformerWorkspaceTopology::nemotron3_production(),
+            nemotron3_checkpoint_streaming_config(),
+            SortformerEncoderKind::FeatureStackingRope,
+        ),
+        other => {
+            return Err(Error::InvalidInput(format!(
+                "{other} is not a Sortformer diarizer"
+            )))
+        }
+    };
+    let cfg = apply_streaming_profile(
+        checkpoint,
+        encoder_kind,
+        SortformerStreamingProfile::DEFAULT,
+    );
+    workspace_estimate_for(topology, cfg, target_sample_count, separate_device_memory)
 }
 
 fn workspace_estimate_for(
@@ -559,7 +970,13 @@ fn workspace_estimate_for(
             },
         ) => {
             // Conv subsampling's first output is the largest
-            // duration/frequency activation of the encoder stack.
+            // duration/frequency activation of the encoder stack. The
+            // dw_striding chain holds at most three of it at once: the conv0
+            // matmul result and its NCHW copy, then that copy and its ReLU
+            // output; the depthwise stage after it holds the ReLU output plus
+            // two quarter-size tensors (per-group outputs and their `cat`).
+            // Live malloc bytes peaked at 2.02x conv0's output (+96.2 MiB at
+            // 1,520 feature frames), against the 8x counted before.
             let conv_t = u(chunk_feature_frames.div_ceil(2));
             let conv_f = u(topology.feature_bins.div_ceil(2));
             let conv_elements = conv_t * conv_f * u(conv_channels);
@@ -576,7 +993,7 @@ fn workspace_estimate_for(
                 u(transformer_heads) * u(composite_frames) * u(composite_frames);
             let transformer_elements =
                 transformer_linear * 20 + transformer_ff * 4 + transformer_scores * 4;
-            conv_elements * 8 + conformer_elements + transformer_elements + conformer_linear * 8
+            conv_elements * 3 + conformer_elements + transformer_elements + conformer_linear * 8
         }
         (
             SortformerEncoderTopology::FeatureStackingRope {
@@ -610,9 +1027,9 @@ fn workspace_estimate_for(
             )))
         }
     };
-    let accelerator_bytes = (feature_elements + graph_elements)
-        * f32_bytes
-        * u(SORTFORMER_TENSOR_SAFETY_FACTOR as usize);
+    let accelerator_bytes =
+        ((feature_elements + graph_elements) * f32_bytes * SORTFORMER_WORKSPACE_SAFETY_PERCENT)
+            .div_ceil(100);
 
     let to_u64 = |bytes: u128, domain: &str| {
         u64::try_from(bytes).map_err(|_| {
@@ -633,26 +1050,133 @@ struct SortformerStreamingChunkPlan {
     right_offset: usize,
 }
 
+/// `(rows, D)` embeddings kept on the model device. Empty is `None`, so no
+/// zero-sized tensor reaches a device kernel. Every operation is an exact
+/// copy (`narrow`, `cat`, `index_select`), so the values match the host rows
+/// they replace bit for bit.
+#[derive(Debug, Clone, Default)]
+struct EmbeddingRows(Option<Tensor>);
+
+impl EmbeddingRows {
+    fn new(tensor: Tensor) -> Result<Self> {
+        let (rows, _) = tensor.dims2()?;
+        Ok(Self((rows > 0).then_some(tensor)))
+    }
+
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, |tensor| tensor.dims()[0])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn tensor(&self) -> Option<&Tensor> {
+        self.0.as_ref()
+    }
+
+    fn narrow(&self, start: usize, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Ok(Self(None));
+        }
+        let tensor = self.0.as_ref().ok_or_else(|| {
+            Error::InferenceError("Sortformer embedding rows out of range".into())
+        })?;
+        Ok(Self(Some(tensor.narrow(0, start, len)?)))
+    }
+
+    fn cat(parts: &[&Self]) -> Result<Self> {
+        let tensors = parts
+            .iter()
+            .filter_map(|part| part.0.as_ref())
+            .collect::<Vec<_>>();
+        Ok(Self(match tensors.as_slice() {
+            [] => None,
+            [only] => Some((*only).clone()),
+            many => Some(Tensor::cat(many, 0)?),
+        }))
+    }
+
+    fn index_select(&self, indices: &[u32]) -> Result<Self> {
+        if indices.is_empty() {
+            return Ok(Self(None));
+        }
+        let tensor = self.0.as_ref().ok_or_else(|| {
+            Error::InferenceError("Sortformer embedding rows out of range".into())
+        })?;
+        let indices = Tensor::from_slice(indices, indices.len(), tensor.device())?;
+        Ok(Self(Some(tensor.index_select(&indices, 0)?)))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SortformerStreamingState {
-    spkcache: Vec<Vec<f32>>,
+    spkcache: EmbeddingRows,
     spkcache_preds: Option<Vec<Vec<f32>>>,
-    fifo: Vec<Vec<f32>>,
+    fifo: EmbeddingRows,
     fifo_preds: Vec<Vec<f32>>,
     mean_sil_emb: Vec<f32>,
     n_sil_frames: usize,
+    /// Device-to-host reads the state update made (silent FIFO rows for the
+    /// running silence mean).
+    host_reads: u64,
 }
 
 impl SortformerStreamingState {
     fn new(emb_dim: usize) -> Self {
         Self {
-            spkcache: Vec::new(),
+            spkcache: EmbeddingRows::default(),
             spkcache_preds: None,
-            fifo: Vec::new(),
+            fifo: EmbeddingRows::default(),
             fifo_preds: Vec::new(),
             mean_sil_emb: vec![0.0; emb_dim],
             n_sil_frames: 0,
+            host_reads: 0,
         }
+    }
+}
+
+/// Per-model counters for the streaming loop (SRT-7), reported under
+/// `streaming_path` in `family_diagnostics`.
+#[derive(Debug, Default)]
+struct SortformerStreamingCounters {
+    chunks: AtomicU64,
+    /// Bounded steps the streaming passes ran in (PIPE-8): one per pass when
+    /// it runs whole, one per runtime stage when it is staged.
+    steps: AtomicU64,
+    host_reads: AtomicU64,
+    physical_state_commits: AtomicU64,
+}
+
+/// A streaming pass that runs in bounded steps (PIPE-8): its chunk plan, the
+/// streaming state, and the probabilities so far. A step may run as its own
+/// runtime stage, so a long file does not hold an execution permit for its
+/// whole pass.
+#[derive(Debug)]
+pub(crate) struct SortformerStream {
+    cfg: SortformerStreamingConfig,
+    sample_count: usize,
+    feature_frames: usize,
+    plans: Vec<SortformerStreamingChunkPlan>,
+    next_plan: usize,
+    chunks_per_step: usize,
+    /// `None` only while a step runs.
+    state: Option<SortformerStreamingState>,
+    track_silence_mean: bool,
+    total_preds: Vec<Vec<f32>>,
+    chunks: u64,
+    host_reads: u64,
+}
+
+impl SortformerStream {
+    /// Every chunk has run; the stream can finish.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.next_plan >= self.plans.len()
+    }
+
+    /// Steps left before the stream can finish.
+    pub(crate) fn steps_remaining(&self) -> usize {
+        (self.plans.len() - self.next_plan).div_ceil(self.chunks_per_step)
     }
 }
 
@@ -831,22 +1355,25 @@ fn commit_sortformer_streaming_state(
 }
 
 fn padded_embedding_tensor(
-    rows: &[Vec<f32>],
+    rows: &EmbeddingRows,
     capacity: usize,
     hidden: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    let mut flat = vec![0.0_f32; capacity.saturating_mul(hidden)];
-    for (index, row) in rows.iter().enumerate() {
-        if row.len() != hidden {
-            return Err(Error::InferenceError(format!(
-                "Sortformer embedding row has width {}; expected {hidden}",
-                row.len()
-            )));
-        }
-        flat[index * hidden..(index + 1) * hidden].copy_from_slice(row);
+    let Some(tensor) = rows.tensor() else {
+        return Tensor::zeros((capacity, hidden), DType::F32, device).map_err(Error::from);
+    };
+    let (len, width) = tensor.dims2()?;
+    if width != hidden || len > capacity {
+        return Err(Error::InferenceError(format!(
+            "Sortformer embedding rows [{len}, {width}] do not fit [{capacity}, {hidden}]"
+        )));
     }
-    Tensor::from_vec(flat, (capacity, hidden), device).map_err(Error::from)
+    tensor
+        .to_device(device)?
+        .pad_with_zeros(0, 0, capacity - len)?
+        .contiguous()
+        .map_err(Error::from)
 }
 
 fn padded_prediction_tensor(
@@ -880,14 +1407,12 @@ const SORTFORMER_SCORE_BOOST_DELTA: f32 = std::f32::consts::LN_2;
 /// Speaker-channel count pinned by each served Sortformer checkpoint.
 /// The checkpoint YAML must agree or the load fails closed.
 fn expected_speaker_count(variant: ModelVariant) -> Result<usize> {
-    match variant {
-        ModelVariant::DiarStreamingSortformer4SpkV21 => Ok(4),
-        ModelVariant::Nemotron3Diarization => Ok(8),
-        _ => Err(Error::ModelLoadError(format!(
+    variant.diarization_speaker_channels().ok_or_else(|| {
+        Error::ModelLoadError(format!(
             "Unsupported Sortformer diarization variant: {}",
             variant.dir_name()
-        ))),
-    }
+        ))
+    })
 }
 
 pub struct SortformerDiarizerModel {
@@ -959,12 +1484,18 @@ impl SortformerDiarizerModel {
 
         let expected_spks = expected_speaker_count(variant)?;
         let num_spks = config.max_num_of_spks.unwrap_or(expected_spks);
-        if num_spks != expected_spks {
+        let module_spks = config
+            .sortformer_modules
+            .as_ref()
+            .and_then(|modules| modules.num_spks)
+            .unwrap_or(num_spks);
+        if num_spks != expected_spks || module_spks != expected_spks {
             return Err(Error::ModelLoadError(format!(
-                "Unsupported Sortformer speaker count {num_spks}; {} expects {expected_spks}",
+                "Unsupported Sortformer speaker count {num_spks} (sortformer_modules.num_spks {module_spks}); {} expects {expected_spks}",
                 variant.dir_name()
             )));
         }
+        let graph = resolve_graph_spec(&config)?;
 
         let device = sortformer_model_device(&device_profile);
         let vb =
@@ -994,20 +1525,48 @@ impl SortformerDiarizerModel {
         let model = SortformerInferenceModel::load(
             &vb,
             preprocessor_cfg,
-            variant,
+            resolve_streaming_profile(),
             num_spks,
             streaming_mode,
-            config.encoder.clone(),
+            graph,
             modules_cfg.clone(),
             device.clone(),
             device_profile.kind.is_cuda(),
         )?;
 
-        Ok(Self {
+        let model = Self {
             variant,
             _artifacts: artifacts,
             _checkpoint_tensor_count: tensor_info.len(),
             model,
+        };
+        tracing::info!(
+            "{} streams with the {} profile: {}",
+            variant.dir_name(),
+            model.model.streaming_profile.name(),
+            model.family_diagnostics()
+        );
+        Ok(model)
+    }
+
+    /// The active streaming profile and geometry, for loaded-model
+    /// diagnostics.
+    pub fn family_diagnostics(&self) -> serde_json::Value {
+        let streaming = self.model.streaming.map(|cfg| {
+            serde_json::json!({
+                "chunk_len": cfg.chunk_len,
+                "chunk_left_context": cfg.chunk_left_context,
+                "chunk_right_context": cfg.chunk_right_context,
+                "fifo_len": cfg.fifo_len,
+                "spkcache_update_period": cfg.spkcache_update_period,
+                "spkcache_len": cfg.spkcache_len,
+            })
+        });
+        serde_json::json!({
+            "streaming_profile": self.model.streaming_profile.name(),
+            "streaming": streaming,
+            "kernels": self.model.encoder.kernel_diagnostics(),
+            "streaming_path": self.model.streaming_path_diagnostics(),
         })
     }
 
@@ -1039,26 +1598,7 @@ impl SortformerDiarizerModel {
     where
         F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
     {
-        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, None, observer)
-    }
-
-    pub(crate) fn diarize_with_workspace_observer_physical<F>(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        config: &DiarizationConfig,
-        state: &mut InvocationTensorLease,
-        observer: F,
-    ) -> Result<DiarizationResult>
-    where
-        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
-    {
-        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
-            return Err(Error::InferenceError(
-                "Sortformer received a foreign physical streaming domain".into(),
-            ));
-        }
-        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, Some(state), observer)
+        self.diarize_with_workspace_observer_impl(audio, sample_rate, config, observer)
     }
 
     fn diarize_with_workspace_observer_impl<F>(
@@ -1066,7 +1606,6 @@ impl SortformerDiarizerModel {
         audio: &[f32],
         sample_rate: u32,
         config: &DiarizationConfig,
-        physical_state: Option<&mut InvocationTensorLease>,
         mut observer: F,
     ) -> Result<DiarizationResult>
     where
@@ -1078,12 +1617,14 @@ impl SortformerDiarizerModel {
         if sample_rate == 0 {
             return Err(Error::InvalidInput("Invalid sample rate: 0".to_string()));
         }
+        self.validate_speaker_limits(config)?;
 
         let resampled_samples;
         let samples = if sample_rate == TARGET_SAMPLE_RATE {
             audio
         } else {
-            resampled_samples = resample_linear(audio, sample_rate, TARGET_SAMPLE_RATE);
+            resampled_samples =
+                crate::audio::resample_mono_high_quality(audio, sample_rate, TARGET_SAMPLE_RATE)?;
             &resampled_samples
         };
 
@@ -1098,24 +1639,126 @@ impl SortformerDiarizerModel {
         let workspace_estimate = self.model.workspace_estimate(samples.len())?;
         let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
 
-        let (speaker_probs, frame_stride_samples) = match physical_state {
-            Some(state) => self
-                .model
-                .infer_speaker_probabilities_physical(samples, state)?,
-            None => self.model.infer_speaker_probabilities(samples)?,
+        let (speaker_probs, frame_stride_samples) =
+            self.model.infer_speaker_probabilities(samples)?;
+        let result =
+            self.segments_from_probabilities(samples, speaker_probs, frame_stride_samples, config);
+        workspace.release()?;
+        Ok(result)
+    }
+
+    fn validate_speaker_limits(&self, config: &DiarizationConfig) -> Result<()> {
+        crate::catalog::validate_diarization_speaker_limits(
+            config.min_speakers,
+            config.max_speakers,
+            self.model.num_speakers,
+        )
+        .map_err(Error::InvalidInput)
+    }
+
+    /// Start a diarization of 16 kHz `audio` that runs in steps of about
+    /// `step_audio_secs` each (PIPE-8). Run [`Self::advance_stream`] until the
+    /// stream is finished, then [`Self::finish_stream_physical`]; the result
+    /// is the one [`Self::diarize`] gives, bit for bit.
+    pub(crate) fn begin_stream(
+        &self,
+        audio: &[f32],
+        config: &DiarizationConfig,
+        step_audio_secs: f32,
+    ) -> Result<SortformerStream> {
+        if audio.is_empty() {
+            return Err(Error::InvalidInput("Empty audio input".to_string()));
+        }
+        self.validate_speaker_limits(config)?;
+        let cfg = self.model.streaming.ok_or_else(|| {
+            Error::InferenceError("staged Sortformer requires the bounded streaming path".into())
+        })?;
+        let feature_frames = self.model.preprocessor.feature_frame_count(audio.len());
+        Ok(self.model.begin_stream(
+            audio.len(),
+            feature_frames,
+            cfg,
+            chunks_per_stream_step(cfg, self.model.preprocessor.hop_length, step_audio_secs),
+        ))
+    }
+
+    /// Run the stream's next step under the per-stage workspace observer.
+    pub(crate) fn advance_stream<F>(
+        &self,
+        stream: &mut SortformerStream,
+        audio: &[f32],
+        mut observer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        let workspace_estimate = self.model.workspace_estimate(audio.len())?;
+        let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
+        self.model.advance_stream(stream, audio)?;
+        workspace.release()
+    }
+
+    /// Commit a finished stream's final cache to the invocation state and
+    /// turn its probabilities into speaker segments.
+    pub(crate) fn finish_stream_physical<F>(
+        &self,
+        stream: SortformerStream,
+        audio: &[f32],
+        config: &DiarizationConfig,
+        state: &mut InvocationTensorLease,
+        mut observer: F,
+    ) -> Result<DiarizationResult>
+    where
+        F: FnMut(SortformerWorkspaceEvent) -> Result<()>,
+    {
+        if state.domain() != physical::SORTFORMER_STREAMING_STATE_DOMAIN {
+            return Err(Error::InferenceError(
+                "Sortformer received a foreign physical streaming domain".into(),
+            ));
+        }
+        if stream.sample_count != audio.len() {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream over {} samples finished with {}",
+                stream.sample_count,
+                audio.len()
+            )));
+        }
+        let workspace_estimate = self.model.workspace_estimate(audio.len())?;
+        let workspace = SortformerWorkspaceGuard::new(&mut observer, workspace_estimate)?;
+        let speaker_probs = if stream.feature_frames == 0 {
+            Vec::new()
+        } else {
+            self.model.finish_stream(stream, Some(state))?
         };
+        let result = self.segments_from_probabilities(
+            audio,
+            speaker_probs,
+            self.model.probs_frame_stride_samples()?,
+            config,
+        );
+        workspace.release()?;
+        Ok(result)
+    }
+
+    /// Speaker segments from the probability rows of 16 kHz `samples`.
+    fn segments_from_probabilities(
+        &self,
+        samples: &[f32],
+        speaker_probs: Vec<Vec<f32>>,
+        frame_stride_samples: usize,
+        config: &DiarizationConfig,
+    ) -> DiarizationResult {
+        let duration_secs = samples.len() as f32 / TARGET_SAMPLE_RATE as f32;
         // Probability rows expand to the 10 ms timeline either because the
         // head runs at the encoded rate (v2.1, repeated in post-processing)
         // or because the upsampler already emitted 10 ms rows (Nemotron-3).
         let frame_repeat = (frame_stride_samples / self.model.preprocessor.hop_length).max(1);
         if speaker_probs.is_empty() {
-            let result = DiarizationResult {
+            return DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
             };
-            workspace.release()?;
-            return Ok(result);
         }
 
         let explicit_min_speech_ms = config
@@ -1136,42 +1779,40 @@ impl SortformerDiarizerModel {
                     5000.0,
                 )
             });
-        let min_speech_ms = explicit_min_speech_ms
-            .unwrap_or(DEFAULT_MIN_SPEECH_MS)
-            .clamp(
-                frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
-                5000.0,
+        // D3: NeMo has no external VAD gate; Sortformer is itself the speech
+        // detector. The opt-in gate keeps whole probabilities and clips the
+        // post-processed segments to padded VAD speech regions instead.
+        let vad_regions = if resolve_vad_gate(config) {
+            let min_speech_ms = explicit_min_speech_ms
+                .unwrap_or(DEFAULT_MIN_SPEECH_MS)
+                .clamp(
+                    frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
+                    5000.0,
+                );
+            let min_silence_ms = explicit_min_silence_ms
+                .unwrap_or(DEFAULT_MIN_SILENCE_MS)
+                .clamp(
+                    frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
+                    5000.0,
+                );
+            let vad_mask = sortformer_vad_frame_mask(
+                samples,
+                speaker_probs.len(),
+                frame_stride_samples,
+                min_speech_ms,
+                min_silence_ms,
             );
-        let min_silence_ms = explicit_min_silence_ms
-            .unwrap_or(DEFAULT_MIN_SILENCE_MS)
-            .clamp(
-                frame_stride_samples as f32 * 1000.0 / TARGET_SAMPLE_RATE as f32,
-                5000.0,
-            );
-
-        let mut gated_probs = speaker_probs;
-        let frame_count = gated_probs.len();
-        let vad_mask = sortformer_vad_frame_mask(
-            samples,
-            frame_count,
-            frame_stride_samples,
-            min_speech_ms,
-            min_silence_ms,
-        );
+            Some(padded_vad_regions(&vad_mask, frame_stride_samples))
+        } else {
+            None
+        };
+        let gated_probs = speaker_probs;
 
         let num_speakers = self.model.num_speakers;
-        for (frame_idx, active) in vad_mask.iter().copied().enumerate() {
-            if !active {
-                for spk in 0..num_speakers {
-                    gated_probs[frame_idx][spk] = 0.0;
-                }
-            }
-        }
 
-        let requested_max = config.max_speakers.unwrap_or(num_speakers);
-        let max_speakers = requested_max.clamp(1, num_speakers);
-        let requested_min = config.min_speakers.unwrap_or(1);
-        let min_speakers = requested_min.clamp(1, max_speakers);
+        // Limits above the channel count were refused up front.
+        let max_speakers = config.max_speakers.unwrap_or(num_speakers).max(1);
+        let min_speakers = config.min_speakers.unwrap_or(1).clamp(1, max_speakers);
         let limit_speaker_channels = should_limit_speaker_channels(config);
 
         let postprocessing_params =
@@ -1180,12 +1821,15 @@ impl SortformerDiarizerModel {
         let mut raw_segments = Vec::<RawSegment>::new();
         let mut speaker_stats = Vec::<SpeakerActivityStats>::new();
         for speaker_idx in 0..num_speakers {
-            let speaker_segments = ts_vad_post_processing(
+            let mut speaker_segments = predlist_to_timestamps(
                 &gated_probs,
                 speaker_idx,
                 &postprocessing_params,
                 frame_repeat,
             );
+            if let Some(regions) = &vad_regions {
+                speaker_segments = gate_segments(&speaker_segments, regions);
+            }
             if speaker_segments.is_empty() {
                 if limit_speaker_channels {
                     speaker_stats.push(SpeakerActivityStats {
@@ -1242,22 +1886,22 @@ impl SortformerDiarizerModel {
         }
 
         if raw_segments.is_empty() {
-            let result = DiarizationResult {
+            return DiarizationResult {
                 segments: Vec::new(),
                 duration_secs,
                 speaker_count: 0,
             };
-            drop(speaker_stats);
-            drop(vad_mask);
-            drop(gated_probs);
-            workspace.release()?;
-            return Ok(result);
         }
 
         if limit_speaker_channels {
             let selected_speakers =
                 select_speaker_channels(&speaker_stats, min_speakers, max_speakers, num_speakers);
-            raw_segments.retain(|segment| selected_speakers.contains(&segment.speaker_idx));
+            reassign_dropped_speaker_segments(
+                &mut raw_segments,
+                &selected_speakers,
+                &gated_probs,
+                frame_stride_samples,
+            );
         }
 
         raw_segments.sort_by(|a, b| {
@@ -1322,19 +1966,11 @@ impl SortformerDiarizerModel {
             .collect::<std::collections::BTreeSet<_>>()
             .len();
 
-        drop(speaker_labels);
-        drop(speaker_remap);
-        drop(ordered);
-        drop(speaker_stats);
-        drop(vad_mask);
-        drop(gated_probs);
-        let result = DiarizationResult {
+        DiarizationResult {
             segments,
             duration_secs,
             speaker_count,
-        };
-        workspace.release()?;
-        Ok(result)
+        }
     }
 
     pub fn variant(&self) -> ModelVariant {
@@ -1343,15 +1979,18 @@ impl SortformerDiarizerModel {
 }
 
 fn sortformer_model_device(device_profile: &DeviceProfile) -> Device {
-    if sortformer_uses_selected_model_device(device_profile.kind) {
+    if sortformer_uses_selected_model_device(BackendKind::from(device_profile.kind)) {
         device_profile.device.clone()
     } else {
         Device::Cpu
     }
 }
 
-fn sortformer_uses_selected_model_device(kind: DeviceKind) -> bool {
-    kind.is_cuda()
+/// Whether the weights live on the `backend`'s device: only CUDA; Metal and
+/// CPU loads keep them in host memory (on Metal, outside what the Metal
+/// device observer sees). Load admission prices the same placement.
+pub(crate) fn sortformer_uses_selected_model_device(backend: BackendKind) -> bool {
+    backend == BackendKind::Cuda
 }
 
 #[derive(Debug, Clone)]
@@ -1391,19 +2030,21 @@ struct SortformerInferenceModel {
     head: SortformerSpeakerHead,
     num_speakers: usize,
     streaming: Option<SortformerStreamingConfig>,
+    streaming_profile: SortformerStreamingProfile,
     /// Nemotron-3's learned silence embedding used for cache silence slots;
     /// v2.1 keeps None and tracks a running silence mean instead.
     silence_embedding: Option<Vec<f32>>,
+    streaming_counters: SortformerStreamingCounters,
 }
 
 impl SortformerInferenceModel {
     fn load(
         vb: &VarBuilder,
         preprocessor_cfg: SortformerPreprocessorConfig,
-        variant: ModelVariant,
+        profile: SortformerStreamingProfile,
         num_spks: usize,
         streaming_mode: bool,
-        encoder_cfg: Option<SortformerEncoderConfig>,
+        graph: SortformerGraphSpec,
         modules_cfg: SortformerModulesConfig,
         device: Device,
         separate_device_memory: bool,
@@ -1415,20 +2056,35 @@ impl SortformerInferenceModel {
         }
         let feature_bins = preprocessor_cfg.features.unwrap_or(128);
         let preprocessor = SortformerPreprocessor::load(vb, preprocessor_cfg)?;
-        let encoder_kind = resolve_encoder_kind(encoder_cfg.as_ref())?;
-        let encoder = match encoder_kind {
-            SortformerEncoderKind::Conformer => SortformerAcousticEncoder::Conformer(
-                SortformerConformerEncoder::load(
-                    vb.pp("encoder"),
-                    encoder_cfg.and_then(|cfg| cfg.xscaling).unwrap_or(true),
-                )?,
-            ),
-            SortformerEncoderKind::FeatureStackingRope => {
-                SortformerAcousticEncoder::FeatureStackingRope(SortformerRopeEncoder::load(
-                    vb.pp("encoder"),
-                    feature_bins,
-                )?)
+        let encoder_kind = graph.encoder_kind();
+        let encoder = match graph {
+            SortformerGraphSpec::Conformer {
+                heads, xscaling, ..
+            } => {
+                let encoder = SortformerConformerEncoder::load(vb.pp("encoder"), xscaling)?;
+                if let Some(layer) = encoder
+                    .layers
+                    .iter()
+                    .find(|layer| layer.self_attn.num_heads != heads)
+                {
+                    return Err(Error::ModelLoadError(format!(
+                        "Sortformer config encoder.n_heads = {heads} does not match the checkpoint's {} relative-position heads",
+                        layer.self_attn.num_heads
+                    )));
+                }
+                SortformerAcousticEncoder::Conformer(encoder)
             }
+            SortformerGraphSpec::FeatureStackingRope {
+                heads,
+                stacking_factor,
+                rope_base,
+            } => SortformerAcousticEncoder::FeatureStackingRope(SortformerRopeEncoder::load(
+                vb.pp("encoder"),
+                feature_bins,
+                heads,
+                stacking_factor,
+                rope_base,
+            )?),
         };
 
         let encoder_proj_w = vb
@@ -1438,13 +2094,20 @@ impl SortformerInferenceModel {
         let encoder_proj =
             mlx::load_linear(proj_in, proj_out, vb.pp("sortformer_modules.encoder_proj"))?;
 
-        let expander = match encoder_kind {
-            SortformerEncoderKind::Conformer => SortformerFrameExpander::SortformerTransformer(
-                SortformerTransformerEncoder::load(vb.pp("transformer_encoder"))?,
-            ),
-            SortformerEncoderKind::FeatureStackingRope => SortformerFrameExpander::SubpixelUpsampler(
-                SortformerSubpixelUpsampler::load(vb.pp("sortformer_modules"))?,
-            ),
+        let expander = match graph {
+            SortformerGraphSpec::Conformer {
+                transformer_heads, ..
+            } => {
+                SortformerFrameExpander::SortformerTransformer(SortformerTransformerEncoder::load(
+                    vb.pp("transformer_encoder"),
+                    transformer_heads,
+                )?)
+            }
+            SortformerGraphSpec::FeatureStackingRope { .. } => {
+                SortformerFrameExpander::SubpixelUpsampler(SortformerSubpixelUpsampler::load(
+                    vb.pp("sortformer_modules"),
+                )?)
+            }
         };
         let head = SortformerSpeakerHead::load(vb.pp("sortformer_modules"), num_spks)?;
         let silence_embedding = match encoder_kind {
@@ -1464,7 +2127,7 @@ impl SortformerInferenceModel {
             }
         };
         let streaming = resolve_streaming_config(
-            variant,
+            profile,
             &modules_cfg,
             encoder.d_model(),
             num_spks,
@@ -1481,7 +2144,9 @@ impl SortformerInferenceModel {
             head,
             num_speakers: num_spks,
             streaming: Some(streaming),
+            streaming_profile: profile,
             silence_embedding,
+            streaming_counters: SortformerStreamingCounters::default(),
         };
         model.validate_production_topology(proj_in, proj_out)?;
         Ok(model)
@@ -1681,34 +2346,6 @@ impl SortformerInferenceModel {
         Ok((out, self.probs_frame_stride_samples()?))
     }
 
-    fn infer_speaker_probabilities_physical(
-        &self,
-        samples: &[f32],
-        state: &mut InvocationTensorLease,
-    ) -> Result<(Vec<Vec<f32>>, usize)> {
-        let feature_frames = self.preprocessor.feature_frame_count(samples.len());
-        if feature_frames == 0 {
-            return Ok((Vec::new(), self.probs_frame_stride_samples()?));
-        }
-        let streaming_cfg = self.streaming.ok_or_else(|| {
-            Error::InferenceError(
-                "Sortformer physical state requires the bounded streaming path".into(),
-            )
-        })?;
-        if state.arena()?.absolute_cursor() != 0 {
-            return Err(Error::InferenceError(
-                "Sortformer invocation state was not reset before inference".into(),
-            ));
-        }
-        let out = self.infer_speaker_probabilities_streaming(
-            samples,
-            feature_frames,
-            streaming_cfg,
-            Some(state),
-        )?;
-        Ok((out, self.probs_frame_stride_samples()?))
-    }
-
     fn infer_speaker_probabilities_offline(
         &self,
         features: &Tensor,
@@ -1727,15 +2364,65 @@ impl SortformerInferenceModel {
         samples: &[f32],
         feature_frames: usize,
         cfg: SortformerStreamingConfig,
-        mut physical_state: Option<&mut InvocationTensorLease>,
+        physical_state: Option<&mut InvocationTensorLease>,
     ) -> Result<Vec<Vec<f32>>> {
+        let mut stream = self.begin_stream(samples.len(), feature_frames, cfg, usize::MAX);
+        self.advance_stream(&mut stream, samples)?;
+        self.finish_stream(stream, physical_state)
+    }
+
+    /// Start a streaming pass over `sample_count` samples whose steps each
+    /// run at most `chunks_per_step` chunks.
+    fn begin_stream(
+        &self,
+        sample_count: usize,
+        feature_frames: usize,
+        cfg: SortformerStreamingConfig,
+        chunks_per_step: usize,
+    ) -> SortformerStream {
         let mut state = SortformerStreamingState::new(cfg.fc_d_model);
         if let Some(silence) = &self.silence_embedding {
             state.mean_sil_emb = silence.clone();
         }
-        let track_silence_mean = self.silence_embedding.is_none();
-        let mut total_preds = Vec::new();
-        for plan in plan_streaming_feature_chunks(feature_frames, cfg) {
+        SortformerStream {
+            cfg,
+            sample_count,
+            feature_frames,
+            plans: plan_streaming_feature_chunks(feature_frames, cfg),
+            next_plan: 0,
+            chunks_per_step: chunks_per_step.max(1),
+            state: Some(state),
+            track_silence_mean: self.silence_embedding.is_none(),
+            total_preds: Vec::new(),
+            chunks: 0,
+            host_reads: 0,
+        }
+    }
+
+    /// Run the stream's next step: up to `chunks_per_step` chunks. The state
+    /// carries over unchanged between steps, so any split of the chunks into
+    /// steps gives the probabilities of one uninterrupted pass, bit for bit.
+    fn advance_stream(&self, stream: &mut SortformerStream, samples: &[f32]) -> Result<()> {
+        if samples.len() != stream.sample_count {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream over {} samples resumed with {}",
+                stream.sample_count,
+                samples.len()
+            )));
+        }
+        let cfg = stream.cfg;
+        let mut state = stream
+            .state
+            .take()
+            .ok_or_else(|| Error::InferenceError("Sortformer stream state was lost".into()))?;
+        let end = stream
+            .next_plan
+            .saturating_add(stream.chunks_per_step)
+            .min(stream.plans.len());
+        // The cache, FIFO and chunk embeddings stay on the model device; the
+        // only per-chunk host reads are the probabilities (once) and, for the
+        // running silence mean, the silent rows popped from the FIFO.
+        for plan in &stream.plans[stream.next_plan..end] {
             let chunk = self
                 .preprocessor
                 .compute_feature_range(samples, plan.feature_start, plan.feature_end)?
@@ -1748,79 +2435,117 @@ impl SortformerInferenceModel {
                 continue;
             }
 
-            let chunk_rows = tensor_to_embedding_rows(&chunk_pre_encoded, chunk_pre_encoded_len)?;
-            let mut composite_rows =
-                Vec::with_capacity(state.spkcache.len() + state.fifo.len() + chunk_rows.len());
-            composite_rows.extend(state.spkcache.iter().cloned());
-            composite_rows.extend(state.fifo.iter().cloned());
-            composite_rows.extend(chunk_rows.iter().cloned());
-            if composite_rows.is_empty() {
+            let chunk_rows =
+                EmbeddingRows::new(chunk_pre_encoded.i((0, ..chunk_pre_encoded_len, ..))?)?;
+            let composite = EmbeddingRows::cat(&[&state.spkcache, &state.fifo, &chunk_rows])?;
+            let Some(composite) = composite.tensor() else {
                 continue;
-            }
+            };
+            stream.chunks += 1;
 
-            let composite = tensor_from_embedding_rows(
-                &composite_rows,
-                cfg.fc_d_model,
-                chunk_pre_encoded.device(),
-            )?;
-            let (encoded, encoded_len) = self.encoder.forward_pre_encoded(
-                &composite,
-                state.spkcache.len() + state.fifo.len() + chunk_rows.len(),
-            )?;
+            let composite_len = composite.dim(0)?;
+            let (encoded, encoded_len) = self
+                .encoder
+                .forward_pre_encoded(&composite.unsqueeze(0)?, composite_len)?;
             let probs = self.forward_probabilities(&encoded, encoded_len)?;
+            let output_rows = encoded_len * cfg.output_frames_per_encoded_frame;
+            let prob_rows = tensor_to_probability_rows(&probs, output_rows, self.num_speakers)?;
+            stream.host_reads += 1;
+            let pooled;
             let pred_rows = if cfg.output_frames_per_encoded_frame == 1 {
-                tensor_to_probability_rows(&probs, encoded_len, self.num_speakers)?
+                &prob_rows
             } else {
-                let mut pooled = pool_upsampled_probabilities(
-                    &probs,
+                // A trailing encoded frame over a zero-padded mel group keeps
+                // its pooled probability, as in NeMo (which masks by the
+                // encoder length, ceil(T / 8)) and HF (NDZ-6).
+                pooled = pool_probability_rows(
+                    &prob_rows,
                     encoded_len,
                     cfg.output_frames_per_encoded_frame,
                     self.num_speakers,
                 )?;
-                // A trailing encoded frame whose stacked mel group was
-                // zero-padded is not a real frame: the reference masks it to
-                // zero probability before the cache sees it.
-                let chunk_mel_frames = plan.feature_end - plan.feature_start;
-                if chunk_mel_frames % cfg.output_frames_per_encoded_frame != 0 {
-                    if let Some(last) = pooled.last_mut() {
-                        last.fill(0.0);
-                    }
-                }
-                pooled
+                &pooled
             };
             let (updated_state, _chunk_preds, output_range) = update_streaming_state(
                 state,
                 &chunk_rows,
-                &pred_rows,
+                pred_rows,
                 pre_encoded_left_offset(plan.left_offset, cfg.subsampling_factor),
                 pre_encoded_right_offset(plan.right_offset, cfg.subsampling_factor),
-                track_silence_mean,
+                stream.track_silence_mean,
                 cfg,
             )?;
-            state = if let Some(lease) = physical_state.as_deref_mut() {
-                commit_sortformer_streaming_state(lease, cfg, &updated_state)?;
-                updated_state
-            } else {
-                updated_state
-            };
-            if output_range.is_empty() {
-                continue;
-            }
-            let output_len = output_range.len();
-            let chunk_output = probs.i((.., output_range, ..))?;
-            total_preds.extend(tensor_to_probability_rows(
-                &chunk_output,
-                output_len,
-                self.num_speakers,
-            )?);
+            state = updated_state;
+            stream
+                .total_preds
+                .extend_from_slice(&prob_rows[output_range]);
         }
+        stream.state = Some(state);
+        stream.next_plan = end;
+        self.streaming_counters
+            .steps
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The probabilities of a stream that has run every chunk. With
+    /// `physical_state` the final cache is committed to the invocation state.
+    fn finish_stream(
+        &self,
+        mut stream: SortformerStream,
+        physical_state: Option<&mut InvocationTensorLease>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if !stream.is_finished() {
+            return Err(Error::InferenceError(format!(
+                "Sortformer stream finished after {} of {} chunks",
+                stream.next_plan,
+                stream.plans.len()
+            )));
+        }
+        let cfg = stream.cfg;
+        let state = stream
+            .state
+            .take()
+            .ok_or_else(|| Error::InferenceError("Sortformer stream state was lost".into()))?;
+        let host_reads = stream.host_reads + state.host_reads;
+        // Nothing reads the invocation state back while the stream runs, so
+        // it is committed once, with the final cache, instead of being staged
+        // on the arena device after every chunk.
+        if let Some(lease) = physical_state {
+            if lease.arena()?.absolute_cursor() != 0 {
+                return Err(Error::InferenceError(
+                    "Sortformer invocation state was not reset before inference".into(),
+                ));
+            }
+            commit_sortformer_streaming_state(lease, cfg, &state)?;
+            self.streaming_counters
+                .physical_state_commits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.streaming_counters
+            .chunks
+            .fetch_add(stream.chunks, Ordering::Relaxed);
+        self.streaming_counters
+            .host_reads
+            .fetch_add(host_reads, Ordering::Relaxed);
+        let mut total_preds = stream.total_preds;
         if cfg.output_frames_per_encoded_frame > 1 {
             // The upsampler pads the final stacked group; trim the trailing
             // rows back to the mel frame count.
-            total_preds.truncate(feature_frames);
+            total_preds.truncate(stream.feature_frames);
         }
 
         Ok(total_preds)
+    }
+
+    fn streaming_path_diagnostics(&self) -> serde_json::Value {
+        let counters = &self.streaming_counters;
+        serde_json::json!({
+            "chunks": counters.chunks.load(Ordering::Relaxed),
+            "steps": counters.steps.load(Ordering::Relaxed),
+            "host_reads": counters.host_reads.load(Ordering::Relaxed),
+            "physical_state_commits": counters.physical_state_commits.load(Ordering::Relaxed),
+        })
     }
 
     fn forward_probabilities(&self, encoded: &Tensor, encoded_len: usize) -> Result<Tensor> {
@@ -1843,13 +2568,13 @@ impl SortformerInferenceModel {
 }
 
 fn resolve_streaming_config(
-    variant: ModelVariant,
+    profile: SortformerStreamingProfile,
     modules_cfg: &SortformerModulesConfig,
     encoder_d_model: usize,
     num_spks: usize,
     encoder_kind: SortformerEncoderKind,
 ) -> Result<SortformerStreamingConfig> {
-    let mut cfg = SortformerStreamingConfig {
+    let cfg = SortformerStreamingConfig {
         fc_d_model: modules_cfg.fc_d_model.unwrap_or(encoder_d_model),
         num_speakers: num_spks,
         subsampling_factor: modules_cfg
@@ -1880,50 +2605,57 @@ fn resolve_streaming_config(
             .clamp(0.0, 1.0),
     };
 
-    match resolve_streaming_profile(variant) {
-        SortformerStreamingProfile::Model => {}
-        SortformerStreamingProfile::LowLatency | SortformerStreamingProfile::HighLatency
-            if encoder_kind == SortformerEncoderKind::FeatureStackingRope =>
-        {
-            return Err(Error::ModelLoadError(
-                "Nemotron-3-Diarization only supports its checkpoint streaming profile; \
-                 latency overrides are not published for this checkpoint"
-                    .to_string(),
-            ));
-        }
-        SortformerStreamingProfile::LowLatency => {
-            cfg.chunk_len = 6;
-            cfg.chunk_right_context = 7;
-            cfg.fifo_len = 188;
-            cfg.spkcache_update_period = 144;
-            cfg.spkcache_len = 188;
-        }
-        SortformerStreamingProfile::HighLatency => {
-            cfg.chunk_len = 340;
-            cfg.chunk_right_context = 40;
-            cfg.fifo_len = 40;
-            cfg.spkcache_update_period = 300;
-            cfg.spkcache_len = 188;
-        }
-    }
-
-    cfg.validate()
+    apply_streaming_profile(cfg, encoder_kind, profile).validate()
 }
 
-fn resolve_streaming_profile(variant: ModelVariant) -> SortformerStreamingProfile {
-    if let Ok(value) = std::env::var("IZWI_SORTFORMER_STREAMING_PROFILE") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "model" => return SortformerStreamingProfile::Model,
-            "low_latency" | "low-latency" | "low" => return SortformerStreamingProfile::LowLatency,
-            "high_latency" | "high-latency" | "high" => {
-                return SortformerStreamingProfile::HighLatency
-            }
-            _ => {}
+fn apply_streaming_profile(
+    mut cfg: SortformerStreamingConfig,
+    encoder_kind: SortformerEncoderKind,
+    profile: SortformerStreamingProfile,
+) -> SortformerStreamingConfig {
+    if let Some(geometry) = profile.card_geometry(encoder_kind) {
+        cfg.chunk_len = geometry.chunk_len;
+        cfg.chunk_right_context = geometry.chunk_right_context;
+        cfg.fifo_len = geometry.fifo_len;
+        cfg.spkcache_update_period = geometry.spkcache_update_period;
+        cfg.spkcache_len = geometry.spkcache_len;
+    }
+    cfg
+}
+
+/// Reads `IZWI_SORTFORMER_STREAMING_PROFILE`. Every profile is published
+/// for both checkpoints; an unknown value logs and keeps the default rather
+/// than failing the load.
+fn resolve_streaming_profile() -> SortformerStreamingProfile {
+    let Ok(value) = std::env::var("IZWI_SORTFORMER_STREAMING_PROFILE") else {
+        return SortformerStreamingProfile::DEFAULT;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => SortformerStreamingProfile::DEFAULT,
+        "model" => SortformerStreamingProfile::Model,
+        "low_latency" | "low-latency" | "low" => SortformerStreamingProfile::LowLatency,
+        "very_high_latency" | "very-high-latency" | "high_latency" | "high-latency" | "high"
+        | "offline" => SortformerStreamingProfile::VeryHighLatency,
+        other => {
+            tracing::warn!(
+                "unknown IZWI_SORTFORMER_STREAMING_PROFILE {other:?}; using the {} profile",
+                SortformerStreamingProfile::DEFAULT.name()
+            );
+            SortformerStreamingProfile::DEFAULT
         }
     }
+}
 
-    let _ = variant;
-    SortformerStreamingProfile::Model
+/// Whole chunks in a step of about `step_audio_secs` of 16 kHz audio, at
+/// least one.
+fn chunks_per_stream_step(
+    cfg: SortformerStreamingConfig,
+    hop_length: usize,
+    step_audio_secs: f32,
+) -> usize {
+    let chunk_samples = cfg.chunk_len * cfg.subsampling_factor * hop_length;
+    let step_samples = (step_audio_secs.max(0.0) * TARGET_SAMPLE_RATE as f32) as usize;
+    (step_samples / chunk_samples.max(1)).max(1)
 }
 
 fn plan_streaming_feature_chunks(
@@ -1964,21 +2696,6 @@ fn pre_encoded_right_offset(right_offset: usize, subsampling_factor: usize) -> u
     ((right_offset as f32) / (subsampling_factor as f32)).ceil() as usize
 }
 
-fn tensor_to_embedding_rows(tensor: &Tensor, row_count: usize) -> Result<Vec<Vec<f32>>> {
-    if row_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let view = tensor.i((0, ..row_count, ..))?;
-    let (_, emb_dim) = view.dims2()?;
-    crate::models::shared::telemetry::record_host_read(DType::F32, row_count * emb_dim);
-    let values = view.flatten_all()?.to_vec1::<f32>()?;
-    Ok(values
-        .chunks(emb_dim)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>())
-}
-
 fn tensor_to_probability_rows(
     tensor: &Tensor,
     row_count: usize,
@@ -2004,61 +2721,44 @@ fn tensor_to_probability_rows(
         .collect::<Vec<_>>())
 }
 
-fn tensor_from_embedding_rows(
-    rows: &[Vec<f32>],
-    emb_dim: usize,
-    device: &Device,
-) -> Result<Tensor> {
-    if rows.is_empty() {
-        return Tensor::zeros((1, 0, emb_dim), DType::F32, device).map_err(Error::from);
-    }
-    let mut flat = Vec::with_capacity(rows.len() * emb_dim);
-    for row in rows {
-        if row.len() != emb_dim {
-            return Err(Error::InferenceError(format!(
-                "Inconsistent Sortformer embedding row size {}; expected {}",
-                row.len(),
-                emb_dim
-            )));
-        }
-        flat.extend_from_slice(row);
-    }
-    Tensor::from_vec(flat, (1, rows.len(), emb_dim), device).map_err(Error::from)
-}
-
 /// Pools the upsampled probability rows back to the encoded frame rate for
 /// streaming cache management, matching the reference `_pool_probs`
-/// (sigmoid has already been applied by the speaker head).
-fn pool_upsampled_probabilities(
-    probs: &Tensor,
+/// (sigmoid has already been applied by the speaker head). The rows are
+/// already on the host; the arithmetic is Candle's CPU `mean`: an in-order
+/// sum from zero, then a multiply by `1 / factor`.
+fn pool_probability_rows(
+    rows: &[Vec<f32>],
     encoded_len: usize,
     upsample_factor: usize,
     num_speakers: usize,
 ) -> Result<Vec<Vec<f32>>> {
-    if encoded_len == 0 {
-        return Ok(Vec::new());
-    }
-    let (_, rows, speaker_dim) = probs.dims3()?;
-    if speaker_dim != num_speakers || rows != encoded_len * upsample_factor {
+    if rows.len() != encoded_len * upsample_factor
+        || rows.iter().any(|row| row.len() != num_speakers)
+    {
         return Err(Error::InferenceError(format!(
-            "unexpected Sortformer upsampled probability shape [{rows}, {speaker_dim}]; expected [{}, {num_speakers}]",
+            "unexpected Sortformer upsampled probability rows ({}); expected [{}, {num_speakers}]",
+            rows.len(),
             encoded_len * upsample_factor
         )));
     }
-    let pooled = probs
-        .reshape((1, encoded_len, upsample_factor, num_speakers))?
-        .mean(2)?;
-    crate::models::shared::telemetry::record_host_read(DType::F32, encoded_len * num_speakers);
-    let values = pooled.flatten_all()?.to_vec1::<f32>()?;
-    Ok(values
-        .chunks(num_speakers)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>())
+    let scale = (1.0 / upsample_factor as f64) as f32;
+    Ok(rows
+        .chunks_exact(upsample_factor.max(1))
+        .map(|group| {
+            let mut sum = vec![0.0f32; num_speakers];
+            for row in group {
+                for (acc, value) in sum.iter_mut().zip(row) {
+                    *acc += value;
+                }
+            }
+            sum.into_iter().map(|value| value * scale).collect()
+        })
+        .collect())
 }
 
 fn update_streaming_state(
     mut state: SortformerStreamingState,
-    chunk_rows: &[Vec<f32>],
+    chunk_rows: &EmbeddingRows,
     preds: &[Vec<f32>],
     lc: usize,
     rc: usize,
@@ -2080,7 +2780,7 @@ fn update_streaming_state(
     let chunk_valid_len = chunk_rows.len().saturating_sub(lc + rc);
     let chunk_start = lc.min(chunk_rows.len());
     let chunk_end = (chunk_start + chunk_valid_len).min(chunk_rows.len());
-    let chunk_payload = chunk_rows[chunk_start..chunk_end].to_vec();
+    let chunk_payload = chunk_rows.narrow(chunk_start, chunk_end - chunk_start)?;
     let chunk_preds =
         preds[spkcache_len + fifo_len + chunk_start..spkcache_len + fifo_len + chunk_end].to_vec();
     let output_start = (spkcache_len + fifo_len + chunk_start)
@@ -2088,30 +2788,31 @@ fn update_streaming_state(
     let output_end =
         (spkcache_len + fifo_len + chunk_end) * cfg.output_frames_per_encoded_frame;
 
-    state.fifo.extend(chunk_payload.clone());
+    state.fifo = EmbeddingRows::cat(&[&state.fifo, &chunk_payload])?;
     state.fifo_preds.extend(chunk_preds.clone());
 
     if fifo_len + chunk_payload.len() > cfg.fifo_len {
+        // NeMo: max(update_period, chunk - fifo_len + fifo) in signed
+        // arithmetic. The branch guarantees chunk + fifo > fifo_len, so
+        // subtracting from the sum never saturates.
+        let overflow = (chunk_payload.len() + fifo_len) - cfg.fifo_len;
         let pop_out_len = cfg
             .spkcache_update_period
-            .max(
-                chunk_payload
-                    .len()
-                    .saturating_sub(cfg.fifo_len)
-                    .saturating_add(fifo_len),
-            )
+            .max(overflow)
             .min(fifo_len + chunk_payload.len());
-        let pop_out_embs = state.fifo[..pop_out_len].to_vec();
+        let pop_out_embs = state.fifo.narrow(0, pop_out_len)?;
         let pop_out_preds = state.fifo_preds[..pop_out_len].to_vec();
 
         if track_silence_mean {
-            update_silence_profile(&mut state, &pop_out_embs, &pop_out_preds, cfg.sil_threshold);
+            update_silence_profile(&mut state, &pop_out_embs, &pop_out_preds, cfg.sil_threshold)?;
         }
-        state.fifo.drain(..pop_out_len);
+        state.fifo = state
+            .fifo
+            .narrow(pop_out_len, state.fifo.len() - pop_out_len)?;
         state.fifo_preds.drain(..pop_out_len);
 
         let prev_spkcache_len = state.spkcache.len();
-        state.spkcache.extend(pop_out_embs);
+        state.spkcache = EmbeddingRows::cat(&[&state.spkcache, &pop_out_embs])?;
         if let Some(spkcache_preds) = state.spkcache_preds.as_mut() {
             spkcache_preds.extend(pop_out_preds);
         } else if state.spkcache.len() > cfg.spkcache_len {
@@ -2138,15 +2839,32 @@ fn update_streaming_state(
 
 fn update_silence_profile(
     state: &mut SortformerStreamingState,
-    emb_seq: &[Vec<f32>],
+    emb_seq: &EmbeddingRows,
     preds: &[Vec<f32>],
     sil_threshold: f32,
-) {
-    for (emb, pred) in emb_seq.iter().zip(preds.iter()) {
-        let is_silence = pred.iter().copied().sum::<f32>() < sil_threshold;
-        if !is_silence {
-            continue;
-        }
+) -> Result<()> {
+    if emb_seq.len() != preds.len() {
+        return Err(Error::InferenceError(format!(
+            "Sortformer silence update has {} embeddings for {} prediction rows",
+            emb_seq.len(),
+            preds.len()
+        )));
+    }
+    let silent = preds
+        .iter()
+        .enumerate()
+        .filter(|(_, pred)| pred.iter().copied().sum::<f32>() < sil_threshold)
+        .map(|(index, _)| index as u32)
+        .collect::<Vec<_>>();
+    let Some(silent_rows) = emb_seq.index_select(&silent)?.0 else {
+        return Ok(());
+    };
+    // Only the silent rows come to the host, in frame order, so the running
+    // mean keeps its sequential f32 arithmetic.
+    let (rows, width) = silent_rows.dims2()?;
+    crate::models::shared::telemetry::record_host_read(DType::F32, rows * width);
+    state.host_reads += 1;
+    for emb in silent_rows.to_vec2::<f32>()? {
         let total = state.n_sil_frames as f32;
         for (idx, value) in emb.iter().copied().enumerate() {
             state.mean_sil_emb[idx] = if state.n_sil_frames == 0 {
@@ -2157,14 +2875,15 @@ fn update_silence_profile(
         }
         state.n_sil_frames += 1;
     }
+    Ok(())
 }
 
 fn compress_spkcache(
-    emb_seq: &[Vec<f32>],
+    emb_seq: &EmbeddingRows,
     preds: &[Vec<f32>],
     mean_sil_emb: &[f32],
     cfg: SortformerStreamingConfig,
-) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+) -> Result<(EmbeddingRows, Vec<Vec<f32>>)> {
     if emb_seq.len() != preds.len() {
         return Err(Error::InferenceError(format!(
             "Sortformer speaker cache compression length mismatch: {} embeddings vs {} prediction rows",
@@ -2224,26 +2943,43 @@ fn compress_spkcache(
         .into_iter()
         .take(cfg.spkcache_len)
         .collect::<Vec<_>>();
-    selected.sort_by_key(|a| a.flat_index);
+    // NeMo `_get_topk_indices` maps every -inf pick to `max_index` before
+    // sorting, so disabled slots follow all kept frames and silence pads.
+    // The order feeds position-dependent attention over the cache.
+    selected.sort_by_key(|a| (a.score == f32::NEG_INFINITY, a.flat_index));
 
-    let mut spkcache = Vec::with_capacity(cfg.spkcache_len);
+    // Gather on the device: row `emb_seq.len()` of the source is the
+    // silence embedding.
+    let silence_row = emb_seq.len() as u32;
+    let mut rows = Vec::with_capacity(cfg.spkcache_len);
     let mut spkcache_preds = Vec::with_capacity(cfg.spkcache_len);
     for candidate in selected {
-        if candidate.score.is_finite() {
-            if let Some(frame_idx) = candidate.frame_index {
-                spkcache.push(emb_seq[frame_idx].clone());
+        match candidate.frame_index {
+            Some(frame_idx) if candidate.score.is_finite() => {
+                rows.push(frame_idx as u32);
                 spkcache_preds.push(preds[frame_idx].clone());
-            } else {
-                spkcache.push(mean_sil_emb.to_vec());
+            }
+            _ => {
+                rows.push(silence_row);
                 spkcache_preds.push(vec![0.0; cfg.num_speakers]);
             }
-        } else {
-            spkcache.push(mean_sil_emb.to_vec());
-            spkcache_preds.push(vec![0.0; cfg.num_speakers]);
         }
     }
+    let source = if rows.contains(&silence_row) {
+        let device = emb_seq
+            .tensor()
+            .map_or(Device::Cpu, |tensor| tensor.device().clone());
+        let silence = EmbeddingRows::new(Tensor::from_slice(
+            mean_sil_emb,
+            (1, mean_sil_emb.len()),
+            &device,
+        )?)?;
+        EmbeddingRows::cat(&[emb_seq, &silence])?
+    } else {
+        emb_seq.clone()
+    };
 
-    Ok((spkcache, spkcache_preds))
+    Ok((source.index_select(&rows)?, spkcache_preds))
 }
 
 fn get_log_pred_scores(
@@ -2575,17 +3311,45 @@ impl SortformerPreprocessor {
     }
 }
 
+/// Per-model engagement counters for the channel-independent depthwise
+/// convolutions (SRT-5), reported under `kernels` in `family_diagnostics`.
+#[derive(Debug, Default)]
+struct SortformerPathCounters {
+    conformer_depthwise_conv1d: AtomicU64,
+    subsampling_depthwise_conv2d: AtomicU64,
+    rel_pos_tables_built: AtomicU64,
+}
+
+impl SortformerPathCounters {
+    fn conformer_depthwise_conv1d(&self) -> u64 {
+        self.conformer_depthwise_conv1d.load(Ordering::Relaxed)
+    }
+
+    fn subsampling_depthwise_conv2d(&self) -> u64 {
+        self.subsampling_depthwise_conv2d.load(Ordering::Relaxed)
+    }
+
+    fn rel_pos_tables_built(&self) -> u64 {
+        self.rel_pos_tables_built.load(Ordering::Relaxed)
+    }
+}
+
 struct SortformerConformerEncoder {
     pre_encode: ConvSubsamplingDw,
     layers: Vec<ConformerLayer>,
     d_model: usize,
     input_scale: f64,
     frame_stride_samples: usize,
+    counters: Arc<SortformerPathCounters>,
+    /// The relative-position table of the last composite length: the
+    /// steady-state chunks all share one length.
+    rel_pos_cache: std::sync::Mutex<Option<(usize, Tensor)>>,
 }
 
 impl SortformerConformerEncoder {
     fn load(vb: VarBuilder, xscaling: bool) -> Result<Self> {
-        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"))?;
+        let counters = Arc::new(SortformerPathCounters::default());
+        let pre_encode = ConvSubsamplingDw::load(vb.pp("pre_encode"), &counters)?;
 
         let mut layers = Vec::new();
         let mut idx = 0usize;
@@ -2594,7 +3358,7 @@ impl SortformerConformerEncoder {
             if !layer_vb.contains_tensor("norm_out.weight") {
                 break;
             }
-            layers.push(ConformerLayer::load(layer_vb)?);
+            layers.push(ConformerLayer::load(layer_vb, &counters)?);
             idx += 1;
         }
         if layers.is_empty() {
@@ -2614,6 +3378,8 @@ impl SortformerConformerEncoder {
                 1.0
             },
             frame_stride_samples: 160 * 8,
+            counters,
+            rel_pos_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -2638,11 +3404,29 @@ impl SortformerConformerEncoder {
             pre_encoded.clone()
         };
         let pos_len = x.dim(1)?;
-        let pos_emb = build_rel_positional_embedding(pos_len, self.d_model, x.device())?;
+        let pos_emb = self.rel_pos_embedding(pos_len, x.device())?;
         for layer in &self.layers {
             x = layer.forward(&x, &pos_emb)?;
         }
         Ok((x, encoded_len))
+    }
+
+    fn rel_pos_embedding(&self, len: usize, device: &Device) -> Result<Tensor> {
+        let mut cache = self
+            .rel_pos_cache
+            .lock()
+            .map_err(|_| Error::InferenceError("Sortformer position cache poisoned".into()))?;
+        if let Some((cached_len, table)) = cache.as_ref() {
+            if *cached_len == len && table.device().same_device(device) {
+                return Ok(table.clone());
+            }
+        }
+        let table = build_rel_positional_embedding(len, self.d_model, device)?;
+        self.counters
+            .rel_pos_tables_built
+            .fetch_add(1, Ordering::Relaxed);
+        *cache = Some((len, table.clone()));
+        Ok(table)
     }
 
     fn frame_stride_samples(&self) -> usize {
@@ -2662,10 +3446,11 @@ struct ConvSubsamplingDw {
     conv6: Conv2d,
     out: Linear,
     out_channels: usize,
+    counters: Arc<SortformerPathCounters>,
 }
 
 impl ConvSubsamplingDw {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, counters: &Arc<SortformerPathCounters>) -> Result<Self> {
         let conv0_w = vb.pp("conv.0").get_unchecked_dtype("weight", DType::F32)?;
         let (out_channels, _, _, _) = conv0_w.dims4()?;
 
@@ -2701,7 +3486,24 @@ impl ConvSubsamplingDw {
             conv6,
             out,
             out_channels,
+            counters: Arc::clone(counters),
         })
+    }
+
+    /// conv.2 / conv.5: the stride-2 depthwise convs, run by the shared
+    /// strided-tap op (about 22 ops) instead of Candle's grouped conv2d, which
+    /// runs one convolution per channel (SRT-5).
+    fn depthwise(&self, conv: &Conv2d, x: &Tensor) -> Result<Tensor> {
+        let cfg = conv.config();
+        let spec = DepthwiseConv2dSpec {
+            padding: cfg.padding,
+            stride: cfg.stride,
+        };
+        let y = depthwise_conv2d(x, conv.weight(), conv.bias(), spec)?;
+        self.counters
+            .subsampling_depthwise_conv2d
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(y)
     }
 
     fn forward(&self, features_t: &Tensor, feature_frames: usize) -> Result<(Tensor, usize)> {
@@ -2710,11 +3512,11 @@ impl ConvSubsamplingDw {
         x = self.conv0.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv2.forward(&x)?;
+        x = self.depthwise(&self.conv2, &x)?;
         x = self.conv3.forward(&x)?;
         x = x.relu()?;
 
-        x = self.conv5.forward(&x)?;
+        x = self.depthwise(&self.conv5, &x)?;
         x = self.conv6.forward(&x)?;
         x = x.relu()?;
 
@@ -2750,7 +3552,7 @@ struct ConformerLayer {
 }
 
 impl ConformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, counters: &Arc<SortformerPathCounters>) -> Result<Self> {
         let d_model = vb
             .pp("norm_out")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -2769,7 +3571,7 @@ impl ConformerLayer {
         let self_attn = RelPosSelfAttention::load(vb.pp("self_attn"), d_model)?;
 
         let norm_conv = layer_norm(d_model, 1e-5, vb.pp("norm_conv"))?;
-        let conv = ConformerConv::load(vb.pp("conv"), d_model)?;
+        let conv = ConformerConv::load(vb.pp("conv"), d_model, counters)?;
 
         let norm_ff2 = layer_norm(d_model, 1e-5, vb.pp("norm_feed_forward2"))?;
         let ff2 = FeedForward::load(vb.pp("feed_forward2"), d_model, ff_dim)?;
@@ -2841,14 +3643,24 @@ impl FeedForward {
 
 struct ConformerConv {
     pointwise_conv1: Conv1d,
-    depthwise_conv: Conv1d,
-    batch_norm: candle_nn::BatchNorm,
+    /// The depthwise kernel `(C, 1, K)` and bias with the inference
+    /// BatchNorm folded in. The shared shift-and-accumulate op runs 2K + 2
+    /// element-wise ops instead of Candle's one convolution per channel
+    /// (SRT-5).
+    depthwise_weight: Tensor,
+    depthwise_bias: Tensor,
+    depthwise_spec: DepthwiseConv1dSpec,
     pointwise_conv2: Conv1d,
     d_model: usize,
+    counters: Arc<SortformerPathCounters>,
 }
 
 impl ConformerConv {
-    fn load(vb: VarBuilder, d_model: usize) -> Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        d_model: usize,
+        counters: &Arc<SortformerPathCounters>,
+    ) -> Result<Self> {
         let kernel_size = vb
             .pp("depthwise_conv")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -2863,6 +3675,8 @@ impl ConformerConv {
             vb.pp("pointwise_conv1"),
         )?;
 
+        // Loaded as a grouped Conv1d for the layout checks; only its
+        // weight and bias are used.
         let depthwise_conv = mlx::load_conv1d(
             d_model,
             d_model,
@@ -2876,6 +3690,18 @@ impl ConformerConv {
         )?;
 
         let batch_norm = batch_norm(d_model, 1e-5, vb.pp("batch_norm"))?;
+        let (scale, shift) = batch_norm_affine(
+            batch_norm.running_mean(),
+            batch_norm.running_var(),
+            batch_norm.eps(),
+            batch_norm.weight_and_bias(),
+        )?;
+        let (depthwise_weight, depthwise_bias) = fold_channel_affine(
+            depthwise_conv.weight(),
+            depthwise_conv.bias(),
+            &scale,
+            &shift,
+        )?;
 
         let pointwise_conv2 = mlx::load_conv1d(
             d_model,
@@ -2887,10 +3713,12 @@ impl ConformerConv {
 
         Ok(Self {
             pointwise_conv1,
-            depthwise_conv,
-            batch_norm,
+            depthwise_weight,
+            depthwise_bias,
+            depthwise_spec: DepthwiseConv1dSpec::symmetric((kernel_size - 1) / 2),
             pointwise_conv2,
             d_model,
+            counters: Arc::clone(counters),
         })
     }
 
@@ -2902,8 +3730,15 @@ impl ConformerConv {
         let x_b = x.i((.., self.d_model.., ..))?;
         x = x_a.broadcast_mul(&ops::sigmoid(&x_b)?)?;
 
-        x = self.depthwise_conv.forward(&x)?;
-        x = self.batch_norm.forward_t(&x, false)?;
+        x = depthwise_conv1d(
+            &x,
+            &self.depthwise_weight,
+            Some(&self.depthwise_bias),
+            self.depthwise_spec,
+        )?;
+        self.counters
+            .conformer_depthwise_conv1d
+            .fetch_add(1, Ordering::Relaxed);
         x = swish(&x)?;
         x = self.pointwise_conv2.forward(&x)?;
 
@@ -3028,7 +3863,7 @@ struct SortformerTransformerEncoder {
 }
 
 impl SortformerTransformerEncoder {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, num_heads: usize) -> Result<Self> {
         let mut layers = Vec::new();
         let mut idx = 0usize;
         loop {
@@ -3036,7 +3871,7 @@ impl SortformerTransformerEncoder {
             if !layer_vb.contains_tensor("layer_norm_1.weight") {
                 break;
             }
-            layers.push(SortformerTransformerLayer::load(layer_vb)?);
+            layers.push(SortformerTransformerLayer::load(layer_vb, num_heads)?);
             idx += 1;
         }
         if layers.is_empty() {
@@ -3072,7 +3907,7 @@ struct SortformerTransformerLayer {
 }
 
 impl SortformerTransformerLayer {
-    fn load(vb: VarBuilder) -> Result<Self> {
+    fn load(vb: VarBuilder, num_heads: usize) -> Result<Self> {
         let d_model = vb
             .pp("layer_norm_1")
             .get_unchecked_dtype("weight", DType::F32)?
@@ -3098,8 +3933,7 @@ impl SortformerTransformerLayer {
             )));
         }
 
-        let num_heads = 8usize;
-        if d_model % num_heads != 0 {
+        if num_heads == 0 || d_model % num_heads != 0 {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer transformer hidden size {d_model} is not divisible by {num_heads} heads"
             )));
@@ -3267,6 +4101,27 @@ impl SortformerAcousticEncoder {
             Self::FeatureStackingRope(encoder) => encoder.d_model,
         }
     }
+
+    /// Which convolution paths ran, so a deploy shows the fast paths engaged.
+    fn kernel_diagnostics(&self) -> serde_json::Value {
+        let shared_total = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        match self {
+            Self::Conformer(encoder) => serde_json::json!({
+                "conformer_depthwise_conv1d": "shift_accumulate_folded_batch_norm",
+                "conformer_depthwise_conv1d_calls": encoder.counters.conformer_depthwise_conv1d(),
+                "subsampling_depthwise_conv2d": "strided_taps",
+                "subsampling_depthwise_conv2d_calls": encoder.counters.subsampling_depthwise_conv2d(),
+                "shared_depthwise_conv1d_calls_total": shared_total,
+                "shared_depthwise_conv2d_calls_total":
+                    crate::kernels::depthwise_conv::depthwise_conv2d_calls(),
+                "rel_pos_tables_built": encoder.counters.rel_pos_tables_built(),
+            }),
+            // Feature stacking and RoPE attention: no depthwise convolution.
+            Self::FeatureStackingRope(_) => serde_json::json!({
+                "shared_depthwise_conv1d_calls_total": shared_total,
+            }),
+        }
+    }
 }
 
 /// Post-attention frame expander: v2.1's sortformer transformer runs at the
@@ -3306,19 +4161,25 @@ struct SortformerRopeEncoder {
 }
 
 impl SortformerRopeEncoder {
-    fn load(vb: VarBuilder, feature_bins: usize) -> Result<Self> {
+    /// `num_heads`, `stacking_factor` and `rope_base` are the yaml's
+    /// `n_heads`, `subsampling_factor` and `rope_base`.
+    fn load(
+        vb: VarBuilder,
+        feature_bins: usize,
+        num_heads: usize,
+        stacking_factor: usize,
+        rope_base: f32,
+    ) -> Result<Self> {
         let proj_vb = vb.pp("pre_encode.proj");
         let proj_w = proj_vb.get_unchecked_dtype("weight", DType::F32)?;
         let (proj_out, proj_in) = proj_w.dims2()?;
-        if feature_bins == 0 || proj_in % feature_bins != 0 {
+        if feature_bins == 0 || proj_in != stacking_factor * feature_bins {
             return Err(Error::ModelLoadError(format!(
-                "unsupported Sortformer rope stacking projection [{proj_out}, {proj_in}] for {feature_bins} mel bins"
+                "unsupported Sortformer rope stacking projection [{proj_out}, {proj_in}] for {stacking_factor} stacked frames of {feature_bins} mel bins"
             )));
         }
-        let stacking_factor = proj_in / feature_bins;
         let d_model = proj_out;
-        let num_heads = NEMOTRON3_ROPE_HEADS;
-        if d_model % num_heads != 0 || !(d_model / num_heads).is_multiple_of(2) {
+        if num_heads == 0 || d_model % num_heads != 0 || !(d_model / num_heads).is_multiple_of(2) {
             return Err(Error::ModelLoadError(format!(
                 "Sortformer rope hidden size {d_model} does not split into even {num_heads} heads"
             )));
@@ -3353,7 +4214,7 @@ impl SortformerRopeEncoder {
 
         let rope_inv_freq = (0..head_dim)
             .step_by(2)
-            .map(|i| 1.0 / NEMOTRON3_ROPE_THETA.powf(i as f32 / head_dim as f32))
+            .map(|i| 1.0 / rope_base.powf(i as f32 / head_dim as f32))
             .collect();
 
         Ok(Self {
@@ -3504,7 +4365,7 @@ impl SortformerRopeLayer {
         let h = x.broadcast_add(&attn_out)?;
         let ff = self
             .ff_out
-            .forward(&self.ff_in.forward(&self.norm2.forward(&h)?)?.gelu()?)?;
+            .forward(&self.ff_in.forward(&self.norm2.forward(&h)?)?.gelu_erf()?)?;
         h.broadcast_add(&ff).map_err(Error::from)
     }
 
@@ -3766,57 +4627,122 @@ fn select_speaker_channels(
         .collect()
 }
 
-fn ts_vad_post_processing(
+/// SRT-12: limiting the speaker count keeps the speech of the channels it
+/// drops. Each of their segments goes to the selected channel with the
+/// highest mean probability over it (ties to the lower channel), whose
+/// probability becomes its confidence; overlapping segments of one speaker
+/// merge afterwards.
+fn reassign_dropped_speaker_segments(
+    segments: &mut [RawSegment],
+    selected: &[usize],
+    probs: &[Vec<f32>],
+    frame_stride_samples: usize,
+) {
+    for segment in segments
+        .iter_mut()
+        .filter(|segment| !selected.contains(&segment.speaker_idx))
+    {
+        let best = selected
+            .iter()
+            .map(|&speaker| {
+                let probability = average_speaker_probability_for_range(
+                    probs,
+                    speaker,
+                    segment.start_secs,
+                    segment.end_secs,
+                    frame_stride_samples,
+                );
+                (speaker, probability)
+            })
+            .max_by(|a, b| {
+                a.1.unwrap_or(0.0)
+                    .total_cmp(&b.1.unwrap_or(0.0))
+                    .then(b.0.cmp(&a.0))
+            });
+        if let Some((speaker, probability)) = best {
+            segment.speaker_idx = speaker;
+            segment.confidence = probability;
+        }
+    }
+}
+
+/// NeMo's current post-processing of one speaker channel
+/// (`predlist_to_timestamps`): binarize the probabilities at their own frame
+/// period (`frame_repeat` x 10 ms: 80 ms for v2.1, 10 ms for Nemotron-3) with
+/// `binarization_vectorized`, then apply `filtering`.
+fn predlist_to_timestamps(
     probs: &[Vec<f32>],
     speaker_idx: usize,
     params: &PostProcessingParams,
     frame_repeat: usize,
 ) -> Vec<(f32, f32)> {
-    let frame_repeat = frame_repeat.max(1);
-    let mut repeated = Vec::with_capacity(probs.len() * frame_repeat);
-    for row in probs {
-        let value = row[speaker_idx].clamp(0.0, 1.0);
-        for _ in 0..frame_repeat {
-            repeated.push(value);
-        }
-    }
-
-    filtering(&binarization(&repeated, params), params)
+    let frame_secs = TS_VAD_FRAME_LENGTH_SECS * frame_repeat.max(1) as f32;
+    let sequence = probs
+        .iter()
+        .map(|row| row[speaker_idx].clamp(0.0, 1.0))
+        .collect::<Vec<_>>();
+    filtering(&binarization(&sequence, frame_secs, params), params)
 }
 
-fn binarization(sequence: &[f32], params: &PostProcessingParams) -> Vec<(f32, f32)> {
-    let mut speech = false;
-    let mut start = 0.0f32;
+/// NeMo's `binarization_vectorized` (SRT-11), a hysteresis over frames of
+/// `frame_secs`. With `onset >= offset` a frame above `onset` turns speech on,
+/// one below `offset` turns it off, and frames between keep the state. With
+/// `onset < offset` (the `dihard3` preset) a frame at or above `offset` sets
+/// speech, one at or below `onset` clears it, and each frame strictly between
+/// toggles it. A segment spans its first speech frame to the first frame
+/// after it without speech, or to the end of the sequence (N frames, where
+/// the legacy loop stopped at frame N - 1), widened by the pads; the start is
+/// clamped at 0. Padded segments that touch or overlap merge.
+fn binarization(
+    sequence: &[f32],
+    frame_secs: f32,
+    params: &PostProcessingParams,
+) -> Vec<(f32, f32)> {
     let mut segments = Vec::new();
-    let mut last_index = 0usize;
-
+    let mut push = |start: usize, end: usize| {
+        let start_secs = (start as f32 * frame_secs - params.pad_onset).max(0.0);
+        let end_secs = end as f32 * frame_secs + params.pad_offset;
+        if end_secs > start_secs {
+            segments.push((start_secs, end_secs));
+        }
+    };
+    let mut speech_start = None::<usize>;
     for (idx, &value) in sequence.iter().enumerate() {
-        last_index = idx;
-        if speech {
-            if value < params.offset {
-                let seg_start = (start - params.pad_onset).max(0.0);
-                let seg_end = idx as f32 * TS_VAD_FRAME_LENGTH_SECS + params.pad_offset;
-                if seg_end > seg_start {
-                    segments.push((seg_start, seg_end));
-                }
-                start = idx as f32 * TS_VAD_FRAME_LENGTH_SECS;
-                speech = false;
+        let speech = speech_start.is_some();
+        let next = if params.onset >= params.offset {
+            if value > params.onset {
+                true
+            } else if value < params.offset {
+                false
+            } else {
+                speech
             }
-        } else if value > params.onset {
-            start = idx as f32 * TS_VAD_FRAME_LENGTH_SECS;
-            speech = true;
+        } else if value >= params.offset {
+            true
+        } else if value <= params.onset {
+            false
+        } else if value > params.onset && value < params.offset {
+            !speech
+        } else {
+            speech
+        };
+        match (speech_start, next) {
+            (None, true) => speech_start = Some(idx),
+            (Some(start), false) => {
+                push(start, idx);
+                speech_start = None;
+            }
+            _ => {}
         }
     }
-
-    if speech {
-        let seg_start = (start - params.pad_onset).max(0.0);
-        let seg_end = last_index as f32 * TS_VAD_FRAME_LENGTH_SECS + params.pad_offset;
-        if seg_end > seg_start {
-            segments.push((seg_start, seg_end));
-        }
+    if let Some(start) = speech_start {
+        push(start, sequence.len());
     }
-
-    merge_overlap_ranges(&segments)
+    if params.pad_onset > 0.0 || params.pad_offset > 0.0 {
+        merge_overlap_ranges(&segments)
+    } else {
+        segments
+    }
 }
 
 fn filtering(segments: &[(f32, f32)], params: &PostProcessingParams) -> Vec<(f32, f32)> {
@@ -3985,6 +4911,51 @@ fn sortformer_vad_frame_mask(
     .unwrap_or_else(|_| vec![true; frame_count])
 }
 
+/// The opt-in VAD gate: the request's `vad_gate`, else
+/// `IZWI_SORTFORMER_VAD_GATE` (read once), else off.
+fn resolve_vad_gate(config: &DiarizationConfig) -> bool {
+    static ENV: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_SORTFORMER_VAD_GATE"));
+    config.vad_gate.or_else(|| ENV.get()).unwrap_or(false)
+}
+
+/// Speech regions of a frame mask in seconds, each widened by one encoded
+/// Sortformer frame (80 ms) on both sides so the gate never clips an onset
+/// or offset the model placed inside that frame.
+fn padded_vad_regions(mask: &[bool], frame_stride_samples: usize) -> Vec<(f32, f32)> {
+    let frame_secs = frame_stride_samples as f32 / TARGET_SAMPLE_RATE as f32;
+    let encoded_frame_secs =
+        (TS_VAD_UNIT_FRAME_COUNT * PRODUCTION_HOP_LENGTH) as f32 / TARGET_SAMPLE_RATE as f32;
+    let pad_secs = encoded_frame_secs.max(frame_secs);
+    let regions = collect_active_regions(mask)
+        .into_iter()
+        .map(|(start, end)| {
+            (
+                (start as f32 * frame_secs - pad_secs).max(0.0),
+                (end + 1) as f32 * frame_secs + pad_secs,
+            )
+        })
+        .collect::<Vec<_>>();
+    merge_overlap_ranges(&regions)
+}
+
+/// Gates whole post-processed segments: one that meets no speech region is
+/// dropped, and one that does is trimmed to the first and last regions it
+/// meets. Pauses the VAD finds inside a turn never split it.
+fn gate_segments(segments: &[(f32, f32)], regions: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    segments
+        .iter()
+        .filter_map(|&(start, end)| {
+            let mut met = regions
+                .iter()
+                .filter(|&&(region_start, region_end)| region_start < end && region_end > start);
+            let first = met.next()?;
+            let last = met.next_back().unwrap_or(first);
+            Some((start.max(first.0), end.min(last.1)))
+        })
+        .collect()
+}
+
 fn ms_f32_to_u32(ms: f32) -> u32 {
     ms.round().max(1.0) as u32
 }
@@ -4086,34 +5057,6 @@ fn build_rel_positional_embedding(len: usize, d_model: usize, device: &Device) -
 
 fn swish(x: &Tensor) -> Result<Tensor> {
     x.broadcast_mul(&ops::sigmoid(x)?).map_err(Error::from)
-}
-
-fn resample_linear(audio: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if audio.is_empty() || src_rate == 0 || dst_rate == 0 {
-        return Vec::new();
-    }
-    if src_rate == dst_rate {
-        return audio.to_vec();
-    }
-
-    let src_len = audio.len();
-    let dst_len = ((src_len as u64) * (dst_rate as u64) / (src_rate as u64))
-        .max(1)
-        .min(usize::MAX as u64) as usize;
-    let mut out = Vec::with_capacity(dst_len);
-
-    let scale = src_rate as f64 / dst_rate as f64;
-    for i in 0..dst_len {
-        let src_pos = i as f64 * scale;
-        let idx0 = src_pos.floor() as usize;
-        let idx1 = (idx0 + 1).min(src_len.saturating_sub(1));
-        let frac = (src_pos - idx0 as f64) as f32;
-        let sample0 = audio[idx0];
-        let sample1 = audio[idx1];
-        out.push(sample0 + (sample1 - sample0) * frac);
-    }
-
-    out
 }
 
 fn hann_window(win_length: usize) -> Vec<f32> {
@@ -4285,14 +5228,15 @@ fn normalize_all_features(mel: &mut [f32], n_mels: usize, frames: usize, valid_f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{BackendKind, DeviceKind};
+    use crate::backends::BackendKind;
     use crate::runtime::audio_io::decode_audio_bytes;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
+    /// The crate-wide environment lock, so the profile tests here order
+    /// against every other test that touches the process environment.
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::env_test_lock()
     }
 
     fn streaming_cfg_for_test() -> SortformerStreamingConfig {
@@ -4391,29 +5335,39 @@ mod tests {
         owner.lease().unwrap()
     }
 
+    /// Host rows as device-resident streaming embeddings.
+    fn emb_rows(rows: &[Vec<f32>]) -> EmbeddingRows {
+        let width = rows.first().map_or(0, Vec::len);
+        let flat = rows.iter().flatten().copied().collect::<Vec<_>>();
+        EmbeddingRows::new(Tensor::from_vec(flat, (rows.len(), width), &Device::Cpu).unwrap())
+            .unwrap()
+    }
+
+    fn host_rows(rows: &EmbeddingRows) -> Vec<Vec<f32>> {
+        rows.tensor()
+            .map_or_else(Vec::new, |tensor| tensor.to_vec2::<f32>().unwrap())
+    }
+
     fn synthetic_streaming_state(cfg: &SortformerStreamingConfig) -> SortformerStreamingState {
         SortformerStreamingState {
-            spkcache: vec![vec![0.5; cfg.fc_d_model]; 4.min(cfg.spkcache_len)],
+            spkcache: emb_rows(&vec![vec![0.5; cfg.fc_d_model]; 4.min(cfg.spkcache_len)]),
             spkcache_preds: Some(vec![vec![0.25; cfg.num_speakers]; 4.min(cfg.spkcache_len)]),
-            fifo: Vec::new(),
+            fifo: EmbeddingRows::default(),
             fifo_preds: Vec::new(),
             mean_sil_emb: vec![0.1; cfg.fc_d_model],
             n_sil_frames: 12,
+            host_reads: 0,
         }
     }
 
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_arena_device() {
-        // resolve_streaming_config reads the profile env var on every call;
-        // hold the lock so a concurrent profile test cannot flip this
-        // default-profile resolution into an override-rejection error.
-        let _env = env_lock().lock().unwrap();
         let cases = [
             ("v2.1", streaming_cfg_for_test()),
             (
                 "nemotron",
                 resolve_streaming_config(
-                    ModelVariant::Nemotron3Diarization,
+                    SortformerStreamingProfile::Model,
                     &SortformerModulesConfig {
                         // The checkpoint publishes an 8-channel-divisible
                         // cache; the 188 default is 4-channel only.
@@ -4453,7 +5407,7 @@ mod tests {
             return;
         };
         let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
+            SortformerStreamingProfile::Model,
             &SortformerModulesConfig {
                 spkcache_len: Some(192),
                 ..SortformerModulesConfig::default()
@@ -4479,10 +5433,9 @@ mod tests {
     #[ignore = "requires CUDA hardware"]
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_cuda_arena_device() {
-        let _env = env_lock().lock().unwrap();
         let device = Device::new_cuda(0).unwrap();
         let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
+            SortformerStreamingProfile::Model,
             &SortformerModulesConfig {
                 spkcache_len: Some(192),
                 ..SortformerModulesConfig::default()
@@ -4502,9 +5455,9 @@ mod tests {
 
     #[test]
     fn sortformer_only_uses_selected_model_device_for_cuda() {
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Cpu));
-        assert!(!sortformer_uses_selected_model_device(DeviceKind::Metal));
-        assert!(sortformer_uses_selected_model_device(DeviceKind::Cuda));
+        assert!(!sortformer_uses_selected_model_device(BackendKind::Cpu));
+        assert!(!sortformer_uses_selected_model_device(BackendKind::Metal));
+        assert!(sortformer_uses_selected_model_device(BackendKind::Cuda));
     }
 
     #[test]
@@ -4611,6 +5564,61 @@ mod tests {
 
         assert_eq!(mask.len(), 100);
         assert!(mask.iter().all(|active| !active));
+    }
+
+    /// D3: the VAD gate is opt-in. A request value wins over the
+    /// environment, which wins over the off default.
+    #[test]
+    fn vad_gate_is_off_unless_requested() {
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_VAD_GATE";
+        let previous = std::env::var(key).ok();
+        let requested = |vad_gate| DiarizationConfig {
+            vad_gate,
+            ..DiarizationConfig::default()
+        };
+        std::env::remove_var(key);
+        let unset = resolve_vad_gate(&DiarizationConfig::default());
+        let request_on = resolve_vad_gate(&requested(Some(true)));
+        std::env::set_var(key, "1");
+        let env_on = resolve_vad_gate(&DiarizationConfig::default());
+        let request_off = resolve_vad_gate(&requested(Some(false)));
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        assert!(!unset);
+        assert!(request_on);
+        assert!(env_on);
+        assert!(!request_off);
+    }
+
+    /// SRT-4: when on, the gate widens each VAD speech region by one
+    /// encoded Sortformer frame (80 ms) and trims whole segments to the
+    /// regions; it never touches probabilities.
+    #[test]
+    fn vad_gate_pads_regions_by_one_encoded_frame_and_clips_segments() {
+        let mask = [false, false, true, true, false, false, false, true, false];
+        // v2.1 rows are 80 ms: frames 2-3 and 7, each widened by one frame.
+        let v21 = padded_vad_regions(&mask, 1280);
+        let expected = [(0.08, 0.40), (0.48, 0.72)];
+        assert_eq!(v21.len(), expected.len());
+        for (actual, expected) in v21.iter().zip(expected) {
+            assert!((actual.0 - expected.0).abs() < 1e-6, "{v21:?}");
+            assert!((actual.1 - expected.1).abs() < 1e-6, "{v21:?}");
+        }
+        // Nemotron-3 rows are 10 ms: the pad is still 80 ms (8 rows).
+        let nemotron = padded_vad_regions(&mask, 160);
+        assert_eq!(nemotron.len(), 1);
+        assert!((nemotron[0].0 - 0.0).abs() < 1e-6);
+        assert!((nemotron[0].1 - 0.16).abs() < 1e-6);
+
+        // A segment is trimmed to the regions it meets, not split at the
+        // pause between them; one outside every region is dropped.
+        let gated = gate_segments(&[(0.0, 0.6), (0.9, 1.2), (0.2, 0.3)], &v21);
+        assert_eq!(gated.len(), 2, "{gated:?}");
+        assert!((gated[0].0 - 0.08).abs() < 1e-6 && (gated[0].1 - 0.6).abs() < 1e-6);
+        assert!((gated[1].0 - 0.2).abs() < 1e-6 && (gated[1].1 - 0.3).abs() < 1e-6);
     }
 
     #[test]
@@ -4747,59 +5755,87 @@ mod tests {
         assert_eq!(clamped, vec![0, 1, 2, 3]);
     }
 
-    #[test]
-    fn resolve_streaming_config_uses_model_profile_by_default() {
-        let _env = env_lock().lock().unwrap();
-        let cfg = resolve_streaming_config(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            &SortformerModulesConfig::default(),
-            512,
-            4,
-            SortformerEncoderKind::Conformer,
-        )
-        .unwrap();
-
-        assert_eq!(cfg.chunk_len, 188);
-        assert_eq!(cfg.chunk_right_context, 1);
-        assert_eq!(cfg.fifo_len, 0);
-        assert_eq!(cfg.spkcache_update_period, 188);
-        assert_eq!(cfg.spkcache_len, 188);
+    fn streaming_geometry(cfg: &SortformerStreamingConfig) -> [usize; 6] {
+        [
+            cfg.chunk_len,
+            cfg.chunk_left_context,
+            cfg.chunk_right_context,
+            cfg.fifo_len,
+            cfg.spkcache_update_period,
+            cfg.spkcache_len,
+        ]
     }
 
-    #[test]
-    fn resolve_streaming_config_honors_high_latency_override() {
+    fn with_profile_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _env = env_lock().lock().unwrap();
         let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
         let previous = std::env::var(key).ok();
-        std::env::set_var(key, "high");
-
-        let cfg = resolve_streaming_config(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            &SortformerModulesConfig::default(),
-            512,
-            4,
-            SortformerEncoderKind::Conformer,
-        )
-        .unwrap();
-
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
         match previous {
             Some(value) => std::env::set_var(key, value),
             None => std::env::remove_var(key),
         }
+        result
+    }
 
-        assert_eq!(cfg.chunk_len, 340);
-        assert_eq!(cfg.chunk_right_context, 40);
-        assert_eq!(cfg.fifo_len, 40);
-        assert_eq!(cfg.spkcache_update_period, 300);
-        assert_eq!(cfg.spkcache_len, 188);
+    /// D2: file diarization defaults to the card very-high-latency profile
+    /// (SRT-3), and the knob still selects the yaml and low profiles. An
+    /// unknown value keeps the default instead of failing the load.
+    #[test]
+    fn resolve_streaming_profile_defaults_to_card_very_high_latency() {
+        for (value, expected) in [
+            (None, SortformerStreamingProfile::VeryHighLatency),
+            (Some(""), SortformerStreamingProfile::VeryHighLatency),
+            (Some("high"), SortformerStreamingProfile::VeryHighLatency),
+            (Some("offline"), SortformerStreamingProfile::VeryHighLatency),
+            (Some("model"), SortformerStreamingProfile::Model),
+            (Some("Low-Latency"), SortformerStreamingProfile::LowLatency),
+            (Some("bogus"), SortformerStreamingProfile::VeryHighLatency),
+        ] {
+            assert_eq!(
+                with_profile_env(value, resolve_streaming_profile),
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
-    fn resolve_streaming_config_nemotron3_uses_checkpoint_values_and_rejects_overrides() {
-        // Both resolutions read the profile env var; one lock must span
-        // them so a concurrent profile test cannot flip the default-profile
-        // case into the override-rejection error.
-        let _env = env_lock().lock().unwrap();
+    fn resolve_streaming_config_applies_the_v21_card_profiles() {
+        let resolve = |profile| {
+            resolve_streaming_config(
+                profile,
+                &SortformerModulesConfig::default(),
+                512,
+                4,
+                SortformerEncoderKind::Conformer,
+            )
+            .unwrap()
+        };
+        // chunk / left / right / FIFO / update period / cache
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::DEFAULT)),
+            [340, 1, 40, 40, 300, 188]
+        );
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::Model)),
+            [188, 1, 1, 0, 188, 188]
+        );
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::LowLatency)),
+            [6, 1, 7, 188, 144, 188]
+        );
+    }
+
+    /// NDZ-1/NDZ-3: Nemotron-3 defaults to its card offline profile and
+    /// accepts every published profile, including under the knob a v2.1
+    /// operator sets.
+    #[test]
+    fn resolve_streaming_config_nemotron3_defaults_to_card_offline_profile() {
         let modules_cfg = SortformerModulesConfig {
             fc_d_model: Some(512),
             subsampling_factor: Some(8),
@@ -4807,40 +5843,107 @@ mod tests {
             fifo_len: Some(0),
             chunk_len: Some(264),
             spkcache_update_period: Some(264),
+            chunk_left_context: Some(0),
+            chunk_right_context: Some(0),
+            spkcache_sil_frames_per_spk: Some(1),
             ..SortformerModulesConfig::default()
         };
-        let cfg = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
-            &modules_cfg,
-            512,
-            8,
-            SortformerEncoderKind::FeatureStackingRope,
-        )
-        .unwrap();
-
-        assert_eq!(cfg.fc_d_model, 512);
-        assert_eq!(cfg.num_speakers, 8);
-        assert_eq!(cfg.output_frames_per_encoded_frame, 8);
-        assert_eq!(cfg.chunk_len, 264);
-        assert_eq!(cfg.spkcache_len, 264);
-        assert_eq!(cfg.spkcache_update_period, 264);
-        assert_eq!(cfg.fifo_len, 0);
-
-        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
-        let previous = std::env::var(key).ok();
-        std::env::set_var(key, "high");
-        let overridden = resolve_streaming_config(
-            ModelVariant::Nemotron3Diarization,
-            &modules_cfg,
-            512,
-            8,
-            SortformerEncoderKind::FeatureStackingRope,
+        let resolve = |profile| {
+            resolve_streaming_config(
+                profile,
+                &modules_cfg,
+                512,
+                8,
+                SortformerEncoderKind::FeatureStackingRope,
+            )
+            .unwrap()
+        };
+        let default = resolve(SortformerStreamingProfile::DEFAULT);
+        assert_eq!(default.fc_d_model, 512);
+        assert_eq!(default.num_speakers, 8);
+        assert_eq!(default.output_frames_per_encoded_frame, 8);
+        assert_eq!(streaming_geometry(&default), [340, 0, 40, 40, 300, 264]);
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::Model)),
+            [264, 0, 0, 0, 264, 264]
         );
-        match previous {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        assert_eq!(
+            streaming_geometry(&resolve(SortformerStreamingProfile::LowLatency)),
+            [9, 0, 4, 264, 222, 264]
+        );
+        let under_high_knob = with_profile_env(Some("high"), || {
+            resolve_streaming_config(
+                resolve_streaming_profile(),
+                &modules_cfg,
+                512,
+                8,
+                SortformerEncoderKind::FeatureStackingRope,
+            )
+        });
+        assert_eq!(
+            streaming_geometry(&under_high_knob.unwrap()),
+            [340, 0, 40, 40, 300, 264]
+        );
+    }
+
+    /// Every published profile of both checkpoints fits its production
+    /// envelope and the request authorization, and its physical state
+    /// carries the FIFO components exactly when the profile has a FIFO.
+    #[test]
+    fn every_published_profile_fits_the_production_authorization() {
+        // The pipeline's one-hour limit at 16 kHz.
+        let one_hour = 60 * 60 * TARGET_SAMPLE_RATE as usize;
+        let authorization = production_workspace_authorization(one_hour, false).unwrap();
+        let cases = [
+            (
+                SortformerWorkspaceTopology::v21_production(),
+                SortformerStreamingConfig {
+                    chunk_len: 188,
+                    chunk_left_context: 1,
+                    chunk_right_context: 1,
+                    fifo_len: 0,
+                    spkcache_update_period: 188,
+                    ..production_workspace_streaming_config()
+                },
+                SortformerEncoderKind::Conformer,
+            ),
+            (
+                SortformerWorkspaceTopology::nemotron3_production(),
+                nemotron3_checkpoint_streaming_config(),
+                SortformerEncoderKind::FeatureStackingRope,
+            ),
+        ];
+        for (topology, checkpoint, kind) in cases {
+            for profile in [
+                SortformerStreamingProfile::Model,
+                SortformerStreamingProfile::LowLatency,
+                SortformerStreamingProfile::VeryHighLatency,
+            ] {
+                let cfg = apply_streaming_profile(checkpoint, kind, profile)
+                    .validate()
+                    .unwrap();
+                topology.validate_production(cfg).unwrap();
+                let estimate = workspace_estimate_for(topology, cfg, one_hour, false).unwrap();
+                assert!(
+                    estimate.host_bytes <= authorization.host_bytes,
+                    "{kind:?} {profile:?}"
+                );
+                assert!(
+                    estimate.accelerator_bytes <= authorization.accelerator_bytes,
+                    "{kind:?} {profile:?}"
+                );
+                let contract = physical::sortformer_invocation_contract(cfg).unwrap();
+                let crate::kv::v2::StateDomainSpec::Tensor(state) = &contract.domains[0] else {
+                    panic!("Sortformer state must be a tensor domain");
+                };
+                let expected_components = if cfg.fifo_len > 0 { 6 } else { 4 };
+                assert_eq!(
+                    state.components.len(),
+                    expected_components,
+                    "{kind:?} {profile:?}"
+                );
+            }
         }
-        assert!(overridden.is_err());
     }
 
     #[test]
@@ -4909,11 +6012,19 @@ mod tests {
             vec![0.9, 0.0, 0.0, 0.0],
             vec![0.8, 0.0, 0.0, 0.0],
         ];
-        let (state, first_chunk_preds, _) =
-            update_streaming_state(state, &first_chunk, &first_preds, 0, 0, true, cfg).unwrap();
+        let (state, first_chunk_preds, _) = update_streaming_state(
+            state,
+            &emb_rows(&first_chunk),
+            &first_preds,
+            0,
+            0,
+            true,
+            cfg,
+        )
+        .unwrap();
         assert_eq!(first_chunk_preds, first_preds);
         assert!(state.spkcache.is_empty());
-        assert_eq!(state.fifo, first_chunk);
+        assert_eq!(host_rows(&state.fifo), first_chunk);
 
         let second_chunk = vec![vec![3.0, 3.0], vec![4.0, 4.0]];
         let second_preds = vec![
@@ -4922,16 +6033,141 @@ mod tests {
             vec![0.0, 0.9, 0.0, 0.0],
             vec![0.0, 0.8, 0.0, 0.0],
         ];
-        let (state, second_chunk_preds, _) =
-            update_streaming_state(state, &second_chunk, &second_preds, 0, 0, true, cfg).unwrap();
+        let (state, second_chunk_preds, _) = update_streaming_state(
+            state,
+            &emb_rows(&second_chunk),
+            &second_preds,
+            0,
+            0,
+            true,
+            cfg,
+        )
+        .unwrap();
 
-        assert_eq!(state.spkcache, vec![vec![1.0, 1.0], vec![2.0, 2.0]]);
-        assert_eq!(state.fifo, vec![vec![3.0, 3.0], vec![4.0, 4.0]]);
+        assert_eq!(
+            host_rows(&state.spkcache),
+            vec![vec![1.0, 1.0], vec![2.0, 2.0]]
+        );
+        assert_eq!(host_rows(&state.fifo), vec![vec![3.0, 3.0], vec![4.0, 4.0]]);
         assert!(state.spkcache_preds.is_none());
         assert_eq!(
             second_chunk_preds,
             vec![vec![0.0, 0.9, 0.0, 0.0], vec![0.0, 0.8, 0.0, 0.0]]
         );
+    }
+
+    /// SRT-2, NeMo `streaming_update`: with chunk 6 < FIFO 188 the pop is
+    /// `max(update_period, chunk - fifo_len + fifo)` = max(144, 4) = 144,
+    /// leaving 48 FIFO frames, not the 186 a saturating subtraction pops.
+    #[test]
+    fn update_streaming_state_pops_update_period_when_chunk_shorter_than_fifo() {
+        let cfg = SortformerStreamingConfig {
+            spkcache_len: 188,
+            fifo_len: 188,
+            chunk_len: 6,
+            spkcache_update_period: 144,
+            chunk_left_context: 0,
+            chunk_right_context: 0,
+            spkcache_sil_frames_per_spk: 3,
+            ..streaming_cfg_for_test()
+        };
+        let mut state = SortformerStreamingState::new(2);
+        state.fifo = emb_rows(&(0..186).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>());
+        let chunk = (186..192).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>();
+        let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; 192];
+
+        let (state, _, _) =
+            update_streaming_state(state, &emb_rows(&chunk), &preds, 0, 0, true, cfg).unwrap();
+
+        assert_eq!(state.spkcache.len(), 144);
+        assert_eq!(state.fifo.len(), 48);
+        let fifo = host_rows(&state.fifo);
+        assert_eq!(fifo[0], vec![144.0, 0.0]);
+        assert_eq!(fifo[47], vec![191.0, 0.0]);
+    }
+
+    /// The pop arithmetic against NeMo's signed formula on hand-computed
+    /// cases: `min(max(period, chunk - fifo_len + fifo), fifo + chunk)`.
+    #[test]
+    fn update_streaming_state_pop_length_follows_nemo_signed_formula() {
+        // (fifo_len, update_period, current fifo, chunk, expected pop)
+        let cases = [
+            (188, 144, 186, 6, 144),
+            (188, 144, 183, 6, 144),
+            (40, 300, 0, 340, 300),
+            (40, 300, 40, 340, 340),
+            (40, 300, 40, 120, 160),
+            (0, 188, 0, 188, 188),
+            (8, 12, 8, 20, 20),
+            (8, 12, 4, 20, 16),
+        ];
+        for (fifo_len, period, current, chunk_len, expected) in cases {
+            let cfg = SortformerStreamingConfig {
+                spkcache_len: 4096,
+                fifo_len,
+                chunk_len,
+                spkcache_update_period: period,
+                ..streaming_cfg_for_test()
+            };
+            let mut state = SortformerStreamingState::new(2);
+            state.fifo = emb_rows(&vec![vec![0.0, 0.0]; current]);
+            let chunk = emb_rows(&vec![vec![1.0, 1.0]; chunk_len]);
+            let preds = vec![vec![0.9, 0.0, 0.0, 0.0]; current + chunk_len];
+            let (state, _, _) =
+                update_streaming_state(state, &chunk, &preds, 0, 0, true, cfg).unwrap();
+            assert_eq!(
+                state.spkcache.len(),
+                expected,
+                "fifo_len {fifo_len}, period {period}, fifo {current}, chunk {chunk_len}"
+            );
+            assert_eq!(state.fifo.len(), current + chunk_len - expected);
+        }
+    }
+
+    /// SRT-1, NeMo `_get_topk_indices`: every selected -inf pick becomes
+    /// `max_index` before the sort, so the disabled slots land after all
+    /// kept frames and silence pads instead of at their flat index.
+    #[test]
+    fn compress_spkcache_places_disabled_slots_at_the_end_like_nemo() {
+        let cfg = SortformerStreamingConfig {
+            spkcache_len: 16,
+            spkcache_sil_frames_per_spk: 1,
+            ..streaming_cfg_for_test()
+        };
+        let emb_seq = (0..20).map(|i| vec![i as f32, 0.0]).collect::<Vec<_>>();
+        let mut preds = vec![vec![0.05; 4]; 20];
+        for frame in 0..3 {
+            preds[frame][0] = 0.9;
+        }
+        for frame in 5..7 {
+            preds[frame][1] = 0.9;
+        }
+        let silence = vec![-1.0, -1.0];
+
+        let (cache, cache_preds) =
+            compress_spkcache(&emb_rows(&emb_seq), &preds, &silence, cfg).unwrap();
+        let cache = host_rows(&cache);
+
+        // Kept: speaker 0's frames 0-2 then its silence pad, speaker 1's
+        // frames 5-6 then its pad, the pads of speakers 2 and 3, and the
+        // seven disabled -inf picks last.
+        let mut expected = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![2.0, 0.0],
+            silence.clone(),
+            vec![5.0, 0.0],
+            vec![6.0, 0.0],
+        ];
+        expected.extend(std::iter::repeat_n(silence.clone(), 10));
+        assert_eq!(cache, expected);
+        for (row, pred) in cache.iter().zip(&cache_preds) {
+            if *row == silence {
+                assert_eq!(pred, &vec![0.0; 4]);
+            } else {
+                assert_eq!(pred, &preds[row[0] as usize]);
+            }
+        }
     }
 
     #[test]
@@ -4947,27 +6183,159 @@ mod tests {
         };
 
         let sequence = vec![0.1, 0.6, 0.7, 0.2, 0.1];
-        let segments = binarization(&sequence, &params);
+        let segments = binarization(&sequence, TS_VAD_FRAME_LENGTH_SECS, &params);
 
         assert_eq!(segments, vec![(0.01, 0.03)]);
     }
 
-    #[test]
-    fn filtering_merges_short_non_speech_gaps_like_nemo_default_order() {
-        let params = PostProcessingParams {
-            onset: 0.5,
-            offset: 0.5,
-            pad_onset: 0.0,
-            pad_offset: 0.0,
+    fn binarization_params(
+        onset: f32,
+        offset: f32,
+        pad_onset: f32,
+        pad_offset: f32,
+    ) -> PostProcessingParams {
+        PostProcessingParams {
+            onset,
+            offset,
+            pad_onset,
+            pad_offset,
             min_duration_on: 0.0,
-            min_duration_off: 0.15,
+            min_duration_off: 0.0,
             filter_speech_first: true,
+        }
+    }
+
+    fn assert_segments_near(actual: &[(f32, f32)], expected: &[(f32, f32)]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(
+                (a.0 - e.0).abs() < 1e-5 && (a.1 - e.1).abs() < 1e-5,
+                "{actual:?} vs {expected:?}"
+            );
+        }
+    }
+
+    /// SRT-11: NeMo's `binarization_vectorized` at the native 80 ms frame
+    /// ends a segment still active at the last frame at N frames (0.48 s);
+    /// the legacy loop over 10 ms repeats stopped at 8N - 1 (0.47 s).
+    #[test]
+    fn vectorized_binarization_ends_a_trailing_segment_at_the_sequence_end() {
+        let params = binarization_params(0.5, 0.5, 0.0, 0.0);
+        let sequence = [0.2, 0.7, 0.8, 0.3, 0.6, 0.9];
+        assert_segments_near(
+            &binarization(&sequence, 0.08, &params),
+            &[(0.08, 0.24), (0.32, 0.48)],
+        );
+        // The same probabilities as v2.1 rows through the post-processing.
+        let rows = sequence.iter().map(|p| vec![*p]).collect::<Vec<_>>();
+        assert_segments_near(
+            &predlist_to_timestamps(&rows, 0, &params, TS_VAD_UNIT_FRAME_COUNT),
+            &[(0.08, 0.24), (0.32, 0.48)],
+        );
+    }
+
+    /// SRT-11: with onset < offset (the dihard3 preset's 0.56 / 1.0) a frame
+    /// between the thresholds toggles speech instead of holding it; a frame
+    /// at or above offset sets it, one at or below onset clears it, and NaN
+    /// neither sets, clears nor toggles.
+    #[test]
+    fn vectorized_binarization_toggles_between_onset_and_offset() {
+        let params = binarization_params(0.3, 0.7, 0.0, 0.0);
+        let frame = TS_VAD_FRAME_LENGTH_SECS;
+        assert_segments_near(
+            &binarization(&[0.5, 0.5, 0.5], frame, &params),
+            &[(0.0, 0.01), (0.02, 0.03)],
+        );
+        assert_segments_near(
+            &binarization(&[0.5, 0.8, 0.5, 0.5, 0.2, 0.5, 0.9], frame, &params),
+            &[(0.0, 0.02), (0.03, 0.04), (0.05, 0.07)],
+        );
+        assert_segments_near(
+            &binarization(&[0.8, f32::NAN, 0.1], frame, &params),
+            &[(0.0, 0.02)],
+        );
+    }
+
+    /// SRT-11: pads widen each segment (the start clamped at 0, the end not)
+    /// and padded segments that touch or overlap merge.
+    #[test]
+    fn vectorized_binarization_pads_and_merges_like_nemo() {
+        let params = binarization_params(0.5, 0.5, 0.1, 0.05);
+        let sequence = [0.9, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.9];
+        assert_segments_near(
+            &binarization(&sequence, 0.08, &params),
+            &[(0.0, 0.29), (0.46, 0.69)],
+        );
+    }
+
+    /// SRT-12: `max_speakers` below the active count reassigns the dropped
+    /// channel's speech to the kept channel most probable over it instead of
+    /// deleting it, so the attributed speech does not shrink.
+    #[test]
+    fn limiting_speakers_reassigns_dropped_speech_to_the_most_probable_kept_speaker() {
+        // 80 ms rows over 3.2 s: speaker 0 talks 0-1.6 s, speaker 1 1.6-2.4
+        // s (where speaker 2 is the more probable of the kept two), speaker 2
+        // 2.4-3.2 s and 0.8-1.2 s over speaker 0.
+        let stride = TS_VAD_UNIT_FRAME_COUNT * PRODUCTION_HOP_LENGTH;
+        let probs = (0..40)
+            .map(|frame| match frame {
+                0..=9 => vec![0.9, 0.1, 0.1],
+                10..=14 => vec![0.9, 0.1, 0.8],
+                15..=19 => vec![0.9, 0.1, 0.1],
+                20..=29 => vec![0.3, 0.9, 0.6],
+                _ => vec![0.1, 0.1, 0.9],
+            })
+            .collect::<Vec<_>>();
+        let segment = |speaker_idx, start_secs, end_secs| RawSegment {
+            speaker_idx,
+            start_secs,
+            end_secs,
+            confidence: None,
         };
+        let mut segments = vec![
+            segment(0, 0.0, 1.6),
+            segment(2, 0.8, 1.2),
+            segment(1, 1.6, 2.4),
+            segment(2, 2.4, 3.2),
+        ];
+        let speech = |segments: &[RawSegment]| {
+            merge_overlap_ranges(
+                &segments
+                    .iter()
+                    .map(|segment| (segment.start_secs, segment.end_secs))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let before = speech(&segments);
+        let stats = (0..3)
+            .map(|speaker_idx| SpeakerActivityStats {
+                speaker_idx,
+                total_duration_secs: segments
+                    .iter()
+                    .filter(|segment| segment.speaker_idx == speaker_idx)
+                    .map(|segment| segment.end_secs - segment.start_secs)
+                    .sum(),
+                peak_probability: 0.9,
+                segment_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let selected = select_speaker_channels(&stats, 1, 2, 3);
+        assert_eq!(selected, vec![0, 2]);
+        reassign_dropped_speaker_segments(&mut segments, &selected, &probs, stride);
 
-        let segments = vec![(0.0, 0.5), (0.55, 1.0), (1.3, 1.7)];
-        let filtered = filtering(&segments, &params);
-
-        assert_eq!(filtered, vec![(0.0, 1.0), (1.3, 1.7)]);
+        assert!(segments.iter().all(|segment| segment.speaker_idx != 1));
+        let moved = &segments[2];
+        assert_eq!(
+            (moved.speaker_idx, moved.start_secs, moved.end_secs),
+            (2, 1.6, 2.4)
+        );
+        // Its confidence is now speaker 2's probability over it.
+        assert_eq!(
+            moved.confidence,
+            average_speaker_probability_for_range(&probs, 2, 1.6, 2.4, stride)
+        );
+        assert!(moved.confidence.unwrap() < 0.7);
+        assert_eq!(speech(&segments), before);
     }
 
     #[test]
@@ -5025,99 +6393,6 @@ mod tests {
 
     #[test]
     #[ignore = "requires local Sortformer checkpoint"]
-    fn sortformer_local_checkpoint_matches_diarization_2_reference_segments() {
-        let models_root = std::env::var("IZWI_MODELS_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("izwi")
-                    .join("models")
-            });
-        let model_dir = models_root.join(ModelVariant::DiarStreamingSortformer4SpkV21.dir_name());
-        if !model_dir
-            .join("diar_streaming_sortformer_4spk-v2.1.nemo")
-            .exists()
-        {
-            eprintln!(
-                "Skipping Sortformer checkpoint test, model not found at {}",
-                model_dir.display()
-            );
-            return;
-        }
-
-        let audio_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/diarization-2.mp3");
-        let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
-        let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
-
-        let model = SortformerDiarizerModel::load(
-            &model_dir,
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            DeviceProfile::cpu(),
-        )
-        .expect("sortformer checkpoint should load");
-        let diarization = model
-            .diarize(&samples, sample_rate, &DiarizationConfig::default())
-            .expect("sortformer diarization should run");
-
-        let expected = vec![
-            (0.40, 2.72, 0usize),
-            (3.20, 4.96, 0),
-            (5.44, 10.08, 0),
-            (10.72, 15.52, 0),
-            (15.60, 18.32, 0),
-            (19.60, 20.08, 0),
-            (20.88, 22.88, 0),
-            (23.28, 27.84, 0),
-            (28.40, 29.84, 0),
-            (30.16, 36.96, 0),
-            (38.40, 42.64, 0),
-            (42.80, 62.16, 1),
-            (62.40, 68.80, 2),
-            (69.44, 92.80, 2),
-            (92.88, 97.60, 3),
-            (97.92, 104.00, 0),
-            (104.16, 116.55, 0),
-        ];
-
-        assert_eq!(
-            diarization.segments.len(),
-            expected.len(),
-            "unexpected segment count: {:#?}",
-            diarization.segments
-        );
-
-        for (segment, (expected_start, expected_end, expected_speaker)) in
-            diarization.segments.iter().zip(expected.iter())
-        {
-            let actual_speaker = parse_test_speaker_id(&segment.speaker);
-            assert!(
-                (segment.start_secs - expected_start).abs() <= 0.02,
-                "segment start mismatch for {:?}: expected {}, got {}",
-                segment,
-                expected_start,
-                segment.start_secs
-            );
-            assert!(
-                (segment.end_secs - expected_end).abs() <= 0.02,
-                "segment end mismatch for {:?}: expected {}, got {}",
-                segment,
-                expected_end,
-                segment.end_secs
-            );
-            assert_eq!(
-                actual_speaker, *expected_speaker,
-                "speaker mismatch for {:?}",
-                segment
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires local Sortformer checkpoint"]
     fn nemotron3_local_checkpoint_diarizes_eight_channels_on_cpu() {
         let models_root = std::env::var("IZWI_MODELS_DIR")
             .ok()
@@ -5143,11 +6418,14 @@ mod tests {
         let audio_bytes = std::fs::read(&audio_path).expect("sample audio should exist");
         let (samples, sample_rate) = decode_audio_bytes(&audio_bytes).expect("audio should decode");
 
-        let model = SortformerDiarizerModel::load(
-            &model_dir,
-            ModelVariant::Nemotron3Diarization,
-            DeviceProfile::cpu(),
-        )
+        let model = {
+            let _env = env_lock().lock().unwrap();
+            SortformerDiarizerModel::load(
+                &model_dir,
+                ModelVariant::Nemotron3Diarization,
+                DeviceProfile::cpu(),
+            )
+        }
         .expect("nemotron3 checkpoint should load");
         let config = DiarizationConfig {
             max_speakers: Some(8),
@@ -5202,6 +6480,10 @@ mod tests {
     /// Builds a synthetic `SortformerRopeEncoder` checkpoint: 2 layers,
     /// d_model 64 (8 heads x 8), FFN 32, 16 mel bins stacked by 4.
     fn rope_encoder_fixture() -> Result<SortformerRopeEncoder> {
+        rope_encoder_fixture_with_base(10_000.0)
+    }
+
+    fn rope_encoder_fixture_with_base(rope_base: f32) -> Result<SortformerRopeEncoder> {
         fn seed_values(len: usize, seed: f32) -> Vec<f32> {
             (0..len)
                 .map(|i| ((i as f32 + 1.0) * seed) * 0.01)
@@ -5240,7 +6522,7 @@ mod tests {
             insert(&mut tensors, format!("{prefix}ffn.net.3.bias"), vec![64], 0.0);
         }
         let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
-        SortformerRopeEncoder::load(vb.pp("encoder"), 16)
+        SortformerRopeEncoder::load(vb.pp("encoder"), 16, 8, 4, rope_base)
     }
 
     #[test]
@@ -5303,6 +6585,64 @@ mod tests {
             .is_err());
     }
 
+    /// NeMo's `FeedForward` and HF's `hidden_act: gelu` use the exact erf
+    /// GELU; candle's `gelu()` is the tanh approximation (NDZ-2).
+    #[test]
+    fn rope_layer_ffn_uses_exact_erf_gelu() {
+        let d_model = 8;
+        let identity = Tensor::eye(d_model, DType::F32, &Device::Cpu).unwrap();
+        let zeros = |shape: &[usize]| Tensor::zeros(shape, DType::F32, &Device::Cpu).unwrap();
+        let ones = |len: usize| Tensor::ones(len, DType::F32, &Device::Cpu).unwrap();
+        let tensors = std::collections::HashMap::from([
+            ("norm1.weight".to_string(), ones(d_model)),
+            ("norm1.bias".to_string(), zeros(&[d_model])),
+            ("norm2.weight".to_string(), ones(d_model)),
+            ("norm2.bias".to_string(), zeros(&[d_model])),
+            // Zero attention leaves h = x, so the block is x + ffn(norm2(x)).
+            (
+                "attn.w_qkv.weight".to_string(),
+                zeros(&[3 * d_model, d_model]),
+            ),
+            (
+                "attn.out_proj.weight".to_string(),
+                zeros(&[d_model, d_model]),
+            ),
+            ("attn.out_proj.bias".to_string(), zeros(&[d_model])),
+            ("ffn.net.0.weight".to_string(), identity.clone()),
+            ("ffn.net.0.bias".to_string(), zeros(&[d_model])),
+            ("ffn.net.3.weight".to_string(), identity),
+            ("ffn.net.3.bias".to_string(), zeros(&[d_model])),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let layer = SortformerRopeLayer::load(vb, d_model, 2, 4).unwrap();
+        let values = (0..3 * d_model)
+            .map(|i| ((i * 7) % 11) as f32 - 5.0)
+            .collect::<Vec<_>>();
+        let x = Tensor::from_vec(values, (1, 3, d_model), &Device::Cpu).unwrap();
+        let (cos, sin) = (
+            Tensor::ones((3, 4), DType::F32, &Device::Cpu).unwrap(),
+            zeros(&[3, 4]),
+        );
+
+        let actual = layer.forward(&x, &cos, &sin).unwrap();
+        let normed = layer.norm2.forward(&x).unwrap();
+        let expected = (&x + normed.gelu_erf().unwrap()).unwrap();
+        let max_abs = (actual - expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            max_abs <= 1e-6,
+            "FFN activation is not exact GELU: {max_abs:e}"
+        );
+    }
+
     #[test]
     fn subpixel_upsampler_expands_to_output_rate() {
         // Center-tap identity weights reproduce nearest-neighbour upsampling,
@@ -5345,15 +6685,14 @@ mod tests {
     }
 
     #[test]
-    fn pool_upsampled_probabilities_averages_within_encoded_frames() {
-        let probs = Tensor::from_vec(
-            vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-            (1, 4, 2),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let pooled =
-            pool_upsampled_probabilities(&probs, 2, 2, 2).unwrap();
+    fn pool_probability_rows_averages_within_encoded_frames() {
+        let probs = vec![
+            vec![0.1f32, 0.2],
+            vec![0.3, 0.4],
+            vec![0.5, 0.6],
+            vec![0.7, 0.8],
+        ];
+        let pooled = pool_probability_rows(&probs, 2, 2, 2).unwrap();
         let expected = [vec![0.2, 0.3], vec![0.6, 0.7]];
         for (row, expected_row) in pooled.iter().zip(expected.iter()) {
             for (value, expected_value) in row.iter().zip(expected_row.iter()) {
@@ -5361,8 +6700,39 @@ mod tests {
             }
         }
 
-        assert!(pool_upsampled_probabilities(&probs, 2, 2, 4).is_err());
-        assert!(pool_upsampled_probabilities(&probs, 3, 2, 2).is_err());
+        assert!(pool_probability_rows(&probs, 2, 2, 4).is_err());
+        assert!(pool_probability_rows(&probs, 3, 2, 2).is_err());
+    }
+
+    /// SRT-7: host pooling of the once-read probabilities is bit-identical
+    /// to the device `mean` it replaces (Nemotron-3's 8x upsampled rows).
+    #[test]
+    fn host_pooling_matches_candle_mean_bit_for_bit() {
+        let (encoded_len, factor, speakers) = (37, 8, 8);
+        let values = random_values(encoded_len * factor * speakers, 0xB17E, 0.5, 0.5);
+        let probs = Tensor::from_vec(
+            values.clone(),
+            (1, encoded_len * factor, speakers),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let expected = probs
+            .reshape((1, encoded_len, factor, speakers))
+            .unwrap()
+            .mean(2)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let rows = values
+            .chunks(speakers)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>();
+        let pooled = pool_probability_rows(&rows, encoded_len, factor, speakers).unwrap();
+        for (actual, expected) in pooled.iter().flatten().zip(expected.iter().flatten()) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
     }
 
     #[test]
@@ -5371,7 +6741,7 @@ mod tests {
         cfg.output_frames_per_encoded_frame = 8;
 
         let state = SortformerStreamingState::new(2);
-        let chunk_rows = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
+        let chunk_rows = emb_rows(&[vec![1.0, 1.0], vec![2.0, 2.0]]);
         let preds = vec![vec![0.9, 0.0, 0.0, 0.0], vec![0.8, 0.0, 0.0, 0.0]];
         let (_, _, output_range) =
             update_streaming_state(state, &chunk_rows, &preds, 0, 0, false, cfg).unwrap();
@@ -5380,7 +6750,7 @@ mod tests {
         // Left/right context frames are attended but not emitted: their
         // upsampled rows sit outside the output range.
         let state = SortformerStreamingState::new(2);
-        let chunk_rows = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        let chunk_rows = emb_rows(&[vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]]);
         let preds = vec![
             vec![0.9, 0.0, 0.0, 0.0],
             vec![0.8, 0.0, 0.0, 0.0],
@@ -5389,5 +6759,1147 @@ mod tests {
         let (_, _, output_range) =
             update_streaming_state(state, &chunk_rows, &preds, 1, 1, false, cfg).unwrap();
         assert_eq!(output_range, 8..16);
+    }
+
+    /// The workspace estimate bounds the measured per-chunk peak of each
+    /// streaming profile, and over-reserves v2.1 by at most the 1.5x safety
+    /// factor. Peaks are the largest process-footprint growth of one diarize
+    /// call recorded by `sortformer_workspace_measured_peak_per_profile`
+    /// (M1 Pro, CPU, release build, 2026-10-14), for the sample counts it
+    /// uses: the speaker cache and FIFO filled, then three full chunks.
+    #[test]
+    fn sortformer_workspace_estimate_bounds_the_measured_peak() {
+        let v21 = SortformerWorkspaceTopology::v21_production();
+        for (profile, samples, measured) in [
+            (
+                SortformerStreamingProfile::Model,
+                970_240_usize,
+                384_631_072_u64,
+            ),
+            (
+                SortformerStreamingProfile::VeryHighLatency,
+                1_754_880,
+                750_699_096,
+            ),
+            (SortformerStreamingProfile::LowLatency, 535_040, 234_455_304),
+        ] {
+            let cfg = resolve_streaming_config(
+                profile,
+                &SortformerModulesConfig::default(),
+                PRODUCTION_CONFORMER_D_MODEL,
+                4,
+                SortformerEncoderKind::Conformer,
+            )
+            .unwrap();
+            let estimate = workspace_estimate_for(v21, cfg, samples, false).unwrap();
+            let total = estimate.host_bytes + estimate.accelerator_bytes;
+            assert!(
+                total >= measured,
+                "v2.1 {profile:?}: {total} B < measured {measured} B"
+            );
+            assert!(
+                total <= measured * 3 / 2,
+                "v2.1 {profile:?}: {total} B is over 1.5x the measured {measured} B"
+            );
+        }
+
+        // Nemotron-3's peak was 51 MiB: the estimate bounds it with room to
+        // spare (its RoPE and upsampler counts are not calibrated here).
+        let nemotron3 = workspace_estimate_for(
+            SortformerWorkspaceTopology::nemotron3_production(),
+            nemotron3_workspace_streaming_config(),
+            1_351_680,
+            false,
+        )
+        .unwrap();
+        assert!(nemotron3.host_bytes + nemotron3.accelerator_bytes >= 53_624_904);
+        // Its default card offline profile peaked at 108.6 MiB (115.5 s,
+        // composite 684 frames; 2026-10-15).
+        let card_offline = apply_streaming_profile(
+            nemotron3_checkpoint_streaming_config(),
+            SortformerEncoderKind::FeatureStackingRope,
+            SortformerStreamingProfile::VeryHighLatency,
+        );
+        let estimate = workspace_estimate_for(
+            SortformerWorkspaceTopology::nemotron3_production(),
+            card_offline,
+            1_848_320,
+            false,
+        )
+        .unwrap();
+        assert!(estimate.host_bytes + estimate.accelerator_bytes >= 113_901_664);
+    }
+
+    /// Live process memory for the measurement below: the physical
+    /// footprint (what the OS and Metal working set charge) and the bytes
+    /// malloc has handed out and not taken back. `purge` first returns
+    /// malloc's cached free pages, so a baseline does not hide reuse.
+    #[cfg(target_os = "macos")]
+    fn process_memory_sample(purge: bool) -> (u64, u64) {
+        #[repr(C)]
+        struct MallocStatistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // rusage_info_v0: a 16-byte UUID, then u64 fields; ri_phys_footprint
+        // is the eighth of them (index 9 counting the UUID as two words).
+        let mut info = [0_u64; 32];
+        let mut stats = MallocStatistics {
+            blocks_in_use: 0,
+            size_in_use: 0,
+            max_size_in_use: 0,
+            size_allocated: 0,
+        };
+        // SAFETY: both buffers are large enough for the structures libSystem
+        // writes (rusage_info_v0 is 96 bytes) and outlive the calls. Pressure
+        // relief only returns free pages to the OS.
+        unsafe {
+            if purge {
+                malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+            }
+            assert_eq!(
+                proc_pid_rusage(std::process::id() as i32, 0, info.as_mut_ptr().cast()),
+                0
+            );
+            malloc_zone_statistics(std::ptr::null_mut(), &mut stats);
+        }
+        (info[9], stats.size_in_use as u64)
+    }
+
+    /// Measures one diarize call per streaming profile on the real
+    /// checkpoints (CPU, which is also where Sortformer runs on the Metal
+    /// backend) and prints the peak footprint and malloc deltas next to the
+    /// loaded model's own workspace estimate. The audio fills the speaker
+    /// cache and FIFO and then runs full chunks, so the composite is at its
+    /// largest. Run with `--ignored --nocapture`; the figures calibrate
+    /// `workspace_estimate_for` (see `MEASURED_*` in the bound test).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires local Sortformer checkpoints; measurement only"]
+    fn sortformer_workspace_measured_peak_per_profile() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let models_root = std::env::var("IZWI_MODELS_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("izwi")
+                    .join("models")
+            });
+        let _env = env_lock().lock().unwrap();
+        let key = "IZWI_SORTFORMER_STREAMING_PROFILE";
+        let previous = std::env::var(key).ok();
+        for (variant, profile) in [
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "model"),
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "high_latency"),
+            (ModelVariant::DiarStreamingSortformer4SpkV21, "low_latency"),
+            (ModelVariant::Nemotron3Diarization, "model"),
+            (ModelVariant::Nemotron3Diarization, "high_latency"),
+            (ModelVariant::Nemotron3Diarization, "low_latency"),
+        ] {
+            let model_dir = models_root.join(variant.dir_name());
+            if !model_dir.exists() {
+                eprintln!(
+                    "skipping {variant}: no checkpoint at {}",
+                    model_dir.display()
+                );
+                continue;
+            }
+            std::env::set_var(key, profile);
+            let model = SortformerDiarizerModel::load(&model_dir, variant, DeviceProfile::cpu())
+                .expect("checkpoint should load");
+            let cfg = model.model.streaming.expect("streaming profile");
+            let chunk_frames = (cfg.chunk_len + cfg.chunk_left_context + cfg.chunk_right_context)
+                * cfg.subsampling_factor;
+            let fill_frames = (cfg.spkcache_len + cfg.fifo_len) * cfg.subsampling_factor;
+            let samples = (fill_frames + 3 * chunk_frames) * PRODUCTION_HOP_LENGTH;
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            let audio: Vec<f32> = (0..samples)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / (1_u64 << 24) as f32 - 0.5) * 0.2
+                })
+                .collect();
+            let config = DiarizationConfig::default();
+            model
+                .diarize(
+                    &audio[..TARGET_SAMPLE_RATE as usize / 2],
+                    TARGET_SAMPLE_RATE,
+                    &config,
+                )
+                .expect("warm-up");
+            let estimate = model.workspace_estimate(samples).unwrap();
+            let mut peaks = Vec::new();
+            for _ in 0..3 {
+                let (footprint_base, malloc_base) = process_memory_sample(true);
+                let stop = Arc::new(AtomicBool::new(false));
+                let footprint_peak = Arc::new(AtomicU64::new(footprint_base));
+                let malloc_peak = Arc::new(AtomicU64::new(malloc_base));
+                let sampler = {
+                    let (stop, footprint_peak, malloc_peak) =
+                        (stop.clone(), footprint_peak.clone(), malloc_peak.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Acquire) {
+                            let (footprint, malloc) = process_memory_sample(false);
+                            footprint_peak.fetch_max(footprint, Ordering::AcqRel);
+                            malloc_peak.fetch_max(malloc, Ordering::AcqRel);
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                        }
+                    })
+                };
+                model
+                    .diarize(&audio, TARGET_SAMPLE_RATE, &config)
+                    .expect("diarize");
+                stop.store(true, Ordering::Release);
+                sampler.join().unwrap();
+                peaks.push((
+                    footprint_peak.load(Ordering::Acquire) - footprint_base,
+                    malloc_peak.load(Ordering::Acquire) - malloc_base,
+                ));
+            }
+            let footprint = peaks.iter().map(|peak| peak.0).max().unwrap();
+            let malloc = peaks.iter().map(|peak| peak.1).max().unwrap();
+            let estimated = estimate.host_bytes + estimate.accelerator_bytes;
+            let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+            println!(
+                "{variant} {profile}: {:.1} s audio, chunk {chunk_frames} feature frames, \
+                 composite {} frames; footprint peak +{:.1} MiB, malloc peak +{:.1} MiB \
+                 (runs {peaks:?}); estimate {:.1} MiB (host {:.1} + accelerator {:.1}), \
+                 {:.2}x the larger peak",
+                samples as f64 / TARGET_SAMPLE_RATE as f64,
+                subsampled_len_3x(chunk_frames) + cfg.spkcache_len + cfg.fifo_len,
+                mib(footprint),
+                mib(malloc),
+                mib(estimated),
+                mib(estimate.host_bytes),
+                mib(estimate.accelerator_bytes),
+                estimated as f64 / footprint.max(malloc) as f64,
+            );
+        }
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    /// Deterministic values in [-scale, scale) + offset.
+    fn random_values(len: usize, seed: u64, scale: f32, offset: f32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = (state >> 40) as f32 / (1u64 << 24) as f32;
+                (unit * 2.0 - 1.0) * scale + offset
+            })
+            .collect()
+    }
+
+    fn random_tensor(shape: &[usize], seed: u64, scale: f32, offset: f32) -> Tensor {
+        let values = random_values(shape.iter().product(), seed, scale, offset);
+        Tensor::from_vec(values, shape, &Device::Cpu).unwrap()
+    }
+
+    /// NaN-safe: a NaN or infinite difference counts as infinitely far.
+    fn tensor_max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        assert_eq!(a.dims(), b.dims());
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        a.iter()
+            .zip(&b)
+            .map(|(x, y)| {
+                let d = (x - y).abs();
+                if d.is_finite() {
+                    d
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max)
+    }
+
+    const SYNTHETIC_D_MODEL: usize = 16;
+    const SYNTHETIC_CONV_CHANNELS: usize = 4;
+    const SYNTHETIC_FEATURE_BINS: usize = 16;
+
+    /// A synthetic v2.1-shaped Conformer encoder checkpoint: dw_striding
+    /// subsampling (4 channels, 16 mel bins), `layers` Conformer layers of
+    /// width 16 (2 heads), FFN 32, depthwise kernel 9 with BatchNorm.
+    fn conformer_encoder_tensors(layers: usize) -> HashMap<String, Tensor> {
+        let d = SYNTHETIC_D_MODEL;
+        let c = SYNTHETIC_CONV_CHANNELS;
+        let mut tensors = HashMap::new();
+        let mut seed = 0x5EED_0001_u64;
+        let mut insert = |name: String, shape: &[usize], scale: f32, offset: f32| {
+            seed += 0x9E37_79B9;
+            tensors.insert(
+                format!("encoder.{name}"),
+                random_tensor(shape, seed, scale, offset),
+            );
+        };
+        for conv in ["0", "2", "5"] {
+            insert(
+                format!("pre_encode.conv.{conv}.weight"),
+                &[c, 1, 3, 3],
+                0.5,
+                0.0,
+            );
+            insert(format!("pre_encode.conv.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        for conv in ["3", "6"] {
+            insert(
+                format!("pre_encode.conv.{conv}.weight"),
+                &[c, c, 1, 1],
+                0.5,
+                0.0,
+            );
+            insert(format!("pre_encode.conv.{conv}.bias"), &[c], 0.1, 0.0);
+        }
+        let out_in = c * SYNTHETIC_FEATURE_BINS / 8;
+        insert("pre_encode.out.weight".into(), &[d, out_in], 0.3, 0.0);
+        insert("pre_encode.out.bias".into(), &[d], 0.1, 0.0);
+        for layer in 0..layers {
+            let l = format!("layers.{layer}.");
+            for norm in [
+                "norm_feed_forward1",
+                "norm_self_att",
+                "norm_conv",
+                "norm_feed_forward2",
+                "norm_out",
+            ] {
+                insert(format!("{l}{norm}.weight"), &[d], 0.1, 1.0);
+                insert(format!("{l}{norm}.bias"), &[d], 0.1, 0.0);
+            }
+            for ff in ["feed_forward1", "feed_forward2"] {
+                insert(format!("{l}{ff}.linear1.weight"), &[32, d], 0.25, 0.0);
+                insert(format!("{l}{ff}.linear1.bias"), &[32], 0.1, 0.0);
+                insert(format!("{l}{ff}.linear2.weight"), &[d, 32], 0.18, 0.0);
+                insert(format!("{l}{ff}.linear2.bias"), &[d], 0.1, 0.0);
+            }
+            insert(format!("{l}self_attn.pos_bias_u"), &[2, d / 2], 0.1, 0.0);
+            insert(format!("{l}self_attn.pos_bias_v"), &[2, d / 2], 0.1, 0.0);
+            for linear in ["linear_q", "linear_k", "linear_v", "linear_out"] {
+                insert(format!("{l}self_attn.{linear}.weight"), &[d, d], 0.25, 0.0);
+                insert(format!("{l}self_attn.{linear}.bias"), &[d], 0.1, 0.0);
+            }
+            insert(
+                format!("{l}self_attn.linear_pos.weight"),
+                &[d, d],
+                0.25,
+                0.0,
+            );
+            insert(
+                format!("{l}conv.pointwise_conv1.weight"),
+                &[2 * d, d, 1],
+                0.25,
+                0.0,
+            );
+            insert(format!("{l}conv.pointwise_conv1.bias"), &[2 * d], 0.1, 0.0);
+            insert(
+                format!("{l}conv.depthwise_conv.weight"),
+                &[d, 1, 9],
+                0.3,
+                0.0,
+            );
+            insert(format!("{l}conv.depthwise_conv.bias"), &[d], 0.1, 0.0);
+            insert(format!("{l}conv.batch_norm.weight"), &[d], 0.2, 1.0);
+            insert(format!("{l}conv.batch_norm.bias"), &[d], 0.1, 0.0);
+            insert(format!("{l}conv.batch_norm.running_mean"), &[d], 0.2, 0.0);
+            insert(format!("{l}conv.batch_norm.running_var"), &[d], 0.4, 0.8);
+            insert(
+                format!("{l}conv.pointwise_conv2.weight"),
+                &[d, d, 1],
+                0.25,
+                0.0,
+            );
+            insert(format!("{l}conv.pointwise_conv2.bias"), &[d], 0.1, 0.0);
+        }
+        tensors
+    }
+
+    fn conformer_encoder_fixture(layers: usize) -> SortformerConformerEncoder {
+        let vb =
+            VarBuilder::from_tensors(conformer_encoder_tensors(layers), DType::F32, &Device::Cpu);
+        SortformerConformerEncoder::load(vb.pp("encoder"), true).unwrap()
+    }
+
+    /// SRT-5: the Conformer conv module (shared shift-and-accumulate op with
+    /// the folded BatchNorm) matches Candle's per-channel grouped conv1d
+    /// followed by the unfolded BatchNorm.
+    #[test]
+    fn conformer_conv_folded_depthwise_matches_grouped_conv_and_batch_norm() {
+        use candle_nn::ModuleT;
+
+        let d = SYNTHETIC_D_MODEL;
+        let tensors = conformer_encoder_tensors(1);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let vb = vb.pp("encoder.layers.0.conv");
+        let counters = Arc::new(SortformerPathCounters::default());
+        let conv = ConformerConv::load(vb.clone(), d, &counters).unwrap();
+
+        let grouped = Conv1d::new(
+            vb.get((d, 1, 9), "depthwise_conv.weight").unwrap(),
+            Some(vb.get(d, "depthwise_conv.bias").unwrap()),
+            Conv1dConfig {
+                padding: 4,
+                groups: d,
+                ..Default::default()
+            },
+        );
+        let norm = batch_norm(d, 1e-5, vb.pp("batch_norm")).unwrap();
+        for (batch, time, seed) in [(1, 37, 11), (2, 9, 12), (1, 1, 13)] {
+            let x = random_tensor(&[batch, time, d], seed, 1.0, 0.0);
+            let h = conv
+                .pointwise_conv1
+                .forward(&x.transpose(1, 2).unwrap())
+                .unwrap();
+            let h = h
+                .i((.., ..d, ..))
+                .unwrap()
+                .broadcast_mul(&ops::sigmoid(&h.i((.., d.., ..)).unwrap()).unwrap())
+                .unwrap();
+            let h = grouped.forward(&h).unwrap();
+            let h = norm.forward_t(&h, false).unwrap();
+            let expected = conv
+                .pointwise_conv2
+                .forward(&swish(&h).unwrap())
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let actual = conv.forward(&x).unwrap();
+            let diff = tensor_max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "batch {batch} time {time}: max |diff| {diff}");
+        }
+        assert_eq!(counters.conformer_depthwise_conv1d(), 3);
+    }
+
+    /// SRT-5 engagement: every Conformer layer's depthwise conv runs through
+    /// the shared op, once per layer per streaming chunk.
+    #[test]
+    fn conformer_encoder_runs_each_depthwise_conv_through_the_shared_op() {
+        let layers = 3;
+        let encoder = conformer_encoder_fixture(layers);
+        let shared_before = crate::kernels::depthwise_conv::depthwise_conv1d_calls();
+        let chunks = 4;
+        for chunk in 0..chunks {
+            let mel_frames = 40 + 8 * chunk;
+            let features_t = random_tensor(
+                &[1, mel_frames, SYNTHETIC_FEATURE_BINS],
+                100 + chunk as u64,
+                1.0,
+                0.0,
+            );
+            let (pre, len) = encoder.pre_encode(&features_t, mel_frames).unwrap();
+            let (encoded, _) = encoder.forward_pre_encoded(&pre, len).unwrap();
+            assert_eq!(encoded.dims3().unwrap(), (1, len, SYNTHETIC_D_MODEL));
+            assert_eq!(
+                encoder.counters.conformer_depthwise_conv1d(),
+                ((chunk + 1) * layers) as u64
+            );
+            assert_eq!(
+                encoder.counters.subsampling_depthwise_conv2d(),
+                2 * (chunk + 1) as u64
+            );
+        }
+        // Other tests may run concurrently; the shared counter only grows.
+        assert!(
+            crate::kernels::depthwise_conv::depthwise_conv1d_calls()
+                >= shared_before + (chunks * layers) as u64
+        );
+        let diagnostics = SortformerAcousticEncoder::Conformer(encoder).kernel_diagnostics();
+        assert_eq!(
+            diagnostics["conformer_depthwise_conv1d_calls"],
+            serde_json::json!(chunks * layers)
+        );
+        assert_eq!(
+            diagnostics["subsampling_depthwise_conv2d_calls"],
+            serde_json::json!(2 * chunks)
+        );
+    }
+
+    /// SRT-5: the dw_striding subsampling (strided-tap depthwise conv2d)
+    /// matches the same graph through Candle's per-channel grouped conv2d,
+    /// on odd chunk lengths.
+    #[test]
+    fn subsampling_depthwise_conv2d_matches_grouped_conv2d() {
+        let encoder = conformer_encoder_fixture(1);
+        let sub = &encoder.pre_encode;
+        for (mel_frames, seed) in [(40, 21), (37, 22), (9, 23), (1, 24)] {
+            let features_t =
+                random_tensor(&[1, mel_frames, SYNTHETIC_FEATURE_BINS], seed, 1.0, 0.0);
+            let mut x = features_t.unsqueeze(1).unwrap();
+            x = sub.conv0.forward(&x).unwrap().relu().unwrap();
+            x = sub.conv2.forward(&x).unwrap();
+            x = sub.conv3.forward(&x).unwrap().relu().unwrap();
+            x = sub.conv5.forward(&x).unwrap();
+            x = sub.conv6.forward(&x).unwrap().relu().unwrap();
+            let (b, c, t, f) = x.dims4().unwrap();
+            let expected = x
+                .transpose(1, 2)
+                .unwrap()
+                .reshape((b, t, c * f))
+                .unwrap()
+                .apply(&sub.out)
+                .unwrap();
+            let (actual, len) = encoder.pre_encode(&features_t, mel_frames).unwrap();
+            assert_eq!(len, subsampled_len_3x(mel_frames));
+            let diff = tensor_max_abs_diff(&expected, &actual);
+            assert!(diff <= 1e-5, "{mel_frames} frames: max |diff| {diff}");
+        }
+    }
+
+    #[test]
+    fn conformer_conv_norm_type_fails_closed_unless_batch_norm() {
+        let cfg = |norm: Option<&str>| SortformerEncoderConfig {
+            conv_norm_type: norm.map(str::to_string),
+            ..SortformerEncoderConfig::default()
+        };
+        assert!(validate_conv_norm_type(None).is_ok());
+        assert!(validate_conv_norm_type(Some(&cfg(None))).is_ok());
+        assert!(validate_conv_norm_type(Some(&cfg(Some("batch_norm")))).is_ok());
+        for other in ["layer_norm", "group_norm", "fused_batch_norm"] {
+            assert!(validate_conv_norm_type(Some(&cfg(Some(other)))).is_err());
+        }
+    }
+
+    const V21_MODEL_CONFIG: &str =
+        include_str!("../../../../../tests/fixtures/sortformer_config/v21_model_config.yaml");
+    const NEMOTRON3_MODEL_CONFIG: &str =
+        include_str!("../../../../../tests/fixtures/sortformer_config/nemotron3_model_config.yaml");
+
+    /// The yaml with the value at `path` replaced (`Some`) or removed
+    /// (`None`), parsed as a Sortformer config.
+    fn edited_config(
+        yaml: &str,
+        path: &[&str],
+        value: Option<serde_yaml::Value>,
+    ) -> SortformerModelConfig {
+        let mut root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let (last, parents) = path.split_last().unwrap();
+        let mut node = &mut root;
+        for key in parents {
+            node = node.get_mut(*key).unwrap();
+        }
+        let map = node.as_mapping_mut().unwrap();
+        match value {
+            Some(value) => {
+                map.insert((*last).into(), value);
+            }
+            None => {
+                map.remove(*last);
+            }
+        }
+        serde_yaml::from_value(root).unwrap()
+    }
+
+    fn yaml_value(text: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(text).unwrap()
+    }
+
+    /// SRT-8 / NDZ-4: both published checkpoint yamls resolve to the graph
+    /// izwi runs, with head counts and the RoPE base read from the yaml.
+    #[test]
+    fn published_sortformer_yamls_resolve_the_served_graphs() {
+        let v21: SortformerModelConfig = serde_yaml::from_str(V21_MODEL_CONFIG).unwrap();
+        assert_eq!(
+            resolve_graph_spec(&v21).unwrap(),
+            SortformerGraphSpec::Conformer {
+                heads: 8,
+                xscaling: true,
+                transformer_heads: 8,
+            }
+        );
+        let nemotron: SortformerModelConfig = serde_yaml::from_str(NEMOTRON3_MODEL_CONFIG).unwrap();
+        assert_eq!(
+            resolve_graph_spec(&nemotron).unwrap(),
+            SortformerGraphSpec::FeatureStackingRope {
+                heads: 8,
+                stacking_factor: 8,
+                rope_base: 10_000.0,
+            }
+        );
+    }
+
+    /// SRT-8 / NDZ-4: a graph-defining field the graph does not implement
+    /// fails the load and names the field, whether it is set or left to a
+    /// NeMo default izwi does not serve.
+    #[test]
+    fn unserved_sortformer_graph_fields_fail_closed() {
+        let cases: &[(&str, &[&str], Option<&str>, &str)] = &[
+            (
+                V21_MODEL_CONFIG,
+                &["async_streaming"],
+                Some("true"),
+                "async_streaming",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "_target_"],
+                Some("x.SqueezeformerEncoder"),
+                "encoder target",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                Some("striding"),
+                "encoder.subsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                None,
+                "encoder.subsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "subsampling_factor"],
+                Some("4"),
+                "encoder.subsampling_factor",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "causal_downsampling"],
+                Some("true"),
+                "encoder.causal_downsampling",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                Some("abs_pos"),
+                "encoder.self_attention_model",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "att_context_size"],
+                Some("[70, 1]"),
+                "encoder.att_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "att_context_size"],
+                Some("[[-1, -1], [70, 1]]"),
+                "encoder.att_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "conv_norm_type"],
+                Some("layer_norm"),
+                "conv_norm_type",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "conv_context_size"],
+                Some("causal"),
+                "encoder.conv_context_size",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "untie_biases"],
+                Some("false"),
+                "encoder.untie_biases",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "use_bias"],
+                Some("false"),
+                "encoder.use_bias",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["encoder", "global_tokens"],
+                Some("4"),
+                "encoder.global_tokens",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["high_resolution"],
+                Some("true"),
+                "high_resolution",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                Some("1"),
+                "output_subsampling_factor",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["sortformer_modules", "use_learnable_sil_emb"],
+                Some("true"),
+                "use_learnable_sil_emb",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder"],
+                None,
+                "transformer_encoder",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "pre_ln"],
+                Some("true"),
+                "transformer_encoder.pre_ln",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "hidden_act"],
+                Some("gelu"),
+                "transformer_encoder.hidden_act",
+            ),
+            (
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "mask_future"],
+                Some("true"),
+                "transformer_encoder.mask_future",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "subsampling"],
+                Some("dw_striding"),
+                "encoder.subsampling",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                Some("rel_pos"),
+                "encoder.self_attention_model",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "self_attention_model"],
+                None,
+                "encoder.self_attention_model",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "xscaling"],
+                Some("true"),
+                "encoder.xscaling",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "qkv_bias"],
+                Some("true"),
+                "encoder.qkv_bias",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "qk_norm"],
+                Some("true"),
+                "encoder.qk_norm",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "pre_block_norm"],
+                Some("false"),
+                "encoder.pre_block_norm",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "attn_mode"],
+                Some("causal"),
+                "encoder.attn_mode",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rotary_fraction"],
+                Some("0.5"),
+                "encoder.rotary_fraction",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rope_base"],
+                Some("0.0"),
+                "encoder.rope_base",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "causal_tail_len"],
+                Some("16"),
+                "encoder.causal_tail_len",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["high_resolution"],
+                Some("false"),
+                "high_resolution",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                Some("8"),
+                "output_subsampling_factor",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["output_subsampling_factor"],
+                None,
+                "output_subsampling_factor",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["sortformer_modules", "use_learnable_sil_emb"],
+                Some("false"),
+                "use_learnable_sil_emb",
+            ),
+            (
+                NEMOTRON3_MODEL_CONFIG,
+                &["transformer_encoder"],
+                Some("{num_attention_heads: 8}"),
+                "transformer_encoder",
+            ),
+        ];
+        for (yaml, path, value, field) in cases {
+            let config = edited_config(yaml, path, value.map(yaml_value));
+            let err = resolve_graph_spec(&config)
+                .expect_err(&format!("{path:?} = {value:?} must fail closed"))
+                .to_string();
+            assert!(err.contains(field), "{path:?} = {value:?}: {err}");
+        }
+    }
+
+    /// NDZ-4: the head counts and the RoPE base come from the yaml (NeMo
+    /// defaults when absent), and a head count off the production topology
+    /// is refused by its pin rather than loaded with eight heads.
+    #[test]
+    fn sortformer_head_counts_and_rope_base_come_from_the_yaml() {
+        let spec = |yaml, path: &[&str], value: Option<&str>| {
+            resolve_graph_spec(&edited_config(yaml, path, value.map(yaml_value))).unwrap()
+        };
+        assert!(matches!(
+            spec(V21_MODEL_CONFIG, &["encoder", "n_heads"], Some("4")),
+            SortformerGraphSpec::Conformer { heads: 4, .. }
+        ));
+        assert!(matches!(
+            spec(V21_MODEL_CONFIG, &["encoder", "n_heads"], None),
+            SortformerGraphSpec::Conformer { heads: 4, .. }
+        ));
+        assert!(matches!(
+            spec(
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "num_attention_heads"],
+                Some("4")
+            ),
+            SortformerGraphSpec::Conformer {
+                transformer_heads: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spec(
+                V21_MODEL_CONFIG,
+                &["transformer_encoder", "num_attention_heads"],
+                None
+            ),
+            SortformerGraphSpec::Conformer {
+                transformer_heads: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            spec(NEMOTRON3_MODEL_CONFIG, &["encoder", "n_heads"], Some("16")),
+            SortformerGraphSpec::FeatureStackingRope { heads: 16, .. }
+        ));
+        assert!(matches!(
+            spec(
+                NEMOTRON3_MODEL_CONFIG,
+                &["encoder", "rope_base"],
+                Some("500000.0")
+            ),
+            SortformerGraphSpec::FeatureStackingRope {
+                rope_base: 500_000.0,
+                ..
+            }
+        ));
+
+        let cfg = production_workspace_streaming_config();
+        let mut topology = SortformerWorkspaceTopology::v21_production();
+        assert!(topology.validate_production(cfg).is_ok());
+        topology.expander = SortformerFrameExpanderTopology::SortformerTransformer {
+            layers: PRODUCTION_TRANSFORMER_LAYERS,
+            d_model: PRODUCTION_TRANSFORMER_D_MODEL,
+            inner_dim: PRODUCTION_TRANSFORMER_INNER_DIM,
+            heads: 4,
+        };
+        assert!(topology.validate_production(cfg).is_err());
+
+        // The RoPE frequencies follow the yaml's base.
+        let encoder = rope_encoder_fixture_with_base(100.0).unwrap();
+        let head_dim = encoder.head_dim as f32;
+        assert!((encoder.rope_inv_freq[1] - 100f32.powf(-2.0 / head_dim)).abs() < 1e-7);
+    }
+
+    /// A synthetic v2.1-shaped streaming model: the synthetic Conformer
+    /// encoder, a projection to 8, one 8-head transformer layer and the
+    /// 4-speaker head, streaming 6-frame chunks through an 8-row cache and
+    /// a 4-row FIFO so the cache compresses every few chunks. Every frame
+    /// counts as silent, so the running silence mean is exercised.
+    fn synthetic_streaming_model(layers: usize) -> SortformerInferenceModel {
+        let mut tensors = conformer_encoder_tensors(layers);
+        let (d, h, inner) = (SYNTHETIC_D_MODEL, 8, 16);
+        let mut seed = 0xFEED_0001_u64;
+        let mut insert = |name: &str, shape: &[usize], scale: f32, offset: f32| {
+            seed += 0x9E37_79B9;
+            tensors.insert(name.to_string(), random_tensor(shape, seed, scale, offset));
+        };
+        insert("sortformer_modules.encoder_proj.weight", &[h, d], 0.3, 0.0);
+        insert("sortformer_modules.encoder_proj.bias", &[h], 0.1, 0.0);
+        let l = "transformer_encoder.layers.0.";
+        for norm in ["layer_norm_1", "layer_norm_2"] {
+            insert(&format!("{l}{norm}.weight"), &[h], 0.1, 1.0);
+            insert(&format!("{l}{norm}.bias"), &[h], 0.1, 0.0);
+        }
+        for linear in ["query_net", "key_net", "value_net", "out_projection"] {
+            insert(
+                &format!("{l}first_sub_layer.{linear}.weight"),
+                &[h, h],
+                0.3,
+                0.0,
+            );
+            insert(&format!("{l}first_sub_layer.{linear}.bias"), &[h], 0.1, 0.0);
+        }
+        insert(
+            &format!("{l}second_sub_layer.dense_in.weight"),
+            &[inner, h],
+            0.3,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_in.bias"),
+            &[inner],
+            0.1,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_out.weight"),
+            &[h, inner],
+            0.3,
+            0.0,
+        );
+        insert(
+            &format!("{l}second_sub_layer.dense_out.bias"),
+            &[h],
+            0.1,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.first_hidden_to_hidden.weight",
+            &[h, h],
+            0.4,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.first_hidden_to_hidden.bias",
+            &[h],
+            0.1,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.single_hidden_to_spks.weight",
+            &[4, h],
+            1.5,
+            0.0,
+        );
+        insert(
+            "sortformer_modules.single_hidden_to_spks.bias",
+            &[4],
+            0.5,
+            0.0,
+        );
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let preprocessor = SortformerPreprocessor::load(
+            &vb,
+            SortformerPreprocessorConfig {
+                sample_rate: Some(TARGET_SAMPLE_RATE),
+                window_size: Some(0.025),
+                window_stride: Some(0.01),
+                features: Some(SYNTHETIC_FEATURE_BINS),
+                n_fft: Some(512),
+                normalize: Some("NA".to_string()),
+            },
+        )
+        .unwrap();
+        let encoder = SortformerConformerEncoder::load(vb.pp("encoder"), true).unwrap();
+        let streaming = SortformerStreamingConfig {
+            fc_d_model: d,
+            spkcache_len: 8,
+            fifo_len: 4,
+            chunk_len: 6,
+            spkcache_update_period: 3,
+            chunk_left_context: 1,
+            chunk_right_context: 2,
+            spkcache_sil_frames_per_spk: 1,
+            sil_threshold: 10.0,
+            ..production_workspace_streaming_config()
+        }
+        .validate()
+        .unwrap();
+        SortformerInferenceModel {
+            device: Device::Cpu,
+            separate_device_memory: false,
+            preprocessor,
+            encoder: SortformerAcousticEncoder::Conformer(encoder),
+            encoder_proj: mlx::load_linear(d, h, vb.pp("sortformer_modules.encoder_proj")).unwrap(),
+            expander: SortformerFrameExpander::SortformerTransformer(
+                SortformerTransformerEncoder::load(vb.pp("transformer_encoder"), 8).unwrap(),
+            ),
+            head: SortformerSpeakerHead::load(vb.pp("sortformer_modules"), 4).unwrap(),
+            num_speakers: 4,
+            streaming: Some(streaming),
+            streaming_profile: SortformerStreamingProfile::Model,
+            silence_embedding: None,
+            streaming_counters: SortformerStreamingCounters::default(),
+        }
+    }
+
+    /// SRT-7: the streaming loop keeps its state on the model device. Per
+    /// chunk it reads the probabilities once (plus the silent FIFO rows for
+    /// the running silence mean), reuses the relative-position table of a
+    /// repeated composite length, and commits the physical invocation state
+    /// once at the end instead of after every chunk. The physical and plain
+    /// paths give bit-identical probabilities.
+    #[test]
+    fn streaming_state_stays_on_device_with_bounded_host_reads() {
+        let model = synthetic_streaming_model(2);
+        let cfg = model.streaming.unwrap();
+        let samples = random_values(16_000 * 6, 0xA0D10, 0.3, 0.0);
+        let feature_frames = model.preprocessor.feature_frame_count(samples.len());
+        let planned = plan_streaming_feature_chunks(feature_frames, cfg).len() as u64;
+        assert!(planned >= 8, "{planned} chunks");
+
+        let plain = model
+            .infer_speaker_probabilities_streaming(&samples, feature_frames, cfg, None)
+            .unwrap();
+        let path = model.streaming_path_diagnostics();
+        let chunks = path["chunks"].as_u64().unwrap();
+        let host_reads = path["host_reads"].as_u64().unwrap();
+        assert_eq!(chunks, planned);
+        assert!(
+            host_reads > chunks && host_reads <= 2 * chunks,
+            "{host_reads} host reads over {chunks} chunks"
+        );
+        assert_eq!(path["physical_state_commits"], serde_json::json!(0));
+        let SortformerAcousticEncoder::Conformer(encoder) = &model.encoder else {
+            unreachable!("synthetic model is a Conformer");
+        };
+        let tables = encoder.counters.rel_pos_tables_built();
+        assert!(
+            tables >= 1 && tables < chunks / 2,
+            "{tables} tables, {chunks} chunks"
+        );
+        assert_eq!(encoder.counters.conformer_depthwise_conv1d(), 2 * chunks);
+
+        let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+        let physical = model
+            .infer_speaker_probabilities_streaming(&samples, feature_frames, cfg, Some(&mut lease))
+            .unwrap();
+        assert_eq!(lease.arena().unwrap().absolute_cursor(), 1);
+        assert_eq!(
+            model.streaming_path_diagnostics()["physical_state_commits"],
+            serde_json::json!(1)
+        );
+        assert_eq!(physical.len(), plain.len());
+        for (a, b) in physical.iter().flatten().zip(plain.iter().flatten()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// PIPE-8: a stream run in bounded steps carries its state between
+    /// steps unchanged, so every split gives the one-pass probabilities and
+    /// the same committed state, bit for bit, and counts one step per stage.
+    #[test]
+    fn staged_stream_matches_one_pass_bit_for_bit() {
+        let model = synthetic_streaming_model(2);
+        let cfg = model.streaming.unwrap();
+        let samples = random_values(16_000 * 6, 0x57A6E, 0.3, 0.0);
+        let feature_frames = model.preprocessor.feature_frame_count(samples.len());
+        let planned = plan_streaming_feature_chunks(feature_frames, cfg).len();
+        assert!(planned >= 8, "{planned} chunks");
+        let mut one_pass_lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+        let one_pass = model
+            .infer_speaker_probabilities_streaming(
+                &samples,
+                feature_frames,
+                cfg,
+                Some(&mut one_pass_lease),
+            )
+            .unwrap();
+        let committed = |lease: &InvocationTensorLease| {
+            lease
+                .read_snapshot()
+                .unwrap()
+                .components
+                .into_iter()
+                .map(|slice| {
+                    let values = slice
+                        .tensor
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    values.into_iter().map(f32::to_bits).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for chunks_per_step in [1, 2, 3, planned] {
+            let steps_before = model.streaming_path_diagnostics()["steps"]
+                .as_u64()
+                .unwrap();
+            let mut stream =
+                model.begin_stream(samples.len(), feature_frames, cfg, chunks_per_step);
+            let expected_steps = planned.div_ceil(chunks_per_step);
+            assert_eq!(stream.steps_remaining(), expected_steps);
+            while !stream.is_finished() {
+                model.advance_stream(&mut stream, &samples).unwrap();
+            }
+            assert_eq!(
+                model.streaming_path_diagnostics()["steps"]
+                    .as_u64()
+                    .unwrap()
+                    - steps_before,
+                expected_steps as u64
+            );
+            let mut lease = streaming_state_commit_lease(cfg, BackendKind::Cpu, Device::Cpu);
+            let staged = model.finish_stream(stream, Some(&mut lease)).unwrap();
+            assert_eq!(
+                staged.len(),
+                one_pass.len(),
+                "{chunks_per_step} chunks/step"
+            );
+            for (a, b) in staged.iter().flatten().zip(one_pass.iter().flatten()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{chunks_per_step} chunks/step");
+            }
+            assert_eq!(committed(&lease), committed(&one_pass_lease));
+        }
+
+        // A stream cannot finish early or resume over other audio.
+        let mut stream = model.begin_stream(samples.len(), feature_frames, cfg, 1);
+        assert!(model.advance_stream(&mut stream, &samples[1..]).is_err());
+        model.advance_stream(&mut stream, &samples).unwrap();
+        assert!(model.finish_stream(stream, None).is_err());
+    }
+
+    /// A step covers about 90 s of 16 kHz audio in whole chunks: three
+    /// 27.2 s chunks of the v2.1 card profile, never zero.
+    #[test]
+    fn stream_steps_cover_bounded_audio() {
+        let cfg = production_workspace_streaming_config();
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 90.0), 3);
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 1.0), 1);
+        assert_eq!(chunks_per_stream_step(cfg, PRODUCTION_HOP_LENGTH, 0.0), 1);
     }
 }

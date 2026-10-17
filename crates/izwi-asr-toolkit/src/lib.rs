@@ -539,6 +539,15 @@ impl TimedWord {
     fn midpoint_secs(&self) -> f32 {
         (self.start_secs + self.end_secs) / 2.0
     }
+
+    /// Whether the word belongs to the chunk between seams `after_secs` and
+    /// `until_secs` (`None` = no neighbour on that side): its midpoint lies
+    /// after the first and no later than the second.
+    pub fn within_seams(&self, after_secs: Option<f32>, until_secs: Option<f32>) -> bool {
+        let midpoint = self.midpoint_secs();
+        !after_secs.is_some_and(|seam| midpoint <= seam)
+            && !until_secs.is_some_and(|seam| midpoint > seam)
+    }
 }
 
 /// Where two consecutive chunks hand over: the middle of the audio both
@@ -611,11 +620,7 @@ impl TranscriptAssembler {
         let mut kept = Vec::new();
         for word in words {
             let text = word.text.trim();
-            let midpoint = word.midpoint_secs();
-            if text.is_empty()
-                || after_secs.is_some_and(|seam| midpoint <= seam)
-                || until_secs.is_some_and(|seam| midpoint > seam)
-            {
+            if text.is_empty() || !word.within_seams(after_secs, until_secs) {
                 continue;
             }
             let end_secs = word.end_secs.max(word.start_secs);
@@ -926,7 +931,7 @@ fn append_with_spacing(dst: &mut String, delta: &str) {
 }
 
 /// Separator to insert between merged text `prev` and an appended `delta`.
-fn spacing_between(prev: &str, delta: &str) -> &'static str {
+pub fn spacing_between(prev: &str, delta: &str) -> &'static str {
     let needs_space = match (prev.chars().next_back(), delta.chars().next()) {
         (Some(a), Some(b)) => {
             !a.is_whitespace()

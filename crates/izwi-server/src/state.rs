@@ -6,6 +6,7 @@ use crate::chat_store::ChatStore;
 use crate::db::StoreDatabase;
 use crate::diarization_store::DiarizationStore;
 use crate::media_ingest::MediaIngestService;
+use crate::node_identity::NodeIdentity;
 use crate::onboarding_store::OnboardingStore;
 use crate::persistence::{LocalMediaStorageProvider, PersistenceContext};
 use crate::saved_voice_store::SavedVoiceStore;
@@ -16,7 +17,9 @@ use crate::transcription_store::TranscriptionStore;
 use crate::voice_observation_store::VoiceObservationStore;
 use crate::voice_store::VoiceStore;
 use izwi_agent::planner::PlanningMode;
-use izwi_core::{RuntimeRequestContext, RuntimeService, ServeRuntimeConfig, WorkloadClass};
+use izwi_core::{
+    JobCancellation, RuntimeRequestContext, RuntimeService, ServeRuntimeConfig, WorkloadClass,
+};
 use izwi_hooks::{EnterpriseHooks, MediaStorageProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -319,6 +322,57 @@ pub struct StoredAgentSessionRecord {
 
 pub use izwi_gateway::lifecycle::ServerLifecycle;
 
+/// Cancellation handles of the diarization jobs this process is running, by
+/// record id, so cancelling a record stops its pipeline (PIPE-7).
+#[derive(Debug, Clone, Default)]
+pub struct DiarizationJobRegistry(Arc<std::sync::Mutex<HashMap<String, JobCancellation>>>);
+
+impl DiarizationJobRegistry {
+    /// Track `record_id` while the returned guard lives.
+    pub fn register(&self, record_id: &str) -> RegisteredDiarizationJob {
+        let cancellation = JobCancellation::new();
+        self.jobs()
+            .insert(record_id.to_string(), cancellation.clone());
+        RegisteredDiarizationJob {
+            registry: self.clone(),
+            record_id: record_id.to_string(),
+            cancellation,
+        }
+    }
+
+    /// Cancel the running job of `record_id`; false when none is running.
+    pub fn cancel(&self, record_id: &str) -> bool {
+        self.jobs()
+            .get(record_id)
+            .map(JobCancellation::cancel)
+            .is_some()
+    }
+
+    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, JobCancellation>> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// A running diarization job; it leaves the registry when dropped.
+#[derive(Debug)]
+pub struct RegisteredDiarizationJob {
+    registry: DiarizationJobRegistry,
+    record_id: String,
+    cancellation: JobCancellation,
+}
+
+impl RegisteredDiarizationJob {
+    pub fn cancellation(&self) -> &JobCancellation {
+        &self.cancellation
+    }
+}
+
+impl Drop for RegisteredDiarizationJob {
+    fn drop(&mut self) {
+        self.registry.jobs().remove(&self.record_id);
+    }
+}
+
 /// Shared application state with fine-grained locking and backpressure
 #[derive(Clone)]
 pub struct AppState {
@@ -355,6 +409,8 @@ pub struct AppState {
     pub transcription_store: Arc<TranscriptionStore>,
     /// SQLite-backed diarization history store.
     pub diarization_store: Arc<DiarizationStore>,
+    /// Diarization jobs running in this process.
+    pub diarization_jobs: DiarizationJobRegistry,
     /// SQLite-backed speech generation history store.
     pub speech_history_store: Arc<SpeechHistoryStore>,
     /// SQLite-backed saved voice store.
@@ -450,6 +506,7 @@ impl AppState {
             chat_store,
             transcription_store,
             diarization_store,
+            diarization_jobs: DiarizationJobRegistry::default(),
             speech_history_store,
             saved_voice_store,
             onboarding_store,
@@ -482,16 +539,24 @@ impl AppState {
         let realtime_session_capacity = realtime_session_limit_from_env();
         let store_database = StoreDatabase::from_connection(persistence.database.connection());
         let media_storage = persistence.media_storage();
+        // The node that owns the in-process jobs these stores start (P1V-1).
+        let node = NodeIdentity::from_env();
 
         let chat_store = Arc::new(ChatStore::initialize_with_database(store_database.clone()));
-        let transcription_store = Arc::new(TranscriptionStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
-        let diarization_store = Arc::new(DiarizationStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-        ));
+        let transcription_store = Arc::new(
+            TranscriptionStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+            )
+            .with_node_identity(node.clone()),
+        );
+        let diarization_store = Arc::new(
+            DiarizationStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+            )
+            .with_node_identity(node.clone()),
+        );
         let saved_voice_store = Arc::new(SavedVoiceStore::initialize_with_storage(
             store_database.clone(),
             media_storage.clone(),
@@ -514,11 +579,14 @@ impl AppState {
             media_storage.clone(),
             ArtifactStoreLimits::default(),
         )?);
-        let speech_history_store = Arc::new(SpeechHistoryStore::initialize_with_storage(
-            store_database.clone(),
-            media_storage.clone(),
-            artifact_store.clone(),
-        ));
+        let speech_history_store = Arc::new(
+            SpeechHistoryStore::initialize_with_storage(
+                store_database.clone(),
+                media_storage.clone(),
+                artifact_store.clone(),
+            )
+            .with_node_identity(node),
+        );
         let media_ingest = Arc::new(MediaIngestService::new(
             media_storage,
             batch_runtime_store.clone(),
@@ -543,6 +611,7 @@ impl AppState {
             chat_store,
             transcription_store,
             diarization_store,
+            diarization_jobs: DiarizationJobRegistry::default(),
             speech_history_store,
             saved_voice_store,
             onboarding_store,
@@ -681,8 +750,9 @@ fn trim_store_by<T>(
 #[cfg(test)]
 mod tests {
     use super::{
-        request_limits, trim_store_by, AppState, RequestAdmissionLimiter, RequestAdmissionLimits,
-        StoredAgentSessionRecord, StoredResponseInputItem, StoredResponseRecord,
+        request_limits, trim_store_by, AppState, DiarizationJobRegistry, RequestAdmissionLimiter,
+        RequestAdmissionLimits, StoredAgentSessionRecord, StoredResponseInputItem,
+        StoredResponseRecord,
     };
     use crate::test_support::env_lock;
     use izwi_agent::planner::PlanningMode;
@@ -692,6 +762,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    /// PIPE-7: a registered job can be cancelled by its record id, and it
+    /// leaves the registry once its task drops the registration.
+    #[test]
+    fn diarization_job_registry_cancels_running_jobs_by_record_id() {
+        let registry = DiarizationJobRegistry::default();
+        let job = registry.register("dir_running");
+        assert!(!job.cancellation().is_cancelled());
+        assert!(!registry.cancel("dir_other"));
+        assert!(registry.cancel("dir_running"));
+        assert!(job.cancellation().is_cancelled());
+        drop(job);
+        assert!(!registry.cancel("dir_running"));
+    }
 
     #[test]
     fn trim_store_by_evicts_oldest_response_record() {

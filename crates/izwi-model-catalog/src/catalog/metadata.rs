@@ -303,6 +303,13 @@ impl ModelVariant {
     pub const FISH_S2_PRO_ARTIFACT_REVISION: &'static str =
         "1de9996b6be38b745688de084d87a5633f714e4e";
     pub const FISH_S2_PRO_MAX_OUTPUT_FRAMES: usize = 4096;
+    /// The `.nemo` revisions izwi's Sortformer loader was verified against
+    /// (sha256 `8abd3283…2ef8` and `867c53f5…e96d`); a re-published archive
+    /// changes graph config and weights together (NDZ-5).
+    pub const SORTFORMER_4SPK_V21_ARTIFACT_REVISION: &'static str =
+        "cd03eee90fbec18297ac31b8c21546e596b7f71c";
+    pub const NEMOTRON3_DIARIZATION_ARTIFACT_REVISION: &'static str =
+        "f667ed73aee57d40cc39428eb768b4fd87a0a29e";
     pub const FISH_S2_PRO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const LFM25_AUDIO_NATIVE_CONTEXT_TOKENS: usize = 32_768;
     pub const FISH_S2_PRO_FRAME_RATE_HZ: f32 = 21.5;
@@ -331,6 +338,10 @@ impl ModelVariant {
             Self::Qwen3827BFp8 => Some(Self::QWEN38_27B_FP8_ARTIFACT_REVISION),
             Self::Qwen36Moe35BA3BFp8 => Some(Self::QWEN36_MOE_35B_A3B_FP8_ARTIFACT_REVISION),
             Self::FishAudioS2Pro => Some(Self::FISH_S2_PRO_ARTIFACT_REVISION),
+            Self::DiarStreamingSortformer4SpkV21 => {
+                Some(Self::SORTFORMER_4SPK_V21_ARTIFACT_REVISION)
+            }
+            Self::Nemotron3Diarization => Some(Self::NEMOTRON3_DIARIZATION_ARTIFACT_REVISION),
             _ => None,
         }
     }
@@ -522,8 +533,8 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 2_368_284_501, // .nemo bytes, HF tree, Oct 2026
             Self::GraniteSpeech412B => 4_626_414_392,   // safetensors index metadata total_size
             Self::GraniteSpeech412BPlus => 4_223_757_112, // safetensors index metadata total_size
-            Self::DiarStreamingSortformer4SpkV21 => 510_000_000, // ~0.47 GB (est)
-            Self::Nemotron3Diarization => 200_000_000,          // ~0.19 GB .nemo, HF, Sep 2026
+            Self::DiarStreamingSortformer4SpkV21 => 471_367_680, // .nemo bytes, HF tree, Oct 2026
+            Self::Nemotron3Diarization => 198_676_480,  // .nemo bytes, HF tree, Oct 2026
             Self::Qwen306B => 1_520_000_000,            // ~1.42 GB (est)
             Self::Qwen306B4Bit => 900_000_000,          // ~0.84 GB (est)
             Self::Qwen317B => 4_080_000_000,            // ~3.80 GB (actual: 3.44GB + 622MB shards)
@@ -538,7 +549,7 @@ impl ModelVariant {
             Self::Qwen36Moe35BA3BFp8 => 37_470_000_000, // ~34.9 GiB indexed FP8 safetensors + chat/tokenizer metadata (HF model-card total; re-pinned at download)
             Self::Gemma34BIt => 8_600_000_000,          // ~8.01 GB (est)
             Self::Qwen3ForcedAligner06B => 1_840_072_459, // ~1.71 GB
-            Self::Qwen3ForcedAligner06B4Bit => 703_200_000, // ~0.65 GB
+            Self::Qwen3ForcedAligner06B4Bit => 975_853_671, // ~0.91 GB
             Self::VoxtralMini4BRealtime2602 => 8_874_376_007, // resolved download total, Oct 2026
             Self::Voxtral4BTts2603 => 8_650_000_000,    // ~8.04 GB plus voice assets
             Self::VibeVoice15BTts => 5_408_043_974,     // safetensors index metadata total_size
@@ -572,8 +583,12 @@ impl ModelVariant {
             Self::Nemotron35AsrStreaming06B => 6.0,
             // Same architecture as plus; base's untied head adds 0.4 GB BF16.
             Self::GraniteSpeech412B | Self::GraniteSpeech412BPlus => 10.0,
-            Self::DiarStreamingSortformer4SpkV21 => 3.0,
-            Self::Nemotron3Diarization => 2.0,
+            // The diarizers and the forced aligner are priced by their
+            // residency plans (`asr_memory`); these figures cover the largest
+            // plan resident on any backend. Sortformer loads F32 weights:
+            // 0.44 GiB (v2.1) and 0.37 GiB (Nemotron-3) on every backend.
+            Self::DiarStreamingSortformer4SpkV21 => 0.5,
+            Self::Nemotron3Diarization => 0.4,
             Self::Qwen306B => 3.0,
             Self::Qwen306B4Bit => 2.0,
             Self::Qwen317B => 5.0,
@@ -595,8 +610,9 @@ impl ModelVariant {
             // the qwen3_5_moe representation plan replaces it per backend.
             Self::Qwen36Moe35BA3BFp8 => 140.0,
             Self::Gemma34BIt => 11.0,
-            Self::Qwen3ForcedAligner06B => 2.5,
-            Self::Qwen3ForcedAligner06B4Bit => 1.5,
+            // Both aligners dequantize to F32 on the CPU (3.42 GiB); Metal
+            // (F16 text) holds 2.69 GiB and CUDA (BF16 text) 2.30 GiB.
+            Self::Qwen3ForcedAligner06B | Self::Qwen3ForcedAligner06B4Bit => 3.5,
             Self::VoxtralMini4BRealtime2602 => 16.0,
             Self::Voxtral4BTts2603 => 16.0,
             Self::VibeVoice15BTts => 12.0,
@@ -633,6 +649,16 @@ impl ModelVariant {
             self.family(),
             crate::catalog::ModelFamily::SortformerDiarization
         )
+    }
+
+    /// The speaker channels a diarization checkpoint emits: the most speakers
+    /// it can tell apart, and the bound on `min_speakers`/`max_speakers`.
+    pub fn diarization_speaker_channels(&self) -> Option<usize> {
+        match self {
+            Self::DiarStreamingSortformer4SpkV21 => Some(4),
+            Self::Nemotron3Diarization => Some(8),
+            _ => None,
+        }
     }
 
     /// Whether this model can produce persisted diarization records.
@@ -1387,8 +1413,8 @@ mod tests {
         assert_eq!(variant.dir_name(), "Nemotron-3-Diarization");
         assert_eq!(variant.display_name(), "Nemotron 3 Diarization");
         assert_eq!(variant.license_label(), Some("OpenMDW-1.1"));
-        assert_eq!(variant.estimated_size(), 200_000_000);
-        assert_eq!(variant.memory_required_gb(), 2.0);
+        assert_eq!(variant.estimated_size(), 198_676_480);
+        assert_eq!(variant.memory_required_gb(), 0.4);
     }
 
     #[test]

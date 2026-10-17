@@ -40,6 +40,45 @@ fn conv_stack_output_len(input_len: usize) -> usize {
     conv_output_len(conv_output_len(conv_output_len(input_len)))
 }
 
+/// Transient bytes one convolution-stem slice may hold (QFA-8). The stem
+/// runs over slices of whole 1 s chunks, so its working set is bounded by the
+/// slice instead of growing with the audio.
+pub(crate) const QWEN3_AUDIO_CNN_SLICE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// F32 bytes the convolution stem holds per chunk at its widest point: the
+/// first convolution's output and its GELU, plus the second convolution's
+/// patch matrix (`9 × channels` rows per output position; Metal and CUDA
+/// without cuDNN materialize it whole) with its output and GELU. The third
+/// convolution works on a quarter of that.
+pub(crate) fn qwen3_audio_cnn_chunk_bytes(channels: u64, mel_bins: u64, chunk_frames: u64) -> u64 {
+    let half = |len: u64| conv_output_len(len as usize) as u64;
+    let first = channels * half(mel_bins) * half(chunk_frames);
+    let second_positions = half(half(mel_bins)) * half(half(chunk_frames));
+    let second = second_positions * channels * (9 + 2);
+    (2 * first + second) * 4
+}
+
+/// Chunks per convolution-stem slice: as many as fit
+/// [`QWEN3_AUDIO_CNN_SLICE_BUDGET_BYTES`], at most the checkpoint's
+/// `conv_chunksize` (the upstream slice length, 500), and at least one.
+pub(crate) fn qwen3_audio_cnn_slice_chunks(
+    channels: u64,
+    mel_bins: u64,
+    chunk_frames: u64,
+    conv_chunksize: Option<usize>,
+) -> usize {
+    let per_chunk = qwen3_audio_cnn_chunk_bytes(channels, mel_bins, chunk_frames).max(1);
+    let by_budget =
+        usize::try_from(QWEN3_AUDIO_CNN_SLICE_BUDGET_BYTES / per_chunk).unwrap_or(usize::MAX);
+    by_budget.min(conv_chunksize.unwrap_or(500)).max(1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Convolution-stem slices dispatched on this thread.
+    static CONV_STEM_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rows of the F32 sinusoidal position table the audio tower builds on the
 /// host and uploads at load (priced by `runtime/lifecycle/asr_memory.rs`).
 pub(crate) const QWEN3_ASR_AUDIO_POSITIONS: usize = 1500;
@@ -544,6 +583,38 @@ impl AudioTower {
         self.cfg.num_mel_bins
     }
 
+    /// The convolution stem over `[chunks, 1, n_mels, chunk_frames]`, run
+    /// over slices of at most [`qwen3_audio_cnn_slice_chunks`] chunks so its
+    /// transient is one slice's, not the whole audio's (QFA-8; upstream
+    /// splits by `conv_chunksize` the same way). Every chunk is convolved on
+    /// its own along the batch axis, so the concatenated output is
+    /// bit-identical to one unsliced pass; `conv_out` then runs once over it
+    /// with the unsliced shape.
+    fn conv_stem(&self, chunks: &Tensor) -> Result<Tensor> {
+        let (total, _, _, chunk_frames) = chunks.dims4()?;
+        let slice = qwen3_audio_cnn_slice_chunks(
+            self.cfg.downsample_hidden_size as u64,
+            self.cfg.num_mel_bins as u64,
+            chunk_frames as u64,
+            self.cfg.conv_chunksize,
+        );
+        let mut outputs = Vec::with_capacity(total.div_ceil(slice));
+        let mut start = 0;
+        while start < total {
+            let len = slice.min(total - start);
+            #[cfg(test)]
+            CONV_STEM_DISPATCHES.with(|count| count.set(count.get() + 1));
+            let x = gelu(&self.conv2d1.forward(&chunks.narrow(0, start, len)?)?)?;
+            let x = gelu(&self.conv2d2.forward(&x)?)?;
+            outputs.push(gelu(&self.conv2d3.forward(&x)?)?);
+            start += len;
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
+        }
+        Tensor::cat(&outputs, 0).map_err(Error::from)
+    }
+
     pub fn forward(&self, mel: &Tensor, feature_lens: Option<&[usize]>) -> Result<Tensor> {
         let bsz = mel.dim(0)?;
         let total_frames = mel.dim(3)?;
@@ -697,12 +768,7 @@ impl AudioTower {
         let mut x = Tensor::stack(&chunk_refs, 0)?; // [num_chunks, chunk_input_len, n_mels]
         x = x.transpose(1, 2)?.unsqueeze(1)?; // [num_chunks, 1, n_mels, chunk_input_len]
 
-        x = self.conv2d1.forward(&x)?;
-        x = gelu(&x)?;
-        x = self.conv2d2.forward(&x)?;
-        x = gelu(&x)?;
-        x = self.conv2d3.forward(&x)?;
-        x = gelu(&x)?;
+        x = self.conv_stem(&x)?;
 
         let num_chunks = x.dim(0)?;
         let channels = x.dim(1)?;
@@ -836,13 +902,8 @@ impl AudioTower {
         let mut x = Tensor::stack(&chunk_refs, 0)?; // [all_chunks, chunk_input_len, n_mels]
         x = x.transpose(1, 2)?.unsqueeze(1)?;
 
-        // One convolutional launch sequence serves every request row.
-        x = self.conv2d1.forward(&x)?;
-        x = gelu(&x)?;
-        x = self.conv2d2.forward(&x)?;
-        x = gelu(&x)?;
-        x = self.conv2d3.forward(&x)?;
-        x = gelu(&x)?;
+        // One convolutional launch sequence per slice serves every request row.
+        x = self.conv_stem(&x)?;
 
         let num_chunks = x.dim(0)?;
         let channels = x.dim(1)?;
@@ -1111,6 +1172,73 @@ mod tests {
                 "tensor mismatch at {index}: {lhs} != {rhs}"
             );
         }
+    }
+
+    fn conv_stem_dispatches() -> usize {
+        CONV_STEM_DISPATCHES.with(std::cell::Cell::get)
+    }
+
+    /// QFA-8: the stem runs ⌈chunks / K⌉ slices and the output is
+    /// bit-identical to one unsliced pass, for the scalar and ragged paths.
+    #[test]
+    fn sliced_conv_stem_is_bit_identical_to_one_pass() {
+        let device = Device::Cpu;
+        let mut tower = tiny_audio_tower(&device);
+        let chunks = 250usize;
+        let frames = chunks * 100;
+        let features = Tensor::from_vec(
+            crate::kernels::numeric_check::xorshift_values(frames * 8, 7, 1.0),
+            (frames, 8),
+            &device,
+        )
+        .unwrap();
+        let bits = |tensor: &Tensor| {
+            tensor
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let mut run = |slice: usize| {
+            tower.cfg.conv_chunksize = Some(slice);
+            let before = conv_stem_dispatches();
+            let scalar = tower.forward_feature_sequence(&features, frames).unwrap();
+            let scalar_dispatches = conv_stem_dispatches() - before;
+            let ragged_lengths = [frames, frames - 150];
+            let ragged = Tensor::stack(&[&features, &features], 0).unwrap();
+            let before = conv_stem_dispatches();
+            let batch = tower
+                .forward_feature_batch(&ragged, &ragged_lengths)
+                .unwrap()
+                .into_padded();
+            let ragged_dispatches = conv_stem_dispatches() - before;
+            (
+                bits(&scalar),
+                scalar_dispatches,
+                bits(&batch),
+                ragged_dispatches,
+            )
+        };
+        let whole = run(500);
+        let sliced = run(32);
+        assert_eq!((whole.1, whole.3), (1, 1));
+        assert_eq!(sliced.1, chunks.div_ceil(32));
+        assert_eq!(sliced.3, (2 * chunks - 1).div_ceil(32));
+        assert!(sliced.0 == whole.0, "scalar output changed when sliced");
+        assert!(sliced.2 == whole.2, "ragged output changed when sliced");
+    }
+
+    /// The real checkpoint's stem (480 channels, 128 mel bins, 100-frame
+    /// chunks) holds about 29 MB per chunk, so a slice takes 9 chunks.
+    #[test]
+    fn conv_stem_slice_is_sized_from_its_byte_budget() {
+        assert_eq!(qwen3_audio_cnn_chunk_bytes(480, 128, 100), 29_184_000);
+        assert_eq!(qwen3_audio_cnn_slice_chunks(480, 128, 100, Some(500)), 9);
+        assert_eq!(qwen3_audio_cnn_slice_chunks(480, 128, 100, Some(4)), 4);
+        assert_eq!(qwen3_audio_cnn_slice_chunks(2, 8, 100, None), 500);
     }
 
     #[test]

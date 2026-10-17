@@ -536,6 +536,11 @@
       },
       "AlignmentResponse": {
         "properties": {
+          "alignment_source": {
+            "description": "`model` when every word was timed by the aligner; `heuristic` when\nsome windows fell back to evenly spaced timings (see `warnings`).",
+            "example": "model",
+            "type": "string"
+          },
           "alignments": {
             "items": {
               "$ref": "#/components/schemas/AlignmentWord"
@@ -543,13 +548,23 @@
             "type": "array"
           },
           "duration": {
+            "description": "Duration of the aligned audio in seconds.",
             "format": "float",
             "type": "number"
+          },
+          "warnings": {
+            "description": "One entry per alignment window whose timings are not the model's.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
           "alignments",
-          "duration"
+          "duration",
+          "alignment_source",
+          "warnings"
         ],
         "type": "object"
       },
@@ -1963,6 +1978,7 @@
             ]
           },
           "response_format": {
+            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs.",
             "type": [
               "string",
               "null"
@@ -2040,6 +2056,7 @@
             ]
           },
           "response_format": {
+            "description": "One of json, verbose_json, text, srt, vtt; anything else (including\ndiarized_json) is rejected with 400 before transcription runs.",
             "type": [
               "string",
               "null"
@@ -2159,6 +2176,15 @@
       },
       "VerboseAlignmentResponse": {
         "properties": {
+          "alignment_source": {
+            "example": "model",
+            "type": "string"
+          },
+          "alignment_windows": {
+            "description": "Aligner windows the audio was split into (each at most the aligner's\naudio limit).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "alignments": {
             "items": {
               "$ref": "#/components/schemas/AlignmentWord"
@@ -2166,6 +2192,7 @@
             "type": "array"
           },
           "duration": {
+            "description": "Duration of the aligned audio in seconds.",
             "format": "float",
             "type": "number"
           },
@@ -2185,6 +2212,12 @@
             "format": "double",
             "type": "number"
           },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "word_count": {
             "minimum": 0,
             "type": "integer"
@@ -2194,7 +2227,10 @@
           "alignments",
           "duration",
           "word_count",
-          "processing_time_ms"
+          "processing_time_ms",
+          "alignment_source",
+          "warnings",
+          "alignment_windows"
         ],
         "type": "object"
       },
@@ -2204,7 +2240,9 @@
             "format": "float",
             "type": "number"
           },
-          "izwi_asr_diagnostics": {},
+          "izwi_asr_diagnostics": {
+            "description": "ASR diagnostics. With word or segment timestamps it also carries\n`alignment_source` (model, heuristic or failed), `alignment_warnings`\nfor windows timed by interval fallback, or `alignment_error`."
+          },
           "language": {
             "type": [
               "string",

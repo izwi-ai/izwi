@@ -11,7 +11,7 @@ use crate::engine::{
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
-use crate::runtime::types::{DiarizationConfig, GenerationRequest, RuntimeRequestContext};
+use crate::runtime::types::{GenerationRequest, RuntimeRequestContext};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -385,55 +385,6 @@ impl AudioChatRuntimeRequest {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct DiarizationRuntimeRequest {
-    pub(crate) audio: RuntimeAudioInput,
-    pub(crate) diarization_model_id: Option<String>,
-    pub(crate) asr_model_id: Option<String>,
-    pub(crate) aligner_model_id: Option<String>,
-    pub(crate) llm_model_id: Option<String>,
-    pub(crate) config: DiarizationConfig,
-    pub(crate) enable_llm_refinement: bool,
-}
-
-impl DiarizationRuntimeRequest {
-    pub(crate) fn from_bytes(
-        audio_bytes: impl Into<Vec<u8>>,
-        config: DiarizationConfig,
-    ) -> Result<Self> {
-        let audio = RuntimeAudioInput::Bytes(audio_bytes.into());
-        audio.validate("diarization")?;
-        Ok(Self {
-            audio,
-            diarization_model_id: None,
-            asr_model_id: None,
-            aligner_model_id: None,
-            llm_model_id: None,
-            config,
-            enable_llm_refinement: false,
-        })
-    }
-
-    pub(crate) fn with_pipeline_models(
-        mut self,
-        diarization_model_id: Option<String>,
-        asr_model_id: Option<String>,
-        aligner_model_id: Option<String>,
-        llm_model_id: Option<String>,
-    ) -> Self {
-        self.diarization_model_id = diarization_model_id;
-        self.asr_model_id = asr_model_id;
-        self.aligner_model_id = aligner_model_id;
-        self.llm_model_id = llm_model_id;
-        self
-    }
-
-    pub(crate) fn with_llm_refinement(mut self, enable_llm_refinement: bool) -> Self {
-        self.enable_llm_refinement = enable_llm_refinement;
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,22 +607,5 @@ mod tests {
                 timeout_ms: TTS_STREAM_SEND_DEADLINE_MS
             }
         );
-    }
-
-    #[test]
-    fn diarization_runtime_request_captures_pipeline_model_ids() {
-        let request =
-            DiarizationRuntimeRequest::from_bytes(vec![1, 2], DiarizationConfig::default())
-                .expect("valid diarization request")
-                .with_pipeline_models(
-                    Some("diar".to_string()),
-                    Some("asr".to_string()),
-                    Some("aligner".to_string()),
-                    Some("llm".to_string()),
-                )
-                .with_llm_refinement(true);
-
-        assert_eq!(request.asr_model_id.as_deref(), Some("asr"));
-        assert!(request.enable_llm_refinement);
     }
 }

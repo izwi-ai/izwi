@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ModelInfo } from "@/api";
 import {
+  isDiarizationPipelineAsrModel,
   resolveDiarizationRouteModel,
 } from "@/features/speech-text/modelFilters";
 
@@ -96,5 +97,59 @@ describe("resolveDiarizationRouteModel", () => {
     });
 
     expect(resolved).toBe("diar_streaming_sortformer_4spk-v2.1");
+  });
+});
+
+describe("isDiarizationPipelineAsrModel", () => {
+  function withCapabilities(
+    variant: string,
+    capabilities: Partial<NonNullable<ModelInfo["route_capabilities"]>>,
+  ): ModelInfo {
+    return {
+      ...model(variant),
+      route_capabilities: {
+        openai_chat_completions: false,
+        openai_responses: false,
+        openai_audio_speech: false,
+        openai_audio_transcriptions: false,
+        speech_to_text_jobs: false,
+        speech_to_text_realtime: false,
+        diarization_records: false,
+        text_to_speech_records: false,
+        voice_design_records: false,
+        voice_clone_records: false,
+        saved_voice_reuse: false,
+        studio_projects: false,
+        voice_realtime_text_model: false,
+        voice_realtime_modular_asr: false,
+        voice_realtime_modular_tts: false,
+        voice_realtime_unified: false,
+        forced_alignment: false,
+        tokenizer: false,
+        ...capabilities,
+      },
+    };
+  }
+
+  it("offers ASR models that run speech-to-text jobs", () => {
+    expect(
+      isDiarizationPipelineAsrModel(
+        withCapabilities("Parakeet-TDT-0.6B-v3", {
+          openai_audio_transcriptions: true,
+          speech_to_text_jobs: true,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("hides audio-chat models the pipeline cannot run", () => {
+    expect(
+      isDiarizationPipelineAsrModel(
+        withCapabilities("LFM2.5-Audio-1.5B-GGUF", {
+          openai_audio_transcriptions: true,
+          voice_realtime_unified: true,
+        }),
+      ),
+    ).toBe(false);
   });
 });

@@ -55,6 +55,10 @@ pub(crate) trait InvocationSlotArena:
     fn reset_for_reuse(&mut self) -> Result<()>;
 
     fn prepare_completion(&mut self) -> Result<()>;
+
+    /// Synchronize the arena's device after a failed operation and leave the
+    /// arena dirty, so queued work finishes before the slot is reused.
+    fn fence_after_error(&mut self) -> Result<()>;
 }
 
 impl slot_arena_sealed::Sealed for InvocationTensorArena {}
@@ -88,6 +92,10 @@ impl InvocationSlotArena for InvocationTensorArena {
     fn prepare_completion(&mut self) -> Result<()> {
         InvocationTensorArena::prepare_completion(self)
     }
+
+    fn fence_after_error(&mut self) -> Result<()> {
+        InvocationTensorArena::fence_after_error(self)
+    }
 }
 
 impl slot_arena_sealed::Sealed for InvocationStaticAttentionArena {}
@@ -120,6 +128,10 @@ impl InvocationSlotArena for InvocationStaticAttentionArena {
 
     fn prepare_completion(&mut self) -> Result<()> {
         InvocationStaticAttentionArena::prepare_completion(self)
+    }
+
+    fn fence_after_error(&mut self) -> Result<()> {
+        InvocationStaticAttentionArena::fence_after_error(self)
     }
 }
 
@@ -705,6 +717,14 @@ impl<A: InvocationSlotArena> InvocationWorkspacePhysicalLeaseV2 for InvocationSl
     fn abort(&mut self) {
         self.abort_once();
     }
+
+    fn abort_and_fence(&mut self) -> Result<()> {
+        let fenced = self
+            .arena_mut()
+            .and_then(|mut arena| arena.fence_after_error());
+        self.abort_once();
+        fenced
+    }
 }
 
 impl<A: InvocationSlotArena> Drop for InvocationSlotLease<A> {
@@ -1168,6 +1188,10 @@ mod tests {
                     "injected invocation slot completion fence failure".to_string(),
                 ));
             }
+            Ok(())
+        }
+
+        fn fence_after_error(&mut self) -> Result<()> {
             Ok(())
         }
     }
@@ -1866,6 +1890,21 @@ mod tests {
         second_backing
             .authenticate_completion(&second_completion)
             .unwrap();
+    }
+
+    #[test]
+    fn abort_and_fence_releases_the_slot_and_the_next_lease_is_reset() {
+        let owner = owner(1, 17);
+        let backing = owner.backing();
+        let mut physical = backing.lease().unwrap();
+        physical.abort_and_fence().unwrap();
+        // One slot: the next lease reuses it only if the fence released it,
+        // and the dirty arena must have been reset before exposure.
+        let next = owner.lease().unwrap();
+        assert!(!next.arena().unwrap().is_dirty());
+        drop(next);
+        drop(physical);
+        owner.close_and_drain().unwrap();
     }
 
     #[test]

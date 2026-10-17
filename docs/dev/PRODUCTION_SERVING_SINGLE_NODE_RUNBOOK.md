@@ -818,6 +818,19 @@ Do not replace the local server with the gateway for desktop or local workflows.
 `--role local` remains the compatibility profile and continues to own its
 runtime, SQLite/provider state, and full route set.
 
+**Diarization and forced alignment run in the full server only.** Workers
+take one of three task kinds (`IZWI_WORKER_TASK`: `chat`, `speech_to_text`,
+`text_to_speech`). There is no diarization or forced-alignment task kind, so
+no `izwi-serving-worker` loads a Sortformer diarizer or the Qwen3 forced
+aligner. `/v1/diarizations`, `/v1/audio/align` and word timestamps on
+`/v1/audio/transcriptions` (which run the aligner) are served only by the full
+server (`--role local`), whose load admission prices these models from their
+checkpoints. A worker's capacity snapshot reports invocation, queue and
+session counts with no memory signal, so autoscaling could not react to
+these models' memory refusals in any case. When several servers share one
+records database, give each its own `IZWI_NODE_ID` (see "Servers sharing one
+records database" under Fleet operation).
+
 ### Realtime relay preview (DS3.6, off by default)
 
 `IZWI_GATEWAY_REALTIME=on` exposes `GET /v1/realtime/ws` (WebSocket,
@@ -1353,6 +1366,16 @@ worker-authoritative until the store answers again. PostgreSQL coordination
 sessions carry a 5 s `statement_timeout` and
 `idle_in_transaction_session_timeout`, so a stuck statement or abandoned
 claim transaction cannot hold a worker's advisory lock.
+
+**Servers sharing one records database.** Diarization jobs, streamed
+transcriptions and streamed speech run as tasks of the server that accepted
+them, and at startup a server fails the ones it left pending or processing.
+Records carry the node that runs them, and a server recovers only its own. Set
+`IZWI_NODE_ID` (1–128 ASCII letters, digits, `-`, `_`) to an id unique to each
+server and stable across its restarts. On SQLite the default node `local` also
+recovers rows written before owners were recorded. On any other database a
+server with no `IZWI_NODE_ID` skips this recovery and logs a warning, because
+it cannot tell its records from another server's.
 
 PostgreSQL is the validated server-backed store: the migrator promotes the
 shared DDL per backend, and the fleet store execution suite and the durable

@@ -45,6 +45,8 @@ use crate::tokenizer::Tokenizer;
 use decode::decode_tokens;
 use nemo::{ensure_parakeet_artifacts, ParakeetArtifacts};
 pub(crate) use nemo::{parakeet_checkpoint_paths, parakeet_native_artifacts_complete};
+#[cfg(test)]
+pub(crate) use physical::{parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE_DOMAIN};
 pub(crate) use physical::{ParakeetPhysicalStateSpec, PARAKEET_PREDICTOR_STATE_GROUP};
 use preprocessor::{ParakeetLogMel, ParakeetPreprocessor};
 

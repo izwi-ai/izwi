@@ -500,7 +500,7 @@ fn add_scalar_navigation_paths(doc: &mut Value) {
         "/v1/diarizations/{record_id}",
         "Diarization",
         "diarization record",
-        "Fetch, update, or delete a saved diarization record.",
+        "Fetch, update, or delete a saved diarization record. A record's `warnings` list the degraded pipeline steps behind it (an aligner that could not be used, word timings repaired from speaker turns, a truncated ASR decode).",
         &[("record_id", "Diarization record identifier")],
     );
     add_operation_with_params(
@@ -1207,7 +1207,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "language".to_string(),
         json!({
             "type": "string",
-            "description": "Optional transcription language hint."
+            "description": "Optional transcription or diarization ASR language hint."
         }),
     );
     properties.insert(
@@ -1223,7 +1223,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         json!({
             "type": "boolean",
             "default": false,
-            "description": "For transcription jobs, generate an AI summary after the transcript is ready. Defaults to false."
+            "description": "For transcription and diarization jobs, generate an AI summary after the transcript is ready (diarization uses llm_model). Defaults to false."
         }),
     );
     properties.insert(
@@ -1245,7 +1245,7 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         "llm_model".to_string(),
         json!({
             "type": "string",
-            "description": "Optional diarization transcript-refinement model."
+            "description": "Optional diarization chat model for transcript refinement and the summary."
         }),
     );
     properties.insert(
@@ -1253,6 +1253,13 @@ fn speech_text_job_create_properties(include_form_aliases: bool) -> Map<String, 
         json!({
             "type": "boolean",
             "description": "For diarization jobs, enable optional LLM transcript refinement."
+        }),
+    );
+    properties.insert(
+        "vad_gate".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "For diarization jobs, clip diarizer segments to VAD speech regions (off by default; helps on noisy input)."
         }),
     );
     properties.insert(
@@ -1743,7 +1750,7 @@ fn create_transcription() {}
         )
     ),
     responses(
-        (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text", body = AlignmentResponse),
+        (status = 200, description = "Word-level alignment as JSON, verbose JSON, or text. Audio longer than the aligner's 180 s window (the same on every backend) is aligned in sub-windows cut at quiet points; alignment_source and warnings report windows timed by interval fallback.", body = AlignmentResponse),
         (status = 400, description = "Invalid request", body = ApiErrorEnvelope),
         (status = 415, description = "Unsupported media type", body = ApiErrorEnvelope),
         (status = 500, description = "Server error", body = ApiErrorEnvelope)
@@ -2120,6 +2127,8 @@ pub struct TranscriptionMultipartRequest {
     pub model: Option<String>,
     pub aligner_model: Option<String>,
     pub language: Option<String>,
+    /// One of json, verbose_json, text, srt, vtt; anything else (including
+    /// diarized_json) is rejected with 400 before transcription runs.
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
@@ -2134,6 +2143,8 @@ pub struct TranscriptionJsonRequest {
     pub model: Option<String>,
     pub aligner_model: Option<String>,
     pub language: Option<String>,
+    /// One of json, verbose_json, text, srt, vtt; anything else (including
+    /// diarized_json) is rejected with 400 before transcription runs.
     pub response_format: Option<String>,
     pub stream: Option<bool>,
     pub prompt: Option<String>,
@@ -2156,6 +2167,9 @@ pub struct VerboseTranscriptionResponse {
     pub segments: Option<Vec<TranscriptionTimestampSegment>>,
     pub processing_time_ms: f64,
     pub rtf: Option<f64>,
+    /// ASR diagnostics. With word or segment timestamps it also carries
+    /// `alignment_source` (model, heuristic or failed), `alignment_warnings`
+    /// for windows timed by interval fallback, or `alignment_error`.
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
 }
 

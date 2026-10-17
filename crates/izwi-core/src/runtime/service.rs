@@ -29,10 +29,9 @@ use crate::engine::metrics::{
 };
 use crate::engine::{
     engine_batch_metrics_snapshot, engine_stream_metrics_snapshot, AdapterBindingKey,
-    StageWorkSelector, Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest,
-    EngineOutput, EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason,
-    ResourceAmount, ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig,
-    WorkloadClass,
+    Engine as CoreEngine, EngineAudioInput, EngineCoreConfig, EngineCoreRequest, EngineOutput,
+    EngineStreamPolicy, EngineTask, GenerationParams, OutputFinishReason, ResourceAmount,
+    ResourceVector, SessionKey, StreamingOutput, TaskType, WorkUnit, WorkerConfig, WorkloadClass,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_BYTES_TOTAL,
     ENGINE_EXECUTOR_BATCH_WORKSPACE_DOMAIN_BYTES_TOTAL,
     ENGINE_EXECUTOR_CONTINUOUS_ENVELOPE_SCALAR_FALLBACKS_TOTAL,
@@ -87,8 +86,9 @@ use crate::models::architectures::whisper::asr::{
 use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    capability_row, CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding,
-    LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
+    capability_row, contract_supports_atomic_blocking, CapabilityKind, ExecutionTargetKind,
+    LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry,
+    StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
@@ -216,7 +216,7 @@ fn runtime_completion(output: EngineOutput) -> Result<EngineOutput> {
     Ok(output)
 }
 
-fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
+pub(crate) fn transient_resources(backend: BackendKind, input_bytes: usize) -> ResourceVector {
     const BASE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
     let input_bytes = input_bytes as u64;
     let host_preparation_bytes = BASE_WORKSPACE_BYTES.saturating_add(input_bytes.saturating_mul(8));
@@ -887,6 +887,9 @@ pub struct RuntimeService {
     step_driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     step_driver_wakeup: Arc<Notify>,
     step_driver_started: AtomicBool,
+    /// Uploads the diarization pipeline decoded itself (PIPE-14): callers
+    /// that pass decoded samples add none.
+    pub(crate) diarization_audio_decodes: Arc<AtomicU64>,
     pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
@@ -1066,14 +1069,7 @@ fn loaded_contract_for_residency(
             expected_target.expect("checked as some")
         )));
     }
-    if asr_long_form
-        && !contract.stages.iter().any(|stage| {
-            matches!(
-                stage.selector,
-                StageWorkSelector::Atomic | StageWorkSelector::Any
-            )
-        })
-    {
+    if asr_long_form && !contract_supports_atomic_blocking(&contract) {
         return Err(Error::InvalidInput(format!(
             "loaded capability {:?} for {} does not support atomic blocking execution",
             capability,

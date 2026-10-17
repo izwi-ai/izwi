@@ -677,6 +677,24 @@ async fn dropped_waiter_guard_cleans_an_unbound_registration() {
     assert!(receiver.await.is_err());
 }
 
+/// The fault-injection hook fails its own runtime only: the resource
+/// authority is shared by every runtime in the process, and a probe test that
+/// poisoned it failed unrelated tests running alongside.
+#[test]
+fn injected_device_fault_fails_only_its_own_runtime() {
+    let _authority_lock = crate::engine::resources::test_support::authority_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let faulted = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    let neighbour = RuntimeService::new(EngineConfig::default()).expect("runtime");
+    assert!(faulted.latch_device_fault_for_test(&Error::InferenceError(
+        "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \"an illegal memory access was encountered\")"
+            .into(),
+    )));
+    assert!(faulted.health().is_failed());
+    assert!(neighbour.health().is_healthy(), "{:?}", neighbour.health());
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_pending_guard_reclaims_admitted_session_and_job() {

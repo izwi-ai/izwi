@@ -1,4 +1,5 @@
-//! Depthwise (groups == channels) 1-D convolution as shift-and-accumulate.
+//! Depthwise (groups == channels) 1-D convolution as shift-and-accumulate,
+//! plus the transposed and strided 2-D variants built the same way.
 //!
 //! Candle's grouped `conv1d` splits the input and kernel into `groups` chunks
 //! and runs one single-group convolution per chunk before concatenating them
@@ -263,6 +264,112 @@ pub fn depthwise_conv_transpose1d(
         out = out.broadcast_add(&bias.to_dtype(acc_dtype)?.reshape((1, channels, 1))?)?;
     }
     TRANSPOSED_CALLS.fetch_add(1, Ordering::Relaxed);
+    out.to_dtype(out_dtype)
+}
+
+static DEPTHWISE_CONV2D_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of depthwise 2-D convolutions served by
+/// [`depthwise_conv2d`].
+pub fn depthwise_conv2d_calls() -> u64 {
+    DEPTHWISE_CONV2D_CALLS.load(Ordering::Relaxed)
+}
+
+/// Geometry of a depthwise 2-D convolution: one stride and one zero padding
+/// for both spatial axes, dilation 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthwiseConv2dSpec {
+    pub padding: usize,
+    pub stride: usize,
+}
+
+/// Depthwise (`groups == channels`) 2-D convolution on
+/// `(batch, channels, height, width)`, matching Candle's grouped `conv2d`
+/// (`weight` `(C, 1, KH, KW)`, dilation 1) up to summation order.
+///
+/// Candle runs one convolution per channel and concatenates them. Here the
+/// zero-padded input is viewed as `(…, H/s, s, W/s, s)`, so tap `(i, j)` is
+/// the strided view at rows `i + s·q` and columns `j + s·p` without a copy,
+/// and the output is the sum of the KH·KW scaled views: about
+/// `2·KH·KW + 4` ops whatever the channel count.
+pub fn depthwise_conv2d(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: Option<&Tensor>,
+    spec: DepthwiseConv2dSpec,
+) -> Result<Tensor> {
+    let (batch, channels, height, width) = x.dims4()?;
+    let (kernel_h, kernel_w) = match weight.dims() {
+        [c, 1, kh, kw] if *c == channels && *kh > 0 && *kw > 0 => (*kh, *kw),
+        dims => candle_core::bail!(
+            "depthwise conv2d weight {dims:?} does not match {channels} channels"
+        ),
+    };
+    let stride = spec.stride.max(1);
+    let (padded_h, padded_w) = (height + 2 * spec.padding, width + 2 * spec.padding);
+    if padded_h < kernel_h || padded_w < kernel_w {
+        candle_core::bail!(
+            "depthwise conv2d input {padded_h}x{padded_w} (padded) is smaller than the kernel {kernel_h}x{kernel_w}"
+        );
+    }
+    let out_h = (padded_h - kernel_h) / stride + 1;
+    let out_w = (padded_w - kernel_w) / stride + 1;
+    // Each stride phase must hold the furthest tap offset plus the output.
+    let phase_h = (kernel_h - 1) / stride + out_h;
+    let phase_w = (kernel_w - 1) / stride + out_w;
+
+    let out_dtype = x.dtype();
+    let acc_dtype = match out_dtype {
+        DType::F16 | DType::BF16 => DType::F32,
+        dtype => dtype,
+    };
+    // Zero-pad (or trim never-read trailing rows) to exactly
+    // `stride * phase` along each spatial axis.
+    let fit = |x: Tensor, dim: usize, size: usize, len: usize| -> Result<Tensor> {
+        let right = len.saturating_sub(size + spec.padding);
+        let x = x.pad_with_zeros(dim, spec.padding, right)?;
+        if x.dim(dim)? > len {
+            x.narrow(dim, 0, len)
+        } else {
+            Ok(x)
+        }
+    };
+    let x = fit(x.to_dtype(acc_dtype)?, 2, height, stride * phase_h)?;
+    let x = fit(x, 3, width, stride * phase_w)?;
+    // A free view: row `r = stride·q + a` is `grid[.., q, a, ..]`, and the
+    // same for columns.
+    let grid = x.reshape((batch, channels, phase_h, stride, phase_w, stride))?;
+    // One contiguous `(1, C, 1, 1, 1, 1)` weight row per tap.
+    let taps = weight
+        .reshape((channels, kernel_h * kernel_w))?
+        .to_dtype(acc_dtype)?
+        .t()?
+        .contiguous()?;
+    let mut acc: Option<Tensor> = None;
+    for i in 0..kernel_h {
+        for j in 0..kernel_w {
+            let view = grid
+                .narrow(2, i / stride, out_h)?
+                .narrow(3, i % stride, 1)?
+                .narrow(4, j / stride, out_w)?
+                .narrow(5, j % stride, 1)?;
+            let tap = taps
+                .narrow(0, i * kernel_w + j, 1)?
+                .reshape((1, channels, 1, 1, 1, 1))?;
+            let term = view.broadcast_mul(&tap)?;
+            acc = Some(match acc {
+                Some(acc) => (acc + term)?,
+                None => term,
+            });
+        }
+    }
+    let mut out = acc
+        .expect("the kernel has at least one tap")
+        .reshape((batch, channels, out_h, out_w))?;
+    if let Some(bias) = bias {
+        out = out.broadcast_add(&bias.to_dtype(acc_dtype)?.reshape((1, channels, 1, 1))?)?;
+    }
+    DEPTHWISE_CONV2D_CALLS.fetch_add(1, Ordering::Relaxed);
     out.to_dtype(out_dtype)
 }
 
@@ -620,6 +727,119 @@ mod tests {
             8,
             1
         ));
+    }
+
+    /// The strided-tap depthwise conv2d matches Candle's grouped `conv2d`
+    /// (one convolution per channel) across the dw_striding k3/s2/p1 geometry
+    /// and other strides, kernels, paddings and odd sizes.
+    #[test]
+    fn depthwise_conv2d_matches_candle_grouped_conv2d() {
+        let mut rng = XorShift(0x7A3C_91E5_0B2D_4F61);
+        // (batch, channels, height, width, kh, kw, stride, padding, bias)
+        let cases = [
+            (1, 32, 41, 64, 3, 3, 2, 1, true), // Sortformer / Parakeet dw_striding
+            (2, 8, 37, 17, 3, 3, 2, 1, true),  // batched, odd sizes
+            (1, 8, 1, 1, 3, 3, 2, 1, false),   // single pixel
+            (1, 4, 9, 6, 3, 3, 4, 0, true),    // stride 4 trims a tail row
+            (1, 6, 10, 11, 5, 3, 3, 2, true),  // rectangular kernel
+            (1, 5, 7, 8, 3, 3, 1, 1, false),   // stride 1
+            (1, 3, 8, 9, 1, 1, 2, 0, true),    // 1x1 strided
+            (1, 4, 6, 7, 2, 2, 2, 0, true),    // even kernel
+        ];
+        for (batch, channels, height, width, kh, kw, stride, padding, with_bias) in cases {
+            let x = rng.tensor(&[batch, channels, height, width]);
+            let weight = rng.tensor(&[channels, 1, kh, kw]);
+            let bias = with_bias.then(|| rng.tensor(&[channels]));
+            let mut expected = x.conv2d(&weight, padding, stride, 1, channels).unwrap();
+            if let Some(bias) = &bias {
+                expected = expected
+                    .broadcast_add(&bias.reshape((1, channels, 1, 1)).unwrap())
+                    .unwrap();
+            }
+            let before = depthwise_conv2d_calls();
+            let actual = depthwise_conv2d(
+                &x,
+                &weight,
+                bias.as_ref(),
+                DepthwiseConv2dSpec { padding, stride },
+            )
+            .unwrap();
+            assert!(depthwise_conv2d_calls() > before);
+            let diff = max_abs_diff(&expected, &actual);
+            assert!(
+                diff <= 1e-5,
+                "case {:?}: max |diff| {diff}",
+                (batch, channels, height, width, kh, kw, stride, padding)
+            );
+        }
+        // Mismatched weights and inputs smaller than the kernel are rejected.
+        let x = rng.tensor(&[1, 4, 2, 2]);
+        let spec = DepthwiseConv2dSpec {
+            padding: 0,
+            stride: 1,
+        };
+        assert!(depthwise_conv2d(&x, &rng.tensor(&[4, 2, 1, 1]), None, spec).is_err());
+        assert!(depthwise_conv2d(&x, &rng.tensor(&[4, 1, 3, 3]), None, spec).is_err());
+    }
+
+    /// CPU micro-benchmark against Candle's per-group loop (Sortformer
+    /// dw_striding conv.2 geometry for a 15 s chunk: 256 channels, 760x64).
+    #[test]
+    #[ignore = "timing only: cargo test --release ... -- --ignored --nocapture"]
+    fn bench_depthwise_conv2d_vs_candle_grouped_conv2d() {
+        let mut rng = XorShift(0x2468_ACE0_1357_9BDF);
+        for (channels, height, width) in [(256, 760, 64), (256, 380, 32), (256, 52, 64)] {
+            let x = rng.tensor(&[1, channels, height, width]);
+            let weight = rng.tensor(&[channels, 1, 3, 3]);
+            let spec = DepthwiseConv2dSpec {
+                padding: 1,
+                stride: 2,
+            };
+            let iters = 5;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                x.conv2d(&weight, 1, 2, 1, channels).unwrap();
+            }
+            let candle = start.elapsed() / iters;
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                depthwise_conv2d(&x, &weight, None, spec).unwrap();
+            }
+            let shared = start.elapsed() / iters;
+            eprintln!(
+                "C={channels} {height}x{width} k3 s2: candle grouped {candle:?}, strided taps {shared:?} ({:.1}x)",
+                candle.as_secs_f64() / shared.as_secs_f64()
+            );
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_depthwise_conv2d_matches_cpu() {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_depthwise_conv2d_matches_cpu")
+        else {
+            return;
+        };
+        let mut rng = XorShift(0x0BAD_5EED_1234_5678);
+        let x = rng.tensor(&[1, 16, 37, 33]);
+        let weight = rng.tensor(&[16, 1, 3, 3]);
+        let bias = rng.tensor(&[16]);
+        let spec = DepthwiseConv2dSpec {
+            padding: 1,
+            stride: 2,
+        };
+        let cpu = depthwise_conv2d(&x, &weight, Some(&bias), spec).unwrap();
+        let metal = depthwise_conv2d(
+            &x.to_device(&device).unwrap(),
+            &weight.to_device(&device).unwrap(),
+            Some(&bias.to_device(&device).unwrap()),
+            spec,
+        )
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap();
+        assert!(max_abs_diff(&cpu, &metal) <= 1e-5);
     }
 
     #[cfg(feature = "metal")]

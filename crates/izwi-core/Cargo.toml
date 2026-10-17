@@ -53,6 +53,7 @@ rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
 rayon = "1.11"
+regex = "1.12"
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

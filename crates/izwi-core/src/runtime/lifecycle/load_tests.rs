@@ -4,13 +4,13 @@ use super::{
     kokoro_effective_context_tokens, loaded_asr_state_publication_route,
     managed_chat_capacity_policy, materialization_tolerance_bytes, model_memory_estimate,
     model_resource_plan, now_unix_millis, plan_invocation_allocations,
-    portable_context_reserve_bytes, portable_invocation_context_intent,
+    portable_context_reserve_bytes, portable_invocation_context_intent, precision_reload_gate,
     qwen38_representation_memory_estimate, reconcile_observed_growth,
     residency_budget_has_capacity, select_lru_eviction_candidate, state_fit_budgets,
     validate_scratch_only_invocation_publication, DeviceUsageSample,
     LoadedAsrStatePublicationRoute, ModelMemoryEstimate, PortableInvocationContextIntent,
-    QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES, QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES,
-    QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
+    PrecisionReloadRequest, QWEN38_CUDA_DEVICE_CONVERSION_SCRATCH_BYTES,
+    QWEN38_CUDA_HOST_CONVERSION_SCRATCH_BYTES, QWEN38_PORTABLE_CONVERSION_SCRATCH_BYTES,
 };
 use crate::backends::kv::managed_kv_backend_compiled;
 use crate::backends::{BackendKind, BackendPreference};
@@ -915,6 +915,144 @@ fn whisper_asr_selects_physical_invocation_publication() {
 }
 
 #[test]
+fn parakeet_load_route_publishes_long_form_predictor_beside_retained_state() {
+    use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceBindingV2};
+    use crate::models::architectures::parakeet::asr::{
+        parakeet_physical_state_spec, PARAKEET_PREDICTOR_STATE_DOMAIN,
+    };
+    use crate::runtime::adapters::{
+        LoadedModelBundleDraft, LoadedStatePublication, RuntimeAdapterRegistry,
+        StreamingRequirements,
+    };
+
+    let model = ModelInstanceId::new(91);
+    let draft = LoadedModelBundleDraft::build(
+        &RuntimeAdapterRegistry::built_in(),
+        ExecutionGroupId::new(7),
+        model,
+        crate::model::ModelVariant::ParakeetTdt06BV3,
+        BackendKind::Cpu,
+    )
+    .unwrap();
+    let contracts = draft.execution_contracts(CapabilityKind::Asr).unwrap();
+    let graphs = contracts
+        .iter()
+        .map(|contract| contract.stages.as_ref())
+        .collect::<Vec<_>>();
+    let spec = parakeet_physical_state_spec(&graphs).unwrap();
+    let invocation = spec
+        .invocation
+        .as_ref()
+        .expect("long-form predictor contract");
+    let mut core = crate::engine::EngineCore::new(crate::engine::EngineCoreConfig {
+        backend: BackendKind::Cpu,
+        ..crate::engine::EngineCoreConfig::default()
+    })
+    .unwrap();
+    let retained = core
+        .load_retained_tensor_state(model, spec.retained.as_ref().unwrap(), 1)
+        .unwrap();
+    let retained_uses = super::parakeet_retained_uses(&contracts).unwrap();
+    let retained: crate::kv::v2::RetainedStateRuntimeV2 = retained.into();
+    super::validate_physical_publication_backing(
+        &spec.descriptor,
+        &contracts,
+        Some(&retained),
+        &retained_uses,
+    )
+    .unwrap();
+
+    // Only the two atomic long-form graphs (with and without transport
+    // output) allocate typed state: one predictor slot each.
+    let allocations =
+        plan_invocation_allocations(&spec.descriptor, invocation, &contracts).unwrap();
+    assert_eq!(allocations.len(), 2);
+    let mut bindings = Vec::new();
+    for allocation in allocations {
+        assert_eq!(allocation.key.domain, PARAKEET_PREDICTOR_STATE_DOMAIN);
+        assert_eq!(allocation.slot_count, 1);
+        // Four [1, 640] LSTM tensors plus one [1, 1, 640] output, F32.
+        assert_eq!(allocation.domain.maximum_bytes().unwrap(), 5 * 640 * 4);
+        let backing = core
+            .resolve_and_load_invocation_workspace(
+                model,
+                allocation.adapter_instance,
+                allocation.key.stage_graph,
+                allocation.key.stage,
+                invocation,
+                &allocation.domain,
+                allocation.slot_count,
+            )
+            .unwrap();
+        bindings.push(InvocationWorkspaceBindingV2 {
+            key: allocation.key,
+            backing,
+        });
+    }
+    let bundle = draft
+        .seal(HashMap::from([(
+            CapabilityKind::Asr,
+            LoadedStatePublication::PhysicalV2 {
+                descriptor: spec.descriptor,
+                retained: Some(retained),
+                retained_uses,
+                invocation_workspace: crate::kv::v2::InvocationWorkspaceRuntimeV2::new(bindings)
+                    .unwrap(),
+            },
+        )]))
+        .unwrap();
+
+    let long_form = StreamingRequirements::NONE.with_asr_long_form(true);
+    let contract = bundle
+        .contract_for_streaming(CapabilityKind::Asr, long_form)
+        .unwrap();
+    let stage = contract
+        .adapter_binding()
+        .unwrap()
+        .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+            kind: "diarization.transcribe".into(),
+        })
+        .unwrap()
+        .id;
+    let binding = bundle
+        .capability_binding_for_streaming(CapabilityKind::Asr, long_form)
+        .unwrap();
+    binding
+        .state
+        .validate_against(BackendKind::Cpu, &binding.execution)
+        .unwrap();
+    let mut leases = binding
+        .state
+        .lease_complete_invocation_workspace_set(stage)
+        .unwrap();
+    let predictor = leases
+        .lease_exact_kind_mut(InvocationStateBackingKindV2::Tensor)
+        .unwrap()
+        .typed_mut::<crate::engine::InvocationTensorLease>()
+        .unwrap();
+    assert_eq!(predictor.domain(), PARAKEET_PREDICTOR_STATE_DOMAIN);
+    leases.release().unwrap();
+
+    // Ordinary requests keep the retained sequence graph and lease nothing.
+    let normal = bundle
+        .contract_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+        .unwrap();
+    assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
+    let normal_binding = bundle
+        .capability_binding_for_streaming(CapabilityKind::Asr, StreamingRequirements::NONE)
+        .unwrap();
+    for stage in normal.stages.iter() {
+        assert!(normal_binding
+            .state
+            .lease_complete_invocation_workspace_set(stage.id)
+            .unwrap()
+            .domains()
+            .next()
+            .is_none());
+    }
+}
+
+#[test]
 fn generic_invocation_planner_allocates_every_domain_at_exact_row_concurrency() {
     let execution = invocation_execution(3);
     let contract = invocation_contract(2);
@@ -1718,6 +1856,97 @@ fn state_fits_leave_one_request_envelope_on_a_16_gb_metal_budget() {
         assert!(left >= envelope, "{variant}: {left} < {envelope}");
         assert!(fit > 0, "{variant}");
     }
+}
+
+/// A loading thread's precision reload waits on its gate until the load
+/// task answers, and sees the task's refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_precision_reload_gate_blocks_until_the_load_task_answers() {
+    let (mut gate, mut requests) = precision_reload_gate();
+    let loader = tokio::task::spawn_blocking(move || {
+        let admitted = gate("text", candle_core::DType::F32);
+        let refused = gate("text", candle_core::DType::F32);
+        (admitted, refused)
+    });
+    for answer in [Ok(()), Err(Error::ModelLoadError("no room".into()))] {
+        let request = requests.recv().await.expect("reload request");
+        assert_eq!(
+            (request.component.as_str(), request.dtype),
+            ("text", candle_core::DType::F32)
+        );
+        request.reply.send(answer).unwrap();
+    }
+    let (admitted, refused) = loader.await.unwrap();
+    admitted.unwrap();
+    assert!(refused.unwrap_err().to_string().contains("no room"));
+    // A gate whose load task is gone refuses instead of blocking.
+    let (mut gate, requests) = precision_reload_gate();
+    drop(requests);
+    let orphaned = tokio::task::spawn_blocking(move || gate("text", candle_core::DType::F32));
+    assert!(orphaned.await.unwrap().is_err());
+}
+
+/// A failed probe's reload takes a second reservation: the loading
+/// slot's authorization grows from the lowered load's peak to the reload
+/// plan's before the reload allocates, and the reload plan then prices
+/// the load. A reload that cannot fit is refused with the shortfall and
+/// leaves the authorization as admitted.
+#[tokio::test]
+async fn a_failed_probe_grows_the_load_authorization_to_the_reload_plan() {
+    let models_dir = std::env::temp_dir().join(format!("izwi-precision-reload-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&models_dir).unwrap();
+    let runtime = RuntimeService::new(EngineConfig {
+        models_dir: models_dir.clone(),
+        backend: BackendPreference::Cpu,
+        ..Default::default()
+    })
+    .unwrap();
+    let plan = |load_peak_bytes, resident_bytes| {
+        model_resource_plan(
+            BackendKind::Cpu,
+            ModelMemoryEstimate {
+                load_peak_bytes,
+                resident_bytes,
+            },
+        )
+    };
+    let (lowered, reload, too_large) = (plan(256, 128), plan(512, 384), plan(2048, 1024));
+    let authority = vector_authority(all_memory_capacity(1024));
+    let variant = ModelVariant::Qwen3ForcedAligner06B;
+    let lease = authority
+        .reserve(
+            ReservationOwner::new(ReservationClass::Model, "precision-reload"),
+            lowered.load_authorization,
+        )
+        .unwrap();
+    let lifecycle = &runtime.model_lifecycle;
+    lifecycle.install_loading_slot(variant, lease).unwrap();
+    let (reply, _) = oneshot::channel();
+    let request = PrecisionReloadRequest {
+        component: "text".into(),
+        dtype: candle_core::DType::F32,
+        reply,
+    };
+    let grown = lifecycle
+        .grow_load_authorization_for_reload(variant, &lowered, reload, &request)
+        .await
+        .unwrap();
+    assert_eq!(grown, reload);
+    assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+    let error = lifecycle
+        .grow_load_authorization_for_reload(variant, &reload, too_large, &request)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "Cannot reload {variant} text at F32 after its load-time probe failed"
+        )),
+        "{error}"
+    );
+    assert_eq!(authority.snapshot().reserved, reload.load_authorization);
+    assert!(lifecycle.remove_resident_slot(variant));
+    std::fs::remove_dir_all(models_dir).unwrap();
 }
 
 /// The weight lease records the smaller of the estimate and the observed

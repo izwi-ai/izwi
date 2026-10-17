@@ -388,7 +388,8 @@ fn with_single_invocation_cache<T>(
             domains.len()
         )));
     };
-    let output = run(leases.cache_mut(*domain)?)?;
+    let result = run(leases.cache_mut(*domain)?);
+    let output = leases.fence_on_error(result)?;
     let _completions = leases.release()?;
     Ok(output)
 }
@@ -402,8 +403,9 @@ fn with_single_invocation_tensor<T>(
     let output = {
         let tensor =
             leases.lease_exact_kind_mut(crate::kv::v2::InvocationStateBackingKindV2::Tensor)?;
-        run(tensor.typed_mut::<crate::engine::InvocationTensorLease>()?)?
+        run(tensor.typed_mut::<crate::engine::InvocationTensorLease>()?)
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 1 {
         return Err(Error::InferenceError(
@@ -430,8 +432,9 @@ fn with_nemotron_offline_state<T>(
         run(
             predictor.typed_mut::<crate::engine::InvocationTensorLease>()?,
             acoustic.typed_mut::<crate::engine::InvocationTensorLease>()?,
-        )?
+        )
     };
+    let output = leases.fence_on_error(output)?;
     let completions = leases.release()?;
     if completions.len() != 2 {
         return Err(Error::InferenceError(

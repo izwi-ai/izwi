@@ -15,6 +15,7 @@ use crate::{
     db::{raw, StoreDatabase},
     entity::{speech_history_records, RuntimeProjectionAttempt},
     ids::new_uuid,
+    node_identity::{NodeIdentity, RecoveryScope},
     persistence::{delete_media_object, persist_audio_object, read_media_object},
 };
 
@@ -439,6 +440,8 @@ pub struct SpeechHistoryStore {
     db: StoreDatabase,
     media_storage: Arc<dyn MediaStorageProvider>,
     artifact_store: Arc<ArtifactStore>,
+    /// The node whose tasks stream the records this store creates.
+    node: NodeIdentity,
 }
 
 impl SpeechHistoryStore {
@@ -467,6 +470,7 @@ impl SpeechHistoryStore {
             db,
             media_storage,
             artifact_store,
+            node: NodeIdentity::local(),
         })
     }
 
@@ -479,7 +483,14 @@ impl SpeechHistoryStore {
             db,
             media_storage,
             artifact_store,
+            node: NodeIdentity::local(),
         }
+    }
+
+    /// Records this store creates are owned by `node` (P1V-1).
+    pub fn with_node_identity(mut self, node: NodeIdentity) -> Self {
+        self.node = node;
+        self
     }
 
     pub async fn list_records_page(
@@ -731,6 +742,7 @@ impl SpeechHistoryStore {
                 audio_media_asset_id: Set(None),
                 audio_artifact_tenant: Set(None),
                 stop_reason: Set(record.stop_reason.clone()),
+                owner_node_id: Set(Some(self.node.id().to_string())),
             })
             .exec(db)
             .await
@@ -793,13 +805,38 @@ impl SpeechHistoryStore {
 
     /// Fail persisted speech projections that cannot be resumed after startup.
     /// A pending/processing projection remains live only while a matching
-    /// durable TTS job is still in a non-terminal state.
-    pub async fn reconcile_stale_processing_records(&self) -> anyhow::Result<u64> {
+    /// durable TTS job is still in a non-terminal state. A streamed record
+    /// with no runtime job runs as a task of the node that created it, so on
+    /// a shared database only that node fails it (P1V-1). Returns the number
+    /// of records failed, or `None` when this node cannot tell its records
+    /// from another node's.
+    pub async fn reconcile_stale_processing_records(&self) -> anyhow::Result<Option<u64>> {
         let db = self.db.connection().await?;
+        let Some(scope) = self.node.recovery_scope(db.get_database_backend()) else {
+            return Ok(None);
+        };
+        self.reconcile_stale_processing_records_in(&scope)
+            .await
+            .map(Some)
+    }
+
+    async fn reconcile_stale_processing_records_in(
+        &self,
+        scope: &RecoveryScope,
+    ) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let unowned = if scope.include_unowned {
+            "OR owner_node_id IS NULL"
+        } else {
+            ""
+        };
+        // A record a runtime job ran has no node-local task: once no job is
+        // active, nothing will finish it, whichever node starts.
         let result = db
             .execute_raw(raw::statement(
                 db,
-                r#"
+                format!(
+                    r#"
                 UPDATE speech_history_records
                 SET
                     processing_status = 'failed',
@@ -818,8 +855,20 @@ impl SpeechHistoryStore {
                         AND j.route_record_id = speech_history_records.id
                         AND j.status IN ('queued', 'running', 'retrying')
                   )
-                "#,
-                Vec::new(),
+                  AND (
+                      owner_node_id = ?1
+                      {unowned}
+                      OR EXISTS (
+                          SELECT 1
+                          FROM runtime_jobs j
+                          WHERE j.job_kind = 'tts_speech'
+                            AND j.route_record_kind = speech_history_records.route_kind
+                            AND j.route_record_id = speech_history_records.id
+                      )
+                  )
+                "#
+                ),
+                vec![scope.owner.clone().into()],
             )?)
             .await
             .context("Failed to reconcile stale speech history processing records")?;
@@ -2381,6 +2430,90 @@ mod tests {
         clear_env();
     }
 
+    /// P1V-1 on a database several nodes share: node A's startup fails the
+    /// speech streams A left running and leaves node B's. Unowned rows are
+    /// recovered only where the database belongs to one node.
+    #[tokio::test]
+    async fn startup_reconciliation_leaves_other_nodes_streams_running() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let node = |id| {
+            store
+                .clone()
+                .with_node_identity(NodeIdentity::configured(id).expect("node id"))
+        };
+        let (node_a, node_b) = (node("node-a"), node("node-b"));
+        let streaming = || NewSpeechHistoryRecord {
+            processing_status: SpeechHistoryProcessingStatus::Processing,
+            audio_bytes: Vec::new(),
+            audio_filename: None,
+            ..ready_record()
+        };
+        let a_stream = node_a.create_record(streaming()).await.expect("A");
+        let b_stream = node_b.create_record(streaming()).await.expect("B");
+        let legacy = node_a.create_record(streaming()).await.expect("legacy");
+        let db = store.db.connection().await.expect("db");
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE speech_history_records SET owner_node_id = NULL WHERE id = ?1",
+                vec![legacy.id.clone().into()],
+            )
+            .expect("sql"),
+        )
+        .await
+        .expect("unown legacy row");
+        let status = |id: &String| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .get_record(SpeechRouteKind::TextToSpeech, id)
+                    .await
+                    .expect("lookup")
+                    .expect("record")
+                    .processing_status
+            }
+        };
+        use SpeechHistoryProcessingStatus::{Failed, Processing};
+
+        let shared = RecoveryScope {
+            owner: "node-a".to_string(),
+            include_unowned: false,
+        };
+        assert_eq!(
+            node_a
+                .reconcile_stale_processing_records_in(&shared)
+                .await
+                .expect("A recovery"),
+            1
+        );
+        assert_eq!(status(&a_stream.id).await, Failed);
+        assert_eq!(status(&b_stream.id).await, Processing);
+        assert_eq!(status(&legacy.id).await, Processing);
+
+        assert_eq!(
+            node_a
+                .reconcile_stale_processing_records()
+                .await
+                .expect("A recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&legacy.id).await, Failed);
+        assert_eq!(status(&b_stream.id).await, Processing);
+
+        assert_eq!(
+            node_b
+                .reconcile_stale_processing_records()
+                .await
+                .expect("B recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&b_stream.id).await, Failed);
+
+        clear_env();
+    }
+
     #[tokio::test]
     async fn startup_reconciliation_fails_only_processing_records_without_active_jobs() {
         let _guard = env_lock();
@@ -2412,7 +2545,7 @@ mod tests {
                 .reconcile_stale_processing_records()
                 .await
                 .expect("startup reconciliation"),
-            1
+            Some(1)
         );
         let stale = store
             .get_record(SpeechRouteKind::TextToSpeech, stale.id)
@@ -2470,7 +2603,7 @@ mod tests {
                 .reconcile_stale_processing_records()
                 .await
                 .expect("cancelling reconciliation"),
-            0
+            Some(0)
         );
         let still_cancelling = store
             .get_record(SpeechRouteKind::TextToSpeech, resumable.id)

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::audio_payload::{
-    decode_base64_audio_payload, inspect_audio_payload_canonical_with_diagnostics,
+    decode_audio_payload_canonical_with_diagnostics, decode_base64_audio_payload,
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload,
 };
 use crate::api::pagination::{encode_cursor, CursorPagination, CursorPaginationQuery};
@@ -23,13 +23,15 @@ use crate::diarization_store::{
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
 use crate::error::{core_api_error, ApiError, ApiJson};
-use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
-    parse_chat_model_variant, parse_model_variant, resolve_diarization_model_variant_strict,
-    ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation, DiarizationConfig, GenerationParams,
-    ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
+    parse_model_variant, resolve_diarization_asr_model_variant, resolve_diarization_llm_variant,
+    resolve_diarization_model_variant, resolve_diarization_model_variant_strict,
+    validate_diarization_speaker_limits, ChatMessage, ChatRequestConfig, ChatRole, ChatTruncation,
+    DiarizationConfig, DiarizationPipelineOptions, DiarizationTranscriptResult, GenerationParams,
+    JobCancellation, ModelVariant, RuntimeRequestContext, RuntimeService, WorkloadClass,
 };
+use tracing::{info, info_span, warn, Instrument};
 
 use super::AUDIO_UPLOAD_LIMIT_BYTES;
 use crate::api::speech_text_upload::{multipart_upload_error, resolve_source_audio_mime_type};
@@ -69,11 +71,24 @@ pub struct RerunDiarizationRecordRequest {
     pub min_silence_duration_ms: Option<f64>,
     #[serde(default)]
     pub enable_llm_refinement: Option<bool>,
+    /// Defaults to whether the source record asked for a summary.
+    #[serde(default)]
+    pub generate_summary: Option<bool>,
+    /// Defaults to the source record's language hint.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Defaults to the source record's VAD gate.
+    #[serde(default)]
+    pub vad_gate: Option<bool>,
 }
 
 #[derive(Debug, Default)]
 struct ParsedDiarizationCreateRequest {
     audio_bytes: Vec<u8>,
+    /// The upload as canonical 16 kHz mono samples, decoded once when the
+    /// request was validated (PIPE-14); a rerun has none and decodes the
+    /// stored audio in the pipeline.
+    decoded_samples: Option<Vec<f32>>,
     audio_mime_type: Option<String>,
     audio_filename: Option<String>,
     model_id: Option<String>,
@@ -85,6 +100,12 @@ struct ParsedDiarizationCreateRequest {
     min_speech_duration_ms: Option<f64>,
     min_silence_duration_ms: Option<f64>,
     enable_llm_refinement: Option<bool>,
+    /// Summarize the transcript with the pipeline LLM once it is ready (D6).
+    generate_summary: bool,
+    /// ASR language hint; `None` detects the language per chunk.
+    language: Option<String>,
+    /// Clip Sortformer segments to VAD speech; `None` keeps the default.
+    vad_gate: Option<bool>,
     stream: bool,
 }
 
@@ -109,6 +130,12 @@ struct JsonCreateRequest {
     min_silence_duration_ms: Option<f64>,
     #[serde(default)]
     enable_llm_refinement: Option<bool>,
+    #[serde(default)]
+    generate_summary: Option<bool>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    vad_gate: Option<bool>,
     #[serde(default)]
     audio_mime_type: Option<String>,
     #[serde(default)]
@@ -255,13 +282,24 @@ pub async fn cancel_record(
     let cancelled = state
         .diarization_store
         .update_processing_status(
-            record_id,
+            record_id.clone(),
             DiarizationProcessingStatus::Failed,
             Some("Cancelled by user.".to_string()),
         )
         .await
-        .map_err(map_store_error)?
-        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+        .map_err(map_store_error)?;
+    let Some(cancelled) = cancelled else {
+        // It finished since it was read: report that outcome instead.
+        let current = state
+            .diarization_store
+            .get_record(record_id)
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
+        return Ok(Json(current));
+    };
+    // The record says why it stopped; now stop the pipeline (PIPE-7).
+    state.diarization_jobs.cancel(&record_id);
 
     Ok(Json(cancelled))
 }
@@ -296,13 +334,19 @@ pub async fn regenerate_summary(
     Extension(ctx): Extension<RequestContext>,
     Path(record_id): Path<String>,
 ) -> Result<Json<DiarizationRecord>, ApiError> {
+    let existing = state
+        .diarization_store
+        .get_record(record_id.clone())
+        .await
+        .map_err(map_store_error)?
+        .ok_or_else(|| ApiError::not_found("Diarization record not found"))?;
     let record = state
         .diarization_store
         .update_summary(
             record_id,
             UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Pending,
-                model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+                model_id: Some(summary_model_id(existing.llm_model_id.as_deref())),
                 text: None,
                 error: None,
                 updated_at: None,
@@ -328,7 +372,12 @@ async fn create_pending_record(
 ) -> Result<DiarizationRecord, ApiError> {
     reject_granite_diarization_model(parsed.model_id.as_deref())?;
     validate_diarization_model_id(parsed.model_id.as_deref())?;
-    validate_speaker_bounds(parsed.min_speakers, parsed.max_speakers)?;
+    resolve_pipeline_model_ids(parsed)?;
+    validate_speaker_bounds(
+        parsed.model_id.as_deref(),
+        parsed.min_speakers,
+        parsed.max_speakers,
+    )?;
 
     state
         .diarization_store
@@ -344,6 +393,8 @@ async fn create_pending_record(
             min_speech_duration_ms: parsed.min_speech_duration_ms,
             min_silence_duration_ms: parsed.min_silence_duration_ms,
             enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+            language: parsed.language.clone(),
+            vad_gate: parsed.vad_gate,
             processing_time_ms: 0.0,
             duration_secs: None,
             rtf: None,
@@ -402,6 +453,36 @@ fn validate_diarization_model_id(model_id: Option<&str>) -> Result<(), ApiError>
         .map(|_| ())
 }
 
+/// Explicit pipeline ASR and aligner ids are the source of truth as well:
+/// reject ids the pipeline cannot run before the job starts (instead of
+/// failing it after diarization or silently using the default), and persist
+/// the resolved catalog ids. Missing ids keep the server-side defaults.
+fn resolve_pipeline_model_ids(parsed: &mut ParsedDiarizationCreateRequest) -> Result<(), ApiError> {
+    if let Some(raw) = parsed.asr_model_id.as_deref() {
+        let variant =
+            resolve_diarization_asr_model_variant(Some(raw)).map_err(ApiError::bad_request)?;
+        parsed.asr_model_id = Some(variant.dir_name().to_string());
+    }
+    if let Some(raw) = parsed.aligner_model_id.as_deref() {
+        let variant = parse_model_variant(raw)
+            .ok()
+            .filter(ModelVariant::is_forced_aligner)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("Model '{raw}' is not a forced aligner model."))
+            })?;
+        parsed.aligner_model_id = Some(variant.dir_name().to_string());
+    }
+    if let Some(raw) = parsed.llm_model_id.as_deref() {
+        let variant = resolve_diarization_llm_variant(Some(raw)).map_err(|_| {
+            ApiError::bad_request(format!(
+                "Model '{raw}' is not a chat model for diarization refinement or summaries."
+            ))
+        })?;
+        parsed.llm_model_id = Some(variant.dir_name().to_string());
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct GeneratedDiarizationArtifacts {
     duration_secs: f64,
@@ -414,6 +495,7 @@ struct GeneratedDiarizationArtifacts {
     asr_text: String,
     raw_transcript: String,
     transcript: String,
+    warnings: Vec<String>,
     summary_status: DiarizationSummaryStatus,
     summary_model_id: Option<String>,
     segments: Vec<DiarizationSegmentRecord>,
@@ -428,19 +510,38 @@ fn spawn_diarization_processing_task(
     parsed: ParsedDiarizationCreateRequest,
     correlation_id: Option<String>,
 ) {
-    tokio::spawn(async move {
+    // The job outlives its request's span: carry the ids into its own logs.
+    let span = diarization_job_span(&record_id, correlation_id.as_deref());
+    let task = async move {
         let runtime = state.runtime.clone();
         let diarization_store = state.diarization_store.clone();
-        let _ = diarization_store
+        // Registered before the record turns processing, so a cancel either
+        // finds this job or has already made the record terminal.
+        let job = state.diarization_jobs.register(&record_id);
+        let started = diarization_store
             .update_processing_status(
                 record_id.clone(),
                 DiarizationProcessingStatus::Processing,
                 None,
             )
             .await;
+        if matches!(started, Ok(None)) {
+            // Cancelled (or deleted) before it started.
+            return;
+        }
 
-        let audio_bytes = match diarization_store.get_audio(record_id.clone()).await {
-            Ok(Some(audio)) => audio.audio_bytes,
+        let mut parsed = parsed;
+        // A create hands over the samples its validation decoded; a rerun
+        // reads the stored upload, which the pipeline decodes (PIPE-14).
+        let audio = match parsed.decoded_samples.take() {
+            Some(samples) => Ok(Some(JobAudio::Samples(samples))),
+            None => diarization_store
+                .get_audio(record_id.clone())
+                .await
+                .map(|audio| audio.map(|audio| JobAudio::Encoded(audio.audio_bytes))),
+        };
+        let audio = match audio {
+            Ok(Some(audio)) => audio,
             Ok(None) => {
                 let _ = diarization_store
                     .update_processing_status(
@@ -466,8 +567,9 @@ fn spawn_diarization_processing_task(
         match generate_diarization_artifacts(
             &state,
             runtime.clone(),
-            audio_bytes.as_slice(),
+            audio,
             &parsed,
+            job.cancellation(),
             correlation_id.as_deref(),
         )
         .await
@@ -496,6 +598,7 @@ fn spawn_diarization_processing_task(
                             asr_text: artifacts.asr_text,
                             raw_transcript: artifacts.raw_transcript,
                             transcript: artifacts.transcript,
+                            warnings: artifacts.warnings,
                             summary_status: artifacts.summary_status,
                             summary_model_id: artifacts.summary_model_id,
                             summary_text: None,
@@ -528,6 +631,10 @@ fn spawn_diarization_processing_task(
                     }
                 }
             }
+            Err(_) if job.cancellation().is_cancelled() => {
+                // The record already says "Cancelled by user.".
+                info!(record_id = %record_id, "diarization pipeline cancelled");
+            }
             Err(err) => {
                 // The record carries the error, but operators debug from the
                 // server log: surface every terminal pipeline failure here.
@@ -546,47 +653,110 @@ fn spawn_diarization_processing_task(
                     .await;
             }
         }
-    });
+    };
+    tokio::spawn(task.instrument(span));
+}
+
+/// The span of one diarization job's processing, so its pipeline logs carry
+/// the record and the request's correlation id (PIPE-18).
+fn diarization_job_span(record_id: &str, correlation_id: Option<&str>) -> tracing::Span {
+    info_span!(
+        "diarization_job",
+        record_id = %record_id,
+        correlation_id = correlation_id.unwrap_or("-")
+    )
+}
+
+/// The audio a diarization job runs on.
+enum JobAudio {
+    /// Canonical 16 kHz mono samples, already decoded.
+    Samples(Vec<f32>),
+    /// A stored upload the pipeline decodes.
+    Encoded(Vec<u8>),
 }
 
 async fn generate_diarization_artifacts(
     state: &AppState,
     runtime: Arc<RuntimeService>,
-    audio_bytes: &[u8],
+    audio: JobAudio,
     parsed: &ParsedDiarizationCreateRequest,
+    cancellation: &JobCancellation,
     _correlation_id: Option<&str>,
 ) -> Result<GeneratedDiarizationArtifacts, ApiError> {
     let _permit = state.acquire_workload_permit(WorkloadClass::Online).await;
     let started = Instant::now();
+    let (model_id, asr_model_id, aligner_model_id, llm_model_id) = (
+        parsed.model_id.as_deref(),
+        parsed.asr_model_id.as_deref(),
+        parsed.aligner_model_id.as_deref(),
+        parsed.llm_model_id.as_deref(),
+    );
+    let config = DiarizationConfig {
+        min_speakers: parsed.min_speakers,
+        max_speakers: parsed.max_speakers,
+        min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
+        min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
+        vad_gate: parsed.vad_gate,
+    };
+    let options = DiarizationPipelineOptions {
+        enable_llm_refinement: parsed.enable_llm_refinement.unwrap_or(false),
+        language: parsed.language.clone(),
+        cancellation: cancellation.clone(),
+    };
     // Keep diarization processing unbounded by wall-clock timeout so valid
     // long jobs can finish and persist successfully.
-    let output = runtime
-        .diarize_with_transcript_bytes(
-            audio_bytes,
-            parsed.model_id.as_deref(),
-            parsed.asr_model_id.as_deref(),
-            parsed.aligner_model_id.as_deref(),
-            parsed.llm_model_id.as_deref(),
-            &DiarizationConfig {
-                min_speakers: parsed.min_speakers,
-                max_speakers: parsed.max_speakers,
-                min_speech_duration_ms: parsed.min_speech_duration_ms.map(|v| v as f32),
-                min_silence_duration_ms: parsed.min_silence_duration_ms.map(|v| v as f32),
-            },
-            parsed.enable_llm_refinement.unwrap_or(false),
-        )
-        .await
-        .map_err(core_api_error)?;
+    let output = match audio {
+        JobAudio::Samples(samples) => runtime
+            .diarize_with_transcript_samples(
+                samples,
+                model_id,
+                asr_model_id,
+                aligner_model_id,
+                llm_model_id,
+                &config,
+                &options,
+            )
+            .await
+            .map_err(core_api_error)?,
+        JobAudio::Encoded(bytes) => runtime
+            .diarize_with_transcript_bytes(
+                &bytes,
+                model_id,
+                asr_model_id,
+                aligner_model_id,
+                llm_model_id,
+                &config,
+                &options,
+            )
+            .await
+            .map_err(core_api_error)?,
+    };
 
-    let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
+    Ok(diarization_artifacts(
+        output,
+        started.elapsed().as_secs_f64() * 1000.0,
+        parsed
+            .generate_summary
+            .then(|| summary_model_id(parsed.llm_model_id.as_deref())),
+    ))
+}
+
+/// The record fields of one pipeline result, warnings included, so a record
+/// with estimated timings says so.
+fn diarization_artifacts(
+    output: DiarizationTranscriptResult,
+    processing_time_ms: f64,
+    summary_model: Option<String>,
+) -> GeneratedDiarizationArtifacts {
     let rtf = if output.duration_secs > 0.0 {
         Some((processing_time_ms / 1000.0) / output.duration_secs as f64)
     } else {
         None
     };
-    let (summary_status, summary_model_id) = initial_summary_state(output.transcript.as_str());
+    let (summary_status, summary_model_id) =
+        initial_summary_state(output.transcript.as_str(), summary_model);
 
-    Ok(GeneratedDiarizationArtifacts {
+    GeneratedDiarizationArtifacts {
         duration_secs: output.duration_secs as f64,
         processing_time_ms,
         rtf,
@@ -597,6 +767,7 @@ async fn generate_diarization_artifacts(
         asr_text: output.asr_text,
         raw_transcript: output.raw_transcript,
         transcript: output.transcript,
+        warnings: output.warnings,
         summary_status,
         summary_model_id,
         segments: output
@@ -633,7 +804,7 @@ async fn generate_diarization_artifacts(
                 word_end: utterance.word_end,
             })
             .collect(),
-    })
+    }
 }
 
 fn build_rerun_create_request(
@@ -643,6 +814,7 @@ fn build_rerun_create_request(
 ) -> ParsedDiarizationCreateRequest {
     ParsedDiarizationCreateRequest {
         audio_bytes: source_audio.audio_bytes,
+        decoded_samples: None,
         audio_mime_type: Some(source_audio.audio_mime_type),
         audio_filename: source_audio.audio_filename,
         model_id: source_record.model_id.clone(),
@@ -662,33 +834,49 @@ fn build_rerun_create_request(
                 .enable_llm_refinement
                 .unwrap_or(source_record.enable_llm_refinement),
         ),
+        generate_summary: rerun
+            .generate_summary
+            .unwrap_or(source_record.summary_status != DiarizationSummaryStatus::NotRequested),
+        language: sanitize_optional(rerun.language).or_else(|| source_record.language.clone()),
+        vad_gate: rerun.vad_gate.or(source_record.vad_gate),
         stream: false,
     }
 }
 
+/// Speaker limits the diarization model can meet: at most its speaker
+/// channels (4 for the default v2.1, 8 for Nemotron-3), and `min_speakers`
+/// no greater than `max_speakers`. A job that would clamp them silently is
+/// refused when it is created.
 fn validate_speaker_bounds(
+    model_id: Option<&str>,
     min_speakers: Option<usize>,
     max_speakers: Option<usize>,
 ) -> Result<(), ApiError> {
-    if let (Some(min), Some(max)) = (min_speakers, max_speakers) {
-        if min > max {
-            return Err(ApiError::bad_request(
-                "`min_speakers` cannot be greater than `max_speakers`.",
-            ));
-        }
-    }
-
-    Ok(())
+    let channels = resolve_diarization_model_variant(model_id)
+        .diarization_speaker_channels()
+        .unwrap_or(usize::MAX);
+    validate_diarization_speaker_limits(min_speakers, max_speakers, channels)
+        .map_err(ApiError::bad_request)
 }
 
-fn initial_summary_state(transcript: &str) -> (DiarizationSummaryStatus, Option<String>) {
-    if transcript.trim().is_empty() {
-        (DiarizationSummaryStatus::NotRequested, None)
-    } else {
-        (
-            DiarizationSummaryStatus::Pending,
-            Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
-        )
+/// The model that summarizes a record: its pipeline LLM, else the default.
+fn summary_model_id(llm_model_id: Option<&str>) -> String {
+    llm_model_id
+        .unwrap_or(DEFAULT_DIARIZATION_SUMMARY_MODEL)
+        .to_string()
+}
+
+/// A summary is generated only when the job asked for one (`summary_model`)
+/// and there is a transcript to summarize (D6): it loads a chat model.
+fn initial_summary_state(
+    transcript: &str,
+    summary_model: Option<String>,
+) -> (DiarizationSummaryStatus, Option<String>) {
+    match summary_model {
+        Some(model) if !transcript.trim().is_empty() => {
+            (DiarizationSummaryStatus::Pending, Some(model))
+        }
+        _ => (DiarizationSummaryStatus::NotRequested, None),
     }
 }
 
@@ -707,6 +895,10 @@ fn maybe_spawn_summary_generation(
         summary_timeout_secs,
         record.id.clone(),
         record.transcript.clone(),
+        record
+            .summary_model_id
+            .clone()
+            .unwrap_or_else(|| summary_model_id(record.llm_model_id.as_deref())),
         correlation_id,
     );
 }
@@ -716,6 +908,7 @@ fn spawn_summary_generation_task(
     summary_timeout_secs: u64,
     record_id: String,
     transcript: String,
+    model_id: String,
     correlation_id: Option<String>,
 ) {
     tokio::spawn(async move {
@@ -730,7 +923,10 @@ fn spawn_summary_generation_task(
                 persist_summary_update(
                     &diarization_store,
                     record_id.as_str(),
-                    summary_failure_update("Summary generation unavailable: request queue closed."),
+                    summary_failure_update(
+                        "Summary generation unavailable: request queue closed.",
+                        &model_id,
+                    ),
                 )
                 .await;
                 return;
@@ -742,6 +938,7 @@ fn spawn_summary_generation_task(
         } else {
             generate_diarization_summary_with_timeout(
                 runtime,
+                &model_id,
                 transcript.as_str(),
                 correlation_id.as_deref(),
                 summary_timeout_secs,
@@ -755,12 +952,12 @@ fn spawn_summary_generation_task(
         let summary_update = match summary_result {
             Ok(summary_text) => UpdateDiarizationSummary {
                 status: DiarizationSummaryStatus::Ready,
-                model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+                model_id: Some(model_id),
                 text: Some(summary_text),
                 error: None,
                 updated_at: None,
             },
-            Err(err) => summary_failure_update(err.as_str()),
+            Err(err) => summary_failure_update(err.as_str(), &model_id),
         };
 
         persist_summary_update(&diarization_store, record_id.as_str(), summary_update).await;
@@ -769,6 +966,7 @@ fn spawn_summary_generation_task(
 
 async fn generate_diarization_summary_with_timeout(
     runtime: Arc<RuntimeService>,
+    model_id: &str,
     transcript: &str,
     correlation_id: Option<&str>,
     timeout_secs: u64,
@@ -776,7 +974,13 @@ async fn generate_diarization_summary_with_timeout(
 ) -> Result<String, String> {
     tokio::time::timeout(
         Duration::from_secs(timeout_secs.max(1)),
-        generate_diarization_summary(runtime, transcript, correlation_id, runtime_context),
+        generate_diarization_summary(
+            runtime,
+            model_id,
+            transcript,
+            correlation_id,
+            runtime_context,
+        ),
     )
     .await
     .map_err(|_| summary_timeout_error(timeout_secs))?
@@ -784,14 +988,13 @@ async fn generate_diarization_summary_with_timeout(
 
 async fn generate_diarization_summary(
     runtime: Arc<RuntimeService>,
+    model_id: &str,
     transcript: &str,
     correlation_id: Option<&str>,
     runtime_context: RuntimeRequestContext,
 ) -> Result<String, String> {
-    let variant =
-        parse_chat_model_variant(Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)).map_err(|err| {
-            format!("Invalid summary model '{DEFAULT_DIARIZATION_SUMMARY_MODEL}': {err}")
-        })?;
+    let variant = resolve_diarization_llm_variant(Some(model_id))
+        .map_err(|err| format!("Invalid summary model '{model_id}': {err}"))?;
     let params = GenerationParams {
         max_tokens: DEFAULT_DIARIZATION_SUMMARY_MAX_TOKENS,
         temperature: 0.2,
@@ -832,10 +1035,10 @@ async fn generate_diarization_summary(
         .ok_or_else(|| "Summary generation returned empty text".to_string())
 }
 
-fn summary_failure_update(error: &str) -> UpdateDiarizationSummary {
+fn summary_failure_update(error: &str, model_id: &str) -> UpdateDiarizationSummary {
     UpdateDiarizationSummary {
         status: DiarizationSummaryStatus::Failed,
-        model_id: Some(DEFAULT_DIARIZATION_SUMMARY_MODEL.to_string()),
+        model_id: Some(model_id.to_string()),
         text: None,
         error: Some(truncate_summary_error(error)),
         updated_at: None,
@@ -942,7 +1145,9 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             .map_err(|err| ApiError::bad_request(format!("Invalid JSON payload: {err}")))?;
 
         let audio_payload = decode_base64_audio_payload(payload.audio_base64.as_str())?;
-        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &audio_payload)?;
+        let (audio_payload, decoded_samples) =
+            decode_audio_payload_canonical_with_diagnostics("diarization.create", audio_payload)
+                .await?;
         let audio_filename = sanitize_optional(payload.audio_filename);
         let audio_mime_type = sanitize_optional(payload.audio_mime_type)
             .or_else(|| audio_payload.content_type_hint().map(str::to_string))
@@ -956,6 +1161,7 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
 
         return Ok(ParsedDiarizationCreateRequest {
             audio_bytes: audio_payload.bytes,
+            decoded_samples: Some(decoded_samples),
             audio_mime_type,
             audio_filename,
             model_id: sanitize_optional(payload.model_id),
@@ -967,6 +1173,9 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
             min_speech_duration_ms: payload.min_speech_duration_ms,
             min_silence_duration_ms: payload.min_silence_duration_ms,
             enable_llm_refinement: payload.enable_llm_refinement,
+            generate_summary: payload.generate_summary.unwrap_or(false),
+            language: sanitize_optional(payload.language),
+            vad_gate: payload.vad_gate,
             stream: payload.stream.unwrap_or(false),
         });
     }
@@ -993,10 +1202,15 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
-                        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &payload)?;
+                        let (payload, samples) = decode_audio_payload_canonical_with_diagnostics(
+                            "diarization.create",
+                            payload,
+                        )
+                        .await?;
                         out.audio_mime_type = payload.source_mime_type;
                         out.audio_filename = payload.filename;
                         out.audio_bytes = payload.bytes;
+                        out.decoded_samples = Some(samples);
                     }
                 }
                 "audio_base64" => {
@@ -1008,11 +1222,16 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                     )
                     .await?
                     {
-                        inspect_audio_payload_canonical_with_diagnostics("diarization.create", &payload)?;
+                        let (payload, samples) = decode_audio_payload_canonical_with_diagnostics(
+                            "diarization.create",
+                            payload,
+                        )
+                        .await?;
                         if out.audio_mime_type.is_none() {
                             out.audio_mime_type = payload.content_type_hint().map(str::to_string);
                         }
                         out.audio_bytes = payload.bytes;
+                        out.decoded_samples = Some(samples);
                     }
                 }
                 "audio_mime_type" => {
@@ -1106,6 +1325,30 @@ async fn parse_create_request(req: Request) -> Result<ParsedDiarizationCreateReq
                         ))
                     })?;
                     out.enable_llm_refinement = Some(parse_truthy(text.as_str()));
+                }
+                "generate_summary" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'generate_summary' field: {err}"
+                        ))
+                    })?;
+                    out.generate_summary = parse_truthy(text.as_str());
+                }
+                "language" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'language' field: {err}"
+                        ))
+                    })?;
+                    out.language = sanitize_optional(Some(text));
+                }
+                "vad_gate" => {
+                    let text = field.text().await.map_err(|err| {
+                        ApiError::bad_request(format!(
+                            "Failed reading multipart 'vad_gate' field: {err}"
+                        ))
+                    })?;
+                    out.vad_gate = Some(parse_truthy(text.as_str()));
                 }
                 "stream" => {
                     let text = field.text().await.map_err(|err| {
@@ -1234,6 +1477,9 @@ mod tests {
             asr_text: "hello there".to_string(),
             raw_transcript: "SPEAKER_00: hello there".to_string(),
             transcript: "SPEAKER_00: hello there".to_string(),
+            warnings: Vec::new(),
+            language: None,
+            vad_gate: None,
             summary_status: DiarizationSummaryStatus::Ready,
             summary_model_id: Some("Qwen3.5-4B".to_string()),
             summary_text: Some("Speaker 00 greets.".to_string()),
@@ -1246,6 +1492,31 @@ mod tests {
             audio_mime_type: "audio/wav".to_string(),
             audio_filename: Some("meeting.wav".to_string()),
         }
+    }
+
+    /// LIVE-9: a pipeline result whose aligner could not load carries a
+    /// warning, and the record fields keep it instead of looking aligned.
+    #[test]
+    fn pipeline_warnings_reach_the_record() {
+        let warning =
+            "Forced aligner unavailable (needs 2.77 GB); word timings are estimated, not aligned";
+        let output = DiarizationTranscriptResult {
+            segments: Vec::new(),
+            words: Vec::new(),
+            utterances: Vec::new(),
+            asr_text: "hello there".to_string(),
+            raw_transcript: "hello there".to_string(),
+            transcript: "hello there".to_string(),
+            duration_secs: 3.0,
+            speaker_count: 1,
+            alignment_coverage: 0.0,
+            unattributed_words: 0,
+            llm_refined: false,
+            warnings: vec![warning.to_string()],
+        };
+        let artifacts = diarization_artifacts(output, 1_500.0, None);
+        assert_eq!(artifacts.warnings, [warning]);
+        assert_eq!(artifacts.alignment_coverage, Some(0.0));
     }
 
     fn sample_audio() -> StoredDiarizationAudio {
@@ -1274,6 +1545,7 @@ mod tests {
             .expect("request should parse");
 
         assert!(!parsed.audio_bytes.is_empty());
+        assert_eq!(parsed.decoded_samples.as_ref().map(Vec::len), Some(4));
         assert_eq!(parsed.audio_mime_type.as_deref(), Some("audio/wav"));
         assert_eq!(
             parsed.model_id.as_deref(),
@@ -1307,6 +1579,198 @@ mod tests {
         assert_eq!(parsed.audio_bytes, vec![1_u8, 2_u8, 3_u8]);
     }
 
+    /// PIPE-18, D3: `language` reaches the pipeline ASR and `vad_gate` the
+    /// diarizer from JSON and multipart creates, and a rerun keeps the
+    /// source's values unless it overrides them.
+    #[tokio::test]
+    async fn create_and_rerun_carry_language_and_vad_gate() {
+        let json = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": wav_data_url("audio/wav"),
+                    "language": " German ",
+                    "vad_gate": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let parsed = parse_create_request(json).await.unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("German"));
+        assert_eq!(parsed.vad_gate, Some(true));
+
+        let boundary = "izwi-test-boundary";
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&[0.0, 0.1, -0.1, 0.0], AudioFormat::Wav)
+            .unwrap();
+        let mut body = Vec::new();
+        for (name, value) in [("language", "French"), ("vad_gate", "false")] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(&wav);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let multipart = Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let parsed = parse_create_request(multipart).await.unwrap();
+        assert_eq!(parsed.language.as_deref(), Some("French"));
+        assert_eq!(parsed.vad_gate, Some(false));
+
+        let mut source = sample_record();
+        source.language = Some("German".to_string());
+        source.vad_gate = Some(true);
+        let kept = build_rerun_create_request(&source, sample_audio(), Default::default());
+        assert_eq!(kept.language.as_deref(), Some("German"));
+        assert_eq!(kept.vad_gate, Some(true));
+        let overridden = build_rerun_create_request(
+            &source,
+            sample_audio(),
+            RerunDiarizationRecordRequest {
+                language: Some("Spanish".to_string()),
+                vad_gate: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(overridden.language.as_deref(), Some("Spanish"));
+        assert_eq!(overridden.vad_gate, Some(false));
+    }
+
+    /// PIPE-14: a job decodes its upload once. A create keeps the samples
+    /// its validation decoded and drops the encoded bytes once they are
+    /// stored, so the pipeline decodes nothing; a rerun has only the stored
+    /// upload, which the pipeline decodes once.
+    #[tokio::test]
+    async fn each_job_decodes_its_upload_once() {
+        use izwi_core::{backends::BackendPreference, ServeRuntimeConfig};
+        let (state, _temp_dir) = {
+            let _guard = crate::test_support::env_lock();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let models_dir = temp_dir.path().join("models");
+            std::fs::create_dir_all(&models_dir).unwrap();
+            std::env::set_var("IZWI_DB_PATH", temp_dir.path().join("decode-once.sqlite3"));
+            std::env::set_var("IZWI_MEDIA_DIR", temp_dir.path().join("media"));
+            let serve_config = ServeRuntimeConfig {
+                backend: BackendPreference::Cpu,
+                models_dir,
+                ..ServeRuntimeConfig::default()
+            };
+            let runtime = RuntimeService::new(serve_config.engine_config()).unwrap();
+            let state = AppState::new(runtime, &serve_config).unwrap();
+            std::env::remove_var("IZWI_DB_PATH");
+            std::env::remove_var("IZWI_MEDIA_DIR");
+            (state, temp_dir)
+        };
+        let wav = AudioEncoder::new(16_000, 1)
+            .encode(&vec![0.1; 16_000], AudioFormat::Wav)
+            .unwrap();
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "audio_base64": base64::engine::general_purpose::STANDARD.encode(&wav)
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        // No checkpoints exist here: each job fails at the Sortformer load,
+        // after its audio reached the pipeline.
+        let run = |mut parsed: ParsedDiarizationCreateRequest| {
+            let state = state.clone();
+            async move {
+                let record = create_pending_record(&state, &mut parsed).await.unwrap();
+                assert!(parsed.audio_bytes.is_empty(), "the store owns the upload");
+                spawn_diarization_processing_task(
+                    state.clone(),
+                    30,
+                    record.id.clone(),
+                    parsed,
+                    None,
+                );
+                for _ in 0..500 {
+                    let current = state
+                        .diarization_store
+                        .get_record(record.id.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if current.processing_status == DiarizationProcessingStatus::Failed {
+                        return current;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                panic!("the job never finished");
+            }
+        };
+
+        let parsed = parse_create_request(request).await.unwrap();
+        assert_eq!(parsed.decoded_samples.as_ref().map(Vec::len), Some(16_000));
+        let created = run(parsed).await;
+        assert_eq!(state.runtime.diarization_audio_decodes(), 0);
+
+        let source_audio = state
+            .diarization_store
+            .get_audio(created.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let rerun = build_rerun_create_request(&created, source_audio, Default::default());
+        assert!(rerun.decoded_samples.is_none());
+        run(rerun).await;
+        assert_eq!(state.runtime.diarization_audio_decodes(), 1);
+    }
+
+    /// PIPE-18: a job's pipeline logs carry its record id and the request's
+    /// correlation id, though the job outlives the request.
+    #[test]
+    fn diarization_job_logs_carry_the_correlation_id() {
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(
+                async { warn!("diarization pipeline failed") }
+                    .instrument(diarization_job_span("dir_42", Some("corr-7"))),
+            );
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let line: serde_json::Value = serde_json::from_str(logged.trim()).unwrap();
+        assert_eq!(line["span"]["correlation_id"], "corr-7", "{logged}");
+        assert_eq!(line["span"]["record_id"], "dir_42", "{logged}");
+    }
+
     #[test]
     fn rerun_request_applies_requested_overrides() {
         let parsed = build_rerun_create_request(
@@ -1318,6 +1782,7 @@ mod tests {
                 min_speech_duration_ms: Some(180.0),
                 min_silence_duration_ms: Some(140.0),
                 enable_llm_refinement: Some(false),
+                ..Default::default()
             },
         );
 
@@ -1330,12 +1795,41 @@ mod tests {
 
     #[test]
     fn rejects_invalid_speaker_bounds() {
-        let err = validate_speaker_bounds(Some(4), Some(2))
+        let err = validate_speaker_bounds(None, Some(4), Some(2))
             .expect_err("min speakers should not exceed max speakers");
         assert_eq!(
             err.message,
             "`min_speakers` cannot be greater than `max_speakers`."
         );
+    }
+
+    /// PIPE-18: limits above the model's speaker channels are a 400, not a
+    /// silent clamp: 4 for the default v2.1, 8 for Nemotron-3.
+    #[test]
+    fn rejects_speaker_bounds_above_the_model_channels() {
+        for (model_id, min, max, field) in [
+            (None, None, Some(5), "max_speakers"),
+            (None, Some(5), None, "min_speakers"),
+            (
+                Some("diar_streaming_sortformer_4spk-v2.1"),
+                Some(1),
+                Some(6),
+                "max_speakers",
+            ),
+            (
+                Some("Nemotron-3-Diarization"),
+                None,
+                Some(9),
+                "max_speakers",
+            ),
+        ] {
+            let err = validate_speaker_bounds(model_id, min, max)
+                .expect_err("limits above the speaker channels are refused");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(err.message.contains(field), "{}", err.message);
+        }
+        assert!(validate_speaker_bounds(None, Some(1), Some(4)).is_ok());
+        assert!(validate_speaker_bounds(Some("Nemotron-3-Diarization"), Some(2), Some(8)).is_ok());
     }
 
     #[test]
@@ -1349,15 +1843,65 @@ mod tests {
         assert!(err.message.contains("64 MiB"));
     }
 
+    /// D6, LIVE-10: a summary loads a chat model, so a job gets one only
+    /// when it asks, and it uses the job's pipeline LLM.
     #[test]
-    fn defaults_summary_state_to_pending_for_non_empty_transcripts() {
-        let (status, model_id) = initial_summary_state("SPEAKER_00: hello");
-        assert_eq!(status, DiarizationSummaryStatus::Pending);
-        assert_eq!(model_id.as_deref(), Some("Qwen3.5-4B"));
-
-        let (status, model_id) = initial_summary_state("   ");
+    fn summary_is_generated_only_on_request_with_the_pipeline_llm() {
+        let (status, model_id) = initial_summary_state("SPEAKER_00: hello", None);
         assert_eq!(status, DiarizationSummaryStatus::NotRequested);
         assert_eq!(model_id, None);
+
+        let requested = Some(summary_model_id(Some("Qwen3-8B")));
+        let (status, model_id) = initial_summary_state("SPEAKER_00: hello", requested.clone());
+        assert_eq!(status, DiarizationSummaryStatus::Pending);
+        assert_eq!(model_id.as_deref(), Some("Qwen3-8B"));
+
+        let (status, model_id) = initial_summary_state("   ", requested);
+        assert_eq!(status, DiarizationSummaryStatus::NotRequested);
+        assert_eq!(model_id, None);
+        assert_eq!(summary_model_id(None), DEFAULT_DIARIZATION_SUMMARY_MODEL);
+    }
+
+    #[tokio::test]
+    async fn create_requests_a_summary_only_when_asked() {
+        let request = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "audio_base64": wav_data_url("audio/wav") });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let plain = parse_create_request(request(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert!(!plain.generate_summary);
+        let asked = parse_create_request(request(serde_json::json!({ "generate_summary": true })))
+            .await
+            .unwrap();
+        assert!(asked.generate_summary);
+
+        // A rerun keeps the source's choice unless it overrides it.
+        let mut source = sample_record();
+        source.summary_status = DiarizationSummaryStatus::NotRequested;
+        let rerun = |source: &DiarizationRecord, generate_summary| {
+            build_rerun_create_request(
+                source,
+                sample_audio(),
+                RerunDiarizationRecordRequest {
+                    generate_summary,
+                    ..Default::default()
+                },
+            )
+            .generate_summary
+        };
+        assert!(!rerun(&source, None));
+        assert!(rerun(&source, Some(true)));
+        source.summary_status = DiarizationSummaryStatus::Ready;
+        assert!(rerun(&source, None));
+        assert!(!rerun(&source, Some(false)));
     }
 
     #[test]
@@ -1383,12 +1927,9 @@ mod tests {
 
     #[test]
     fn summary_failure_update_sets_failed_status_and_truncates_error() {
-        let update = summary_failure_update("x".repeat(500).as_str());
+        let update = summary_failure_update("x".repeat(500).as_str(), "Qwen3-8B");
         assert_eq!(update.status, DiarizationSummaryStatus::Failed);
-        assert_eq!(
-            update.model_id.as_deref(),
-            Some(DEFAULT_DIARIZATION_SUMMARY_MODEL)
-        );
+        assert_eq!(update.model_id.as_deref(), Some("Qwen3-8B"));
         assert!(update.text.is_none());
         let error = update.error.expect("error should be populated");
         assert_eq!(error.len(), 320);

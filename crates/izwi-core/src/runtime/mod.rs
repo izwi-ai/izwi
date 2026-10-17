@@ -16,6 +16,7 @@ mod conformance;
 mod coordinator;
 mod diarization;
 pub(crate) mod fish_capacity;
+mod forced_alignment;
 mod health;
 mod kokoro;
 mod lifecycle;
@@ -53,8 +54,11 @@ pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
     ConformanceExecutionClass,
 };
-pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
+pub use coordinator::{
+    CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobCancellation, JobSpec,
+};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
+pub use forced_alignment::{AlignedWindow, AlignmentSource, AlignmentWindow, WindowedAlignment};
 pub use health::RuntimeHealth;
 pub(crate) use health::{fatal_device_fault, fatal_device_fault_message};
 pub use lifecycle::SessionModelLeases;
@@ -77,11 +81,12 @@ pub use telemetry::{
     TRACE_REQUEST_ID, TRACE_STREAMING_MODE,
 };
 pub use types::{
-    AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig, DiarizationResult,
-    DiarizationSegment, DiarizationTranscriptResult, DiarizationUtterance, DiarizationWord,
-    GenerationConfig, GenerationRequest, GenerationResult, InferenceOptions, RuntimeRequestContext,
-    SpeakerAttributedAsrResult, SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
-    SpeechToSpeechGeneration, TtsStopReason, TtsStreamingMode,
+    AsrTranscription, AudioChunk, ChatGeneration, ChunkStats, DiarizationConfig,
+    DiarizationPipelineOptions, DiarizationResult, DiarizationSegment, DiarizationTranscriptResult,
+    DiarizationUtterance, DiarizationWord, GenerationConfig, GenerationRequest, GenerationResult,
+    InferenceOptions, RuntimeRequestContext, SpeakerAttributedAsrResult,
+    SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn, SpeechToSpeechGeneration, TtsStopReason,
+    TtsStreamingMode,
 };
 pub use voice_metrics::{
     prometheus_voice_metric_name, prometheus_voice_metric_type, voice_metric_catalog,

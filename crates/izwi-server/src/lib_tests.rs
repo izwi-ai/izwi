@@ -64,6 +64,30 @@ async fn lifecycle_ready(client: &reqwest::Client, base: &str) -> (u16, bool) {
     (status, lifecycle_ready)
 }
 
+#[test]
+fn bounded_exit_does_not_wait_for_a_blocking_drain_that_never_finishes() {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = run_with_bounded_exit(
+            async {
+                // Stands in for an unload stuck in Device::synchronize.
+                tokio::task::spawn_blocking(|| loop {
+                    std::thread::park();
+                });
+                Ok(())
+            },
+            Duration::from_millis(200),
+        );
+        let _ = done_tx.send(result.is_ok());
+    });
+    let started = Instant::now();
+    let ok = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("process exit must not wait for a never-ending blocking task");
+    assert!(ok);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
 #[tokio::test]
 async fn local_server_answers_liveness_while_models_preload() {
     let _env = env_lock();

@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 
+use crate::catalog::ModelFamily;
 use crate::models::architectures::qwen3::core::Qwen3Config;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -21,6 +22,41 @@ pub struct Qwen3AsrConfig {
     /// Timestamp segment time in ms (present in ForcedAligner models)
     #[serde(default)]
     pub timestamp_segment_time: Option<usize>,
+}
+
+impl Qwen3AsrConfig {
+    /// The forced aligner (a `forced_aligner` thinker or a classification
+    /// head) or Qwen3-ASR.
+    pub fn model_family(&self) -> ModelFamily {
+        let forced_aligner = self
+            .thinker_config
+            .model_type
+            .as_deref()
+            .is_some_and(|name| name.to_ascii_lowercase().contains("forced_aligner"))
+            || self.thinker_config.classify_num.is_some();
+        if forced_aligner {
+            ModelFamily::Qwen3ForcedAligner
+        } else {
+            ModelFamily::Qwen3Asr
+        }
+    }
+
+    /// An MLX-quantized safetensors checkpoint.
+    pub fn is_mlx_quantized(&self) -> bool {
+        self.quantization.is_some() || self.quantization_config.is_some()
+    }
+
+    /// The MLX quantization settings, `quantization_config` first.
+    pub fn mlx_quantization(&self) -> Option<&serde_json::Value> {
+        self.quantization_config
+            .as_ref()
+            .or(self.quantization.as_ref())
+    }
+
+    /// The bit width of each packed MLX weight element.
+    pub fn mlx_bits(&self) -> Option<u64> {
+        self.mlx_quantization()?.get("bits")?.as_u64()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

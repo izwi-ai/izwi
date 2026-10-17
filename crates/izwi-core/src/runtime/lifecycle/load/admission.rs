@@ -448,18 +448,19 @@ impl ModelLifecycleController {
     }
 
     /// One reconciliation checkpoint for a load priced by a residency plan
-    /// (ASR and TTS), or `None` for other families and backends without a
-    /// device observer (CPU).
+    /// (ASR, the forced aligner, the diarizers and TTS), or `None` for other
+    /// families, for weights the observer cannot see, and for backends
+    /// without a device observer (CPU).
     pub(super) fn sample_device_usage(&self, variant: ModelVariant) -> Option<DeviceUsageSample> {
-        if !reconciles_device_usage(variant) {
+        let backend = self.backend_router.context().backend_kind;
+        if !reconciles_device_usage(variant, backend) {
             return None;
         }
         let authority = self.coordinator.resource_authority();
         let observed = authority.observed_device_usage_bytes()?;
         Some(DeviceUsageSample {
             observed,
-            reserved: authority
-                .reserved_bytes_in_domain(self.backend_router.context().backend_kind),
+            reserved: authority.reserved_bytes_in_domain(backend),
         })
     }
 
@@ -579,6 +580,72 @@ impl ModelLifecycleController {
             host_bytes,
             accelerator_bytes,
         }))
+    }
+
+    /// Grows a loading slot's authorization to the precision reload plan
+    /// of `variant` before a component whose load-time probe failed reloads
+    /// at `request.dtype`, through the same live check as the load itself
+    /// (pooled-scratch flush and eviction included). Returns the reload plan
+    /// that now prices the load, or `None` when the load has none (its plan
+    /// already covers the reload). Refuses, with the shortfall, when the
+    /// reload cannot fit.
+    pub(super) async fn admit_precision_reload(
+        &self,
+        variant: ModelVariant,
+        model_path: &Path,
+        current: &ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<Option<ModelResourcePlan>> {
+        let device = &self.backend_router.context().device;
+        let Some(reload) = asr_memory::precision_reload_plan(variant, model_path, device)? else {
+            return Ok(None);
+        };
+        self.grow_load_authorization_for_reload(variant, current, reload, request)
+            .await
+            .map(Some)
+    }
+
+    pub(super) async fn grow_load_authorization_for_reload(
+        &self,
+        variant: ModelVariant,
+        current: &ModelResourcePlan,
+        reload: ModelResourcePlan,
+        request: &PrecisionReloadRequest,
+    ) -> Result<ModelResourcePlan> {
+        let backend = self.backend_router.context().backend_kind;
+        let refused = |error: Error| {
+            Error::ModelLoadError(format!(
+                "Cannot reload {variant} {} at {:?} after its load-time probe failed: {error}",
+                request.component, request.dtype
+            ))
+        };
+        let growth = match (
+            load_domain_bytes(current.load_authorization, backend),
+            load_domain_bytes(reload.load_authorization, backend),
+        ) {
+            (ResourceAmount::Known(current), ResourceAmount::Known(reload)) => {
+                reload.saturating_sub(current)
+            }
+            _ => 0,
+        };
+        warn!(
+            model = %variant,
+            component = %request.component,
+            dtype = ?request.dtype,
+            growth_bytes = growth,
+            "A lowered-precision load failed its probe; admitting the reload"
+        );
+        // The loader synchronized the device after dropping the lowered
+        // component, so a fresh sample sees its memory free.
+        self.coordinator
+            .resource_authority()
+            .refresh_physical_capacity_after_release();
+        self.ensure_portable_memory_before_load(variant, growth)
+            .await
+            .map_err(refused)?;
+        self.grow_loading_slot_authorization(variant, reload.load_authorization)
+            .map_err(refused)?;
+        Ok(reload)
     }
 
     pub(super) async fn reserve_model_resources(

@@ -3,7 +3,9 @@
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QueryResult, Set,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -15,11 +17,16 @@ use crate::{
     db::{raw, StoreDatabase},
     entity::diarization_records,
     ids::new_uuid,
+    node_identity::{NodeIdentity, RecoveryScope},
     persistence::{
         delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
     },
     storage_layout,
 };
+
+/// The error of a record whose in-process job died with the server (P1V-1).
+pub const INTERRUPTED_BY_SHUTDOWN_ERROR: &str =
+    "Interrupted by a server shutdown before it finished; rerun the job.";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +154,13 @@ pub struct DiarizationRecord {
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
+    /// Degraded pipeline steps: an aligner that could not be used, windows
+    /// whose word timings are not the aligner's, a truncated ASR decode.
+    pub warnings: Vec<String>,
+    /// ASR language hint the job ran with; `None` detects it.
+    pub language: Option<String>,
+    /// Sortformer VAD gate the job asked for; `None` keeps the server default.
+    pub vad_gate: Option<bool>,
     pub summary_status: DiarizationSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -180,6 +194,8 @@ pub struct NewDiarizationRecord {
     pub min_speech_duration_ms: Option<f64>,
     pub min_silence_duration_ms: Option<f64>,
     pub enable_llm_refinement: bool,
+    pub language: Option<String>,
+    pub vad_gate: Option<bool>,
     pub processing_time_ms: f64,
     pub duration_secs: Option<f64>,
     pub rtf: Option<f64>,
@@ -234,6 +250,7 @@ pub struct CompleteDiarizationRecord {
     pub asr_text: String,
     pub raw_transcript: String,
     pub transcript: String,
+    pub warnings: Vec<String>,
     pub summary_status: DiarizationSummaryStatus,
     pub summary_model_id: Option<String>,
     pub summary_text: Option<String>,
@@ -248,6 +265,8 @@ pub struct CompleteDiarizationRecord {
 pub struct DiarizationStore {
     db: StoreDatabase,
     media_storage: Arc<dyn MediaStorageProvider>,
+    /// The node whose tasks run the jobs and summaries this store starts.
+    node: NodeIdentity,
 }
 
 impl DiarizationStore {
@@ -265,6 +284,7 @@ impl DiarizationStore {
         Ok(Self {
             db: StoreDatabase::new(db_path),
             media_storage: Arc::new(LocalMediaStorageProvider::new(media_root)),
+            node: NodeIdentity::local(),
         })
     }
 
@@ -272,7 +292,17 @@ impl DiarizationStore {
         db: StoreDatabase,
         media_storage: Arc<dyn MediaStorageProvider>,
     ) -> Self {
-        Self { db, media_storage }
+        Self {
+            db,
+            media_storage,
+            node: NodeIdentity::local(),
+        }
+    }
+
+    /// Records this store starts are owned by `node` (P1V-1).
+    pub fn with_node_identity(mut self, node: NodeIdentity) -> Self {
+        self.node = node;
+        self
     }
 
     pub async fn list_records_page(
@@ -383,6 +413,7 @@ impl DiarizationStore {
         let asr_model_id = sanitize_optional_text(record.asr_model_id.as_deref(), 160);
         let aligner_model_id = sanitize_optional_text(record.aligner_model_id.as_deref(), 160);
         let llm_model_id = sanitize_optional_text(record.llm_model_id.as_deref(), 160);
+        let language = sanitize_optional_text(record.language.as_deref(), 64);
         let processing_error = sanitize_optional_text(record.processing_error.as_deref(), 1_000);
         let processing_status =
             normalize_processing_status(record.processing_status, processing_error.as_deref());
@@ -414,9 +445,9 @@ impl DiarizationStore {
             .alignment_coverage
             .filter(|value| value.is_finite() && *value >= 0.0);
         let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let asr_text = sanitize_transcript_text(record.asr_text.as_str());
+        let raw_transcript = sanitize_transcript_text(record.raw_transcript.as_str());
+        let transcript = sanitize_transcript_text(record.transcript.as_str());
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -492,6 +523,9 @@ impl DiarizationStore {
             asr_text: Set(asr_text),
             raw_transcript: Set(raw_transcript),
             transcript: Set(transcript),
+            warnings_json: Set("[]".to_string()),
+            language: Set(language),
+            vad_gate: Set(record.vad_gate.map(i64::from)),
             summary_status: Set(summary_status.as_db_value().to_string()),
             summary_model_id: Set(summary_model_id),
             summary_text: Set(summary_text),
@@ -504,6 +538,7 @@ impl DiarizationStore {
             audio_mime_type: Set(audio_mime_type),
             audio_filename: Set(audio_filename),
             audio_storage_path: Set(audio_storage_path.clone()),
+            owner_node_id: Set(Some(self.node.id().to_string())),
         })
         .exec(db)
         .await
@@ -594,7 +629,22 @@ impl DiarizationStore {
                 }
             });
 
-        let result = diarization_records::Entity::update_many()
+        let mut update_query = diarization_records::Entity::update_many();
+        if summary_status == DiarizationSummaryStatus::Pending {
+            // This node's task generates the summary. A record still being
+            // diarized keeps the owner that runs its pipeline.
+            update_query = update_query.col_expr(
+                diarization_records::Column::OwnerNodeId,
+                Expr::case(
+                    diarization_records::Column::ProcessingStatus
+                        .is_in(["pending".to_string(), "processing".to_string()]),
+                    Expr::col(diarization_records::Column::OwnerNodeId),
+                )
+                .finally(Expr::value(self.node.id()))
+                .into(),
+            );
+        }
+        let result = update_query
             .col_expr(
                 diarization_records::Column::SummaryStatus,
                 Expr::value(summary_status.as_db_value()),
@@ -627,6 +677,66 @@ impl DiarizationStore {
         fetch_record_without_audio(db, &record_id).await
     }
 
+    /// Fail the jobs a previous run of this node left pending or processing
+    /// (P1V-1). Diarization jobs and their summaries run as tasks of the
+    /// node that accepted them, so at startup none of its own can still be
+    /// running; left alone they would stay "processing" forever. Records
+    /// other nodes own on a shared database are theirs to recover. A failed
+    /// record keeps its audio and can be rerun. Returns the number of
+    /// records failed, or `None` when this node cannot tell its records from
+    /// another node's (see [`NodeIdentity::recovery_scope`]).
+    pub async fn fail_interrupted_records(&self) -> anyhow::Result<Option<u64>> {
+        let db = self.db.connection().await?;
+        let Some(scope) = self.node.recovery_scope(db.get_database_backend()) else {
+            return Ok(None);
+        };
+        self.fail_interrupted_records_in(&scope).await.map(Some)
+    }
+
+    async fn fail_interrupted_records_in(&self, scope: &RecoveryScope) -> anyhow::Result<u64> {
+        let db = self.db.connection().await?;
+        let owned = || {
+            let owner = diarization_records::Column::OwnerNodeId;
+            let mut owned = Condition::any().add(owner.eq(scope.owner.as_str()));
+            if scope.include_unowned {
+                owned = owned.add(owner.is_null());
+            }
+            owned
+        };
+        let active = ["pending".to_string(), "processing".to_string()];
+        let jobs = diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::ProcessingStatus,
+                Expr::value(DiarizationProcessingStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::ProcessingError,
+                Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
+            )
+            .filter(diarization_records::Column::ProcessingStatus.is_in(active))
+            .filter(owned())
+            .exec(db)
+            .await
+            .context("Failed to fail interrupted diarization records")?;
+        diarization_records::Entity::update_many()
+            .col_expr(
+                diarization_records::Column::SummaryStatus,
+                Expr::value(DiarizationSummaryStatus::Failed.as_db_value()),
+            )
+            .col_expr(
+                diarization_records::Column::SummaryError,
+                Expr::value(INTERRUPTED_BY_SHUTDOWN_ERROR),
+            )
+            .filter(diarization_records::Column::SummaryStatus.eq("pending"))
+            .filter(owned())
+            .exec(db)
+            .await
+            .context("Failed to fail interrupted diarization summaries")?;
+        Ok(jobs.rows_affected)
+    }
+
+    /// Move a pending or processing record to `status`. Returns `None` when
+    /// the record is missing or already terminal (ready or failed).
     pub async fn update_processing_status(
         &self,
         record_id: String,
@@ -647,6 +757,12 @@ impl DiarizationStore {
                 Expr::value(processing_error),
             )
             .filter(diarization_records::Column::Id.eq(record_id.clone()))
+            // A terminal record keeps its outcome: a pipeline error arriving
+            // after "Cancelled by user." must not overwrite it (PIPE-7).
+            .filter(
+                diarization_records::Column::ProcessingStatus
+                    .is_in(["pending".to_string(), "processing".to_string()]),
+            )
             .exec(db)
             .await
             .context("Failed updating diarization processing status")?;
@@ -697,15 +813,17 @@ impl DiarizationStore {
             .alignment_coverage
             .filter(|value| value.is_finite() && *value >= 0.0);
         let unattributed_words = i64::try_from(record.unattributed_words).unwrap_or(0);
-        let asr_text = sanitize_required_text(record.asr_text.as_str(), 40_000);
-        let raw_transcript = sanitize_required_text(record.raw_transcript.as_str(), 100_000);
-        let transcript = sanitize_required_text(record.transcript.as_str(), 100_000);
+        let asr_text = sanitize_transcript_text(record.asr_text.as_str());
+        let raw_transcript = sanitize_transcript_text(record.raw_transcript.as_str());
+        let transcript = sanitize_transcript_text(record.transcript.as_str());
         let segments_json =
             serde_json::to_string(&record.segments).context("Failed serializing segments")?;
         let words_json =
             serde_json::to_string(&record.words).context("Failed serializing words")?;
         let utterances_json =
             serde_json::to_string(&record.utterances).context("Failed serializing utterances")?;
+        let warnings_json = serde_json::to_string(&sanitize_warnings(record.warnings))
+            .context("Failed serializing diarization warnings")?;
         let summary_model_id = sanitize_optional_text(record.summary_model_id.as_deref(), 160);
         let summary_text = sanitize_optional_text(record.summary_text.as_deref(), 20_000);
         let summary_error = sanitize_optional_text(record.summary_error.as_deref(), 1_000);
@@ -795,6 +913,10 @@ impl DiarizationStore {
             .col_expr(
                 diarization_records::Column::Transcript,
                 Expr::value(transcript),
+            )
+            .col_expr(
+                diarization_records::Column::WarningsJson,
+                Expr::value(warnings_json),
             )
             .col_expr(
                 diarization_records::Column::SummaryStatus,
@@ -926,7 +1048,10 @@ const DIARIZATION_RECORD_COLUMNS: &str = r#"
     utterances_json,
     speaker_name_overrides_json,
     audio_mime_type,
-    audio_filename
+    audio_filename,
+    warnings_json,
+    language,
+    vad_gate
 "#;
 
 async fn fetch_record_without_audio(
@@ -1073,6 +1198,11 @@ fn map_diarization_record(row: &QueryResult) -> anyhow::Result<DiarizationRecord
         speaker_name_overrides,
         audio_mime_type: row.try_get_by_index(32)?,
         audio_filename: row.try_get_by_index(33)?,
+        warnings: parse_json_vec(row.try_get_by_index(34)?),
+        language: row.try_get_by_index(35)?,
+        vad_gate: row
+            .try_get_by_index::<Option<i64>>(36)?
+            .map(|value| value != 0),
     })
 }
 
@@ -1200,6 +1330,24 @@ fn transcript_preview_with_utterances(
     } else {
         truncate_string(&normalized, 180)
     }
+}
+
+/// Transcript text is stored whole (as the words JSON is): the record is the
+/// only copy of a job's transcript, however long the audio.
+fn sanitize_transcript_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        " ".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter_map(|warning| sanitize_optional_text(Some(warning.as_str()), 500))
+        .collect()
 }
 
 fn sanitize_required_text(raw: &str, max_chars: usize) -> String {
@@ -1366,7 +1514,7 @@ fn i64_to_usize(value: i64) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn build_test_store() -> (DiarizationStore, PathBuf) {
@@ -1379,7 +1527,7 @@ mod tests {
         (store, root)
     }
 
-    fn sample_record() -> NewDiarizationRecord {
+    pub(crate) fn sample_record() -> NewDiarizationRecord {
         NewDiarizationRecord {
             model_id: Some("diar_streaming_sortformer_4spk-v2.1".to_string()),
             asr_model_id: Some("Parakeet-TDT-0.6B-v3".to_string()),
@@ -1392,6 +1540,8 @@ mod tests {
             min_speech_duration_ms: Some(240.0),
             min_silence_duration_ms: Some(200.0),
             enable_llm_refinement: true,
+            language: None,
+            vad_gate: None,
             processing_time_ms: 500.0,
             duration_secs: Some(12.0),
             rtf: Some(0.4),
@@ -1493,6 +1643,7 @@ mod tests {
             segments: sample_record().segments,
             words: sample_record().words,
             utterances: sample_record().utterances,
+            warnings: Vec::new(),
         }
     }
 
@@ -1699,6 +1850,85 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test temp dir should be removable");
     }
 
+    /// PIPE-9: an hour of speech is well past 40k characters; the stored
+    /// transcript texts must not be cut, and the pipeline warnings persist.
+    #[tokio::test]
+    async fn long_transcripts_and_warnings_round_trip_unchanged() {
+        let (store, root) = build_test_store();
+        let long_text = "word ".repeat(10_000).trim_end().to_string();
+        assert!(long_text.chars().count() > 40_000);
+        let long_transcript = format!("SPEAKER_00 [0.00s - 3600.00s]: {}", "word ".repeat(30_000))
+            .trim_end()
+            .to_string();
+        assert!(long_transcript.chars().count() > 100_000);
+
+        let mut pending = sample_record();
+        pending.processing_status = DiarizationProcessingStatus::Pending;
+        pending.asr_text = long_text.clone();
+        let created = store
+            .create_record(pending)
+            .await
+            .expect("record should be created");
+        assert_eq!(created.asr_text, long_text);
+        assert!(created.warnings.is_empty());
+
+        let warnings = vec![
+            "Forced aligner unavailable (needs 2.77 GB); word timings are estimated, not aligned"
+                .to_string(),
+        ];
+        let mut complete = sample_complete_record();
+        complete.asr_text = long_text.clone();
+        complete.raw_transcript = long_transcript.clone();
+        complete.transcript = long_transcript.clone();
+        complete.alignment_coverage = Some(0.0);
+        complete.warnings = warnings.clone();
+        store
+            .complete_record(created.id.clone(), complete)
+            .await
+            .expect("completion should succeed")
+            .expect("record should exist");
+
+        let stored = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(stored.asr_text, long_text);
+        assert_eq!(stored.raw_transcript, long_transcript);
+        assert_eq!(stored.transcript, long_transcript);
+        assert_eq!(stored.warnings, warnings);
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// The language hint and VAD gate a job ran with persist, so a rerun can
+    /// repeat them.
+    #[tokio::test]
+    async fn language_and_vad_gate_round_trip() {
+        let (store, root) = build_test_store();
+        for (language, vad_gate) in [
+            (Some("German".to_string()), Some(true)),
+            (None, Some(false)),
+            (None, None),
+        ] {
+            let mut record = sample_record();
+            record.language = language.clone();
+            record.vad_gate = vad_gate;
+            let created = store.create_record(record).await.expect("record");
+            assert_eq!(
+                (created.language.clone(), created.vad_gate),
+                (language.clone(), vad_gate)
+            );
+            let stored = store
+                .get_record(created.id)
+                .await
+                .expect("lookup")
+                .expect("record");
+            assert_eq!((stored.language, stored.vad_gate), (language, vad_gate));
+        }
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
     #[tokio::test]
     async fn completion_does_not_overwrite_terminal_records() {
         let (store, root) = build_test_store();
@@ -1750,6 +1980,228 @@ mod tests {
             completion.is_none(),
             "terminal records should not be overwritten by async completion"
         );
+
+        let current = store
+            .get_record(created.id)
+            .await
+            .expect("record lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(
+            current.processing_status,
+            DiarizationProcessingStatus::Failed
+        );
+        assert_eq!(
+            current.processing_error.as_deref(),
+            Some("Cancelled by user.")
+        );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1: a job left pending or processing by a previous process fails
+    /// at startup with a clear error (and a pending summary with it), while
+    /// finished records are untouched.
+    #[tokio::test]
+    async fn startup_fails_records_left_running_by_a_previous_process() {
+        let (store, root) = build_test_store();
+        let mut ids = Vec::new();
+        for status in [
+            DiarizationProcessingStatus::Pending,
+            DiarizationProcessingStatus::Processing,
+            DiarizationProcessingStatus::Ready,
+        ] {
+            let mut record = sample_record();
+            record.processing_status = status;
+            record.summary_status = DiarizationSummaryStatus::NotRequested;
+            if status == DiarizationProcessingStatus::Ready {
+                record.summary_status = DiarizationSummaryStatus::Pending;
+                record.summary_text = None;
+            }
+            let created = store.create_record(record).await.expect("record");
+            ids.push(created.id);
+        }
+
+        assert_eq!(
+            store
+                .fail_interrupted_records()
+                .await
+                .expect("startup recovery"),
+            Some(2)
+        );
+
+        for id in &ids[..2] {
+            let record = store
+                .get_record(id.clone())
+                .await
+                .expect("record lookup")
+                .expect("record");
+            assert_eq!(
+                record.processing_status,
+                DiarizationProcessingStatus::Failed
+            );
+            assert_eq!(
+                record.processing_error.as_deref(),
+                Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
+            );
+        }
+        let ready = store
+            .get_record(ids[2].clone())
+            .await
+            .expect("record lookup")
+            .expect("record");
+        assert_eq!(ready.processing_status, DiarizationProcessingStatus::Ready);
+        assert!(ready.processing_error.is_none());
+        assert_eq!(ready.summary_status, DiarizationSummaryStatus::Failed);
+        assert_eq!(
+            ready.summary_error.as_deref(),
+            Some(INTERRUPTED_BY_SHUTDOWN_ERROR)
+        );
+        assert_eq!(
+            store.fail_interrupted_records().await.expect("rerun"),
+            Some(0)
+        );
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// P1V-1 on a database several nodes share: node A's startup fails the
+    /// jobs and summaries A left running and leaves node B's running. Rows
+    /// written before owners were recorded are recovered only where the
+    /// database belongs to one node.
+    #[tokio::test]
+    async fn startup_recovery_leaves_other_nodes_jobs_running() {
+        let (store, root) = build_test_store();
+        let node = |id| {
+            store
+                .clone()
+                .with_node_identity(NodeIdentity::configured(id).expect("node id"))
+        };
+        let (node_a, node_b) = (node("node-a"), node("node-b"));
+        let processing = || {
+            let mut record = sample_record();
+            record.processing_status = DiarizationProcessingStatus::Processing;
+            record.summary_status = DiarizationSummaryStatus::NotRequested;
+            record.summary_text = None;
+            record
+        };
+        let a_job = node_a.create_record(processing()).await.expect("A job");
+        let b_job = node_b.create_record(processing()).await.expect("B job");
+        let legacy = node_a.create_record(processing()).await.expect("legacy");
+        let db = store.db.connection().await.expect("db");
+        db.execute_raw(
+            raw::statement(
+                db,
+                "UPDATE diarization_records SET owner_node_id = NULL WHERE id = ?1",
+                vec![legacy.id.clone().into()],
+            )
+            .expect("statement"),
+        )
+        .await
+        .expect("unown legacy row");
+        // B regenerates the summary of a finished record of A's: B runs it.
+        let mut finished = sample_record();
+        finished.summary_status = DiarizationSummaryStatus::NotRequested;
+        finished.summary_text = None;
+        let b_summary = node_a.create_record(finished).await.expect("finished");
+        // B asks for a summary of A's running job: A still runs the job.
+        for id in [&b_summary.id, &a_job.id] {
+            node_b
+                .update_summary(
+                    id.clone(),
+                    UpdateDiarizationSummary {
+                        status: DiarizationSummaryStatus::Pending,
+                        model_id: Some("Qwen3.5-4B".to_string()),
+                        text: None,
+                        error: None,
+                        updated_at: None,
+                    },
+                )
+                .await
+                .expect("summary update")
+                .expect("record");
+        }
+        let status = |id: &String| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let record = store.get_record(id).await.expect("lookup").expect("record");
+                (record.processing_status, record.summary_status)
+            }
+        };
+        use DiarizationProcessingStatus::{Failed, Processing, Ready};
+        use DiarizationSummaryStatus::{Failed as SummaryFailed, NotRequested, Pending};
+
+        // A shared database: A recovers only what it owns.
+        let shared = RecoveryScope {
+            owner: "node-a".to_string(),
+            include_unowned: false,
+        };
+        assert_eq!(
+            node_a
+                .fail_interrupted_records_in(&shared)
+                .await
+                .expect("A recovery"),
+            1
+        );
+        assert_eq!(status(&a_job.id).await, (Failed, SummaryFailed));
+        assert_eq!(status(&b_job.id).await, (Processing, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, Pending));
+        assert_eq!(status(&legacy.id).await, (Processing, NotRequested));
+
+        // SQLite belongs to one node: A also recovers the unowned row.
+        assert_eq!(
+            node_a.fail_interrupted_records().await.expect("A recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&legacy.id).await, (Failed, NotRequested));
+        assert_eq!(status(&b_job.id).await, (Processing, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, Pending));
+
+        // B's own restart recovers B's job and the summary it was running.
+        assert_eq!(
+            node_b.fail_interrupted_records().await.expect("B recovery"),
+            Some(1)
+        );
+        assert_eq!(status(&b_job.id).await, (Failed, NotRequested));
+        assert_eq!(status(&b_summary.id).await, (Ready, SummaryFailed));
+
+        std::fs::remove_dir_all(root).expect("test temp dir should be removable");
+    }
+
+    /// PIPE-7: the cancelled pipeline's own error, or a late status write,
+    /// arrives after the cancel and must not replace "Cancelled by user.".
+    #[tokio::test]
+    async fn status_updates_do_not_overwrite_terminal_records() {
+        let (store, root) = build_test_store();
+        let mut pending = sample_record();
+        pending.processing_status = DiarizationProcessingStatus::Pending;
+        let created = store
+            .create_record(pending)
+            .await
+            .expect("pending record should be created");
+        store
+            .update_processing_status(
+                created.id.clone(),
+                DiarizationProcessingStatus::Failed,
+                Some("Cancelled by user.".to_string()),
+            )
+            .await
+            .expect("cancel status update should succeed")
+            .expect("record should exist");
+
+        for (status, error) in [
+            (
+                DiarizationProcessingStatus::Failed,
+                Some("Cancelled: job \"dir\" was cancelled".to_string()),
+            ),
+            (DiarizationProcessingStatus::Processing, None),
+        ] {
+            let late = store
+                .update_processing_status(created.id.clone(), status, error)
+                .await
+                .expect("late status update should execute");
+            assert!(late.is_none(), "{status:?} overwrote a terminal record");
+        }
 
         let current = store
             .get_record(created.id)

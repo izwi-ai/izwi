@@ -3,11 +3,11 @@
 mod audio;
 mod config;
 mod tokenizer;
+mod word_units;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{fs, io::Read};
 
@@ -31,8 +31,8 @@ use crate::engine::{StageDescriptor, StageWorkSelector, WorkCost};
 use crate::error::{Error, Result};
 use crate::kernels::buffer_pool::maybe_init_global_buffer_pool;
 use crate::kernels::numeric_check::{
-    load_with_precision_fallback, run_numeric_self_check, xorshift_tensor, NumericSelfCheckReport,
-    PrecisionLoad, F16_SAFE_MAX_ABS,
+    admit_precision_reload, load_with_precision_fallback, run_numeric_self_check, xorshift_tensor,
+    NumericSelfCheckReport, PrecisionLoad, F16_SAFE_MAX_ABS,
 };
 use crate::kv::v2::{
     stage_graph_fingerprint, BoundedShape, CapabilityStateDescriptorV2, CheckpointPolicy,
@@ -60,12 +60,16 @@ use crate::models::shared::memory::accounting::{
 use crate::models::shared::memory::metal::metal_pool_for_device;
 use crate::models::shared::state::exact_stage_scratch_domain;
 use crate::models::shared::weights::gguf::{var_builder_from_gguf_filtered, GgufLoader};
+use crate::models::shared::weights::staged;
 use crate::runtime::asr_automatic_context as qwen3_asr_automatic_context;
 
-pub(crate) use audio::QWEN3_ASR_AUDIO_POSITIONS;
 use audio::AudioTower;
+pub(crate) use audio::{
+    qwen3_audio_cnn_chunk_bytes, qwen3_audio_cnn_slice_chunks, QWEN3_ASR_AUDIO_POSITIONS,
+};
 use config::Qwen3AsrConfig;
 use tokenizer::{AsrTokenizer, SpecialTokenIds};
+pub(crate) use word_units::{alignment_units, AlignmentUnit};
 
 const QWEN3_ASR_PREPARED_INPUT_DOMAIN: StateDomainId = StateDomainId::new(2);
 static NEXT_QWEN3_ASR_AUDIO_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -264,7 +268,6 @@ impl Qwen3AsrModel {
             QWEN3_ASR_SAMPLE_RATE,
             mel.n_fft,
             mel.hop_length,
-            qwen_asr_drop_last_mel_frame(),
             self.device.device.is_cuda(),
             self.preprocessor.nb_max_frames,
         )?;
@@ -836,6 +839,11 @@ fn qwen3_asr_invocation_workspace_bytes(domain: &StateDomainSpec, max_tokens: u6
 
 impl InferenceStateContractProvider for Qwen3AsrModel {
     fn inference_state_contract(&self) -> Result<InferenceStateCapability> {
+        // The forced aligner runs one cacheless forward per request, as its
+        // `ForcedAlignment` adapter declares.
+        if self.is_forced_aligner {
+            return Ok(InferenceStateCapability::Stateless);
+        }
         Ok(InferenceStateCapability::Managed(
             self.managed_inference_state_contract()?,
         ))
@@ -1334,7 +1342,17 @@ impl Qwen3AsrDiagnostics {
 const DEFAULT_TRANSCRIBE_MAX_NEW_TOKENS: usize = 512;
 const ASR_INCREMENTAL_DECODE_RESYNC_TOKENS: usize = 32;
 const QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS: usize = 1_200;
-const QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS: usize = 180;
+/// One forced-alignment window on every backend (D1, as upstream). Its
+/// forward working set is reserved per window by the forced-alignment
+/// envelope; the convolution stem runs by slices and the portable prefill by
+/// query blocks, so the window fits on CPU and Metal as well as CUDA.
+pub(crate) const QWEN3_ALIGNER_MAX_AUDIO_SECONDS: usize = 180;
+/// Alignable words (or CJK characters) one aligner window accepts per second
+/// of audio. Fast speech runs about 5 per second; the bound keeps the prompt
+/// (about 3.5 tokens per word) proportional to the encoded window.
+const QWEN3_ALIGNER_MAX_WORDS_PER_SECOND: f64 = 10.0;
+/// Word allowance for very short windows (a single short utterance).
+const QWEN3_ALIGNER_MIN_WORD_ALLOWANCE: usize = 32;
 const QWEN3_ASR_SAMPLE_RATE: u32 = 16_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1401,9 +1419,8 @@ fn qwen3_asr_resampled_sample_count(
     dst_rate: u32,
 ) -> Result<usize> {
     // Keep this ordering identical to `resample`: an identity conversion does
-    // not inspect rates, and an empty non-identity conversion produces no
-    // samples. Sharing this helper prevents admission geometry from drifting
-    // from the physical front end.
+    // not inspect rates. Sharing this helper prevents admission geometry from
+    // drifting from the physical front end.
     if src_rate == dst_rate {
         return Ok(input_samples);
     }
@@ -1412,14 +1429,11 @@ fn qwen3_asr_resampled_sample_count(
             "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
         )));
     }
-    if input_samples == 0 {
-        return Ok(0);
-    }
-    Ok(((input_samples as u64)
-        .saturating_mul(dst_rate as u64)
-        .checked_div(src_rate as u64)
-        .unwrap_or(0) as usize)
-        .max(1))
+    Ok(crate::audio::target_sample_count(
+        input_samples,
+        src_rate,
+        dst_rate,
+    ))
 }
 
 fn qwen3_asr_mel_frame_count(samples: usize, n_fft: usize, hop_length: usize) -> Result<usize> {
@@ -1443,21 +1457,21 @@ fn qwen3_asr_mel_frame_count(samples: usize, n_fft: usize, hop_length: usize) ->
         .ok_or_else(|| Error::Overloaded("Qwen3 ASR mel frame count overflow".to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The front end's sample and frame counts for `input_samples`. The mel drops
+/// the last centre-padded frame, as [`qwen3_log_mel`] does.
 fn qwen3_asr_frontend_geometry(
     input_samples: usize,
     input_sample_rate: u32,
     output_sample_rate: u32,
     n_fft: usize,
     hop_length: usize,
-    drop_last: bool,
     cuda_device_observed: bool,
     configured_max_frames: usize,
 ) -> Result<Qwen3AsrFrontendGeometry> {
     let resampled_samples =
         qwen3_asr_resampled_sample_count(input_samples, input_sample_rate, output_sample_rate)?;
     let mel_frames_before_drop = qwen3_asr_mel_frame_count(resampled_samples, n_fft, hop_length)?;
-    let mel_last_frame_dropped = drop_last && mel_frames_before_drop > 0;
+    let mel_last_frame_dropped = mel_frames_before_drop > 0;
     let mel_frames_before_truncate =
         mel_frames_before_drop.saturating_sub(usize::from(mel_last_frame_dropped));
     let mel_frames = qwen3_asr_admit_frames(
@@ -1485,18 +1499,41 @@ fn qwen3_asr_effective_max_frames(
     sample_rate: usize,
     hop_length: usize,
 ) -> usize {
-    if !cuda_device_observed {
-        return configured_max_frames;
-    }
     let seconds = if forced_aligner {
-        QWEN3_ALIGNER_CUDA_MAX_AUDIO_SECONDS
-    } else {
+        QWEN3_ALIGNER_MAX_AUDIO_SECONDS
+    } else if cuda_device_observed {
         QWEN3_ASR_CUDA_MAX_AUDIO_SECONDS
+    } else {
+        return configured_max_frames;
     };
     seconds
         .saturating_mul(sample_rate.max(1))
         .checked_div(hop_length.max(1))
         .unwrap_or(0)
+}
+
+/// Whisper log-mel features as `WhisperFeatureExtractor` computes them for
+/// Qwen3-ASR and the forced aligner: the centre-padded STFT without its last
+/// frame, then clamped to `max - 8` and scaled, with the max taken over the
+/// kept frames. Returns frame-major features and their frame count, one
+/// frame per hop of audio (`samples / hop` for an even FFT size).
+fn qwen3_log_mel(mel: &MelSpectrogram, samples: &[f32]) -> Result<(Vec<f32>, usize)> {
+    debug_assert!(!mel.config().normalize);
+    let (mut flat, frames) = mel.compute_flat(samples)?;
+    let kept = frames.saturating_sub(1);
+    flat.truncate(kept * mel.config().n_mels);
+    MelSpectrogram::whisper_normalize_flat(&mut flat);
+    Ok((flat, kept))
+}
+
+/// Most alignable words one aligner window of `audio_seconds` accepts.
+pub(crate) fn qwen3_aligner_max_words(audio_seconds: f64) -> usize {
+    let proportional = if audio_seconds.is_finite() && audio_seconds > 0.0 {
+        (audio_seconds * QWEN3_ALIGNER_MAX_WORDS_PER_SECOND).ceil() as usize
+    } else {
+        0
+    };
+    proportional.max(QWEN3_ALIGNER_MIN_WORD_ALLOWANCE)
 }
 
 fn qwen3_asr_admit_frames(
@@ -1517,14 +1554,19 @@ fn qwen3_asr_admit_frames(
     if maximum == 0 || frames <= maximum {
         return Ok(frames);
     }
-    if cuda_device_observed {
-        let route = if forced_aligner {
-            "forced alignment"
-        } else {
-            "transcription"
-        };
+    // The aligner times the whole reference text against the audio it
+    // encodes, so a truncated mel would squeeze every later word into the
+    // window. Over-limit alignment is rejected on every backend; callers
+    // window the audio by `max_audio_seconds_hint`.
+    if forced_aligner {
         return Err(Error::InvalidInput(format!(
-            "Qwen3 ASR CUDA {route} input has {frames} mel frames, exceeding the explicit {maximum}-frame limit"
+            "Qwen3 forced alignment input has {frames} mel frames, exceeding the {maximum}-frame ({:.1} s) window; split the audio into windows of at most that length",
+            maximum as f64 * hop_length.max(1) as f64 / sample_rate.max(1) as f64
+        )));
+    }
+    if cuda_device_observed {
+        return Err(Error::InvalidInput(format!(
+            "Qwen3 ASR CUDA transcription input has {frames} mel frames, exceeding the explicit {maximum}-frame limit"
         )));
     }
     Ok(maximum)
@@ -1554,20 +1596,13 @@ impl Qwen3AsrModel {
             let config_str = fs::read_to_string(config_path)?;
             serde_json::from_str(&config_str)?
         };
-        let timestamp_token_id = config.timestamp_token_id;
-        let timestamp_segment_time_ms = config.timestamp_segment_time.map(|v| v as u32);
-        let is_forced_aligner = config
-            .thinker_config
-            .model_type
-            .as_deref()
-            .map(|name| name.to_ascii_lowercase().contains("forced_aligner"))
-            .unwrap_or(false)
-            || config.thinker_config.classify_num.is_some();
-        let model_family = if is_forced_aligner {
-            ModelFamily::Qwen3ForcedAligner
-        } else {
-            ModelFamily::Qwen3Asr
-        };
+        let model_family = config.model_family();
+        let is_forced_aligner = model_family == ModelFamily::Qwen3ForcedAligner;
+        let (timestamp_token_id, timestamp_segment_time_ms) = forced_aligner_timestamp_config(
+            is_forced_aligner,
+            config.timestamp_token_id,
+            config.timestamp_segment_time,
+        )?;
 
         let mut text_cfg = config.thinker_config.text_config.clone();
         let inferred_lm_head_size = if let Some(gguf_path) = gguf_path.as_ref() {
@@ -1616,7 +1651,8 @@ impl Qwen3AsrModel {
             n_mels: preprocessor.feature_size.max(1),
             f_min: 0.0,
             f_max: 8_000.0,
-            normalize: true,
+            // Normalized in `qwen3_log_mel`, after the last frame is dropped.
+            normalize: false,
             mel_scale: MelScale::Slaney,
             mel_norm: MelNorm::Slaney,
         };
@@ -1627,8 +1663,7 @@ impl Qwen3AsrModel {
         // stricter around f32 boundaries, so select audio/text dtypes separately.
         let is_gguf = gguf_loader.is_some();
         let checkpoint_format = if is_gguf { "gguf" } else { "safetensors" };
-        let is_quantized =
-            is_gguf || config.quantization.is_some() || config.quantization_config.is_some();
+        let is_quantized = is_gguf || config.is_mlx_quantized();
         if !is_gguf && is_quantized {
             validate_quantization_config(&config)?;
         }
@@ -1651,92 +1686,84 @@ impl Qwen3AsrModel {
         // On Metal a lowered audio or text dtype must pass its own load-time
         // probe, or that component alone reloads in F32 (report 13).
         let check = device.kind.is_metal();
-        let (audio_tower, audio_precision, text_model, text_precision) = if let Some(gguf_path) =
-            gguf_path.as_ref()
-        {
-            let loader = gguf_loader.as_ref().ok_or_else(|| {
-                Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
-            })?;
-            let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
-            let (audio_tower, audio_precision) = load_with_precision_fallback(
-                "Qwen3-ASR audio tower",
-                &audio_selection,
-                check,
-                DType::F32,
-                |audio_dtype| {
-                    let vb_audio = var_builder_from_gguf_filtered(
-                        gguf_path,
-                        audio_dtype,
-                        &device.device,
-                        |name| qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix),
-                    )?;
-                    let vb_audio = if tensor_prefix.is_empty() {
-                        vb_audio
-                    } else {
-                        vb_audio.pp(tensor_prefix)
-                    };
-                    AudioTower::load(audio_cfg.clone(), vb_audio.pp("audio_tower"))
-                },
-                |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, &device.device),
-            )?;
-            let (text_model, text_precision) = load_with_precision_fallback(
-                "Qwen3-ASR text",
-                &text_selection,
-                check,
-                DType::F32,
-                |text_dtype| {
-                    if gguf_qmatmul_text_enabled {
-                        return Qwen3Model::load_gguf_text(
-                            text_cfg.clone(),
-                            loader,
+        let (audio_tower, audio_precision, text_model, text_precision) =
+            if let Some(gguf_path) = gguf_path.as_ref() {
+                let loader = gguf_loader.as_ref().ok_or_else(|| {
+                    Error::ModelLoadError("Qwen ASR GGUF loader missing for GGUF path".to_string())
+                })?;
+                let tensor_prefix = qwen3_asr_gguf_tensor_prefix(loader);
+                load_qwen3_asr_components(
+                    &audio_selection,
+                    &text_selection,
+                    check,
+                    &device.device,
+                    |audio_dtype| {
+                        let vb_audio = var_builder_from_gguf_filtered(
+                            gguf_path,
+                            audio_dtype,
                             &device.device,
+                            |name| qwen3_asr_gguf_audio_tensor_matches(name, tensor_prefix),
+                        )?;
+                        let vb_audio = if tensor_prefix.is_empty() {
+                            vb_audio
+                        } else {
+                            vb_audio.pp(tensor_prefix)
+                        };
+                        AudioTower::load(audio_cfg.clone(), vb_audio.pp("audio_tower"))
+                    },
+                    |text_dtype| {
+                        if gguf_qmatmul_text_enabled {
+                            return Qwen3Model::load_gguf_text(
+                                text_cfg.clone(),
+                                loader,
+                                &device.device,
+                                text_dtype,
+                                tensor_prefix,
+                            );
+                        }
+                        let vb_text = var_builder_from_gguf_filtered(
+                            gguf_path,
                             text_dtype,
-                            tensor_prefix,
-                        );
-                    }
-                    let vb_text = var_builder_from_gguf_filtered(
-                        gguf_path,
-                        text_dtype,
-                        &device.device,
-                        |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
-                    )?;
-                    let vb_text = if tensor_prefix.is_empty() {
-                        vb_text
-                    } else {
-                        vb_text.pp(tensor_prefix)
+                            &device.device,
+                            |name| qwen3_asr_gguf_text_tensor_matches(name, tensor_prefix),
+                        )?;
+                        let vb_text = if tensor_prefix.is_empty() {
+                            vb_text
+                        } else {
+                            vb_text.pp(tensor_prefix)
+                        };
+                        Qwen3Model::load(text_cfg.clone(), vb_text)
+                    },
+                )?
+            } else {
+                let shard_paths = resolve_safetensors_shards(model_dir)?;
+                let var_builder = |dtype: DType| -> Result<VarBuilder<'static>> {
+                    // SAFETY: the mapped shards are read-only checkpoint files.
+                    let vb = unsafe {
+                        staged::metal_synced_safetensors(&shard_paths, dtype, &device.device)?
                     };
-                    Qwen3Model::load(text_cfg.clone(), vb_text)
-                },
-                qwen3_asr_text_self_check,
-            )?;
-            (audio_tower, audio_precision, text_model, text_precision)
-        } else {
-            let (vb_text, vb_audio) = load_safetensors_var_builders(
-                model_dir,
-                &device,
-                text_selection.dtype,
-                audio_selection.dtype,
-            )?;
-            let has_thinker_prefix = vb_text.contains_tensor("thinker.audio_tower.conv2d1.weight");
-            let vb_text = if has_thinker_prefix {
-                vb_text.pp("thinker")
-            } else {
-                vb_text
+                    Ok(
+                        if vb.contains_tensor("thinker.audio_tower.conv2d1.weight") {
+                            vb.pp("thinker")
+                        } else {
+                            vb
+                        },
+                    )
+                };
+                load_qwen3_asr_components(
+                    &audio_selection,
+                    &text_selection,
+                    check,
+                    &device.device,
+                    |audio_dtype| {
+                        AudioTower::load(
+                            audio_cfg.clone(),
+                            var_builder(audio_dtype)?.pp("audio_tower"),
+                        )
+                    },
+                    |text_dtype| Qwen3Model::load(text_cfg.clone(), var_builder(text_dtype)?),
+                )?
             };
-            let vb_audio = if has_thinker_prefix {
-                vb_audio.pp("thinker")
-            } else {
-                vb_audio
-            };
-            let audio_tower = AudioTower::load(audio_cfg, vb_audio.pp("audio_tower"))?;
-            let text_model = Qwen3Model::load(text_cfg, vb_text)?;
-            (
-                audio_tower,
-                PrecisionLoad::unchecked(&audio_selection),
-                text_model,
-                PrecisionLoad::unchecked(&text_selection),
-            )
-        };
         let (audio_dtype, text_dtype) = (audio_precision.loaded, text_precision.loaded);
 
         info!(
@@ -1868,8 +1895,10 @@ impl Qwen3AsrModel {
             self.mel.config().hop_length,
         );
         if maximum_frames > 0 {
-            let hop = self.mel.config().hop_length.max(1) as f32;
-            return Some(maximum_frames as f32 * hop / sample_rate);
+            // One mel frame per hop of audio: the window is exactly the frame
+            // limit's audio (180 s for the aligner).
+            let hop = self.mel.config().hop_length.max(1);
+            return Some(maximum_frames as f32 * hop as f32 / sample_rate);
         }
         if self.preprocessor.n_samples > 0 {
             return Some(self.preprocessor.n_samples as f32 / sample_rate);
@@ -1911,7 +1940,6 @@ impl Qwen3AsrModel {
             QWEN3_ASR_SAMPLE_RATE,
             mel.n_fft,
             mel.hop_length,
-            qwen_asr_drop_last_mel_frame(),
             self.device.device.is_cuda(),
             self.preprocessor.nb_max_frames,
         )?;
@@ -2189,7 +2217,6 @@ impl Qwen3AsrModel {
 
         let mel_config = self.mel.config();
         let n_mels = mel_config.n_mels;
-        let drop_last = qwen_asr_drop_last_mel_frame();
         let mut host_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let geometry = qwen3_asr_frontend_geometry(
@@ -2198,7 +2225,6 @@ impl Qwen3AsrModel {
                 QWEN3_ASR_SAMPLE_RATE,
                 mel_config.n_fft,
                 mel_config.hop_length,
-                drop_last,
                 self.device.device.is_cuda(),
                 self.preprocessor.nb_max_frames,
             )?;
@@ -2222,11 +2248,11 @@ impl Qwen3AsrModel {
             }
 
             let mel_started = Instant::now();
-            let (mut flat, actual_frames) = self.mel.compute_flat(&resampled)?;
-            if actual_frames != geometry.mel_frames_before_drop {
+            let (mut flat, actual_frames) = qwen3_log_mel(&self.mel, &resampled)?;
+            if actual_frames != geometry.mel_frames_before_truncate {
                 return Err(Error::InferenceError(format!(
                     "Qwen3 ASR mel geometry drifted: predicted={}, actual={actual_frames}",
-                    geometry.mel_frames_before_drop
+                    geometry.mel_frames_before_truncate
                 )));
             }
             flat.truncate(
@@ -2732,57 +2758,87 @@ impl Qwen3AsrModel {
             })
     }
 
-    /// Forced alignment: align reference text with audio timestamps.
-    /// Returns a vector of (word, start_time_ms, end_time_ms) tuples.
+    /// Forced alignment of `reference_text`, split into word units for
+    /// `language` ([`alignment_units`]). Returns each unit's source text,
+    /// punctuation included, with its start and end in milliseconds.
     pub fn force_align(
         &self,
         audio: &[f32],
         sample_rate: u32,
         reference_text: &str,
-        _language: Option<&str>,
+        language: Option<&str>,
     ) -> Result<Vec<(String, u32, u32)>> {
+        let units = alignment_units(reference_text, language);
+        let timings = self.force_align_units(audio, sample_rate, &units)?;
+        Ok(units
+            .iter()
+            .zip(timings)
+            .map(|(unit, (start, end))| (unit.surface(reference_text).to_string(), start, end))
+            .collect())
+    }
+
+    /// Forced alignment of word units: one `(start_ms, end_ms)` per unit,
+    /// the reference's values (`parse_timestamp`). Words may have
+    /// `start == end`, and nothing replaces implausible timings: callers that
+    /// want a fallback check the timings themselves and say so.
+    pub fn force_align_units(
+        &self,
+        audio: &[f32],
+        sample_rate: u32,
+        units: &[AlignmentUnit],
+    ) -> Result<Vec<(u32, u32)>> {
         if !self.is_forced_aligner {
             return Err(Error::InvalidInput(
                 "Forced alignment requires a Qwen3-ForcedAligner model; Qwen3 ASR does not expose an autoregressive alignment capability"
                     .to_string(),
             ));
         }
-        self.force_align_with_nar_head(audio, sample_rate, reference_text)
+        self.force_align_with_nar_head(audio, sample_rate, units)
     }
 
     fn force_align_with_nar_head(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        reference_text: &str,
-    ) -> Result<Vec<(String, u32, u32)>> {
+        units: &[AlignmentUnit],
+    ) -> Result<Vec<(u32, u32)>> {
         let audio = if sample_rate != 16_000 {
             resample(audio, sample_rate, 16_000)?
         } else {
             audio.to_vec()
         };
 
-        let mut mel_spec = self.mel.compute(&audio)?;
-        let admitted_frames = qwen3_asr_admit_frames(
-            mel_spec.len(),
+        if units.is_empty() {
+            return Err(Error::InvalidInput(
+                "Reference text produced no alignable words".to_string(),
+            ));
+        }
+        let words = units
+            .iter()
+            .map(|unit| unit.text.clone())
+            .collect::<Vec<_>>();
+        let audio_seconds = audio.len() as f64 / f64::from(QWEN3_ASR_SAMPLE_RATE);
+        let max_words = qwen3_aligner_max_words(audio_seconds);
+        if words.len() > max_words {
+            return Err(Error::InvalidInput(format!(
+                "Forced alignment text has {} words for {audio_seconds:.1} s of audio; one window aligns at most {max_words}",
+                words.len()
+            )));
+        }
+
+        let (flat, frames) = qwen3_log_mel(&self.mel, &audio)?;
+        qwen3_asr_admit_frames(
+            frames,
             self.device.device.is_cuda(),
             true,
             self.preprocessor.nb_max_frames,
             self.mel.config().sample_rate,
             self.mel.config().hop_length,
         )?;
-        mel_spec.truncate(admitted_frames);
-
-        let n_mels = self.mel.config().n_mels;
-        if mel_spec.is_empty() {
+        if frames == 0 {
             return Err(Error::InvalidInput("Empty audio input".to_string()));
         }
-
-        let frames = mel_spec.len();
-        let mut flat = Vec::with_capacity(frames * n_mels);
-        for frame in mel_spec.iter() {
-            flat.extend_from_slice(frame);
-        }
+        let n_mels = self.mel.config().n_mels;
 
         let mel = Tensor::from_vec(flat, (frames, n_mels), &self.device.device)?
             .transpose(0, 1)?
@@ -2796,13 +2852,6 @@ impl Qwen3AsrModel {
             audio_embeds = audio_embeds.to_dtype(self.text_dtype)?;
         }
         let audio_len = audio_embeds.dim(1)?;
-
-        let words = extract_alignment_words(reference_text);
-        if words.is_empty() {
-            return Err(Error::InvalidInput(
-                "Reference text produced no alignable words".to_string(),
-            ));
-        }
 
         let prompt = self.build_forced_aligner_prompt(audio_len, &words)?;
         let timestamp_positions: Vec<usize> = prompt
@@ -2823,49 +2872,26 @@ impl Qwen3AsrModel {
             &self.device.device,
         )?;
 
-        let logits = self.forward_with_audio(
+        let logits = self.timestamp_logits(
             &input_ids,
             &audio_embeds,
             prompt.audio_pad_start,
             prompt.audio_pad_len,
+            &timestamp_positions,
         )?;
 
-        let segment_time_ms = self.timestamp_segment_time_ms.unwrap_or(20).max(1);
-        let timestamp_ms = batched_timestamp_argmax(&logits, &timestamp_positions)?
-            .into_iter()
-            .map(|cls_idx| cls_idx.saturating_mul(segment_time_ms))
-            .collect::<Vec<_>>();
-
-        let mut fixed = fix_timestamp_sequence(&timestamp_ms);
-        let required = words.len().saturating_mul(2);
-        if fixed.len() < required {
-            let fill = fixed.last().copied().unwrap_or(0);
-            fixed.resize(required, fill);
+        let segment_time_ms = self.timestamp_segment_time_ms.ok_or_else(|| {
+            Error::InvalidInput("Forced aligner model has no timestamp_segment_time".to_string())
+        })?;
+        let classes = timestamp_argmax(&logits, &timestamp_positions)?;
+        if classes.len() != words.len() * 2 {
+            return Err(Error::InferenceError(format!(
+                "Forced aligner prompt has {} timestamp markers for {} words",
+                classes.len(),
+                words.len()
+            )));
         }
-
-        let mut alignments = Vec::with_capacity(words.len());
-        for (idx, word) in words.iter().enumerate() {
-            let start = fixed.get(idx * 2).copied().unwrap_or(0);
-            let mut end = fixed
-                .get(idx * 2 + 1)
-                .copied()
-                .unwrap_or_else(|| start.saturating_add(segment_time_ms));
-            if end <= start {
-                end = start.saturating_add(1);
-            }
-            alignments.push((word.clone(), start, end));
-        }
-
-        let audio_duration_ms = ((audio.len() as f32 / 16_000.0) * 1000.0).round() as u32;
-        normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        if alignment_distribution_is_degenerate(&alignments, audio_duration_ms) {
-            warn!(
-                "Forced aligner produced degenerate timestamp distribution; falling back to interval-based alignment"
-            );
-            alignments = distribute_words_over_interval(&words, 0, audio_duration_ms.max(1));
-            normalize_alignment_bounds(&mut alignments, audio_duration_ms);
-        }
-        Ok(alignments)
+        Ok(reference_word_timings(&classes, segment_time_ms))
     }
 
     fn build_forced_aligner_prompt(
@@ -2910,12 +2936,15 @@ impl Qwen3AsrModel {
         decode_raw_asr_output(&self.tokenizer, &self.specials, tokens)
     }
 
-    fn forward_with_audio(
+    /// The aligner's classifier logits at the prompt's timestamp rows only,
+    /// `[1, timestamp_positions.len(), classes]` (QFA-9).
+    fn timestamp_logits(
         &self,
         input_ids: &Tensor,
         audio_embeds: &Tensor,
         audio_pad_start: usize,
         audio_pad_len: usize,
+        timestamp_positions: &[usize],
     ) -> Result<Tensor> {
         let (embeds, position_ids) = self.prepare_audio_prompt_embeddings(
             input_ids,
@@ -2923,8 +2952,12 @@ impl Qwen3AsrModel {
             audio_pad_start,
             audio_pad_len,
         )?;
-        self.text_model
-            .forward_stateless_with_embeds(&embeds, 0, position_ids.as_ref())
+        self.text_model.forward_stateless_rows_with_embeds(
+            &embeds,
+            0,
+            position_ids.as_ref(),
+            timestamp_positions,
+        )
     }
 
     fn prepare_audio_prompt_embeddings(
@@ -3222,159 +3255,6 @@ fn batched_decode_argmax(output: &Tensor) -> Result<Vec<u32>> {
         .map_err(Error::from)
 }
 
-fn extract_alignment_words(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    let flush = |buffer: &mut String, out: &mut Vec<String>| {
-        if buffer.is_empty() {
-            return;
-        }
-        out.push(buffer.clone());
-        buffer.clear();
-    };
-
-    for ch in text.chars() {
-        if is_east_asian_char(ch) {
-            flush(&mut current, &mut words);
-            words.push(ch.to_string());
-            continue;
-        }
-
-        if is_alignment_word_char(ch) {
-            current.push(ch);
-        } else {
-            flush(&mut current, &mut words);
-        }
-    }
-    flush(&mut current, &mut words);
-
-    words
-}
-
-fn is_alignment_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '\'' || ch == '-'
-}
-
-fn is_east_asian_char(ch: char) -> bool {
-    let code = ch as u32;
-    (0x4E00..=0x9FFF).contains(&code)
-        || (0x3400..=0x4DBF).contains(&code)
-        || (0x20000..=0x2A6DF).contains(&code)
-        || (0x2A700..=0x2B73F).contains(&code)
-        || (0x2B740..=0x2B81F).contains(&code)
-        || (0x2B820..=0x2CEAF).contains(&code)
-        || (0xF900..=0xFAFF).contains(&code)
-        || (0x3040..=0x309F).contains(&code) // Hiragana
-        || (0x30A0..=0x30FF).contains(&code) // Katakana
-        || (0xAC00..=0xD7AF).contains(&code) // Hangul syllables
-        || (0x1100..=0x11FF).contains(&code) // Hangul Jamo
-        || (0x3130..=0x318F).contains(&code) // Hangul Compatibility Jamo
-}
-
-fn distribute_words_over_interval(
-    words: &[String],
-    start_ms: u32,
-    end_ms: u32,
-) -> Vec<(String, u32, u32)> {
-    if words.is_empty() {
-        return Vec::new();
-    }
-
-    let start = start_ms.min(end_ms);
-    let mut end = end_ms.max(start.saturating_add(1));
-    let min_span = words.len() as u32;
-    if end.saturating_sub(start) < min_span {
-        end = start.saturating_add(min_span);
-    }
-
-    let span = end.saturating_sub(start).max(1);
-    let step = span as f32 / words.len() as f32;
-
-    words
-        .iter()
-        .enumerate()
-        .map(|(idx, word)| {
-            let ws = start.saturating_add((idx as f32 * step).floor() as u32);
-            let mut we = if idx + 1 == words.len() {
-                end
-            } else {
-                start.saturating_add(((idx + 1) as f32 * step).floor() as u32)
-            };
-            if we <= ws {
-                we = ws.saturating_add(1);
-            }
-            (word.clone(), ws, we)
-        })
-        .collect()
-}
-
-fn normalize_alignment_bounds(alignments: &mut [(String, u32, u32)], audio_duration_ms: u32) {
-    if alignments.is_empty() {
-        return;
-    }
-
-    let max_end = audio_duration_ms.max(1);
-    let mut cursor = 0u32;
-
-    for (_, start, end) in alignments.iter_mut() {
-        let mut s = (*start).min(max_end.saturating_sub(1));
-        let mut e = (*end).min(max_end);
-
-        if s < cursor {
-            s = cursor;
-        }
-        if e <= s {
-            e = s.saturating_add(1).min(max_end);
-        }
-        if e <= s {
-            // audio may be fully exhausted; preserve monotonic order with best effort.
-            s = max_end.saturating_sub(1);
-            e = max_end;
-        }
-
-        *start = s;
-        *end = e;
-        cursor = e;
-    }
-}
-
-fn alignment_distribution_is_degenerate(
-    alignments: &[(String, u32, u32)],
-    audio_duration_ms: u32,
-) -> bool {
-    if alignments.is_empty() {
-        return true;
-    }
-    if alignments.len() < 8 {
-        return false;
-    }
-
-    let audio_duration_ms = audio_duration_ms.max(1);
-    let tail_start = audio_duration_ms.saturating_sub(250);
-    let mut min_start = u32::MAX;
-    let mut max_end = 0u32;
-    let mut tiny_spans = 0usize;
-    let mut tail_heavy = 0usize;
-
-    for (_, start, end) in alignments {
-        min_start = min_start.min((*start).min(audio_duration_ms));
-        max_end = max_end.max((*end).min(audio_duration_ms));
-        if *end <= start.saturating_add(1) {
-            tiny_spans += 1;
-        }
-        if *start >= tail_start {
-            tail_heavy += 1;
-        }
-    }
-
-    let span = max_end.saturating_sub(min_start);
-    let len = alignments.len();
-    tiny_spans * 10 >= len * 8
-        || tail_heavy * 10 >= len * 8
-        || span <= (audio_duration_ms / 20).max(1)
-}
-
 /// The thinker dtype hint a GGUF checkpoint implies: the published GGUFs are
 /// converted from BF16 weights and carry no dtype of their own.
 pub(crate) const QWEN3_ASR_GGUF_CHECKPOINT_DTYPE: &str = "bf16";
@@ -3622,18 +3502,51 @@ fn infer_downsample_hidden_size(loader: &GgufLoader) -> Result<usize> {
     ))
 }
 
-fn load_safetensors_var_builders(
-    model_dir: &Path,
-    device: &DeviceProfile,
-    text_dtype: DType,
-    audio_dtype: DType,
-) -> Result<(VarBuilder<'static>, VarBuilder<'static>)> {
-    let shard_paths = resolve_safetensors_shards(model_dir)?;
-    let vb_text =
-        unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, text_dtype, &device.device)? };
-    let vb_audio =
-        unsafe { VarBuilder::from_mmaped_safetensors(&shard_paths, audio_dtype, &device.device)? };
-    Ok((vb_text, vb_audio))
+/// The audio tower and the text model, each read at its selected dtype by
+/// `load_audio` / `load_text`. With `check` (Metal), a dtype below F32 must
+/// pass that component's load-time probe, or the component alone reloads in
+/// F32 (report 13), for GGUF and safetensors checkpoints alike. Admission
+/// prices the selected dtypes, so a reload first synchronizes the device
+/// (Candle frees the dropped component's buffers only then) and asks the
+/// load's [`admit_precision_reload`] gate for its memory.
+fn load_qwen3_asr_components(
+    audio_selection: &DTypeSelection,
+    text_selection: &DTypeSelection,
+    check: bool,
+    device: &candle_core::Device,
+    mut load_audio: impl FnMut(DType) -> Result<AudioTower>,
+    mut load_text: impl FnMut(DType) -> Result<Qwen3Model>,
+) -> Result<(AudioTower, PrecisionLoad, Qwen3Model, PrecisionLoad)> {
+    let admit_reload = |label: &str, selected: DType, dtype: DType| -> Result<()> {
+        if dtype != selected {
+            device.synchronize()?;
+            admit_precision_reload(label, dtype)?;
+        }
+        Ok(())
+    };
+    let (audio_tower, audio_precision) = load_with_precision_fallback(
+        "Qwen3-ASR audio tower",
+        audio_selection,
+        check,
+        DType::F32,
+        |dtype| {
+            admit_reload("audio tower", audio_selection.dtype, dtype)?;
+            load_audio(dtype)
+        },
+        |tower| qwen3_asr_audio_self_check(tower, audio_selection.dtype, device),
+    )?;
+    let (text_model, text_precision) = load_with_precision_fallback(
+        "Qwen3-ASR text",
+        text_selection,
+        check,
+        DType::F32,
+        |dtype| {
+            admit_reload("text", text_selection.dtype, dtype)?;
+            load_text(dtype)
+        },
+        qwen3_asr_text_self_check,
+    )?;
+    Ok((audio_tower, audio_precision, text_model, text_precision))
 }
 
 fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -3670,6 +3583,54 @@ fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>> {
         )));
     }
     Ok(vec![weights_path])
+}
+
+/// How [`Qwen3AsrModel::load`] reads a safetensors checkpoint: the shards,
+/// the text and audio-tower dtypes it resolves on the device, and the bit width
+/// of MLX-packed weights. Load admission prices the checkpoint with it
+/// (`runtime/lifecycle/asr_memory.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Qwen3AsrSafetensorsLoad {
+    pub(crate) shards: Vec<PathBuf>,
+    pub(crate) text_dtype: DType,
+    pub(crate) audio_dtype: DType,
+    /// Bits per packed element of an MLX-quantized checkpoint, as its config
+    /// names them.
+    pub(crate) mlx_bits: Option<u64>,
+}
+
+/// [`Qwen3AsrSafetensorsLoad`] for the checkpoint in `model_dir` on `device`,
+/// or `None` when the loader would read a GGUF checkpoint instead or the
+/// config or weights are missing (the loader reports those).
+pub(crate) fn qwen3_asr_safetensors_load(
+    model_dir: &Path,
+    variant: ModelVariant,
+    device: &DeviceProfile,
+) -> Result<Option<Qwen3AsrSafetensorsLoad>> {
+    let config_path = model_dir.join("config.json");
+    if resolve_qwen_asr_gguf_path(model_dir, variant).is_some() || !config_path.is_file() {
+        return Ok(None);
+    }
+    let config: Qwen3AsrConfig = serde_json::from_str(&fs::read_to_string(config_path)?)?;
+    let shards = match resolve_safetensors_shards(model_dir) {
+        Ok(shards) => shards,
+        Err(Error::ModelNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let quantized = config.is_mlx_quantized();
+    let (text_dtype, audio_dtype) = qwen3_asr_weight_dtypes(
+        device,
+        config.model_family(),
+        false,
+        quantized,
+        config.thinker_config.dtype.as_deref(),
+    )?;
+    Ok(Some(Qwen3AsrSafetensorsLoad {
+        shards,
+        text_dtype,
+        audio_dtype,
+        mlx_bits: if quantized { config.mlx_bits() } else { None },
+    }))
 }
 
 /// The text and audio-tower weight dtypes the Qwen3-ASR loader selects on
@@ -3722,6 +3683,18 @@ fn qwen3_asr_weight_precisions(
             requested, selected.dtype, device.kind
         );
         selected
+    } else if device.kind.is_metal()
+        && model_family == ModelFamily::Qwen3ForcedAligner
+        && MetalDTypeOverride::from_env() != MetalDTypeOverride::F32
+    {
+        // D8: the aligner reads one 80 ms timestamp class per boundary and
+        // never decodes, so F16 text moved no boundary on test.wav or a 175 s
+        // cut against F32 (Metal, 2026-10-15) and halves its residency. The
+        // load-time probe reloads the text at F32 if F16 fails.
+        DTypeSelection {
+            dtype: DType::F16,
+            reason: "Metal runs dense aligner text at F16 behind the load-time probe".into(),
+        }
     } else if device.kind.is_metal() {
         // This Qwen speech-family text decode path can drift badly on Metal in fp16 on longer
         // utterances. Prefer f32 unless the user explicitly overrides it.
@@ -4026,7 +3999,54 @@ fn tensor_shape_from_safetensors_header(
     Ok(Some(dims))
 }
 
-fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
+/// The forced aligner's timestamp token and the milliseconds one timestamp
+/// class stands for. The reference reads both from the config
+/// (`Qwen3ForcedAligner.__init__`), so an aligner checkpoint without them is
+/// refused instead of timed with a guessed class length. `(None, None)` for
+/// Qwen3-ASR.
+fn forced_aligner_timestamp_config(
+    is_forced_aligner: bool,
+    timestamp_token_id: Option<u32>,
+    timestamp_segment_time: Option<usize>,
+) -> Result<(Option<u32>, Option<u32>)> {
+    if !is_forced_aligner {
+        return Ok((None, None));
+    }
+    let token = timestamp_token_id.ok_or_else(|| {
+        Error::ModelLoadError("Forced aligner config has no timestamp_token_id".to_string())
+    })?;
+    let segment_ms = timestamp_segment_time
+        .filter(|ms| *ms > 0)
+        .and_then(|ms| u32::try_from(ms).ok())
+        .ok_or_else(|| {
+            Error::ModelLoadError(
+                "Forced aligner config has no positive timestamp_segment_time".to_string(),
+            )
+        })?;
+    Ok((Some(token), Some(segment_ms)))
+}
+
+/// The reference `parse_timestamp`: each timestamp class times the segment
+/// time, repaired by `fix_timestamp`, as one `(start_ms, end_ms)` per word
+/// (two classes per word). The values are returned as they are: a word may
+/// have `start == end`.
+fn reference_word_timings(classes: &[u32], segment_time_ms: u32) -> Vec<(u32, u32)> {
+    let timestamps = classes
+        .iter()
+        .map(|class| f64::from(*class) * f64::from(segment_time_ms))
+        .collect::<Vec<_>>();
+    fix_timestamp_sequence(&timestamps)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[start, end]| (start, end))
+        .collect()
+}
+
+/// The reference `fix_timestamp`: keep the longest non-decreasing
+/// subsequence and repair the rest from its neighbours, in Python float
+/// arithmetic, truncating like `int()`.
+fn fix_timestamp_sequence(data: &[f64]) -> Vec<u32> {
     let n = data.len();
     if n == 0 {
         return Vec::new();
@@ -4063,7 +4083,7 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
         is_normal[idx] = true;
     }
 
-    let mut result: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+    let mut result = data.to_vec();
     let mut i = 0usize;
     while i < n {
         if is_normal[i] {
@@ -4104,9 +4124,9 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
 
             match (left_val, right_val) {
                 (Some(left), Some(right)) => {
-                    let step = (right - left) / (anomaly_count as f32 + 1.0);
+                    let step = (right - left) / (anomaly_count as f64 + 1.0);
                     for (offset, value) in result[i..j].iter_mut().enumerate() {
-                        *value = left + step * (offset as f32 + 1.0);
+                        *value = left + step * (offset as f64 + 1.0);
                     }
                 }
                 (Some(left), None) => {
@@ -4133,11 +4153,7 @@ fn fix_timestamp_sequence(data: &[u32]) -> Vec<u32> {
 }
 
 fn validate_quantization_config(config: &Qwen3AsrConfig) -> Result<()> {
-    let quant = config
-        .quantization_config
-        .as_ref()
-        .or(config.quantization.as_ref());
-    let Some(quant) = quant else {
+    let Some(quant) = config.mlx_quantization() else {
         return Ok(());
     };
 
@@ -4545,239 +4561,11 @@ fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
     false
 }
 
-fn qwen_asr_drop_last_mel_frame() -> bool {
-    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
-        crate::env::flag_or("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME", false)
-    });
-    ENABLED.get()
-}
-
-fn apply_qwen_mel_frame_policy(mel_spec: &mut Vec<Vec<f32>>, drop_last: bool) -> bool {
-    if drop_last && !mel_spec.is_empty() {
-        mel_spec.pop();
-        return true;
-    }
-    false
-}
-
+/// The canonical resampler (soxr HQ response), so a direct caller at
+/// another rate gets the front end production audio gets (QFA-4).
 fn resample(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    let out_len = qwen3_asr_resampled_sample_count(audio.len(), src_rate, dst_rate)?;
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if out_len == 0 {
-        return Ok(Vec::new());
-    }
-    let kernel = cached_resample_kernel(src_rate, dst_rate);
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let numerator = (i as u128) * (src_rate as u128);
-        let center = (numerator / (dst_rate as u128)) as isize;
-        let phase_idx = ((numerator % (dst_rate as u128)) / (kernel.gcd as u128)) as usize;
-        let phase = &kernel.phases[phase_idx];
-        let sample_start = center - RESAMPLE_SINC_HALF + 1;
-
-        if sample_start >= 0
-            && sample_start + RESAMPLE_SINC_TAPS as isize <= audio.len() as isize
-            && phase.weight_sum.abs() > 1e-9
-        {
-            let base = sample_start as usize;
-            let mut acc = 0.0f64;
-            for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
-                acc += audio[base + tap_idx] as f64 * coeff;
-            }
-            out.push((acc / phase.weight_sum) as f32);
-            continue;
-        }
-
-        let mut acc = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for (tap_idx, coeff) in phase.coeffs.iter().copied().enumerate() {
-            let j = sample_start + tap_idx as isize;
-            if let Some(sample) = (j >= 0)
-                .then_some(j as usize)
-                .and_then(|idx| audio.get(idx))
-            {
-                acc += *sample as f64 * coeff;
-                weight_sum += coeff;
-            }
-        }
-
-        out.push(if weight_sum.abs() > 1e-9 {
-            (acc / weight_sum) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(out)
-}
-
-const RESAMPLE_SINC_HALF: isize = 16;
-const RESAMPLE_SINC_TAPS: usize = (RESAMPLE_SINC_HALF as usize) * 2;
-const RESAMPLE_KAISER_BETA: f64 = 6.0;
-
-struct ResamplePhase {
-    coeffs: [f64; RESAMPLE_SINC_TAPS],
-    weight_sum: f64,
-}
-
-struct ResampleKernel {
-    gcd: u32,
-    phases: Vec<ResamplePhase>,
-}
-
-fn cached_resample_kernel(src_rate: u32, dst_rate: u32) -> Arc<ResampleKernel> {
-    static CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<ResampleKernel>>>> = OnceLock::new();
-
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(kernel) = guard.get(&(src_rate, dst_rate)) {
-            return Arc::clone(kernel);
-        }
-    }
-
-    let kernel = Arc::new(ResampleKernel::new(src_rate, dst_rate));
-    if let Ok(mut guard) = cache.lock() {
-        Arc::clone(
-            guard
-                .entry((src_rate, dst_rate))
-                .or_insert_with(|| Arc::clone(&kernel)),
-        )
-    } else {
-        kernel
-    }
-}
-
-impl ResampleKernel {
-    fn new(src_rate: u32, dst_rate: u32) -> Self {
-        // Antirez/qwen-asr uses a bounded windowed-sinc resampler with a Kaiser
-        // window for anti-aliasing when downsampling. Coefficients depend only
-        // on the rational source/destination phase, so cache the polyphase table
-        // and keep the sample-edge renormalization in the hot loop.
-        let gcd = gcd_u32(src_rate, dst_rate);
-        let period = (dst_rate / gcd) as usize;
-        let cutoff = (dst_rate as f64 / src_rate as f64).min(1.0);
-        let inv_i0_beta = 1.0 / bessel_i0(RESAMPLE_KAISER_BETA);
-        let mut phases = Vec::with_capacity(period);
-
-        for phase_idx in 0..period {
-            let frac = phase_idx as f64 / period as f64;
-            let mut coeffs = [0.0f64; RESAMPLE_SINC_TAPS];
-            for (tap_idx, coeff) in coeffs.iter_mut().enumerate() {
-                let offset = tap_idx as isize - RESAMPLE_SINC_HALF + 1;
-                let d = offset as f64 - frac;
-                *coeff = sinc(d * cutoff)
-                    * kaiser_window(
-                        d,
-                        RESAMPLE_SINC_HALF as f64,
-                        RESAMPLE_KAISER_BETA,
-                        inv_i0_beta,
-                    )
-                    * cutoff;
-            }
-            let weight_sum = coeffs.iter().copied().sum();
-            phases.push(ResamplePhase { coeffs, weight_sum });
-        }
-
-        Self { gcd, phases }
-    }
-}
-
-fn gcd_u32(mut lhs: u32, mut rhs: u32) -> u32 {
-    while rhs != 0 {
-        let rem = lhs % rhs;
-        lhs = rhs;
-        rhs = rem;
-    }
-    lhs
-}
-
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-9 {
-        1.0
-    } else {
-        let pix = std::f64::consts::PI * x;
-        pix.sin() / pix
-    }
-}
-
-fn kaiser_window(distance: f64, half_width: f64, beta: f64, inv_i0_beta: f64) -> f64 {
-    let normalized = distance / half_width;
-    if normalized <= -1.0 || normalized >= 1.0 {
-        return 0.0;
-    }
-    let inner = (1.0 - normalized * normalized).max(0.0).sqrt();
-    bessel_i0(beta * inner) * inv_i0_beta
-}
-
-fn bessel_i0(x: f64) -> f64 {
-    let mut sum = 1.0;
-    let mut term = 1.0;
-    let xx = x * x;
-    for k in 1..=20 {
-        let k = k as f64;
-        term *= xx / (4.0 * k * k);
-        sum += term;
-    }
-    sum
-}
-
-#[cfg(test)]
-fn resample_reference(audio: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>> {
-    if src_rate == dst_rate {
-        return Ok(audio.to_vec());
-    }
-    if src_rate == 0 || dst_rate == 0 {
-        return Err(Error::InvalidInput(format!(
-            "Invalid sample rate for resampling: {src_rate} -> {dst_rate}"
-        )));
-    }
-    if audio.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ratio = dst_rate as f64 / src_rate as f64;
-    let cutoff = ratio.min(1.0);
-    let out_len = ((audio.len() as u64)
-        .saturating_mul(dst_rate as u64)
-        .checked_div(src_rate as u64)
-        .unwrap_or(0) as usize)
-        .max(1);
-    let inv_i0_beta = 1.0 / bessel_i0(RESAMPLE_KAISER_BETA);
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f64 / ratio;
-        let center = src_pos.floor() as isize;
-        let mut acc = 0.0f64;
-        let mut weight_sum = 0.0f64;
-
-        for j in (center - RESAMPLE_SINC_HALF + 1)..=(center + RESAMPLE_SINC_HALF) {
-            let d = j as f64 - src_pos;
-            let coeff = sinc(d * cutoff)
-                * kaiser_window(
-                    d,
-                    RESAMPLE_SINC_HALF as f64,
-                    RESAMPLE_KAISER_BETA,
-                    inv_i0_beta,
-                )
-                * cutoff;
-            if let Some(sample) = (j >= 0)
-                .then_some(j as usize)
-                .and_then(|idx| audio.get(idx))
-            {
-                acc += *sample as f64 * coeff;
-                weight_sum += coeff;
-            }
-        }
-
-        out.push(if weight_sum.abs() > 1e-9 {
-            (acc / weight_sum) as f32
-        } else {
-            0.0
-        });
-    }
-    Ok(out)
+    qwen3_asr_resampled_sample_count(audio.len(), src_rate, dst_rate)?;
+    crate::audio::resample_mono_high_quality(audio, src_rate, dst_rate)
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {
@@ -4845,29 +4633,34 @@ fn collect_stop_token_ids(specials: &SpecialTokenIds) -> Vec<u32> {
     stop_ids
 }
 
-fn batched_timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<u32>> {
+/// The class of each timestamp row. `logits` holds one row per entry of
+/// `positions` (the prompt positions they were scored at, for errors).
+fn timestamp_argmax(logits: &Tensor, positions: &[usize]) -> Result<Vec<u32>> {
     if positions.is_empty() {
         return Ok(Vec::new());
     }
     let dims = logits.dims();
-    if dims.len() != 3 || dims[0] != 1 {
+    if dims.len() != 3 || dims[0] != 1 || dims[1] != positions.len() {
         return Err(Error::InferenceError(format!(
-            "Forced aligner timestamp argmax expects logits shape [1, seq, classes], got {dims:?}"
+            "Forced aligner timestamp argmax expects logits shape [1, {}, classes], got {dims:?}",
+            positions.len()
         )));
     }
-    let seq_len = dims[1];
-    let mut position_ids = Vec::with_capacity(positions.len());
-    for &position in positions {
-        if position >= seq_len {
-            return Err(Error::InferenceError(format!(
-                "Forced aligner timestamp position {position} is out of range for sequence length {seq_len}"
-            )));
-        }
-        position_ids.push(position as i64);
+    let token_logits = logits.i(0)?;
+    // A NaN row argmaxes to class 0, which would read as a fabricated 0 ms
+    // timestamp; a device fault must surface as an error instead.
+    let rows = token_logits.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    if let Some(row) = rows
+        .iter()
+        .position(|row| row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(Error::InferenceError(format!(
+            "Forced aligner produced non-finite timestamp logits at prompt position {} \
+             (timestamp {row} of {})",
+            positions[row],
+            positions.len()
+        )));
     }
-
-    let positions = Tensor::from_vec(position_ids, (positions.len(),), logits.device())?;
-    let token_logits = logits.i(0)?.index_select(&positions, 0)?;
     let indices = token_logits.argmax(D::Minus1)?.to_dtype(DType::U32)?;
     indices.to_vec1::<u32>().map_err(Error::from)
 }
@@ -5019,8 +4812,77 @@ mod tests {
         assert!(error.to_string().contains("context conflict"));
         assert!(error.to_string().contains("Qwen/Qwen3-ASR-0.6B"));
     }
+    /// D1: one 180 s aligner window on every backend, rejected (not
+    /// truncated) above it; the configured 30 s ASR frame count no longer
+    /// bounds the aligner on CPU/Metal.
     #[test]
-    fn cuda_audio_limits_expand_without_changing_portable_truncation() {
+    fn forced_aligner_takes_one_180_s_window_on_every_backend() {
+        let configured = 3_000;
+        for cuda in [false, true] {
+            assert_eq!(
+                qwen3_asr_effective_max_frames(cuda, true, configured, 16_000, 160),
+                18_000
+            );
+            assert_eq!(
+                qwen3_asr_admit_frames(3_001, cuda, true, configured, 16_000, 160).unwrap(),
+                3_001
+            );
+            assert_eq!(
+                qwen3_asr_admit_frames(18_000, cuda, true, configured, 16_000, 160).unwrap(),
+                18_000
+            );
+            let error = qwen3_asr_admit_frames(18_001, cuda, true, configured, 16_000, 160)
+                .expect_err("the aligner must reject, not truncate, over-limit audio");
+            assert!(matches!(error, Error::InvalidInput(_)), "{error}");
+            assert!(error.to_string().contains("180.0 s"), "{error}");
+        }
+    }
+
+    /// With the last centre-padded frame dropped, 180.0 s encodes exactly the
+    /// 18,000-frame limit, so the window hint is 180.0 s; one more hop is
+    /// rejected.
+    #[test]
+    fn forced_aligner_window_hint_fits_the_frame_limit() {
+        let frames = |samples: usize| {
+            qwen3_asr_frontend_geometry(samples, 16_000, 16_000, 400, 160, false, 0)
+                .unwrap()
+                .mel_frames
+        };
+        let window = 180 * 16_000;
+        assert_eq!(frames(window), 18_000);
+        assert_eq!(frames(window + 159), 18_000);
+        assert_eq!(frames(window + 160), 18_001);
+        assert_eq!(frames(30 * 16_000), 3_000);
+        for cuda in [false, true] {
+            for (samples, admitted) in [(window, true), (window + 160, false)] {
+                assert_eq!(
+                    qwen3_asr_admit_frames(frames(samples), cuda, true, 3_000, 16_000, 160).is_ok(),
+                    admitted
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forced_aligner_word_bound_is_proportional_to_the_window() {
+        assert_eq!(
+            qwen3_aligner_max_words(0.0),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+        assert_eq!(
+            qwen3_aligner_max_words(1.0),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+        assert_eq!(qwen3_aligner_max_words(30.0), 300);
+        assert_eq!(qwen3_aligner_max_words(180.0), 1_800);
+        assert_eq!(
+            qwen3_aligner_max_words(f64::NAN),
+            QWEN3_ALIGNER_MIN_WORD_ALLOWANCE
+        );
+    }
+
+    #[test]
+    fn cuda_audio_limits_expand_portable_transcription_truncation() {
         let configured = 3_000;
         assert_eq!(
             qwen3_asr_admit_frames(3_001, false, false, configured, 16_000, 160).unwrap(),
@@ -5029,10 +4891,6 @@ mod tests {
         assert_eq!(
             qwen3_asr_effective_max_frames(true, false, configured, 16_000, 160),
             120_000
-        );
-        assert_eq!(
-            qwen3_asr_effective_max_frames(true, true, configured, 16_000, 160),
-            18_000
         );
         assert_eq!(
             qwen3_asr_admit_frames(120_000, true, false, configured, 16_000, 160).unwrap(),
@@ -5197,19 +5055,12 @@ mod tests {
         }
 
         // The exact 30 s prompt plus the 512-token decode cap fits a sequence.
-        let frontend = qwen3_asr_frontend_geometry(
-            30 * 16_000,
-            16_000,
-            16_000,
-            400,
-            160,
-            false,
-            false,
-            12_000,
-        )
-        .unwrap();
+        let frontend =
+            qwen3_asr_frontend_geometry(30 * 16_000, 16_000, 16_000, 400, 160, false, 12_000)
+                .unwrap();
         let audio_tokens = audio::get_cnn_output_lengths(&[frontend.mel_frames])[0];
-        assert_eq!(audio_tokens, 391);
+        // 3,000 frames, as WhisperFeatureExtractor gives (QFA-4).
+        assert_eq!(audio_tokens, 390);
         let prompt = build_qwen_asr_prompt_tokens(
             &test_specials(Some(7)),
             audio_tokens,
@@ -6139,17 +5990,69 @@ mod tests {
         );
     }
 
+    fn qwen3_test_mel(n_mels: usize) -> MelSpectrogram {
+        MelSpectrogram::new(MelConfig {
+            sample_rate: QWEN3_ASR_SAMPLE_RATE as usize,
+            n_fft: 400,
+            win_length: None,
+            hop_length: 160,
+            n_mels,
+            f_min: 0.0,
+            f_max: 8_000.0,
+            normalize: false,
+            mel_scale: MelScale::Slaney,
+            mel_norm: MelNorm::Slaney,
+        })
+        .expect("Qwen3 mel frontend")
+    }
+
+    /// QFA-4: 24 kHz fox.wav (3.6 s) gives WhisperFeatureExtractor's 360
+    /// frames, not the 361 centre-padded STFT frames.
     #[test]
-    fn qwen_mel_frame_policy_is_opt_in() {
-        let mut mel = vec![vec![1.0], vec![2.0], vec![3.0]];
-        assert!(!apply_qwen_mel_frame_policy(&mut mel, false));
-        assert_eq!(mel.len(), 3);
+    fn qwen3_mel_keeps_the_whisper_frame_count() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/fox.wav");
+        let (audio, rate) =
+            crate::audio::decode_audio_bytes_to_mono(&std::fs::read(path).expect("fox.wav"))
+                .expect("decode fox.wav");
+        assert_eq!((audio.len(), rate), (86_400, 24_000));
+        let resampled = resample(&audio, rate, QWEN3_ASR_SAMPLE_RATE).expect("resample");
+        let mel = qwen3_test_mel(128);
+        let (flat, frames) = qwen3_log_mel(&mel, &resampled).expect("mel");
+        assert_eq!(frames, 360);
+        assert_eq!(flat.len(), 360 * 128);
+        let geometry = qwen3_asr_frontend_geometry(
+            audio.len(),
+            rate,
+            QWEN3_ASR_SAMPLE_RATE,
+            400,
+            160,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(geometry.mel_frames, 360);
+        assert_eq!(geometry.mel_frames_before_drop, 361);
+    }
 
-        assert!(apply_qwen_mel_frame_policy(&mut mel, true));
-        assert_eq!(mel, vec![vec![1.0], vec![2.0]]);
-
-        let mut empty: Vec<Vec<f32>> = Vec::new();
-        assert!(!apply_qwen_mel_frame_policy(&mut empty, true));
+    /// The `max - 8` floor comes from the kept frames only: a burst at the
+    /// very end is loudest in the dropped frame, which must not raise the
+    /// floor of the others.
+    #[test]
+    fn qwen3_mel_floor_ignores_the_dropped_frame() {
+        let mut audio = vec![0.0f32; 16_000];
+        for (idx, sample) in audio[15_960..].iter_mut().enumerate() {
+            *sample = if idx % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        let mel = qwen3_test_mel(16);
+        let (raw, frames) = mel.compute_flat(&audio).expect("raw mel");
+        let max = |values: &[f32]| values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max_all = max(&raw);
+        let max_kept = max(&raw[..(frames - 1) * 16]);
+        assert!(max_all > max_kept + 1.0, "{max_all} vs {max_kept}");
+        let (features, kept) = qwen3_log_mel(&mel, &audio).expect("features");
+        assert_eq!(kept, frames - 1);
+        let floor = features.iter().copied().fold(f32::INFINITY, f32::min);
+        assert_eq!(floor, (max_kept - 8.0 + 4.0) / 4.0);
     }
 
     #[test]
@@ -6162,7 +6065,7 @@ mod tests {
             n_mels: 8,
             f_min: 0.0,
             f_max: 8_000.0,
-            normalize: true,
+            normalize: false,
             mel_scale: MelScale::Slaney,
             mel_norm: MelNorm::Slaney,
         })
@@ -6176,6 +6079,7 @@ mod tests {
                 let resampled =
                     resample(&audio, sample_rate, QWEN3_ASR_SAMPLE_RATE).expect("resample");
                 let (_, actual_frames) = mel.compute_flat(&resampled).expect("mel frames");
+                let (_, kept_frames) = qwen3_log_mel(&mel, &resampled).expect("kept frames");
 
                 let geometry = qwen3_asr_frontend_geometry(
                     input_samples,
@@ -6184,26 +6088,13 @@ mod tests {
                     mel.config().n_fft,
                     mel.config().hop_length,
                     false,
-                    false,
                     0,
                 )
                 .expect("frontend geometry");
                 assert_eq!(geometry.resampled_samples, resampled.len());
                 assert_eq!(geometry.mel_frames_before_drop, actual_frames);
-                assert_eq!(geometry.mel_frames, actual_frames);
-
-                let dropped = qwen3_asr_frontend_geometry(
-                    input_samples,
-                    sample_rate,
-                    QWEN3_ASR_SAMPLE_RATE,
-                    mel.config().n_fft,
-                    mel.config().hop_length,
-                    true,
-                    false,
-                    0,
-                )
-                .expect("dropped geometry");
-                assert_eq!(dropped.mel_frames, actual_frames.saturating_sub(1));
+                assert_eq!(geometry.mel_frames, kept_frames);
+                assert_eq!(kept_frames, actual_frames - 1);
             }
         }
     }
@@ -6274,42 +6165,6 @@ mod tests {
     }
 
     #[test]
-    fn resample_polyphase_matches_scalar_reference() {
-        let input = (0..4096)
-            .map(|idx| {
-                let t = idx as f32;
-                (t * 0.013).sin() * 0.65 + (t * 0.071).cos() * 0.25
-            })
-            .collect::<Vec<_>>();
-
-        for (src_rate, dst_rate) in [
-            (48_000, 16_000),
-            (44_100, 16_000),
-            (24_000, 16_000),
-            (16_000, 48_000),
-        ] {
-            let optimized = resample(&input, src_rate, dst_rate).expect("optimized resample");
-            let reference =
-                resample_reference(&input, src_rate, dst_rate).expect("reference resample");
-            assert_eq!(
-                optimized.len(),
-                reference.len(),
-                "length mismatch for {src_rate}->{dst_rate}"
-            );
-
-            let max_diff = optimized
-                .iter()
-                .zip(reference.iter())
-                .map(|(lhs, rhs)| (lhs - rhs).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                max_diff <= 1e-6,
-                "max diff {max_diff} exceeded tolerance for {src_rate}->{dst_rate}"
-            );
-        }
-    }
-
-    #[test]
     fn resample_rejects_zero_sample_rates() {
         let input = vec![0.0f32, 1.0];
         let err = resample(&input, 0, 16_000).expect_err("zero source rate");
@@ -6320,84 +6175,115 @@ mod tests {
     }
 
     #[test]
-    fn resample_keeps_constant_signal_stable() {
-        let input = vec![0.75f32; 128];
-        let output = resample(&input, 48_000, 16_000).expect("resample");
-
-        assert_eq!(output.len(), 42);
-        for value in output {
-            assert!((value - 0.75).abs() < 1e-3, "unexpected value: {value}");
-        }
-    }
-
-    #[test]
     fn text_delta_finds_suffix_when_prefix_changes() {
         assert_eq!(text_delta("Hello", "Hello world"), " world");
         assert_eq!(text_delta("abcd", "abXY"), "XY");
     }
 
     #[test]
-    fn extract_alignment_words_strips_markers() {
-        let words = extract_alignment_words("hello,  world! it's me.");
-        assert_eq!(words, vec!["hello", "world", "it's", "me"]);
-    }
-
-    #[test]
-    fn extract_alignment_words_splits_cjk_and_hangul() {
-        let words = extract_alignment_words("你好 world 안녕");
-        assert_eq!(words, vec!["你", "好", "world", "안", "녕"]);
-    }
-
-    #[test]
-    fn distribute_words_over_interval_is_monotonic() {
-        let words = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-        let aligned = distribute_words_over_interval(&words, 100, 160);
-        assert_eq!(aligned.len(), 3);
-        assert!(aligned[0].1 < aligned[0].2);
-        assert!(aligned[1].1 >= aligned[0].2);
-        assert!(aligned[2].2 >= aligned[1].2);
-    }
-
-    #[test]
-    fn normalize_alignment_bounds_clamps_to_duration() {
-        let mut alignments = vec![
-            ("one".to_string(), 0, 20),
-            ("two".to_string(), 10, 12),
-            ("three".to_string(), 100, 140),
-        ];
-        normalize_alignment_bounds(&mut alignments, 60);
-        assert_eq!(alignments[0].0, "one");
-        assert!(alignments[0].1 < alignments[0].2);
-        assert!(alignments[1].1 >= alignments[0].2);
-        assert!(alignments[2].2 <= 60);
-    }
-
-    #[test]
-    fn alignment_distribution_is_degenerate_detects_tail_collapse() {
-        let alignments = (0..20)
-            .map(|idx| (format!("w{idx}"), 27_302u32, 27_303u32))
-            .collect::<Vec<_>>();
-        assert!(alignment_distribution_is_degenerate(&alignments, 27_303));
-    }
-
-    #[test]
-    fn alignment_distribution_is_degenerate_accepts_spread_alignment() {
-        let alignments = (0..20)
-            .map(|idx| {
-                let start = idx * 120;
-                let end = start + 80;
-                (format!("w{idx}"), start, end)
-            })
-            .collect::<Vec<_>>();
-        assert!(!alignment_distribution_is_degenerate(&alignments, 3_000));
-    }
-
-    #[test]
     fn fix_timestamp_sequence_recovers_monotonicity() {
-        let repaired = fix_timestamp_sequence(&[100, 80, 120, 60, 140]);
+        let repaired = fix_timestamp_sequence(&[100.0, 80.0, 120.0, 60.0, 140.0]);
         assert_eq!(repaired.len(), 5);
         for pair in repaired.windows(2) {
             assert!(pair[0] <= pair[1]);
+        }
+        // Three or more anomalies are interpolated and truncated like int()
+        // (the reference `fix_timestamp` gives the same).
+        assert_eq!(
+            fix_timestamp_sequence(&[0.0, 90.0, 80.0, 70.0, 60.0, 100.0]),
+            [0, 90, 92, 95, 97, 100]
+        );
+    }
+
+    /// QFA-5: izwi's post-processing of the reference's raw timestamp
+    /// classes gives exactly the reference's word timings, zero-length words
+    /// and LIS repairs included. Classes and `fixed_ms` from qwen-asr 0.0.6
+    /// on test.wav (windowed and official encoder) and fox.wav (windowed),
+    /// `01-aligner-reference-{test,fox}.json` of the 2026-10-14 audit.
+    #[test]
+    fn post_processing_returns_the_reference_timings() {
+        const TEST_WINDOWED: [u32; 134] = [
+            2, 4, 4, 7, 7, 11, 11, 15, 15, 20, 21, 22, 22, 30, 32, 33, 33, 42, 42, 44, 44, 46, 53,
+            55, 55, 68, 69, 71, 72, 76, 76, 78, 78, 83, 83, 92, 92, 94, 94, 98, 106, 109, 109, 113,
+            113, 115, 115, 120, 120, 123, 124, 134, 135, 142, 151, 160, 160, 163, 163, 167, 167,
+            170, 170, 174, 174, 183, 185, 187, 187, 195, 195, 204, 204, 210, 212, 214, 214, 221,
+            221, 224, 224, 231, 234, 235, 235, 241, 241, 249, 251, 258, 257, 259, 259, 266, 266,
+            268, 268, 276, 276, 285, 286, 287, 287, 290, 290, 296, 299, 301, 301, 304, 304, 308,
+            308, 316, 316, 321, 321, 329, 331, 333, 333, 337, 338, 348, 347, 350, 350, 350, 350,
+            357, 357, 359, 359, 369,
+        ];
+        const TEST_WINDOWED_FIXED_MS: [u32; 134] = [
+            160, 320, 320, 560, 560, 880, 880, 1200, 1200, 1600, 1680, 1760, 1760, 2400, 2560,
+            2640, 2640, 3360, 3360, 3520, 3520, 3680, 4240, 4400, 4400, 5440, 5520, 5680, 5760,
+            6080, 6080, 6240, 6240, 6640, 6640, 7360, 7360, 7520, 7520, 7840, 8480, 8720, 8720,
+            9040, 9040, 9200, 9200, 9600, 9600, 9840, 9920, 10720, 10800, 11360, 12080, 12800,
+            12800, 13040, 13040, 13360, 13360, 13600, 13600, 13920, 13920, 14640, 14800, 14960,
+            14960, 15600, 15600, 16320, 16320, 16800, 16960, 17120, 17120, 17680, 17680, 17920,
+            17920, 18480, 18720, 18800, 18800, 19280, 19280, 19920, 20080, 20640, 20640, 20720,
+            20720, 21280, 21280, 21440, 21440, 22080, 22080, 22800, 22880, 22960, 22960, 23200,
+            23200, 23680, 23920, 24080, 24080, 24320, 24320, 24640, 24640, 25280, 25280, 25680,
+            25680, 26320, 26480, 26640, 26640, 26960, 27040, 27840, 27840, 28000, 28000, 28000,
+            28000, 28560, 28560, 28720, 28720, 29520,
+        ];
+        // The official (whole-clip encoder) classes differ in five places.
+        let mut test_official = TEST_WINDOWED;
+        let mut test_official_fixed_ms = TEST_WINDOWED_FIXED_MS;
+        for (idx, class, fixed) in [
+            (9, 21, 1680),
+            (26, 68, 5440),
+            (111, 307, 24560),
+            (123, 347, 27760),
+            (124, 347, 27760),
+        ] {
+            test_official[idx] = class;
+            test_official_fixed_ms[idx] = fixed;
+        }
+        let fox_windowed = [
+            3, 4, 4, 7, 7, 13, 13, 19, 20, 25, 25, 28, 28, 29, 29, 35, 35, 41,
+        ];
+        let fox_windowed_fixed_ms = [
+            240, 320, 320, 560, 560, 1040, 1040, 1520, 1600, 2000, 2000, 2240, 2240, 2320, 2320,
+            2800, 2800, 3280,
+        ];
+        for (classes, fixed_ms) in [
+            (&TEST_WINDOWED[..], &TEST_WINDOWED_FIXED_MS[..]),
+            (&test_official[..], &test_official_fixed_ms[..]),
+            (&fox_windowed[..], &fox_windowed_fixed_ms[..]),
+        ] {
+            let expected = fixed_ms
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[start, end]| (start, end))
+                .collect::<Vec<_>>();
+            assert_eq!(reference_word_timings(classes, 80), expected);
+        }
+        // test.wav's word 63 is zero-length in the reference.
+        assert_eq!(
+            reference_word_timings(&TEST_WINDOWED, 80)[63],
+            (28_000, 28_000)
+        );
+    }
+
+    #[test]
+    fn aligner_checkpoints_must_declare_their_timestamp_config() {
+        assert_eq!(
+            forced_aligner_timestamp_config(true, Some(151_705), Some(80)).unwrap(),
+            (Some(151_705), Some(80))
+        );
+        assert_eq!(
+            forced_aligner_timestamp_config(false, None, None).unwrap(),
+            (None, None)
+        );
+        for (token, segment) in [
+            (None, Some(80)),
+            (Some(151_705), None),
+            (Some(151_705), Some(0)),
+        ] {
+            assert!(matches!(
+                forced_aligner_timestamp_config(true, token, segment),
+                Err(Error::ModelLoadError(_))
+            ));
         }
     }
 
@@ -6507,39 +6393,52 @@ mod tests {
     }
 
     #[test]
-    fn batched_timestamp_argmax_selects_requested_positions() {
+    fn timestamp_argmax_reads_one_class_per_scored_row() {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(
             vec![
-                0.1f32, 0.2, 0.9, 0.0, //
-                0.8, 0.1, 0.0, 0.2, //
-                0.3, 1.4, 0.2, 0.0, //
+                0.3f32, 1.4, 0.2, 0.0, //
+                0.1, 0.2, 0.9, 0.0, //
                 0.0, 0.2, 0.1, 2.0,
             ],
-            (1, 4, 4),
+            (1, 3, 4),
             &device,
         )
         .expect("logits");
 
-        let indices = batched_timestamp_argmax(&logits, &[2, 0, 3]).expect("argmax");
+        let indices = timestamp_argmax(&logits, &[20, 7, 31]).expect("argmax");
 
         assert_eq!(indices, vec![1, 2, 3]);
     }
 
     #[test]
-    fn batched_timestamp_argmax_rejects_out_of_range_position() {
+    fn timestamp_argmax_rejects_a_row_count_mismatch() {
         let device = candle_core::Device::Cpu;
         let logits = Tensor::from_vec(vec![0.1f32; 8], (1, 2, 4), &device).expect("logits");
-        let err = batched_timestamp_argmax(&logits, &[2])
-            .expect_err("timestamp position should be out of range");
+        let err = timestamp_argmax(&logits, &[2])
+            .expect_err("one position cannot describe two scored rows");
 
-        assert!(format!("{err}").contains("out of range"));
+        assert!(format!("{err}").contains("[1, 1, classes]"), "{err}");
     }
 
     #[test]
-    #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
-    fn forced_aligner_local_checkpoint_loads_and_aligns() {
-        let models_root = std::env::var("IZWI_MODELS_DIR")
+    fn timestamp_argmax_rejects_non_finite_logits() {
+        let device = candle_core::Device::Cpu;
+        for poison in [f32::NAN, f32::INFINITY] {
+            let mut values = vec![0.1f32; 12];
+            values[2] = 0.9;
+            values[5] = poison;
+            let logits = Tensor::from_vec(values, (1, 3, 4), &device).expect("logits");
+
+            let err = timestamp_argmax(&logits, &[4, 5, 6])
+                .expect_err("a non-finite timestamp row must not become class 0");
+            assert!(format!("{err}").contains("non-finite"), "{err}");
+            assert!(format!("{err}").contains("prompt position 5"), "{err}");
+        }
+    }
+
+    pub(super) fn local_models_root() -> PathBuf {
+        std::env::var("IZWI_MODELS_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
@@ -6548,8 +6447,108 @@ mod tests {
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join("izwi")
                     .join("models")
-            });
-        let model_dir = models_root.join("Qwen3-ForcedAligner-0.6B");
+            })
+    }
+
+    /// The aligner against qwen-asr 0.0.6 on fox.wav and test.wav: the same
+    /// word units, and word boundaries within 40 ms on average of the
+    /// reference's windowed-encoder run (the form izwi implements).
+    /// `IZWI_ALIGNER_REFERENCE_DIR` holds the audit's
+    /// `01-aligner-reference-{fox,test}.json`; `IZWI_ALIGNER_DEVICE` picks
+    /// cpu (default) or metal; `IZWI_ALIGNER_DUMP` names a file for the
+    /// timings.
+    ///
+    /// Every boundary must also be within 160 ms, with the production decode
+    /// or the reference's own 16 kHz audio (`IZWI_ALIGNER_AUDIO_DIR`). Both
+    /// measure all equal on CPU: the canonical resampler matches soxr_hq. It
+    /// once passed 7.3-8 kHz whole and moved test.wav's `AIautonomous` end by
+    /// 800 ms (mean 15.5 ms over 134 boundaries).
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and IZWI_ALIGNER_REFERENCE_DIR"]
+    fn forced_aligner_matches_the_reference_timings() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_matches_the_reference_timings",
+        );
+        let reference_dir = PathBuf::from(
+            std::env::var("IZWI_ALIGNER_REFERENCE_DIR").expect("IZWI_ALIGNER_REFERENCE_DIR"),
+        );
+        let device_name = std::env::var("IZWI_ALIGNER_DEVICE").unwrap_or_else(|_| "cpu".into());
+        let device = DeviceSelector::detect_with_preference(Some(&device_name)).expect("device");
+        let model = Qwen3AsrModel::load(
+            &local_models_root().join("Qwen3-ForcedAligner-0.6B"),
+            ModelVariant::Qwen3ForcedAligner06B,
+            device,
+        )
+        .expect("load aligner");
+        let data = std::env::var("IZWI_ALIGNER_AUDIO_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"));
+        let mut dump = serde_json::Map::new();
+        let mut off_target = Vec::new();
+        for name in ["fox", "test"] {
+            let path = reference_dir.join(format!("01-aligner-reference-{name}.json"));
+            let reference: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).expect("reference")).unwrap();
+            let text = reference["input"]["transcript"].as_str().unwrap();
+            let language = reference["input"]["language"].as_str();
+            let bytes = fs::read(data.join(format!("{name}.wav"))).expect("audio");
+            // The production decode, which resamples to 16 kHz itself.
+            let (audio, rate) =
+                crate::runtime::audio_io::decode_audio_bytes_canonical(&bytes).expect("decode");
+            let units = alignment_units(text, language);
+            let timings = model
+                .force_align_units(&audio, rate, &units)
+                .expect("align");
+            dump.insert(name.into(), json!(timings));
+            for variant in ["windowed", "official"] {
+                let words = reference["variants"][variant]["words"].as_array().unwrap();
+                let texts = words
+                    .iter()
+                    .map(|word| word["text"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    units
+                        .iter()
+                        .map(|unit| unit.text.as_str())
+                        .collect::<Vec<_>>(),
+                    texts,
+                    "{name}: word units"
+                );
+                let ms = |value: &serde_json::Value| (value.as_f64().unwrap() * 1000.0).round();
+                let deltas = words
+                    .iter()
+                    .zip(&timings)
+                    .flat_map(|(word, (start, end))| {
+                        [
+                            (ms(&word["start"]) - f64::from(*start)).abs(),
+                            (ms(&word["end"]) - f64::from(*end)).abs(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+                let max = deltas.iter().copied().fold(0.0, f64::max);
+                eprintln!(
+                    "{device_name} {name} vs {variant}: mean |d| {mean:.1} ms, max {max} ms, \
+                     {} of {} boundaries differ",
+                    deltas.iter().filter(|delta| **delta > 0.0).count(),
+                    deltas.len()
+                );
+                if variant == "windowed" && (mean > 40.0 || max > 160.0) {
+                    off_target.push(format!("{name}: mean {mean:.1} ms, max {max} ms"));
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("IZWI_ALIGNER_DUMP") {
+            fs::write(path, serde_json::Value::Object(dump).to_string()).expect("dump");
+        }
+        assert!(off_target.is_empty(), "{off_target:?}");
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3-ForcedAligner checkpoint"]
+    fn forced_aligner_local_checkpoint_loads_and_aligns() {
+        let model_dir = local_models_root().join("Qwen3-ForcedAligner-0.6B");
         if !model_dir.join("model.safetensors").exists() {
             eprintln!(
                 "Skipping forced aligner local checkpoint test, model not found at {}",
@@ -6570,6 +6569,125 @@ mod tests {
             "forced aligner should return timestamps"
         );
     }
+
+    /// fox.wav gives a 77-token prompt (77 % 32 = 13), which hit Candle's
+    /// causal Metal SDPA over-read in the dense text model; the 4-bit audio
+    /// tower's OHWI conv kernels hit the strided-kernel conv bug. Metal must
+    /// match CPU per word boundary.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires local Qwen3-ForcedAligner checkpoints and a Metal device (~5 GB)"]
+    fn forced_aligner_metal_matches_cpu() {
+        let _lease = crate::backends::metal_test_device_or_skip("forced_aligner_metal_matches_cpu");
+        const MAX_BOUNDARY_DRIFT_MS: u32 = 80;
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let bytes = std::fs::read(data.join("fox.wav")).expect("fox.wav");
+        let (audio, sample_rate) =
+            crate::audio::decode_audio_bytes_to_mono(&bytes).expect("decode fox.wav");
+        let text = std::fs::read_to_string(data.join("fox.md")).expect("fox.md");
+        let text = text.trim();
+
+        for (dir_name, variant) in [
+            (
+                "Qwen3-ForcedAligner-0.6B",
+                ModelVariant::Qwen3ForcedAligner06B,
+            ),
+            (
+                "Qwen3-ForcedAligner-0.6B-4bit",
+                ModelVariant::Qwen3ForcedAligner06B4Bit,
+            ),
+        ] {
+            let model_dir = local_models_root().join(dir_name);
+            if !model_dir.join("model.safetensors").exists() {
+                eprintln!("Skipping {dir_name}: not found at {}", model_dir.display());
+                continue;
+            }
+            // One model resident at a time.
+            let align_on = |device: &str| {
+                let device = DeviceSelector::detect_with_preference(Some(device)).expect(device);
+                let model = Qwen3AsrModel::load(&model_dir, variant, device).expect("load");
+                model
+                    .force_align(&audio, sample_rate, text, None)
+                    .expect("force_align")
+            };
+            let cpu = align_on("cpu");
+            let metal = align_on("metal");
+            eprintln!("{dir_name} cpu:   {cpu:?}\n{dir_name} metal: {metal:?}");
+
+            assert_eq!(cpu.len(), metal.len(), "{dir_name}: word count");
+            for (c, m) in cpu.iter().zip(&metal) {
+                assert_eq!(c.0, m.0, "{dir_name}: word order");
+                let drift = c.1.abs_diff(m.1).max(c.2.abs_diff(m.2));
+                assert!(
+                    drift <= MAX_BOUNDARY_DRIFT_MS,
+                    "{dir_name}: '{}' Metal {:?} vs CPU {:?}",
+                    c.0,
+                    (m.1, m.2),
+                    (c.1, c.2)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_f16_text_tests {
+    use super::tests::local_models_root;
+    use super::*;
+    use crate::backends::DeviceSelector;
+
+    /// D8 gate: the dense aligner's F16 Metal text moves at most 2 of
+    /// test.wav's word boundaries by more than 80 ms against F32 text
+    /// (measured 2026-10-15: none moved, here and on a 175 s cut).
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B checkpoint and a Metal device"]
+    fn dense_aligner_f16_text_keeps_test_wav_boundaries() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "dense_aligner_f16_text_keeps_test_wav_boundaries",
+        );
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let bytes = std::fs::read(data.join("test.wav")).expect("test.wav");
+        let (audio, rate) =
+            crate::audio::decode_audio_bytes_to_mono(&bytes).expect("decode test.wav");
+        let text = std::fs::read_to_string(data.join("test.md")).expect("test.md");
+        let align = |pin_f32: bool| {
+            if pin_f32 {
+                std::env::set_var("IZWI_METAL_DTYPE", "f32");
+            }
+            let device = DeviceSelector::detect_with_preference(Some("metal")).expect("metal");
+            let model = Qwen3AsrModel::load(
+                &local_models_root().join("Qwen3-ForcedAligner-0.6B"),
+                ModelVariant::Qwen3ForcedAligner06B,
+                device,
+            );
+            std::env::remove_var("IZWI_METAL_DTYPE");
+            let model = model.expect("load");
+            let dtype = model.text_dtype;
+            let words = model
+                .force_align(&audio, rate, text.trim(), None)
+                .expect("align");
+            (dtype, words)
+        };
+        let (f16_dtype, f16) = align(false);
+        let (f32_dtype, f32) = align(true);
+        assert_eq!((f16_dtype, f32_dtype), (DType::F16, DType::F32));
+        assert_eq!(f16.len(), f32.len());
+        let boundaries = f16
+            .iter()
+            .zip(&f32)
+            .flat_map(|(a, b)| [a.1.abs_diff(b.1), a.2.abs_diff(b.2)])
+            .collect::<Vec<_>>();
+        let moved = boundaries.iter().filter(|delta| **delta > 80).count();
+        eprintln!(
+            "F16 vs F32 text: {moved}/{} boundaries moved > 80 ms, max {} ms",
+            boundaries.len(),
+            boundaries.iter().max().copied().unwrap_or(0)
+        );
+        assert!(moved <= 2, "{moved} boundaries moved > 80 ms");
+    }
 }
 
 #[cfg(test)]
@@ -6577,10 +6695,214 @@ mod precision_tests {
     use candle_core::{DType, Device};
 
     use super::{
-        qwen3_asr_audio_self_check, qwen3_asr_text_self_check, select_quantized_text_dtype,
+        load_qwen3_asr_components, qwen3_asr_audio_self_check, qwen3_asr_text_self_check,
+        qwen3_asr_weight_precisions, select_quantized_text_dtype, Qwen3AsrModel,
     };
-    use crate::backends::{DeviceCapabilities, DeviceKind, DeviceProfile};
+    use crate::backends::{DTypeSelection, DeviceCapabilities, DeviceKind, DeviceProfile};
     use crate::catalog::ModelFamily;
+    use crate::kernels::numeric_check::PrecisionLoad;
+    use crate::kv::{InferenceStateCapability, InferenceStateContractProvider};
+    use crate::models::architectures::qwen3::core::tiny_qwen3_model_for_test;
+
+    fn selection(dtype: DType) -> DTypeSelection {
+        DTypeSelection {
+            dtype,
+            reason: "test selection".into(),
+        }
+    }
+
+    /// A Qwen3 speech-family model over the tiny audio tower and text model.
+    fn tiny_model(is_forced_aligner: bool) -> Qwen3AsrModel {
+        let device = Device::Cpu;
+        let tokenizer = super::tokenizer::gguf_shaped_test_tokenizer(Some("qwen3_asr")).unwrap();
+        let specials = tokenizer.specials().clone();
+        let mel = super::MelSpectrogram::new(super::MelConfig {
+            sample_rate: 16_000,
+            n_fft: 400,
+            win_length: None,
+            hop_length: 160,
+            n_mels: 8,
+            f_min: 0.0,
+            f_max: 8_000.0,
+            normalize: false,
+            mel_scale: super::MelScale::Slaney,
+            mel_norm: super::MelNorm::Slaney,
+        })
+        .unwrap();
+        Qwen3AsrModel {
+            audio_preparation_id: 0,
+            device: DeviceProfile::cpu(),
+            audio_dtype: DType::F32,
+            text_dtype: DType::F32,
+            checkpoint_format: "safetensors",
+            gguf_qmatmul_text_enabled: false,
+            is_forced_aligner,
+            timestamp_token_id: None,
+            timestamp_segment_time_ms: None,
+            tokenizer,
+            specials,
+            audio_tower: super::audio::tiny_audio_tower_for_test(&device),
+            text_model: tiny_qwen3_model_for_test(&device),
+            text_context_tokens: Some(128),
+            mel,
+            preprocessor: serde_json::from_str("{}").unwrap(),
+            audio_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
+            text_precision: PrecisionLoad::unchecked(&selection(DType::F32)),
+        }
+    }
+
+    /// QFA-7 / ADM-11: both checkpoint formats load through one helper, so
+    /// a safetensors checkpoint's lowered tier (the 4-bit aligner's F16 text
+    /// on Metal) runs its load-time probe, as the GGUF one always did. F32
+    /// is the reference and is never probed; off Metal nothing is.
+    #[test]
+    fn lowered_tiers_run_their_load_time_probe_on_metal() {
+        let device = Device::Cpu;
+        for check in [true, false] {
+            let mut audio_loads = Vec::new();
+            let mut text_loads = Vec::new();
+            let (_, audio, _, text) = load_qwen3_asr_components(
+                &selection(DType::F32),
+                &selection(DType::F16),
+                check,
+                &device,
+                |dtype| {
+                    audio_loads.push(dtype);
+                    Ok(super::audio::tiny_audio_tower_for_test(&device))
+                },
+                |dtype| {
+                    text_loads.push(dtype);
+                    Ok(tiny_qwen3_model_for_test(&device))
+                },
+            )
+            .unwrap();
+            assert_eq!(audio_loads, [DType::F32]);
+            // A passing probe keeps the tier: one load, no F32 reload.
+            assert_eq!(text_loads, [DType::F16]);
+            assert!(audio.self_check.is_none());
+            assert_eq!(text.loaded, DType::F16);
+            match text.self_check {
+                Some(report) => assert!(check && report.passed, "{}", report.reason),
+                None => assert!(!check),
+            }
+        }
+    }
+
+    /// A failed text probe asks the load's reload gate for the F32 text's
+    /// memory after dropping the F16 text and before reloading; a refusal
+    /// stops the load without reloading.
+    #[test]
+    fn a_failed_probe_admits_the_f32_reload_before_loading_it() {
+        use crate::kernels::numeric_check::with_precision_reload_gate;
+        use crate::models::architectures::qwen3::core::tiny_non_finite_qwen3_model_for_test;
+        use std::sync::{Arc, Mutex};
+
+        let device = Device::Cpu;
+        for admit in [true, false] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let gate_events = events.clone();
+            let gate = Box::new(move |label: &str, dtype: DType| {
+                gate_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("admit {label} {dtype:?}"));
+                if admit {
+                    Ok(())
+                } else {
+                    Err(crate::error::Error::ModelLoadError("refused".into()))
+                }
+            });
+            let outcome = with_precision_reload_gate(gate, || {
+                load_qwen3_asr_components(
+                    &selection(DType::F32),
+                    &selection(DType::F16),
+                    true,
+                    &device,
+                    |_| Ok(super::audio::tiny_audio_tower_for_test(&device)),
+                    |dtype| {
+                        events.lock().unwrap().push(format!("load text {dtype:?}"));
+                        Ok(if dtype == DType::F16 {
+                            tiny_non_finite_qwen3_model_for_test(&device)
+                        } else {
+                            tiny_qwen3_model_for_test(&device)
+                        })
+                    },
+                )
+            });
+            let mut expected = vec!["load text F16", "admit text F32"];
+            match outcome {
+                Ok((_, audio, _, text)) => {
+                    assert!(admit);
+                    expected.push("load text F32");
+                    assert!(text.fell_back() && !audio.fell_back());
+                }
+                Err(error) => {
+                    assert!(!admit);
+                    assert!(error.to_string().contains("refused"), "{error}");
+                }
+            }
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+
+    /// QFA-11: the aligner's cacheless forward publishes no KV, matching its
+    /// stateless `ForcedAlignment` adapter; Qwen3-ASR keeps its managed
+    /// contract.
+    #[test]
+    fn the_forced_aligner_reports_a_stateless_contract() {
+        let aligner = tiny_model(true).inference_state_contract().unwrap();
+        assert!(matches!(aligner, InferenceStateCapability::Stateless));
+        let asr = tiny_model(false).inference_state_contract().unwrap();
+        assert!(matches!(asr, InferenceStateCapability::Managed(_)));
+    }
+
+    /// The published 4-bit aligner on Metal: the F16 text tier really runs
+    /// its probe, and the loaded model is stateless.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires the local Qwen3-ForcedAligner-0.6B-4bit checkpoint and a Metal device"]
+    fn forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe() {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "forced_aligner_4bit_metal_text_tier_runs_its_load_time_probe",
+        );
+        use std::io::Write;
+        let model_dir = super::tests::local_models_root().join("Qwen3-ForcedAligner-0.6B-4bit");
+        if !model_dir.join("model.safetensors").exists() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped: no checkpoint at {}",
+                model_dir.display()
+            );
+            return;
+        }
+        let device = crate::backends::DeviceSelector::detect_with_preference(Some("metal"))
+            .expect("metal device");
+        let model = Qwen3AsrModel::load(
+            &model_dir,
+            crate::model::ModelVariant::Qwen3ForcedAligner06B4Bit,
+            device,
+        )
+        .expect("load");
+        let _ = writeln!(
+            std::io::stderr(),
+            "text: {:?} -> {:?} ({}); probe {:?}",
+            model.text_precision.requested,
+            model.text_precision.loaded,
+            model.text_precision.reason,
+            model
+                .text_precision
+                .self_check
+                .as_ref()
+                .map(|r| (r.passed, &r.reason)),
+        );
+        assert_eq!(model.text_precision.requested, DType::F16);
+        assert!(model.text_precision.self_check.is_some());
+        assert!(model.audio_precision.self_check.is_none());
+        assert!(matches!(
+            model.inference_state_contract().unwrap(),
+            InferenceStateCapability::Stateless
+        ));
+    }
 
     #[test]
     fn quantized_text_on_metal_takes_the_lm_tier_unless_f32_is_pinned() {
@@ -6607,6 +6929,51 @@ mod precision_tests {
         assert_eq!(
             select_quantized_text_dtype(&DeviceProfile::cpu(), ModelFamily::Qwen3Asr, DType::BF16)
                 .dtype,
+            DType::F32
+        );
+    }
+
+    /// D8: dense aligner text takes the F16 tier on Metal (probed at load)
+    /// unless `IZWI_METAL_DTYPE=f32`; dense Qwen3-ASR text stays F32.
+    #[test]
+    fn dense_aligner_text_takes_f16_on_metal_unless_f32_is_pinned() {
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let metal = DeviceProfile {
+            device: Device::Cpu,
+            kind: DeviceKind::Metal,
+            capabilities: DeviceCapabilities {
+                supports_f16: true,
+                ..Default::default()
+            },
+            memory_pool: None,
+        };
+        let text = |family| {
+            qwen3_asr_weight_precisions(&metal, family, false, false, Some("bfloat16"))
+                .unwrap()
+                .0
+        };
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        let aligner = text(ModelFamily::Qwen3ForcedAligner);
+        assert_eq!(aligner.dtype, DType::F16);
+        assert!(aligner.reason.contains("probe"), "{}", aligner.reason);
+        assert_eq!(text(ModelFamily::Qwen3Asr).dtype, DType::F32);
+        std::env::set_var("IZWI_METAL_DTYPE", "f32");
+        let pinned = text(ModelFamily::Qwen3ForcedAligner);
+        std::env::remove_var("IZWI_METAL_DTYPE");
+        assert_eq!(pinned.dtype, DType::F32);
+        assert_eq!(
+            qwen3_asr_weight_precisions(
+                &DeviceProfile::cpu(),
+                ModelFamily::Qwen3ForcedAligner,
+                false,
+                false,
+                Some("bfloat16")
+            )
+            .unwrap()
+            .0
+            .dtype,
             DType::F32
         );
     }

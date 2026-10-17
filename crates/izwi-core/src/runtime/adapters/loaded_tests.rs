@@ -1417,6 +1417,82 @@ fn offline_asr_transport_progress_does_not_require_native_streaming() {
 }
 
 #[test]
+fn every_pipeline_selectable_asr_publishes_an_atomic_long_form_graph() {
+    // The diarization pipeline loads its ASR long-form on every backend
+    // and refuses a contract without an atomic stage, so every variant the
+    // pipeline resolver accepts must publish one: in the sealed bundle and
+    // in the weight-free probe the pipeline runs before diarizing.
+    let registry = RuntimeAdapterRegistry::built_in();
+    let mut selectable = Vec::new();
+    for &variant in ModelVariant::all() {
+        if crate::catalog::resolve_diarization_asr_model_variant(Some(variant.dir_name()))
+            != Ok(variant)
+        {
+            continue;
+        }
+        selectable.push(variant);
+        for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
+            assert!(
+                registry
+                    .supports_atomic_long_form(CapabilityKind::Asr, variant, backend)
+                    .unwrap_or_else(|error| panic!("{variant}/{backend:?}: {error}")),
+                "{variant}/{backend:?} probe has no atomic long-form graph"
+            );
+            let draft = LoadedModelBundleDraft::build(
+                &registry,
+                ExecutionGroupId::new(7),
+                ModelInstanceId::new(1),
+                variant,
+                backend,
+            )
+            .unwrap();
+            install_test_preparation_seals(&draft, backend, 1);
+            let contract = draft
+                .capabilities
+                .get(&CapabilityKind::Asr)
+                .unwrap()
+                .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+                .unwrap();
+            assert!(
+                contract_supports_atomic_blocking(&contract),
+                "{variant}/{backend:?} long-form contract has no atomic stage"
+            );
+            // The pipeline transcribes only from an invocation workspace.
+            assert!(
+                matches!(
+                    contract.metadata.state_requirement,
+                    InferenceStateRequirement::Invocation
+                        | InferenceStateRequirement::RetainedAndInvocation
+                ),
+                "{variant}/{backend:?} ASR is not invocation-backed"
+            );
+            assert!(
+                contract
+                    .adapter_binding()
+                    .unwrap()
+                    .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+                        kind: "diarization.transcribe".into(),
+                    })
+                    .is_ok(),
+                "{variant}/{backend:?} cannot place a diarization transcription"
+            );
+        }
+    }
+    // Every native ASR family and Voxtral is selectable by its catalog id
+    // (no variant escapes the check through an unparseable name), and no
+    // audio-chat model is: the pipeline cannot hold one as its ASR.
+    let expected = ModelVariant::all()
+        .iter()
+        .copied()
+        .filter(|variant| variant.is_asr() || variant.is_voxtral())
+        .collect::<Vec<_>>();
+    assert_eq!(selectable, expected);
+    assert!(selectable.contains(&ModelVariant::ParakeetTdt06BV3));
+    assert!(selectable.contains(&ModelVariant::VoxtralMini4BRealtime2602));
+    assert!(!selectable.contains(&ModelVariant::Lfm25Audio15BGguf));
+}
+
+#[test]
 fn every_asr_stream_route_binds_to_its_loaded_contract() {
     let registry = RuntimeAdapterRegistry::built_in();
     let mut offline_only = Vec::new();
@@ -2482,12 +2558,10 @@ fn whisper_normal_and_long_form_graphs_are_distinct_and_scalar() {
 }
 
 #[test]
-fn parakeet_has_no_long_form_graph_until_publications_split() {
-    // Parakeet's retained predictor state and its scratch atomic
-    // workspace cannot share one load-sealed publication, so the adapter
-    // ignores the long-form flag and the pipeline's atomic requirement
-    // fails closed at load (service-level guard) until publications can
-    // be split per graph.
+fn parakeet_long_form_graph_is_one_atomic_stage_beside_the_sequence_graph() {
+    // The diarization pipeline loads ASR with the long-form flag and
+    // refuses a contract without an atomic stage; Parakeet must publish
+    // that graph while ordinary requests keep the retained sequence graph.
     let registry = RuntimeAdapterRegistry::built_in();
     let metadata = *registry
         .require(CapabilityKind::Asr, ModelVariant::ParakeetTdt06BV3)
@@ -2502,20 +2576,27 @@ fn parakeet_has_no_long_form_graph_until_publications_split() {
     let normal = adapter.contract(StreamingRequirements::NONE).unwrap();
     assert_eq!(normal.execution_profile.mode, ExecutionMode::Sequence);
     assert_eq!(normal.stages[0].name, "asr.encoder.parakeet");
-
-    let long_form_request = adapter
-        .contract(StreamingRequirements::NONE.with_asr_long_form(true))
-        .unwrap();
-    assert_eq!(long_form_request.stages.len(), normal.stages.len());
-    assert_eq!(
-        long_form_request.stages[0].name,
-        normal.stages[0].name,
-        "the flag must be ignored until publications split"
-    );
-    assert!(long_form_request
+    assert!(normal
         .stages
         .iter()
-        .all(|stage| !matches!(stage.selector, StageWorkSelector::Atomic)));
+        .all(|stage| stage.selector != StageWorkSelector::Atomic));
+
+    let long = adapter
+        .contract(StreamingRequirements::NONE.with_asr_long_form(true))
+        .unwrap();
+    assert_eq!(long.execution_profile.mode, ExecutionMode::Atomic);
+    assert_eq!(long.execution_profile.max_batch_size, 1);
+    assert_eq!(long.stages.len(), 1);
+    assert_eq!(long.stages[0].name, "asr.long_form.atomic");
+    assert_eq!(long.stages[0].selector, StageWorkSelector::Atomic);
+    assert_eq!(long.stages[0].batch_mode, NativeBatchMode::None);
+    assert!(long
+        .adapter_binding()
+        .unwrap()
+        .stage_for_work(&crate::engine::WorkUnit::AtomicJob {
+            kind: "diarization.transcribe".into(),
+        })
+        .is_ok());
 }
 
 #[test]

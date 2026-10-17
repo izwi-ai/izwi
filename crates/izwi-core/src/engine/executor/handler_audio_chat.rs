@@ -83,7 +83,8 @@ impl NativeExecutor {
                 &mut leases,
                 &mut |_delta| {},
             )
-        })?;
+        });
+        let input_transcription = leases.fence_on_error(input_transcription)?;
         if request.is_cancelled() {
             return Ok(Self::cancelled_audio_chat(request));
         }
@@ -183,7 +184,7 @@ impl NativeExecutor {
                 )
             }
         });
-        let output = match output {
+        let output = match leases.fence_on_error(output) {
             Err(Error::Cancelled(_)) => return Ok(Self::cancelled_audio_chat(request)),
             output => output?,
         };
