@@ -409,19 +409,10 @@ pub async fn generate_long_form_tts(
 }
 
 /// Long-form segments in flight at once: the rows the engine batches TTS at
-/// (the resolved tensor width on CUDA, two rows on CPU and Metal; the
-/// engine's `engine_row_width`), so segments synthesize side by side
+/// (`RuntimeService::tts_row_width`), so segments synthesize side by side
 /// instead of one after another (SPK-F12). More would only queue.
 fn long_form_segment_concurrency(runtime: &RuntimeService) -> usize {
-    let backend = runtime.backend_context().backend_kind;
-    let width = runtime.config().max_batch_size.resolve(backend);
-    match backend {
-        izwi_core::backends::BackendKind::Cuda => width,
-        izwi_core::backends::BackendKind::Cpu | izwi_core::backends::BackendKind::Metal => {
-            width.min(2)
-        }
-    }
-    .max(1)
+    runtime.tts_row_width()
 }
 
 /// Generate the segments with up to `concurrency` in flight, returning each

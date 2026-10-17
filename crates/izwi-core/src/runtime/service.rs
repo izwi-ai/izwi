@@ -3964,6 +3964,14 @@ impl RuntimeService {
         &self.config
     }
 
+    /// The rows the engine batches TTS (and every other non-chat
+    /// capability) at: the resolved tensor width on CUDA, the portable two
+    /// rows on CPU and Metal (`catalog::engine_row_width`). Callers that fan
+    /// out TTS work size their concurrency from it; more would only queue.
+    pub fn tts_row_width(&self) -> usize {
+        self.adapter_registry.max_tensor_batch_size().max(1)
+    }
+
     /// Effective startup concurrency policy; never re-reads rollout environment variables.
     pub fn chat_concurrency_policy(
         &self,
@@ -11406,6 +11414,7 @@ mod tests {
         // runs at the engine width, clamped per family, and sizes its own
         // staged rows.
         assert_eq!(automatic.adapter_registry.max_tensor_batch_size(), 2);
+        assert_eq!(automatic.tts_row_width(), 2);
         assert_eq!(automatic.adapter_registry.max_chat_tensor_batch_size(), 8);
         assert_eq!(automatic.config().max_staged_transactions, 2);
         let core = automatic.core_engine.config();
@@ -11423,6 +11432,15 @@ mod tests {
         let core = explicit.core_engine.config();
         assert_eq!(core.max_staged_transactions, 3);
         assert!(!core.automatic_row_limits.staged_transactions);
+
+        // An operator's narrower width narrows the TTS rows too.
+        let single = RuntimeService::new(EngineConfig {
+            backend: crate::backends::BackendPreference::Cpu,
+            max_batch_size: crate::config::BatchSizePreference::fixed(1).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(single.tts_row_width(), 1);
     }
 
     /// Unset step sizes take the backend's automatic budget and chunk; an
