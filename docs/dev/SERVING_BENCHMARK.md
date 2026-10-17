@@ -195,6 +195,45 @@ of the 0.6 ms, so the step driver keeps prepare, execute and commit in
 order. The ignored `step_host_overhead_bench` prints the same gap
 (`device_idle`) for a mock model with a fixed device time.
 
+### Long-form transcription beside chat
+
+Long-form ASR (Whisper, Qwen3-ASR, Granite Speech, LFM2.5 Audio) runs one
+audio window per engine dispatch (`asr.long_form.chunked` stages), not the
+whole file in one dispatch. Between two windows the device runs other
+work: control jobs (KV page operations, loads, frees) first, then model
+dispatches by execution lane and workload-class weight
+(`izwi_engine_device_queue_wait_seconds{device,class}`). A running chat
+stream therefore waits at most one window per gap, and after each window a
+ready chat prompt takes the next prefill slot before the transcription's
+next window. VibeVoice ASR, offline Voxtral and Nemotron, and Parakeet
+still transcribe a file in one dispatch.
+
+`IZWI_LANE_STEP_DRIVERS=1` runs one step driver per loaded model instead of
+one for the engine (default off). Lanes then prepare, commit and deliver
+concurrently and an abort, load or purge waits only for its own lane. On
+Metal and CUDA the physical admission still launches one dispatch at a
+time, so the device time a long dispatch holds is bounded by the chunking
+above, not by the lane drivers.
+
+Measured on an M-series Mac (Metal, LFM2.5-1.2B-Instruct Q4_K_M chat at
+`--request-rate 2 --num-prompts 16`, 128 tokens in and out, beside a
+26-minute Whisper-Large-v3-Turbo transcription started 4 s before the chat
+load; machine shared with other work, one run each):
+
+| Build | Chat TTFT p50 / p95 | Chat ITL p50 / p95 / max | Transcription |
+|---|---|---|---|
+| Before (one dispatch per file) | 162.3 s / 167.5 s | 33.4 / 70.0 / 192 ms | 165 s (154 s alone) |
+| After (one window per dispatch) | 12.9 s / 21.3 s | 27.5 / 1891 / 2365 ms | 155 s (148 s alone) |
+
+Before, no chat stream ran while the transcription held the device: every
+request waited for the whole file and then streamed normally, so its ITL
+looks clean. After, streams run during the transcription and each window
+(about 2-2.5 s on this machine) is one inter-token gap, which is the ITL
+tail. Without the transcription both builds measured ITL p95 39-63 ms
+across runs. Several requests failed with 503 in these runs because the
+shared machine left little live memory (`insufficient live memory`), in
+both builds.
+
 ## Regression check per backend
 
 `--profile regression` is a small deterministic profile. It uses 24 seeded
