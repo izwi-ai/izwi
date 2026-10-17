@@ -29,10 +29,10 @@ use izwi_serving_client::WorkerClientTlsConfig;
 use izwi_serving_protocol::{
     decode_realtime_audio_frame, AttemptId, CallerId, CancellationBehavior, DeploymentId,
     GatewayAttestedCallerContext, InputFormat, InvocationErrorCode, InvocationEvent,
-    InvocationEventKind, ModelAlias, ModelGeneration, OutputFormat, PermittedAction,
-    PolicyRevision, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
-    RealtimeSessionCloseCode, RequestId, ServiceClass, ServiceCredentials, SessionId, TaskKind,
-    TenantId, TraceContext, WorkerId, PROTOCOL_V1, REALTIME_SUBPROTOCOL,
+    InvocationEventKind, ModelAlias, OutputFormat, PermittedAction, PolicyRevision,
+    RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeSessionCloseCode,
+    RequestId, ServiceClass, ServiceCredentials, SessionId, TaskKind, TenantId, TraceContext,
+    PROTOCOL_V1, REALTIME_SUBPROTOCOL,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -87,18 +87,10 @@ pub(crate) struct RelayStage {
     pub output_format: OutputFormat,
 }
 
-/// One live relayed session as observed by the gateway. Read through
-/// `registration()` by introspection tests; retained as the registry's
-/// operator-visibility data contract.
+/// One live relayed session as observed by the gateway: when it was
+/// registered, so a session whose cleanup never ran expires.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct SessionRegistration {
-    pub attempt_id: AttemptId,
-    pub worker_id: WorkerId,
-    pub incarnation_id: String,
-    pub deployment_id: DeploymentId,
-    pub model_generation: ModelGeneration,
-    pub principal_namespace: String,
     pub created_at: Instant,
 }
 
@@ -180,18 +172,6 @@ impl RealtimeSessionRegistry {
         } else {
             false
         }
-    }
-
-    /// Live registration lookup for introspection.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn registration(&self, session_id: &SessionId) -> Option<SessionRegistration> {
-        self.entries
-            .lock()
-            .expect("registry poisoned")
-            .by_session
-            .get(session_id)
-            .cloned()
     }
 }
 
@@ -410,23 +390,12 @@ async fn run_relay_session(
 
     // Session accounting: one bounded registry entry per live session gates
     // capacity and duplicate sessions before any worker work happens.
-    let registration =
-        |worker_id: WorkerId, incarnation_id: String, generation| SessionRegistration {
-            attempt_id: requested.attempt_id.clone(),
-            worker_id,
-            incarnation_id,
-            deployment_id: stage.deployment_id.clone(),
-            model_generation: generation,
-            principal_namespace: principal_namespace(&context.principal),
-            created_at: Instant::now(),
-        };
+    let registration = || SessionRegistration {
+        created_at: Instant::now(),
+    };
     if let Err(error) = relay.sessions().insert(
         requested.session_id.clone(),
-        registration(
-            WorkerId::new("pending-selection").expect("bounded identity"),
-            String::new(),
-            ModelGeneration::new(1).expect("non-zero generation"),
-        ),
+        registration(),
         REGISTRATION_TTL,
     ) {
         let code = match error {
@@ -524,11 +493,7 @@ async fn run_relay_session(
     relay.sessions().remove(&requested.session_id);
     let _ = relay.sessions().insert(
         requested.session_id.clone(),
-        registration(
-            selected.key.worker_id.clone(),
-            selected.key.incarnation_id.as_str().to_string(),
-            selected.model_generation,
-        ),
+        registration(),
         REGISTRATION_TTL,
     );
 
@@ -931,15 +896,7 @@ mod tests {
     }
 
     fn registration(created_at: Instant) -> SessionRegistration {
-        SessionRegistration {
-            attempt_id: id("attempt-1"),
-            worker_id: id("worker-1"),
-            incarnation_id: "incarnation-1".into(),
-            deployment_id: id("deployment-1"),
-            model_generation: ModelGeneration::new(1).unwrap(),
-            principal_namespace: "tenant:t1".into(),
-            created_at,
-        }
+        SessionRegistration { created_at }
     }
 
     #[test]

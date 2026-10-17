@@ -43,7 +43,6 @@ impl ArtifactCleanupReason {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArtifactCleanupIntent {
     pub id: String,

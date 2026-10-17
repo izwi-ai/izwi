@@ -471,7 +471,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[allow(dead_code)]
     pub fn new(runtime: RuntimeService, serve_config: &ServeRuntimeConfig) -> anyhow::Result<Self> {
         Self::with_enterprise_hooks(runtime, serve_config, EnterpriseHooks::noop())
     }

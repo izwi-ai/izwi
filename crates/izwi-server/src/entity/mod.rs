@@ -1,3 +1,5 @@
+// sea-orm's entity derives generate `Model`/`Relation` items that not every
+// table reads; the store layer uses the column and active-model types.
 #![allow(dead_code)]
 
 use sea_orm::entity::prelude::*;

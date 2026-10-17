@@ -1641,6 +1641,8 @@ fn response_with_statuses(statuses: &[(&str, &str)]) -> Value {
     Value::Object(responses)
 }
 
+// Route stubs for `#[utoipa::path]`: only the OpenAPI derive reads them, so
+// each one carries a dead-code allow.
 #[allow(dead_code)]
 #[utoipa::path(
     get,
@@ -1848,13 +1850,11 @@ fn cancel_response() {}
 )]
 fn list_response_input_items() {}
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApiErrorEnvelope {
     pub error: ApiErrorBody,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApiErrorBody {
     pub message: String,
@@ -1864,7 +1864,6 @@ pub struct ApiErrorBody {
     pub code: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProbeCheck {
     pub name: String,
@@ -1872,7 +1871,6 @@ pub struct ProbeCheck {
     pub message: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LiveResponse {
     pub status: String,
@@ -1884,7 +1882,6 @@ pub struct LiveResponse {
     pub runtime_failure: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadyResponse {
     pub status: String,
@@ -1901,14 +1898,12 @@ pub struct ReadyResponse {
     pub startup_warnings: Vec<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RequestAdmissionClassSnapshot {
     pub capacity: usize,
     pub available: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RealtimeSessionAdmissionSnapshot {
     pub capacity: usize,
@@ -1916,7 +1911,6 @@ pub struct RealtimeSessionAdmissionSnapshot {
     pub available: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MediaIngestLaneSnapshot {
     pub capacity: usize,
@@ -1940,7 +1934,6 @@ pub enum RuntimeQueueClass {
     Batch,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RuntimeQueueDepth {
     pub queue_class: RuntimeQueueClass,
@@ -1948,7 +1941,6 @@ pub struct RuntimeQueueDepth {
     pub oldest_age_ms: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RuntimeQueueHealthSnapshot {
     pub heartbeat_stale_after_ms: u64,
@@ -1959,7 +1951,6 @@ pub struct RuntimeQueueHealthSnapshot {
     pub uncovered_queue_classes: Vec<RuntimeQueueClass>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RequestAdmissionSnapshot {
     pub global: RequestAdmissionClassSnapshot,
@@ -1971,14 +1962,12 @@ pub struct RequestAdmissionSnapshot {
     pub background: RequestAdmissionClassSnapshot,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OpenAiModelsResponse {
     pub object: String,
     pub data: Vec<OpenAiModel>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OpenAiModel {
     pub id: String,
@@ -1987,14 +1976,12 @@ pub struct OpenAiModel {
     pub owned_by: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CursorPaginationQuery {
     pub limit: Option<usize>,
     pub cursor: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CursorPagination {
     pub next_cursor: Option<String>,
@@ -2002,7 +1989,6 @@ pub struct CursorPagination {
     pub limit: usize,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -2037,7 +2023,6 @@ pub enum ChatReasoningEffort {
     Low,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTemplateKwargs {
     pub enable_thinking: Option<bool>,
@@ -2045,13 +2030,11 @@ pub struct ChatTemplateKwargs {
     pub preserve_thinking: Option<bool>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionStreamOptions {
     pub include_usage: Option<bool>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionMessage {
     pub role: String,
@@ -2059,7 +2042,6 @@ pub struct ChatCompletionMessage {
     pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -2073,7 +2055,6 @@ pub struct ChatCompletionResponse {
     pub izwi_timing: Option<ChatTiming>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionChoice {
     pub index: usize,
@@ -2081,7 +2062,6 @@ pub struct ChatCompletionChoice {
     pub finish_reason: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionChunk {
     pub id: String,
@@ -2092,7 +2072,6 @@ pub struct ChatCompletionChunk {
     pub usage: Option<Usage>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatCompletionDelta {
     pub index: usize,
@@ -2100,7 +2079,6 @@ pub struct ChatCompletionDelta {
     pub finish_reason: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Usage {
     pub prompt_tokens: usize,
@@ -2109,13 +2087,11 @@ pub struct Usage {
     pub prompt_tokens_details: PromptTokensDetails,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SpeechRequest {
     pub model: String,
@@ -2137,7 +2113,6 @@ pub struct SpeechRequest {
     pub saved_voice_id: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SpeechStreamEvent {
     pub event: String,
@@ -2155,7 +2130,6 @@ pub struct SpeechStreamEvent {
     pub error: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionMultipartRequest {
     #[schema(value_type = String, format = Binary)]
@@ -2172,7 +2146,6 @@ pub struct TranscriptionMultipartRequest {
     pub timestamp_granularities: Option<Vec<String>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionJsonRequest {
     pub audio_base64: String,
@@ -2187,13 +2160,11 @@ pub struct TranscriptionJsonRequest {
     pub timestamp_granularities: Option<Vec<String>>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionResponse {
     pub text: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VerboseTranscriptionResponse {
     pub text: String,
@@ -2206,7 +2177,6 @@ pub struct VerboseTranscriptionResponse {
     pub izwi_asr_diagnostics: Option<serde_json::Value>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionTimestampWord {
     pub word: String,
@@ -2214,7 +2184,6 @@ pub struct TranscriptionTimestampWord {
     pub end: f32,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TranscriptionTimestampSegment {
     pub id: usize,
@@ -2223,7 +2192,6 @@ pub struct TranscriptionTimestampSegment {
     pub text: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponsesCreateRequest {
     pub model: String,
@@ -2247,7 +2215,6 @@ pub struct ResponsesCreateRequest {
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseObject {
     pub id: String,
@@ -2261,7 +2228,6 @@ pub struct ResponseObject {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseUsage {
     pub input_tokens: usize,
@@ -2270,13 +2236,11 @@ pub struct ResponseUsage {
     pub input_tokens_details: InputTokensDetails,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InputTokensDetails {
     pub cached_tokens: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseDeletedObject {
     pub id: String,
@@ -2284,14 +2248,12 @@ pub struct ResponseDeletedObject {
     pub deleted: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResponseInputItemsList {
     pub object: String,
     pub data: Vec<serde_json::Value>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ServerSentEvent {
     pub event: Option<String>,
@@ -2835,7 +2797,6 @@ mod tests {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChatTiming {
     pub queue_wait_ms: f64,

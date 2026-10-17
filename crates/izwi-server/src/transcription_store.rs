@@ -22,8 +22,6 @@ use crate::{
     storage_layout,
 };
 
-const DEFAULT_LIST_LIMIT: usize = 200;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -1607,11 +1605,6 @@ fn i64_to_u64(value: i64) -> u64 {
     } else {
         value as u64
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

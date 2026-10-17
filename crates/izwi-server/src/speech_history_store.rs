@@ -12,14 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     artifact_store::{ArtifactId, ArtifactRetention, ArtifactStore, ArtifactTenant},
-    batch_runtime::store::BatchRuntimeStore,
     db::{raw, StoreDatabase},
     entity::{speech_history_records, RuntimeProjectionAttempt},
     ids::new_uuid,
-    persistence::{
-        delete_media_object, persist_audio_object, read_media_object, LocalMediaStorageProvider,
-    },
-    storage_layout,
+    persistence::{delete_media_object, persist_audio_object, read_media_object},
 };
 
 /// Incremental mono PCM16 WAV spool. Drop removes partial output on any failure,
@@ -244,8 +240,6 @@ pub struct StoredSpeechAudioStream {
     pub audio_filename: Option<String>,
 }
 
-const DEFAULT_LIST_LIMIT: usize = 200;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechRouteKind {
@@ -448,8 +442,13 @@ pub struct SpeechHistoryStore {
 }
 
 impl SpeechHistoryStore {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn initialize() -> anyhow::Result<Self> {
+        use crate::{
+            batch_runtime::store::BatchRuntimeStore, persistence::LocalMediaStorageProvider,
+            storage_layout,
+        };
+
         let db_path = storage_layout::resolve_db_path();
         let media_root = storage_layout::resolve_media_root();
 
@@ -1547,11 +1546,6 @@ fn i64_to_usize(value: i64) -> Option<usize> {
     } else {
         usize::try_from(value).ok()
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

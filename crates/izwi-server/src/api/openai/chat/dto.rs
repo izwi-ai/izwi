@@ -6,7 +6,6 @@ use crate::api::openai::convert::InboundContent;
 use crate::api::openai::tool_calls::{ToolCall, ToolCallDelta};
 use izwi_core::{ChatReasoningEffort, ChatTemplateKwargs, ChatTruncation};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -49,8 +48,6 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<OpenAiResponseFormat>,
     #[serde(default)]
     pub stop: Option<serde_json::Value>,
-    #[serde(default)]
-    pub user: Option<String>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
     #[serde(default)]

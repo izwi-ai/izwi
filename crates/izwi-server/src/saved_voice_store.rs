@@ -17,7 +17,6 @@ use crate::{
     storage_layout,
 };
 
-const DEFAULT_LIST_LIMIT: usize = 500;
 const DEFAULT_PERMISSION_SCOPE: &str = "local_owner";
 const DEFAULT_CONSENT_STATUS: &str = "granted";
 const LOCAL_TTS_ALLOWED_USE: &str = "local_tts";
@@ -540,11 +539,6 @@ fn i64_to_u64(value: i64) -> u64 {
     } else {
         value as u64
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]

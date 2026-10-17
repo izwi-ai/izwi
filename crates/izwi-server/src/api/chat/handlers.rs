@@ -80,7 +80,6 @@ pub struct UpdateChatThreadRequest {
     pub system_prompt: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateThreadMessageRequest {
     pub model: String,

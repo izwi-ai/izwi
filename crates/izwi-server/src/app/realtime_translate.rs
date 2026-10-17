@@ -25,15 +25,15 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use izwi_serving_protocol::{
     encode_realtime_audio_frame, AttemptId, AttemptIdentity, InputFormat, InvocationErrorCode,
-    InvocationEvent, InvocationEventKind, ModelGeneration, OutputFormat, RealtimeAudioCodec,
-    RealtimeAudioSpec, RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit,
-    RealtimeSessionCloseCode, RealtimeStageInput, RequestId, ServiceClass, SessionId, TaskKind,
-    WorkerId, MAX_REALTIME_AUDIO_FRAME_BYTES, PROTOCOL_V1,
+    InvocationEvent, InvocationEventKind, OutputFormat, RealtimeAudioCodec, RealtimeAudioSpec,
+    RealtimeClientFrame, RealtimeServerFrame, RealtimeSessionAdmit, RealtimeSessionCloseCode,
+    RealtimeStageInput, RequestId, ServiceClass, SessionId, TaskKind,
+    MAX_REALTIME_AUDIO_FRAME_BYTES, PROTOCOL_V1,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WireMessage;
 
-use crate::api::request_context::{principal_namespace, RequestContext};
+use crate::api::request_context::RequestContext;
 use crate::app::realtime_protocol::{
     RealtimeAudioGapAction, RealtimeClose, RealtimeCloseCode, RealtimeCloseReason,
     RealtimeErrorCode, RealtimeEventEnvelope, RealtimeProtocol, RealtimeServerEnvelope,
@@ -351,14 +351,14 @@ pub(crate) async fn run_translate_session(
                 // Stage availability gates the session the same way an
                 // unconfigured stage refuses a v1 admit: fail closed before
                 // any accounting.
-                let Some(stage) = asr_stage(&relay) else {
+                if asr_stage(&relay).is_none() {
                     close_client(
                         &mut client_sink,
                         Some(RealtimeSessionCloseCode::PolicyDenied),
                     )
                     .await;
                     break;
-                };
+                }
                 let identity = match mint_identity() {
                     Ok(identity) => identity,
                     Err(message) => {
@@ -367,12 +367,6 @@ pub(crate) async fn run_translate_session(
                     }
                 };
                 let registration = SessionRegistration {
-                    attempt_id: identity.attempt_id.clone(),
-                    worker_id: WorkerId::new("pending-selection").expect("bounded identity"),
-                    incarnation_id: String::new(),
-                    deployment_id: stage.deployment_id.clone(),
-                    model_generation: ModelGeneration::new(1).expect("non-zero generation"),
-                    principal_namespace: principal_namespace(&context.principal),
                     created_at: std::time::Instant::now(),
                 };
                 match relay.sessions().insert(
@@ -1208,17 +1202,11 @@ async fn dial_asr_worker(
         ));
     }
 
-    // Refresh the registry entry with the resolved worker identity.
+    // Restart the registry entry's expiry now that a worker accepted it.
     relay.sessions().remove(&identity.session_id);
     let _ = relay.sessions().insert(
         identity.session_id.clone(),
         SessionRegistration {
-            attempt_id: identity.attempt_id.clone(),
-            worker_id: selected.key.worker_id.clone(),
-            incarnation_id: selected.key.incarnation_id.as_str().to_string(),
-            deployment_id: selected.deployment_id.clone(),
-            model_generation: selected.model_generation,
-            principal_namespace: principal_namespace(&context.principal),
             created_at: std::time::Instant::now(),
         },
         REGISTRATION_TTL,

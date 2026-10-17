@@ -41,8 +41,9 @@ pub(crate) fn new_speech_tempfile() -> anyhow::Result<SpeechTempFile> {
 
 struct SpeechSpool {
     owner_dir: PathBuf,
-    #[allow(dead_code)]
-    owner_lock: File,
+    /// Held for the spool's lifetime: the lock marks this process's
+    /// directory as owned.
+    _owner_lock: File,
     active_tempfiles: AtomicUsize,
 }
 
@@ -118,7 +119,7 @@ impl SpeechSpool {
                     Ok(owner_lock) => {
                         return Ok(Self {
                             owner_dir,
-                            owner_lock,
+                            _owner_lock: owner_lock,
                             active_tempfiles: AtomicUsize::new(0),
                         });
                     }

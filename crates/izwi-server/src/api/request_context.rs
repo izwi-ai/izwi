@@ -34,7 +34,6 @@ const MAX_GATEWAY_HEADER_VALUE_BYTES: usize = 8 * 1024;
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     pub correlation_id: String,
-    #[allow(dead_code)]
     pub principal: Principal,
     /// Receiver-local ingress time used to preserve the original end-to-end
     /// request budget when work crosses another process boundary.
@@ -179,32 +178,6 @@ pub(crate) fn principal_namespace(principal: &Principal) -> String {
         Some(tenant) => format!("tenant:{tenant}"),
         None => format!("principal:{}", principal.id),
     }
-}
-
-#[allow(dead_code)]
-pub async fn attach_request_context(mut req: Request, next: Next) -> Response {
-    let correlation_id = req
-        .headers()
-        .get(REQUEST_ID_HEADER)
-        .and_then(header_to_string)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    req.extensions_mut().insert(RequestContext::new(
-        correlation_id.clone(),
-        Principal::local_anonymous(),
-    ));
-
-    if let Ok(value) = HeaderValue::from_str(&correlation_id) {
-        req.headers_mut().insert(REQUEST_ID_HEADER, value);
-    }
-
-    let mut response = with_request_id(correlation_id.clone(), next.run(req)).await;
-    if let Ok(value) = correlation_id.parse() {
-        response.headers_mut().insert(REQUEST_ID_HEADER, value);
-    }
-    response
 }
 
 pub async fn attach_enterprise_request_context(
@@ -871,10 +844,6 @@ mod tests {
     };
     use tower::Service;
 
-    async fn echo_context(Extension(context): Extension<RequestContext>) -> String {
-        context.correlation_id
-    }
-
     async fn echo_context_and_header(
         headers: HeaderMap,
         Extension(context): Extension<RequestContext>,
@@ -891,7 +860,10 @@ mod tests {
         let response = send_request(
             Router::new()
                 .route("/", get(echo_context_and_header))
-                .layer(middleware::from_fn(attach_request_context)),
+                .layer(middleware::from_fn(|req, next| async move {
+                    let hooks = izwi_hooks::EnterpriseHooks::noop();
+                    attach_enterprise_request_context_with_hooks(&hooks, None, req, next).await
+                })),
             Request::builder()
                 .uri("/")
                 .body(Body::empty())
@@ -912,35 +884,6 @@ mod tests {
             .await
             .expect("body should read");
         assert_eq!(body, format!("{request_id}|{request_id}").as_bytes());
-    }
-
-    #[tokio::test]
-    async fn supplied_request_id_is_preserved() {
-        let supplied = "client-request-123";
-        let response = send_request(
-            Router::new()
-                .route("/", get(echo_context))
-                .layer(middleware::from_fn(attach_request_context)),
-            Request::builder()
-                .uri("/")
-                .header(HeaderName::from_static(REQUEST_ID_HEADER), supplied)
-                .body(Body::empty())
-                .expect("request should build"),
-        )
-        .await;
-
-        assert_eq!(
-            response
-                .headers()
-                .get(REQUEST_ID_HEADER)
-                .and_then(|value| value.to_str().ok()),
-            Some(supplied)
-        );
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body should read");
-        assert_eq!(body, supplied.as_bytes());
     }
 
     #[tokio::test]

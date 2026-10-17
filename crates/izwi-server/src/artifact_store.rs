@@ -193,7 +193,6 @@ pub(crate) struct AttemptArtifactWrite {
     pub object: ArtifactWrite,
 }
 
-#[allow(dead_code)] // The final-WAV adopter follows the provider primitive.
 #[derive(Debug, Clone)]
 pub(crate) struct ArtifactFileWrite {
     pub content_type: String,
@@ -204,7 +203,11 @@ pub(crate) struct ArtifactFileWrite {
     pub retention: ArtifactRetention,
 }
 
-#[allow(dead_code)] // The final-WAV adopter follows the provider primitive.
+/// A generic attempt artifact written through the reserved file primitive.
+/// Production writes only the final speech WAV
+/// (`put_attempt_speech_history_file`); the conformance tests drive the
+/// primitive through this generic form.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct AttemptArtifactFileWrite {
     pub publication_key: String,
@@ -467,7 +470,7 @@ impl ArtifactStore {
         .await
     }
 
-    #[allow(dead_code)] // Exercised by conformance tests before route adoption.
+    #[cfg(test)]
     pub(crate) async fn put_attempt_file_artifact(
         &self,
         tenant: &ArtifactTenant,
@@ -973,7 +976,6 @@ impl ArtifactStore {
         .await
     }
 
-    #[allow(dead_code)]
     async fn store_reserved_file(
         &self,
         tenant: &ArtifactTenant,
@@ -1144,7 +1146,6 @@ impl ArtifactStore {
         self.validate_object_identity(&write.content_type, write.filename.as_deref())
     }
 
-    #[allow(dead_code)]
     fn validate_file_write(&self, write: &ArtifactFileWrite) -> Result<(), ArtifactStoreError> {
         if write.size_bytes == 0 {
             return Err(ArtifactStoreError::InvalidInput("empty artifact"));

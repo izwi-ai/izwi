@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::openai::convert::InboundContent;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResponsesCreateRequest {
     pub model: String,
@@ -17,8 +16,6 @@ pub struct ResponsesCreateRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
-    #[serde(default)]
-    pub user: Option<String>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]

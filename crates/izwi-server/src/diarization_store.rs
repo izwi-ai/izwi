@@ -20,8 +20,6 @@ use crate::{
     storage_layout,
 };
 
-const DEFAULT_LIST_LIMIT: usize = 200;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -1362,11 +1360,6 @@ fn i64_to_usize(value: i64) -> Option<usize> {
     } else {
         usize::try_from(value).ok()
     }
-}
-
-#[allow(dead_code)]
-pub const fn default_list_limit() -> usize {
-    DEFAULT_LIST_LIMIT
 }
 
 #[cfg(test)]
