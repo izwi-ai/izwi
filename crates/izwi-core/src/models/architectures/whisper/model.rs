@@ -1203,8 +1203,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_f16_whisper_is_finite_and_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_f16_whisper_is_finite_and_tracks_cpu_f32",
+        ) else {
             return;
         };
         let f16 = probe_at(DType::F16, &device);

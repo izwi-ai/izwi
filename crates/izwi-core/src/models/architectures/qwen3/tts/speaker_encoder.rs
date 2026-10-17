@@ -621,8 +621,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn speaker_encoder_runs_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; speaker encoder Metal leg not run");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("speaker_encoder_runs_on_metal")
+        else {
             return;
         };
         let config = SpeakerEncoderConfig {

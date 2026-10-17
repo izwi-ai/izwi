@@ -4861,8 +4861,9 @@ mod tests {
     fn metal_weight_only_f16_engages_ggml_and_matches_cpu_f32() {
         use crate::kernels::f16_weight_linear::F16WeightLinearPath;
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_weight_only_f16_engages_ggml_and_matches_cpu_f32",
+        ) else {
             return;
         };
         let (network, vb) = hashed_encoder_network(&device, true, hashed_conformer_tensors());

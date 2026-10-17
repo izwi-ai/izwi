@@ -146,6 +146,8 @@ fn qwen35_local_decode_trace() {
     let model_dir = std::path::PathBuf::from(home)
         .join("Library/Application Support/izwi/models")
         .join(&name);
+    #[cfg(feature = "metal")]
+    let _lease = crate::backends::metal_test_device_or_skip("qwen35_local_decode_trace");
     let device = DeviceSelector::detect_for_preference(BackendPreference::Metal)
         .ok()
         .filter(|profile| profile.kind != crate::backends::DeviceKind::Cpu)
@@ -484,6 +486,9 @@ fn qwen35_decode_width_parity_and_throughput_cpu() {
 #[test]
 #[ignore = "needs a local Qwen3.5 checkpoint"]
 fn qwen35_decode_width_parity_and_throughput_metal() {
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "qwen35_decode_width_parity_and_throughput_metal",
+    );
     let device =
         DeviceSelector::detect_for_preference(BackendPreference::Metal).expect("metal device");
     if device.kind == crate::backends::DeviceKind::Cpu {

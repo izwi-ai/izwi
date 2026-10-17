@@ -5435,8 +5435,9 @@ pub(crate) mod tests {
     #[test]
     fn every_fused_path_resolves_and_tracks_the_reference_trunk_on_metal() {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; metal end-to-end leg not run");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "every_fused_path_resolves_and_tracks_the_reference_trunk_on_metal",
+        ) else {
             return;
         };
         let cfg = e2e_config();
@@ -5717,7 +5718,9 @@ pub(crate) mod tests {
     #[test]
     fn segmented_decode_matches_the_standard_batched_path_on_metal() {
         use crate::models::architectures::qwen36moe::fused_moe::Qwen36MoeBackendRequest;
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "segmented_decode_matches_the_standard_batched_path_on_metal",
+        ) else {
             return;
         };
         let load = || {
@@ -6211,7 +6214,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn owned_recurrent_states_do_not_alias_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "owned_recurrent_states_do_not_alias_on_metal",
+        ) else {
             return;
         };
         let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)

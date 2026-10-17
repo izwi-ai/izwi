@@ -349,9 +349,9 @@ fn tiny_mixed_steps_match_split_calls_on_cpu() {
 #[cfg(feature = "metal")]
 #[test]
 fn tiny_mixed_steps_match_split_calls_on_metal() {
-    let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
-        "tiny_mixed_steps_match_split_calls_on_metal",
-    ) else {
+    let Some((device, _serial)) =
+        crate::backends::metal_test_device_or_skip("tiny_mixed_steps_match_split_calls_on_metal")
+    else {
         return;
     };
     assert_tiny_parity(&device, 1e-4);
@@ -404,7 +404,7 @@ fn asr_trunk_mixed_steps_match_split_calls_on_cpu() {
 #[ignore = "needs the Qwen3-ASR-0.6B GGUF"]
 fn asr_trunk_mixed_steps_match_split_calls_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
-    let Some((_, _serial)) = crate::models::shared::metal_test_device_or_skip(
+    let Some((_, _serial)) = crate::backends::metal_test_device_or_skip(
         "asr_trunk_mixed_steps_match_split_calls_on_metal",
     ) else {
         return;

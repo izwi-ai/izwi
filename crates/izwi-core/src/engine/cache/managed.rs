@@ -5526,7 +5526,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn managed_metal_runtime_allocates_on_the_exact_worker_device() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "managed_metal_runtime_allocates_on_the_exact_worker_device",
+        ) else {
             return Ok(());
         };
         let expected_location = device.location();

@@ -1036,8 +1036,9 @@ mod precision_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_fish_probe_passes_in_f16() {
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((metal, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_fish_probe_passes_in_f16")
+        else {
             return;
         };
         let (slow, fast) = tiny_random_parts(&metal, DType::F16, 1.0);

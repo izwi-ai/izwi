@@ -1790,7 +1790,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn replayed_session_resumes_exactly_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "gemma3 replayed_session_resumes_exactly_on_metal",
         ) else {
             return;
@@ -1806,7 +1806,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn incremental_stream_matches_whole_sequence_decode_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "gemma3 incremental_stream_matches_whole_sequence_decode_on_metal",
         ) else {
             return;
@@ -1984,7 +1984,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn continuous_batch_reads_back_once_per_step_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "gemma3 continuous_batch_reads_back_once_per_step_on_metal",
         ) else {
             return;

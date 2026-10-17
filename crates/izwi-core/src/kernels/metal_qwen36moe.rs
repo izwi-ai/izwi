@@ -1464,10 +1464,6 @@ mod tests {
     use crate::kernels::cuda::moe::{self, RouteSpec, SharedSlot};
     use candle_core::{DType, Device, Tensor};
 
-    fn device() -> Option<Device> {
-        crate::backends::metal_device_if_available(0)
-    }
-
     fn bytes(n: usize, seed: u64) -> Vec<u8> {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..n)
@@ -1513,7 +1509,11 @@ mod tests {
 
     #[test]
     fn metal_fp8_projection_matches_the_cpu_reference() {
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_fp8_projection_matches_the_cpu_reference",
+        ) else {
+            return;
+        };
         for (m, n, k) in [(1usize, 64usize, 256usize), (3, 136, 512), (7, 512, 2048)] {
             let w = Tensor::from_vec(bytes(n * k, (n + k) as u64), (n, k), &Device::Cpu).unwrap();
             let s = Tensor::from_vec(
@@ -1538,7 +1538,11 @@ mod tests {
 
     #[test]
     fn metal_grouped_prefill_matches_the_per_pair_kernels() {
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_grouped_prefill_matches_the_per_pair_kernels",
+        ) else {
+            return;
+        };
         let (hidden, inter, experts, tokens) = (1024usize, 512usize, 33usize, 48usize);
         let spec = RouteSpec {
             num_experts: experts,
@@ -1613,7 +1617,11 @@ mod tests {
     #[test]
     fn metal_gdn_decode_matches_the_cpu_reference_at_trunk_geometry() {
         use crate::kernels::cuda::gdn::{conv_decode, recurrent_decode, GdnDecodeSpec, HEAD_DIM};
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_gdn_decode_matches_the_cpu_reference_at_trunk_geometry",
+        ) else {
+            return;
+        };
         let d = HEAD_DIM;
         for grouped in [true, false] {
             let spec = GdnDecodeSpec {
@@ -1680,7 +1688,11 @@ mod tests {
     #[test]
     fn metal_rms_norm_matches_the_composition() {
         use crate::kernels::cuda::norm::{add_rms_norm, rms_norm};
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_rms_norm_matches_the_composition")
+        else {
+            return;
+        };
         for (rows, hidden) in [(1usize, 2048usize), (5, 2048), (16, 256)] {
             let mk = |seed: f32| {
                 Tensor::from_vec(wave(rows * hidden, seed, 3.0), (rows, hidden), &Device::Cpu)
@@ -1720,7 +1732,11 @@ mod tests {
     #[test]
     fn metal_attn_gate_matches_the_composition() {
         use crate::kernels::cuda::gate::{attn_gate, reference};
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_attn_gate_matches_the_composition")
+        else {
+            return;
+        };
         for (rows, heads, head_dim) in [(1usize, 16usize, 256usize), (3, 2, 100)] {
             let width = heads * head_dim;
             let attn =
@@ -1752,7 +1768,11 @@ mod tests {
     #[test]
     fn metal_qk_norm_rope_matches_the_cpu_reference() {
         use crate::kernels::cuda::rope::{qk_norm_rope, MropePosition, QkNormRopeSpec};
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_qk_norm_rope_matches_the_cpu_reference",
+        ) else {
+            return;
+        };
         let spec = QkNormRopeSpec {
             num_heads: 16,
             num_kv_heads: 2,
@@ -1817,7 +1837,11 @@ mod tests {
 
     #[test]
     fn metal_fused_moe_matches_the_cpu_reference_at_trunk_geometry() {
-        let Some(gpu) = device() else { return };
+        let Some((gpu, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_fused_moe_matches_the_cpu_reference_at_trunk_geometry",
+        ) else {
+            return;
+        };
         let (hidden, inter, experts) = (2048usize, 512usize, 256usize);
         let spec = RouteSpec {
             num_experts: experts,

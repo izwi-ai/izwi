@@ -6191,7 +6191,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn owned_recurrent_states_do_not_alias_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "owned_recurrent_states_do_not_alias_on_metal",
+        ) else {
             return;
         };
         let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)
@@ -6747,8 +6749,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn mrope_plan_keeps_long_position_angles_in_f32_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; qwen38 mrope metal leg not run");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "mrope_plan_keeps_long_position_angles_in_f32_on_metal",
+        ) else {
             return;
         };
         assert_mrope_plan_rounds_only_cos_sin(&device, &[(DType::F32, 1e-5), (DType::F16, 1e-3)]);

@@ -230,7 +230,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_dequantization_is_bit_exact_against_the_cpu_reference() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_dequantization_is_bit_exact_against_the_cpu_reference",
+        ) else {
             return;
         };
         for (n, k) in [(192usize, 384usize), (1280, 256), (256, 768)] {

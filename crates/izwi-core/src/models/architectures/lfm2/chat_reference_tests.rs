@@ -557,6 +557,8 @@ fn lfm25_chat_matches_the_f32_reference_on_cpu() {
 fn lfm25_chat_matches_the_f32_reference_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
     use candle_core::Device;
+    let _lease =
+        crate::backends::metal_test_device_or_skip("lfm25_chat_matches_the_f32_reference_on_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !matches!(profile.device, Device::Metal(_)) {
         eprintln!("skipping: no Metal device");
@@ -599,6 +601,7 @@ fn lfm25_chat_matches_the_f32_reference_on_cuda() {
 fn lfm25_f16_kv_tracks_f32_kv_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
     use candle_core::Device;
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_f16_kv_tracks_f32_kv_on_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !matches!(profile.device, Device::Metal(_)) {
         eprintln!("skipping: no Metal device");
@@ -764,6 +767,9 @@ fn lfm25_decode_matches_across_batch_widths_on_cpu() {
 fn lfm25_decode_matches_across_batch_widths_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
     use candle_core::Device;
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "lfm25_decode_matches_across_batch_widths_on_metal",
+    );
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !matches!(profile.device, Device::Metal(_)) {
         eprintln!("skipping: no Metal device");
@@ -877,6 +883,9 @@ fn lfm25_replay_rebuilds_the_unpreempted_state_on_cpu() {
 fn lfm25_replay_rebuilds_the_unpreempted_state_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
     use candle_core::Device;
+    let _lease = crate::backends::metal_test_device_or_skip(
+        "lfm25_replay_rebuilds_the_unpreempted_state_on_metal",
+    );
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !matches!(profile.device, Device::Metal(_)) {
         eprintln!("skipping: no Metal device");

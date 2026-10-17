@@ -3657,9 +3657,13 @@ mod tests {
     fn batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics() -> Result<()> {
         let mut devices = vec![Device::Cpu];
         #[cfg(feature = "metal")]
-        if let Some(device) = crate::backends::metal_device_if_available(0) {
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "batched_row_mutations_preserve_order_dtypes_and_parallel_copy_semantics",
+        )
+        .map(|(device, lease)| {
             devices.push(device);
-        }
+            lease
+        });
         #[cfg(feature = "cuda")]
         if let Ok(device) = Device::new_cuda(0) {
             devices.push(device);
@@ -3731,7 +3735,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn prefill_lowering_is_compact_and_cache_key_tracks_generations() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "prefill_lowering_is_compact_and_cache_key_tracks_generations",
+        ) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -3858,9 +3864,14 @@ mod tests {
     #[test]
     fn resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero() -> Result<()> {
         let mut devices = vec![Device::Cpu];
-        if let Some(metal) = crate::backends::metal_device_if_available(0) {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "resident_page_copy_fills_the_leading_pages_and_keeps_the_tail_zero",
+        )
+        .map(|(metal, lease)| {
             devices.push(metal);
-        }
+            lease
+        });
         for device in devices {
             for dtype in [DType::F32, DType::F16] {
                 // [pages, page_tokens, kv_heads, head_dim]
@@ -3884,7 +3895,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn failed_in_place_plan_update_never_serves_mixed_device_tables() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "failed_in_place_plan_update_never_serves_mixed_device_tables",
+        ) else {
             return Ok(());
         };
         let arena_id = KvArenaId {
@@ -3969,7 +3982,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn clean_page_tracking_elides_only_proven_redundant_zeroes() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "clean_page_tracking_elides_only_proven_redundant_zeroes",
+        ) else {
             return Ok(());
         };
         let binding = KvLayerBinding {
@@ -4040,7 +4055,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn graph_writes_keep_the_write_bookkeeping() -> Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("graph_writes_keep_the_write_bookkeeping")
+        else {
             return Ok(());
         };
         let bindings = [0u32, 1].map(|layer| KvLayerBinding {

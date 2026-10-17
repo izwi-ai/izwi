@@ -659,7 +659,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn mixed_step_matches_per_row_attention_on_metal() {
-        let Some((device, _guard)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _guard)) = crate::backends::metal_test_device_or_skip(
             "mixed_step_matches_per_row_attention_on_metal",
         ) else {
             return;

@@ -396,7 +396,10 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_rotation_matches_frozen_upstream_oracles() {
-        let device = crate::backends::metal_device_if_available(0).expect("Metal device");
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_rotation_matches_frozen_upstream_oracles",
+        )
+        .expect("Metal device");
         check_oracles(&device);
     }
 

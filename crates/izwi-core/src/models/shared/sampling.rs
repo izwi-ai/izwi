@@ -1841,7 +1841,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn batched_rows_match_single_row_sampling_with_one_readback_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "batched_rows_match_single_row_sampling_with_one_readback_on_metal",
         ) else {
             return;
@@ -1972,8 +1972,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_device_resident_top_k_sample_matches_cpu_gumbel_max() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_device_resident_top_k_sample_matches_cpu_gumbel_max",
+        ) else {
             return;
         };
         let values = crate::kernels::numeric_check::xorshift_values(2049, 31, 4.0);
@@ -2329,7 +2330,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_bounded_candidates_match_cpu_semantics_if_available() {
-        let Some(metal) = crate::backends::metal_device_if_available(0) else {
+        let Some((metal, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_bounded_candidates_match_cpu_semantics_if_available",
+        ) else {
             return;
         };
         let width = 257;

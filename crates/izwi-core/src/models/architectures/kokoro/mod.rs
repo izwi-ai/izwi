@@ -1765,6 +1765,10 @@ mod tests {
             return;
         };
 
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "kokoro_local_generate_metal_smoke_if_env_set",
+        );
         let Ok(device) = DeviceSelector::detect_with_preference(Some("metal")) else {
             return;
         };

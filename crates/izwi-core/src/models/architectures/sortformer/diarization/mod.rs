@@ -4422,7 +4422,9 @@ mod tests {
     #[test]
     fn sortformer_streaming_commit_stages_state_on_the_metal_arena_device() {
         let _env = env_lock().lock().unwrap();
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "sortformer_streaming_commit_stages_state_on_the_metal_arena_device",
+        ) else {
             // No Metal device on this host: the CPU test above still covers
             // the device-routing contract.
             return;

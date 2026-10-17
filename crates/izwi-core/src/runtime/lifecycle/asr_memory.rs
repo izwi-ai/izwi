@@ -2741,7 +2741,9 @@ pub(super) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn granite_metal_representation_matches_the_loader() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "granite_metal_representation_matches_the_loader",
+        ) else {
             return;
         };
         let _env = env_lock();

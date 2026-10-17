@@ -512,7 +512,7 @@ fn tiny_mixed_steps_match_split_calls_on_cpu() {
 #[cfg(feature = "metal")]
 #[test]
 fn tiny_mixed_steps_match_split_calls_on_metal() {
-    let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+    let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
         "lfm2 tiny_mixed_steps_match_split_calls_on_metal",
     ) else {
         return;
@@ -579,9 +579,9 @@ fn lfm25_mixed_steps_match_split_calls_on_cpu() {
 #[ignore = "needs the LFM2.5-1.2B GGUF (IZWI_LFM25_MODELS_DIR)"]
 fn lfm25_mixed_steps_match_split_calls_on_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
-    let Some((_, _serial)) = crate::models::shared::metal_test_device_or_skip(
-        "lfm25_mixed_steps_match_split_calls_on_metal",
-    ) else {
+    let Some((_, _serial)) =
+        crate::backends::metal_test_device_or_skip("lfm25_mixed_steps_match_split_calls_on_metal")
+    else {
         return;
     };
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
@@ -872,7 +872,7 @@ fn lfm25_mixed_vs_split_step_timing_cpu() {
 fn lfm25_mixed_vs_split_step_timing_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
     let Some((_, _serial)) =
-        crate::models::shared::metal_test_device_or_skip("lfm25_mixed_vs_split_step_timing_metal")
+        crate::backends::metal_test_device_or_skip("lfm25_mixed_vs_split_step_timing_metal")
     else {
         return;
     };

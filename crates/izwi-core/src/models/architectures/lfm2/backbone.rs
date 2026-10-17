@@ -2845,7 +2845,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn rope_tables_match_f64_at_far_positions_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "rope_tables_match_f64_at_far_positions_on_metal",
+        ) else {
             return;
         };
         assert_rope_tables_exact(&device);
@@ -3475,7 +3477,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn unfused_shortconv_ring_falls_back_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "unfused_shortconv_ring_falls_back_on_metal",
+        ) else {
             return;
         };
         assert_unfused_ring_matches_cpu(&device);

@@ -3313,8 +3313,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var(super::FUSED_DECODE_ENV);
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; fused DeltaNet Metal leg not run");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "fused_deltanet_decode_matches_the_candle_chain_on_metal",
+        ) else {
             return;
         };
         for (key_heads, value_heads) in [(2, 2), (2, 4)] {
@@ -3494,7 +3495,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn owned_recurrent_states_do_not_alias_on_metal() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "owned_recurrent_states_do_not_alias_on_metal",
+        ) else {
             return;
         };
         let first = owned_zero_tensor(&[1, 2, 4, 4], DType::F32, &device)

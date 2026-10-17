@@ -974,7 +974,7 @@ impl EngineConfig {
 }
 
 fn default_backend_preference() -> BackendPreference {
-    BackendRouter::env_preference().unwrap_or(BackendPreference::Auto)
+    BackendRouter::unset_preference()
 }
 
 fn default_num_threads() -> usize {

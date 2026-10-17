@@ -1717,7 +1717,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fused_write_matches_write_and_attend_on_a_metal_arena() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "fused_write_matches_write_and_attend_on_a_metal_arena",
+        ) else {
             return;
         };
         let (kv_heads, heads, dim, page_tokens) = (2usize, 4usize, 8usize, 4u32);
@@ -1878,8 +1880,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_probe_cache_attends_causally_in_f16() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("metal_probe_cache_attends_causally_in_f16")
+        else {
             return;
         };
         probe_cache_attends_causally(&device, candle_core::DType::F16);

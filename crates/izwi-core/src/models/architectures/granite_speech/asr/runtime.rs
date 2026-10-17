@@ -5744,8 +5744,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_weight_only_f16_encoder_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_weight_only_f16_encoder_tracks_cpu_f32",
+        ) else {
             return;
         };
         assert_weight_only_f16_encoder_tracks_f32(&device);
@@ -5792,8 +5793,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_encoder_valid_key_mask_builds_on_the_gpu() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_encoder_valid_key_mask_builds_on_the_gpu",
+        ) else {
             return;
         };
         let mask = encoder_valid_key_mask(&[1, 3], 2, 2, &device, DType::F32).unwrap();
@@ -5927,8 +5929,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_selective_f16_lm_probe_tracks_cpu_f32() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_selective_f16_lm_probe_tracks_cpu_f32",
+        ) else {
             return;
         };
         assert_selective_f16_lm_tracks_f32(&device);

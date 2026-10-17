@@ -3091,8 +3091,9 @@ mod tests {
                     .unwrap();
             host_f32(&latent).unwrap()
         };
-        let Some(metal_device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; VibeVoice F16 latent leg not run");
+        let Some((metal_device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_f16_latent_sampling_matches_f32_on_the_checkpoint",
+        ) else {
             return;
         };
         let reference = sample(&Device::Cpu, DeviceKind::Cpu, DType::F32);

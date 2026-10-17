@@ -22,6 +22,8 @@ pub use cuda_runtime::{
     private_cuda_runtime_candidates, private_cuda_runtime_env_key, resolve_private_cuda_runtime,
     CudaRuntimeDiagnostics,
 };
+#[cfg(all(test, feature = "metal"))]
+pub(crate) use device::metal_test_device_or_skip;
 pub use device::{
     metal_apple_gpu_family, metal_bf16_checkpoint_lm_tier, metal_device_if_available,
     metal_runtime_supported, metal_supports_fast_bf16, parse_dtype_name, AppleGpuFamily,

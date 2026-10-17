@@ -188,6 +188,7 @@ fn lfm25_decode_step_timing_cpu() {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_decode_step_timing_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_decode_step_timing_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if !profile.device.is_metal() {
         return;
@@ -259,7 +260,9 @@ fn projection_bandwidth(device: &candle_core::Device) {
 #[test]
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_projection_bandwidth_metal() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("lfm25_projection_bandwidth_metal")
+    else {
         return;
     };
     projection_bandwidth(&device);
@@ -276,7 +279,9 @@ fn lfm25_projection_bandwidth_cpu() {
 #[test]
 #[ignore = "timing"]
 fn lfm25_selection_ops_metal() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("lfm25_selection_ops_metal")
+    else {
         return;
     };
     let logits = Tensor::randn(0f32, 1f32, (1, 65_536), &device).unwrap();
@@ -383,6 +388,7 @@ fn scalar_vs_batched(profile: DeviceProfile) {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_scalar_vs_batched_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_scalar_vs_batched_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if profile.device.is_metal() {
         scalar_vs_batched(profile);
@@ -479,6 +485,7 @@ fn one_sync_vs_three(profile: DeviceProfile) {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_one_sync_vs_three_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_one_sync_vs_three_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if profile.device.is_metal() {
         one_sync_vs_three(profile);
@@ -539,6 +546,8 @@ fn fused_vs_unfused_shortconv(profile: DeviceProfile) {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_fused_vs_unfused_shortconv_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease =
+        crate::backends::metal_test_device_or_skip("lfm25_fused_vs_unfused_shortconv_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if profile.device.is_metal() {
         fused_vs_unfused_shortconv(profile);
@@ -613,7 +622,9 @@ fn batched_projection_shapes(device: &candle_core::Device) {
 #[test]
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_batched_projection_shapes_metal() {
-    if let Some(device) = crate::backends::metal_device_if_available(0) {
+    if let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("lfm25_batched_projection_shapes_metal")
+    {
         batched_projection_shapes(&device);
     }
 }
@@ -636,7 +647,9 @@ fn lfm25_kquant_mat_vec_matches_candle_on_real_weights() {
     let path = models_dir_for_bench()
         .join("LFM2.5-1.2B-Instruct-GGUF")
         .join("LFM2.5-1.2B-Instruct-Q4_K_M.gguf");
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
+    let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+        "lfm25_kquant_mat_vec_matches_candle_on_real_weights",
+    ) else {
         return;
     };
     if !path.exists() {
@@ -769,6 +782,7 @@ fn batch_width_scaling(profile: DeviceProfile) {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_batch_width_scaling_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_batch_width_scaling_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if profile.device.is_metal() {
         batch_width_scaling(profile);
@@ -853,6 +867,7 @@ fn kv_dtype_decode(profile: DeviceProfile) {
 #[ignore = "needs the LFM2.5-1.2B GGUF"]
 fn lfm25_kv_dtype_decode_metal() {
     use crate::backends::{BackendPreference, DeviceSelector};
+    let _lease = crate::backends::metal_test_device_or_skip("lfm25_kv_dtype_decode_metal");
     let profile = DeviceSelector::detect_for_preference(BackendPreference::Metal).unwrap();
     if profile.device.is_metal() {
         kv_dtype_decode(profile);

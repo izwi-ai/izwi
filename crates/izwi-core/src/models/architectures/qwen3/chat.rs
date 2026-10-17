@@ -1683,7 +1683,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn replayed_session_resumes_exactly_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "qwen3 replayed_session_resumes_exactly_on_metal",
         ) else {
             return;
@@ -1699,7 +1699,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn incremental_stream_matches_whole_sequence_decode_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "qwen3 incremental_stream_matches_whole_sequence_decode_on_metal",
         ) else {
             return;
@@ -1722,7 +1722,7 @@ mod stream_tests {
     fn concurrent_streams_on_one_metal_device_match_a_serial_run() {
         use crate::models::shared::sampling::ChatSampler;
 
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "qwen3 concurrent_streams_on_one_metal_device_match_a_serial_run",
         ) else {
             return;
@@ -1841,7 +1841,7 @@ mod stream_tests {
     #[cfg(feature = "metal")]
     #[test]
     fn continuous_batch_reads_back_once_per_step_on_metal() {
-        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+        let Some((device, _serial)) = crate::backends::metal_test_device_or_skip(
             "qwen3 continuous_batch_reads_back_once_per_step_on_metal",
         ) else {
             return;

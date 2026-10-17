@@ -761,7 +761,17 @@ pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
     if !metal_runtime_supported() {
         return None;
     }
+    #[cfg(all(test, feature = "metal"))]
+    assert!(
+        metal_test_lease::held() || super::DeviceScope::current().is_some(),
+        "a test reached the shared Metal device without \
+         `backends::metal_test_device_or_skip` (two threads driving one Metal \
+         device corrupt readbacks and can crash in its residency set)"
+    );
+    shared_metal_device(ordinal)
+}
 
+fn shared_metal_device(ordinal: usize) -> Option<Device> {
     let devices = METAL_DEVICES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut devices = devices
         .lock()
@@ -783,10 +793,95 @@ pub fn metal_device_if_available(ordinal: usize) -> Option<Device> {
 pub(crate) fn private_metal_device_for_tests(
     ordinal: usize,
 ) -> candle_core::Result<Option<Device>> {
-    if metal_device_if_available(ordinal).is_none() {
+    if !metal_runtime_supported() || shared_metal_device(ordinal).is_none() {
         return Ok(None);
     }
+    // Construct under the registry lock: Candle's device constructor is not
+    // safe to run concurrently.
+    let _devices = METAL_DEVICES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Device::new_metal(ordinal).map(Some)
+}
+
+/// The shared Metal device for a test's Metal leg, held exclusively, or
+/// `None` after a skip note written past libtest's output capture.
+/// `IZWI_REQUIRE_METAL_PARITY=1` turns the skip into a failure on lanes that
+/// own a Metal GPU.
+///
+/// Production runs every device operation on the device's
+/// [`DeviceThread`](super::DeviceThread), because Candle's `MetalDevice` must
+/// not be driven from two threads: concurrent allocations add to and commit
+/// its residency set outside any common lock (a SIGSEGV in
+/// `-[IOGPUMetalResidencySet commit]`), and concurrent command buffers corrupt
+/// readbacks (stray zero token ids, denormal garbage). Tests drive Metal on
+/// their own threads instead, so every test that reaches the shared device
+/// holds this lease for its whole Metal leg, and
+/// [`metal_device_if_available`] refuses a test thread without one. The
+/// lease is re-entrant on its thread.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn metal_test_device_or_skip(
+    test: &str,
+) -> Option<(Device, metal_test_lease::MetalTestLease)> {
+    use std::io::Write;
+
+    let lease = metal_test_lease::MetalTestLease::acquire();
+    let Some(device) = metal_device_if_available(0) else {
+        assert!(
+            std::env::var_os("IZWI_REQUIRE_METAL_PARITY").is_none(),
+            "{test}: IZWI_REQUIRE_METAL_PARITY is set but no Metal device is available"
+        );
+        let _ = writeln!(std::io::stderr(), "{test}: skipped, no Metal device");
+        return None;
+    };
+    Some((device, lease))
+}
+
+#[cfg(all(test, feature = "metal"))]
+pub(crate) mod metal_test_lease {
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static SHARED_DEVICE: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static HELD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether the calling thread holds the shared Metal device's lease.
+    pub(crate) fn held() -> bool {
+        HELD.with(Cell::get)
+    }
+
+    /// Exclusive use of the shared Metal device by the thread holding it.
+    pub(crate) struct MetalTestLease {
+        /// `None` for a nested lease on a thread that already holds one.
+        serial: Option<MutexGuard<'static, ()>>,
+    }
+
+    impl MetalTestLease {
+        pub(super) fn acquire() -> Self {
+            if held() {
+                return Self { serial: None };
+            }
+            let serial = SHARED_DEVICE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            HELD.with(|held| held.set(true));
+            Self {
+                serial: Some(serial),
+            }
+        }
+    }
+
+    impl Drop for MetalTestLease {
+        fn drop(&mut self) {
+            if self.serial.is_some() {
+                HELD.with(|held| held.set(false));
+            }
+        }
+    }
 }
 
 impl DeviceSelector {
@@ -1458,6 +1553,8 @@ mod tests {
 
     #[test]
     fn test_detect_kind_matches_device() {
+        #[cfg(feature = "metal")]
+        let _lease = metal_test_device_or_skip("test_detect_kind_matches_device");
         let profile = DeviceSelector::detect().unwrap();
         match profile.kind {
             DeviceKind::Cpu => assert!(profile.device.is_cpu()),
@@ -1735,8 +1832,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_device_reports_an_apple_silicon_family() {
-        let Some(device) = metal_device_if_available(0) else {
-            eprintln!("skipping: no Metal device");
+        let Some((device, _lease)) =
+            metal_test_device_or_skip("metal_device_reports_an_apple_silicon_family")
+        else {
             return;
         };
         let family = metal_apple_gpu_family(&device).expect("Apple GPU family");

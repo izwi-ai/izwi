@@ -930,7 +930,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv1d_metal_matches_candle_reference",
+        ) else {
             return Ok(());
         };
 
@@ -962,7 +964,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv2d_metal_matches_candle_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv2d_metal_matches_candle_reference",
+        ) else {
             return Ok(());
         };
 
@@ -990,7 +994,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn depthwise_conv1d_bias_swish_metal_matches_reference() -> candle_core::Result<()> {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "depthwise_conv1d_bias_swish_metal_matches_reference",
+        ) else {
             return Ok(());
         };
 

@@ -432,7 +432,9 @@ mod tests {
 
     #[test]
     fn small_batches_match_candle_per_row_mat_vec() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "small_batches_match_candle_per_row_mat_vec",
+        ) else {
             return;
         };
         for (dtype, rows, cols) in [
@@ -472,7 +474,9 @@ mod tests {
     #[test]
     #[ignore = "timing"]
     fn small_batch_timing() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("small_batch_timing")
+        else {
             return;
         };
         for (dtype, rows, cols) in [
@@ -508,7 +512,9 @@ mod tests {
 
     #[test]
     fn unsupported_shapes_are_refused() {
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
+        let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("unsupported_shapes_are_refused")
+        else {
             return;
         };
         let (ext, _) = weight(&device, GgmlDType::Q4K, 8, 256);

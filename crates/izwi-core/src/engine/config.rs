@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use super::scheduler::SchedulingPolicy;
-use crate::backends::{BackendKind, BackendPreference, BackendRouter, BackendSelectionSource};
+use crate::backends::{BackendKind, BackendRouter, BackendSelectionSource};
 use crate::config::{
     resolve_kv_cache_policy, BatchSizePreference, PhysicalExecutionCapacity, PhysicalExecutionMode,
     PhysicalInFlightLimit, ResolvedKvCachePolicy, DEFAULT_MAX_PREFIX_CACHE_PAGES,
@@ -492,8 +492,8 @@ fn default_streaming_chunk_size() -> usize {
 } // 200ms at 24kHz
 
 fn default_backend_kind() -> BackendKind {
-    BackendRouter::resolve_context_from_env_or(
-        BackendPreference::Auto,
+    BackendRouter::resolve_context(
+        BackendRouter::unset_preference(),
         BackendSelectionSource::Default,
     )
     .backend_kind

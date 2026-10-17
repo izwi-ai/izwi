@@ -413,7 +413,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fused_step_matches_op_by_op_on_metal() {
-        if let Some(device) = crate::backends::metal_device_if_available(0) {
+        if let Some((device, _lease)) =
+            crate::backends::metal_test_device_or_skip("fused_step_matches_op_by_op_on_metal")
+        {
             assert_matches_op_by_op(&device, 1e-5);
         }
     }

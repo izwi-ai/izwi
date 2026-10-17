@@ -938,10 +938,11 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_attached_prefill_matches_the_fresh_run() {
-        if crate::backends::metal_device_if_available(0).is_none() {
-            eprintln!("metal device unavailable; attach leg not run");
+        let Some((_, _lease)) = crate::backends::metal_test_device_or_skip(
+            "metal_attached_prefill_matches_the_fresh_run",
+        ) else {
             return;
-        }
+        };
         let profile = crate::backends::DeviceSelector::detect_for_preference(
             crate::backends::BackendPreference::Metal,
         )
@@ -2124,8 +2125,9 @@ pub(crate) mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fixture_generation_matches_between_cpu_and_metal() {
-        let Some(_metal_device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; parity leg not run");
+        let Some((_metal_device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "fixture_generation_matches_between_cpu_and_metal",
+        ) else {
             return;
         };
         let run = |device: DeviceProfile| -> Vec<String> {

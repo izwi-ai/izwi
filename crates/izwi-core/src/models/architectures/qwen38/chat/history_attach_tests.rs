@@ -599,8 +599,9 @@ fn attached_history_matches_the_fresh_run_on_cpu_graph_decode() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_attached_history_matches_the_fresh_run() {
-    let Some(device) = crate::backends::metal_device_if_available(0) else {
-        eprintln!("metal device unavailable; qwen38 history attach leg not run");
+    let Some((device, _lease)) =
+        crate::backends::metal_test_device_or_skip("metal_attached_history_matches_the_fresh_run")
+    else {
         return;
     };
     assert_attach_matches_fresh(device, Qwen38KvStorageProvider::MetalF16, 8, true);

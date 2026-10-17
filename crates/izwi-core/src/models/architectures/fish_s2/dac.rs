@@ -1885,9 +1885,11 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_incremental_codec_matches_full_decode_and_rollback() {
-        check_incremental_codec_partitions(
-            &crate::backends::metal_device_if_available(0).expect("Metal device"),
-        );
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_incremental_codec_matches_full_decode_and_rollback",
+        )
+        .expect("Metal device");
+        check_incremental_codec_partitions(&device);
     }
 
     #[cfg(feature = "cuda")]
@@ -1977,7 +1979,11 @@ mod tests {
     #[test]
     #[ignore = "requires Metal; no CPU fallback"]
     fn metal_batched_codec_matches_scalar_for_mixed_ages_and_rollback() {
-        check_batched_codec(&crate::backends::metal_device_if_available(0).expect("Metal device"));
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_batched_codec_matches_scalar_for_mixed_ages_and_rollback",
+        )
+        .expect("Metal device");
+        check_batched_codec(&device);
     }
 
     fn check_batched_codec(device: &Device) {
@@ -2415,9 +2421,11 @@ mod tests {
     #[test]
     #[ignore = "requires an available Metal device; never falls back to CPU"]
     fn metal_codec_attention_matches_dense_oracle() {
-        check_blocked_attention(
-            &crate::backends::metal_device_if_available(0).expect("Metal device"),
-        );
+        let (device, _lease) = crate::backends::metal_test_device_or_skip(
+            "metal_codec_attention_matches_dense_oracle",
+        )
+        .expect("Metal device");
+        check_blocked_attention(&device);
     }
 
     #[cfg(feature = "cuda")]

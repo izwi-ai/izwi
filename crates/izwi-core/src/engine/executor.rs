@@ -88,8 +88,8 @@ use super::resources::{BatchWorkspaceLease, ResourceAuthority, ResourceVector};
 use super::scheduler::ScheduledRequest;
 use super::types::{AudioOutput, TaskType};
 use crate::backends::{
-    can_parallelize_requests, BackendContext, BackendKind, BackendPreference, BackendRouter,
-    BackendSelectionSource, DeviceJobTag, DeviceThread,
+    can_parallelize_requests, BackendContext, BackendKind, BackendRouter, BackendSelectionSource,
+    DeviceJobTag, DeviceThread,
 };
 use crate::engine::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use crate::error::{Error, Result};
@@ -1007,7 +1007,7 @@ impl std::fmt::Debug for WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         let backend_context = BackendRouter::resolve_context(
-            BackendPreference::Auto,
+            BackendRouter::unset_preference(),
             BackendSelectionSource::Default,
         );
         let backend_kind = backend_context.backend_kind;
@@ -5983,6 +5983,10 @@ mod tests {
 
     #[test]
     fn automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows() {
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "automatic_tensor_width_follows_resolved_backend_and_not_scheduler_rows",
+        );
         for backend in [BackendKind::Cpu, BackendKind::Metal, BackendKind::Cuda] {
             let engine = EngineCoreConfig {
                 backend,

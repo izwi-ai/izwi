@@ -2731,8 +2731,9 @@ mod tests {
         use candle_core::{DType, DeviceLocation};
         use std::sync::Arc;
 
-        let Some(device) = crate::backends::metal_device_if_available(0) else {
-            eprintln!("metal device unavailable; metal plan leg not run");
+        let Some((device, _lease)) = crate::backends::metal_test_device_or_skip(
+            "native_trunk_forwards_under_the_metal_dtype_plan_on_metal",
+        ) else {
             return;
         };
         let device_profile = DeviceProfile {

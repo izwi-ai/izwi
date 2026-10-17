@@ -4161,6 +4161,10 @@ mod tests {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "cpu".to_string());
+        #[cfg(feature = "metal")]
+        let _lease = crate::backends::metal_test_device_or_skip(
+            "nemotron_local_silence_forward_smoke_if_available",
+        );
         let device =
             DeviceSelector::detect_with_preference(Some(&backend)).expect("requested device");
         if backend.eq_ignore_ascii_case("metal") && device.kind != DeviceKind::Metal {
