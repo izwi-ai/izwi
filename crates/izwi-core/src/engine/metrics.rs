@@ -1127,6 +1127,7 @@ pub struct EngineBatchMetricsSnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
+    pub capacity_replay_capped_total: u64,
     pub recompute_preemptions_total: u64,
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,
@@ -1177,6 +1178,14 @@ pub(crate) fn record_capacity_suspension() {
 }
 pub(crate) fn record_capacity_replay(tokens: usize) {
     ENGINE_CAPACITY_REPLAY_TOKENS.fetch_add(tokens as u64, Ordering::Relaxed);
+}
+
+static ENGINE_CAPACITY_REPLAY_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Every replayable claim holder had reached its replay cap, so capacity
+/// pressure fell through to the claim-deadlock breaker.
+pub(crate) fn record_capacity_replay_capped() {
+    ENGINE_CAPACITY_REPLAY_CAPPED.fetch_add(1, Ordering::Relaxed);
 }
 
 static ENGINE_RECOMPUTE_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -1720,6 +1729,7 @@ pub fn engine_batch_metrics_snapshot() -> EngineBatchMetricsSnapshot {
         model_tensor_batch_width_counts: ENGINE_MODEL_WIDTH_COUNTS.snapshot(),
         capacity_suspensions_total: ENGINE_CAPACITY_SUSPENSIONS.load(Ordering::Relaxed),
         capacity_replay_tokens_total: ENGINE_CAPACITY_REPLAY_TOKENS.load(Ordering::Relaxed),
+        capacity_replay_capped_total: ENGINE_CAPACITY_REPLAY_CAPPED.load(Ordering::Relaxed),
         recompute_preemptions_total: ENGINE_RECOMPUTE_PREEMPTIONS.load(Ordering::Relaxed),
         claim_deadlock_aborts_total: ENGINE_CLAIM_DEADLOCK_ABORTS.load(Ordering::Relaxed),
         kv_blocked_requests: ENGINE_KV_BLOCKED_REQUESTS.load(Ordering::Relaxed),

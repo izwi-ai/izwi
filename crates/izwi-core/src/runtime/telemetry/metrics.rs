@@ -305,6 +305,7 @@ pub struct EngineRuntimeTelemetrySnapshot {
     pub model_tensor_batch_width_counts: BTreeMap<u64, u64>,
     pub capacity_suspensions_total: u64,
     pub capacity_replay_tokens_total: u64,
+    pub capacity_replay_capped_total: u64,
     pub recompute_preemptions_total: u64,
     pub claim_deadlock_aborts_total: u64,
     pub kv_blocked_requests: u64,

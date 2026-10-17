@@ -17,7 +17,7 @@ use super::cache::tensor_snapshots::declared_snapshot_prefill_interval;
 use super::config::EngineCoreConfig;
 use super::execution::{
     CacheMode, ExecutionProfile, NativeBatchMode, PrefillMode, RealtimePreparationMode,
-    RealtimeStageOutcome, RealtimeSubphase,
+    RealtimeStageOutcome, RealtimeSubphase, ReplayCapability,
 };
 use super::request::{EngineCoreRequest, RequestStatus, WorkloadClass};
 use super::types::{Priority, RequestId, SequenceId, TaskType};
@@ -36,6 +36,11 @@ const CLASS_VIRTUAL_TIME_UNITS: u64 = 120;
 /// prefix index and prefills from zero, so pages evicted between every probe
 /// and its prepare cannot replan the same request forever.
 const MAX_MANAGED_PREFIX_CURSOR_LOSSES: u8 = 2;
+
+/// Capacity replays after which a request is no longer chosen as a replay
+/// victim, so one request cannot be suspended over and over; once no
+/// replayable victim is left the claim-deadlock breaker decides.
+const MAX_CAPACITY_REPLAYS: u8 = 3;
 
 /// Schedule-time managed prefix probe for one exact session: the cursor its
 /// first prefill span may start at, or `None` for a zero-start prefill.
@@ -627,6 +632,9 @@ struct RequestMetadata {
     retry_not_before: Option<Instant>,
     replay_prompt_tokens: Option<usize>,
     capacity_blocked_on: Option<SessionKey>,
+    /// Capacity replays this request has been through; at
+    /// `MAX_CAPACITY_REPLAYS` it is no longer chosen as a replay victim.
+    capacity_replays: u8,
     /// Retained per-session bound after a pre-execution workspace rejection.
     workspace_prefill_token_cap: Option<usize>,
     /// DS1.2b: declared `CommittedSnapshots` interval of the loaded contract.
@@ -665,6 +673,8 @@ struct RequestCachePolicy {
     decode_batch: NativeBatchMode,
     recompute_safe: bool,
     cache_release_safe: bool,
+    /// The loaded family rebuilds a released session by replaying its tokens.
+    token_replay: bool,
     preferred_decode_tokens: usize,
     sustained_decode_quantum: bool,
     /// DS9.4: the loaded model can run shared speculative envelopes, so
@@ -691,6 +701,7 @@ impl Default for RequestCachePolicy {
             decode_batch: NativeBatchMode::None,
             recompute_safe: false,
             cache_release_safe: false,
+            token_replay: false,
             preferred_decode_tokens: 1,
             sustained_decode_quantum: false,
             speculative_decode_batch: false,
@@ -857,6 +868,7 @@ impl Scheduler {
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
+            capacity_replays: 0,
             workspace_prefill_token_cap: loaded_prefill_token_cap(request),
             managed_snapshot_prefill_interval: request
                 .v2_state_descriptor()
@@ -913,6 +925,7 @@ impl Scheduler {
                 retry_not_before: None,
                 replay_prompt_tokens: None,
                 capacity_blocked_on: None,
+                capacity_replays: 0,
                 workspace_prefill_token_cap: loaded_prefill_token_cap(request),
                 managed_snapshot_prefill_interval: request
                     .v2_state_descriptor()
@@ -1080,6 +1093,7 @@ impl Scheduler {
             decode_batch: profile.decode_batch,
             recompute_safe: profile.recompute_safe,
             cache_release_safe: profile.cache_release_safe,
+            token_replay: profile.replay == ReplayCapability::TokenReplay,
             preferred_decode_tokens: profile.preferred_decode_tokens.max(1),
             sustained_decode_quantum: profile.effective_sustained_decode_quantum(),
             speculative_decode_batch: profile.speculative_decode_batch,
@@ -3023,6 +3037,7 @@ impl Scheduler {
         // cursor must not survive into the replayed spans.
         metadata.managed_prefix_cursor = None;
         metadata.capacity_blocked_on = Some(survivor);
+        metadata.capacity_replays = metadata.capacity_replays.saturating_add(1);
         running.num_tokens_processed = 0;
         running.prefill_complete = false;
         running.prefill_in_flight = false;
@@ -3055,8 +3070,30 @@ impl Scheduler {
             })
     }
 
-    /// Protect the older equal-priority request. Victims remain suspended until
-    /// that exact survivor leaves, avoiding repeated eviction/replay oscillation.
+    /// Whether the loaded family of `request_id` rebuilds a released session
+    /// by replaying its tokens.
+    pub(crate) fn replays_tokens(&self, request_id: &RequestId) -> bool {
+        self.requests
+            .get(request_id)
+            .is_some_and(|metadata| metadata.cache_policy.token_replay)
+    }
+
+    /// Whether `session` has been replayed for capacity as often as one
+    /// request may be.
+    pub(crate) fn capacity_replays_exhausted(&self, session: &SessionKey) -> bool {
+        self.requests
+            .get(&session.request_id)
+            .is_some_and(|metadata| {
+                metadata.sequence_id == session.epoch
+                    && metadata.capacity_replays >= MAX_CAPACITY_REPLAYS
+            })
+    }
+
+    /// The lowest-priority, then youngest, candidate below the survivor in
+    /// the same priority/age order; the older equal-priority request is
+    /// protected. Victims remain suspended until that exact survivor leaves,
+    /// and a request replayed `MAX_CAPACITY_REPLAYS` times is not chosen
+    /// again, avoiding repeated eviction/replay oscillation.
     pub(crate) fn published_capacity_victim(
         &self,
         candidates: impl IntoIterator<Item = SessionKey>,
@@ -3078,10 +3115,16 @@ impl Scheduler {
                     && !running.finalize_in_flight
                     && !running.audio_decode_in_flight
                     && !self.capacity_waiting(meta)
+                    && meta.capacity_replays < MAX_CAPACITY_REPLAYS
                     && (meta.priority < owner.priority
                         || meta.priority == owner.priority && meta.sequence_id > owner.sequence_id)
             })
-            .max_by_key(|candidate| candidate.epoch)
+            .max_by_key(|candidate| {
+                (
+                    std::cmp::Reverse(self.requests[&candidate.request_id].priority),
+                    candidate.epoch,
+                )
+            })
     }
 
     /// Restart an exact running request incarnation from prefill after an
@@ -4267,6 +4310,7 @@ mod tests {
                 decode_batch: NativeBatchMode::None,
                 recompute_safe: false,
                 cache_release_safe: false,
+                token_replay: false,
                 preferred_decode_tokens: 1,
                 sustained_decode_quantum: false,
                 speculative_decode_batch: false,
@@ -4277,6 +4321,7 @@ mod tests {
             retry_not_before: None,
             replay_prompt_tokens: None,
             capacity_blocked_on: None,
+            capacity_replays: 0,
             workspace_prefill_token_cap: None,
             managed_snapshot_prefill_interval: interval,
             managed_snapshot_boundary: None,
@@ -4596,6 +4641,76 @@ mod tests {
         assert_eq!(
             scheduler.published_capacity_victim([peer_session.clone()], &survivor),
             Some(peer_session)
+        );
+    }
+
+    /// D4: the replay victim is the lowest-priority claim holder, then the
+    /// youngest among equal priority (published or not), never the older
+    /// equal-priority survivor, and a request replayed
+    /// `MAX_CAPACITY_REPLAYS` times is no longer chosen.
+    #[test]
+    fn capacity_victim_is_lowest_priority_then_youngest_until_its_replay_cap() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_tokens_per_step: 1024,
+            enable_adaptive_batching: false,
+            enable_chunked_prefill: false,
+            ..Default::default()
+        });
+        let survivor = build_request(TaskType::Chat, "survivor", Priority::Normal);
+        let older_low = build_request(TaskType::Chat, "older-low", Priority::Low);
+        let younger_low = build_request(TaskType::Chat, "younger-low", Priority::Low);
+        let youngest_normal = build_request(TaskType::Chat, "youngest-normal", Priority::Normal);
+        let requests = [&survivor, &older_low, &younger_low, &youngest_normal];
+        for request in requests {
+            assert!(scheduler.add_request(request));
+        }
+        scheduler.schedule();
+        for request in requests {
+            scheduler.update_after_step(&request.id, request.num_prompt_tokens(), 1, 1.0);
+        }
+        let session = |request: &EngineCoreRequest| {
+            SessionKey::new(
+                request.id.clone(),
+                scheduler.get_sequence_id(&request.id).unwrap(),
+            )
+        };
+        let survivor = session(&survivor);
+        let older_low = session(&older_low);
+        let younger_low = session(&younger_low);
+        let youngest_normal = session(&youngest_normal);
+        let candidates = [
+            survivor.clone(),
+            older_low.clone(),
+            younger_low.clone(),
+            youngest_normal.clone(),
+        ];
+        assert_eq!(
+            scheduler.published_capacity_victim(candidates.clone(), &survivor),
+            Some(younger_low.clone())
+        );
+        assert_eq!(
+            scheduler
+                .published_capacity_victim([survivor.clone(), youngest_normal.clone()], &survivor),
+            Some(youngest_normal)
+        );
+        // The survivor is never its own victim.
+        assert_eq!(
+            scheduler.published_capacity_victim([survivor.clone()], &survivor),
+            None
+        );
+        for _ in 0..MAX_CAPACITY_REPLAYS {
+            assert!(!scheduler.capacity_replays_exhausted(&younger_low));
+            scheduler
+                .requests
+                .get_mut(&younger_low.request_id)
+                .unwrap()
+                .capacity_replays += 1;
+        }
+        assert!(scheduler.capacity_replays_exhausted(&younger_low));
+        assert_eq!(
+            scheduler.published_capacity_victim(candidates, &survivor),
+            Some(older_low)
         );
     }
 

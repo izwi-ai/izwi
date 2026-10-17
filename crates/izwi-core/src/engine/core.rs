@@ -1202,6 +1202,8 @@ impl EngineCore {
             ))));
         }
         let mut work = match profile.mode {
+            // A full prefill writes the whole prompt in one quantum, or a
+            // capacity replay's whole journal (prompt plus generated tokens).
             ExecutionMode::Sequence | ExecutionMode::Realtime
                 if scheduled.is_prefill && profile.prefill == PrefillMode::Full =>
             {
@@ -1209,7 +1211,7 @@ impl EngineCore {
                     phase: super::SequencePhase::Prefill,
                     input: super::InputRange {
                         start: 0,
-                        end: request.num_prompt_tokens(),
+                        end: scheduled.num_tokens,
                     },
                     max_output_steps: 1,
                     auxiliary_state: None,
@@ -1700,23 +1702,41 @@ impl EngineCore {
                 .is_ok_and(|model| model.admits_incrementally_on_cuda())
     }
 
-    /// Whether a session released for capacity can be rebuilt by replaying
-    /// its tokens: its loaded contract declares token replay.
+    /// Whether a session released for capacity is rebuilt by replaying its
+    /// tokens: its loaded contract declares token replay and capacity replay
+    /// is on (always for the CUDA incremental route, whose claims rely on it).
     fn replays_for_capacity(&self, request_id: &RequestId) -> bool {
-        self.config.cuda_incremental_chat_enabled()
-            && self.execution_profiles.get(request_id).is_some_and(|cached| {
-                cached.profile.replay == super::ReplayCapability::TokenReplay
-            })
+        (self.config.enable_capacity_replay || self.config.cuda_incremental_chat_enabled())
+            && self.scheduler.replays_tokens(request_id)
     }
 
+    /// Suspend a replayable claim holder so a blocked request can grow. A
+    /// row on the CUDA incremental route (claims of exactly its next span)
+    /// protects itself as soon as it blocks. Chunked claim holders act only
+    /// once their model is in `deadlocked`: then every holder has been seen
+    /// blocked, possibly in different steps, so the survivor and victim are
+    /// chosen among all of them, and a row blocked while its peers still make
+    /// progress waits for them instead of evicting one.
     async fn suspend_published_session_for_capacity(
         &mut self,
         blocked: &[super::scheduler::ScheduledRequest],
+        deadlocked: &HashSet<ModelInstanceId>,
     ) -> Result<bool> {
+        let deadlocked_holders = deadlocked
+            .iter()
+            .filter_map(|model| self.claim_waiters.get(model))
+            .flat_map(|waiters| waiters.holders.iter().cloned());
         let candidates = blocked
             .iter()
-            .filter(|row| self.replays_for_capacity(&row.request_id))
-            .map(|row| row.session_key());
+            .filter(|row| {
+                self.requests
+                    .get(&row.request_id)
+                    .is_some_and(|request| self.uses_incremental_chat_capacity(request))
+            })
+            .map(|row| row.session_key())
+            .chain(deadlocked_holders)
+            .filter(|session| self.replays_for_capacity(&session.request_id))
+            .collect::<Vec<_>>();
         let Some(survivor) = self.scheduler.capacity_survivor(candidates) else {
             return Ok(false);
         };
@@ -1738,11 +1758,18 @@ impl EngineCore {
                         .active_managed_cache
                         .values()
                         .any(|reservation| reservation.session == *session)
-            });
+            })
+            .collect::<Vec<_>>();
         let Some(victim) = self
             .scheduler
-            .published_capacity_victim(candidates, &survivor)
+            .published_capacity_victim(candidates.iter().cloned(), &survivor)
         else {
+            if candidates
+                .iter()
+                .any(|session| self.scheduler.capacity_replays_exhausted(session))
+            {
+                super::metrics::record_capacity_replay_capped();
+            }
             return Ok(false);
         };
         let Some(replay_tokens) = self.executor.suspend_session_for_capacity(&victim).await? else {
@@ -1763,16 +1790,15 @@ impl EngineCore {
     }
 
     /// Chunked chat claims grow during generation, so every claim holder of a
-    /// model can end up waiting to grow at once while none can finish. When no
-    /// row ran this step, suspension and preemption freed nothing, and every
-    /// claim holder of a model has been seen blocked since the holder set last
-    /// changed, fail the youngest lowest-priority holder so the others can
-    /// complete. Decode selection is clamped to the physical width, so the
-    /// holders need not all be blocked in the same step.
-    async fn fail_claim_deadlocked_session(
+    /// model can end up waiting to grow at once while none can finish. Record
+    /// this step's blocked holders and return the models whose every claim
+    /// holder has been seen blocked since the holder set last changed. Decode
+    /// selection is clamped to the physical width, so the holders need not
+    /// all be blocked in the same step.
+    fn claim_deadlocked_models(
         &mut self,
         blocked: &[super::scheduler::ScheduledRequest],
-    ) {
+    ) -> HashSet<ModelInstanceId> {
         let mut by_model = HashMap::<ModelInstanceId, Vec<super::SessionKey>>::new();
         for row in blocked {
             let Some(request) = self.requests.get(&row.request_id) else {
@@ -1792,6 +1818,7 @@ impl EngineCore {
             };
             by_model.entry(model).or_default().push(row.session_key());
         }
+        let mut deadlocked = HashSet::new();
         for (model, blocked_sessions) in by_model {
             let mut holders = self.managed_kv_cache.capacity_claim_sessions(model);
             holders.sort_by(|left, right| {
@@ -1803,13 +1830,27 @@ impl EngineCore {
                 waiters.blocked.clear();
             }
             waiters.blocked.extend(blocked_sessions);
-            let deadlocked = holders.len() > 1
+            if holders.len() > 1
                 && holders
                     .iter()
-                    .all(|holder| waiters.blocked.contains(holder));
-            if !deadlocked {
-                continue;
+                    .all(|holder| waiters.blocked.contains(holder))
+            {
+                deadlocked.insert(model);
             }
+        }
+        deadlocked
+    }
+
+    /// When no row ran this step and suspension and preemption freed
+    /// nothing, fail the youngest lowest-priority claim holder of each
+    /// deadlocked model so the others can complete.
+    async fn fail_claim_deadlocked_session(&mut self, deadlocked: HashSet<ModelInstanceId>) {
+        for model in deadlocked {
+            let holders = self
+                .claim_waiters
+                .get(&model)
+                .map(|waiters| waiters.holders.clone())
+                .unwrap_or_default();
             // Session epochs are scheduler sequence ids, so the highest epoch
             // among the lowest-priority holders is the youngest.
             let Some(victim) = holders
@@ -4986,7 +5027,7 @@ impl EngineCore {
             .collect::<Vec<_>>();
         if !blocked.is_empty()
             && self
-                .suspend_published_session_for_capacity(&blocked)
+                .suspend_published_session_for_capacity(&blocked, &HashSet::new())
                 .await?
         {
             // Reclaimed state changes the physical resource envelope. Keep
@@ -5296,19 +5337,18 @@ impl EngineCore {
         super::metrics::record_kv_blocked_requests(capacity_blocked.len());
         self.resolve_managed_prepare_failures(prepare_failures)
             .await;
-        if decode_batches.is_empty()
-            && prefill_batches.is_empty()
-            && (self
-                .suspend_published_session_for_capacity(&capacity_blocked)
+        if decode_batches.is_empty() && prefill_batches.is_empty() {
+            let deadlocked = self.claim_deadlocked_models(&capacity_blocked);
+            if self
+                .suspend_published_session_for_capacity(&capacity_blocked, &deadlocked)
                 .await?
                 || self
                     .preempt_unpublished_session_for_capacity(&capacity_blocked)
-                    .await?)
-        {
-            return Ok(None);
-        }
-        if decode_batches.is_empty() && prefill_batches.is_empty() {
-            self.fail_claim_deadlocked_session(&capacity_blocked).await;
+                    .await?
+            {
+                return Ok(None);
+            }
+            self.fail_claim_deadlocked_session(deadlocked).await;
         }
         if decode_batches.is_empty()
             && prefill_batches.is_empty()
@@ -11305,6 +11345,85 @@ mod tests {
         assert!(older_peak > 32, "older peaked at {older_peak}");
     }
 
+    /// D4: a burst of equal-priority chat requests over an arena too small
+    /// for them: the first two claim holders end up waiting to grow at once
+    /// (the claim deadlock of
+    /// `chunked_claim_deadlock_fails_only_the_youngest_request`) while the
+    /// third waits for admission. With capacity replay (the default) the
+    /// younger holder is suspended and replayed after the protected request
+    /// finishes, so every request completes with exactly its token budget and
+    /// prompt usage. With replay off the claim-deadlock breaker fails one.
+    #[tokio::test]
+    async fn kv_pressure_burst_completes_every_request_with_capacity_replay() {
+        for replay in [true, false] {
+            let model = ModelInstanceId::new(97);
+            let executor = UnifiedExecutor::new_for_test(Box::new(ManagedDecodeExecutor {
+                token_replay: true,
+                ..Default::default()
+            }));
+            let mut core = EngineCore::new_with_unified_executor(
+                EngineCoreConfig {
+                    enable_chunked_prefill: false,
+                    block_size: 16,
+                    // Each request needs three pages for 8 prompt + 40
+                    // output tokens; the arena holds four.
+                    max_blocks: 4,
+                    max_batch_size: 2,
+                    managed_chat_claim_quantum_tokens: 16,
+                    enable_capacity_replay: replay,
+                    backend: BackendKind::Cpu,
+                    ..Default::default()
+                },
+                executor,
+            )
+            .expect("core");
+            core.retry_policy.execution_backoff_base = Duration::ZERO;
+            core.retry_policy.execution_backoff_max = Duration::ZERO;
+            let ids = ["oldest", "middle", "youngest"];
+            for id in ids {
+                let mut request = managed_test_request(&mut core, model, id, (1..=8).collect());
+                request.params.max_tokens = 40;
+                core.add_request(request).expect("add");
+            }
+            let before = super::super::metrics::engine_batch_metrics_snapshot();
+            let mut finished = HashMap::new();
+            for _ in 0..600 {
+                for output in core
+                    .step()
+                    .await
+                    .expect("capacity pressure must not fail the engine step")
+                {
+                    if output.is_finished {
+                        finished.insert(output.request_id.clone(), output);
+                    }
+                }
+                if finished.len() == ids.len() {
+                    break;
+                }
+            }
+            let after = super::super::metrics::engine_batch_metrics_snapshot();
+            if !replay {
+                assert!(
+                    finished
+                        .values()
+                        .any(|output| output.error.as_deref().is_some_and(
+                            |error| error.contains("exhausted by concurrent requests")
+                        )),
+                    "without replay the deadlock breaker fails a request"
+                );
+                continue;
+            }
+            assert_eq!(finished.len(), ids.len(), "every request completes");
+            for id in ids {
+                let output = &finished[id];
+                assert!(output.error.is_none(), "{id}: {:?}", output.error);
+                assert_eq!(output.token_stats.generated_tokens, 40, "{id}");
+                assert_eq!(output.token_stats.prompt_tokens, 8, "{id}");
+            }
+            assert!(after.capacity_suspensions_total > before.capacity_suspensions_total);
+        }
+    }
+
     /// Stage the hybrid test model's recurrent state (domain 2) over a row's
     /// paged span, as a hybrid adapter does before its rows commit.
     fn stage_test_tensor_state(
@@ -11344,6 +11463,10 @@ mod tests {
     #[derive(Default)]
     struct ManagedDecodeExecutor {
         incremental_prefill: bool,
+        /// Declare token replay and suspend sessions for capacity, keeping
+        /// each session's committed token count as its replay length.
+        token_replay: bool,
+        committed: Arc<Mutex<HashMap<super::super::SessionKey, usize>>>,
         /// Declare resumable prefill beside continuous decode rows of this
         /// width, which a bound mixed stage turns into mixed steps.
         mixed_width: Option<usize>,
@@ -11357,6 +11480,9 @@ mod tests {
             let mut profile = ManagedReceiptExecutor.execution_profile(request)?;
             if self.incremental_prefill {
                 profile.prefill = PrefillMode::Incremental;
+            }
+            if self.token_replay {
+                profile.replay = super::super::ReplayCapability::TokenReplay;
             }
             if let Some(width) = self.mixed_width {
                 profile.prefill = PrefillMode::Incremental;
@@ -11375,11 +11501,30 @@ mod tests {
             ManagedReceiptExecutor.cleanup_session(session)
         }
 
+        fn suspend_session_for_capacity(
+            &self,
+            session: &super::super::SessionKey,
+        ) -> Result<Option<usize>> {
+            Ok(self
+                .token_replay
+                .then(|| self.committed.lock().unwrap().remove(session))
+                .flatten())
+        }
+
         fn execute_physical_batch(
             &self,
             execution: super::super::executor::PhysicalBatchExecution<'_>,
         ) -> super::super::executor::PhysicalDispatchResult {
             let dispatch = execution.expected_dispatch();
+            self.committed
+                .lock()
+                .unwrap()
+                .extend(execution.scheduled.iter().map(|scheduled| {
+                    (
+                        scheduled.session_key(),
+                        scheduled.num_computed_tokens + scheduled.num_tokens,
+                    )
+                }));
             self.executed
                 .lock()
                 .unwrap()

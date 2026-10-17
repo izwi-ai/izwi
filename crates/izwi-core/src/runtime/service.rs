@@ -7974,6 +7974,7 @@ impl RuntimeService {
             model_tensor_batch_width_counts: batch.model_tensor_batch_width_counts,
             capacity_suspensions_total: batch.capacity_suspensions_total,
             capacity_replay_tokens_total: batch.capacity_replay_tokens_total,
+            capacity_replay_capped_total: batch.capacity_replay_capped_total,
             recompute_preemptions_total: batch.recompute_preemptions_total,
             claim_deadlock_aborts_total: batch.claim_deadlock_aborts_total,
             kv_blocked_requests: batch.kv_blocked_requests,
@@ -8242,6 +8243,7 @@ impl RuntimeService {
             "kind",
             &[
                 ("replay", snapshot.capacity_suspensions_total),
+                ("replay_capped", snapshot.capacity_replay_capped_total),
                 ("recompute", snapshot.recompute_preemptions_total),
                 ("abort", snapshot.claim_deadlock_aborts_total),
             ],
@@ -10598,7 +10600,7 @@ mod tests {
         assert!(payload.contains("izwi_engine_executor_model_tensor_batch_width_calls_total"));
         assert!(payload.contains("izwi_engine_scheduler_capacity_suspensions_total"));
         assert!(payload.contains("izwi_engine_scheduler_capacity_replay_tokens_total"));
-        for kind in ["replay", "recompute", "abort"] {
+        for kind in ["replay", "replay_capped", "recompute", "abort"] {
             assert!(payload.contains(&format!(
                 "izwi_engine_scheduler_preemptions_total{{kind=\"{kind}\"}}"
             )));
