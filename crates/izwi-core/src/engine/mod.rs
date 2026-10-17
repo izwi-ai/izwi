@@ -102,8 +102,8 @@ pub use execution::{
     OutcomeProvenance, OutputVisibility, PhysicalBatch, PhysicalBatchReport,
     PhysicalBatchRowReport, PhysicalLaunchPolicy, PlanId, PrefillMode, ReadyQuantum,
     RealtimeOperationId, RealtimePreparationMode, RealtimeStageOutcome, RealtimeSubphase,
-    RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch, SessionKey,
-    StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
+    ReplayCapability, RetryDisposition, SequencePhase, SequenceRestartReason, SessionEpoch,
+    SessionKey, StageDescriptor, StageId, StageProgressKind, StageShapePolicy, StageWorkSelector,
     StateDisposition, TerminalOutcome, WorkCost, WorkUnit, YieldReason,
 };
 pub use executor::{

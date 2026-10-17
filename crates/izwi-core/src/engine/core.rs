@@ -1697,12 +1697,16 @@ impl EngineCore {
             && request.task_type == super::TaskType::Chat
             && request
                 .prepared_chat_model_for_executor()
-                .is_ok_and(|model| {
-                    matches!(
-                        model.as_ref(),
-                        crate::models::registry::NativeChatModel::Qwen38(_)
-                    )
-                })
+                .is_ok_and(|model| model.admits_incrementally_on_cuda())
+    }
+
+    /// Whether a session released for capacity can be rebuilt by replaying
+    /// its tokens: its loaded contract declares token replay.
+    fn replays_for_capacity(&self, request_id: &RequestId) -> bool {
+        self.config.cuda_incremental_chat_enabled()
+            && self.execution_profiles.get(request_id).is_some_and(|cached| {
+                cached.profile.replay == super::ReplayCapability::TokenReplay
+            })
     }
 
     async fn suspend_published_session_for_capacity(
@@ -1711,11 +1715,7 @@ impl EngineCore {
     ) -> Result<bool> {
         let candidates = blocked
             .iter()
-            .filter(|row| {
-                self.requests
-                    .get(&row.request_id)
-                    .is_some_and(|request| self.uses_incremental_chat_capacity(request))
-            })
+            .filter(|row| self.replays_for_capacity(&row.request_id))
             .map(|row| row.session_key());
         let Some(survivor) = self.scheduler.capacity_survivor(candidates) else {
             return Ok(false);
@@ -1731,11 +1731,7 @@ impl EngineCore {
             .capacity_claim_sessions(model)
             .into_iter()
             .filter(|session| *session != survivor)
-            .filter(|session| {
-                self.requests
-                    .get(&session.request_id)
-                    .is_some_and(|request| self.uses_incremental_chat_capacity(request))
-            })
+            .filter(|session| self.replays_for_capacity(&session.request_id))
             .filter(|session| {
                 !self.active_plans.contains_session(session)
                     && !self

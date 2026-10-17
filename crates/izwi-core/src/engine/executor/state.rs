@@ -22,29 +22,14 @@ use crate::models::architectures::voxtral::realtime::{
 use crate::models::architectures::voxtral::tts::retained::VoxtralTtsRetainedState;
 use crate::models::registry::{
     AsrModelLease, FishS2TtsModelLease, Lfm25AudioModelLease, NativeAsrDecodeState, NativeAsrModel,
-    NativeChatDecodeState, QwenTtsModelLease, VibeVoiceTtsModelLease, VoxtralModelLease,
-    VoxtralTtsModelLease,
+    NativeChatDecodeState, NativeChatReplayCheckpoint, QwenTtsModelLease, VibeVoiceTtsModelLease,
+    VoxtralModelLease, VoxtralTtsModelLease,
 };
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
 
-/// Family-typed durable continuation record for a suspended chat session.
-pub(super) enum SuspendedReplayCheckpoint {
-    Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
-    Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
-}
-
-impl SuspendedReplayCheckpoint {
-    pub(super) fn replay_tokens(&self) -> usize {
-        match self {
-            Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
-            Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
-        }
-    }
-}
-
 pub(super) struct SuspendedChatDecode {
     pub(super) variant: ModelVariant,
-    pub(super) checkpoint: SuspendedReplayCheckpoint,
+    pub(super) checkpoint: NativeChatReplayCheckpoint,
     pub(super) last_tokens_generated: usize,
     pub(super) stream_sequence: usize,
     pub(super) streamed_text: String,

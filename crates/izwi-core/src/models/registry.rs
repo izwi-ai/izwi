@@ -15,8 +15,9 @@ use crate::backends::state::PhysicalStateTransactionId;
 use crate::backends::{BackendKind, DTypeSelectionRequest, DeviceProfile, DeviceThread};
 use crate::catalog::{prefix_reuse_engages, ModelFamily, ModelTask, PrefixReuseMode};
 use crate::engine::{
-    InvocationStaticAttentionLease, InvocationTensorLease, RetainedStaticAttentionRuntimeV2,
-    RetainedStaticAttentionSequenceId, RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
+    InvocationStaticAttentionLease, InvocationTensorLease, ReplayCapability,
+    RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
+    RetainedTensorStateRuntimeV2, StageDescriptor, WorkCost,
 };
 use crate::error::{Error, Result};
 use crate::kv::v2::{InvocationStateBackingKindV2, InvocationWorkspaceLeaseSetV2};
@@ -4519,6 +4520,24 @@ pub(crate) enum NativeChatDecodeCheckpoint {
     Lfm2(Lfm2ChatDecodeCheckpoint),
 }
 
+/// Family-typed CPU continuation record of a chat session suspended for
+/// capacity: everything needed to rebuild its released physical state by
+/// replaying tokens. It owns no tensors, cache views or device events.
+pub(crate) enum NativeChatReplayCheckpoint {
+    Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
+    Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
+}
+
+impl NativeChatReplayCheckpoint {
+    /// Tokens the replay writes back: everything the released state held.
+    pub(crate) fn replay_tokens(&self) -> usize {
+        match self {
+            Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
+            Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NativeChatPreparedPrompt {
     Qwen35(Qwen35PreparedPrompt),
@@ -4603,6 +4622,30 @@ impl NativeChatDecodeState {
             Self::Lfm2(state) => Some(state.prefill_progress()),
         }
     }
+
+    /// Capture the CPU continuation record of a session whose physical state
+    /// is about to be released for capacity; `None` when the family cannot
+    /// replay. The caller fences the last completed step first.
+    pub(crate) fn replay_checkpoint(&self) -> Result<Option<NativeChatReplayCheckpoint>> {
+        Ok(Some(match self {
+            Self::Qwen38(state) => NativeChatReplayCheckpoint::Qwen38(state.replay_checkpoint()?),
+            Self::Qwen36Moe(state) => {
+                NativeChatReplayCheckpoint::Qwen36Moe(state.replay_checkpoint()?)
+            }
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => return Ok(None),
+        }))
+    }
+
+    /// Length of the replay still being rebuilt, or `None` once the state
+    /// decodes normally.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Qwen38(state) => state.replay_tokens(),
+            Self::Qwen36Moe(state) => state.replay_tokens(),
+            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => None,
+        }
+    }
+
     pub(crate) fn begin_continuous_quantum(
         &mut self,
         cache: PhysicalPagedKvCache,
@@ -5182,6 +5225,74 @@ impl NativeChatModel {
             | Self::Gemma3(_)
             | Self::Lfm2(_)
         )
+    }
+
+    /// How this loaded model rebuilds a session released for capacity.
+    /// Qwen3.6-MoE keeps a replay checkpoint, but its replay waits for CUDA
+    /// validation, so it does not declare one.
+    pub fn replay_capability(&self) -> ReplayCapability {
+        match self {
+            Self::Qwen38(_) => ReplayCapability::TokenReplay,
+            Self::Qwen3(_)
+            | Self::Qwen35(_)
+            | Self::Qwen36Moe(_)
+            | Self::Gemma3(_)
+            | Self::Lfm2(_) => ReplayCapability::None,
+        }
+    }
+
+    /// Whether CUDA incremental admission (a claim of exactly the next
+    /// scheduled span, including projected speculative spans) is validated
+    /// for this family.
+    pub fn admits_incrementally_on_cuda(&self) -> bool {
+        matches!(self, Self::Qwen38(_))
+    }
+
+    /// Start rebuilding a suspended session in a fresh context-0 reservation.
+    /// The returned state replays before it decodes again.
+    pub(crate) fn begin_replay_state_managed(
+        &self,
+        checkpoint: &NativeChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+        mtp_cache: Option<PhysicalPagedKvCache>,
+    ) -> Result<NativeChatDecodeState> {
+        match (self, checkpoint) {
+            (Self::Qwen38(model), NativeChatReplayCheckpoint::Qwen38(checkpoint)) => {
+                Ok(NativeChatDecodeState::Qwen38(
+                    model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
+                ))
+            }
+            (Self::Qwen36Moe(model), NativeChatReplayCheckpoint::Qwen36Moe(checkpoint)) => {
+                Ok(NativeChatDecodeState::Qwen36Moe(
+                    model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
+                ))
+            }
+            _ => Err(Error::InferenceError(
+                "replay model does not match session".into(),
+            )),
+        }
+    }
+
+    /// Replay `[span_start, span_end)` of a suspended session's journal into
+    /// its state without sampling or emitting output. Returns whether the
+    /// replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut NativeChatDecodeState,
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        match (self, state) {
+            (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
+                model.continue_replay_physical(state, span_start, span_end)
+            }
+            (Self::Qwen36Moe(model), NativeChatDecodeState::Qwen36Moe(state)) => {
+                model.continue_replay_physical(state, span_start, span_end)
+            }
+            _ => Err(Error::InferenceError(
+                "chat replay crossed model family".into(),
+            )),
+        }
     }
 
     /// Whether one continuous model call executes all live rows through a

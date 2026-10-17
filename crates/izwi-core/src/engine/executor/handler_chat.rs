@@ -241,14 +241,8 @@ impl NativeExecutor {
         let Some(super::ExecutorStateSlot::Ready { state, .. }) = states.get(session) else {
             return Ok(None);
         };
-        let checkpoint = match &state.state {
-            NativeChatDecodeState::Qwen38(model_state) => {
-                super::state::SuspendedReplayCheckpoint::Qwen38(model_state.replay_checkpoint()?)
-            }
-            NativeChatDecodeState::Qwen36Moe(model_state) => {
-                super::state::SuspendedReplayCheckpoint::Qwen36Moe(model_state.replay_checkpoint()?)
-            }
-            _ => return Ok(None),
+        let Some(checkpoint) = state.state.replay_checkpoint()? else {
+            return Ok(None);
         };
         let tokens = checkpoint.replay_tokens();
         let mut suspended = self
@@ -497,28 +491,8 @@ impl NativeExecutor {
                 let cache = managed_cache
                     .take()
                     .ok_or_else(|| Error::InferenceError("replay lost target cache".into()))?;
-                let mut state = match (model.as_ref(), &saved.checkpoint) {
-                    (NativeChatModel::Qwen38(qwen), super::state::SuspendedReplayCheckpoint::Qwen38(checkpoint)) => {
-                        NativeChatDecodeState::Qwen38(qwen.begin_replay_state_physical(
-                            checkpoint,
-                            cache,
-                            mtp_cache.take(),
-                        )?)
-                    }
-                    (
-                        NativeChatModel::Qwen36Moe(moe),
-                        super::state::SuspendedReplayCheckpoint::Qwen36Moe(checkpoint),
-                    ) => NativeChatDecodeState::Qwen36Moe(moe.begin_replay_state_physical(
-                        checkpoint,
-                        cache,
-                        mtp_cache.take(),
-                    )?),
-                    _ => {
-                        return Err(Error::InferenceError(
-                            "replay model does not match session".into(),
-                        ))
-                    }
-                };
+                let mut state =
+                    model.begin_replay_state_managed(&saved.checkpoint, cache, mtp_cache.take())?;
                 if let Some(reservation) = tensor_reservation.as_ref() {
                     state.bind_hybrid_tensor_sequence(reservation.sequence)?;
                 }
@@ -708,11 +682,9 @@ impl NativeExecutor {
         }
         let resumable_prefill_quantum = scheduled.is_prefill && resumable_prefill;
         let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
-        let replay_tokens = state_lease.state().and_then(|active| match &active.state {
-            NativeChatDecodeState::Qwen38(state) => state.replay_tokens(),
-            NativeChatDecodeState::Qwen36Moe(state) => state.replay_tokens(),
-            _ => None,
-        });
+        let replay_tokens = state_lease
+            .state()
+            .and_then(|active| active.state.replay_tokens());
         let resumable_span = resumable_prefill_quantum
             .then(|| {
                 resumable_prefill_span(
@@ -735,22 +707,9 @@ impl NativeExecutor {
             // token below and carries the logprob entries to stream.
             let mut stopped_logprobs = None;
             let mut step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
-                match (model.as_ref(), &mut active_state.state) {
-                    (NativeChatModel::Qwen38(qwen), NativeChatDecodeState::Qwen38(state)) => {
-                        Self::run_blocking(|| qwen.continue_replay_physical(state, start, end))?;
-                    }
-                    (
-                        NativeChatModel::Qwen36Moe(moe),
-                        NativeChatDecodeState::Qwen36Moe(state),
-                    ) => {
-                        Self::run_blocking(|| moe.continue_replay_physical(state, start, end))?;
-                    }
-                    _ => {
-                        return Err(Error::InferenceError(
-                            "chat replay crossed model family".into(),
-                        ));
-                    }
-                }
+                Self::run_blocking(|| {
+                    model.continue_replay(&mut active_state.state, start, end)
+                })?;
                 crate::engine::metrics::record_capacity_replay(end - start);
                 NativeChatDecodeStep {
                     delta: String::new(),

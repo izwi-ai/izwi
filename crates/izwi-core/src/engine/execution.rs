@@ -1234,6 +1234,20 @@ impl PhysicalLaunchPolicy {
     }
 }
 
+/// How a loaded model can rebuild a session whose physical state was released
+/// for capacity (recompute preemption).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayCapability {
+    /// The session cannot be rebuilt; releasing it loses the request.
+    #[default]
+    None,
+    /// The family keeps a CPU journal of the prompt and generated tokens (plus
+    /// sampler and text state) and recomputes the released state by
+    /// re-prefilling it, so the request resumes without re-emitting output.
+    TokenReplay,
+}
+
 /// Effective execution behavior for one model/request/backend combination.
 ///
 /// Profiles fail closed: advanced scheduling features stay disabled unless
@@ -1294,6 +1308,9 @@ pub struct ExecutionProfile {
     /// for cross-request fork. `None` keeps scheduling unchanged.
     #[serde(default)]
     pub managed_snapshot_prefill_interval: Option<u32>,
+    /// Whether the loaded model can rebuild a session released for capacity.
+    #[serde(default)]
+    pub replay: ReplayCapability,
 }
 
 impl ExecutionProfile {
@@ -1335,6 +1352,7 @@ impl ExecutionProfile {
             kv_dtype: "none".to_string(),
             cache_namespace: None,
             managed_snapshot_prefill_interval: None,
+            replay: ReplayCapability::None,
         }
     }
 

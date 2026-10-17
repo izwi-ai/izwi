@@ -3460,6 +3460,12 @@ impl ModelExecutor for NativeExecutor {
             profile.incremental_decode = true;
             profile.recompute_safe = profile.resolved_from_loaded_model;
             profile.cache_release_safe = profile.resolved_from_loaded_model;
+            if request.task_type == super::types::TaskType::Chat {
+                profile.replay = request
+                    .prepared_chat_model_for_executor()
+                    .map(|model| model.replay_capability())
+                    .unwrap_or_default();
+            }
         }
         if matches!(request.task_type, super::types::TaskType::ASR) && !implementation_incremental {
             // Long audio can switch to a full chunk-plan operation after media
