@@ -533,7 +533,7 @@ impl Qwen3ChatModel {
                 .flatten()
                 .collect(),
             ),
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
             replay_end: None,

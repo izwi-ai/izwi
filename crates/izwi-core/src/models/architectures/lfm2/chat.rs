@@ -583,7 +583,7 @@ impl Lfm2ChatModel {
             ),
             // A JSON-constrained row must sample through the grammar, so it
             // never takes the batched argmax shortcut.
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(config.skip_special_tokens),
             stop_reason: None,
             assembled: String::new(),
             max_new_tokens: max_new_tokens.max(1),

@@ -287,9 +287,9 @@ struct ReplyText {
 }
 
 impl ReplyText {
-    fn new() -> Self {
+    fn new(skip_special_tokens: bool) -> Self {
         Self {
-            decoder: IncrementalDecoder::new(true),
+            decoder: IncrementalDecoder::new(skip_special_tokens),
             held: String::new(),
         }
     }
@@ -800,7 +800,7 @@ impl Gemma3ChatModel {
                 .flatten()
                 .collect(),
             ),
-            text: ReplyText::new(),
+            text: ReplyText::new(config.skip_special_tokens),
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
@@ -1860,7 +1860,7 @@ mod stream_tests {
                 .collect::<Vec<_>>();
             let (_, old_end, _) = whole_sequence_stream(&tokenizer, &ids);
 
-            let mut text = ReplyText::new();
+            let mut text = ReplyText::new(true);
             let mut streamed = String::new();
             let mut stagnant = 0;
             let mut new_end = None;
@@ -1898,7 +1898,7 @@ mod stream_tests {
         // " a", "é" in two byte tokens, "b", "€" in three, "<unused7>"
         // across three pieces, "c", then "<" "unused" kept as text.
         let ids = [0, 4, 5, 1, 6, 7, 8, 10, 11, 12, 2, 10, 11];
-        let mut text = ReplyText::new();
+        let mut text = ReplyText::new(true);
         let mut deltas = ids
             .iter()
             .map(|&id| tokenizer.decode_next(&mut text, id).unwrap())
@@ -1921,7 +1921,7 @@ mod stream_tests {
         // "é" then a stray continuation byte: ByteFallback decodes the
         // whole byte run as U+FFFD, rewriting the emitted "é".
         let ids = [4, 5, 5, 1];
-        let mut text = ReplyText::new();
+        let mut text = ReplyText::new(true);
         let mut streamed = String::new();
         for &id in &ids {
             streamed.push_str(&tokenizer.decode_next(&mut text, id).unwrap());
@@ -1936,7 +1936,7 @@ mod stream_tests {
 
     #[test]
     fn partial_placeholders_are_held_until_decided() {
-        let mut text = ReplyText::new();
+        let mut text = ReplyText::new(true);
         assert_eq!(text.release("ab<unu", false), "ab");
         assert_eq!(text.release("sed12", false), "");
         assert_eq!(text.release(">c<", false), "c");

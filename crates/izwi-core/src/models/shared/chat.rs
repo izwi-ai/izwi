@@ -112,6 +112,9 @@ pub struct ChatGenerationConfig {
     /// DS9.2: constrain generation to one valid JSON value
     /// (`response_format: json_object`). Only honored by samplers that opt in.
     pub constrain_json_object: bool,
+    /// Leave special tokens other than parsed markup out of the reply text
+    /// (`Tokenizer::skips_special_token`).
+    pub skip_special_tokens: bool,
 }
 
 impl Default for ChatGenerationConfig {
@@ -128,6 +131,7 @@ impl Default for ChatGenerationConfig {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: true,
         }
     }
 }

@@ -89,6 +89,12 @@ pub struct GenerationParams {
     #[serde(default)]
     pub constrain_json_object: bool,
 
+    /// Leave special tokens out of generated chat text (vLLM's
+    /// `skip_special_tokens`, on by default). Markup the serving stack
+    /// parses (tool calls, reasoning) stays in either way.
+    #[serde(default = "default_skip_special_tokens")]
+    pub skip_special_tokens: bool,
+
     /// Speech sampling the request set explicitly (TTS only).
     #[serde(default)]
     pub speech: SpeechSamplingOptions,
@@ -193,6 +199,10 @@ fn default_repetition_penalty() -> f32 {
 fn default_max_tokens() -> usize {
     2048
 }
+fn default_skip_special_tokens() -> bool {
+    true
+}
+
 fn default_speed() -> f32 {
     1.0
 }
@@ -217,6 +227,7 @@ impl Default for GenerationParams {
             logprobs: false,
             top_logprobs: 0,
             constrain_json_object: false,
+            skip_special_tokens: default_skip_special_tokens(),
             speech: SpeechSamplingOptions::default(),
         }
     }

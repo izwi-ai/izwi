@@ -4718,6 +4718,7 @@ impl EngineCoreRequest {
             logprobs: self.params.logprobs || self.params.top_logprobs > 0,
             top_logprobs: self.params.top_logprobs,
             constrain_json_object: self.params.constrain_json_object,
+            skip_special_tokens: self.params.skip_special_tokens,
         }
     }
 
@@ -6142,6 +6143,18 @@ impl RequestBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// Special tokens are skipped unless a request turns it off; a request
+    /// that omits the field keeps the default.
+    #[test]
+    fn chat_requests_skip_special_tokens_unless_they_opt_out() {
+        let params: super::GenerationParams = serde_json::from_str("{}").unwrap();
+        assert!(params.skip_special_tokens);
+        let mut request = super::EngineCoreRequest::chat(Vec::new());
+        assert!(request.chat_generation_config().skip_special_tokens);
+        request.params.skip_special_tokens = false;
+        assert!(!request.chat_generation_config().skip_special_tokens);
+    }
+
     /// KOK-20: a speed outside the engine range is clamped before
     /// preparation, so engine admission leaves it unchanged and the prepared
     /// artifact still matches the request.

@@ -191,6 +191,7 @@ impl RuntimeService {
             logprobs: params.logprobs || params.top_logprobs > 0,
             top_logprobs: params.top_logprobs,
             constrain_json_object: params.constrain_json_object,
+            skip_special_tokens: params.skip_special_tokens,
         }
     }
 
