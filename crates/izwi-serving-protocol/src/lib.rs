@@ -6,6 +6,7 @@
 //! the gateway's responsibility.
 
 mod approvals;
+pub mod env;
 mod identity;
 mod ndjson;
 mod realtime;

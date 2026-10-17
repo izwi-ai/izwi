@@ -1,13 +1,16 @@
 use anyhow::{bail, Context};
+use env_config::{WORKER_TLS_CERT_REF_ENV, WORKER_TLS_CLIENT_CA_REF_ENV, WORKER_TLS_KEY_REF_ENV};
 use izwi_core::{
     backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeHealth, RuntimeService,
 };
 use izwi_serving_fence::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
-    WORKER_EXECUTION_REPRESENTATION_ENV, WORKER_GENERATION_FENCE_ENV,
-    WORKER_MAX_CONTEXT_TOKENS_ENV, WORKER_MAX_OUTPUT_TOKENS_ENV, WORKER_MODEL_LOAD_LOCK_ENV,
-    WORKER_MODEL_LOAD_SLOTS_ENV, WORKER_OWNERSHIP_LOCK_ENV, WORKER_PRECISION_ENV, WORKER_TASK_ENV,
+    MANAGED_WORKER_ENV, WORKER_EXECUTION_REPRESENTATION_ENV, WORKER_GENERATION_FENCE_ENV,
+    WORKER_INCARNATION_ENV, WORKER_MAX_CONTEXT_TOKENS_ENV, WORKER_MAX_OUTPUT_TOKENS_ENV,
+    WORKER_MODEL_LOAD_LOCK_ENV, WORKER_MODEL_LOAD_SLOTS_ENV, WORKER_OWNERSHIP_LOCK_ENV,
+    WORKER_PRECISION_ENV, WORKER_TASK_ENV,
 };
+use izwi_serving_protocol::env::EnvSnapshot;
 use izwi_serving_protocol::secret_file::{file_reference_path, read_secret_file, SecretFile};
 use izwi_serving_protocol::*;
 use izwi_serving_worker::{
@@ -21,13 +24,12 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 
-const WORKER_TLS_CERT_REF_ENV: &str = "IZWI_WORKER_TLS_CERT_REF";
-const WORKER_TLS_KEY_REF_ENV: &str = "IZWI_WORKER_TLS_KEY_REF";
-const WORKER_TLS_CLIENT_CA_REF_ENV: &str = "IZWI_WORKER_TLS_CLIENT_CA_REF";
+mod env_config;
+
 const MAX_TLS_PEM_FILE_BYTES: u64 = 256 * 1024;
 
 /// Text logs by default; `IZWI_LOG_FORMAT=json` for one JSON object per line.
-fn init_tracing() -> anyhow::Result<()> {
+fn init_tracing(env: &EnvSnapshot) -> anyhow::Result<()> {
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "izwi_serving_worker=info,izwi_core=info".into());
@@ -35,7 +37,7 @@ fn init_tracing() -> anyhow::Result<()> {
     let registry = tracing_subscriber::registry().with(filter).with(
         izwi_serving_client::otlp::otlp_layer_from_env("izwi-serving-worker"),
     );
-    match std::env::var("IZWI_LOG_FORMAT").ok().as_deref() {
+    match env.get("IZWI_LOG_FORMAT")? {
         None | Some("text") => registry.with(tracing_subscriber::fmt::layer()).init(),
         Some("json") => registry
             .with(izwi_serving_worker::json_log_layer(std::io::stdout))
@@ -47,10 +49,12 @@ fn init_tracing() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    // Every IZWI_* variable this worker reads, read once.
+    let env = env_config::capture();
+    init_tracing(&env)?;
 
-    let process = WorkerProcessConfig::from_env()?;
-    let managed_locks = managed_lock_context(&process)?;
+    let process = WorkerProcessConfig::from_env(&env)?;
+    let managed_locks = managed_lock_context(&env, &process)?;
     let _fences = acquire_managed_worker_fences(&process, managed_locks.as_ref())?;
     if let DeviceAssignment::Cpu { affinity, .. } = &process.assignment {
         if !affinity.is_empty() {
@@ -68,25 +72,28 @@ async fn main() -> anyhow::Result<()> {
     // switch); with no explicit choice, catalog-auto engages reuse per
     // loaded model where the catalog cell has backend-lane evidence.
     // Chunked prefill remains opt-in.
-    let explicit_prefix_caching = env_flag_value("IZWI_ENABLE_PREFIX_CACHING");
+    let explicit_prefix_caching = env.flag("IZWI_ENABLE_PREFIX_CACHING")?;
     let enable_prefix_caching = explicit_prefix_caching.unwrap_or(false);
     let prefix_reuse_catalog_auto = match explicit_prefix_caching {
         Some(_) => false,
-        None => env_flag_value(izwi_core::serve_runtime::ENV_PREFIX_REUSE_AUTO)
-            .unwrap_or(izwi_core::serve_runtime::PREFIX_REUSE_CATALOG_AUTO_DEFAULT),
+        None => env.flag_or(
+            izwi_core::serve_runtime::ENV_PREFIX_REUSE_AUTO,
+            izwi_core::serve_runtime::PREFIX_REUSE_CATALOG_AUTO_DEFAULT,
+        )?,
     };
-    let managed_prefix_cache_salt = std::env::var("IZWI_MANAGED_PREFIX_CACHE_SALT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let managed_prefix_cache_salt = env
+        .get("IZWI_MANAGED_PREFIX_CACHE_SALT")?
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     if enable_prefix_caching && managed_prefix_cache_salt.is_none() {
         bail!("IZWI_ENABLE_PREFIX_CACHING=1 requires IZWI_MANAGED_PREFIX_CACHE_SALT");
     }
-    let enable_chunked_prefill = parse_env_flag("IZWI_ENABLE_CHUNKED_PREFILL");
+    let enable_chunked_prefill = env.flag_or("IZWI_ENABLE_CHUNKED_PREFILL", false)?;
     let engine_defaults = izwi_core::config::EngineConfig::default();
     let max_sequence_length =
-        match std::env::var("IZWI_MAX_SEQUENCE_LENGTH") {
-            Ok(raw) if !raw.trim().is_empty() => Some(
+        match env.get("IZWI_MAX_SEQUENCE_LENGTH")? {
+            Some(raw) if !raw.trim().is_empty() => Some(
                 izwi_core::config::ContextLengthPreference::explicit(raw.trim().parse().map_err(
                     |error| anyhow::anyhow!("invalid IZWI_MAX_SEQUENCE_LENGTH: {error}"),
                 )?)?,
@@ -105,41 +112,41 @@ async fn main() -> anyhow::Result<()> {
         prefix_reuse_catalog_auto,
         managed_prefix_cache_salt,
         // Unset stays automatic: each model sizes its prefix budget at load.
-        max_prefix_cache_pages: parse_optional_env("IZWI_MAX_PREFIX_CACHE_PAGES")?,
+        max_prefix_cache_pages: env.parse("IZWI_MAX_PREFIX_CACHE_PAGES")?,
         enable_chunked_prefill,
-        chunked_prefill_threshold: parse_env(
+        chunked_prefill_threshold: env.parse_or(
             "IZWI_CHUNKED_PREFILL_THRESHOLD",
             engine_defaults.chunked_prefill_threshold,
         )?,
-        max_tokens_per_step: parse_env(
+        max_tokens_per_step: env.parse_or(
             izwi_core::serve_runtime::ENV_MAX_TOKENS_PER_STEP,
             engine_defaults.max_tokens_per_step,
         )?,
         // DS4 hierarchical offload: explicit opt-in via a positive host pool
         // budget; the kill switch forces it off even when a budget is set.
-        kv_host_pool_budget_bytes: if env_flag_value(izwi_core::serve_runtime::ENV_KV_HOST_OFFLOAD)
+        kv_host_pool_budget_bytes: if env.flag(izwi_core::serve_runtime::ENV_KV_HOST_OFFLOAD)?
             == Some(false)
         {
             0
         } else {
-            parse_env(
+            env.parse_or(
                 izwi_core::serve_runtime::ENV_KV_HOST_POOL_BUDGET_BYTES,
                 engine_defaults.kv_host_pool_budget_bytes,
             )?
         },
-        kv_offload_high_watermark: parse_env(
+        kv_offload_high_watermark: env.parse_or(
             izwi_core::serve_runtime::ENV_KV_OFFLOAD_HIGH_WATERMARK,
             engine_defaults.kv_offload_high_watermark,
         )?,
-        kv_offload_low_watermark: parse_env(
+        kv_offload_low_watermark: env.parse_or(
             izwi_core::serve_runtime::ENV_KV_OFFLOAD_LOW_WATERMARK,
             engine_defaults.kv_offload_low_watermark,
         )?,
-        kv_offload_max_in_flight_pages: parse_env(
+        kv_offload_max_in_flight_pages: env.parse_or(
             izwi_core::serve_runtime::ENV_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES,
             engine_defaults.kv_offload_max_in_flight_pages,
         )?,
-        kv_offload_max_promotion_pages: parse_env(
+        kv_offload_max_promotion_pages: env.parse_or(
             izwi_core::serve_runtime::ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES,
             engine_defaults.kv_offload_max_promotion_pages,
         )?,
@@ -375,14 +382,15 @@ fn model_load_slots_from(raw: Option<&str>) -> anyhow::Result<u32> {
 }
 
 fn managed_lock_context(
+    env: &EnvSnapshot,
     process: &WorkerProcessConfig,
 ) -> anyhow::Result<Option<ManagedLockContext>> {
     if !process.managed {
         return Ok(None);
     }
-    let ownership = PathBuf::from(required_env(WORKER_OWNERSHIP_LOCK_ENV)?);
-    let generation = PathBuf::from(required_env(WORKER_GENERATION_FENCE_ENV)?);
-    let model_load = PathBuf::from(required_env(WORKER_MODEL_LOAD_LOCK_ENV)?);
+    let ownership = PathBuf::from(env.required(WORKER_OWNERSHIP_LOCK_ENV)?);
+    let generation = PathBuf::from(env.required(WORKER_GENERATION_FENCE_ENV)?);
+    let model_load = PathBuf::from(env.required(WORKER_MODEL_LOAD_LOCK_ENV)?);
     let directory = ownership
         .parent()
         .context("worker ownership lock must have a parent directory")?;
@@ -400,9 +408,7 @@ fn managed_lock_context(
     Ok(Some(ManagedLockContext {
         namespace,
         paths,
-        model_load_slots: model_load_slots_from(
-            std::env::var(WORKER_MODEL_LOAD_SLOTS_ENV).ok().as_deref(),
-        )?,
+        model_load_slots: model_load_slots_from(env.get(WORKER_MODEL_LOAD_SLOTS_ENV)?)?,
     }))
 }
 
@@ -536,19 +542,21 @@ struct DeclaredDeployment {
 }
 
 impl DeclaredDeployment {
-    fn from_env() -> anyhow::Result<Self> {
-        let label = |name: &str| {
-            std::env::var(name)
-                .ok()
+    fn from_env(env: &EnvSnapshot) -> anyhow::Result<Self> {
+        let label = |name: &str| -> anyhow::Result<Option<String>> {
+            Ok(env
+                .get(name)?
                 .filter(|value| !value.trim().is_empty())
+                .map(str::to_string))
         };
-        let limit = |name: &str| {
-            parse_optional_env::<std::num::NonZeroU32>(name)
-                .map(|limit| limit.map(std::num::NonZeroU32::get))
+        let limit = |name: &str| -> anyhow::Result<Option<u32>> {
+            Ok(env
+                .parse::<std::num::NonZeroU32>(name)?
+                .map(std::num::NonZeroU32::get))
         };
         Ok(Self {
-            precision: label(WORKER_PRECISION_ENV),
-            execution_representation: label(WORKER_EXECUTION_REPRESENTATION_ENV),
+            precision: label(WORKER_PRECISION_ENV)?,
+            execution_representation: label(WORKER_EXECUTION_REPRESENTATION_ENV)?,
             max_context_tokens: limit(WORKER_MAX_CONTEXT_TOKENS_ENV)?,
             max_output_tokens: limit(WORKER_MAX_OUTPUT_TOKENS_ENV)?,
         })
@@ -556,17 +564,19 @@ impl DeclaredDeployment {
 }
 
 impl WorkerProcessConfig {
-    fn from_env() -> anyhow::Result<Self> {
-        let task = parse_worker_task()?;
-        let model = env_or(
-            "IZWI_WORKER_MODEL",
-            match task {
-                TaskKind::Chat => "LFM2.5-1.2B-Instruct-GGUF",
-                TaskKind::SpeechToText => "Nemotron-3.5-ASR-Streaming-0.6B",
-                TaskKind::TextToSpeech => "Kokoro-82M",
-                TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
-            },
-        );
+    fn from_env(env: &EnvSnapshot) -> anyhow::Result<Self> {
+        let task = parse_worker_task(env)?;
+        let model = env
+            .get_or(
+                "IZWI_WORKER_MODEL",
+                match task {
+                    TaskKind::Chat => "LFM2.5-1.2B-Instruct-GGUF",
+                    TaskKind::SpeechToText => "Nemotron-3.5-ASR-Streaming-0.6B",
+                    TaskKind::TextToSpeech => "Kokoro-82M",
+                    TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
+                },
+            )?
+            .to_string();
         let variant = match task {
             TaskKind::Chat => {
                 let variant = izwi_core::parse_chat_model_variant(Some(&model))
@@ -614,18 +624,18 @@ impl WorkerProcessConfig {
             }
             TaskKind::Unknown => bail!("parse_worker_task yields only known tasks"),
         };
-        let assignment = parse_assignment()?;
-        let max_active_invocations = parse_env("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
+        let assignment = parse_assignment(env)?;
+        let max_active_invocations = env.parse_or("IZWI_WORKER_MAX_ACTIVE", 1usize)?;
         if max_active_invocations == 0 {
             bail!("IZWI_WORKER_MAX_ACTIVE must be non-zero");
         }
-        let bind: SocketAddr = env_or("IZWI_WORKER_BIND", "127.0.0.1:9470")
+        let bind: SocketAddr = env
+            .get_or("IZWI_WORKER_BIND", "127.0.0.1:9470")?
             .parse()
             .context("parse IZWI_WORKER_BIND")?;
-        let tls = WorkerTlsConfig::from_env()?;
-        let allow_insecure_plaintext = std::env::var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE"));
+        let tls = WorkerTlsConfig::from_env(env)?;
+        let allow_insecure_plaintext =
+            env.flag_or("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND", false)?;
         if tls.is_none() && !bind.ip().is_loopback() && !allow_insecure_plaintext {
             bail!(
                 "plaintext worker transport may bind only to a loopback address; \
@@ -643,54 +653,57 @@ impl WorkerProcessConfig {
         Ok(Self {
             bind,
             tls,
-            models_dir: std::env::var_os("IZWI_MODELS_DIR")
+            models_dir: env
+                .get_os("IZWI_MODELS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_models_dir),
             task,
             variant,
             public_model: ModelAlias::new(model)?,
-            worker_id: WorkerId::new(env_or("IZWI_WORKER_ID", "local-cpu-1"))?,
-            node_id: NodeId::new(env_or("IZWI_WORKER_NODE_ID", "local-node"))?,
+            worker_id: WorkerId::new(env.get_or("IZWI_WORKER_ID", "local-cpu-1")?)?,
+            node_id: NodeId::new(env.get_or("IZWI_WORKER_NODE_ID", "local-node")?)?,
             incarnation_id: IncarnationId::new(
-                std::env::var("IZWI_WORKER_INCARNATION_ID")
-                    .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+                env.get(WORKER_INCARNATION_ENV)?
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             )?,
-            deployment_id: DeploymentId::new(env_or("IZWI_WORKER_DEPLOYMENT_ID", "lfm25-cpu-v1"))?,
-            artifact_revision: ArtifactRevision::new(required_env(
-                "IZWI_WORKER_ARTIFACT_REVISION",
-            )?)?,
-            model_generation: ModelGeneration::new(parse_env(
-                "IZWI_WORKER_MODEL_GENERATION",
-                1u64,
-            )?)?,
-            credential_id: CredentialId::new(required_env("IZWI_WORKER_CREDENTIAL_ID")?)?,
-            bearer_token: ServiceBearerToken::new(required_env("IZWI_WORKER_BEARER_TOKEN")?)?,
+            deployment_id: DeploymentId::new(
+                env.get_or("IZWI_WORKER_DEPLOYMENT_ID", "lfm25-cpu-v1")?,
+            )?,
+            artifact_revision: ArtifactRevision::new(
+                env.required("IZWI_WORKER_ARTIFACT_REVISION")?,
+            )?,
+            model_generation: ModelGeneration::new(
+                env.parse_or("IZWI_WORKER_MODEL_GENERATION", 1u64)?,
+            )?,
+            credential_id: CredentialId::new(env.required("IZWI_WORKER_CREDENTIAL_ID")?)?,
+            bearer_token: ServiceBearerToken::new(env.required("IZWI_WORKER_BEARER_TOKEN")?)?,
             assignment,
             max_active_invocations,
-            max_request_bytes: parse_env(
-                "IZWI_WORKER_MAX_REQUEST_BYTES",
-                DEFAULT_MAX_REQUEST_BYTES,
-            )?,
-            max_retained_attempts: parse_env(
+            max_request_bytes: env
+                .parse_or("IZWI_WORKER_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?,
+            max_retained_attempts: env.parse_or(
                 "IZWI_WORKER_MAX_RETAINED_ATTEMPTS",
                 DEFAULT_MAX_RETAINED_ATTEMPTS,
             )?,
-            attempt_retention: Duration::from_secs(parse_env(
+            attempt_retention: Duration::from_secs(env.parse_or(
                 "IZWI_WORKER_ATTEMPT_RETENTION_SECS",
                 DEFAULT_ATTEMPT_RETENTION.as_secs(),
             )?),
-            streaming: parse_env("IZWI_WORKER_STREAMING", true)?,
-            managed: managed_worker(),
+            streaming: env.flag_or("IZWI_WORKER_STREAMING", true)?,
+            managed: managed_worker(env)?,
             drain_grace: Duration::from_millis(parse_bounded_duration_env(
+                env,
                 "IZWI_WORKER_DRAIN_GRACE_MS",
                 30_000,
             )?),
             cancellation_grace: Duration::from_millis(parse_bounded_duration_env(
+                env,
                 "IZWI_WORKER_CANCELLATION_GRACE_MS",
                 10_000,
             )?),
-            exit_on_runtime_failure: parse_env("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
-            declared: DeclaredDeployment::from_env()?,
+            exit_on_runtime_failure: env.flag_or("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
+            declared: DeclaredDeployment::from_env(env)?,
         })
     }
 
@@ -717,15 +730,15 @@ impl std::fmt::Debug for WorkerTlsConfig {
 }
 
 impl WorkerTlsConfig {
-    fn from_env() -> anyhow::Result<Option<Self>> {
-        let cert_ref = std::env::var(WORKER_TLS_CERT_REF_ENV).ok();
-        let key_ref = std::env::var(WORKER_TLS_KEY_REF_ENV).ok();
-        let client_ca_ref = std::env::var(WORKER_TLS_CLIENT_CA_REF_ENV).ok();
+    fn from_env(env: &EnvSnapshot) -> anyhow::Result<Option<Self>> {
+        let cert_ref = env.get(WORKER_TLS_CERT_REF_ENV)?;
+        let key_ref = env.get(WORKER_TLS_KEY_REF_ENV)?;
+        let client_ca_ref = env.get(WORKER_TLS_CLIENT_CA_REF_ENV)?;
 
         match (cert_ref, key_ref) {
             (Some(cert_ref), Some(key_ref)) => {
-                let cert_bytes = load_pem_file(&cert_ref, "server certificate")?.bytes;
-                let key_file = load_pem_file(&key_ref, "server private key")?;
+                let cert_bytes = load_pem_file(cert_ref, "server certificate")?.bytes;
+                let key_file = load_pem_file(key_ref, "server private key")?;
                 if let Some(mode) = key_file.shared_mode {
                     tracing::warn!(
                         mode = format_args!("{mode:o}"),
@@ -773,7 +786,7 @@ impl WorkerTlsConfig {
                     .context("server private key file contains no key PEM blocks")?;
 
                 let mut config = if let Some(ca_ref) = client_ca_ref {
-                    let ca_bytes = load_pem_file(&ca_ref, "client CA")?.bytes;
+                    let ca_bytes = load_pem_file(ca_ref, "client CA")?.bytes;
                     let ca_items = rustls_pemfile::read_all(&mut ca_bytes.as_slice())
                         .map_err(|_| anyhow::anyhow!("client CA PEM is invalid"))?;
                     let client_certs: Vec<_> = ca_items
@@ -919,57 +932,71 @@ impl axum::serve::Listener for TlsListener {
     }
 }
 
-fn parse_assignment() -> anyhow::Result<DeviceAssignment> {
-    match env_or("IZWI_BACKEND", "cpu")
+fn parse_assignment(env: &EnvSnapshot) -> anyhow::Result<DeviceAssignment> {
+    match env
+        .get_or("IZWI_BACKEND", "cpu")?
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
         "cpu" => {
-            let thread_budget = parse_env("IZWI_WORKER_CPU_THREADS", 1u16)?;
+            let thread_budget = env.parse_or("IZWI_WORKER_CPU_THREADS", 1u16)?;
             if thread_budget == 0 {
                 bail!("IZWI_WORKER_CPU_THREADS must be non-zero");
             }
             let host_memory_limit_bytes = parse_positive_env(
+                env,
                 "IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES",
                 2 * 1024 * 1024 * 1024u64,
             )?;
-            verify_matching_budget("IZWI_CPU_MEMORY_BUDGET_BYTES", host_memory_limit_bytes)?;
+            verify_matching_budget(env, "IZWI_CPU_MEMORY_BUDGET_BYTES", host_memory_limit_bytes)?;
             Ok(DeviceAssignment::Cpu {
                 thread_budget,
-                affinity: parse_cpu_affinity()?,
+                affinity: parse_cpu_affinity(env)?,
                 host_memory_limit_bytes,
             })
         }
         "metal" => {
             let shared_memory_limit_bytes = parse_positive_env(
+                env,
                 "IZWI_WORKER_SHARED_MEMORY_LIMIT_BYTES",
                 2 * 1024 * 1024 * 1024u64,
             )?;
-            verify_matching_budget("IZWI_METAL_MEMORY_BUDGET_BYTES", shared_memory_limit_bytes)?;
+            verify_matching_budget(
+                env,
+                "IZWI_METAL_MEMORY_BUDGET_BYTES",
+                shared_memory_limit_bytes,
+            )?;
             Ok(DeviceAssignment::Metal {
-                device_id: DeviceId::new(required_env("IZWI_WORKER_EXPECTED_DEVICE_ID")?)?,
-                process_local_device_index: parse_env("IZWI_METAL_DEVICE_ORDINAL", 0u32)?,
+                device_id: DeviceId::new(env.required("IZWI_WORKER_EXPECTED_DEVICE_ID")?)?,
+                process_local_device_index: env.parse_or("IZWI_METAL_DEVICE_ORDINAL", 0u32)?,
                 shared_memory_limit_bytes,
             })
         }
         "cuda" => {
             let device_memory_limit_bytes = parse_positive_env(
+                env,
                 "IZWI_WORKER_DEVICE_MEMORY_LIMIT_BYTES",
                 2 * 1024 * 1024 * 1024u64,
             )?;
-            verify_matching_budget("IZWI_CUDA_MEMORY_BUDGET_BYTES", device_memory_limit_bytes)?;
+            verify_matching_budget(
+                env,
+                "IZWI_CUDA_MEMORY_BUDGET_BYTES",
+                device_memory_limit_bytes,
+            )?;
             let host_memory_limit_bytes = parse_positive_env(
+                env,
                 "IZWI_WORKER_HOST_MEMORY_LIMIT_BYTES",
                 2 * 1024 * 1024 * 1024u64,
             )?;
             verify_matching_budget(
+                env,
                 "IZWI_CUDA_HOST_MEMORY_BUDGET_BYTES",
                 host_memory_limit_bytes,
             )?;
             Ok(DeviceAssignment::Cuda {
-                device_uuid: DeviceId::new(required_env("IZWI_WORKER_EXPECTED_DEVICE_UUID")?)?,
-                process_local_device_index: parse_env("IZWI_CUDA_DEVICE_ORDINAL", 0u32)?,
+                device_uuid: DeviceId::new(env.required("IZWI_WORKER_EXPECTED_DEVICE_UUID")?)?,
+                process_local_device_index: env.parse_or("IZWI_CUDA_DEVICE_ORDINAL", 0u32)?,
                 device_memory_limit_bytes,
                 host_memory_limit_bytes,
             })
@@ -1003,13 +1030,10 @@ fn runtime_assignment(assignment: &DeviceAssignment) -> anyhow::Result<RuntimeDe
     })
 }
 
-fn parse_cpu_affinity() -> anyhow::Result<Vec<u16>> {
-    let Some(raw) = std::env::var_os("IZWI_WORKER_CPU_AFFINITY") else {
+fn parse_cpu_affinity(env: &EnvSnapshot) -> anyhow::Result<Vec<u16>> {
+    let Some(raw) = env.get("IZWI_WORKER_CPU_AFFINITY")? else {
         return Ok(Vec::new());
     };
-    let raw = raw
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("IZWI_WORKER_CPU_AFFINITY must be UTF-8"))?;
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -1032,51 +1056,49 @@ fn parse_cpu_affinity() -> anyhow::Result<Vec<u16>> {
     Ok(affinity)
 }
 
-fn parse_positive_env<T>(name: &str, fallback: T) -> anyhow::Result<T>
+fn parse_positive_env<T>(env: &EnvSnapshot, name: &str, fallback: T) -> anyhow::Result<T>
 where
     T: std::str::FromStr + Default + PartialEq,
     T::Err: std::fmt::Display,
 {
-    let value = parse_env(name, fallback)?;
+    let value = env.parse_or(name, fallback)?;
     if value == T::default() {
         bail!("{name} must be non-zero");
     }
     Ok(value)
 }
 
-fn parse_bounded_duration_env(name: &str, fallback_ms: u64) -> anyhow::Result<u64> {
-    let value = parse_positive_env(name, fallback_ms)?;
+fn parse_bounded_duration_env(
+    env: &EnvSnapshot,
+    name: &str,
+    fallback_ms: u64,
+) -> anyhow::Result<u64> {
+    let value = parse_positive_env(env, name, fallback_ms)?;
     if value > 24 * 60 * 60 * 1000 {
         bail!("{name} must not exceed one day");
     }
     Ok(value)
 }
 
-fn verify_matching_budget(name: &str, advertised: u64) -> anyhow::Result<()> {
-    match std::env::var(name) {
-        Ok(raw) => {
-            let enforced = raw
-                .parse::<u64>()
-                .with_context(|| format!("parse {name}"))?;
+fn verify_matching_budget(env: &EnvSnapshot, name: &str, advertised: u64) -> anyhow::Result<()> {
+    match env.parse::<u64>(name)? {
+        Some(enforced) => {
             if enforced != advertised {
                 bail!("{name} must match the worker assignment budget");
             }
         }
-        Err(std::env::VarError::NotPresent) if managed_worker() => {
+        None if managed_worker(env)? => {
             bail!("managed worker requires {name} to enforce its assignment budget");
         }
-        Err(std::env::VarError::NotPresent) => {
+        None => {
             tracing::warn!(budget = advertised, variable = name, "local worker memory assignment is advisory because no runtime budget was configured");
         }
-        Err(error) => bail!("failed to read {name}: {error}"),
     }
     Ok(())
 }
 
-fn managed_worker() -> bool {
-    std::env::var("IZWI_WORKER_MANAGED")
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+fn managed_worker(env: &EnvSnapshot) -> anyhow::Result<bool> {
+    Ok(env.flag_or(MANAGED_WORKER_ENV, false)?)
 }
 
 fn verify_artifact_manifest(process: &WorkerProcessConfig) -> anyhow::Result<()> {
@@ -1236,14 +1258,11 @@ fn loaded_deployment(
     })
 }
 
-fn env_or(name: &str, fallback: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| fallback.into())
-}
-
 /// Parses `IZWI_WORKER_TASK`. Chat remains the default so existing
 /// deployments are byte-identical.
-fn parse_worker_task() -> anyhow::Result<TaskKind> {
-    match env_or(WORKER_TASK_ENV, "chat")
+fn parse_worker_task(env: &EnvSnapshot) -> anyhow::Result<TaskKind> {
+    match env
+        .get_or(WORKER_TASK_ENV, "chat")?
         .trim()
         .to_ascii_lowercase()
         .as_str()
@@ -1257,62 +1276,6 @@ fn parse_worker_task() -> anyhow::Result<TaskKind> {
     }
 }
 
-fn required_env(name: &str) -> anyhow::Result<String> {
-    let value = std::env::var(name).with_context(|| format!("{name} is required"))?;
-    if value.trim().is_empty() {
-        bail!("{name} must not be empty");
-    }
-    Ok(value)
-}
-
-fn parse_env<T>(name: &str, fallback: T) -> anyhow::Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid {name}: {error}")),
-        Err(_) => Ok(fallback),
-    }
-}
-
-/// `None` when the variable is unset, so an automatic default stays automatic.
-fn parse_optional_env<T>(name: &str) -> anyhow::Result<Option<T>>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
-        })
-        .transpose()
-}
-
-/// Read a tri-state env flag: `None` when unset or unrecognized, so an
-/// absent variable is distinguishable from an explicit `0`/`false`.
-fn env_flag_value(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-}
-
-fn parse_env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true")
-    })
-}
-
 fn default_models_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1323,8 +1286,6 @@ fn default_models_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn model_load_slots_parse_is_bounded_and_defaults_to_one() {
@@ -1466,17 +1427,15 @@ models_directory = "{root}"
         )
         .unwrap();
 
-        let process = {
-            let _lock = ENV_LOCK.lock().unwrap();
-            for (name, value) in spec.environment() {
-                std::env::set_var(name, value);
-            }
-            let process = WorkerProcessConfig::from_env();
-            for name in spec.environment().keys() {
-                std::env::remove_var(name);
-            }
-            process.unwrap()
-        };
+        // The worker captures only the variables it registers.
+        let env = env_config::snapshot(spec.environment().iter().filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            env_config::WORKER_ENV
+                .iter()
+                .any(|var| var.name == name)
+                .then(|| (name, value.to_str().unwrap()))
+        }));
+        let process = WorkerProcessConfig::from_env(&env).unwrap();
         let expected = ExpectedWorkerIdentity::from_config(&node, &worker_id, incarnation).unwrap();
         (process, expected)
     }
@@ -1649,14 +1608,15 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
         let (cert, key) = (files.path().join("cert.pem"), files.path().join("key.pem"));
         std::fs::write(&cert, TEST_TLS_CERT_PEM).unwrap();
         std::fs::write(&key, TEST_TLS_KEY_PEM).unwrap();
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
-        std::env::set_var(WORKER_TLS_CERT_REF_ENV, format!("file:{}", cert.display()));
-        std::env::set_var(WORKER_TLS_KEY_REF_ENV, format!("file:{}", key.display()));
-        let tls = WorkerTlsConfig::from_env();
-        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
-        tls.unwrap().unwrap()
+        let (cert, key) = (
+            format!("file:{}", cert.display()),
+            format!("file:{}", key.display()),
+        );
+        let env = env_config::snapshot([
+            (WORKER_TLS_CERT_REF_ENV, cert.as_str()),
+            (WORKER_TLS_KEY_REF_ENV, key.as_str()),
+        ]);
+        WorkerTlsConfig::from_env(&env).unwrap().unwrap()
     }
 
     #[tokio::test]
@@ -1707,63 +1667,58 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
 
     #[test]
     fn tls_config_rejects_partial_cert_and_key_pair() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
-        std::env::remove_var(WORKER_TLS_CLIENT_CA_REF_ENV);
-        assert!(WorkerTlsConfig::from_env().unwrap().is_none());
-
-        std::env::set_var(WORKER_TLS_CERT_REF_ENV, "file:/tmp/cert.pem");
-        assert!(WorkerTlsConfig::from_env().is_err());
-
-        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-        std::env::set_var(WORKER_TLS_KEY_REF_ENV, "file:/tmp/key.pem");
-        assert!(WorkerTlsConfig::from_env().is_err());
-
-        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
-        assert!(WorkerTlsConfig::from_env().unwrap().is_none());
+        let tls = |pairs: &[(&str, &str)]| {
+            WorkerTlsConfig::from_env(&env_config::snapshot(pairs.iter().copied()))
+        };
+        assert!(tls(&[]).unwrap().is_none());
+        assert!(tls(&[(WORKER_TLS_CERT_REF_ENV, "file:/tmp/cert.pem")]).is_err());
+        assert!(tls(&[(WORKER_TLS_KEY_REF_ENV, "file:/tmp/key.pem")]).is_err());
     }
 
     #[test]
     fn tls_config_rejects_non_file_references_and_relative_paths() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::set_var(WORKER_TLS_CERT_REF_ENV, "http://example.com/cert.pem");
-        std::env::set_var(WORKER_TLS_KEY_REF_ENV, "file:relative/key.pem");
-        let result = WorkerTlsConfig::from_env();
+        let result = WorkerTlsConfig::from_env(&env_config::snapshot([
+            (WORKER_TLS_CERT_REF_ENV, "http://example.com/cert.pem"),
+            (WORKER_TLS_KEY_REF_ENV, "file:relative/key.pem"),
+        ]));
         assert!(result.is_err());
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("file: path"),
             "error should mention file: path requirement: {error}"
         );
-        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
     }
 
     #[test]
     fn non_loopback_plaintext_bind_fails_closed_without_acknowledgement() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND");
-        std::env::remove_var(WORKER_TLS_CERT_REF_ENV);
-        std::env::remove_var(WORKER_TLS_KEY_REF_ENV);
-        std::env::set_var("IZWI_WORKER_BIND", "0.0.0.0:9470");
-        std::env::set_var("IZWI_WORKER_ARTIFACT_REVISION", "test-rev");
-        std::env::set_var("IZWI_WORKER_CREDENTIAL_ID", "test-cred");
-        std::env::set_var("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678");
-
-        let result = WorkerProcessConfig::from_env();
+        let required = [
+            ("IZWI_WORKER_BIND", "0.0.0.0:9470"),
+            ("IZWI_WORKER_ARTIFACT_REVISION", "test-rev"),
+            ("IZWI_WORKER_CREDENTIAL_ID", "test-cred"),
+            ("IZWI_WORKER_BEARER_TOKEN", "test-token-12345678"),
+        ];
+        let result = WorkerProcessConfig::from_env(&env_config::snapshot(required));
         assert!(result.is_err());
         let error = result.err().unwrap().to_string();
         assert!(error.contains("plaintext worker transport may bind only to a loopback address"));
 
-        std::env::set_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND", "1");
-        let result = WorkerProcessConfig::from_env();
+        let acknowledged = required
+            .into_iter()
+            .chain([("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND", "1")]);
+        let result = WorkerProcessConfig::from_env(&env_config::snapshot(acknowledged));
         assert!(result.is_ok());
 
-        std::env::remove_var("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND");
-        std::env::remove_var("IZWI_WORKER_BIND");
-        std::env::remove_var("IZWI_WORKER_ARTIFACT_REVISION");
-        std::env::remove_var("IZWI_WORKER_CREDENTIAL_ID");
-        std::env::remove_var("IZWI_WORKER_BEARER_TOKEN");
+        // A value the shared boolean policy does not recognise fails closed.
+        let garbled = required
+            .into_iter()
+            .chain([("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND", "sure")]);
+        let error = WorkerProcessConfig::from_env(&env_config::snapshot(garbled))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("IZWI_WORKER_ALLOW_INSECURE_PLAINTEXT_BIND must be one of"),
+            "{error}"
+        );
     }
 }
