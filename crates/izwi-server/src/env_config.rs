@@ -103,9 +103,14 @@ pub(crate) static SERVER_ENV: &[EnvVar] = &[
         "`1` when the desktop app owns this process: stdin closing shuts it down.",
     ),
     var(
+        "IZWI_HTTP_SHUTDOWN_PRESTOP_SECS",
+        "0",
+        "Pre-stop window at shutdown (0-60): readiness is unready while requests are still served.",
+    ),
+    var(
         "IZWI_HTTP_SHUTDOWN_GRACE_SECS",
         "20",
-        "How long in-flight HTTP requests may run after shutdown starts (1-300).",
+        "How long in-flight HTTP requests may run after the pre-stop window (1-300); open chat streams get a terminal shutting-down event shortly before it ends.",
     ),
     var(
         "IZWI_BATCH_WORKER_CONCURRENCY",

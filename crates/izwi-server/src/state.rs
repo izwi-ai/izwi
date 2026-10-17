@@ -320,6 +320,8 @@ struct LifecycleInner {
     phase: String,
     ready: bool,
     draining: bool,
+    /// Shutdown's pre-stop window: unready, but still serving.
+    stopping: bool,
     started_at: u64,
     updated_at: u64,
     startup_warnings: Vec<String>,
@@ -339,6 +341,7 @@ impl ServerLifecycle {
                 phase: "initializing".to_string(),
                 ready: false,
                 draining: false,
+                stopping: false,
                 started_at: now,
                 updated_at: now,
                 startup_warnings: Vec::new(),
@@ -347,17 +350,39 @@ impl ServerLifecycle {
         }
     }
 
-    /// Draining is terminal: a startup step that finishes after shutdown
+    /// Shutdown is terminal: a startup step that finishes after shutdown
     /// began must not make the server ready again.
     pub fn mark_ready(&self) {
         self.update(|inner| {
-            if inner.draining {
+            if inner.draining || inner.stopping {
                 return;
             }
             inner.phase = "ready".to_string();
             inner.ready = true;
             inner.draining = false;
         });
+    }
+
+    /// Shutdown's pre-stop window: readiness turns unready so load
+    /// balancers stop routing here, while requests are still served.
+    pub(crate) fn mark_stopping(&self) {
+        self.update(|inner| {
+            if inner.draining {
+                return;
+            }
+            inner.phase = "stopping".to_string();
+            inner.ready = false;
+            inner.stopping = true;
+        });
+    }
+
+    /// Whether shutdown has begun (its pre-stop window or its drain).
+    pub(crate) fn shutdown_started(&self) -> bool {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.draining || guard.stopping
     }
 
     pub fn mark_draining(&self) {
@@ -468,6 +493,9 @@ pub struct AppState {
     pub media_ingest: Arc<MediaIngestService>,
     /// In-process batch worker health snapshot used by readiness and diagnostics.
     pub batch_worker_health: BatchWorkerHealth,
+    /// Turns `true` when shutdown ends the live chat streams with a
+    /// terminal "shutting down" event.
+    pub(crate) stream_shutdown: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl AppState {
@@ -550,6 +578,7 @@ impl AppState {
             artifact_store,
             media_ingest,
             batch_worker_health,
+            stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
         })
     }
 
@@ -642,6 +671,7 @@ impl AppState {
             artifact_store,
             media_ingest,
             batch_worker_health,
+            stream_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
         })
     }
 

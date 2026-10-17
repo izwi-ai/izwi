@@ -1,13 +1,11 @@
 //! Shutdown signals and the ordered shutdown of the HTTP server, the batch worker and the runtime.
 
 use std::io::Read;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use crate::batch_runtime::worker::BatchWorkerDrain;
 use crate::state::AppState;
 
 const DESKTOP_OWNER_PIPE_ENV: &str = "IZWI_DESKTOP_OWNER_PIPE";
@@ -44,27 +42,6 @@ pub(crate) async fn shutdown_requested() {
             info!("Desktop owner pipe closed, shutting down...");
         },
     }
-}
-
-/// Wait for shutdown and begin draining the server, runtime and batch worker.
-pub(crate) async fn shutdown_signal<S>(
-    shutdown_requested: S,
-    state: AppState,
-    batch_worker_drain: Arc<std::sync::OnceLock<BatchWorkerDrain>>,
-    shutdown_started: oneshot::Sender<()>,
-) where
-    S: std::future::Future<Output = ()>,
-{
-    shutdown_requested.await;
-
-    state.lifecycle.mark_draining();
-    state.runtime.begin_drain();
-    if let Some(drain) = batch_worker_drain.get() {
-        drain.begin();
-    }
-    let _ = shutdown_started.send(());
-
-    drop(state);
 }
 
 pub(crate) async fn gateway_shutdown_requested() {
@@ -118,22 +95,84 @@ pub(crate) fn wait_for_owner_pipe_close(mut reader: impl Read) {
     }
 }
 
-pub(crate) async fn await_http_server_shutdown<F>(
-    server: F,
-    shutdown_started: oneshot::Receiver<()>,
-    grace: Duration,
+/// How a role spends its shutdown budget: a pre-stop window in which
+/// readiness is unready but requests are served, then a drain of in-flight
+/// requests. Streams still open near the end of the drain are ended with a
+/// terminal event, so no client is cut off without one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShutdownPlan {
+    pub(crate) prestop: Duration,
+    pub(crate) budget: Duration,
+}
+
+impl ShutdownPlan {
+    pub(crate) fn drain(&self) -> Duration {
+        self.budget.saturating_sub(self.prestop)
+    }
+
+    /// When, into the drain, open streams are told to end: late enough for
+    /// most to finish on their own, early enough to deliver the event.
+    pub(crate) fn stream_notice(&self) -> Duration {
+        let drain = self.drain();
+        drain.saturating_sub((drain / 4).min(Duration::from_secs(2)))
+    }
+}
+
+/// What a role does at each step of its [`ShutdownPlan`].
+pub(crate) trait ShutdownPhases: Send + 'static {
+    /// Readiness turns unready; requests are still admitted.
+    fn begin_prestop(&self);
+    /// Admission closes; admitted requests run on.
+    fn begin_drain(&self);
+    /// Live streams end with a terminal "shutting down" event.
+    fn end_streams(&self);
+}
+
+/// Serve until `shutdown_requested`, then follow `plan`: the pre-stop
+/// window, the drain (the listener stops accepting), the stream notice, and
+/// the end of the budget. `serve` runs the HTTP server with the graceful
+/// shutdown signal it is given. `None` means the budget ran out with
+/// connections still open; they are dropped.
+pub(crate) async fn serve_with_shutdown_plan<S, F, P>(
+    serve: impl FnOnce(futures::future::BoxFuture<'static, ()>) -> F,
+    phases: P,
+    shutdown_requested: S,
+    plan: ShutdownPlan,
 ) -> Option<F::Output>
 where
+    S: std::future::Future<Output = ()> + Send + 'static,
     F: std::future::Future,
+    P: ShutdownPhases + Clone,
 {
+    let (drain_started_tx, drain_started_rx) = oneshot::channel::<()>();
+    let signal_phases = phases.clone();
+    let server = serve(Box::pin(async move {
+        shutdown_requested.await;
+        signal_phases.begin_prestop();
+        info!(
+            prestop_secs = plan.prestop.as_secs_f64(),
+            budget_secs = plan.budget.as_secs_f64(),
+            "Shutdown pre-stop: readiness is unready, requests are still served"
+        );
+        tokio::time::sleep(plan.prestop).await;
+        signal_phases.begin_drain();
+        let _ = drain_started_tx.send(());
+    }));
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => Some(result),
-        started = shutdown_started => {
+        started = drain_started_rx => {
             if started.is_err() {
                 return Some(server.await);
             }
-            tokio::time::timeout(grace, &mut server).await.ok()
+            match tokio::time::timeout(plan.stream_notice(), &mut server).await {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    phases.end_streams();
+                    let rest = plan.drain().saturating_sub(plan.stream_notice());
+                    tokio::time::timeout(rest, &mut server).await.ok()
+                }
+            }
         }
     }
 }

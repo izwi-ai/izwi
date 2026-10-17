@@ -927,7 +927,11 @@ For planned maintenance, drain the gateway before stopping the supervisor:
    `service_unavailable` error event and `[DONE]`, and their exact private
    attempts request cancellation; anything left at the end of the budget is
    dropped. Completion is still worker-authoritative.
-   `IZWI_HTTP_SHUTDOWN_GRACE_SECS` applies to the local role only.
+   The local role follows the same plan: `IZWI_HTTP_SHUTDOWN_PRESTOP_SECS`
+   (default 0, so a desktop or command-line server stops at once) and then
+   `IZWI_HTTP_SHUTDOWN_GRACE_SECS` (default 20) of drain, with the same
+   stream notice for open chat streams (chat completions, Responses and
+   thread chats); it then stops its batch worker and unloads its models.
 4. Send SIGTERM (or Ctrl+C) to the supervisor. Closing each parent-owned control
    pipe makes the worker stop admission. The worker waits `drain_grace_ms`,
    requests cancellation for remaining attempts, then waits

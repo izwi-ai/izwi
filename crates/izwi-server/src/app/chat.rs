@@ -457,7 +457,15 @@ impl ChatDeltaSink {
     }
 }
 
-async fn resolve_chat_terminal<F>(sink: &ChatDeltaSink, generation: F) -> Option<ChatStreamEvent>
+/// The stream's terminal event once `generation` ends, the consumer goes
+/// away (`None`), the consumer stalls, or a `true` on `shutdown` (the local
+/// role's stream notice) ends the stream with a "shutting down" failure.
+/// Dropping `generation` cancels the request.
+async fn resolve_chat_terminal<F>(
+    sink: &ChatDeltaSink,
+    generation: F,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Option<ChatStreamEvent>
 where
     F: Future<Output = izwi_core::Result<ChatGeneration>>,
 {
@@ -466,6 +474,11 @@ where
         result = &mut generation => Some(result),
         _ = sink.event_tx.closed() => return None,
         _ = sink.stalled() => None,
+        () = shutdown_requested(shutdown.as_mut()) => {
+            return Some(ChatStreamEvent::Failed(ApiError::service_unavailable(
+                "The server is shutting down; retry the request",
+            )));
+        }
     };
 
     // A generation can overflow the merged delta and complete in the same
@@ -1349,6 +1362,7 @@ where
     K: Send + 'static,
 {
     let runtime = state.runtime.clone();
+    let shutdown = state.stream_shutdown.subscribe();
     let params = request.resolved_generation_params();
     let chat_config = request.resolved_chat_config();
     let permit = state
@@ -1381,7 +1395,7 @@ where
                     sink.offer(delta, logprobs);
                 }
             });
-            let terminal = resolve_chat_terminal(&sink, generation).await;
+            let terminal = resolve_chat_terminal(&sink, generation, Some(shutdown)).await;
             drop(permit);
             if let Some(terminal) = terminal {
                 sink.finish(terminal).await;
@@ -1432,7 +1446,7 @@ where
         }
 
         let generation = generation_task(sink.clone());
-        let terminal = resolve_chat_terminal(&sink, generation).await;
+        let terminal = resolve_chat_terminal(&sink, generation, None).await;
         drop(permit);
         if let Some(terminal) = terminal {
             sink.finish(terminal).await;
@@ -1464,7 +1478,7 @@ where
                 return;
             }
             let generation = generation_task(sink.clone());
-            let terminal = resolve_chat_terminal(&sink, generation).await;
+            let terminal = resolve_chat_terminal(&sink, generation, None).await;
             drop(permit);
             if let Some(terminal) = terminal {
                 sink.finish(terminal).await;
@@ -1493,6 +1507,36 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::sync::Semaphore;
+
+    /// The local role's stream notice ends a running stream with a
+    /// terminal "shutting down" failure instead of leaving it to be cut.
+    #[tokio::test]
+    async fn shutdown_notice_ends_a_local_stream_with_a_terminal_error() {
+        let (event_tx, _event_rx) = mpsc::channel(4);
+        let sink = ChatDeltaSink::new(event_tx, CHAT_TERMINAL_SEND_TIMEOUT);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let terminal = tokio::spawn(async move {
+            resolve_chat_terminal(
+                &sink,
+                std::future::pending::<izwi_core::Result<ChatGeneration>>(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx.send_replace(true);
+        match tokio::time::timeout(Duration::from_secs(5), terminal)
+            .await
+            .expect("the notice ends the stream")
+            .unwrap()
+        {
+            Some(ChatStreamEvent::Failed(error)) => {
+                assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert!(error.message.contains("shutting down"), "{}", error.message);
+            }
+            other => panic!("expected a shutting-down failure, got {other:?}"),
+        }
+    }
 
     #[test]
     fn worker_usage_maps_cached_tokens_into_the_generation() {

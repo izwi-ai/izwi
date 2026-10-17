@@ -12,7 +12,6 @@ use izwi_serving_protocol::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
 use crate::cli::{BackendArg, GatewayTopology, ServerArgs};
@@ -21,7 +20,9 @@ use crate::roles::gateway_workers::{
     gateway_worker_client, validate_status_cadence, AdoptedGatewayWorker, DuplicateGatewayWorker,
     GatewayWorkerAdopter, GatewayWorkerStatusPoller,
 };
-use crate::shutdown::gateway_shutdown_requested;
+use crate::shutdown::{
+    gateway_shutdown_requested, serve_with_shutdown_plan, ShutdownPhases, ShutdownPlan,
+};
 use crate::{
     app, gateway, gateway_deployments, gateway_shared_approvals, gateway_worker_tls, logging,
     worker_registry, GatewayPerimeterConfig, GatewayRateQuotaConfig,
@@ -151,34 +152,11 @@ pub(crate) async fn run_gateway(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Gateway listening on http://{}", listener.local_addr()?);
 
-    let plan = GatewayShutdownPlan {
+    let plan = ShutdownPlan {
         prestop: Duration::from_secs(args.gateway_prestop_secs),
         budget: Duration::from_secs(args.gateway_shutdown_budget_secs),
     };
     serve_gateway(listener, app, state, gateway_shutdown_requested(), plan).await
-}
-
-/// How a gateway spends its shutdown budget: a pre-stop window in which
-/// readiness is unready but requests are served, then a drain of in-flight
-/// requests. Streams still open near the end of the drain are ended with a
-/// terminal event, so no client is cut off without one.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct GatewayShutdownPlan {
-    pub(crate) prestop: Duration,
-    pub(crate) budget: Duration,
-}
-
-impl GatewayShutdownPlan {
-    fn drain(&self) -> Duration {
-        self.budget.saturating_sub(self.prestop)
-    }
-
-    /// When, into the drain, open streams are told to end: late enough for
-    /// most to finish on their own, early enough to deliver the event.
-    pub(crate) fn stream_notice(&self) -> Duration {
-        let drain = self.drain();
-        drain.saturating_sub((drain / 4).min(Duration::from_secs(2)))
-    }
 }
 
 pub(crate) async fn serve_gateway<S>(
@@ -186,44 +164,22 @@ pub(crate) async fn serve_gateway<S>(
     app: axum::Router,
     state: gateway::GatewayState,
     shutdown_requested: S,
-    plan: GatewayShutdownPlan,
+    plan: ShutdownPlan,
 ) -> anyhow::Result<()>
 where
     S: std::future::Future<Output = ()> + Send + 'static,
 {
-    let signal_state = state.clone();
-    let (drain_started_tx, drain_started_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_requested.await;
-        signal_state.begin_prestop();
-        info!(
-            prestop_secs = plan.prestop.as_secs_f64(),
-            budget_secs = plan.budget.as_secs_f64(),
-            "Gateway pre-stop: readiness is unready, requests are still served"
-        );
-        tokio::time::sleep(plan.prestop).await;
-        signal_state.begin_drain();
-        let _ = drain_started_tx.send(());
-    });
-    let server = async move { server.await };
-    tokio::pin!(server);
-    let finished = tokio::select! {
-        result = &mut server => Some(result),
-        started = drain_started_rx => {
-            if started.is_err() {
-                Some(server.await)
-            } else {
-                match tokio::time::timeout(plan.stream_notice(), &mut server).await {
-                    Ok(result) => Some(result),
-                    Err(_) => {
-                        state.end_streams();
-                        let rest = plan.drain().saturating_sub(plan.stream_notice());
-                        tokio::time::timeout(rest, &mut server).await.ok()
-                    }
-                }
-            }
-        }
-    };
+    let finished = serve_with_shutdown_plan(
+        |signal| async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(signal)
+                .await
+        },
+        state,
+        shutdown_requested,
+        plan,
+    )
+    .await;
     match finished {
         Some(result) => result?,
         None => warn!(
@@ -232,6 +188,20 @@ where
         ),
     }
     Ok(())
+}
+
+impl ShutdownPhases for gateway::GatewayState {
+    fn begin_prestop(&self) {
+        gateway::GatewayState::begin_prestop(self);
+    }
+
+    fn begin_drain(&self) {
+        gateway::GatewayState::begin_drain(self);
+    }
+
+    fn end_streams(&self) {
+        gateway::GatewayState::end_streams(self);
+    }
 }
 
 pub(crate) async fn gateway_state(

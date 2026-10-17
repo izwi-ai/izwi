@@ -18,7 +18,7 @@ use crate::logging::LogFormat;
 use crate::roles::gateway::{
     configured_gateway_worker_approvals, gateway_state, gateway_worker_client_config,
     serve_gateway, validate_gateway_limits, validate_gateway_topology_policy,
-    validate_gateway_topology_source, GatewayShutdownPlan, MAX_CONFIGURED_GATEWAY_WORKERS,
+    validate_gateway_topology_source, MAX_CONFIGURED_GATEWAY_WORKERS,
 };
 use crate::roles::gateway_workers::{
     approve_gateway_worker, configured_worker_capacity, initial_gateway_worker_expectation,
@@ -32,7 +32,8 @@ use crate::roles::local::{
     warmup_preloaded_models_enabled,
 };
 use crate::shutdown::{
-    await_http_server_shutdown, shutdown_worker_then_cleanup, wait_for_owner_pipe_close,
+    serve_with_shutdown_plan, shutdown_worker_then_cleanup, wait_for_owner_pipe_close,
+    ShutdownPhases, ShutdownPlan,
 };
 use crate::test_support::env_lock;
 
@@ -53,6 +54,14 @@ fn local_test_state() -> (AppState, ServeRuntimeConfig, tempfile::TempDir) {
     std::env::remove_var("IZWI_DB_PATH");
     std::env::remove_var("IZWI_MEDIA_DIR");
     (state, serve_config, temp_dir)
+}
+
+/// A short local shutdown: no pre-stop, a 2 s drain.
+fn test_shutdown_plan() -> ShutdownPlan {
+    ShutdownPlan {
+        prestop: Duration::ZERO,
+        budget: Duration::from_secs(2),
+    }
 }
 
 async fn lifecycle_ready(client: &reqwest::Client, base: &str) -> (u16, bool) {
@@ -93,6 +102,7 @@ async fn local_server_answers_liveness_while_models_preload() {
         async move {
             let _ = stopped.await;
         },
+        test_shutdown_plan(),
     ));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -141,6 +151,7 @@ async fn shutdown_during_preload_abandons_startup_without_becoming_ready() {
             app,
             std::future::pending::<Vec<String>>(),
             std::future::ready(()),
+            test_shutdown_plan(),
         ),
     )
     .await
@@ -315,29 +326,147 @@ fn local_batch_worker_timeouts_are_configurable_and_bounded() {
     std::env::remove_var("IZWI_HTTP_SHUTDOWN_GRACE_SECS");
 }
 
-#[tokio::test]
-async fn http_shutdown_finishes_without_waiting_for_a_signal_when_server_exits() {
-    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-    let result = await_http_server_shutdown(
-        async { "server-exited" },
-        shutdown_rx,
-        Duration::from_secs(1),
-    )
-    .await;
-    assert_eq!(result, Some("server-exited"));
+/// Records when each shutdown phase ran.
+#[derive(Clone, Default)]
+struct RecordedPhases(Arc<std::sync::Mutex<Vec<(&'static str, tokio::time::Instant)>>>);
+
+impl RecordedPhases {
+    fn record(&self, phase: &'static str) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((phase, tokio::time::Instant::now()));
+    }
+
+    fn phases(&self) -> Vec<(&'static str, tokio::time::Instant)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl ShutdownPhases for RecordedPhases {
+    fn begin_prestop(&self) {
+        self.record("prestop");
+    }
+
+    fn begin_drain(&self) {
+        self.record("drain");
+    }
+
+    fn end_streams(&self) {
+        self.record("end_streams");
+    }
 }
 
 #[tokio::test]
-async fn http_shutdown_grace_period_bounds_stuck_connections() {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    shutdown_tx.send(()).expect("shutdown receiver is alive");
-    let result = await_http_server_shutdown(
+async fn http_shutdown_finishes_without_waiting_for_a_signal_when_server_exits() {
+    let phases = RecordedPhases::default();
+    let result = serve_with_shutdown_plan(
+        |_signal| async { "server-exited" },
+        phases.clone(),
         std::future::pending::<()>(),
-        shutdown_rx,
-        Duration::from_millis(1),
+        test_shutdown_plan(),
+    )
+    .await;
+    assert_eq!(result, Some("server-exited"));
+    assert!(phases.phases().is_empty());
+}
+
+/// The plan's phases run in order at their times, and connections that
+/// never close are dropped at the end of the budget.
+#[tokio::test(start_paused = true)]
+async fn http_shutdown_plan_runs_its_phases_and_bounds_stuck_connections() {
+    let phases = RecordedPhases::default();
+    let plan = ShutdownPlan {
+        prestop: Duration::from_secs(5),
+        budget: Duration::from_secs(25),
+    };
+    let started = tokio::time::Instant::now();
+    let result = serve_with_shutdown_plan(
+        |signal| async move {
+            signal.await;
+            std::future::pending::<()>().await
+        },
+        phases.clone(),
+        std::future::ready(()),
+        plan,
     )
     .await;
     assert_eq!(result, None);
+    let at = |phase: &str| {
+        phases
+            .phases()
+            .into_iter()
+            .find(|(name, _)| *name == phase)
+            .map(|(_, at)| at - started)
+            .unwrap_or_else(|| panic!("{phase} did not run"))
+    };
+    assert_eq!(at("prestop"), Duration::ZERO);
+    assert_eq!(at("drain"), plan.prestop);
+    assert_eq!(at("end_streams"), plan.prestop + plan.stream_notice());
+    assert_eq!(plan.stream_notice(), Duration::from_secs(18));
+    assert_eq!(started.elapsed(), plan.budget);
+}
+
+/// The local role follows the gateway's plan: during the pre-stop window
+/// readiness is unready while the runtime still admits work, then the
+/// drain closes admission and the server stops within its budget.
+#[tokio::test]
+async fn local_shutdown_serves_through_prestop_then_drains() {
+    let _env = env_lock();
+    let (state, serve_config, _temp_dir) = local_test_state();
+    let app = api::create_router(state.clone(), &serve_config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let plan = ShutdownPlan {
+        prestop: Duration::from_millis(600),
+        budget: Duration::from_millis(1600),
+    };
+    let server = tokio::spawn(serve_local(
+        state.clone(),
+        listener,
+        app,
+        async { Vec::new() },
+        async move {
+            let _ = stopped.await;
+        },
+        plan,
+    ));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !lifecycle_ready(&client, &base).await.1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ready once preload finishes");
+
+    stop.send(()).expect("server is running");
+    let signalled = Instant::now();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(lifecycle_ready(&client, &base).await, (503, false));
+    let live = client.get(format!("{base}/livez")).send().await.unwrap();
+    assert_eq!(live.status().as_u16(), 200);
+    assert!(!state.runtime.coordinator_snapshot().draining);
+    assert!(!state.lifecycle.snapshot().draining);
+
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server stops within its budget")
+        .expect("server task")
+        .expect("server result");
+    assert!(
+        signalled.elapsed() >= plan.prestop,
+        "{:?}",
+        signalled.elapsed()
+    );
+    assert!(state.runtime.coordinator_snapshot().draining);
+    assert!(state.lifecycle.snapshot().draining);
 }
 
 fn clear_bind_env() {
@@ -824,7 +953,7 @@ async fn gateway_shutdown_serves_through_prestop_and_ends_streams_with_a_termina
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (signal_tx, signal_rx) = oneshot::channel::<()>();
-    let plan = GatewayShutdownPlan {
+    let plan = ShutdownPlan {
         prestop: Duration::from_millis(400),
         budget: Duration::from_millis(1600),
     };

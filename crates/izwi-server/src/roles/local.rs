@@ -10,7 +10,6 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::batch_runtime::store::DEFAULT_RUNTIME_MAINTENANCE_BATCH_LIMIT;
@@ -24,8 +23,8 @@ use crate::cli::{BindConfig, ServerArgs};
 use crate::logging::{SERVICE_NAME, SERVICE_VERSION};
 use crate::persistence::PersistenceContext;
 use crate::shutdown::{
-    await_http_server_shutdown, cleanup_runtime_for_shutdown, shutdown_requested, shutdown_signal,
-    shutdown_worker_then_cleanup,
+    cleanup_runtime_for_shutdown, serve_with_shutdown_plan, shutdown_requested,
+    shutdown_worker_then_cleanup, ShutdownPhases, ShutdownPlan,
 };
 use crate::state::AppState;
 use crate::{api, gateway_security, local_security, logging};
@@ -178,6 +177,7 @@ pub(crate) async fn run_local(
             preload_failures
         },
         shutdown_requested(),
+        local_shutdown_plan(),
     )
     .await
 }
@@ -185,13 +185,15 @@ pub(crate) async fn run_local(
 /// Serve the local role on an already bound listener while `preload` loads
 /// the configured models. The server turns ready, and the batch worker
 /// starts, only once preload finishes; a shutdown that begins first
-/// abandons the preload.
+/// abandons the preload. Shutdown follows `plan` like the gateway's, then
+/// stops the batch worker and unloads the runtime.
 pub(crate) async fn serve_local<P, S>(
     state: AppState,
     listener: tokio::net::TcpListener,
     app: axum::Router,
     preload: P,
     shutdown_requested: S,
+    plan: ShutdownPlan,
 ) -> anyhow::Result<()>
 where
     P: std::future::Future<Output = Vec<String>> + Send + 'static,
@@ -204,30 +206,25 @@ where
         batch_worker_drain.clone(),
     ));
 
-    // Clone state for shutdown handler
-    let shutdown_state = state.clone();
-    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
-
-    // Spawn server with graceful shutdown
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(
-        shutdown_requested,
-        shutdown_state,
-        batch_worker_drain,
-        shutdown_started_tx,
-    ));
-
     info!("Server accepting connections. Press Ctrl+C to stop.");
-    let http_shutdown_grace = http_shutdown_grace_timeout();
-    let server_result = await_http_server_shutdown(
-        async move { server.await },
-        shutdown_started_rx,
-        http_shutdown_grace,
+    let server_result = serve_with_shutdown_plan(
+        |signal| async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(signal)
+                .await
+        },
+        LocalShutdown {
+            state: state.clone(),
+            batch_worker_drain,
+        },
+        shutdown_requested,
+        plan,
     )
     .await;
     if server_result.is_none() {
         warn!(
-            grace_secs = http_shutdown_grace.as_secs(),
-            "HTTP graceful shutdown timed out; dropping remaining connections"
+            budget_secs = plan.budget.as_secs(),
+            "HTTP shutdown budget spent; dropping remaining connections"
         );
     }
     // A preload still running when shutdown began is abandoned; a finished
@@ -251,6 +248,31 @@ where
     Ok(())
 }
 
+/// The local role's shutdown steps.
+#[derive(Clone)]
+struct LocalShutdown {
+    state: AppState,
+    batch_worker_drain: Arc<std::sync::OnceLock<BatchWorkerDrain>>,
+}
+
+impl ShutdownPhases for LocalShutdown {
+    fn begin_prestop(&self) {
+        self.state.lifecycle.mark_stopping();
+    }
+
+    fn begin_drain(&self) {
+        self.state.lifecycle.mark_draining();
+        self.state.runtime.begin_drain();
+        if let Some(drain) = self.batch_worker_drain.get() {
+            drain.begin();
+        }
+    }
+
+    fn end_streams(&self) {
+        self.state.stream_shutdown.send_replace(true);
+    }
+}
+
 /// Finish local startup after the listener is bound: record preload
 /// failures (they keep readiness failed), mark the server ready and start the
 /// batch worker. Nothing starts once shutdown has begun.
@@ -267,7 +289,7 @@ where
         warn!(warning = %warning, "Startup readiness warning");
     }
     state.lifecycle.record_preload_failures(preload_failures);
-    if state.lifecycle.snapshot().draining {
+    if state.lifecycle.shutdown_started() {
         return None;
     }
     state.lifecycle.mark_ready();
@@ -396,6 +418,29 @@ pub(crate) fn batch_worker_drain_timeout() -> Duration {
 pub(crate) fn http_shutdown_grace_timeout() -> Duration {
     duration_secs_from_env("IZWI_HTTP_SHUTDOWN_GRACE_SECS", 20, 1, 300)
         .unwrap_or_else(|| Duration::from_secs(20))
+}
+
+/// The pre-stop window at the start of shutdown
+/// (`IZWI_HTTP_SHUTDOWN_PRESTOP_SECS`, 0-60, default 0: a desktop or
+/// command-line server stops at once; set it behind a load balancer).
+pub(crate) fn http_shutdown_prestop() -> Duration {
+    Duration::from_secs(
+        std::env::var("IZWI_HTTP_SHUTDOWN_PRESTOP_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(60),
+    )
+}
+
+/// The local role's shutdown budget: the pre-stop window, then the HTTP
+/// drain grace.
+pub(crate) fn local_shutdown_plan() -> ShutdownPlan {
+    let prestop = http_shutdown_prestop();
+    ShutdownPlan {
+        prestop,
+        budget: prestop + http_shutdown_grace_timeout(),
+    }
 }
 
 fn duration_secs_from_env(
