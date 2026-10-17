@@ -9,6 +9,8 @@ pub mod actor;
 pub mod approvals_file;
 pub mod autoscale;
 mod config;
+/// The supervisor process behind the binary.
+pub mod daemon;
 pub mod env;
 pub mod gateway_ack;
 mod launch;
