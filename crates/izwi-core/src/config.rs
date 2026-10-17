@@ -633,6 +633,28 @@ pub(crate) fn resolve_prefix_engagement(
     }
 }
 
+/// Realtime ASR session limits (SPK-F9). An unset field takes its
+/// `IZWI_ASR_REALTIME_*` environment variable, then the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeAsrSessionConfig {
+    /// Concurrent realtime sessions, which is also the row count of the
+    /// realtime state arena a load reserves up front
+    /// (`IZWI_ASR_REALTIME_MAX_SESSIONS`; default 16 on CUDA, 4 on CPU and
+    /// Metal).
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+    /// Absolute lifetime of one session in seconds
+    /// (`IZWI_ASR_REALTIME_MAX_LIFETIME_SECS`; default 8 hours). Models with
+    /// a bounded stream roll over inside it, so it only bounds a session
+    /// that is never closed.
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u64>,
+    /// Seconds a session may receive no audio before it is reaped
+    /// (`IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS`; default 90).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+}
+
 /// Main engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -688,6 +710,10 @@ pub struct EngineConfig {
     /// Automatic or explicitly fixed maximum sequence length.
     #[serde(default)]
     pub max_sequence_length: ContextLengthPreference,
+
+    /// Realtime ASR session quota, lifetime and idle timeout.
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
 
     /// Memory kept outside fitted model/state plans for allocator and backend
     /// command-buffer overhead.
@@ -795,6 +821,7 @@ impl Default for EngineConfig {
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
+            asr_realtime: RealtimeAsrSessionConfig::default(),
             portable_context_reserve_bytes: default_portable_context_reserve_bytes(),
             chunk_size: default_chunk_size(),
             kv_cache_dtype: default_kv_cache_dtype(),

@@ -9,6 +9,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use crate::backends::state::{PhysicalStateSequenceId, PhysicalStateTransactionId};
 use crate::backends::BackendKind;
 use crate::catalog::{parse_model_variant, resolve_asr_model_variant, ModelFamily};
+use crate::config::RealtimeAsrSessionConfig;
 use crate::engine::{
     AsrProgress, AsrProgressPhase, EngineCoreRequest, EngineOutput, RealtimeAsrSessionHandle,
     ResourceAmount, ResourceVector, RetainedTensorStateRuntimeV2, StreamingOutput, TaskType,
@@ -164,13 +165,22 @@ const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
 const ASR_REALTIME_MAX_SESSIONS_ENV: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
 const ASR_REALTIME_MAX_LIFETIME_SECS_ENV: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
 const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
-/// Concurrent realtime sessions, which is also the row count of the realtime
-/// state arena a load allocates up front: Nemotron's is about 37 MB of F32 per
-/// row (twice per session), so 16 sessions held 1.18 GB that a desktop rarely
-/// uses (NEM-4). Servers raise it with `IZWI_ASR_REALTIME_MAX_SESSIONS`.
+/// Concurrent realtime sessions on CPU and Metal, which is also the row count
+/// of the realtime state arena a load allocates up front: Nemotron's is about
+/// 37 MB of F32 per row (twice per session), so 16 sessions held 1.18 GB that
+/// a desktop rarely uses (NEM-4).
 const DEFAULT_ASR_REALTIME_MAX_SESSIONS: usize = 4;
-const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 10 * 60;
-const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 30;
+/// Concurrent realtime sessions on CUDA: a serving GPU's arena of 16 rows is
+/// a few percent of its memory, and the load's admission prices it.
+const DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS: usize = 16;
+/// A whole working day of captions or a long meeting. Voxtral rolls its
+/// stream over at a pause before its model ceiling and Nemotron's state is
+/// bounded, so the lifetime only reaps a session nobody closes; it used to
+/// force-close every meeting transcription at 10 minutes.
+const DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS: u64 = 8 * 60 * 60;
+/// A muted microphone that stops sending frames keeps its session this long;
+/// 30 s reaped it in an ordinary pause in a conversation.
+const DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS: u64 = 90;
 
 /// Conservative decoder-prompt token reserve for the text surrounding the
 /// audio placeholder (system block, role markers, task instructions). Chunk
@@ -521,20 +531,43 @@ pub(super) struct RealtimeAsrSessionLimits {
 }
 
 impl RealtimeAsrSessionLimits {
-    fn from_env() -> Result<Self> {
-        Ok(Self {
-            max_sessions: positive_usize_env_or_default(
-                ASR_REALTIME_MAX_SESSIONS_ENV,
-                DEFAULT_ASR_REALTIME_MAX_SESSIONS,
-            )?,
-            max_lifetime: Duration::from_secs(positive_u64_env_or_default(
+    /// The engine config's limits, else the environment's, else the
+    /// defaults for `backend`.
+    fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
+        fn configured<T: Default + PartialEq>(value: Option<T>, field: &str) -> Result<Option<T>> {
+            match value {
+                Some(value) if value == T::default() => Err(Error::ConfigError(format!(
+                    "asr_realtime.{field} must be positive"
+                ))),
+                value => Ok(value),
+            }
+        }
+        let default_sessions = match backend {
+            BackendKind::Cuda => DEFAULT_CUDA_ASR_REALTIME_MAX_SESSIONS,
+            BackendKind::Cpu | BackendKind::Metal => DEFAULT_ASR_REALTIME_MAX_SESSIONS,
+        };
+        let max_sessions = match configured(config.max_sessions, "max_sessions")? {
+            Some(sessions) => sessions,
+            None => positive_usize_env_or_default(ASR_REALTIME_MAX_SESSIONS_ENV, default_sessions)?,
+        };
+        let max_lifetime_secs = match configured(config.max_lifetime_secs, "max_lifetime_secs")? {
+            Some(secs) => secs,
+            None => positive_u64_env_or_default(
                 ASR_REALTIME_MAX_LIFETIME_SECS_ENV,
                 DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS,
-            )?),
-            idle_timeout: Duration::from_secs(positive_u64_env_or_default(
+            )?,
+        };
+        let idle_timeout_secs = match configured(config.idle_timeout_secs, "idle_timeout_secs")? {
+            Some(secs) => secs,
+            None => positive_u64_env_or_default(
                 ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV,
                 DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS,
-            )?),
+            )?,
+        };
+        Ok(Self {
+            max_sessions,
+            max_lifetime: Duration::from_secs(max_lifetime_secs),
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
         })
     }
 }
@@ -546,8 +579,8 @@ pub(super) struct RealtimeAsrSessionPolicy {
 }
 
 impl RealtimeAsrSessionPolicy {
-    pub(super) fn from_env() -> Result<Self> {
-        Self::new(RealtimeAsrSessionLimits::from_env()?)
+    pub(super) fn resolve(config: RealtimeAsrSessionConfig, backend: BackendKind) -> Result<Self> {
+        Self::new(RealtimeAsrSessionLimits::resolve(config, backend)?)
     }
 
     fn new(limits: RealtimeAsrSessionLimits) -> Result<Self> {
@@ -5242,6 +5275,69 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// SPK-F9: realtime sessions default to production limits (an 8-hour
+    /// lifetime instead of 10 minutes, a 90 s idle timeout instead of 30 s,
+    /// 16 sessions on CUDA), and the engine config overrides the
+    /// environment and the defaults.
+    #[test]
+    fn realtime_session_limits_default_for_production_and_follow_the_config() {
+        let env_set = [
+            ASR_REALTIME_MAX_SESSIONS_ENV,
+            ASR_REALTIME_MAX_LIFETIME_SECS_ENV,
+            ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV,
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        if !env_set {
+            let resolve = |backend| {
+                RealtimeAsrSessionLimits::resolve(RealtimeAsrSessionConfig::default(), backend)
+                    .unwrap()
+            };
+            let cuda = resolve(BackendKind::Cuda);
+            assert_eq!(cuda.max_sessions, 16);
+            assert_eq!(cuda.max_lifetime, Duration::from_secs(8 * 60 * 60));
+            assert_eq!(cuda.idle_timeout, Duration::from_secs(90));
+            for backend in [BackendKind::Cpu, BackendKind::Metal] {
+                let limits = resolve(backend);
+                assert_eq!(limits.max_sessions, 4, "{backend:?}");
+                assert_eq!(limits.max_lifetime, cuda.max_lifetime);
+                assert_eq!(limits.idle_timeout, cuda.idle_timeout);
+            }
+        }
+
+        let configured = RealtimeAsrSessionLimits::resolve(
+            RealtimeAsrSessionConfig {
+                max_sessions: Some(9),
+                max_lifetime_secs: Some(3_600),
+                idle_timeout_secs: Some(120),
+            },
+            BackendKind::Metal,
+        )
+        .unwrap();
+        assert_eq!(configured.max_sessions, 9);
+        assert_eq!(configured.max_lifetime, Duration::from_secs(3_600));
+        assert_eq!(configured.idle_timeout, Duration::from_secs(120));
+        for zero in [
+            RealtimeAsrSessionConfig {
+                max_sessions: Some(0),
+                ..Default::default()
+            },
+            RealtimeAsrSessionConfig {
+                max_lifetime_secs: Some(0),
+                ..Default::default()
+            },
+            RealtimeAsrSessionConfig {
+                idle_timeout_secs: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                RealtimeAsrSessionLimits::resolve(zero, BackendKind::Cpu),
+                Err(Error::ConfigError(_))
+            ));
+        }
     }
 
     fn saa_decode_policy(secs: f32) -> usize {

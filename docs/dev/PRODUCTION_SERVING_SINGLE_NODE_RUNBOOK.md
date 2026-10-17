@@ -881,6 +881,36 @@ public surface carries no client session ids, so the gateway mints them —
 operator-visible registry entries use gateway-minted ids. Session capacity,
 tenant leases, and the session budget are shared with the passthrough mode.
 
+### Realtime ASR session limits (SPK-F9)
+
+Every runtime that serves realtime ASR (a local server or a speech_to_text
+worker) bounds its sessions with three limits. Each one is read from the
+engine config's `asr_realtime` field when set, else from its environment
+variable, else from the default:
+
+| Limit | Environment | Default |
+|---|---|---|
+| Concurrent sessions | `IZWI_ASR_REALTIME_MAX_SESSIONS` | 16 on CUDA, 4 on CPU and Metal |
+| Absolute lifetime (s) | `IZWI_ASR_REALTIME_MAX_LIFETIME_SECS` | 28,800 (8 hours) |
+| Idle timeout (s) | `IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS` | 90 |
+
+The session count is also the number of rows in the retained state arena
+that a Nemotron or Parakeet load allocates up front. Nemotron's arena is
+about 74 MB per session in F32, all of it held while the model is resident.
+Size the count from the concurrency you need, not as high as possible.
+
+Voxtral rolls its stream over at a pause before the model's ceiling, and
+Nemotron's streaming state is bounded. The lifetime therefore only reaps a
+session that is never closed; it does not limit transcript length.
+
+The idle timeout counts time without audio frames. A client that stops
+sending while its microphone is muted keeps its session for that long. Make
+the timeout longer than such pauses, or have the client keep sending
+silence.
+
+The old defaults were a 10-minute lifetime and a 30 s idle timeout. A
+deployment that relied on them must now set them explicitly.
+
 ### Hierarchical KV offload (DS4, explicit opt-in)
 
 DS4 demotes cold committed prefix pages from the device KV arenas into a

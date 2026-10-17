@@ -3726,7 +3726,8 @@ impl RuntimeService {
         let vibevoice_encoder_batcher = Arc::new(VibeVoiceEncoderBatcher::new(coordinator.clone()));
         let granite_speech_encoder_batcher =
             Arc::new(GraniteSpeechEncoderBatcher::new(coordinator.clone()));
-        let asr_realtime_sessions = RealtimeAsrSessionPolicy::from_env()?;
+        let asr_realtime_sessions =
+            RealtimeAsrSessionPolicy::resolve(config.asr_realtime, selected_backend_kind)?;
         let realtime_asr_sequence_capacity = asr_realtime_sessions.retained_sequence_capacity()?;
         worker_config.resource_authority = Some(coordinator.resource_authority());
         worker_config.physical_execution_admission =
