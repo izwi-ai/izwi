@@ -5,6 +5,7 @@
 mod autoscale_driver;
 mod cli;
 mod diagnostics;
+mod env_config;
 mod error;
 mod rollout_driver;
 
@@ -20,6 +21,7 @@ use rollout_driver::{
     rollout_abort_command, RolloutOutcome,
 };
 
+use izwi_serving_protocol::env::EnvSnapshot;
 use izwi_serving_protocol::{BackendKind, DeploymentId, ServiceBearerToken, WorkerId};
 use std::env;
 use std::fs::File;
@@ -45,14 +47,12 @@ use crate::{
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the supervisor looks for `--clear-quarantine` requests.
 const QUARANTINE_CLEAR_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-/// A path the supervisor keeps a Prometheus textfile at (for a node
-/// exporter's textfile collector); unset writes none.
-const METRICS_TEXTFILE_ENV: &str = "IZWI_SUPERVISOR_METRICS_TEXTFILE";
 
 /// The supervisor process: parse the command line, then supervise this
 /// node's workers until shutdown.
 pub async fn run_from_cli() -> Result<(), SupervisorError> {
-    init_tracing()?;
+    let env = env_config::capture();
+    init_tracing(&env)?;
     let options = match CliOptions::parse(env::args_os().skip(1))? {
         ParseOutcome::Run(options) => options,
         ParseOutcome::Help => {
@@ -60,18 +60,21 @@ pub async fn run_from_cli() -> Result<(), SupervisorError> {
             return Ok(());
         }
     };
-    run(*options).await
+    let metrics_textfile = env
+        .get_os(env_config::METRICS_TEXTFILE_ENV)
+        .map(PathBuf::from);
+    run(*options, metrics_textfile).await
 }
 
 /// Supervisor logs go to stderr: text by default, one JSON object per line
 /// with `IZWI_LOG_FORMAT=json`. `RUST_LOG` overrides the info-level filter.
-fn init_tracing() -> Result<(), SupervisorError> {
+fn init_tracing(env: &EnvSnapshot) -> Result<(), SupervisorError> {
     use std::io::IsTerminal;
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "izwi_serving_supervisor=info".into());
     let registry = tracing_subscriber::registry().with(filter);
-    match env::var("IZWI_LOG_FORMAT").ok().as_deref() {
+    match env.get(env_config::LOG_FORMAT_ENV)? {
         None | Some("text") => registry
             .with(
                 tracing_subscriber::fmt::layer()
@@ -96,7 +99,10 @@ fn init_tracing() -> Result<(), SupervisorError> {
     Ok(())
 }
 
-async fn run(options: CliOptions) -> Result<(), SupervisorError> {
+async fn run(
+    options: CliOptions,
+    metrics_textfile: Option<PathBuf>,
+) -> Result<(), SupervisorError> {
     let validate_only = options.validate_only;
     let config_bytes = read_bounded(&options.config, MAX_NODE_CONFIG_BYTES)?;
     let config = NodeConfig::parse_bounded(&config_bytes)?;
@@ -394,7 +400,6 @@ async fn run(options: CliOptions) -> Result<(), SupervisorError> {
         drop(started);
     }
 
-    let metrics_textfile = env::var_os(METRICS_TEXTFILE_ENV).map(PathBuf::from);
     let mut written_metrics = String::new();
     let mut poll = tokio::time::interval(SUPERVISION_POLL_INTERVAL);
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);

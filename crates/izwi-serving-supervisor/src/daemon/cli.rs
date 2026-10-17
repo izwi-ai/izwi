@@ -257,7 +257,9 @@ pub(crate) fn parse_metal_devices(value: &str) -> Result<Vec<(DeviceId, u32)>, S
 }
 
 /// Declares CUDA devices as `device_uuid@host_device_index@total_memory_bytes`.
-pub(crate) fn parse_cuda_devices(value: &str) -> Result<Vec<(DeviceId, u32, u64)>, SupervisorError> {
+pub(crate) fn parse_cuda_devices(
+    value: &str,
+) -> Result<Vec<(DeviceId, u32, u64)>, SupervisorError> {
     const OPTION: &str = "--cuda-devices";
     let invalid = |reason: String| SupervisorError::InvalidDeviceDeclaration {
         option: OPTION,

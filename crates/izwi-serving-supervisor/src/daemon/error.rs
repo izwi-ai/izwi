@@ -50,6 +50,8 @@ pub enum SupervisorError {
         option: &'static str,
         reason: String,
     },
+    #[error(transparent)]
+    Environment(#[from] izwi_serving_protocol::env::EnvError),
     #[error("worker {worker} secret environment variable {environment} is not set")]
     MissingSecret {
         worker: WorkerId,
