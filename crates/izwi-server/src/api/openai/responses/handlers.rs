@@ -137,6 +137,7 @@ pub async fn create_response(
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: req.skip_special_tokens,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };

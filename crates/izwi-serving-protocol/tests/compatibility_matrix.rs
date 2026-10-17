@@ -45,6 +45,7 @@ fn minor4_chat_descriptor() -> WorkerDescriptor {
         WorkerFeature::ChatJsonObject,
         WorkerFeature::ChatContextPolicy,
         WorkerFeature::ChatTools,
+        WorkerFeature::ChatSkipSpecialTokens,
     ]);
     descriptor
 }
@@ -174,6 +175,7 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             truncation: ChatTruncation::Disabled,
         }),
         tools: vec![json!({"type": "function", "function": {"name": "now"}})],
+        skip_special_tokens: Some(false),
     };
     request.validate().unwrap();
     let encoded = serde_json::to_value(&request).unwrap();
@@ -190,7 +192,8 @@ fn requests_without_minor4_knobs_encode_exactly_as_minor3() {
             "logprobs": 2,
             "response_format": "json_object",
             "context": {"max_tokens": 16, "truncation": "disabled"},
-            "tools": [{"type": "function", "function": {"name": "now"}}]
+            "tools": [{"type": "function", "function": {"name": "now"}}],
+            "skip_special_tokens": false
         })
     );
     assert_eq!(
@@ -414,4 +417,26 @@ fn unsupported_parameters_are_named_by_their_openai_name() {
         ])),
         None
     );
+}
+
+#[test]
+fn only_keeping_special_tokens_needs_the_feature() {
+    let keep = ChatParameters {
+        skip_special_tokens: Some(false),
+        ..ChatParameters::default()
+    };
+    assert_eq!(
+        keep.first_unsupported(&BTreeSet::new()),
+        Some("skip_special_tokens")
+    );
+    assert_eq!(
+        keep.required_features(),
+        BTreeSet::from([WorkerFeature::ChatSkipSpecialTokens])
+    );
+    // Skipping is every worker's default, so asking for it needs nothing.
+    let skip = ChatParameters {
+        skip_special_tokens: Some(true),
+        ..ChatParameters::default()
+    };
+    assert!(skip.required_features().is_empty());
 }

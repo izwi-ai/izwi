@@ -55,6 +55,9 @@ pub struct ChatGenerationControls {
     pub logprobs: Option<usize>,
     /// OpenAI `response_format: json_object`.
     pub constrain_json_object: bool,
+    /// vLLM's `skip_special_tokens: false`: the reply text keeps the
+    /// tokenizer's special tokens. They are skipped by default.
+    pub keep_special_tokens: bool,
 }
 
 impl ResolvedChatSampling {
@@ -78,6 +81,7 @@ impl ResolvedChatSampling {
             logprobs: controls.logprobs.is_some(),
             top_logprobs: controls.logprobs.unwrap_or(0),
             constrain_json_object: controls.constrain_json_object,
+            skip_special_tokens: !controls.keep_special_tokens,
             ..Default::default()
         }
     }
@@ -354,6 +358,7 @@ mod tests {
                 stop: vec!["END".into()],
                 logprobs: Some(2),
                 constrain_json_object: true,
+                keep_special_tokens: true,
             },
         );
         assert_eq!(
@@ -369,12 +374,14 @@ mod tests {
         assert!(params.logprobs);
         assert_eq!(params.top_logprobs, 2);
         assert!(params.constrain_json_object);
+        assert!(!params.skip_special_tokens);
         assert_eq!(params.max_tokens, 16);
 
         let plain = sampling(0.2, 0.3, 7, 1.2, -0.4)
             .into_generation_params(16, ChatGenerationControls::default());
         assert!(!plain.logprobs && plain.top_logprobs == 0 && !plain.constrain_json_object);
         assert!(plain.seed.is_none() && plain.stop_sequences.is_empty());
+        assert!(plain.skip_special_tokens);
     }
 
     #[test]

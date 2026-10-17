@@ -402,6 +402,7 @@ fn prepare_execution_request(
             .response_format
             .as_ref()
             .is_some_and(|format| format.kind == "json_object"),
+        skip_special_tokens: req.skip_special_tokens,
         chat_config,
         correlation_id: Some(ctx.correlation_id.clone()),
     };

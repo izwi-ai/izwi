@@ -69,6 +69,10 @@ pub struct ChatCompletionRequest {
     /// `context_length_exceeded`; `"auto"` drops the oldest turns instead.
     #[serde(default)]
     pub truncation: Option<ChatTruncation>,
+    /// vLLM's OpenAI extension: `false` keeps the tokenizer's special tokens
+    /// in the reply text. Absent or `true` skips them.
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
 }
 
 /// DS9.2: OpenAI `response_format`. Only `json_object` is supported;

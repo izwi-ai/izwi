@@ -45,6 +45,10 @@ pub struct ResponsesCreateRequest {
     /// does not fit the context; `"auto"` drops the oldest turns instead.
     #[serde(default)]
     pub truncation: Option<ChatTruncation>,
+    /// vLLM's OpenAI extension: `false` keeps the tokenizer's special tokens
+    /// in the reply text. Absent or `true` skips them.
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

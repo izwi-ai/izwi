@@ -2006,6 +2006,8 @@ pub struct ChatCompletionRequest {
     pub stop: Option<serde_json::Value>,
     /// `"disabled"` (default) or `"auto"`.
     pub truncation: Option<String>,
+    /// vLLM extension: `false` keeps special tokens in the reply text.
+    pub skip_special_tokens: Option<bool>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
     pub enable_thinking: Option<bool>,
@@ -2213,6 +2215,8 @@ pub struct ResponsesCreateRequest {
     pub reasoning_effort: Option<ChatReasoningEffort>,
     pub preserve_thinking: Option<bool>,
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// vLLM extension: `false` keeps special tokens in the reply text.
+    pub skip_special_tokens: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

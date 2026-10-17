@@ -465,6 +465,7 @@ fn request() -> ChatExecutionRequest {
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: None,
         chat_config: ChatRequestConfig::default(),
         correlation_id: None,
     }
@@ -660,6 +661,7 @@ async fn worker_receives_every_control_it_advertises() {
                 truncation: WorkerChatTruncation::Disabled,
             }),
             tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
+            skip_special_tokens: Some(false),
         }
     );
 }
@@ -674,6 +676,7 @@ fn every_control() -> ChatExecutionRequest {
     request.logprobs = Some(true);
     request.top_logprobs = Some(2);
     request.response_format_json_object = true;
+    request.skip_special_tokens = Some(false);
     request.chat_config.tools =
         vec![serde_json::json!({"type": "function", "function": {"name": "now"}})];
     request
@@ -703,7 +706,7 @@ async fn controls_route_only_to_workers_that_advertise_them() {
     let registry = WorkerRegistry::new(WorkerRegistryConfig::default()).unwrap();
     register_minor3(&registry, "worker-a", "inc-a", client(&older.endpoint()));
     let dispatcher = dispatcher(registry);
-    let cases: [(&str, fn(&mut ChatExecutionRequest)); 7] = [
+    let cases: [(&str, fn(&mut ChatExecutionRequest)); 8] = [
         ("seed", |request| request.seed = Some(7)),
         ("stop", |request| request.stop = vec!["END".into()]),
         ("top_k", |request| request.top_k = Some(9)),
@@ -716,6 +719,9 @@ async fn controls_route_only_to_workers_that_advertise_them() {
         }),
         ("tools", |request| {
             request.chat_config.tools = vec![serde_json::json!({"type": "function"})]
+        }),
+        ("skip_special_tokens", |request| {
+            request.skip_special_tokens = Some(false)
         }),
     ];
     for (parameter, apply) in cases {
@@ -737,9 +743,11 @@ async fn controls_route_only_to_workers_that_advertise_them() {
     }
     assert!(older.requests().is_empty());
 
-    // An explicit `logprobs: false` asks for nothing the worker lacks.
+    // An explicit `logprobs: false` or `skip_special_tokens: true` asks
+    // for nothing the worker lacks.
     let mut plain = request();
     plain.logprobs = Some(false);
+    plain.skip_special_tokens = Some(true);
     dispatcher
         .generate(2, &context, plain, tenant_work())
         .await
@@ -749,6 +757,7 @@ async fn controls_route_only_to_workers_that_advertise_them() {
     assert_eq!(requests[0].schema_version, SchemaVersion::new(1, 3));
     let InvocationInput::Chat { parameters, .. } = &requests[0].input;
     assert_eq!(parameters.context, None);
+    assert_eq!(parameters.skip_special_tokens, None);
     assert_eq!(parameters.temperature, Some(1.0));
 }
 
@@ -1300,6 +1309,7 @@ fn conversation_turn(system: &str, turns: &[(&str, Option<&str>)]) -> ChatExecut
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: None,
         chat_config: ChatRequestConfig::default(),
         correlation_id: None,
     }

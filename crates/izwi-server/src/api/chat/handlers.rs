@@ -364,6 +364,7 @@ pub async fn create_thread_message(
         logprobs: None,
         top_logprobs: None,
         response_format_json_object: false,
+        skip_special_tokens: None,
         chat_config,
         correlation_id: Some(ctx.correlation_id),
     };

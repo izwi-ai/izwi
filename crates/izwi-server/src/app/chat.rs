@@ -50,6 +50,8 @@ pub struct ChatExecutionRequest {
     pub top_logprobs: Option<u8>,
     /// DS9.2: the request carried `response_format: json_object`.
     pub response_format_json_object: bool,
+    /// vLLM's `skip_special_tokens`; `None` skips them (the default).
+    pub skip_special_tokens: Option<bool>,
     pub chat_config: ChatRequestConfig,
     pub correlation_id: Option<String>,
 }
@@ -83,6 +85,7 @@ impl ChatExecutionRequest {
                 stop: self.stop.clone(),
                 logprobs: self.requested_logprobs(),
                 constrain_json_object: self.response_format_json_object,
+                keep_special_tokens: self.skip_special_tokens == Some(false),
             },
         )
     }
@@ -123,6 +126,8 @@ impl ChatExecutionRequest {
                 .response_format_json_object
                 .then_some(ChatResponseFormat::JsonObject),
             tools: self.chat_config.tools.clone(),
+            // Skipping is every worker's default; only keeping them is sent.
+            skip_special_tokens: self.skip_special_tokens.filter(|skip| !skip),
             context: features
                 .contains(&WorkerFeature::ChatContextPolicy)
                 .then(|| ChatContextPolicy {
@@ -1669,6 +1674,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,
+            skip_special_tokens: None,
             chat_config: ChatRequestConfig::default(),
             correlation_id: None,
         };
@@ -1681,6 +1687,17 @@ mod tests {
         assert_eq!(params.max_tokens, 32);
         assert_eq!(params.seed, Some(7));
         assert_eq!(params.stop_sequences, ["END"]);
+        assert!(params.skip_special_tokens);
+
+        let keep_special = ChatExecutionRequest {
+            skip_special_tokens: Some(false),
+            ..request
+        };
+        assert!(
+            !keep_special
+                .resolved_generation_params()
+                .skip_special_tokens
+        );
     }
 
     /// Sampling and output controls and tools travel to the worker (each
@@ -1759,6 +1776,7 @@ mod tests {
             logprobs: None,
             top_logprobs: None,
             response_format_json_object: false,
+            skip_special_tokens: None,
             chat_config: ChatRequestConfig {
                 enable_thinking,
                 ..Default::default()

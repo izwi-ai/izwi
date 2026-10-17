@@ -273,6 +273,8 @@ pub enum WorkerFeature {
     /// Minor 4: renders `ChatParameters::tools` into the prompt with the
     /// model family's tool-calling template.
     ChatTools,
+    /// Minor 4 (additive): honours `ChatParameters::skip_special_tokens`.
+    ChatSkipSpecialTokens,
     /// Minor 4 (additive): a TTS realtime session honours the text-stream
     /// admission's `speaker`, `language` and `incremental` fields.
     RealtimeTtsTextStream,
@@ -297,6 +299,7 @@ impl WorkerFeature {
             | Self::ChatJsonObject
             | Self::ChatContextPolicy
             | Self::ChatTools
+            | Self::ChatSkipSpecialTokens
             | Self::RealtimeTtsTextStream => 4,
             Self::Unknown => u16::MAX,
         }
@@ -463,6 +466,12 @@ pub struct ChatParameters {
     /// parses it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<serde_json::Value>,
+    /// Minor 4, `WorkerFeature::ChatSkipSpecialTokens`: `Some(false)` keeps
+    /// the tokenizer's special tokens in the reply text (vLLM's OpenAI
+    /// extension). Absent skips them, as every worker does by default, so
+    /// only `Some(false)` requires the feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_special_tokens: Option<bool>,
 }
 
 impl ChatParameters {
@@ -483,7 +492,7 @@ impl ChatParameters {
             .map(|(_, name, _)| name)
     }
 
-    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 9] {
+    fn knobs(&self) -> [(bool, &'static str, WorkerFeature); 10] {
         [
             (self.seed.is_some(), "seed", WorkerFeature::ChatSeed),
             (
@@ -518,6 +527,11 @@ impl ChatParameters {
                 WorkerFeature::ChatContextPolicy,
             ),
             (!self.tools.is_empty(), "tools", WorkerFeature::ChatTools),
+            (
+                self.skip_special_tokens == Some(false),
+                "skip_special_tokens",
+                WorkerFeature::ChatSkipSpecialTokens,
+            ),
         ]
     }
 }

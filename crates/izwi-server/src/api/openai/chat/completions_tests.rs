@@ -374,6 +374,7 @@ fn validates_rejects_non_zero_frequency_penalty() {
         chat_template_kwargs: None,
         reasoning_format: None,
         truncation: None,
+        skip_special_tokens: None,
     };
 
     let err = validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -416,6 +417,7 @@ fn strict_profile_accepts_stop_sequences() {
         chat_template_kwargs: None,
         reasoning_format: None,
         truncation: None,
+        skip_special_tokens: None,
     };
 
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Strict)
@@ -482,6 +484,7 @@ fn relaxed_profile_allows_stop_and_frequency_penalty_passthrough() {
         chat_template_kwargs: None,
         reasoning_format: None,
         truncation: None,
+        skip_special_tokens: None,
     };
 
     validate_chat_request_compatibility(&req, OpenAiCompatibilityProfile::Relaxed)

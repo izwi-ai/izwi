@@ -264,6 +264,7 @@ fn chat_request(
             logprobs: parameters.logprobs.map(usize::from),
             constrain_json_object: parameters.response_format
                 == Some(ChatResponseFormat::JsonObject),
+            keep_special_tokens: parameters.skip_special_tokens == Some(false),
         },
     );
     let chat_config = ChatRequestConfig {
@@ -847,6 +848,7 @@ mod tests {
                 truncation: WireChatTruncation::Disabled,
             }),
             tools: vec![serde_json::json!({"type": "function", "function": {"name": "now"}})],
+            skip_special_tokens: Some(false),
         };
         let (params, chat_config, ceiling) = chat_request(VARIANT, &parameters, 64);
         assert_eq!(
@@ -862,6 +864,7 @@ mod tests {
         assert!(params.logprobs);
         assert_eq!(params.top_logprobs, 3);
         assert!(params.constrain_json_object);
+        assert!(!params.skip_special_tokens);
         assert_eq!(params.max_tokens, 16);
         assert_eq!(chat_config.truncation, ChatTruncation::Disabled);
         assert_eq!(chat_config.tools, parameters.tools);
@@ -885,6 +888,7 @@ mod tests {
                 stop: vec!["END".into()],
                 logprobs: Some(3),
                 constrain_json_object: true,
+                keep_special_tokens: true,
             },
         );
         assert_eq!(format!("{params:?}"), format!("{expected:?}"));
@@ -923,6 +927,7 @@ mod tests {
         assert_eq!((params.temperature, params.top_k), (0.1, 50));
         assert_eq!(params.seed, None);
         assert!(!params.logprobs && !params.constrain_json_object);
+        assert!(params.skip_special_tokens);
         assert_eq!(params.max_tokens, CHAT_MAX_TOKENS_UNSET);
         assert_eq!(chat_config.truncation, ChatTruncation::Auto);
         assert_eq!(ceiling, Some(64));

@@ -126,6 +126,7 @@ pub fn minor4_chat_features() -> BTreeSet<WorkerFeature> {
         WorkerFeature::ChatJsonObject,
         WorkerFeature::ChatContextPolicy,
         WorkerFeature::ChatTools,
+        WorkerFeature::ChatSkipSpecialTokens,
     ])
 }
 

@@ -225,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             WorkerFeature::ChatPenalties,
             WorkerFeature::ChatLogprobs,
             WorkerFeature::ChatContextPolicy,
+            WorkerFeature::ChatSkipSpecialTokens,
         ]);
         if izwi_core::chat_supports_json_object(process.variant) {
             features.insert(WorkerFeature::ChatJsonObject);
