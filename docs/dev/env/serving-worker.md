@@ -36,6 +36,7 @@ The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `tr
 | `IZWI_WORKER_STREAMING` | `true` | Advertise and serve streaming invocations. |
 | `IZWI_WORKER_DRAIN_GRACE_MS` | `30000` | Shutdown drain grace (non-zero, at most one day). |
 | `IZWI_WORKER_CANCELLATION_GRACE_MS` | `10000` | Grace for in-flight work after cancellation (non-zero, at most one day). |
+| `IZWI_WORKER_TERMINATION_GRACE_MS` | `5000` | How long open connections may outlast the drain and cancellation graces, or a managed worker's SIGTERM, before the worker exits (non-zero, at most one day). |
 | `IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE` | `true` | Exit when the runtime fails permanently so the supervisor restarts the worker. |
 | `IZWI_WORKER_OWNERSHIP_LOCK` | unset | Set by the supervisor (managed workers): resource ownership lock path. |
 | `IZWI_WORKER_GENERATION_FENCE_LOCK` | unset | Set by the supervisor (managed workers): generation fence lock path. |

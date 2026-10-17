@@ -920,6 +920,11 @@ For planned maintenance, drain the gateway before stopping the supervisor:
    `cancellation_grace_ms`.
 5. The supervisor waits for that cooperative window, sends TERM if the child is
    still present, waits `termination_grace_ms`, and finally kills and reaps it.
+   The worker reads the same grace (`IZWI_WORKER_TERMINATION_GRACE_MS`): after
+   its cooperative window, or at once on the supervisor's TERM, it cancels what
+   is left, gives open connections that grace to close, and then exits on its
+   own (status 1 when connections were still open). A worker nothing
+   supervises treats SIGTERM like Ctrl+C and starts the cooperative drain.
    Review each logged stop outcome: `Cooperative`, `Terminated`, or `Killed`.
 
 If the supervisor dies, managed workers observe control-pipe EOF and enter the

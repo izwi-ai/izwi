@@ -176,6 +176,11 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
         "Grace for in-flight work after cancellation (non-zero, at most one day).",
     ),
     var(
+        "IZWI_WORKER_TERMINATION_GRACE_MS",
+        "5000",
+        "How long open connections may outlast the drain and cancellation graces, or a managed worker's SIGTERM, before the worker exits (non-zero, at most one day).",
+    ),
+    var(
         "IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE",
         "true",
         "Exit when the runtime fails permanently so the supervisor restarts the worker.",

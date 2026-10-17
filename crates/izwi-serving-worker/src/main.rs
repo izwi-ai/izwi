@@ -291,7 +291,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Binds the constructed worker service and serves it with the same
-/// TLS/plain rules for every executor type.
+/// TLS/plain rules for every executor type. Once the shutdown sequence has
+/// drained and cancelled, open connections get the termination grace to
+/// close; a worker still held open after it exits on its own, since tearing
+/// the runtime down would wait on whatever work kept them open.
 async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
     worker: WorkerService<E>,
     process: &WorkerProcessConfig,
@@ -299,12 +302,25 @@ async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
     let listener = tokio::net::TcpListener::bind(process.bind)
         .await
         .with_context(|| format!("bind private worker at {}", process.bind))?;
-    let shutdown = shutdown_signal(
-        worker.clone(),
-        process.managed,
-        process.drain_grace,
-        process.cancellation_grace,
-    );
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+    let grace = ShutdownGrace {
+        drain: process.drain_grace,
+        cancellation: process.cancellation_grace,
+    };
+    let shutdown = {
+        let worker = worker.clone();
+        let managed = process.managed;
+        async move {
+            shutdown_sequence(
+                &worker,
+                cooperative_stop_requested(managed),
+                escalated_stop_requested(managed),
+                grace,
+            )
+            .await;
+            let _ = stopped_tx.send(());
+        }
+    };
     if process.exit_on_runtime_failure {
         tokio::spawn(exit_on_runtime_failure(worker.clone()));
     }
@@ -316,18 +332,58 @@ async fn serve_worker<E: izwi_serving_worker::InvocationExecutor>(
         tls = process.tls.is_some(),
         "worker ready"
     );
-    if let Some(tls) = &process.tls {
+    let served = if let Some(tls) = &process.tls {
         let tls_listener = TlsListener::new(listener, tls.acceptor.clone(), TLS_HANDSHAKE_TIMEOUT)
             .context("start private TLS worker listener")?;
-        axum::serve(tls_listener, worker.router())
-            .with_graceful_shutdown(shutdown)
-            .await
-            .context("serve private TLS worker")
+        let server = axum::serve(tls_listener, worker.router()).with_graceful_shutdown(shutdown);
+        serve_within_termination_grace(
+            async move { server.await.context("serve private TLS worker") },
+            stopped_rx,
+            process.termination_grace,
+        )
+        .await
     } else {
-        axum::serve(listener, worker.router())
-            .with_graceful_shutdown(shutdown)
-            .await
-            .context("serve private worker")
+        let server = axum::serve(listener, worker.router()).with_graceful_shutdown(shutdown);
+        serve_within_termination_grace(
+            async move { server.await.context("serve private worker") },
+            stopped_rx,
+            process.termination_grace,
+        )
+        .await
+    };
+    match served {
+        Some(result) => result,
+        None => {
+            tracing::warn!(
+                termination_grace_ms = process.termination_grace.as_millis() as u64,
+                active_invocations = worker.active_invocations(),
+                "connections outlived the termination grace; exiting without teardown"
+            );
+            std::process::exit(TERMINATION_GRACE_EXIT_CODE);
+        }
+    }
+}
+
+/// Exit status for a worker that stopped because open connections
+/// outlived its termination grace.
+const TERMINATION_GRACE_EXIT_CODE: i32 = 1;
+
+/// Runs `server` to completion, or, once `stopped` fires, for at most
+/// `termination_grace` more. `None` means the grace ran out.
+async fn serve_within_termination_grace<F: std::future::Future>(
+    server: F,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+    termination_grace: Duration,
+) -> Option<F::Output> {
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => Some(result),
+        stopped = stopped => {
+            if stopped.is_err() {
+                return Some(server.await);
+            }
+            tokio::time::timeout(termination_grace, &mut server).await.ok()
+        }
     }
 }
 
@@ -454,27 +510,114 @@ fn acquire_model_load_stage(
         .context("wait for a node model-load stage slot")
 }
 
-async fn shutdown_signal<E: izwi_serving_worker::InvocationExecutor>(
-    worker: WorkerService<E>,
-    managed: bool,
-    drain_grace: Duration,
-    cancellation_grace: Duration,
-) {
+/// The supervisor's shutdown graces the worker spends before its
+/// termination grace (`[shutdown]` in the supervisor's node config).
+#[derive(Debug, Clone, Copy)]
+struct ShutdownGrace {
+    drain: Duration,
+    cancellation: Duration,
+}
+
+/// What the shutdown sequence asks of a worker service.
+trait Stoppable {
+    async fn begin_draining(&self);
+    fn request_cancel_all(&self);
+    fn active_invocations(&self) -> usize;
+}
+
+impl<E: izwi_serving_worker::InvocationExecutor> Stoppable for WorkerService<E> {
+    async fn begin_draining(&self) {
+        WorkerService::begin_draining(self).await;
+    }
+
+    fn request_cancel_all(&self) {
+        WorkerService::request_cancel_all(self);
+    }
+
+    fn active_invocations(&self) -> usize {
+        WorkerService::active_invocations(self)
+    }
+}
+
+/// Ctrl+C, the supervisor closing its control pipe, or, for a worker
+/// nothing supervises, SIGTERM: stop admitting, drain, then cancel.
+async fn cooperative_stop_requested(managed: bool) {
     if managed {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = parent_control_closed() => {}
         }
     } else {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = terminate_signal() => {}
+        }
     }
+}
 
+/// The supervisor's SIGTERM: its cooperative window is over and it kills the
+/// worker once its termination grace runs out. Never resolves for a worker
+/// nothing supervises, where SIGTERM is the cooperative request instead.
+async fn escalated_stop_requested(managed: bool) {
+    if managed {
+        terminate_signal().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            terminate.recv().await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot listen for SIGTERM");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await;
+}
+
+/// Stops the worker once `cooperative` or `escalated` resolves: admission
+/// closes, in-flight work drains for the drain grace, what is left is
+/// cancelled and given the cancellation grace. An escalation, before or
+/// during those waits, cancels at once and skips the remaining waits, so
+/// the termination grace that follows is all the time left.
+async fn shutdown_sequence<W: Stoppable>(
+    worker: &W,
+    cooperative: impl std::future::Future<Output = ()>,
+    escalated: impl std::future::Future<Output = ()>,
+    grace: ShutdownGrace,
+) {
+    tokio::pin!(escalated);
+    let mut escalated_now = tokio::select! {
+        () = cooperative => false,
+        () = &mut escalated => true,
+    };
     worker.begin_draining().await;
-    if wait_until_idle(&worker, drain_grace).await {
-        return;
+    if !escalated_now {
+        tokio::select! {
+            idle = wait_until_idle(worker, grace.drain) => {
+                if idle {
+                    return;
+                }
+            }
+            () = &mut escalated => escalated_now = true,
+        }
     }
     worker.request_cancel_all();
-    let _ = wait_until_idle(&worker, cancellation_grace).await;
+    if !escalated_now {
+        tokio::select! {
+            _ = wait_until_idle(worker, grace.cancellation) => {}
+            () = &mut escalated => {}
+        }
+    }
 }
 
 async fn parent_control_closed() {
@@ -488,10 +631,7 @@ async fn parent_control_closed() {
     }
 }
 
-async fn wait_until_idle<E: izwi_serving_worker::InvocationExecutor>(
-    worker: &WorkerService<E>,
-    timeout: Duration,
-) -> bool {
+async fn wait_until_idle<W: Stoppable>(worker: &W, timeout: Duration) -> bool {
     tokio::time::timeout(timeout, async {
         while worker.active_invocations() != 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -525,6 +665,9 @@ struct WorkerProcessConfig {
     managed: bool,
     drain_grace: Duration,
     cancellation_grace: Duration,
+    /// How long open connections may outlast the drain and cancellation
+    /// graces, or a supervisor's SIGTERM, before the worker exits anyway.
+    termination_grace: Duration,
     /// Exit after the runtime fails permanently (a post-entry panic or a
     /// latched fatal device fault) so the supervisor restarts the worker
     /// with its bounded backoff instead of leaving a Failed process up.
@@ -701,6 +844,11 @@ impl WorkerProcessConfig {
                 env,
                 "IZWI_WORKER_CANCELLATION_GRACE_MS",
                 10_000,
+            )?),
+            termination_grace: Duration::from_millis(parse_bounded_duration_env(
+                env,
+                "IZWI_WORKER_TERMINATION_GRACE_MS",
+                5_000,
             )?),
             exit_on_runtime_failure: env.flag_or("IZWI_WORKER_EXIT_ON_RUNTIME_FAILURE", true)?,
             declared: DeclaredDeployment::from_env(env)?,
@@ -1286,6 +1434,114 @@ fn default_models_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker whose one invocation never finishes on its own.
+    #[derive(Default)]
+    struct StuckWorker {
+        draining: std::sync::atomic::AtomicBool,
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+
+    impl Stoppable for StuckWorker {
+        async fn begin_draining(&self) {
+            self.draining
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn request_cancel_all(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn active_invocations(&self) -> usize {
+            1
+        }
+    }
+
+    const GRACE: ShutdownGrace = ShutdownGrace {
+        drain: Duration::from_secs(30),
+        cancellation: Duration::from_secs(10),
+    };
+
+    /// The supervisor's SIGTERM in the middle of the drain cancels at once
+    /// instead of waiting out the drain and cancellation graces it already
+    /// spent: what is left is its termination grace.
+    #[tokio::test(start_paused = true)]
+    async fn escalation_during_the_drain_cancels_at_once() {
+        let worker = StuckWorker::default();
+        let started = tokio::time::Instant::now();
+        shutdown_sequence(
+            &worker,
+            std::future::ready(()),
+            tokio::time::sleep(Duration::from_secs(1)),
+            GRACE,
+        )
+        .await;
+        assert!(worker.draining.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(worker.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Without an escalation the sequence spends both graces on a worker
+    /// that never goes idle.
+    #[tokio::test(start_paused = true)]
+    async fn cooperative_shutdown_spends_both_graces() {
+        let worker = StuckWorker::default();
+        let started = tokio::time::Instant::now();
+        shutdown_sequence(
+            &worker,
+            std::future::ready(()),
+            std::future::pending(),
+            GRACE,
+        )
+        .await;
+        assert!(worker.cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(started.elapsed() >= GRACE.drain + GRACE.cancellation);
+    }
+
+    /// A connection that never closes holds the server open only for the
+    /// termination grace after the shutdown sequence finished.
+    #[tokio::test(start_paused = true)]
+    async fn open_connections_get_only_the_termination_grace() {
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        stopped_tx.send(()).unwrap();
+        let started = tokio::time::Instant::now();
+        let served = tokio::time::timeout(
+            Duration::from_secs(60),
+            serve_within_termination_grace(
+                std::future::pending::<()>(),
+                stopped_rx,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the termination grace bounds the server");
+        assert!(served.is_none());
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn termination_grace_is_read_and_bounded() {
+        let env = |value: &str| {
+            EnvSnapshot::from_pairs(
+                env_config::WORKER_ENV,
+                [("IZWI_WORKER_TERMINATION_GRACE_MS", value)],
+            )
+        };
+        assert_eq!(
+            parse_bounded_duration_env(&env("2500"), "IZWI_WORKER_TERMINATION_GRACE_MS", 5_000)
+                .unwrap(),
+            2_500
+        );
+        assert!(
+            parse_bounded_duration_env(&env("0"), "IZWI_WORKER_TERMINATION_GRACE_MS", 5_000)
+                .is_err()
+        );
+    }
 
     #[test]
     fn model_load_slots_parse_is_bounded_and_defaults_to_one() {
