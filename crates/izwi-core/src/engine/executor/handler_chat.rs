@@ -444,8 +444,19 @@ impl NativeExecutor {
                         )
                     })?
                 }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen35(_)) => {
-                    Self::run_blocking(|| {
+                // Each family names its own managed start, so a new chat
+                // family fails to compile here instead of falling through
+                // to another family's.
+                Some(cache) => match model.as_ref() {
+                    NativeChatModel::Qwen3(_) => Self::run_blocking(|| {
+                        model.start_qwen3_decode_state_managed(
+                            &request.prompt_tokens,
+                            max_new_tokens,
+                            &generation_config,
+                            cache,
+                        )
+                    })?,
+                    NativeChatModel::Qwen35(_) => Self::run_blocking(|| {
                         model.start_qwen35_decode_state_managed(
                             messages,
                             max_new_tokens,
@@ -453,10 +464,8 @@ impl NativeExecutor {
                             prepared_chat_prompt.and_then(|prepared| prepared.as_qwen35()),
                             cache,
                         )
-                    })?
-                }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen36Moe(_)) => {
-                    Self::run_blocking(|| {
+                    })?,
+                    NativeChatModel::Qwen36Moe(_) => Self::run_blocking(|| {
                         model.start_qwen36_moe_decode_state_managed(
                             messages,
                             max_new_tokens,
@@ -464,10 +473,8 @@ impl NativeExecutor {
                             prepared_chat_prompt.and_then(|prepared| prepared.as_qwen36_moe()),
                             cache,
                         )
-                    })?
-                }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Qwen38(_)) => {
-                    Self::run_blocking(|| {
+                    })?,
+                    NativeChatModel::Qwen38(_) => Self::run_blocking(|| {
                         model.start_qwen38_decode_state_managed(
                             messages,
                             max_new_tokens,
@@ -476,36 +483,24 @@ impl NativeExecutor {
                             cache,
                             mtp_cache.take(),
                         )
-                    })?
-                }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
-                    Self::run_blocking(|| {
+                    })?,
+                    NativeChatModel::Gemma3(_) => Self::run_blocking(|| {
                         model.start_gemma3_decode_state_managed(
                             &request.prompt_tokens,
                             max_new_tokens,
                             &generation_config,
                             cache,
                         )
-                    })?
-                }
-                Some(cache) if matches!(model.as_ref(), NativeChatModel::Lfm2(_)) => {
-                    Self::run_blocking(|| {
+                    })?,
+                    NativeChatModel::Lfm2(_) => Self::run_blocking(|| {
                         model.start_lfm2_decode_state_managed(
                             &request.prompt_tokens,
                             max_new_tokens,
                             &generation_config,
                             cache,
                         )
-                    })?
-                }
-                Some(cache) => Self::run_blocking(|| {
-                    model.start_qwen3_decode_state_managed(
-                        &request.prompt_tokens,
-                        max_new_tokens,
-                        &generation_config,
-                        cache,
-                    )
-                })?,
+                    })?,
+                },
                 None => {
                     return Err(Error::InferenceError(
                         "incremental chat execution requires scheduler-owned physical state".into(),
