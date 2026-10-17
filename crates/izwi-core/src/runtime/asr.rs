@@ -27,7 +27,7 @@ use crate::models::architectures::voxtral::realtime::{
     VoxtralRealtimePreparedResourceUsage,
 };
 use crate::models::registry::{
-    AsrModelLease, NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
+    NativeAsrGenerationOptions, NativeAsrModel, NativeAsrRealtimeEvent,
     NativeAsrRealtimeResourceReservation, NativeAsrRealtimeState, NativeAsrTranscription,
     VoxtralModelLease,
 };
@@ -1048,19 +1048,12 @@ struct RealtimeAsrOperationHandles {
 struct RuntimeEngineRealtimeSession {
     engine: Arc<crate::engine::Engine>,
     handle: RealtimeAsrSessionHandle,
-    model: RuntimeRealtimeEngineModel,
+    /// The Engine path serves Voxtral only: Nemotron's retained tensor state
+    /// runs on the direct path (`realtime_asr_execution_path`).
+    model: VoxtralModelLease,
     retained_metadata_bytes: u64,
     max_output_steps: usize,
     max_cache_append: usize,
-}
-
-#[derive(Clone)]
-enum RuntimeRealtimeEngineModel {
-    Voxtral(VoxtralModelLease),
-    Nemotron {
-        _lease: AsrModelLease,
-        reservation: NativeAsrRealtimeResourceReservation,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1081,80 +1074,6 @@ fn realtime_asr_execution_path(variant: ModelVariant) -> RealtimeAsrExecutionPat
         // chunked fallback).
         ModelFamily::Voxtral => RealtimeAsrExecutionPath::Engine,
         _ => RealtimeAsrExecutionPath::Direct,
-    }
-}
-
-fn realtime_preparation_work_samples(
-    family: ModelFamily,
-    mode: VoxtralRealtimePreparationMode,
-    appended_samples: usize,
-    total_samples: usize,
-) -> Result<usize> {
-    match family {
-        // Voxtral recomputes preparation geometry over the committed prefix.
-        ModelFamily::Voxtral => Ok(total_samples),
-        // Nemotron preparation is incremental. Finish has no new samples but
-        // still consumes the adapter's bounded one-unit completion quantum.
-        ModelFamily::NemotronAsr => Ok(match mode {
-            VoxtralRealtimePreparationMode::Push => appended_samples,
-            VoxtralRealtimePreparationMode::Finish => 0,
-        }),
-        _ => Err(Error::InvalidInput(
-            "unsupported Engine realtime ASR preparation family".into(),
-        )),
-    }
-}
-
-impl RuntimeRealtimeEngineModel {
-    fn preparation_cost(
-        &self,
-        appended_samples: usize,
-        total_samples: usize,
-        sample_rate: u32,
-        mode: VoxtralRealtimePreparationMode,
-    ) -> Result<WorkCost> {
-        let family = match self {
-            Self::Voxtral(_) => ModelFamily::Voxtral,
-            Self::Nemotron { .. } => ModelFamily::NemotronAsr,
-        };
-        let source_samples =
-            realtime_preparation_work_samples(family, mode, appended_samples, total_samples)?;
-        match self {
-            Self::Voxtral(model) => {
-                let geometry = model.realtime_preparation_geometry_for_source_samples(
-                    source_samples,
-                    sample_rate,
-                    mode,
-                )?;
-                voxtral_realtime_preparation_cost(model, geometry)
-            }
-            Self::Nemotron { .. } => Ok(WorkCost::new(
-                u64::try_from(source_samples)
-                    .map_err(|_| Error::Overloaded("Nemotron realtime work overflowed".into()))?
-                    .max(1),
-                0,
-                crate::models::architectures::nemotron::asr::NEMOTRON_REALTIME_STAGE_WORKSPACE_BYTES,
-            )),
-        }
-    }
-
-    fn committed_observation(
-        &self,
-        retained_metadata_bytes: u64,
-    ) -> Result<JobResourceObservation> {
-        match self {
-            Self::Voxtral(_) => Err(Error::InferenceError(
-                "Voxtral committed observation requires prepared geometry".into(),
-            )),
-            Self::Nemotron { reservation, .. } => Ok(JobResourceObservation::new(
-                retained_metadata_bytes
-                    .checked_add(reservation.host_bytes())
-                    .ok_or_else(|| {
-                        Error::Overloaded("Nemotron retained host usage overflowed".into())
-                    })?,
-                reservation.tensor_bytes(),
-            )),
-        }
     }
 }
 
@@ -1852,38 +1771,13 @@ impl RuntimeService {
                         )
                     })?;
                 (
-                    RuntimeRealtimeEngineModel::Voxtral(model.clone()),
+                    model.clone(),
                     peak.max_source_samples,
                     peak.max_host_bytes,
                     peak.max_tensor_bytes,
                     max_output_steps,
                     max_cache_append,
                     Some(model),
-                )
-            }
-            ModelFamily::NemotronAsr => {
-                let lease = self
-                    .model_registry
-                    .get_asr_lease(variant)
-                    .await
-                    .ok_or_else(|| {
-                        Error::ModelNotFound(format!("Nemotron model {variant} is not loaded"))
-                    })?;
-                let reservation =
-                    lease.realtime_stream_resource_reservation(language, prompt, None)?;
-                let max_samples = reservation.max_samples();
-                let max_steps = max_samples.div_ceil(1_280).saturating_add(2).max(1);
-                (
-                    RuntimeRealtimeEngineModel::Nemotron {
-                        _lease: lease,
-                        reservation,
-                    },
-                    max_samples,
-                    reservation.host_bytes(),
-                    reservation.tensor_bytes(),
-                    max_steps,
-                    max_steps,
-                    None,
                 )
             }
             _ => {
@@ -2223,28 +2117,19 @@ impl RuntimeService {
                     "realtime ASR sample rate changed within one stream".into(),
                 ));
             }
-            let preparation_cost = session.model.preparation_cost(
-                samples.len(),
-                total_samples,
-                sample_rate,
-                VoxtralRealtimePreparationMode::Push,
+            // Voxtral recomputes its preparation over the committed prefix.
+            let geometry = session
+                .model
+                .realtime_preparation_geometry_for_source_samples(
+                    total_samples,
+                    sample_rate,
+                    VoxtralRealtimePreparationMode::Push,
+                )?;
+            let preparation_cost = voxtral_realtime_preparation_cost(&session.model, geometry)?;
+            let committed_observation = voxtral_realtime_committed_observation(
+                session.retained_metadata_bytes,
+                session.model.realtime_prepared_resource_usage(geometry)?,
             )?;
-            let committed_observation = match &session.model {
-                RuntimeRealtimeEngineModel::Voxtral(model) => {
-                    let geometry = model.realtime_preparation_geometry_for_source_samples(
-                        total_samples,
-                        sample_rate,
-                        VoxtralRealtimePreparationMode::Push,
-                    )?;
-                    voxtral_realtime_committed_observation(
-                        session.retained_metadata_bytes,
-                        model.realtime_prepared_resource_usage(geometry)?,
-                    )?
-                }
-                RuntimeRealtimeEngineModel::Nemotron { .. } => session
-                    .model
-                    .committed_observation(session.retained_metadata_bytes)?,
-            };
             let ordering = match self
                 .coordinator
                 .acquire_job_ordering(&job, stream.operation_gate.clone())
@@ -2409,28 +2294,18 @@ impl RuntimeService {
         let sample_rate = stream.engine_sample_rate.ok_or_else(|| {
             Error::InvalidInput("realtime ASR finish requires committed audio".into())
         })?;
-        let preparation_cost = session.model.preparation_cost(
-            0,
-            stream.committed_samples,
-            sample_rate,
-            VoxtralRealtimePreparationMode::Finish,
+        let geometry = session
+            .model
+            .realtime_preparation_geometry_for_source_samples(
+                stream.committed_samples,
+                sample_rate,
+                VoxtralRealtimePreparationMode::Finish,
+            )?;
+        let preparation_cost = voxtral_realtime_preparation_cost(&session.model, geometry)?;
+        let committed_observation = voxtral_realtime_committed_observation(
+            session.retained_metadata_bytes,
+            session.model.realtime_prepared_resource_usage(geometry)?,
         )?;
-        let committed_observation = match &session.model {
-            RuntimeRealtimeEngineModel::Voxtral(model) => {
-                let geometry = model.realtime_preparation_geometry_for_source_samples(
-                    stream.committed_samples,
-                    sample_rate,
-                    VoxtralRealtimePreparationMode::Finish,
-                )?;
-                voxtral_realtime_committed_observation(
-                    session.retained_metadata_bytes,
-                    model.realtime_prepared_resource_usage(geometry)?,
-                )?
-            }
-            RuntimeRealtimeEngineModel::Nemotron { .. } => session
-                .model
-                .committed_observation(session.retained_metadata_bytes)?,
-        };
         let ordering = match self
             .coordinator
             .acquire_job_ordering(&job, stream.operation_gate.clone())
@@ -5464,43 +5339,6 @@ mod tests {
         assert_eq!(
             resolve_asr_realtime_stream_variant(Some("not-a-real-model")),
             None
-        );
-    }
-
-    #[test]
-    fn realtime_preparation_work_is_prefix_based_for_voxtral_and_incremental_for_nemotron() {
-        let packet_samples = 160;
-        let total_samples = 480;
-
-        assert_eq!(
-            realtime_preparation_work_samples(
-                ModelFamily::Voxtral,
-                VoxtralRealtimePreparationMode::Push,
-                packet_samples,
-                total_samples,
-            )
-            .unwrap(),
-            total_samples
-        );
-        assert_eq!(
-            realtime_preparation_work_samples(
-                ModelFamily::NemotronAsr,
-                VoxtralRealtimePreparationMode::Push,
-                packet_samples,
-                total_samples,
-            )
-            .unwrap(),
-            packet_samples
-        );
-        assert_eq!(
-            realtime_preparation_work_samples(
-                ModelFamily::NemotronAsr,
-                VoxtralRealtimePreparationMode::Finish,
-                0,
-                total_samples,
-            )
-            .unwrap(),
-            0
         );
     }
 
