@@ -8,6 +8,9 @@
 //! crate instead; check-serving-boundary.sh keeps it free of izwi-core and
 //! every accelerator.
 
+// The lint policy these modules had in izwi-core.
+#![allow(clippy::type_complexity)]
+
 mod backend;
 pub mod catalog;
 pub mod chat;

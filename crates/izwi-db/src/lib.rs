@@ -5,6 +5,11 @@
 //! izwi-server's stores and the gateway's fleet coordination and principal
 //! keys share it. It never depends on izwi-core.
 
+// Async tests hold a process-wide environment lock across awaits so parallel
+// tests cannot observe transient environment overrides (the policy these
+// modules had in izwi-server). Production code keeps the stricter lint.
+#![cfg_attr(test, allow(clippy::await_holding_lock))]
+
 pub mod migrator;
 pub mod raw;
 pub mod schema_contract;
