@@ -16,19 +16,13 @@ use crate::api::tts_long_form::{
 
 /// Characters one segment carries after the reply's first sentence.
 pub(crate) const SEGMENT_MAX_CHARS: usize = 240;
-/// The fewest characters a segment carries before the end of the reply. A
-/// lone short sentence ("Sure.") joins the next one: every TTS request pays
-/// a fixed cost, and Kokoro's admitted audio for a very short text is
-/// smaller than the audio it speaks for it.
-pub(crate) const SEGMENT_MIN_CHARS: usize = 40;
 
 /// Cuts a reply into speakable segments as its text arrives.
 ///
-/// Before the end of the text a segment holds only complete sentences, at
-/// least [`SEGMENT_MIN_CHARS`] of them: the reply's first sentences, no more
-/// than that minimum needs (the first audio waits for nothing else), then
-/// whatever complete sentences have arrived, packed up to
-/// [`SEGMENT_MAX_CHARS`]. A sentence that grows past the cap without ending
+/// Before the end of the text a segment holds only complete sentences: the
+/// reply's first sentence alone, however short (the first audio waits for
+/// nothing else), then whatever complete sentences have arrived, packed up
+/// to [`SEGMENT_MAX_CHARS`]. A sentence that grows past the cap without ending
 /// is spoken in clause- or word-sized pieces as it grows. Abbreviations and
 /// decimals do not end a sentence (`sentence_spans`).
 #[derive(Debug, Default)]
@@ -79,19 +73,14 @@ impl SpeechSegmenter {
         }
 
         let first = spans[0].clone();
-        let chars = |end: usize| pending[first.start..end].chars().count();
         let mut end = first.end;
-        for span in &spans[1..complete] {
-            let full = chars(end) >= SEGMENT_MIN_CHARS
-                && (!self.first_emitted || chars(span.end) > SEGMENT_MAX_CHARS);
-            if full {
-                break;
+        if self.first_emitted {
+            for span in &spans[1..complete] {
+                if pending[first.start..span.end].chars().count() > SEGMENT_MAX_CHARS {
+                    break;
+                }
+                end = span.end;
             }
-            end = span.end;
-        }
-        if !finished && chars(end) < SEGMENT_MIN_CHARS {
-            // A short sentence waits to join the next.
-            return None;
         }
         let text = pending[first.start..end].to_string();
         self.consumed += end;
@@ -268,31 +257,24 @@ mod tests {
     #[test]
     fn segments_follow_the_streamed_text_first_sentence_first() {
         let mut segmenter = SpeechSegmenter::default();
-        for delta in [
-            "Sure,",
-            " Dr.",
-            " Lee, your order is on its way",
-            " now. The",
-            " total is 3",
-            ".14 units",
-        ] {
+        for delta in ["Sure,", " Dr.", " Lee", ". The", " total is 3", ".14 units"] {
             segmenter.push(delta);
         }
         assert_eq!(
             segmenter.next_segment(false).as_deref(),
-            Some("Sure, Dr. Lee, your order is on its way now.")
+            Some("Sure, Dr. Lee.")
         );
         assert_eq!(
             segmenter.next_segment(false),
             None,
             "the second sentence is open"
         );
-        segmenter.push(". It ships today. Any");
+        segmenter.push(". It ships today. Anything");
         assert_eq!(
             segmenter.next_segment(false).as_deref(),
             Some("The total is 3.14 units. It ships today.")
         );
-        segmenter.push("thing else?");
+        segmenter.push(" else?");
         assert_eq!(segmenter.next_segment(false), None);
         assert_eq!(
             segmenter.next_segment(true).as_deref(),
@@ -301,21 +283,20 @@ mod tests {
         assert_eq!(segmenter.next_segment(true), None);
     }
 
-    /// A short sentence joins the next instead of going out alone, until
-    /// the end of the reply.
+    /// A short first sentence is spoken alone, at once: Kokoro admits the
+    /// audio a short text speaks (the 40-character segment minimum that
+    /// worked around its budget is gone).
     #[test]
-    fn a_short_sentence_joins_the_next() {
+    fn a_short_first_sentence_is_spoken_alone() {
         let mut segmenter = SpeechSegmenter::default();
-        segmenter.push("Hi! I can help with");
-        assert_eq!(segmenter.next_segment(false), None);
-        segmenter.push(" that whole order today. Okay");
+        segmenter.push("Sure. I can help with");
+        assert_eq!(segmenter.next_segment(false).as_deref(), Some("Sure."));
+        segmenter.push(" that. Okay. Bye.");
         assert_eq!(
             segmenter.next_segment(false).as_deref(),
-            Some("Hi! I can help with that whole order today.")
+            Some("I can help with that. Okay.")
         );
-        segmenter.push(". Bye.");
-        assert_eq!(segmenter.next_segment(false), None, "short sentences wait");
-        assert_eq!(segmenter.next_segment(true).as_deref(), Some("Okay. Bye."));
+        assert_eq!(segmenter.next_segment(true).as_deref(), Some("Bye."));
     }
 
     /// Any split of the reply into deltas yields the reply's words, in
@@ -330,11 +311,7 @@ mod tests {
             let deltas: Vec<String> = chars.chunks(step).map(|c| c.iter().collect()).collect();
             let deltas: Vec<&str> = deltas.iter().map(String::as_str).collect();
             let segments = segments_of(&deltas);
-            assert_eq!(
-                segments[0],
-                "Sure, Dr. Lee. The total is 3.14 units. It ships today, and arrives tomorrow.",
-                "the shortest run of sentences past the minimum (step {step})"
-            );
+            assert_eq!(segments[0], "Sure, Dr. Lee.", "step {step}");
             let spoken: Vec<String> = segments
                 .iter()
                 .flat_map(|segment| segment.split_whitespace().map(str::to_string))
