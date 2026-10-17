@@ -1,301 +1,43 @@
 //! OpenAI-compatible chat completions endpoints.
 
-use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Extension, State},
-    response::{sse::Event, IntoResponse, Response, Sse},
+    response::{IntoResponse, Response},
     Json,
 };
-use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
 
+use super::dto::{
+    openai_logprobs, ChatCompletionRequest, InboundMessageRole, OpenAiAssistantMessage,
+    OpenAiChatCompletionResponse, OpenAiChoice, OpenAiInboundMessage, OpenAiPromptTokensDetails,
+    OpenAiResponseFormat, OpenAiUsage,
+};
+use super::stream::{render_chat_stream, AuditedStream};
 use crate::api::openai::compat::{
     compatibility_profile, strict_guardrail_message, OpenAiCompatibilityProfile,
 };
 use crate::api::openai::convert::{
-    append_assistant_tool_calls, flatten_content, tool_result_message, InboundContent,
+    append_assistant_tool_calls, flatten_content, tool_result_message,
 };
-use crate::api::openai::tool_calls::{
-    parse_answer, resolve_tool_policy, ParsedOutput, ToolCall, ToolCallDelta, ToolCallFormat,
-    ToolCallParser,
-};
+use crate::api::openai::tool_calls::{parse_answer, resolve_tool_policy, ToolCallFormat};
 use crate::api::request_context::{RequestContext, StreamOutcome};
 use crate::app::chat::{
     chat_top_k, parse_chat_model, resolve_chat_request_config, validate_chat_request_ranges,
-    ChatBackend, ChatExecutionRequest, ChatStreamEvent, ChatStreamObserver, LocalChat,
+    ChatBackend, ChatExecutionRequest, LocalChat,
 };
 use crate::app::chat_content::validate_media_inputs_for_variant;
-use crate::error::{ApiError, ApiJson, ErrorScope};
+use crate::error::{ApiError, ApiJson};
 use crate::gateway::{GatewayAdmissionGuard, GatewayChat, GatewayState, PreAdmittedTenantWork};
 use crate::ids::new_prefixed_id;
 use crate::state::AppState;
 use izwi_core::{
-    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatReasoningEffort,
-    ChatRole, ChatTemplateKwargs, ChatTruncation, ModelFamily, ModelVariant,
+    chat_supports_json_object, ChatGeneration, ChatMediaInput, ChatMessage, ChatRole, ModelFamily,
+    ModelVariant,
 };
 use izwi_serving_protocol::MAX_STOP_SEQUENCE_BYTES;
 
-const CHAT_STREAM_INTERRUPTED_ERROR: &str = "Chat stream ended before a terminal event";
-
-/// An in-band error event: the OpenAI error object of the HTTP error the
-/// request would have had before the stream started.
-fn openai_chat_stream_error_payload(scope: &ErrorScope, error: &ApiError) -> String {
-    scope.openai_body(error).to_string()
-}
-
-fn openai_chat_stream_interruption_payload(
-    scope: &ErrorScope,
-    saw_terminal: bool,
-) -> Option<String> {
-    (!saw_terminal).then(|| {
-        openai_chat_stream_error_payload(scope, &ApiError::internal(CHAT_STREAM_INTERRUPTED_ERROR))
-    })
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatCompletionRequest {
-    pub model: String,
-    pub messages: Vec<OpenAiInboundMessage>,
-    #[serde(default)]
-    pub max_tokens: Option<usize>,
-    #[serde(default)]
-    pub max_completion_tokens: Option<usize>,
-    #[serde(default)]
-    pub stream: Option<bool>,
-    #[serde(default)]
-    pub stream_options: Option<ChatCompletionStreamOptions>,
-    #[serde(default)]
-    pub n: Option<usize>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub top_p: Option<f32>,
-    /// `-1` (vLLM) or `0` disables top-k sampling.
-    #[serde(default)]
-    pub top_k: Option<i64>,
-    #[serde(default)]
-    pub repetition_penalty: Option<f32>,
-    #[serde(default)]
-    pub frequency_penalty: Option<f32>,
-    #[serde(default)]
-    pub presence_penalty: Option<f32>,
-    /// Sampling seed (a signed 64-bit integer, as in OpenAI and vLLM).
-    #[serde(default)]
-    pub seed: Option<i64>,
-    /// DS9.3: include per-token logprobs in the response.
-    #[serde(default)]
-    pub logprobs: Option<bool>,
-    /// DS9.3: number of top alternatives per token (0-20).
-    #[serde(default)]
-    pub top_logprobs: Option<u8>,
-    /// DS9.2: structured output request. `json_object` constrains generation
-    /// to one valid JSON value on models whose sampler enforces it.
-    #[serde(default)]
-    pub response_format: Option<OpenAiResponseFormat>,
-    #[serde(default)]
-    pub stop: Option<serde_json::Value>,
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub tools: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    pub tool_choice: Option<serde_json::Value>,
-    #[serde(default)]
-    pub enable_thinking: Option<bool>,
-    #[serde(default)]
-    pub reasoning_effort: Option<ChatReasoningEffort>,
-    #[serde(default)]
-    pub preserve_thinking: Option<bool>,
-    #[serde(default)]
-    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
-    /// `"parsed"` moves `<think>` reasoning into `reasoning_content`;
-    /// `"none"` (the default) leaves it inside `content`.
-    #[serde(default)]
-    pub reasoning_format: Option<String>,
-    /// Izwi extension mirroring OpenAI Responses: `"disabled"` (the default)
-    /// rejects a request that does not fit the context with
-    /// `context_length_exceeded`; `"auto"` drops the oldest turns instead.
-    #[serde(default)]
-    pub truncation: Option<ChatTruncation>,
-}
-
-/// DS9.2: OpenAI `response_format`. Only `json_object` is supported;
-/// `json_schema` is rejected by `kind` with a documented error, and any
-/// `json_schema` payload key is ignored by deserialization.
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpenAiResponseFormat {
-    #[serde(rename = "type")]
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ChatCompletionStreamOptions {
-    #[serde(default)]
-    pub include_usage: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpenAiInboundMessage {
-    pub role: String,
-    #[serde(default)]
-    pub content: Option<InboundContent>,
-    #[serde(default)]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
-    /// On a `tool` message: the id of the call it answers.
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChatCompletionResponse {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: String,
-    choices: Vec<OpenAiChoice>,
-    usage: OpenAiUsage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    izwi_generation_time_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChoice {
-    index: usize,
-    message: OpenAiAssistantMessage,
-    finish_reason: &'static str,
-    /// DS9.3: per-token logprobs; absent unless the request asked for them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logprobs: Option<OpenAiChoiceLogprobs>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiAssistantMessage {
-    role: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCall>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiUsage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-    /// DS9.1: OpenAI-shape prompt token details. Always present with usage;
-    /// `cached_tokens` is 0 when the serving runtime did not measure prefix
-    /// reuse.
-    prompt_tokens_details: OpenAiPromptTokensDetails,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiPromptTokensDetails {
-    cached_tokens: u64,
-}
-
-/// DS9.3: OpenAI-shape per-choice logprobs wrapper.
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiChoiceLogprobs {
-    content: Vec<OpenAiTokenLogprob>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiTokenLogprob {
-    token: String,
-    logprob: f32,
-    bytes: Vec<u8>,
-    top_logprobs: Vec<OpenAiTopTokenLogprob>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OpenAiTopTokenLogprob {
-    token: String,
-    logprob: f32,
-    bytes: Vec<u8>,
-}
-
-/// DS9.3: map core logprob entries into the OpenAI response shape. `None`
-/// when the request did not collect logprobs.
-fn openai_logprobs(entries: &[izwi_core::engine::TokenLogprob]) -> Option<OpenAiChoiceLogprobs> {
-    if entries.is_empty() {
-        return None;
-    }
-    Some(OpenAiChoiceLogprobs {
-        content: entries
-            .iter()
-            .map(|entry| OpenAiTokenLogprob {
-                token: entry.token.clone(),
-                logprob: entry.logprob,
-                bytes: entry.bytes.clone(),
-                top_logprobs: entry
-                    .top_logprobs
-                    .iter()
-                    .map(|top| OpenAiTopTokenLogprob {
-                        token: top.token.clone(),
-                        logprob: top.logprob,
-                        bytes: top.bytes.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    })
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChatChunk {
-    id: String,
-    object: &'static str,
-    created: u64,
-    model: String,
-    choices: Vec<OpenAiChunkChoice>,
-    /// With `stream_options.include_usage`: `null` on every chunk but the
-    /// last, which carries the usage and no choices.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<Option<OpenAiUsage>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    izwi_generation_time_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    izwi_timing: Option<izwi_core::engine::LatencyBreakdown>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiChunkChoice {
-    index: usize,
-    delta: OpenAiDelta,
-    /// DS9.3: the logprobs of this chunk's tokens; absent unless requested.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logprobs: Option<OpenAiChoiceLogprobs>,
-    finish_reason: Option<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-struct OpenAiDelta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<ToolCallDelta>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboundMessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -535,12 +277,12 @@ pub async fn gateway_completions(
 /// How a request's answer is rendered: extensions, reasoning split and tool
 /// calls.
 #[derive(Debug, Clone, Copy)]
-struct AnswerFormat {
-    compat_profile: OpenAiCompatibilityProfile,
+pub(crate) struct AnswerFormat {
+    pub(crate) compat_profile: OpenAiCompatibilityProfile,
     /// See [`reasoning_split_mode`].
-    reasoning: Option<bool>,
+    pub(crate) reasoning: Option<bool>,
     /// The tool-call format to parse; `None` leaves the answer text.
-    tool_calls: Option<ToolCallFormat>,
+    pub(crate) tool_calls: Option<ToolCallFormat>,
 }
 
 /// Runs a validated chat request on `backend` and renders the OpenAI answer:
@@ -755,229 +497,13 @@ fn render_completion_response(
     Json(response).into_response()
 }
 
-/// Tells the request audit how a stream ended in-band.
-struct AuditedStream<O> {
-    observer: O,
-    outcome: StreamOutcome,
-}
-
-impl<O: ChatStreamObserver> ChatStreamObserver for AuditedStream<O> {
-    fn record_delta(&mut self) {
-        self.observer.record_delta();
-    }
-
-    fn record_completion(&mut self, generation: &ChatGeneration) {
-        self.outcome.record_success();
-        self.observer.record_completion(generation);
-    }
-
-    fn record_failure(&mut self) {
-        self.outcome.record_failure();
-        self.observer.record_failure();
-    }
-}
-
-/// Streamed answer text on its way to the client: reasoning is split off
-/// first, then tool-call markup becomes `tool_calls`.
-struct AnswerStream {
-    splitter: Option<super::reasoning::ReasoningSplitter>,
-    tool_calls: Option<ToolCallParser>,
-}
-
-impl AnswerStream {
-    fn new(format: AnswerFormat) -> Self {
-        Self {
-            splitter: format
-                .reasoning
-                .map(super::reasoning::ReasoningSplitter::new),
-            tool_calls: format.tool_calls.map(ToolCallParser::new),
-        }
-    }
-
-    /// The delta for one piece of model text.
-    fn push(&mut self, text: &str) -> OpenAiDelta {
-        let (reasoning, content) = match self.splitter.as_mut() {
-            Some(splitter) => splitter.push(text),
-            None => (String::new(), text.to_string()),
-        };
-        let parsed = match self.tool_calls.as_mut() {
-            Some(parser) => parser.push(&content),
-            None => ParsedOutput {
-                content,
-                tool_calls: Vec::new(),
-            },
-        };
-        answer_delta(reasoning, parsed)
-    }
-
-    /// The delta for the text held back at the end of the answer.
-    fn finish(&mut self) -> OpenAiDelta {
-        let (reasoning, content) = self
-            .splitter
-            .as_mut()
-            .map(|splitter| splitter.finish())
-            .unwrap_or_default();
-        let parsed = match self.tool_calls.as_mut() {
-            Some(parser) => {
-                let mut parsed = parser.push(&content);
-                parsed.extend(parser.finish());
-                parsed
-            }
-            None => ParsedOutput {
-                content,
-                tool_calls: Vec::new(),
-            },
-        };
-        answer_delta(reasoning, parsed)
-    }
-
-    fn saw_tool_calls(&self) -> bool {
-        self.tool_calls
-            .as_ref()
-            .is_some_and(ToolCallParser::saw_tool_calls)
-    }
-}
-
-fn answer_delta(reasoning: String, parsed: ParsedOutput) -> OpenAiDelta {
-    OpenAiDelta {
-        role: None,
-        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-        content: (!parsed.content.is_empty()).then_some(parsed.content),
-        tool_calls: (!parsed.tool_calls.is_empty()).then_some(parsed.tool_calls),
-    }
-}
-
-impl OpenAiDelta {
-    fn is_empty(&self) -> bool {
-        self.role.is_none()
-            && self.reasoning_content.is_none()
-            && self.content.is_none()
-            && self.tool_calls.is_none()
-    }
-}
-
-fn render_chat_stream(
-    req: ChatCompletionRequest,
-    model_id: String,
-    mut event_rx: tokio::sync::mpsc::Receiver<ChatStreamEvent>,
-    format: AnswerFormat,
-    observer: impl ChatStreamObserver,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let include_usage = req
-        .stream_options
-        .as_ref()
-        .and_then(|opts| opts.include_usage)
-        .unwrap_or(false);
-    let completion_id = new_prefixed_id("chatcmpl-");
-    let created = now_unix_secs();
-    let chunk = move |choices: Vec<OpenAiChunkChoice>| OpenAiChatChunk {
-        id: completion_id.clone(),
-        object: "chat.completion.chunk",
-        created,
-        model: model_id.clone(),
-        choices,
-        usage: include_usage.then_some(None),
-        izwi_generation_time_ms: None,
-        izwi_timing: None,
-    };
-    let choice = |delta, logprobs, finish_reason| {
-        vec![OpenAiChunkChoice {
-            index: 0,
-            delta,
-            logprobs,
-            finish_reason,
-        }]
-    };
-
-    // The body is polled after the handler returns, outside the request's
-    // error scope; capture it here.
-    let errors = ErrorScope::current();
-    let stream = async_stream::stream! {
-        let mut observer = observer;
-        let mut answer = AnswerStream::new(format);
-        let mut saw_terminal = false;
-        while let Some(event) = event_rx.recv().await {
-            let (payloads, terminal) = match event {
-                ChatStreamEvent::Started => {
-                    let delta = OpenAiDelta {
-                        role: Some("assistant"),
-                        reasoning_content: None,
-                        content: None,
-                        tool_calls: None,
-                    };
-                    (vec![chunk_json(&chunk(choice(delta, None, None)))], false)
-                }
-                ChatStreamEvent::Delta { text, logprobs } => {
-                    if !text.is_empty() {
-                        observer.record_delta();
-                    }
-                    let delta = answer.push(&text);
-                    let logprobs = openai_logprobs(&logprobs);
-                    if delta.is_empty() && logprobs.is_none() {
-                        (Vec::new(), false)
-                    } else {
-                        (vec![chunk_json(&chunk(choice(delta, logprobs, None)))], false)
-                    }
-                }
-                ChatStreamEvent::Completed(generation) => {
-                    observer.record_completion(&generation);
-                    // Text held back for a tag is final now.
-                    let delta = answer.finish();
-                    let finish = finish_reason(answer.saw_tool_calls(), generation.finish_reason);
-                    let mut last = chunk(choice(delta, None, Some(finish)));
-                    if format.compat_profile.is_relaxed() {
-                        last.izwi_generation_time_ms = Some(generation.generation_time_ms);
-                        last.izwi_timing = generation.latency_breakdown;
-                    }
-                    let mut payloads = vec![chunk_json(&last)];
-                    if include_usage {
-                        let mut usage = chunk(Vec::new());
-                        usage.usage = Some(Some(OpenAiUsage {
-                            prompt_tokens: generation.prompt_tokens,
-                            completion_tokens: generation.tokens_generated,
-                            total_tokens: generation.prompt_tokens + generation.tokens_generated,
-                            prompt_tokens_details: OpenAiPromptTokensDetails {
-                                cached_tokens: generation.cached_prompt_tokens.unwrap_or(0),
-                            },
-                        }));
-                        payloads.push(chunk_json(&usage));
-                    }
-                    (payloads, true)
-                }
-                ChatStreamEvent::Failed(error) => {
-                    observer.record_failure();
-                    (vec![openai_chat_stream_error_payload(&errors, &error)], true)
-                }
-            };
-            for payload in payloads {
-                yield Ok(Event::default().data(payload));
-            }
-            if terminal {
-                saw_terminal = true;
-                break;
-            }
-        }
-        if let Some(payload) = openai_chat_stream_interruption_payload(&errors, saw_terminal) {
-            observer.record_failure();
-            yield Ok(Event::default().data(payload));
-        }
-        yield Ok(Event::default().data("[DONE]"));
-    };
-
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
-}
-
-fn chunk_json(chunk: &OpenAiChatChunk) -> String {
-    serde_json::to_string(chunk).unwrap_or_default()
-}
-
 #[cfg(test)]
 #[path = "completions_tests.rs"]
 mod tests;
 
 /// Tool calls keep their OpenAI termination contract; other answers report
 /// the engine's budget termination rather than every run as `stop`.
-fn finish_reason(
+pub(crate) fn finish_reason(
     tool_calls: bool,
     reason: Option<izwi_core::engine::OutputFinishReason>,
 ) -> &'static str {

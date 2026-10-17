@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 
 use super::tests::{deltas, generation, sse_payloads, tool_format};
 use super::*;
+use crate::app::chat::ChatStreamEvent;
 
 /// Keys izwi adds to the OpenAI chunk object, and to `delta`.
 const CHUNK_EXTENSIONS: &[&str] = &["izwi_timing", "izwi_generation_time_ms"];

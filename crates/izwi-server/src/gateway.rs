@@ -127,7 +127,7 @@ impl GatewayState {
         &self,
         headers: &HeaderMap,
         body: axum::body::Body,
-    ) -> Result<crate::api::openai::chat::completions::ChatCompletionRequest, ApiError> {
+    ) -> Result<crate::api::openai::chat::dto::ChatCompletionRequest, ApiError> {
         let not_json = || ApiError::bad_request("Gateway chat request body is not valid JSON");
         let is_json = headers
             .get(header::CONTENT_TYPE)

@@ -1,7 +1,9 @@
 //! OpenAI-compatible chat resources.
 
 pub mod completions;
+pub mod dto;
 mod reasoning;
+mod stream;
 
 use axum::{routing::post, Router};
 

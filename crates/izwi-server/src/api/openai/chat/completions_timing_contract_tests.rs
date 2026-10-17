@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::openai::chat::dto::OpenAiChatChunk;
 
 fn reasoning_mode_for(body: serde_json::Value) -> Result<Option<bool>, ApiError> {
     let req: ChatCompletionRequest = serde_json::from_value(body).unwrap();
