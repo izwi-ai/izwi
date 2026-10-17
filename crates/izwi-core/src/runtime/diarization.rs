@@ -4,7 +4,7 @@ use crate::catalog::{
     resolve_asr_model_variant, resolve_diarization_llm_variant, resolve_diarization_model_variant,
 };
 use crate::engine::{ResourceAmount, ResourceVector, WorkUnit};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::models::architectures::sortformer::diarization::{
     production_workspace_authorization, SortformerWorkspaceEstimate, SortformerWorkspaceEvent,
 };
@@ -59,6 +59,67 @@ const MAX_FRAGMENT_DURATION_SECS: f32 = 1.25;
 const FRAGMENT_CONFIDENCE_MARGIN: f32 = 0.08;
 const PHRASE_CAPITALIZED_GAP_SECS: f32 = 0.35;
 const PHRASE_HARD_GAP_SECS: f32 = 0.75;
+
+/// Runs diarization and the transcript stage side by side (SPK-F18). On a
+/// memory-tight machine the model one stage holds can leave too little room
+/// for the other's load, and a model in use cannot be evicted. A stage
+/// refused for capacity therefore reruns alone once the joined run ends and
+/// the other stage's model is evictable: diarization first, then the
+/// transcript, as the serial pipeline ran. `transcribe` learns whether it
+/// runs beside diarization.
+async fn diarize_beside_transcription<D, T, DF, TF>(
+    mut diarize: impl FnMut() -> DF,
+    mut transcribe: impl FnMut(bool) -> TF,
+) -> Result<(D, T)>
+where
+    DF: std::future::Future<Output = Result<D>>,
+    TF: std::future::Future<Output = Result<T>>,
+{
+    let (diarization, transcript) = tokio::try_join!(
+        unless_refused_for_capacity("diarization", diarize()),
+        unless_refused_for_capacity("transcription", transcribe(true)),
+    )?;
+    let diarization = match diarization {
+        Some(diarization) => diarization,
+        None => diarize().await?,
+    };
+    let transcript = match transcript {
+        Some(transcript) => transcript,
+        None => transcribe(false).await?,
+    };
+    Ok((diarization, transcript))
+}
+
+/// `stage`'s result, or `None` when it was refused for capacity.
+async fn unless_refused_for_capacity<T>(
+    stage: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<Option<T>> {
+    match future.await {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == ErrorKind::CapacityExhausted => {
+            warn!(
+                "Diarization pipeline {stage} was refused capacity beside the other stage; rerunning it alone: {error}"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The forced aligner for the pipeline, or `None` (heuristic timings) when
+/// it could not load. A capacity refusal beside diarization is returned
+/// instead, so the transcript stage reruns with room for the aligner.
+fn optional_aligner<B>(loaded: Result<B>, beside_diarization: bool) -> Result<Option<B>> {
+    match loaded {
+        Ok(binding) => Ok(Some(binding)),
+        Err(err) if beside_diarization && err.kind() == ErrorKind::CapacityExhausted => Err(err),
+        Err(err) => {
+            warn!("Forced aligner load failed, using heuristic timings: {err}");
+            Ok(None)
+        }
+    }
+}
 
 /// The ASR text and word timings of one diarization pipeline run.
 struct DiarizationPipelineTranscript {
@@ -690,21 +751,27 @@ impl RuntimeService {
         // The transcript and its word timings do not depend on the speaker
         // segments, so ASR and forced alignment run beside diarization
         // instead of after it (SPK-F18); attribution joins the two.
-        let (diarization, words_and_timings) = tokio::try_join!(
-            self.diarize_samples_stage(
-                &pipeline_job,
-                audio.clone(),
-                steady_usage,
-                diarization_variant,
-                runtime_request.config.clone(),
-            ),
-            self.transcribe_and_align_for_diarization(
-                &pipeline_job,
-                runtime_request.asr_model_id.as_deref(),
-                runtime_request.aligner_model_id.as_deref(),
-                &audio,
-            ),
-        )?;
+        let (diarization, words_and_timings) = diarize_beside_transcription(
+            || {
+                self.diarize_samples_stage(
+                    &pipeline_job,
+                    audio.clone(),
+                    steady_usage,
+                    diarization_variant,
+                    runtime_request.config.clone(),
+                )
+            },
+            |beside_diarization| {
+                self.transcribe_and_align_for_diarization(
+                    &pipeline_job,
+                    runtime_request.asr_model_id.as_deref(),
+                    runtime_request.aligner_model_id.as_deref(),
+                    &audio,
+                    beside_diarization,
+                )
+            },
+        )
+        .await?;
         let DiarizationPipelineTranscript {
             asr_text,
             asr_words,
@@ -815,12 +882,15 @@ impl RuntimeService {
     /// The pipeline's transcript and word timings: ASR (single pass, or
     /// chunked within the model's invocation limit) then forced alignment,
     /// falling back to heuristic timings when no aligner is available.
+    /// `beside_diarization` refuses an aligner load refused for capacity
+    /// instead, so the stage reruns once diarization has released its model.
     async fn transcribe_and_align_for_diarization(
         &self,
         job: &JobLease,
         asr_model_id: Option<&str>,
         aligner_model_id: Option<&str>,
         audio: &PipelineAudio,
+        beside_diarization: bool,
     ) -> Result<DiarizationPipelineTranscript> {
         let asr_variant = resolve_asr_model_variant(asr_model_id);
         self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
@@ -857,22 +927,17 @@ impl RuntimeService {
 
         let aligner_variant =
             crate::runtime::asr::resolve_forced_aligner_variant(aligner_model_id)?;
-        let aligner_binding = match self
-            .load_capability_for_job(
+        let aligner_binding = optional_aligner(
+            self.load_capability_for_job(
                 job,
                 aligner_variant,
                 CapabilityKind::ForcedAlignment,
                 false,
                 ExecutionTargetKind::BatchRunner,
             )
-            .await
-        {
-            Ok(binding) => Some(binding),
-            Err(err) => {
-                warn!("Forced aligner load failed, using heuristic timings: {err}");
-                None
-            }
-        };
+            .await,
+            beside_diarization,
+        )?;
         let aligner_model = if aligner_binding.is_some() {
             match self.model_registry.get_asr(aligner_variant).await {
                 Some(model) => Some(model),
@@ -2447,6 +2512,90 @@ fn secs_to_ms(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript stage refused for capacity beside diarization reruns
+    /// alone after diarization finished; diarization refused the same way
+    /// reruns first; any other failure ends the pipeline without a rerun.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stage_refused_for_capacity_reruns_alone_after_the_joined_run() {
+        use std::cell::RefCell;
+
+        let log = RefCell::new(Vec::new());
+        let refused = || Error::Overloaded("no room for the ASR model".into());
+        let joined = diarize_beside_transcription(
+            || async {
+                log.borrow_mut().push("diarize start");
+                tokio::task::yield_now().await;
+                log.borrow_mut().push("diarize end");
+                Ok("segments")
+            },
+            |beside| {
+                let log = &log;
+                async move {
+                    if beside {
+                        log.borrow_mut().push("transcribe beside");
+                        return Err(refused());
+                    }
+                    log.borrow_mut().push("transcribe alone");
+                    Ok("words")
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined, ("segments", "words"));
+        assert_eq!(
+            log.take(),
+            [
+                "diarize start",
+                "transcribe beside",
+                "diarize end",
+                "transcribe alone"
+            ]
+        );
+
+        let diarize_calls = RefCell::new(0);
+        let joined = diarize_beside_transcription(
+            || async {
+                *diarize_calls.borrow_mut() += 1;
+                if *diarize_calls.borrow() == 1 {
+                    return Err(refused());
+                }
+                Ok("segments")
+            },
+            |beside| async move { Ok(beside) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(joined, ("segments", true));
+        assert_eq!(*diarize_calls.borrow(), 2);
+
+        let transcribe_calls = RefCell::new(0);
+        let error = diarize_beside_transcription(
+            || async { Ok(()) },
+            |_| async {
+                *transcribe_calls.borrow_mut() += 1;
+                Err::<(), _>(Error::InferenceError("decoder failed".into()))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InferenceError(_)));
+        assert_eq!(*transcribe_calls.borrow(), 1);
+    }
+
+    /// Beside diarization an aligner refused for capacity fails the stage
+    /// (so it reruns alone); alone, or for any other failure, the pipeline
+    /// falls back to heuristic timings.
+    #[test]
+    fn only_a_capacity_refusal_beside_diarization_keeps_the_aligner_required() {
+        let refused = || Err::<(), _>(Error::Overloaded("no room for the aligner".into()));
+        assert!(optional_aligner(refused(), true).is_err());
+        assert!(matches!(optional_aligner(refused(), false), Ok(None)));
+        let broken = Err::<(), _>(Error::ModelLoadError("bad weights".into()));
+        assert!(matches!(optional_aligner(broken, true), Ok(None)));
+        assert!(matches!(optional_aligner(Ok(()), true), Ok(Some(()))));
+    }
 
     #[test]
     fn diarization_resolves_voxtral_through_its_loaded_asr_registry() {
