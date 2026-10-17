@@ -21,11 +21,8 @@ pub const BANNER: &str = r#"
 pub struct Theme {
     pub accent: fn(&str) -> console::StyledObject<&str>,
     pub success: fn(&str) -> console::StyledObject<&str>,
-    pub error: fn(&str) -> console::StyledObject<&str>,
     pub warning: fn(&str) -> console::StyledObject<&str>,
     pub info: fn(&str) -> console::StyledObject<&str>,
-    pub muted: fn(&str) -> console::StyledObject<&str>,
-    pub bold: fn(&str) -> console::StyledObject<&str>,
     pub no_color: bool,
 }
 
@@ -34,11 +31,8 @@ impl Default for Theme {
         Self {
             accent: |s| style(s).cyan().bold(),
             success: |s| style(s).green().bold(),
-            error: |s| style(s).red().bold(),
             warning: |s| style(s).yellow(),
             info: |s| style(s).blue(),
-            muted: |s| style(s).dim(),
-            bold: |s| style(s).bold(),
             no_color: false,
         }
     }
@@ -49,11 +43,8 @@ impl Theme {
         Self {
             accent: |s| style(s),
             success: |s| style(s),
-            error: |s| style(s),
             warning: |s| style(s),
             info: |s| style(s),
-            muted: |s| style(s),
-            bold: |s| style(s),
             no_color: true,
         }
     }
@@ -70,10 +61,6 @@ impl Theme {
         println!("{} {}", (self.success)("✓"), msg);
     }
 
-    pub fn error(&self, msg: &str) {
-        eprintln!("{} {}", (self.error)("✗"), msg);
-    }
-
     pub fn warning(&self, msg: &str) {
         println!("{} {}", (self.warning)("⚠"), msg);
     }
@@ -87,16 +74,3 @@ impl Theme {
     }
 }
 
-/// Progress bar styles
-pub fn progress_bar_style() -> indicatif::ProgressStyle {
-    indicatif::ProgressStyle::default_bar()
-        .template("{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-        .unwrap()
-        .progress_chars("#>-")
-}
-
-pub fn spinner_style() -> indicatif::ProgressStyle {
-    indicatif::ProgressStyle::default_spinner()
-        .template("{spinner:.cyan} {msg}")
-        .unwrap()
-}

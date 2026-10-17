@@ -1,7 +1,6 @@
 //! Izwi CLI - World-class command-line interface for audio inference
 //!
 //! Inspired by vLLM, SGlang, Ollama, and llama.cpp CLIs
-#![allow(dead_code)]
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use izwi_core::backends::BackendPreference;
