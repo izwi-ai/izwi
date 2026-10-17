@@ -40,9 +40,7 @@ use crate::engine::{
 use crate::models::shared::telemetry::{
     prometheus as kernel_path_prometheus, snapshot as kernel_path_telemetry_snapshot,
 };
-use crate::runtime::pipeline::{
-    PipelineExecutionSummary, PipelineExecutor, PipelineGraph, PipelineKind,
-};
+use crate::runtime::pipeline::{PipelineExecutionSummary, PipelineKind};
 use crate::runtime::telemetry::histogram::{buckets, CounterFamily, HistogramFamily};
 use crate::runtime::voice_metrics::{
     prometheus_voice_metric_name, voice_metric_catalog, voice_metric_prometheus_contract,
@@ -53,6 +51,9 @@ use crate::runtime::voice_metrics::{
 use crate::runtime::CoordinatorSnapshot;
 use crate::runtime_models::LoadedModelDiagnostics;
 use crate::KernelPathTelemetrySnapshot;
+
+#[cfg(test)]
+use crate::runtime::pipeline::{PipelineExecutor, PipelineGraph};
 
 /// Pipeline stage of a whole engine request (non-streaming).
 pub(crate) const ENGINE_REQUEST_STAGE: &str = "engine.request";
@@ -790,6 +791,7 @@ impl RuntimeTelemetryCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_pipeline_graph(&self, graph: &PipelineGraph) {
         let summary = PipelineExecutor.execute_contract(graph);
         self.record_pipeline_execution(&summary);

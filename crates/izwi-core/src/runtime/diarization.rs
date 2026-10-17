@@ -564,9 +564,8 @@ impl RuntimeService {
             .run_host_blocking_stage(&job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
                 let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                let runtime_request =
-                    DiarizationRuntimeRequest::from_bytes(variant, audio_bytes, config)?
-                        .with_pipeline_models(model_id, None, None, None);
+                let runtime_request = DiarizationRuntimeRequest::from_bytes(audio_bytes, config)?
+                    .with_pipeline_models(model_id, None, None, None);
                 let steady_usage =
                     diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
                 let peak_usage = diarization_input_observation(
@@ -719,18 +718,14 @@ impl RuntimeService {
             .run_host_blocking_stage(&pipeline_job, move || {
                 let (audio_bytes, retained_source) = owned_audio_input.decode_bytes()?;
                 let audio = decode_pipeline_audio_bytes(&audio_bytes)?;
-                let runtime_request = DiarizationRuntimeRequest::from_bytes(
-                    diarization_variant,
-                    audio_bytes,
-                    config,
-                )?
-                .with_pipeline_models(
-                    diarization_model_id,
-                    asr_model_id,
-                    aligner_model_id,
-                    llm_model_id,
-                )
-                .with_llm_refinement(enable_llm_refinement);
+                let runtime_request = DiarizationRuntimeRequest::from_bytes(audio_bytes, config)?
+                    .with_pipeline_models(
+                        diarization_model_id,
+                        asr_model_id,
+                        aligner_model_id,
+                        llm_model_id,
+                    )
+                    .with_llm_refinement(enable_llm_refinement);
                 let steady_usage =
                     diarization_request_audio_observation(input_bytes, &runtime_request, &audio)?;
                 let peak_usage = diarization_input_observation(
@@ -1202,11 +1197,6 @@ fn resolve_chat_variant(model_id: Option<&str>) -> Result<ModelVariant> {
     resolve_diarization_llm_variant(model_id).map_err(|err| Error::InvalidInput(err.to_string()))
 }
 
-fn decode_pipeline_audio(audio_base64: &str) -> Result<PipelineAudio> {
-    let audio_bytes = base64_decode(audio_base64)?;
-    decode_pipeline_audio_bytes(&audio_bytes)
-}
-
 fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
     let (samples, sample_rate) = decode_audio_bytes_canonical(audio_bytes)?;
     let normalized = resample_linear(&samples, sample_rate, PIPELINE_SAMPLE_RATE)?;
@@ -1413,6 +1403,7 @@ fn fallback_word_timings_from_chunks(
     alignments
 }
 
+#[cfg(test)]
 fn fallback_word_timings(text: &str, duration_secs: f32) -> Vec<(String, u32, u32)> {
     let words = extract_words(text);
     fallback_word_timings_from_words(&words, duration_secs)
@@ -2758,12 +2749,8 @@ mod tests {
     fn diarization_transcript_observation_retains_one_encoded_copy() {
         let mut encoded = Vec::with_capacity(64);
         encoded.extend_from_slice(&[1_u8, 2, 3, 4]);
-        let request = DiarizationRuntimeRequest::from_bytes(
-            ModelVariant::DiarStreamingSortformer4SpkV21,
-            encoded,
-            DiarizationConfig::default(),
-        )
-        .expect("runtime request");
+        let request = DiarizationRuntimeRequest::from_bytes(encoded, DiarizationConfig::default())
+            .expect("runtime request");
         let audio = PipelineAudio {
             samples: Arc::from(vec![0.0_f32; 8]),
             sample_rate: PIPELINE_SAMPLE_RATE,

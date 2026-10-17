@@ -3942,6 +3942,7 @@ impl RuntimeService {
         self.model_lifecycle.pinned_model_variants().await
     }
 
+    #[cfg(test)]
     async fn ensure_model_budget_before_load(&self, requested_variant: ModelVariant) -> Result<()> {
         let _mutation_guard = self.model_lifecycle.mutation_gate.lock().await;
         self.model_lifecycle

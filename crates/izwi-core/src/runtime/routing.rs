@@ -16,56 +16,9 @@ use crate::runtime::capabilities::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RouteSource {
-    OpenAiChatCompletions,
-    OpenAiResponses,
-    OpenAiAudioSpeech,
-    OpenAiAudioTranscriptions,
-    ProductTranscriptionJob,
-    ProductSpeechJob,
-    ProductDiarizationRecord,
-    ProductSavedVoice,
-    ProductVoiceSession,
-    RealtimeTranscription,
     RealtimeVoice,
-    AdminModels,
     InternalEngine,
     InternalRuntime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RoutingInputKind {
-    Text,
-    Audio,
-    AudioStream,
-    TextAndAudio,
-    VoiceReference,
-    Artifact,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LatencyClass {
-    Batch,
-    Interactive,
-    Realtime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum QualityClass {
-    Default,
-    Draft,
-    High,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CostClass {
-    Default,
-    Economy,
-    Unbounded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -79,12 +32,8 @@ pub(crate) struct RoutingCandidateTrace {
 pub(crate) struct RoutingRequest {
     pub(crate) source: RouteSource,
     pub(crate) capability: CapabilityKind,
-    pub(crate) input_kind: RoutingInputKind,
     pub(crate) requested_model_variant: Option<ModelVariant>,
     pub(crate) streaming_required: bool,
-    pub(crate) latency_class: LatencyClass,
-    pub(crate) quality_class: QualityClass,
-    pub(crate) cost_class: CostClass,
     pub(crate) allow_model_fallback: bool,
     pub(crate) candidate_models: Vec<ModelVariant>,
 }
@@ -94,22 +43,14 @@ impl RoutingRequest {
         Self {
             source,
             capability,
-            input_kind: RoutingInputKind::Unknown,
             requested_model_variant: None,
             streaming_required: false,
-            latency_class: LatencyClass::Interactive,
-            quality_class: QualityClass::Default,
-            cost_class: CostClass::Default,
             allow_model_fallback: false,
             candidate_models: Vec::new(),
         }
     }
 
-    pub(crate) fn with_input_kind(mut self, input_kind: RoutingInputKind) -> Self {
-        self.input_kind = input_kind;
-        self
-    }
-
+    #[cfg(test)]
     pub(crate) fn with_model_variant(mut self, model_variant: ModelVariant) -> Self {
         self.requested_model_variant = Some(model_variant);
         self
@@ -128,26 +69,13 @@ impl RoutingRequest {
         self
     }
 
-    pub(crate) fn with_latency_class(mut self, latency_class: LatencyClass) -> Self {
-        self.latency_class = latency_class;
-        self
-    }
-
-    pub(crate) fn with_quality_class(mut self, quality_class: QualityClass) -> Self {
-        self.quality_class = quality_class;
-        self
-    }
-
-    pub(crate) fn with_cost_class(mut self, cost_class: CostClass) -> Self {
-        self.cost_class = cost_class;
-        self
-    }
-
+    #[cfg(test)]
     pub(crate) fn with_model_fallback(mut self, allow_model_fallback: bool) -> Self {
         self.allow_model_fallback = allow_model_fallback;
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_candidate_models(mut self, candidate_models: Vec<ModelVariant>) -> Self {
         self.candidate_models = candidate_models;
         self
@@ -158,16 +86,12 @@ impl RoutingRequest {
 pub(crate) struct RoutingDecision {
     pub(crate) source: RouteSource,
     pub(crate) capability: CapabilityKind,
-    pub(crate) input_kind: RoutingInputKind,
     pub(crate) requested_model_variant: Option<ModelVariant>,
     pub(crate) selected_model_variant: ModelVariant,
     pub(crate) execution_plan: CapabilityExecutionPlan,
     pub(crate) backend_kind: BackendKind,
     pub(crate) backend_reason: String,
     pub(crate) backend_diagnostics: Vec<String>,
-    pub(crate) latency_class: LatencyClass,
-    pub(crate) quality_class: QualityClass,
-    pub(crate) cost_class: CostClass,
     pub(crate) fallback_chain: Vec<RoutingCandidateTrace>,
 }
 
@@ -216,16 +140,12 @@ impl<'a> RuntimeRouter<'a> {
                     return Ok(RoutingDecision {
                         source: request.source,
                         capability: request.capability,
-                        input_kind: request.input_kind,
                         requested_model_variant: request.requested_model_variant,
                         selected_model_variant: model_variant,
                         execution_plan,
                         backend_kind: backend_plan.backend.kind(),
                         backend_reason: backend_plan.reason,
                         backend_diagnostics: backend_plan.diagnostics,
-                        latency_class: request.latency_class,
-                        quality_class: request.quality_class,
-                        cost_class: request.cost_class,
                         fallback_chain,
                     });
                 }
@@ -289,8 +209,7 @@ mod tests {
 
         let decision = router
             .plan(
-                RoutingRequest::new(RouteSource::OpenAiChatCompletions, CapabilityKind::Chat)
-                    .with_input_kind(RoutingInputKind::Text)
+                RoutingRequest::new(RouteSource::InternalRuntime, CapabilityKind::Chat)
                     .with_model_variant(ModelVariant::Qwen359BGguf),
             )
             .expect("route decision");
@@ -327,7 +246,7 @@ mod tests {
 
         let decision = router
             .plan(
-                RoutingRequest::new(RouteSource::OpenAiChatCompletions, CapabilityKind::Chat)
+                RoutingRequest::new(RouteSource::InternalRuntime, CapabilityKind::Chat)
                     .with_model_fallback(true)
                     .with_candidate_models(vec![
                         ModelVariant::Kokoro82M,
@@ -352,9 +271,7 @@ mod tests {
 
         let decision = router
             .plan(
-                RoutingRequest::new(RouteSource::RealtimeTranscription, CapabilityKind::Asr)
-                    .with_input_kind(RoutingInputKind::AudioStream)
-                    .with_latency_class(LatencyClass::Realtime)
+                RoutingRequest::new(RouteSource::InternalRuntime, CapabilityKind::Asr)
                     .with_model_fallback(true)
                     .with_streaming_required(true)
                     .with_candidate_models(vec![
@@ -383,7 +300,7 @@ mod tests {
 
         let err = router
             .plan(
-                RoutingRequest::new(RouteSource::OpenAiAudioSpeech, CapabilityKind::Tts)
+                RoutingRequest::new(RouteSource::InternalRuntime, CapabilityKind::Tts)
                     .with_model_fallback(true)
                     .with_candidate_models(vec![
                         ModelVariant::Qwen359BGguf,

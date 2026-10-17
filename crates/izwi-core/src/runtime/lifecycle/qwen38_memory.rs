@@ -60,6 +60,7 @@ pub(super) fn static_estimate(
 
 /// [`static_estimate`] as a resource plan. CUDA authorizes its host
 /// conversion window separately from the device peak.
+#[cfg(test)]
 pub(super) fn static_resource_plan(
     backend: BackendKind,
     performance: &PerformanceConfig,

@@ -16,8 +16,8 @@ use crate::models::architectures::kokoro::admission::kokoro_chunk_price;
 use crate::models::architectures::kokoro::kokoro_output_budget;
 use crate::models::architectures::vibevoice::tts::vibevoice_tts_auto_max_frames_for_text;
 use crate::models::architectures::voxtral::tts::voxtral_tts_auto_max_frames_for_text;
-use crate::runtime::adapters::{CapabilityKind, ExecutionTargetKind};
-use crate::runtime::coordinator::{JobLease, JobResourceObservation};
+use crate::runtime::adapters::CapabilityKind;
+use crate::runtime::coordinator::JobResourceObservation;
 use crate::runtime::request::TtsRuntimeRequest;
 use crate::runtime::service::RuntimeService;
 use crate::runtime::telemetry::{
@@ -29,6 +29,11 @@ use crate::runtime::types::{
     TtsStreamingMode,
 };
 use crate::runtime::CoordinatorLane;
+
+#[cfg(test)]
+use crate::runtime::adapters::ExecutionTargetKind;
+#[cfg(test)]
+use crate::runtime::coordinator::JobLease;
 
 const LFM25_AUDIO_DEFAULT_MAX_NEW_TOKENS: usize = 1024;
 const DIRECT_TTS_STATE_BYTES_PER_UNIT: u64 = 64 * 1024;
@@ -284,6 +289,7 @@ fn uses_direct_streaming_tts_runtime(variant: ModelVariant) -> bool {
 /// The execution target the public TTS route actually uses for `variant`.
 /// The adapter registry must advertise the same target, or no loaded
 /// contract can serve the request (VXT-1).
+#[cfg(test)]
 pub(crate) fn tts_route_target(variant: ModelVariant, streaming: bool) -> ExecutionTargetKind {
     if streaming && uses_direct_streaming_tts_runtime(variant) {
         ExecutionTargetKind::DirectModel
@@ -366,6 +372,7 @@ impl RuntimeService {
     }
 }
 
+#[cfg(test)]
 async fn send_direct_tts_chunk(
     job: &JobLease,
     chunk_tx: &mpsc::Sender<AudioChunk>,

@@ -1022,6 +1022,7 @@ impl InferenceCoordinator {
         })
     }
 
+    #[cfg(test)]
     async fn acquire_execution(
         self: &Arc<Self>,
         deadline: Option<Instant>,
@@ -1048,6 +1049,7 @@ impl InferenceCoordinator {
             .reserve_batch_workspace(execution_group, batch_id, resources)
     }
 
+    #[cfg(test)]
     async fn acquire_execution_units(
         self: &Arc<Self>,
         units: usize,
@@ -1769,6 +1771,7 @@ impl InferenceCoordinator {
         .await
     }
 
+    #[cfg(test)]
     async fn run_blocking_stage_inner<T, F>(
         self: &Arc<Self>,
         job: &JobLease,
@@ -3068,6 +3071,8 @@ fn derive_default_metal_budget(_device: &DeviceProfile) -> Option<u64> {
     None
 }
 
+// Pure arithmetic, tested on every backend; only the Metal probe calls it.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 fn combine_metal_memory_snapshot(
     metal_total: u64,
     metal_allocated: u64,

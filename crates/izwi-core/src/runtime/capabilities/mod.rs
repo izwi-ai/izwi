@@ -54,13 +54,8 @@ pub(crate) struct CapabilityExecutionPlan {
 }
 
 impl CapabilityExecutionPlan {
-    fn from_metadata(
-        metadata: AdapterMetadata,
-        backend_kind: BackendKind,
-        streaming_required: bool,
-    ) -> Self {
-        let mut execution_profile =
-            scalar_execution_profile(metadata, backend_kind, streaming_required);
+    fn from_metadata(metadata: AdapterMetadata, backend_kind: BackendKind) -> Self {
+        let mut execution_profile = scalar_execution_profile(metadata, backend_kind);
         execution_profile.resolved_from_loaded_model = false;
         Self {
             adapter_id: metadata.id,
@@ -101,7 +96,6 @@ impl<'a> CapabilityExecutionRegistry<'a> {
         Ok(CapabilityExecutionPlan::from_metadata(
             metadata,
             request.backend_kind,
-            request.streaming_required,
         ))
     }
 }

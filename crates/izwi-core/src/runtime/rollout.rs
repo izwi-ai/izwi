@@ -49,6 +49,8 @@ impl KvProviderRollout {
         self.optimized_provider_enabled
     }
 
+    // Read by the accelerator KV backend, which only Metal and CUDA builds compile.
+    #[cfg_attr(not(any(feature = "cuda", feature = "metal")), allow(dead_code))]
     pub(crate) const fn metal_eager_fences(self) -> bool {
         self.metal_eager_fences
     }

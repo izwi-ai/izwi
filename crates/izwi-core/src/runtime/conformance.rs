@@ -4,11 +4,14 @@
 //! and future fake adapters a stable checklist before execution behavior is
 //! moved behind new broker, adapter, or pipeline boundaries.
 
+#[cfg(test)]
+use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
+#[cfg(test)]
 use crate::catalog::{CudaSupportLevel, ModelFamily, ModelVariant};
 
-use super::adapters::{CapabilityKind, RuntimeAdapterRegistry};
-
+#[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_VARIANT_COUNT: usize = 45;
+#[cfg(test)]
 pub(crate) const EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -190,8 +193,8 @@ pub fn required_conformance_capabilities() -> &'static [ConformanceCapability] {
 /// Target retained-state ownership recorded before the physical-state
 /// migration starts. This is descriptive scaffolding only; it does not select
 /// an execution path.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum RetainedStateExpectation {
     Managed,
     Stateless,
@@ -200,8 +203,8 @@ pub(crate) enum RetainedStateExpectation {
 /// Invocation workspace requirement recorded independently from retained
 /// state. Every capability must eventually publish a workspace contract, while
 /// atomic capabilities with internal iterative state require a non-empty one.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum WorkspaceExpectation {
     DeclaredMayBeEmpty,
     InvocationStateRequired,
@@ -210,8 +213,8 @@ pub(crate) enum WorkspaceExpectation {
 /// Frozen product expectation for an exact model/capability/backend cell.
 /// `RequiredWhenCompiled` still permits normal runtime hardware admission to
 /// reject an unavailable or unsupported physical device.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum BackendConformanceExpectation {
     RequiredWhenCompiled,
     Unsupported,
@@ -219,8 +222,8 @@ pub(crate) enum BackendConformanceExpectation {
     NotApplicable,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct BackendConformanceExpectations {
     pub(crate) cpu: BackendConformanceExpectation,
     pub(crate) metal: BackendConformanceExpectation,
@@ -230,8 +233,8 @@ pub(crate) struct BackendConformanceExpectations {
 /// One entry per runtime-registry model/capability binding. The binding set is
 /// derived from `ModelVariant::all()` and the built-in adapter registry so a
 /// catalog addition cannot silently escape conformance coverage.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CatalogStateConformanceCase {
     pub(crate) variant: ModelVariant,
     pub(crate) capability: ConformanceCapability,
@@ -244,7 +247,7 @@ pub(crate) struct CatalogStateConformanceCase {
 
 /// Build the Phase-0 catalog/state/backend manifest without affecting model
 /// loading, routing, or execution.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn catalog_state_conformance_manifest() -> Vec<CatalogStateConformanceCase> {
     let registry = RuntimeAdapterRegistry::built_in();
     let mut manifest = Vec::with_capacity(EXPECTED_CATALOG_CAPABILITY_BINDING_COUNT);
@@ -269,6 +272,7 @@ pub(crate) fn catalog_state_conformance_manifest() -> Vec<CatalogStateConformanc
     manifest
 }
 
+#[cfg(test)]
 fn workspace_expectation(
     variant: ModelVariant,
     capability: ConformanceCapability,
@@ -310,6 +314,7 @@ fn workspace_expectation(
     }
 }
 
+#[cfg(test)]
 fn conformance_capability(capability: CapabilityKind) -> ConformanceCapability {
     match capability {
         CapabilityKind::Asr => ConformanceCapability::Asr,
@@ -322,12 +327,11 @@ fn conformance_capability(capability: CapabilityKind) -> ConformanceCapability {
         CapabilityKind::SpeechToSpeech => ConformanceCapability::SpeechToSpeech,
         CapabilityKind::Diarization => ConformanceCapability::Diarization,
         CapabilityKind::ForcedAlignment => ConformanceCapability::ForcedAlignment,
-        CapabilityKind::Vad => ConformanceCapability::Vad,
-        CapabilityKind::Endpointing => ConformanceCapability::Endpointing,
         CapabilityKind::Tokenizer => ConformanceCapability::Tokenizer,
     }
 }
 
+#[cfg(test)]
 fn fixture_id_for(capability: ConformanceCapability) -> &'static str {
     capability_conformance_cases()
         .iter()
@@ -341,6 +345,7 @@ fn fixture_id_for(capability: ConformanceCapability) -> &'static str {
         })
 }
 
+#[cfg(test)]
 fn retained_state_expectation(
     variant: ModelVariant,
     capability: ConformanceCapability,
@@ -424,6 +429,7 @@ fn retained_state_expectation(
     }
 }
 
+#[cfg(test)]
 fn unexpected_capability(
     variant: ModelVariant,
     capability: ConformanceCapability,
@@ -434,6 +440,7 @@ fn unexpected_capability(
     )
 }
 
+#[cfg(test)]
 fn backend_expectations(variant: ModelVariant) -> BackendConformanceExpectations {
     use BackendConformanceExpectation as Expectation;
 

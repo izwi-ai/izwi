@@ -304,6 +304,7 @@ impl ModelLifecycleController {
         self.mark_slot_ready_for_instance(variant, model_instance_id)
     }
 
+    #[cfg(test)]
     pub(super) fn bind_loaded_model_bundle(
         &self,
         variant: ModelVariant,
@@ -316,6 +317,7 @@ impl ModelLifecycleController {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn bind_loaded_model_bundle_with_state_publications(
         &self,
         variant: ModelVariant,

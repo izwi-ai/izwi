@@ -2867,23 +2867,6 @@ impl RuntimeService {
             .await
     }
 
-    pub(crate) async fn asr_transcribe_bytes_with_variant(
-        &self,
-        variant: ModelVariant,
-        audio_bytes: &[u8],
-        language: Option<&str>,
-        correlation_id: Option<&str>,
-    ) -> Result<AsrTranscription> {
-        self.asr_transcribe_bytes_with_variant_and_prompt(
-            variant,
-            audio_bytes,
-            language,
-            None,
-            correlation_id,
-        )
-        .await
-    }
-
     pub(crate) async fn asr_transcribe_bytes_with_variant_and_prompt(
         &self,
         variant: ModelVariant,
@@ -2977,28 +2960,6 @@ impl RuntimeService {
             duration_secs,
             asr_diagnostics: output.asr_diagnostics,
         })
-    }
-
-    pub(crate) async fn asr_transcribe_bytes_with_variant_streaming<F>(
-        &self,
-        variant: ModelVariant,
-        audio_bytes: &[u8],
-        language: Option<&str>,
-        correlation_id: Option<&str>,
-        on_delta: F,
-    ) -> Result<AsrTranscription>
-    where
-        F: FnMut(String) + Send + 'static,
-    {
-        self.asr_transcribe_bytes_with_variant_streaming_and_prompt(
-            variant,
-            audio_bytes,
-            language,
-            None,
-            correlation_id,
-            on_delta,
-        )
-        .await
     }
 
     pub(crate) async fn asr_transcribe_bytes_with_variant_streaming_and_prompt<F>(
@@ -4891,6 +4852,7 @@ fn env_positive_usize(key: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+#[cfg(test)]
 fn speaker_attributed_asr_result_from_text(
     raw_text: &str,
     language: Option<String>,

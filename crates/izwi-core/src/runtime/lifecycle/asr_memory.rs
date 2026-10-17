@@ -286,9 +286,6 @@ pub(super) struct Ledger {
     backend: BackendKind,
     logical: u64,
     resident: u64,
-    /// Buffers kept alive across steps ([`Self::hold`]), and their maximum.
-    live: u64,
-    max_live: u64,
     /// Metal: high-water mark of reusable private-pool intermediates.
     scratch: u64,
     /// Metal: bytes held until a synchronization by steps that do not
@@ -330,8 +327,6 @@ impl Ledger {
             backend,
             logical: 0,
             resident: 0,
-            live: 0,
-            max_live: 0,
             scratch: 0,
             held_unsynced: 0,
             held_max: 0,
@@ -399,24 +394,6 @@ impl Ledger {
                 self.held_unsynced = sum(&[self.held_unsynced, step.held_until_sync])?;
                 self.held_step_max = self.held_step_max.max(step.held_until_sync);
             }
-        }
-        Ok(())
-    }
-
-    /// Keep `bytes` alive, not resident, until [`Self::release`].
-    fn hold(&mut self, bytes: u64) -> Result<()> {
-        self.live = sum(&[self.live, bytes])?;
-        self.max_live = self.max_live.max(self.live);
-        Ok(())
-    }
-
-    fn release(&mut self, bytes: u64) -> Result<()> {
-        self.live = self.live.checked_sub(bytes).ok_or_else(overflow)?;
-        if self.metal() {
-            // Held like a synchronizing step's buffers: the next
-            // synchronization drops it.
-            self.held_max = self.held_max.max(bytes);
-            self.at_sync_max = self.at_sync_max.max(sum(&[bytes, self.before_sync_max])?);
         }
         Ok(())
     }
@@ -868,7 +845,7 @@ impl Ledger {
     }
 
     fn finish(mut self) -> Result<Self> {
-        let base = sum(&[self.resident, self.max_live])?;
+        let base = self.resident;
         self.peak = if self.metal() {
             let base = sum(&[base, self.scratch])?;
             if self.held_unsynced > 0 {

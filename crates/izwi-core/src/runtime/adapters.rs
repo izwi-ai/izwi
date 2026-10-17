@@ -21,7 +21,6 @@ pub(crate) use loaded::{
     LoadedStatePublication, StreamingRequirements,
 };
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapabilityKind {
@@ -35,8 +34,6 @@ pub(crate) enum CapabilityKind {
     SpeechToSpeech,
     Diarization,
     ForcedAlignment,
-    Vad,
-    Endpointing,
     Tokenizer,
 }
 
@@ -62,24 +59,19 @@ impl CapabilityKind {
             Self::SpeechToSpeech => "speech_to_speech",
             Self::Diarization => "diarization",
             Self::ForcedAlignment => "forced_alignment",
-            Self::Vad => "vad",
-            Self::Endpointing => "endpointing",
             Self::Tokenizer => "tokenizer",
         }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StreamingMode {
     None,
-    FinalOnly,
     Chunked,
     Realtime,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionTargetKind {
@@ -95,7 +87,6 @@ pub(crate) enum ExecutionTargetKind {
 pub(crate) enum SequenceExecutionMode {
     None,
     Always,
-    StreamingOnly,
 }
 
 /// Capability-authored lifetime truth for mutable inference data. This is
@@ -206,16 +197,11 @@ const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceSt
 }
 
 impl SequenceExecutionMode {
-    const fn enabled(self, streaming_required: bool) -> bool {
-        match self {
-            Self::None => false,
-            Self::Always => true,
-            Self::StreamingOnly => streaming_required,
-        }
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Always)
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdapterMetadata {
     pub(crate) id: &'static str,
@@ -244,6 +230,7 @@ pub(crate) struct RuntimeAdapterRegistry {
 }
 
 impl RuntimeAdapterRegistry {
+    #[cfg(test)]
     pub(crate) fn built_in() -> Self {
         Self::built_in_with_execution_limits(1, 1)
             .expect("the built-in native adapter registry must be unambiguous")
@@ -324,6 +311,7 @@ impl RuntimeAdapterRegistry {
         self.loaded_native_variants(backend_kind, NativeBatchMode::Static)
     }
 
+    #[cfg(test)]
     pub(crate) fn continuous_tensor_batch_variants(
         &self,
         backend_kind: BackendKind,
@@ -359,10 +347,9 @@ impl RuntimeAdapterRegistry {
 pub(crate) fn scalar_execution_profile(
     metadata: AdapterMetadata,
     backend_kind: BackendKind,
-    streaming_required: bool,
 ) -> ExecutionProfile {
     let variant = metadata.model_variant;
-    let sequence = metadata.sequence_execution.enabled(streaming_required);
+    let sequence = metadata.sequence_execution.enabled();
     let mode = if sequence {
         ExecutionMode::Sequence
     } else {
@@ -843,11 +830,7 @@ mod tests {
             InferenceStateRequirement::Retained
         );
         assert_eq!(
-            scalar_execution_profile(qwen_asr, BackendKind::Cpu, false).mode,
-            ExecutionMode::Sequence
-        );
-        assert_eq!(
-            scalar_execution_profile(qwen_asr, BackendKind::Cpu, true).mode,
+            scalar_execution_profile(qwen_asr, BackendKind::Cpu).mode,
             ExecutionMode::Sequence
         );
     }

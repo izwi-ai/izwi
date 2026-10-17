@@ -21,7 +21,6 @@ use crate::runtime::tts::direct_tts_retained_input_bytes;
 use crate::runtime::types::{AudioChunk, GenerationRequest};
 
 pub(crate) const KOKORO_STREAM_TARGET_CHARS: usize = 180;
-const KOKORO_STREAM_MIN_CHARS: usize = 64;
 
 /// Planned frames of the heaviest chunk the stream planner can produce for
 /// `text`: its chunks never exceed `KOKORO_STREAM_TARGET_CHARS`.

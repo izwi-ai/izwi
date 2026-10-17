@@ -12,10 +12,9 @@ use tokio::task::yield_now;
 use tracing::{debug, error, info_span, warn};
 
 use crate::artifacts::{DownloadProgress, ModelLifecycleSnapshot, ModelManager};
-use crate::audio::{AudioCodec, AudioEncoder, StreamingConfig};
+use crate::audio::{AudioCodec, AudioEncoder};
 use crate::backends::{
-    BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, DeviceProfile,
-    RuntimeDeviceAssignment,
+    BackendKind, BackendPreference, BackendRouter, BackendSelectionSource, RuntimeDeviceAssignment,
 };
 use crate::catalog::{ModelFamily, ModelInfo, ModelVariant};
 use crate::config::{EngineConfig, PrefixCachePolicy, ResolvedKvCachePolicy};
@@ -94,9 +93,7 @@ use crate::runtime::adapters::{
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
 use crate::runtime::audio_io::decode_reference_audio_base64;
-use crate::runtime::broker::{
-    InferenceBroker, InferenceBrokerObservation, InferenceBrokerSnapshot,
-};
+use crate::runtime::broker::{InferenceBroker, InferenceBrokerObservation};
 use crate::runtime::coordinator::{
     CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobLease, JobResourceObservation,
     JobSpec, PreparationArtifact, PreparationCancellation, PreparationRowOutcome,
@@ -115,7 +112,9 @@ use crate::runtime::telemetry::{
 };
 use crate::runtime::types::{ChatGeneration, RuntimeRequestContext};
 use crate::runtime_models::{LoadedModelDiagnostics, ModelRegistry};
-use crate::tokenizer::Tokenizer;
+
+#[cfg(test)]
+use crate::backends::DeviceProfile;
 
 fn effective_physical_execution_parallelism(
     mode: crate::config::PhysicalExecutionMode,
@@ -2376,10 +2375,7 @@ pub struct RuntimeService {
     pub(crate) adapter_registry: Arc<RuntimeAdapterRegistry>,
     pub(crate) model_manager: Arc<ModelManager>,
     pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) tokenizer: Arc<RwLock<Option<Tokenizer>>>,
     pub(crate) codec: Arc<RwLock<AudioCodec>>,
-    #[allow(dead_code)]
-    pub(crate) streaming_config: StreamingConfig,
     pub(crate) core_engine: Arc<CoreEngine>,
     pub(crate) coordinator: Arc<InferenceCoordinator>,
     qwen_asr_encoder_batcher: Arc<QwenAsrEncoderBatcher>,
@@ -2396,7 +2392,6 @@ pub struct RuntimeService {
     pub(crate) loaded_tts_variant: Arc<RwLock<Option<ModelVariant>>>,
     pub(crate) max_loaded_models: Option<usize>,
     pub(crate) model_lifecycle: Arc<ModelLifecycleController>,
-    pub(crate) device: DeviceProfile,
 }
 
 pub(crate) struct AdmittedEngineRequest {
@@ -3745,7 +3740,7 @@ impl RuntimeService {
             model_registry.clone(),
             core_engine.clone(),
             coordinator.clone(),
-            tokenizer.clone(),
+            tokenizer,
             codec.clone(),
             loaded_tts_variant.clone(),
             realtime_asr_sequence_capacity,
@@ -3763,9 +3758,7 @@ impl RuntimeService {
             adapter_registry,
             model_manager,
             model_registry,
-            tokenizer,
             codec,
-            streaming_config: StreamingConfig::default(),
             core_engine,
             coordinator,
             qwen_asr_encoder_batcher,
@@ -3782,7 +3775,6 @@ impl RuntimeService {
             loaded_tts_variant,
             max_loaded_models,
             model_lifecycle,
-            device,
         })
     }
 
@@ -3807,11 +3799,6 @@ impl RuntimeService {
     /// Get explicit artifact and residency states for all known models.
     pub async fn model_lifecycle_snapshots(&self) -> Vec<ModelLifecycleSnapshot> {
         self.model_manager.lifecycle_snapshots().await
-    }
-
-    /// Snapshot of inference broker rollout state.
-    pub(crate) fn inference_broker_snapshot(&self) -> InferenceBrokerSnapshot {
-        self.inference_broker.snapshot()
     }
 
     pub fn record_stage_observation(&self, observation: RuntimeStageObservation) {
@@ -7545,19 +7532,6 @@ impl RuntimeService {
         Fut: Future<Output = Result<()>>,
     {
         self.run_streaming_request_with_broker_streaming(request, on_chunk, true)
-            .await
-    }
-
-    pub(crate) async fn run_transport_streaming_request<F, Fut>(
-        &self,
-        request: EngineCoreRequest,
-        on_chunk: F,
-    ) -> Result<EngineOutput>
-    where
-        F: FnMut(StreamingOutput) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
-        self.run_streaming_request_with_broker_streaming(request, on_chunk, false)
             .await
     }
 

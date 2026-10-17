@@ -228,6 +228,7 @@ impl PipelineGraph {
         &self.stages
     }
 
+    #[cfg(test)]
     pub(crate) fn durable_stages(&self) -> impl Iterator<Item = &PipelineStage> {
         self.stages
             .iter()

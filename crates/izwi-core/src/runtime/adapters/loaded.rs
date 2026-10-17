@@ -1607,10 +1607,9 @@ impl LoadedExecutionAdapter for VoxtralRealtimeExecutionAdapter {
         )
     }
 
-    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+    fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.mode = ExecutionMode::Realtime;
         execution_profile.prefill = PrefillMode::None;
         execution_profile.incremental_decode = true;
@@ -1804,8 +1803,7 @@ fn scalar_contract(
         )));
     }
 
-    let mut execution_profile =
-        scalar_execution_profile(metadata, backend_kind, streaming.model_native);
+    let mut execution_profile = scalar_execution_profile(metadata, backend_kind);
     if metadata.capability == CapabilityKind::Asr
         && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
         && streaming.model_native
@@ -1903,10 +1901,9 @@ impl LoadedExecutionAdapter for NemotronRealtimeExecutionAdapter {
         NEMOTRON_REALTIME_ADAPTER_ABI
     }
 
-    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+    fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let metadata = self.metadata();
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.mode = ExecutionMode::Realtime;
         execution_profile.prefill = PrefillMode::None;
         execution_profile.incremental_decode = true;
@@ -2063,8 +2060,7 @@ impl LoadedExecutionAdapter for PhysicalQwenTtsExecutionAdapter {
                 metadata.model_variant
             )));
         }
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.mode = ExecutionMode::Sequence;
         execution_profile.prefill = PrefillMode::Incremental;
         execution_profile.incremental_decode = true;
@@ -2192,7 +2188,7 @@ impl LoadedExecutionAdapter for StaticTtsExecutionAdapter {
         }
 
         let metadata = self.metadata();
-        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.mode = ExecutionMode::Atomic;
         execution_profile.prefill = PrefillMode::None;
         execution_profile.incremental_decode = false;
@@ -2398,8 +2394,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
             )));
         }
         if streaming.asr_long_form {
-            let mut execution_profile =
-                scalar_execution_profile(metadata, self.backend_kind, false);
+            let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
             execution_profile.mode = ExecutionMode::Atomic;
             execution_profile.prefill = PrefillMode::None;
             execution_profile.incremental_decode = false;
@@ -2441,8 +2436,7 @@ impl LoadedExecutionAdapter for ContinuousAsrExecutionAdapter {
                 stages: Arc::from([stage]),
             });
         }
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         let audio_preparation = self.audio_preparation.get().ok_or_else(|| {
             Error::ModelLoadError(
                 "Qwen3 ASR normal execution graph is unavailable before loaded-model audio preparation is sealed"
@@ -2578,7 +2572,7 @@ impl LoadedExecutionAdapter for VoxtralTtsExecutionAdapter {
     }
 
     fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
-        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -2751,7 +2745,7 @@ impl LoadedExecutionAdapter for FishS2TtsExecutionAdapter {
         } else {
             NativeBatchMode::None
         };
-        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -2946,7 +2940,7 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
             VIBEVOICE_TTS_PREPARATION_STAGE,
         };
         if streaming.asr_long_form {
-            let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+            let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
             profile.mode = ExecutionMode::Atomic;
             profile.cache_mode = CacheMode::None;
             profile.cache_namespace = None;
@@ -2972,7 +2966,7 @@ impl LoadedExecutionAdapter for VibeVoiceTtsExecutionAdapter {
                 stages: Arc::from([stage]),
             });
         }
-        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -3142,12 +3136,11 @@ impl LoadedExecutionAdapter for Lfm25AudioTtsExecutionAdapter {
             .map_err(|_| Error::ModelLoadError("test LFM TTS seal already installed".into()))
     }
 
-    fn contract(&self, streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
+    fn contract(&self, _streaming: StreamingRequirements) -> Result<LoadedExecutionContract> {
         let ceiling = self.ceiling.get().ok_or_else(|| {
             Error::ModelLoadError("LFM2.5 Audio TTS adapter is not preparation-sealed".into())
         })?;
-        let mut profile =
-            scalar_execution_profile(self.metadata, self.backend_kind, streaming.model_native);
+        let mut profile = scalar_execution_profile(self.metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -3307,7 +3300,7 @@ impl LoadedExecutionAdapter for ParakeetAsrExecutionAdapter {
             .checked_mul(width)
             .ok_or_else(|| Error::Overloaded("Parakeet batch workspace overflowed".into()))?;
 
-        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -3502,7 +3495,7 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
             )));
         }
         if streaming.asr_long_form {
-            let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind);
             profile.mode = ExecutionMode::Atomic;
             profile.prefill = PrefillMode::None;
             profile.incremental_decode = false;
@@ -3566,7 +3559,7 @@ impl LoadedExecutionAdapter for Lfm25AudioAsrExecutionAdapter {
             ));
         }
 
-        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -3832,7 +3825,7 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
             )));
         }
         if streaming.asr_long_form {
-            let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind);
             profile.mode = ExecutionMode::Atomic;
             profile.prefill = PrefillMode::None;
             profile.incremental_decode = false;
@@ -3914,7 +3907,7 @@ impl LoadedExecutionAdapter for GraniteSpeechAsrExecutionAdapter {
             ));
         }
 
-        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
         profile.incremental_decode = true;
@@ -4145,7 +4138,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
             )));
         }
         if streaming.asr_long_form {
-            let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+            let mut profile = scalar_execution_profile(metadata, self.backend_kind);
             profile.mode = ExecutionMode::Atomic;
             profile.prefill = PrefillMode::None;
             profile.incremental_decode = false;
@@ -4212,7 +4205,7 @@ impl LoadedExecutionAdapter for VibeVoiceAsrExecutionAdapter {
                 })?,
             )
             .ok_or_else(|| Error::Overloaded("VibeVoice ASR decode workspace overflow".into()))?;
-        let mut profile = scalar_execution_profile(metadata, self.backend_kind, false);
+        let mut profile = scalar_execution_profile(metadata, self.backend_kind);
         let native_prefill = self.max_batch_size > 1;
         profile.mode = ExecutionMode::Sequence;
         profile.prefill = PrefillMode::Incremental;
@@ -4408,8 +4401,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
             )));
         }
         if streaming.asr_long_form {
-            let mut execution_profile =
-                scalar_execution_profile(metadata, self.backend_kind, false);
+            let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
             execution_profile.mode = ExecutionMode::Atomic;
             execution_profile.prefill = PrefillMode::None;
             execution_profile.incremental_decode = false;
@@ -4459,8 +4451,7 @@ impl LoadedExecutionAdapter for WhisperAsrExecutionAdapter {
                 "Whisper audio preparation seal does not match its loaded adapter identity".into(),
             ));
         }
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.mode = ExecutionMode::Sequence;
         execution_profile.prefill = PrefillMode::Incremental;
         execution_profile.incremental_decode = true;
@@ -4694,8 +4685,7 @@ impl LoadedExecutionAdapter for ContinuousChatExecutionAdapter {
                 metadata.model_variant
             )));
         }
-        let mut execution_profile =
-            scalar_execution_profile(metadata, self.backend_kind, streaming.model_native);
+        let mut execution_profile = scalar_execution_profile(metadata, self.backend_kind);
         execution_profile.prefill_batch = NativeBatchMode::None;
         execution_profile.decode_batch = NativeBatchMode::Continuous;
         execution_profile.cache_mode = CacheMode::ExternalPaged;
@@ -5157,6 +5147,7 @@ impl fmt::Debug for LoadedModelBundle {
 }
 
 impl LoadedModelBundle {
+    #[cfg(test)]
     pub(crate) fn bind(
         registry: &RuntimeAdapterRegistry,
         execution_group_id: ExecutionGroupId,
@@ -5177,6 +5168,7 @@ impl LoadedModelBundle {
     /// Bind adapter metadata and exact loaded-model state truth into one sealed
     /// descriptor per capability. Only capabilities explicitly classified as
     /// stateless may omit a physical state publication.
+    #[cfg(test)]
     pub(crate) fn bind_with_state_publications(
         registry: &RuntimeAdapterRegistry,
         execution_group_id: ExecutionGroupId,
@@ -5211,6 +5203,7 @@ impl LoadedModelBundle {
         self.backend_kind
     }
 
+    #[cfg(test)]
     pub(crate) fn adapter_count(&self) -> usize {
         self.capabilities.len()
     }
@@ -5227,6 +5220,7 @@ impl LoadedModelBundle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn contract(
         &self,
         capability: CapabilityKind,
@@ -5270,7 +5264,7 @@ mod tests {
             model_variant: variant,
             streaming_mode: StreamingMode::Chunked,
             execution_target: ExecutionTargetKind::TokenEngine,
-            sequence_execution: SequenceExecutionMode::StreamingOnly,
+            sequence_execution: SequenceExecutionMode::Always,
             state_requirement: InferenceStateRequirement::Retained,
         }
     }
