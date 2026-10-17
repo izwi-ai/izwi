@@ -608,7 +608,13 @@ fn use_cuda_depthwise_candidate(conv: &Conv1d, x: &Tensor) -> bool {
         && conv.weight().dims() == [x.dims()[1], 1, 9]
         && x.dims()[0].saturating_mul(x.dims()[1]).saturating_mul(9)
             <= CUDA_DEPTHWISE_PRODUCT_ELEMENTS
-        && std::env::var("IZWI_LFM_CUDA_DEPTHWISE_CONV").is_ok_and(|value| value == "1")
+        && cuda_depthwise_conv_opted_in()
+}
+
+fn cuda_depthwise_conv_opted_in() -> bool {
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_LFM_CUDA_DEPTHWISE_CONV", false));
+    ENABLED.get()
 }
 
 // Candle's grouped Conv1d dispatches once per channel. Unfold instead keeps all

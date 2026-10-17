@@ -829,7 +829,7 @@ pub(crate) fn metal_test_device_or_skip(
     let lease = metal_test_lease::MetalTestLease::acquire();
     let Some(device) = metal_device_if_available(0) else {
         assert!(
-            std::env::var_os("IZWI_REQUIRE_METAL_PARITY").is_none(),
+            !crate::env::flag_or("IZWI_REQUIRE_METAL_PARITY", false),
             "{test}: IZWI_REQUIRE_METAL_PARITY is set but no Metal device is available"
         );
         let _ = writeln!(std::io::stderr(), "{test}: skipped, no Metal device");

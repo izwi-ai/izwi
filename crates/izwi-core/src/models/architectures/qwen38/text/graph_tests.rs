@@ -351,9 +351,17 @@ fn graph_decode_plan_and_reservation_follow_the_switches() {
         "{}",
         kept.mtp_decision()
     );
-    assert!(mtp_explicit_value(Some(" ON ")) && mtp_explicit_value(Some("1")));
-    for value in [Some("auto"), Some("0"), Some("off"), Some(""), None] {
-        assert!(!mtp_explicit_value(value), "{value:?}");
+    let explicit = |value| mtp_explicit_value("IZWI_CUDA_MTP", value);
+    assert!(explicit(Some(" ON ")) && explicit(Some("1")) && explicit(Some("yes")));
+    for value in [
+        Some("auto"),
+        Some("0"),
+        Some("off"),
+        Some("no"),
+        Some(""),
+        None,
+    ] {
+        assert!(!explicit(value), "{value:?}");
     }
     let mut graphs_off = no_mtp.clone();
     graphs_off.cuda.decode_graphs = OptimizationMode::Off;

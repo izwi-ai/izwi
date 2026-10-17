@@ -49,6 +49,7 @@ pub mod catalog;
 pub mod codecs;
 pub mod config;
 pub mod engine;
+pub mod env;
 pub mod error;
 #[allow(dead_code)]
 pub mod kernels;

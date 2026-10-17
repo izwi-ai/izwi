@@ -55,14 +55,12 @@ pub(crate) const FP8_GEMV_ENV: &str = "IZWI_QWEN38_FP8_GEMV";
 /// kernel instead of a bounded BF16/F16 weight tile plus cuBLAS.
 pub(crate) const FP8_PREFILL_GEMM_ENV: &str = "IZWI_QWEN38_FP8_PREFILL_GEMM";
 pub(crate) use super::lm_head::FP8_LM_HEAD_ENV;
-/// Keeps the CPU LM head in F32 (`dense`, `legacy`, `off`, `0`, `false`)
-/// while the CPU projections are Q8_0.
+/// The Q8_0 CPU LM head while the CPU projections are Q8_0 (on when unset):
+/// a false value or its registered `dense`/`legacy` word keeps the head F32.
 pub(crate) const CPU_LM_HEAD_ENV: &str = "IZWI_QWEN38_CPU_LM_HEAD";
 
 fn cpu_dense_head_requested() -> bool {
-    std::env::var(CPU_LM_HEAD_ENV).is_ok_and(|value| {
-        value.trim().eq_ignore_ascii_case("dense") || legacy_requested(CPU_LM_HEAD_ENV)
-    })
+    legacy_requested(CPU_LM_HEAD_ENV)
 }
 
 /// The checkpoint's block-scale geometry the FP8 kernels index.
@@ -264,17 +262,13 @@ pub(crate) const MTP_EXPLICIT_ENVS: [&str; 3] = [
 fn mtp_explicitly_requested() -> bool {
     MTP_EXPLICIT_ENVS
         .iter()
-        .any(|name| mtp_explicit_value(std::env::var(name).ok().as_deref()))
+        .any(|name| mtp_explicit_value(name, crate::env::value(name).as_deref()))
 }
 
-/// Whether a switch value asks for MTP explicitly (not `auto`, not off).
-pub(crate) fn mtp_explicit_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// Whether switch `name`'s value asks for MTP explicitly: a true boolean
+/// (not `auto`, not off).
+pub(crate) fn mtp_explicit_value(name: &str, value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(izwi_env::parse_bool(name, value), Ok(true)))
 }
 
 /// The activation dtype a load on `device` materializes (the loader derives

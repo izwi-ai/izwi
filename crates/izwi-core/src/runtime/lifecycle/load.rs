@@ -3631,10 +3631,10 @@ impl ModelLifecycleController {
                     ResourceAmount::Known(bytes) => Some(bytes),
                     _ => None,
                 };
-                let native_batching = match std::env::var("IZWI_FISH_NATIVE_BATCHING").as_deref() {
-                    Ok("1" | "true") => true,
-                    Ok("0" | "false") | Err(_) => false,
-                    Ok(value) => return Err(Error::ConfigError(format!("invalid IZWI_FISH_NATIVE_BATCHING={value}; expected true or false"))),
+                let native_batching = match crate::env::value("IZWI_FISH_NATIVE_BATCHING") {
+                    Some(value) => izwi_env::parse_bool("IZWI_FISH_NATIVE_BATCHING", &value)
+                        .map_err(|error| Error::ConfigError(error.to_string()))?,
+                    None => false,
                 };
                 // Automatic staged rows are sized for tensor-width launches. Fish
                 // fits its own autoregressive width (no tensor arena backs its

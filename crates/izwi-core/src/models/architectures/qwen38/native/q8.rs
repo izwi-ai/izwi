@@ -603,7 +603,7 @@ mod tests {
             Ok(device) => device,
             Err(error) => {
                 assert!(
-                    std::env::var("IZWI_REQUIRE_CUDA_TEST_DEVICE").as_deref() != Ok("1"),
+                    !crate::env::flag_or("IZWI_REQUIRE_CUDA_TEST_DEVICE", false),
                     "required CUDA loader device unavailable: {error}"
                 );
                 eprintln!("Skipping CUDA loader probe: {error}");

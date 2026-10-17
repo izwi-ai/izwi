@@ -495,7 +495,8 @@ impl Qwen35TextModel {
         } else {
             source.qmatmul("token_embd.weight", device)?
         });
-        let finite_diagnostics_enabled = qwen35_env_bool("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
+        let finite_diagnostics_enabled =
+            crate::env::flag_or("IZWI_QWEN35_FINITE_DIAGNOSTICS", false);
 
         let mut layers = Vec::with_capacity(cfg.block_count);
         for layer_idx in 0..cfg.block_count {
@@ -2912,31 +2913,16 @@ fn repeat_head_states_seq(x: &Tensor, repeats: usize) -> Result<Tensor> {
         .map_err(Error::from)
 }
 
-fn qwen35_env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
 fn qwen35_tiled_recurrence_enabled() -> bool {
-    qwen35_env_bool("IZWI_QWEN35_TILED_RECURRENCE", true)
+    crate::env::flag_or("IZWI_QWEN35_TILED_RECURRENCE", true)
 }
 
 fn qwen35_rope_kernel_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN35_ROPE_KERNEL")
-        .ok()
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        });
-    qwen35_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
+    qwen35_rope_kernel_policy(
+        device.is_metal(),
+        device.is_cuda(),
+        crate::env::flag("IZWI_QWEN35_ROPE_KERNEL"),
+    )
 }
 
 fn qwen35_rope_kernel_policy(

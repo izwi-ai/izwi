@@ -1104,20 +1104,26 @@ fn realtime_max_samples_for_seconds(sample_rate: u32, seconds: usize) -> Result<
 }
 
 fn configured_realtime_max_samples(sample_rate: u32) -> Result<usize> {
-    let seconds = match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
-        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
-            Error::ConfigError(format!(
-                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
-            ))
-        })?,
-        Err(std::env::VarError::NotPresent) => DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(Error::ConfigError(format!(
-                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
-            )));
-        }
-    };
+    // Read once, so every stream's reservation and the retained-state
+    // contract agree on the limit.
+    static SECONDS: crate::env::ReadOnce<std::result::Result<usize, String>> =
+        crate::env::ReadOnce::new(configured_realtime_max_seconds);
+    let seconds = SECONDS.get().map_err(Error::ConfigError)?;
     realtime_max_samples_for_seconds(sample_rate, seconds)
+}
+
+fn configured_realtime_max_seconds() -> std::result::Result<usize, String> {
+    match std::env::var(NEMOTRON_REALTIME_MAX_SECONDS_ENV) {
+        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must be a positive whole number of seconds"
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_NEMOTRON_REALTIME_MAX_SECONDS),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{NEMOTRON_REALTIME_MAX_SECONDS_ENV} must contain valid UTF-8"
+        )),
+    }
 }
 
 fn state_dtype(dtype: DType) -> Result<StateDType> {

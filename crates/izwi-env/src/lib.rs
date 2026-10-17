@@ -226,6 +226,12 @@ pub fn izwi_literals(source: &str) -> BTreeSet<&str> {
 /// every `.rs` file except test files (`tests.rs`, `*_tests.rs`), each read
 /// up to its top-level `#[cfg(test)] mod` block.
 pub fn production_env_names(source_dir: &Path) -> BTreeSet<String> {
+    production_env_names_excluding(source_dir, &[])
+}
+
+/// [`production_env_names`], skipping the `excluded` files and directories
+/// (such as the registry module that lists every name).
+pub fn production_env_names_excluding(source_dir: &Path, excluded: &[&Path]) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let mut pending = vec![source_dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -233,6 +239,9 @@ pub fn production_env_names(source_dir: &Path) -> BTreeSet<String> {
             .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
         for entry in entries {
             let path = entry.expect("directory entry").path();
+            if excluded.contains(&path.as_path()) {
+                continue;
+            }
             let file_name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
             if path.is_dir() {
                 pending.push(path);
@@ -253,7 +262,10 @@ pub fn production_env_names(source_dir: &Path) -> BTreeSet<String> {
     names
 }
 
-/// The source before its first top-level `#[cfg(test)]` module.
+/// The source before its first top-level inline `#[cfg(test)] mod name {`
+/// block. A `#[cfg(test)] mod name;` declaration (whose file the walk reads
+/// on its own) does not end the production source: code after it still
+/// counts.
 fn without_test_modules(source: &str) -> &str {
     let mut offset = 0;
     let mut lines = source.split_inclusive('\n').peekable();
@@ -261,7 +273,7 @@ fn without_test_modules(source: &str) -> &str {
         if line.trim_end() == "#[cfg(test)]"
             && lines
                 .peek()
-                .is_some_and(|next| next.starts_with("mod ") || next.starts_with("#[path"))
+                .is_some_and(|next| next.starts_with("mod ") && next.trim_end().ends_with('{'))
         {
             return &source[..offset];
         }
@@ -364,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_modules_are_left_out() {
-        let source = "const A: &str = \"IZWI_A\";\n#[cfg(test)]\nfn helper() {}\nconst B: &str = \"IZWI_B\";\n#[cfg(test)]\nmod tests {\n    const C: &str = \"IZWI_C\";\n}\n";
+        let source = "#[cfg(test)]\nmod attach_tests;\nconst A: &str = \"IZWI_A\";\n#[cfg(test)]\nfn helper() {}\nconst B: &str = \"IZWI_B\";\n#[cfg(test)]\nmod tests {\n    const C: &str = \"IZWI_C\";\n}\n";
         assert_eq!(
             izwi_literals(without_test_modules(source))
                 .into_iter()

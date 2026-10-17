@@ -2407,7 +2407,12 @@ pub(super) fn is_asr_stop_token(next: u32, specials: &Lfm25SpecialTokenIds) -> b
 }
 
 fn lfm25_asr_stop_check_interval() -> usize {
-    lfm25_asr_stop_check_interval_from_env(std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL").ok())
+    static INTERVAL: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        lfm25_asr_stop_check_interval_from_env(
+            std::env::var("IZWI_LFM25_ASR_STOP_CHECK_INTERVAL").ok(),
+        )
+    });
+    INTERVAL.get()
 }
 
 fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
@@ -2418,9 +2423,12 @@ fn lfm25_asr_stop_check_interval_from_env(value: Option<String>) -> usize {
 }
 
 fn lfm25_tts_audio_stop_check_interval() -> usize {
-    lfm25_tts_audio_stop_check_interval_from_env(
-        std::env::var("IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL").ok(),
-    )
+    static INTERVAL: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+        lfm25_tts_audio_stop_check_interval_from_env(
+            std::env::var("IZWI_LFM25_TTS_AUDIO_STOP_CHECK_INTERVAL").ok(),
+        )
+    });
+    INTERVAL.get()
 }
 
 fn lfm25_tts_audio_stop_check_interval_from_env(value: Option<String>) -> usize {

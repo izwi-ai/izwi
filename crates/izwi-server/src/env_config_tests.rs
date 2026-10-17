@@ -58,7 +58,7 @@ fn reference() -> String {
          validated when the server starts, and a bad value stops it with an error naming \
          the variable. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or \
          `off`. The engine's own variables (`IZWI_HOST`, `IZWI_PORT`, `IZWI_MAX_*` engine \
-         limits and so on) are read by izwi-core and are not listed here; the gateway \
+         limits and so on) are read by izwi-core and listed in core.md; the gateway \
          role's are in gateway.md.",
         SERVER_ENV,
     );

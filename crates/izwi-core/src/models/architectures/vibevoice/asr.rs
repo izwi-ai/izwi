@@ -3235,8 +3235,9 @@ fn vibevoice_tokenizer_state_projection(
 }
 
 fn vibevoice_asr_max_audio_seconds_hint(device_kind: DeviceKind) -> f32 {
-    let cuda_override = std::env::var(CUDA_MAX_AUDIO_SECONDS_ENV).ok();
-    vibevoice_asr_max_audio_seconds_hint_for(device_kind, cuda_override.as_deref())
+    static CUDA_OVERRIDE: crate::env::ReadOnce<Option<String>> =
+        crate::env::ReadOnce::new(|| std::env::var(CUDA_MAX_AUDIO_SECONDS_ENV).ok());
+    vibevoice_asr_max_audio_seconds_hint_for(device_kind, CUDA_OVERRIDE.get().as_deref())
 }
 
 fn vibevoice_asr_max_audio_seconds_hint_for(

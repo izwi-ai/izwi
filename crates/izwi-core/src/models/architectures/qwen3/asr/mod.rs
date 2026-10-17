@@ -3579,7 +3579,7 @@ fn qwen3_asr_gguf_qmatmul_text_policy(override_enabled: Option<bool>) -> bool {
 }
 
 pub(crate) fn qwen3_asr_use_gguf_qmatmul_text(_device: &candle_core::Device) -> bool {
-    let override_enabled = env_bool("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
+    let override_enabled = crate::env::flag("IZWI_QWEN3_ASR_GGUF_QMATMUL_TEXT");
     qwen3_asr_gguf_qmatmul_text_policy(override_enabled)
 }
 
@@ -4546,18 +4546,10 @@ fn is_special_generation_token(specials: &SpecialTokenIds, id: u32) -> bool {
 }
 
 fn qwen_asr_drop_last_mel_frame() -> bool {
-    env_bool("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME").unwrap_or(false)
-}
-
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().and_then(|raw| {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag_or("IZWI_QWEN_ASR_DROP_LAST_MEL_FRAME", false)
+    });
+    ENABLED.get()
 }
 
 fn apply_qwen_mel_frame_policy(mel_spec: &mut Vec<Vec<f32>>, drop_last: bool) -> bool {

@@ -334,7 +334,14 @@ enum GraniteSaaPrefixMode {
 }
 
 impl GraniteSaaPrefixMode {
+    /// `IZWI_GRANITE_SAA_PREFIX_MODE`, read once per process.
     fn from_env() -> Self {
+        static MODE: crate::env::ReadOnce<GraniteSaaPrefixMode> =
+            crate::env::ReadOnce::new(GraniteSaaPrefixMode::read_env);
+        MODE.get()
+    }
+
+    fn read_env() -> Self {
         match std::env::var("IZWI_GRANITE_SAA_PREFIX_MODE")
             .ok()
             .map(|raw| raw.trim().to_ascii_lowercase())
@@ -4380,19 +4387,20 @@ fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormCon
     if let Some(limit) = model_limit_secs.filter(|value| value.is_finite() && *value > 0.0) {
         cfg.hard_max_chunk_secs = cfg.hard_max_chunk_secs.min(limit * 0.95);
     }
-    if let Some(value) = env_positive_f32("IZWI_GRANITE_SAA_CHUNK_TARGET_SECS") {
+    let overrides = GraniteSaaChunkOverrides::get();
+    if let Some(value) = overrides.target_chunk_secs {
         cfg.target_chunk_secs = value;
     }
-    if let Some(value) = env_positive_f32("IZWI_GRANITE_SAA_CHUNK_MAX_SECS") {
+    if let Some(value) = overrides.hard_max_chunk_secs {
         cfg.hard_max_chunk_secs = value;
     }
-    if let Some(value) = env_positive_f32("IZWI_GRANITE_SAA_CHUNK_OVERLAP_SECS") {
+    if let Some(value) = overrides.overlap_secs {
         cfg.overlap_secs = value;
     }
-    if let Some(value) = env_positive_f32("IZWI_GRANITE_SAA_CHUNK_MIN_SECS") {
+    if let Some(value) = overrides.min_chunk_secs {
         cfg.min_chunk_secs = value;
     }
-    if let Some(value) = env_positive_f32("IZWI_GRANITE_SAA_CHUNK_SILENCE_SEARCH_SECS") {
+    if let Some(value) = overrides.silence_search_secs {
         cfg.silence_search_secs = value;
     }
 
@@ -4426,6 +4434,30 @@ fn granite_saa_long_form_config(model_limit_secs: Option<f32>) -> AsrLongFormCon
     cfg
 }
 
+/// The `IZWI_GRANITE_SAA_CHUNK_*` overrides, read once per process.
+#[derive(Debug, Clone, Copy)]
+struct GraniteSaaChunkOverrides {
+    target_chunk_secs: Option<f32>,
+    hard_max_chunk_secs: Option<f32>,
+    overlap_secs: Option<f32>,
+    min_chunk_secs: Option<f32>,
+    silence_search_secs: Option<f32>,
+}
+
+impl GraniteSaaChunkOverrides {
+    fn get() -> Self {
+        static OVERRIDES: crate::env::ReadOnce<GraniteSaaChunkOverrides> =
+            crate::env::ReadOnce::new(|| GraniteSaaChunkOverrides {
+                target_chunk_secs: env_positive_f32("IZWI_GRANITE_SAA_CHUNK_TARGET_SECS"),
+                hard_max_chunk_secs: env_positive_f32("IZWI_GRANITE_SAA_CHUNK_MAX_SECS"),
+                overlap_secs: env_positive_f32("IZWI_GRANITE_SAA_CHUNK_OVERLAP_SECS"),
+                min_chunk_secs: env_positive_f32("IZWI_GRANITE_SAA_CHUNK_MIN_SECS"),
+                silence_search_secs: env_positive_f32("IZWI_GRANITE_SAA_CHUNK_SILENCE_SEARCH_SECS"),
+            });
+        OVERRIDES.get()
+    }
+}
+
 fn granite_saa_chunk_plan(
     samples: &[f32],
     sample_rate: u32,
@@ -4436,7 +4468,9 @@ fn granite_saa_chunk_plan(
 }
 
 fn granite_saa_max_new_tokens_for_duration(duration_secs: f32) -> usize {
-    if let Some(override_tokens) = env_positive_usize("IZWI_GRANITE_SAA_MAX_NEW_TOKENS") {
+    static OVERRIDE: crate::env::ReadOnce<Option<usize>> =
+        crate::env::ReadOnce::new(|| env_positive_usize("IZWI_GRANITE_SAA_MAX_NEW_TOKENS"));
+    if let Some(override_tokens) = OVERRIDE.get() {
         return override_tokens;
     }
 

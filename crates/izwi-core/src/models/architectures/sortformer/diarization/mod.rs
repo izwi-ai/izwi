@@ -3620,11 +3620,8 @@ fn resolve_postprocessing_params(
     min_duration_on_ms: Option<f32>,
     min_duration_off_ms: Option<f32>,
 ) -> PostProcessingParams {
-    let preset = std::env::var("IZWI_SORTFORMER_PP_PRESET")
-        .unwrap_or_else(|_| "model".to_string())
-        .to_ascii_lowercase();
-
-    let mut params = match preset.as_str() {
+    let env = PostProcessingEnv::get();
+    let mut params = match env.preset.as_str() {
         "callhome" | "callhome_v2" => PostProcessingParams {
             onset: 0.641,
             offset: 0.561,
@@ -3663,25 +3660,25 @@ fn resolve_postprocessing_params(
         },
     };
 
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_ONSET") {
+    if let Some(value) = env.onset {
         params.onset = value.clamp(0.0, 1.0);
     }
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_OFFSET") {
+    if let Some(value) = env.offset {
         params.offset = value.clamp(0.0, 1.0);
     }
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_PAD_ONSET") {
+    if let Some(value) = env.pad_onset {
         params.pad_onset = value.max(0.0);
     }
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_PAD_OFFSET") {
+    if let Some(value) = env.pad_offset {
         params.pad_offset = value.max(0.0);
     }
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_MIN_DURATION_ON") {
+    if let Some(value) = env.min_duration_on {
         params.min_duration_on = value.max(0.0);
     }
-    if let Some(value) = env_postprocessing_value("IZWI_SORTFORMER_PP_MIN_DURATION_OFF") {
+    if let Some(value) = env.min_duration_off {
         params.min_duration_off = value.max(0.0);
     }
-    if let Some(value) = env_flag("IZWI_SORTFORMER_PP_FILTER_SPEECH_FIRST") {
+    if let Some(value) = env.filter_speech_first {
         params.filter_speech_first = value;
     }
 
@@ -3692,21 +3689,47 @@ fn should_limit_speaker_channels(config: &DiarizationConfig) -> bool {
     config.min_speakers.is_some() || config.max_speakers.is_some()
 }
 
+/// The `IZWI_SORTFORMER_PP_*` overrides, read once rather than per request.
+#[derive(Debug, Clone)]
+struct PostProcessingEnv {
+    preset: String,
+    onset: Option<f32>,
+    offset: Option<f32>,
+    pad_onset: Option<f32>,
+    pad_offset: Option<f32>,
+    min_duration_on: Option<f32>,
+    min_duration_off: Option<f32>,
+    filter_speech_first: Option<bool>,
+}
+
+impl PostProcessingEnv {
+    fn get() -> Self {
+        static ENV: crate::env::ReadOnce<PostProcessingEnv> =
+            crate::env::ReadOnce::new(PostProcessingEnv::read);
+        ENV.get()
+    }
+
+    fn read() -> Self {
+        Self {
+            preset: std::env::var("IZWI_SORTFORMER_PP_PRESET")
+                .unwrap_or_else(|_| "model".to_string())
+                .to_ascii_lowercase(),
+            onset: env_postprocessing_value("IZWI_SORTFORMER_PP_ONSET"),
+            offset: env_postprocessing_value("IZWI_SORTFORMER_PP_OFFSET"),
+            pad_onset: env_postprocessing_value("IZWI_SORTFORMER_PP_PAD_ONSET"),
+            pad_offset: env_postprocessing_value("IZWI_SORTFORMER_PP_PAD_OFFSET"),
+            min_duration_on: env_postprocessing_value("IZWI_SORTFORMER_PP_MIN_DURATION_ON"),
+            min_duration_off: env_postprocessing_value("IZWI_SORTFORMER_PP_MIN_DURATION_OFF"),
+            filter_speech_first: crate::env::flag("IZWI_SORTFORMER_PP_FILTER_SPEECH_FIRST"),
+        }
+    }
+}
+
 fn env_postprocessing_value(key: &str) -> Option<f32> {
     std::env::var(key)
         .ok()
         .and_then(|raw| raw.trim().parse::<f32>().ok())
         .filter(|value| value.is_finite())
-}
-
-fn env_flag(key: &str) -> Option<bool> {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
 }
 
 fn select_speaker_channels(

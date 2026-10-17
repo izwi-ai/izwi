@@ -2781,15 +2781,10 @@ fn binds_mixed_step(request: &EngineCoreRequest) -> bool {
 /// forward, and a production kill switch.
 const MIXED_FORCE_SPLIT_ENV: &str = "IZWI_MIXED_FORCE_SPLIT";
 
-fn mixed_force_split_from(value: Option<&str>) -> bool {
-    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on"))
-}
-
 fn mixed_force_split() -> bool {
-    static FORCE_SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCE_SPLIT.get_or_init(|| {
-        mixed_force_split_from(std::env::var(MIXED_FORCE_SPLIT_ENV).ok().as_deref())
-    })
+    static FORCE_SPLIT: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or(MIXED_FORCE_SPLIT_ENV, false));
+    FORCE_SPLIT.get()
 }
 
 fn is_isolated_continuous_model_quantum(scheduled: &[ScheduledRequest]) -> bool {
@@ -5616,16 +5611,6 @@ mod tests {
         let (decode, prefill) = dispatch::split_mixed_rows(&scheduled[1..]).unwrap();
         assert!(decode.is_empty());
         assert_eq!(prefill.len(), 1);
-    }
-
-    #[test]
-    fn mixed_force_split_reads_its_switch() {
-        for on in ["1", "true", " on "] {
-            assert!(mixed_force_split_from(Some(on)), "{on}");
-        }
-        for off in [None, Some("0"), Some("false"), Some("split")] {
-            assert!(!mixed_force_split_from(off), "{off:?}");
-        }
     }
 
     /// The compatibility executor has no mixed route and refuses a mixed

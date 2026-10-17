@@ -294,8 +294,7 @@ pub enum Qwen36MoeGeometryPolicy {
 }
 
 pub fn synthetic_geometry_enabled() -> bool {
-    std::env::var(ENV_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY)
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+    crate::env::flag_or(ENV_ALLOW_SYNTHETIC_QWEN36_MOE_GEOMETRY, false)
 }
 
 impl Qwen36MoeGeometryPolicy {
@@ -1096,22 +1095,21 @@ pub const MTP_HANDOFF_ENV: &str = "IZWI_QWEN36_MTP_HANDOFF";
 /// the manifest plus MoE draft-head execution on the target hardware.
 const MTP_MANIFEST_CENSUS_VERIFIED: bool = false;
 
-/// The explicit opt-in half of the MTP gate. Follows the qwen38 policy
-/// boolean grammar; an invalid value is a hard config error rather than a
-/// silent default.
+/// The explicit opt-in half of the MTP gate: a boolean, off when unset or
+/// empty. An invalid value is a hard config error rather than a silent
+/// default.
 pub fn mtp_handoff_opt_in() -> Result<bool> {
     if MTP_MANIFEST_CENSUS_VERIFIED {
         return Ok(true);
     }
-    let value = std::env::var(MTP_HANDOFF_ENV).unwrap_or_default();
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(false),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(Error::ConfigError(format!(
-            "invalid {MTP_HANDOFF_ENV} value: {other}"
-        ))),
-    }
+    parse_mtp_handoff(crate::env::value(MTP_HANDOFF_ENV).as_deref())
+}
+
+fn parse_mtp_handoff(value: Option<&str>) -> Result<bool> {
+    value.map_or(Ok(false), |value| {
+        izwi_env::parse_bool(MTP_HANDOFF_ENV, value)
+            .map_err(|error| Error::ConfigError(error.to_string()))
+    })
 }
 
 /// Resolve the MTP load policy from the performance knobs plus the handoff
@@ -4410,11 +4408,12 @@ mod tests {
             Qwen36MoeMtpLoadPolicy::Disabled
         );
 
-        // Invalid values fail closed naming the variable.
-        std::env::set_var(MTP_HANDOFF_ENV, "maybe");
-        let error = resolve_mtp_load_policy(BackendKind::Cpu, &cuda_knobs).unwrap_err();
-        assert!(error.to_string().contains(MTP_HANDOFF_ENV));
         std::env::remove_var(MTP_HANDOFF_ENV);
+        // Invalid values fail closed naming the variable. Checked on the
+        // parser: an invalid boolean in the process environment would make
+        // every runtime a concurrent test builds refuse to start.
+        let error = parse_mtp_handoff(Some("maybe")).unwrap_err();
+        assert!(error.to_string().contains(MTP_HANDOFF_ENV));
     }
 
     #[test]

@@ -149,16 +149,9 @@ pub(crate) fn gqa_decode_pipeline(
 /// Whether the simdgroup decode path is enabled (`IZWI_METAL_GQA_DECODE=0`
 /// restores the scalar kernels for every geometry).
 pub(crate) fn gqa_decode_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("IZWI_METAL_GQA_DECODE")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("0" | "false" | "no" | "off")
-        )
-    })
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_METAL_GQA_DECODE", true));
+    ENABLED.get()
 }
 
 /// Copy `source` rows `[rows, row_elements]` into the `destination` rows

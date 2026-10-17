@@ -59,16 +59,7 @@ fn metal_fused_kernels_available() -> bool {
 
 /// Whether to use fused kernels (can be disabled via environment).
 pub fn use_fused_kernels() -> bool {
-    std::env::var("IZWI_FUSED_KERNELS")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-        && fused_kernels_available()
+    fused_kernels_enabled_by_env() && fused_kernels_available()
 }
 
 /// Whether fused kernels are enabled and available for a specific device.
@@ -76,35 +67,12 @@ pub fn use_fused_kernels_for_device(device: &Device) -> bool {
     fused_kernels_enabled_by_env() && fused_kernels_available_for_device(device)
 }
 
-/// `IZWI_FUSED_KERNELS` (default on). Fused ops with a plain-Rust CPU
-/// implementation honour it on CPU too.
+/// `IZWI_FUSED_KERNELS` (default on), read once per process. Fused ops with
+/// a plain-Rust CPU implementation honour it on CPU too.
 pub fn fused_kernels_enabled_by_env() -> bool {
-    std::env::var("IZWI_FUSED_KERNELS")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
-
-/// Whether backend-specific block fusion is enabled for a specific device.
-pub fn use_block_fusion_for_device(device: &Device) -> bool {
-    if !use_fused_kernels_for_device(device) {
-        return false;
-    }
-
-    if device.is_cuda() {
-        return cuda::use_block_fusion();
-    }
-
-    if device.is_metal() {
-        return metal::use_block_fusion();
-    }
-
-    false
+    static FUSED_KERNELS: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_FUSED_KERNELS", true));
+    FUSED_KERNELS.get()
 }
 
 pub fn try_fused_silu_mul(gate: &Tensor, up: &Tensor) -> Option<Tensor> {
@@ -522,7 +490,6 @@ mod tests {
     fn cpu_never_reports_fused_kernel_availability() {
         assert!(!fused_kernels_available_for_device(&Device::Cpu));
         assert!(!use_fused_kernels_for_device(&Device::Cpu));
-        assert!(!use_block_fusion_for_device(&Device::Cpu));
     }
 
     #[test]

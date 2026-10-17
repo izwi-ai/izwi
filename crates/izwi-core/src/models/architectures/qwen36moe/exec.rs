@@ -51,13 +51,18 @@ fn qwen35_prefill_chunk_size() -> usize {
 /// The forward size a prefill span is split into: `IZWI_QWEN35_PREFILL_CHUNK_SIZE`
 /// when set, else `default` (bounded either way).
 fn qwen35_prefill_chunk_size_or(default: usize) -> usize {
-    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
+    PREFILL_CHUNK_SIZE
+        .get()
         .unwrap_or(default)
         .min(MAX_PREFILL_CHUNK_SIZE)
 }
+
+/// `IZWI_QWEN35_PREFILL_CHUNK_SIZE` when set to a positive integer, read once.
+static PREFILL_CHUNK_SIZE: crate::env::ReadOnce<Option<usize>> = crate::env::ReadOnce::new(|| {
+    crate::env::value("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+});
 
 fn next_prefill_segment_end(
     prompt_ids: &[u32],

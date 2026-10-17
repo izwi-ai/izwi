@@ -1213,7 +1213,15 @@ fn decode_pipeline_audio_bytes(audio_bytes: &[u8]) -> Result<PipelineAudio> {
     })
 }
 
+/// The long-form chunk plan, with its `IZWI_ASR_CHUNK_*` overrides read once
+/// per process.
 fn pipeline_chunk_config() -> AsrLongFormConfig {
+    static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
+        crate::env::ReadOnce::new(pipeline_chunk_config_from_env);
+    CONFIG.get()
+}
+
+fn pipeline_chunk_config_from_env() -> AsrLongFormConfig {
     let mut cfg = AsrLongFormConfig::default();
     if let Some(v) = env_positive_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
         cfg.target_chunk_secs = v;

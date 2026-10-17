@@ -2,7 +2,7 @@
 
 <!-- Generated from the binary's environment registry; the crate's env_reference test keeps it current. -->
 
-The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`; any other value, or a number that does not parse, stops the worker with an error naming the variable. Under the supervisor, the variables marked as set by it come from the node config; the model runtime reads further engine variables of its own.
+The variables `izwi-serving-worker` reads, once, at startup. Booleans accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`; any other value, or a number that does not parse, stops the worker with an error naming the variable. Under the supervisor, the variables marked as set by it come from the node config; the model runtime reads further engine variables of its own (core.md).
 
 | Variable | Default | Meaning |
 |---|---|---|

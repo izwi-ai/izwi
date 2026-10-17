@@ -1952,8 +1952,9 @@ fn vibevoice_diffusion_plan(
 }
 
 fn vibevoice_effective_diffusion_steps(device_kind: DeviceKind, requested_steps: usize) -> usize {
-    let override_value = std::env::var(VIBEVOICE_CUDA_DDPM_STEPS_ENV).ok();
-    vibevoice_effective_diffusion_steps_for(device_kind, requested_steps, override_value.as_deref())
+    static OVERRIDE: crate::env::ReadOnce<Option<String>> =
+        crate::env::ReadOnce::new(|| std::env::var(VIBEVOICE_CUDA_DDPM_STEPS_ENV).ok());
+    vibevoice_effective_diffusion_steps_for(device_kind, requested_steps, OVERRIDE.get().as_deref())
 }
 
 fn vibevoice_effective_diffusion_steps_for(
@@ -1983,8 +1984,9 @@ fn vibevoice_effective_diffusion_steps_for(
 }
 
 fn vibevoice_cfg_batching_enabled(device_kind: DeviceKind) -> bool {
-    let override_value = std::env::var(VIBEVOICE_CFG_BATCHING_ENV).ok();
-    vibevoice_cfg_batching_enabled_for(device_kind, override_value.as_deref())
+    static OVERRIDE: crate::env::ReadOnce<Option<String>> =
+        crate::env::ReadOnce::new(|| std::env::var(VIBEVOICE_CFG_BATCHING_ENV).ok());
+    vibevoice_cfg_batching_enabled_for(device_kind, OVERRIDE.get().as_deref())
 }
 
 fn vibevoice_cfg_batching_enabled_for(
@@ -1998,17 +2000,13 @@ fn vibevoice_cfg_batching_enabled_for(
     else {
         return default;
     };
-    match raw.to_ascii_lowercase().as_str() {
-        "auto" => default,
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        other => {
-            warn!(
-                "{VIBEVOICE_CFG_BATCHING_ENV}={other:?} is invalid; using auto CFG batching policy"
-            );
-            default
-        }
+    if raw.eq_ignore_ascii_case("auto") {
+        return default;
     }
+    izwi_env::parse_bool(VIBEVOICE_CFG_BATCHING_ENV, raw).unwrap_or_else(|_| {
+        warn!("{VIBEVOICE_CFG_BATCHING_ENV}={raw:?} is invalid; using auto CFG batching policy");
+        default
+    })
 }
 
 fn vibevoice_cfg_batching_default(device_kind: DeviceKind) -> bool {

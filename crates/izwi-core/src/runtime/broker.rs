@@ -25,7 +25,7 @@ impl InferenceBrokerMode {
     fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "shadow" | "audit" => Self::Shadow,
-            "on" | "enabled" | "true" | "1" => Self::On,
+            "on" | "enabled" | "true" | "1" | "yes" => Self::On,
             _ => Self::Off,
         }
     }
@@ -170,6 +170,24 @@ mod tests {
             InferenceBrokerMode::parse("something-else"),
             InferenceBrokerMode::Off
         );
+    }
+
+    #[test]
+    fn broker_mode_reads_the_shared_boolean_words() {
+        for on in ["1", "true", "yes", "on", "ON", "enabled"] {
+            assert_eq!(
+                InferenceBrokerMode::parse(on),
+                InferenceBrokerMode::On,
+                "{on}"
+            );
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert_eq!(
+                InferenceBrokerMode::parse(off),
+                InferenceBrokerMode::Off,
+                "{off}"
+            );
+        }
     }
 
     #[test]

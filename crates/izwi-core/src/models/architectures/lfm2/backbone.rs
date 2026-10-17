@@ -2564,15 +2564,9 @@ fn should_try_lfm25_metal_prefill_sdpa(
 }
 
 fn lfm25_metal_prefill_sdpa_enabled() -> bool {
-    std::env::var("IZWI_LFM25_METAL_PREFILL_SDPA")
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_LFM25_METAL_PREFILL_SDPA", true));
+    ENABLED.get()
 }
 
 fn normalize_shortconv_weight(

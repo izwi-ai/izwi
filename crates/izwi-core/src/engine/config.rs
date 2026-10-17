@@ -401,24 +401,15 @@ fn default_max_blocks() -> usize {
     1024
 }
 fn default_lane_step_drivers() -> bool {
-    std::env::var("IZWI_LANE_STEP_DRIVERS")
-        .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "on"))
+    crate::env::flag_or("IZWI_LANE_STEP_DRIVERS", false)
 }
 
 fn default_capacity_replay() -> bool {
-    capacity_replay_from_env(std::env::var("IZWI_CAPACITY_REPLAY").ok().as_deref())
-}
-
-fn capacity_replay_from_env(value: Option<&str>) -> bool {
-    value.is_none_or(|value| !matches!(value.trim(), "0" | "false" | "off"))
+    crate::env::flag_or("IZWI_CAPACITY_REPLAY", true)
 }
 
 fn default_cuda_incremental_chat() -> bool {
-    cuda_incremental_chat_from_env(std::env::var("IZWI_CUDA_INCREMENTAL_CHAT").ok().as_deref())
-}
-
-fn cuda_incremental_chat_from_env(value: Option<&str>) -> bool {
-    value.is_none_or(|value| matches!(value, "1" | "true" | "on"))
+    crate::env::flag_or("IZWI_CUDA_INCREMENTAL_CHAT", true)
 }
 
 pub(crate) const DEFAULT_CUDA_STATE_BUDGET_FRACTION: f64 = 0.25;
@@ -562,13 +553,7 @@ fn default_thermal_pressure_hint() -> f64 {
         .clamp(0.0, 1.0)
 }
 fn default_power_save_mode() -> bool {
-    std::env::var("IZWI_POWER_SAVE")
-        .ok()
-        .map(|raw| {
-            let value = raw.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    crate::env::flag_or("IZWI_POWER_SAVE", false)
 }
 fn default_enable_decode_quanta() -> bool {
     false
@@ -850,25 +835,14 @@ impl EngineCoreConfig {
 #[cfg(test)]
 mod managed_kv_default_tests {
     use super::{
-        capacity_replay_from_env, claim_quantum_from_env, resolve_backend_model_context,
-        tts_explicit_output_limit, EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
+        claim_quantum_from_env, resolve_backend_model_context, tts_explicit_output_limit,
+        EngineCoreConfig, CUDA_MAX_NATIVE_CONTEXT_TOKENS,
     };
     use crate::backends::BackendKind;
     use crate::config::{
         KvCacheDtype, PhysicalExecutionMode, PhysicalInFlightLimit, PrefixCachePolicy,
     };
     use crate::model::ModelVariant;
-
-    #[test]
-    fn incremental_chat_defaults_on_and_preserves_explicit_opt_out() {
-        assert!(super::cuda_incremental_chat_from_env(None));
-        for value in ["1", "true", "on"] {
-            assert!(super::cuda_incremental_chat_from_env(Some(value)));
-        }
-        for value in ["0", "false", "off", "", "invalid"] {
-            assert!(!super::cuda_incremental_chat_from_env(Some(value)));
-        }
-    }
 
     #[test]
     fn prefix_snapshot_budget_parses_a_bounded_count() {
@@ -905,17 +879,6 @@ mod managed_kv_default_tests {
         assert_eq!(claim_quantum_from_env(Some(" 16 ")), 16);
         assert_eq!(claim_quantum_from_env(Some("0")), 0);
         assert_eq!(claim_quantum_from_env(Some("lots")), 1024);
-    }
-
-    #[test]
-    fn capacity_replay_is_on_unless_the_operator_turns_it_off() {
-        assert!(capacity_replay_from_env(None));
-        for value in ["1", "true", "on", " on "] {
-            assert!(capacity_replay_from_env(Some(value)), "{value}");
-        }
-        for value in ["0", "false", "off", " 0 "] {
-            assert!(!capacity_replay_from_env(Some(value)), "{value}");
-        }
     }
 
     #[test]

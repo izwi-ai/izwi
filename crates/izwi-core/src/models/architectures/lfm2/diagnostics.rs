@@ -4,7 +4,9 @@ use candle_core::Tensor;
 use crate::error::{Error, Result};
 
 pub(crate) fn enabled() -> bool {
-    std::env::var("IZWI_LFM2_DIAGNOSTICS").is_ok_and(|value| value == "1")
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_LFM2_DIAGNOSTICS", false));
+    ENABLED.get()
 }
 
 /// Reduce on the tensor's device; only one byte crosses the device boundary.

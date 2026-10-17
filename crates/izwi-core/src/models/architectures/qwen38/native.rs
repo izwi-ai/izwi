@@ -59,13 +59,7 @@ enum Qwen38GeometryPolicy {
 }
 
 fn geometry_policy_from_env() -> Qwen38GeometryPolicy {
-    let enabled = std::env::var(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY)
-        .map(|value| {
-            let trimmed = value.trim();
-            trimmed.eq_ignore_ascii_case("1") || trimmed.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false);
-    if enabled {
+    if crate::env::flag_or(ENV_ALLOW_SYNTHETIC_QWEN38_GEOMETRY, false) {
         Qwen38GeometryPolicy::Synthetic
     } else {
         Qwen38GeometryPolicy::Pinned27B

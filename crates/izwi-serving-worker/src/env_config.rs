@@ -389,7 +389,8 @@ mod tests {
              `true`, `false`, `1`, `0`, `yes`, `no`, `on` or `off`; any other value, or a \
              number that does not parse, stops the worker with an error naming the \
              variable. Under the supervisor, the variables marked as set by it come from \
-             the node config; the model runtime reads further engine variables of its own.",
+             the node config; the model runtime reads further engine variables of its own \
+             (core.md).",
             WORKER_ENV,
         )
     }

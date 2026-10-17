@@ -150,14 +150,7 @@ const RUNTIME_LIBRARIES: &[LibraryFamily] = &[
 const RUNTIME_LIBRARIES: &[LibraryFamily] = &[];
 
 pub fn private_cuda_runtime_active() -> bool {
-    std::env::var(CUDA_RUNTIME_ACTIVE_ENV)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes"
-            )
-        })
-        .unwrap_or(false)
+    crate::env::flag_or(CUDA_RUNTIME_ACTIVE_ENV, false)
 }
 
 pub fn private_cuda_runtime_env_key() -> &'static str {

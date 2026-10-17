@@ -2484,15 +2484,12 @@ fn duration_ms(duration: Duration) -> f64 {
 }
 
 fn granite_token_debug_enabled() -> bool {
-    std::env::var("IZWI_GRANITE_TOKEN_DEBUG")
-        .ok()
-        .or_else(|| std::env::var("IZWI_GRANITE_TOKEN_DIAGNOSTICS").ok())
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false)
+    static ENABLED: crate::env::ReadOnce<bool> = crate::env::ReadOnce::new(|| {
+        crate::env::flag("IZWI_GRANITE_TOKEN_DEBUG")
+            .or_else(|| crate::env::flag("IZWI_GRANITE_TOKEN_DIAGNOSTICS"))
+            .unwrap_or(false)
+    });
+    ENABLED.get()
 }
 
 pub fn ensure_granite_speech_artifacts(model_dir: &Path) -> Result<Vec<PathBuf>> {

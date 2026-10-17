@@ -76,18 +76,6 @@ impl PooledBuffer {
     }
 }
 
-fn bool_from_env(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
 /// Configuration for buffer pool sizing.
 #[derive(Debug, Clone)]
 pub struct BufferPoolConfig {
@@ -448,7 +436,7 @@ pub fn maybe_init_global_buffer_pool(device: &Device) -> Option<SharedBufferPool
         return Some(pool);
     }
 
-    if !bool_from_env("IZWI_BUFFER_POOL", true) {
+    if !crate::env::flag_or("IZWI_BUFFER_POOL", true) {
         return None;
     }
 

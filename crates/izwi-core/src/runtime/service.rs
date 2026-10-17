@@ -2457,14 +2457,18 @@ pub const DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT: Duration = Duration::from_secs(3
 const STREAM_SLOW_CONSUMER_TIMEOUT_ENV: &str = "IZWI_STREAM_SLOW_CONSUMER_TIMEOUT_MS";
 
 /// The configured slow-consumer timeout for streamed text output, shared by
-/// the runtime driver and the serving worker's NDJSON relay.
+/// the runtime driver and the serving worker's NDJSON relay. Read once per
+/// process.
 pub fn stream_slow_consumer_timeout() -> Duration {
-    std::env::var(STREAM_SLOW_CONSUMER_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT)
+    static TIMEOUT: crate::env::ReadOnce<Duration> = crate::env::ReadOnce::new(|| {
+        std::env::var(STREAM_SLOW_CONSUMER_TIMEOUT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_STREAM_SLOW_CONSUMER_TIMEOUT)
+    });
+    TIMEOUT.get()
 }
 
 /// Opaque transport-facing handle for an authoritatively admitted chat request.
@@ -3513,6 +3517,7 @@ impl RuntimeService {
 
     /// Create a new inference engine.
     pub fn new(mut config: EngineConfig) -> Result<Self> {
+        crate::env::validate_process_env()?;
         config.performance = config.performance.resolve_env()?;
         let backend_context =
             BackendRouter::resolve_context(config.backend, BackendSelectionSource::Config);
@@ -3525,6 +3530,7 @@ impl RuntimeService {
         mut config: EngineConfig,
         assignment: RuntimeDeviceAssignment,
     ) -> Result<Self> {
+        crate::env::validate_process_env()?;
         config.performance = config.performance.resolve_env()?;
         let backend_context =
             BackendRouter::resolve_assigned_context(&assignment, BackendSelectionSource::Config)?;

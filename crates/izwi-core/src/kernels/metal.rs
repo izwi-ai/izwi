@@ -5077,23 +5077,6 @@ pub struct DeltaNetBlockConfig {
     pub eps: f64,
 }
 
-/// Check if 3:1 block fusion is enabled.
-pub fn use_block_fusion() -> bool {
-    if !use_fused_kernels() {
-        return false;
-    }
-
-    std::env::var("IZWI_BLOCK_FUSION")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(true)
-}
-
 /// Check if fused kernels should be used.
 pub fn use_fused_kernels() -> bool {
     crate::kernels::use_fused_kernels()

@@ -98,14 +98,7 @@ impl Module for GemmaRmsNorm {
 }
 
 fn gemma_cuda_rms_norm_enabled(device: &Device) -> bool {
-    let override_enabled =
-        std::env::var("IZWI_GEMMA3_CUDA_RMS_NORM")
-            .ok()
-            .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            });
+    let override_enabled = crate::env::flag("IZWI_GEMMA3_CUDA_RMS_NORM");
     gemma_cuda_rms_norm_policy(device.is_cuda(), override_enabled)
 }
 

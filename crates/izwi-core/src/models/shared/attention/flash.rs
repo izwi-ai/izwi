@@ -44,24 +44,32 @@ impl FlashAttentionMode {
     }
 }
 
+const FLASH_ATTENTION_ENV: &str = "IZWI_USE_FLASH_ATTENTION";
+
+/// `force`, `auto` or a boolean (true means `auto`); unset or empty means
+/// `auto`, and anything else turns flash attention off.
 fn parse_flash_attention_mode(value: Option<&str>) -> FlashAttentionMode {
-    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("force") => FlashAttentionMode::Force,
-        Some("auto" | "1" | "true" | "yes" | "on") => FlashAttentionMode::Auto,
-        None => FlashAttentionMode::Auto,
-        Some("off" | "0" | "false" | "no") => FlashAttentionMode::Off,
-        Some(_) => FlashAttentionMode::Off,
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return FlashAttentionMode::Auto;
+    };
+    if value.eq_ignore_ascii_case("force") {
+        FlashAttentionMode::Force
+    } else if value.eq_ignore_ascii_case("auto")
+        || matches!(izwi_env::parse_bool(FLASH_ATTENTION_ENV, value), Ok(true))
+    {
+        FlashAttentionMode::Auto
+    } else {
+        FlashAttentionMode::Off
     }
 }
 
 pub fn flash_attention_mode() -> FlashAttentionMode {
     // Read once per process: this runs for every attention call, and an env
     // read takes the process environment lock and allocates.
-    static MODE: std::sync::OnceLock<FlashAttentionMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let value = std::env::var("IZWI_USE_FLASH_ATTENTION").ok();
-        parse_flash_attention_mode(value.as_deref())
-    })
+    static MODE: crate::env::ReadOnce<FlashAttentionMode> = crate::env::ReadOnce::new(|| {
+        parse_flash_attention_mode(crate::env::value(FLASH_ATTENTION_ENV).as_deref())
+    });
+    MODE.get()
 }
 
 /// Compatibility predicate for model diagnostics and existing call sites.
@@ -741,31 +749,15 @@ fn should_use_metal_sdpa_f16_cast(dtype: DType, q_seq: usize) -> bool {
 }
 
 fn metal_sdpa_f32_prefill_cast_enabled() -> bool {
-    // Tests toggle this knob at runtime, so only production builds cache it.
-    #[cfg(test)]
-    return env_bool("IZWI_METAL_SDPA_F32_PREFILL_F16", true);
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| env_bool("IZWI_METAL_SDPA_F32_PREFILL_F16", true))
-    }
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_METAL_SDPA_F32_PREFILL_F16", true));
+    ENABLED.get()
 }
 
 fn metal_sdpa_masked_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| env_bool("IZWI_METAL_SDPA_MASKED", false))
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_METAL_SDPA_MASKED", false));
+    ENABLED.get()
 }
 
 #[inline]
@@ -791,13 +783,17 @@ mod tests {
     #[test]
     fn flash_attention_mode_defaults_to_auto_with_explicit_rollback() {
         assert_eq!(parse_flash_attention_mode(None), FlashAttentionMode::Auto);
-        for value in ["off", "0", "false", "no", "invalid"] {
+        assert_eq!(
+            parse_flash_attention_mode(Some(" ")),
+            FlashAttentionMode::Auto
+        );
+        for value in ["off", "0", "false", "no", "OFF", "invalid"] {
             assert_eq!(
                 parse_flash_attention_mode(Some(value)),
                 FlashAttentionMode::Off
             );
         }
-        for value in ["auto", "1", "true", "yes", "on", " AUTO "] {
+        for value in ["auto", "1", "true", "yes", "on", " AUTO ", "On"] {
             assert_eq!(
                 parse_flash_attention_mode(Some(value)),
                 FlashAttentionMode::Auto

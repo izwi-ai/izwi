@@ -9,7 +9,7 @@ use candle_nn::{ops, rotary_emb, Embedding, Linear, RmsNorm, VarBuilder};
 use candle_transformers::utils::repeat_kv as candle_repeat_kv;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(test)]
@@ -275,18 +275,8 @@ pub(crate) fn qwen3_decoder_cache_domain(
     })
 }
 
-fn parse_env_bool(raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 pub(crate) fn qwen3_dense_projection_fusion_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_DENSE_PROJECTION_FUSION")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_QWEN3_DENSE_PROJECTION_FUSION");
     qwen3_dense_projection_fusion_policy(device.is_metal(), override_enabled)
 }
 
@@ -298,9 +288,9 @@ pub(crate) fn qwen3_dense_projection_fusion_policy(
 }
 
 fn qwen3_qk_rms_norm_fusion_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_QK_RMS_NORM_FUSION")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_QWEN3_QK_RMS_NORM_FUSION"));
+    let override_enabled = OVERRIDE.get();
     qwen3_qk_rms_norm_fusion_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 
@@ -323,9 +313,7 @@ pub(crate) fn qwen3_quantized_projection_grouping_for_hidden_size(
     device: &Device,
     hidden_size: usize,
 ) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_QWEN3_QUANTIZED_PROJECTION_GROUPING");
     qwen3_quantized_projection_grouping_policy(device.is_metal(), hidden_size, override_enabled)
 }
 
@@ -429,13 +417,9 @@ fn thread_mrope_position_readbacks() -> u64 {
 }
 
 pub fn qwen3_runtime_profiling_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("IZWI_QWEN3_PROFILE")
-            .ok()
-            .and_then(|raw| parse_env_bool(&raw))
-            .unwrap_or(false)
-    })
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_QWEN3_PROFILE", false));
+    ENABLED.get()
 }
 
 pub fn qwen3_runtime_profile_snapshot() -> Qwen3RuntimeProfileSnapshot {
@@ -576,9 +560,9 @@ impl Qwen3Projection {
 }
 
 fn qwen3_metal_qmatmul_f32_input_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_METAL_QMATMUL_F32_INPUT")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    static OVERRIDE: crate::env::ReadOnce<Option<bool>> =
+        crate::env::ReadOnce::new(|| crate::env::flag("IZWI_QWEN3_METAL_QMATMUL_F32_INPUT"));
+    let override_enabled = OVERRIDE.get();
     qwen3_metal_qmatmul_f32_input_policy(device.is_metal(), override_enabled)
 }
 
@@ -3079,22 +3063,8 @@ fn try_apply_rope_pair_thd(
     }
 }
 
-fn qwen3_env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(default)
-}
-
 fn qwen3_rope_kernel_enabled(device: &Device) -> bool {
-    let override_enabled = std::env::var("IZWI_QWEN3_ROPE_KERNEL")
-        .ok()
-        .and_then(|raw| parse_env_bool(&raw));
+    let override_enabled = crate::env::flag("IZWI_QWEN3_ROPE_KERNEL");
     qwen3_rope_kernel_policy(device.is_metal(), device.is_cuda(), override_enabled)
 }
 

@@ -150,19 +150,10 @@ pub(crate) fn decode_gate(
     }
 }
 
-/// Whether the environment switch `var` asks for the legacy path
-/// (`legacy`, `off`, `0` or `false`, case-insensitive).
+/// Whether the environment switch `var` asks for the legacy path: a false
+/// value (`false`, `0`, `no`, `off`) or its registered `legacy` word.
 pub(crate) fn legacy_requested(var: &str) -> bool {
-    legacy_value(std::env::var(var).ok().as_deref())
-}
-
-fn legacy_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "legacy" | "off" | "0" | "false"
-        )
-    })
+    !crate::env::flag_or(var, true)
 }
 
 /// Diagnostics summary over per-layer paths: overall backend
@@ -324,17 +315,6 @@ mod tests {
             ))
         );
         assert_eq!(decode_gate(unset, &on, &Device::Cpu, true), None);
-    }
-
-    #[test]
-    fn legacy_switch_values() {
-        for value in ["legacy", " OFF ", "0", "False"] {
-            assert!(legacy_value(Some(value)), "{value}");
-        }
-        for value in ["auto", "1", "fused", ""] {
-            assert!(!legacy_value(Some(value)), "{value}");
-        }
-        assert!(!legacy_value(None));
     }
 
     #[test]

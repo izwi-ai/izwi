@@ -387,11 +387,11 @@ impl ServeRuntimeConfigOverrides {
                 &[],
             ),
             max_scheduler_batch_size: read_env_usize(ENV_MAX_SCHEDULER_BATCH_SIZE, &[]),
-            enable_prefix_caching: read_env_bool(ENV_ENABLE_PREFIX_CACHING, &[]),
-            prefix_reuse_catalog_auto: read_env_bool(ENV_PREFIX_REUSE_AUTO, &[]),
+            enable_prefix_caching: crate::env::flag(ENV_ENABLE_PREFIX_CACHING),
+            prefix_reuse_catalog_auto: crate::env::flag(ENV_PREFIX_REUSE_AUTO),
             managed_prefix_cache_salt: read_env_string(ENV_MANAGED_PREFIX_CACHE_SALT, &[]),
             max_prefix_cache_pages: read_env_usize(ENV_MAX_PREFIX_CACHE_PAGES, &[]),
-            enable_chunked_prefill: read_env_bool(ENV_ENABLE_CHUNKED_PREFILL, &[]),
+            enable_chunked_prefill: crate::env::flag(ENV_ENABLE_CHUNKED_PREFILL),
             chunked_prefill_threshold: read_env_usize(ENV_CHUNKED_PREFILL_THRESHOLD, &[]),
             max_tokens_per_step: read_env_usize(ENV_MAX_TOKENS_PER_STEP, &[]),
             max_retained_sequences: read_env_usize(ENV_MAX_RETAINED_SEQUENCES, &[]),
@@ -406,9 +406,9 @@ impl ServeRuntimeConfigOverrides {
             num_threads: read_env_usize(ENV_NUM_THREADS, &[]),
             max_concurrent_requests: read_env_usize(ENV_MAX_CONCURRENT, LEGACY_ENV_MAX_CONCURRENT),
             request_timeout_secs: read_env_u64(ENV_TIMEOUT, LEGACY_ENV_TIMEOUT),
-            cors_enabled: read_env_bool(ENV_CORS, &[]),
+            cors_enabled: crate::env::flag(ENV_CORS),
             cors_origins: read_env_csv(ENV_CORS_ORIGINS, &[]),
-            ui_enabled: read_env_bool(ENV_NO_UI, &[]).map(|no_ui| !no_ui),
+            ui_enabled: crate::env::flag(ENV_NO_UI).map(|no_ui| !no_ui),
             ui_dir: read_env_path(ENV_UI_DIR, &[]),
         }
     }
@@ -599,16 +599,6 @@ fn read_env_physical_in_flight_limit(
 
 fn read_env_context(primary: &str, aliases: &[&str]) -> Option<ContextLengthPreference> {
     first_non_empty_env(primary, aliases).and_then(|value| value.parse().ok())
-}
-
-fn read_env_bool(primary: &str, aliases: &[&str]) -> Option<bool> {
-    first_non_empty_env(primary, aliases).and_then(|value| {
-        match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
 }
 
 fn read_env_csv(primary: &str, aliases: &[&str]) -> Option<Vec<String>> {

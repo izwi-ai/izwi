@@ -1340,17 +1340,22 @@ impl Engine {
             TaskType::Chat => 64usize,
         };
 
+        static AUDIO: crate::env::ReadOnce<Option<usize>> = crate::env::ReadOnce::new(|| {
+            Engine::queue_capacity_from_env("IZWI_STREAM_AUDIO_QUEUE_CAPACITY")
+        });
+        static TEXT: crate::env::ReadOnce<Option<usize>> = crate::env::ReadOnce::new(|| {
+            Engine::queue_capacity_from_env("IZWI_STREAM_TEXT_QUEUE_CAPACITY")
+        });
+        static ANY: crate::env::ReadOnce<Option<usize>> = crate::env::ReadOnce::new(|| {
+            Engine::queue_capacity_from_env("IZWI_STREAM_QUEUE_CAPACITY")
+        });
         let task_override = match request.task_type {
-            TaskType::TTS | TaskType::SpeechToSpeech => {
-                Self::queue_capacity_from_env("IZWI_STREAM_AUDIO_QUEUE_CAPACITY")
-            }
-            TaskType::ASR | TaskType::Chat => {
-                Self::queue_capacity_from_env("IZWI_STREAM_TEXT_QUEUE_CAPACITY")
-            }
+            TaskType::TTS | TaskType::SpeechToSpeech => AUDIO.get(),
+            TaskType::ASR | TaskType::Chat => TEXT.get(),
         };
 
         task_override
-            .or_else(|| Self::queue_capacity_from_env("IZWI_STREAM_QUEUE_CAPACITY"))
+            .or_else(|| ANY.get())
             .unwrap_or(default_capacity)
     }
 

@@ -316,6 +316,41 @@ fn samples_to_seconds(samples: usize, sample_rate: u32) -> f32 {
     }
 }
 
+/// The streaming ASR chunk overrides, read once per process.
+#[derive(Debug, Clone, Copy)]
+struct StreamChunkOverrides {
+    target_chunk_secs: Option<f32>,
+    hard_max_chunk_secs: Option<f32>,
+    overlap_secs: Option<f32>,
+    min_chunk_secs: Option<f32>,
+    silence_search_secs: Option<f32>,
+    /// Whether any of them is set, even to a value that does not parse: an
+    /// operator tuning stream chunks turns off the single-chunk shortcut.
+    present: bool,
+}
+
+impl StreamChunkOverrides {
+    const KEYS: [&'static str; 5] = [
+        "IZWI_ASR_STREAM_CHUNK_TARGET_SECS",
+        "IZWI_ASR_STREAM_CHUNK_MAX_SECS",
+        "IZWI_ASR_STREAM_CHUNK_OVERLAP_SECS",
+        "IZWI_ASR_STREAM_CHUNK_MIN_SECS",
+        "IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS",
+    ];
+
+    fn from_env() -> Self {
+        let [target, max, overlap, min, silence] = Self::KEYS.map(NativeExecutor::env_f32);
+        Self {
+            target_chunk_secs: target,
+            hard_max_chunk_secs: max,
+            overlap_secs: overlap,
+            min_chunk_secs: min,
+            silence_search_secs: silence,
+            present: Self::KEYS.iter().any(|key| std::env::var(key).is_ok()),
+        }
+    }
+}
+
 impl NativeExecutor {
     pub(super) fn env_f32(key: &str) -> Option<f32> {
         std::env::var(key)
@@ -330,10 +365,16 @@ impl NativeExecutor {
             .and_then(|raw| raw.trim().parse::<usize>().ok())
     }
 
-    /// Holdback options for streaming ASR chunk transcription. The env keys
-    /// keep their historical QWEN prefix for compatibility but apply to every
-    /// family's streaming chunk path.
+    /// Holdback options for streaming ASR chunk transcription, read once per
+    /// process. The env keys keep their historical QWEN prefix for
+    /// compatibility but apply to every family's streaming chunk path.
     pub(super) fn asr_chunk_stream_options() -> AsrChunkStreamOptions {
+        static OPTIONS: crate::env::ReadOnce<AsrChunkStreamOptions> =
+            crate::env::ReadOnce::new(NativeExecutor::asr_chunk_stream_options_from_env);
+        OPTIONS.get()
+    }
+
+    fn asr_chunk_stream_options_from_env() -> AsrChunkStreamOptions {
         let rollback_tokens = Self::env_usize("IZWI_QWEN_ASR_STREAM_ROLLBACK_TOKENS")
             .unwrap_or(5)
             .min(32);
@@ -347,7 +388,14 @@ impl NativeExecutor {
         }
     }
 
+    /// The long-form chunk plan, with its overrides read once per process.
     pub(super) fn asr_long_form_config() -> AsrLongFormConfig {
+        static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
+            crate::env::ReadOnce::new(NativeExecutor::asr_long_form_config_from_env);
+        CONFIG.get()
+    }
+
+    fn asr_long_form_config_from_env() -> AsrLongFormConfig {
         let mut cfg = AsrLongFormConfig::default();
         if let Some(v) = Self::env_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
             cfg.target_chunk_secs = v;
@@ -362,8 +410,10 @@ impl NativeExecutor {
     }
 
     pub(super) fn asr_streaming_low_latency_config(audio_secs: f32) -> AsrLongFormConfig {
+        static OVERRIDES: crate::env::ReadOnce<StreamChunkOverrides> =
+            crate::env::ReadOnce::new(StreamChunkOverrides::from_env);
+        let overrides = OVERRIDES.get();
         let mut cfg = Self::asr_long_form_config();
-        let stream_chunk_overrides_present = Self::stream_chunk_overrides_present();
         if audio_secs <= STREAM_SHORT_AUDIO_SECS_THRESHOLD {
             cfg.target_chunk_secs = DEFAULT_STREAM_SHORT_TARGET_CHUNK_SECS;
             cfg.hard_max_chunk_secs = DEFAULT_STREAM_SHORT_MAX_CHUNK_SECS;
@@ -384,19 +434,19 @@ impl NativeExecutor {
                 .min(DEFAULT_STREAM_LONG_SILENCE_SEARCH_SECS);
         }
 
-        if let Some(v) = Self::env_f32("IZWI_ASR_STREAM_CHUNK_TARGET_SECS") {
+        if let Some(v) = overrides.target_chunk_secs {
             cfg.target_chunk_secs = v;
         }
-        if let Some(v) = Self::env_f32("IZWI_ASR_STREAM_CHUNK_MAX_SECS") {
+        if let Some(v) = overrides.hard_max_chunk_secs {
             cfg.hard_max_chunk_secs = v;
         }
-        if let Some(v) = Self::env_f32("IZWI_ASR_STREAM_CHUNK_OVERLAP_SECS") {
+        if let Some(v) = overrides.overlap_secs {
             cfg.overlap_secs = v;
         }
-        if let Some(v) = Self::env_f32("IZWI_ASR_STREAM_CHUNK_MIN_SECS") {
+        if let Some(v) = overrides.min_chunk_secs {
             cfg.min_chunk_secs = v;
         }
-        if let Some(v) = Self::env_f32("IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS") {
+        if let Some(v) = overrides.silence_search_secs {
             cfg.silence_search_secs = v;
         }
 
@@ -421,7 +471,7 @@ impl NativeExecutor {
                 cfg.overlap_secs = desired_overlap_floor;
             }
 
-            if !stream_chunk_overrides_present && audio_secs <= STREAM_SINGLE_CHUNK_SECS_THRESHOLD {
+            if !overrides.present && audio_secs <= STREAM_SINGLE_CHUNK_SECS_THRESHOLD {
                 let single_chunk_secs = (audio_secs + 0.05).max(cfg.min_chunk_secs.max(0.5));
                 cfg.target_chunk_secs = single_chunk_secs;
                 cfg.hard_max_chunk_secs = single_chunk_secs;
@@ -431,18 +481,6 @@ impl NativeExecutor {
         }
 
         cfg
-    }
-
-    fn stream_chunk_overrides_present() -> bool {
-        [
-            "IZWI_ASR_STREAM_CHUNK_TARGET_SECS",
-            "IZWI_ASR_STREAM_CHUNK_MAX_SECS",
-            "IZWI_ASR_STREAM_CHUNK_OVERLAP_SECS",
-            "IZWI_ASR_STREAM_CHUNK_MIN_SECS",
-            "IZWI_ASR_STREAM_CHUNK_SILENCE_SEARCH_SECS",
-        ]
-        .iter()
-        .any(|key| std::env::var(key).is_ok())
     }
 
     /// The ASR route plan: how a request's audio is segmented, decided once

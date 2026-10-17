@@ -47,17 +47,9 @@ fn to_add_dtype(tensor: Tensor, dtype: DType) -> Result<Tensor> {
 }
 
 fn whisper_metal_sdpa_enabled() -> bool {
-    std::env::var("IZWI_WHISPER_METAL_SDPA")
-        .ok()
-        .map(|value| whisper_metal_sdpa_env_value_enabled(&value))
-        .unwrap_or(false)
-}
-
-fn whisper_metal_sdpa_env_value_enabled(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    static ENABLED: crate::env::ReadOnce<bool> =
+        crate::env::ReadOnce::new(|| crate::env::flag_or("IZWI_WHISPER_METAL_SDPA", false));
+    ENABLED.get()
 }
 
 #[derive(Debug, Clone)]
@@ -1007,7 +999,7 @@ pub(crate) mod test_fixture {
 mod tests {
     use super::{
         flatten_token_major, gelu, reshape_head_major, reshape_token_major, sinusoids,
-        whisper_metal_sdpa_env_value_enabled,
+        whisper_metal_sdpa_enabled,
     };
     use candle_core::{DType, Device, Tensor};
 
@@ -1077,13 +1069,21 @@ mod tests {
 
     #[test]
     fn whisper_metal_sdpa_is_opt_in() {
-        assert!(whisper_metal_sdpa_env_value_enabled("1"));
-        assert!(whisper_metal_sdpa_env_value_enabled("true"));
-        assert!(whisper_metal_sdpa_env_value_enabled("yes"));
-        assert!(whisper_metal_sdpa_env_value_enabled("on"));
-        assert!(!whisper_metal_sdpa_env_value_enabled(""));
-        assert!(!whisper_metal_sdpa_env_value_enabled("0"));
-        assert!(!whisper_metal_sdpa_env_value_enabled("false"));
+        let _guard = crate::env_test_lock().lock().expect("env lock");
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("YES", true),
+            (" on ", true),
+            ("", false),
+            ("0", false),
+            ("off", false),
+        ] {
+            std::env::set_var("IZWI_WHISPER_METAL_SDPA", value);
+            assert_eq!(whisper_metal_sdpa_enabled(), expected, "{value:?}");
+        }
+        std::env::remove_var("IZWI_WHISPER_METAL_SDPA");
+        assert!(!whisper_metal_sdpa_enabled());
     }
 
     /// The tiny model at `dtype` on `device`, and its probe on the shared

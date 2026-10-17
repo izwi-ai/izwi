@@ -69,11 +69,7 @@ const MAX_DECODE_QUANTUM: usize = 16;
 /// `IZWI_QWEN35_DECODE_QUANTUM` (1..=16) when set, else 8 on CUDA and Metal
 /// and 1 on the CPU, where a slow token makes long bursts.
 fn preferred_decode_tokens_for(backend: BackendKind) -> usize {
-    let configured = std::env::var("IZWI_QWEN35_DECODE_QUANTUM")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0);
-    configured.map_or(
+    DECODE_QUANTUM.get().map_or(
         match backend {
             BackendKind::Cuda | BackendKind::Metal => ACCELERATOR_DECODE_QUANTUM,
             BackendKind::Cpu => 1,
@@ -82,11 +78,23 @@ fn preferred_decode_tokens_for(backend: BackendKind) -> usize {
     )
 }
 
-fn qwen35_prefill_chunk_size() -> usize {
-    std::env::var("IZWI_QWEN35_PREFILL_CHUNK_SIZE")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
+/// `IZWI_QWEN35_DECODE_QUANTUM` when set to a positive integer, read once.
+static DECODE_QUANTUM: crate::env::ReadOnce<Option<usize>> =
+    crate::env::ReadOnce::new(|| positive_env_usize("IZWI_QWEN35_DECODE_QUANTUM"));
+
+/// `IZWI_QWEN35_PREFILL_CHUNK_SIZE` when set to a positive integer, read once.
+static PREFILL_CHUNK_SIZE: crate::env::ReadOnce<Option<usize>> =
+    crate::env::ReadOnce::new(|| positive_env_usize("IZWI_QWEN35_PREFILL_CHUNK_SIZE"));
+
+fn positive_env_usize(name: &str) -> Option<usize> {
+    crate::env::value(name)
+        .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn qwen35_prefill_chunk_size() -> usize {
+    PREFILL_CHUNK_SIZE
+        .get()
         .unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE)
         .min(MAX_PREFILL_CHUNK_SIZE)
 }

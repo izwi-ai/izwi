@@ -3031,6 +3031,12 @@ impl NativeAsrModel {
 }
 
 fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
+    static CONFIG: crate::env::ReadOnce<AsrLongFormConfig> =
+        crate::env::ReadOnce::new(lfm25_audio_asr_long_form_config_from_env);
+    CONFIG.get()
+}
+
+fn lfm25_audio_asr_long_form_config_from_env() -> AsrLongFormConfig {
     let mut cfg = AsrLongFormConfig::default();
     if let Some(value) = env_positive_f32("IZWI_ASR_CHUNK_TARGET_SECS") {
         cfg.target_chunk_secs = value;
@@ -3062,8 +3068,10 @@ fn lfm25_audio_asr_long_form_config() -> AsrLongFormConfig {
 }
 
 fn lfm25_audio_asr_single_pass_max_new_tokens(max_tokens: Option<usize>) -> usize {
+    static ENV_MAX_NEW_TOKENS: crate::env::ReadOnce<Option<usize>> =
+        crate::env::ReadOnce::new(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"));
     max_tokens
-        .or_else(|| env_positive_usize("IZWI_LFM25_ASR_MAX_NEW_TOKENS"))
+        .or_else(|| ENV_MAX_NEW_TOKENS.get())
         .unwrap_or(LFM25_AUDIO_ASR_DEFAULT_MAX_NEW_TOKENS)
         .max(1)
 }
@@ -3072,7 +3080,9 @@ fn lfm25_audio_asr_chunk_max_new_tokens(duration_secs: f32, max_tokens: Option<u
     if let Some(max_tokens) = max_tokens {
         return max_tokens.max(1);
     }
-    if let Some(max_tokens) = env_positive_usize("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS") {
+    static ENV_CHUNK_MAX_NEW_TOKENS: crate::env::ReadOnce<Option<usize>> =
+        crate::env::ReadOnce::new(|| env_positive_usize("IZWI_LFM25_ASR_CHUNK_MAX_NEW_TOKENS"));
+    if let Some(max_tokens) = ENV_CHUNK_MAX_NEW_TOKENS.get() {
         return max_tokens;
     }
 

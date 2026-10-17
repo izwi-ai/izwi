@@ -7184,9 +7184,12 @@ impl NativeExecutor {
     }
 
     fn granite_asr_prefix_replay_words() -> usize {
-        Self::env_usize("IZWI_GRANITE_ASR_PREFIX_REPLAY_WORDS")
-            .unwrap_or(GRANITE_ASR_PREFIX_REPLAY_WORDS)
-            .min(GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX)
+        static WORDS: crate::env::ReadOnce<usize> = crate::env::ReadOnce::new(|| {
+            NativeExecutor::env_usize("IZWI_GRANITE_ASR_PREFIX_REPLAY_WORDS")
+                .unwrap_or(GRANITE_ASR_PREFIX_REPLAY_WORDS)
+                .min(GRANITE_ASR_PREFIX_REPLAY_WORDS_MAX)
+        });
+        WORDS.get()
     }
 
     fn granite_asr_prefix_replay_text(prefix_text: &str) -> String {
