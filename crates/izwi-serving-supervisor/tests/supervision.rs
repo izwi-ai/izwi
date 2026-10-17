@@ -26,6 +26,7 @@ import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MANIFEST = json.load(open("{manifest}"))
+EVENTS_PATH = "{manifest}" + ".events"
 WORKER_ID = os.environ["IZWI_WORKER_ID"]
 ENTRY = MANIFEST[WORKER_ID]
 DESCRIPTOR = json.load(open(ENTRY["descriptor"]))
@@ -39,10 +40,19 @@ LOCK = threading.Lock()
 STARTED = time.monotonic()
 with open(ENTRY["launches"], "a") as launches:
     launches.write(os.environ["IZWI_WORKER_INCARNATION_ID"] + "\n")
+FIRST_STATUS_SERVED = False
+
+def record_event(kind):
+    # One shared, append-only log on the system-wide monotonic clock, so a
+    # test can order events across workers without trusting thread timing.
+    with open(EVENTS_PATH, "a") as events:
+        events.write(f"{kind} {WORKER_ID} {time.monotonic()}\n")
+
+record_event("launch")
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global SEQUENCE
+        global SEQUENCE, FIRST_STATUS_SERVED
         hang_after = ENTRY.get("hang_status_after_secs")
         if hang_after is not None and time.monotonic() - STARTED > float(hang_after):
             # A wedged runtime: the listener accepts but never answers.
@@ -53,6 +63,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 SEQUENCE += 1
                 STATUS["status_sequence"] = SEQUENCE
+                if not FIRST_STATUS_SERVED:
+                    FIRST_STATUS_SERVED = True
+                    record_event("status")
             body = json.dumps(STATUS).encode()
         else:
             self.send_response(404)
@@ -271,6 +284,18 @@ impl Rig {
         std::fs::read_to_string(&self.stderr).unwrap_or_default()
     }
 
+    /// The monotonic time of `worker_id`'s first `kind` event in the shared
+    /// fake-worker event log.
+    fn first_event(&self, kind: &str, worker_id: &str) -> Option<f64> {
+        let events = std::fs::read_to_string(self.root.join("manifest.json.events")).ok()?;
+        events.lines().find_map(|line| {
+            let mut fields = line.split(' ');
+            (fields.next() == Some(kind) && fields.next() == Some(worker_id))
+                .then(|| fields.next()?.parse().ok())
+                .flatten()
+        })
+    }
+
     fn launches(&self, worker_id: &str) -> usize {
         std::fs::read_to_string(self.root.join(format!("{worker_id}.launches")))
             .map(|text| text.lines().count())
@@ -351,7 +376,9 @@ fn a_stuck_load_does_not_hold_back_other_workers() {
     );
 }
 
-/// With one load slot, loads run one at a time in config order.
+/// With one load slot, loads run one at a time. The actors race for the
+/// slot, so either worker may load first; the second must launch only once
+/// the first's load has ended.
 #[test]
 fn one_load_slot_serializes_loads() {
     let rig = Rig::build(
@@ -368,22 +395,43 @@ fn one_load_slot_serializes_loads() {
         "max_parallel_model_loads = 1\n\n[readiness]\nstartup_timeout_ms = 2000\npoll_interval_ms = 50\n\n[restart]\ninitial_backoff_ms = 60000\nmaximum_backoff_ms = 60000\n",
     );
     let _supervisor = rig.spawn_supervisor();
+    // Converged outcome: both workers have launched (worker-b is ready and
+    // worker-a has loaded before or after it), whichever took the slot first.
     assert!(
-        wait_until(Duration::from_secs(15), || rig
+        wait_until(Duration::from_secs(30), || rig
             .stderr_text()
-            .contains("worker-b ready as incarnation")),
-        "worker-b must launch once the slot frees; stderr:\n{}",
+            .contains("worker-b ready as incarnation")
+            && rig.launches("worker-a") >= 1),
+        "both workers must launch through the one slot; stderr:\n{}",
         rig.stderr_text()
     );
-    let stderr = rig.stderr_text();
-    let a_failed = stderr
-        .find("worker worker-a failed readiness")
-        .expect("worker-a's load times out first");
-    let b_ready = stderr.find("worker-b ready as incarnation").unwrap();
-    assert!(
-        a_failed < b_ready,
-        "worker-b loaded while worker-a held the only slot:\n{stderr}"
-    );
+    let event = |kind: &str, worker_id: &str| rig.first_event(kind, worker_id);
+    let a_launch = event("launch", "worker-a").expect("worker-a launched");
+    let b_launch = event("launch", "worker-b").expect("worker-b launched");
+    if a_launch < b_launch {
+        // worker-a never turns ready, so it holds the slot until its 2 s
+        // startup timeout; worker-b cannot launch inside that window. The
+        // launch events are written once each interpreter has started, so
+        // allow up to a second of start-up skew between the two.
+        assert!(
+            b_launch - a_launch >= 1.0,
+            "worker-b launched {:.3} s after worker-a, inside worker-a's load; stderr:\n{}",
+            b_launch - a_launch,
+            rig.stderr_text()
+        );
+        assert!(rig
+            .stderr_text()
+            .contains("worker worker-a failed readiness"));
+    } else {
+        // worker-b's load ends when it serves a ready status; worker-a can
+        // only launch after that.
+        let b_status = event("status", "worker-b").expect("worker-b served status");
+        assert!(
+            a_launch > b_status,
+            "worker-a launched while worker-b held the only slot; stderr:\n{}",
+            rig.stderr_text()
+        );
+    }
     assert_eq!(rig.launches("worker-b"), 1);
 }
 
