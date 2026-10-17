@@ -44,7 +44,7 @@ use crate::batch_runtime::{
     worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
 use crate::entity::RuntimeProjectionAttempt;
-use crate::error::{ApiError, ApiJson};
+use crate::error::{core_api_error, ApiError, ApiJson};
 use crate::ids::new_uuid;
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
@@ -755,7 +755,8 @@ async fn create_record(
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &input_text,
             req.max_output_tokens.or(req.max_tokens).unwrap_or(0),
-        )?;
+        )
+        .map_err(core_api_error)?;
     }
     validate_reference_voice_selection(&req)?;
     if route_kind == SpeechRouteKind::TextToSpeech
@@ -1796,14 +1797,20 @@ async fn synthesize_record_internal(
         req.max_output_tokens.or(req.max_tokens),
     );
     let permit = state.acquire_workload_permit(workload_class).await;
-    state.runtime.load_model(variant).await?;
+    state
+        .runtime
+        .load_model(variant)
+        .await
+        .map_err(core_api_error)?;
     let mut runtime_context = permit.runtime_context();
     runtime_context.tenant_key = tenant_key;
     generation_request = generation_request.with_runtime_context(runtime_context);
     // No wall clock wraps active generation (TPIPE-6); a dropped request
     // cancels the engine work.
     let runtime = state.runtime.clone();
-    let output = generate_long_form_tts(&runtime, variant, generation_request).await?;
+    let output = generate_long_form_tts(&runtime, variant, generation_request)
+        .await
+        .map_err(core_api_error)?;
     let stop_reason = output.stop_reason;
 
     let encoder = AudioEncoder::new(output.sample_rate, 1);
@@ -1811,7 +1818,8 @@ async fn synthesize_record_internal(
     let encoded_audio =
         tokio::task::spawn_blocking(move || encoder.encode(&output_samples, AudioFormat::Wav))
             .await
-            .map_err(|err| ApiError::internal(format!("Audio encoding failed: {err}")))??;
+            .map_err(|err| ApiError::internal(format!("Audio encoding failed: {err}")))?
+            .map_err(core_api_error)?;
 
     if let Some(attempt) = attempt {
         attempt
@@ -1943,7 +1951,8 @@ async fn stream_record_creation(
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &generation_request.text,
             generation_request.config.options.max_tokens,
-        )?
+        )
+        .map_err(core_api_error)?
         .segments
         .len()
     } else {

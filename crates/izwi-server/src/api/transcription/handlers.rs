@@ -38,7 +38,7 @@ use crate::batch_runtime::{
     worker::{StageExecutionContext, StageExecutionOutcome, StageExecutor},
 };
 use crate::entity::RuntimeProjectionAttempt;
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
 use crate::ids::new_uuid;
 use crate::media_ingest::{
     AudioIngestPolicy, CanonicalAudioProfile, ExistingAudioIngestRequest, MediaIngestError,
@@ -1334,7 +1334,8 @@ where
                 }
             },
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
 
     let resolved_language = output
         .language
@@ -1355,7 +1356,8 @@ where
                     resolved_language.as_deref(),
                     Some(resolved_aligner_model_id),
                 )
-                .await?;
+                .await
+                .map_err(core_api_error)?;
             let words = alignments_to_word_records(&alignments);
             let segments = build_segment_records(output.text.as_str(), &words);
             (Some(resolved_aligner_model_id.to_string()), words, segments)
@@ -1400,7 +1402,8 @@ where
             max_speakers,
             on_progress,
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
     let resolved_language = output
         .language
         .clone()

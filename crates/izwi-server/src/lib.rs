@@ -30,7 +30,6 @@ mod gateway;
 mod gateway_fleet;
 mod gateway_principal_keys;
 mod gateway_security;
-mod ids;
 mod local_security;
 mod logging;
 pub mod media_ingest;
@@ -63,7 +62,7 @@ use izwi_hooks::EnterpriseHooks;
 // aliases keep their `crate::` paths for the gateway role still hosted here.
 use izwi_gateway::{
     gateway_deployments, gateway_rate_quota, gateway_shared_approvals, gateway_tenant_concurrency,
-    gateway_worker_tls,
+    gateway_worker_tls, ids,
 };
 use roles::{gateway::run_gateway, local::run_local};
 use state::AppState;

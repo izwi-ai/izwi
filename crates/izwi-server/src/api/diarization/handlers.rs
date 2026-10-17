@@ -22,7 +22,7 @@ use crate::diarization_store::{
     DiarizationStore, DiarizationSummaryStatus, DiarizationUtteranceRecord, DiarizationWordRecord,
     NewDiarizationRecord, StoredDiarizationAudio, UpdateDiarizationSummary,
 };
-use crate::error::{ApiError, ApiJson};
+use crate::error::{core_api_error, ApiError, ApiJson};
 use tracing::warn;
 use crate::state::AppState;
 use izwi_core::{
@@ -575,7 +575,8 @@ async fn generate_diarization_artifacts(
             },
             parsed.enable_llm_refinement.unwrap_or(false),
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
 
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
     let rtf = if output.duration_secs > 0.0 {

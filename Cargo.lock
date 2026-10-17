@@ -3803,14 +3803,21 @@ dependencies = [
 name = "izwi-gateway"
 version = "0.1.0-beta-18"
 dependencies = [
+ "anyhow",
  "axum",
+ "clap",
+ "futures",
  "izwi-serving-client",
  "izwi-serving-protocol",
+ "scalar_api_reference",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

@@ -16,7 +16,7 @@ use tracing::info;
 use crate::api::request_context::RequestContext;
 use crate::api::saved_voices::resolve_saved_voice_reference;
 use crate::api::tts_policy::resolve_tts_output_frames;
-use crate::error::{ApiError, ApiJson};
+use crate::error::{core_api_error, ApiError, ApiJson};
 use crate::state::AppState;
 use izwi_core::audio::{AudioEncoder, AudioFormat};
 use izwi_core::{
@@ -207,7 +207,11 @@ pub async fn speech(
         .acquire_workload_permit(WorkloadClass::Interactive)
         .await;
     let request_started = std::time::Instant::now();
-    state.runtime.load_model(variant).await?;
+    state
+        .runtime
+        .load_model(variant)
+        .await
+        .map_err(core_api_error)?;
 
     let format = resolved_format.format;
     let actual_format = resolved_format.label;
@@ -229,7 +233,8 @@ pub async fn speech(
             req.max_output_tokens.or(req.max_tokens),
         );
         crate::api::tts_long_form::generate_long_form_tts(&state.runtime, variant, gen_request)
-            .await?
+            .await
+            .map_err(core_api_error)?
     };
 
     let sample_rate = result.sample_rate;
@@ -237,7 +242,8 @@ pub async fn speech(
     let audio_bytes =
         tokio::task::spawn_blocking(move || encode_speech_samples(&samples, sample_rate, format))
             .await
-            .map_err(|e| ApiError::internal(format!("Audio encoding failed: {}", e)))??;
+            .map_err(|e| ApiError::internal(format!("Audio encoding failed: {}", e)))?
+            .map_err(core_api_error)?;
 
     let content_type = AudioEncoder::content_type(format);
     let duration_secs = result.duration_secs();
@@ -312,8 +318,13 @@ async fn fish_file_speech(
     let mut request = build_generation_request(&req, correlation_id, true, variant);
     request.runtime_context.tenant_key = tenant_key;
     // Validate admission before model load or output allocation.
-    crate::api::tts_long_form::SpeechTextPlan::fish(&req.input, request.config.options.max_tokens)?;
-    state.runtime.load_model(variant).await?;
+    crate::api::tts_long_form::SpeechTextPlan::fish(&req.input, request.config.options.max_tokens)
+        .map_err(core_api_error)?;
+    state
+        .runtime
+        .load_model(variant)
+        .await
+        .map_err(core_api_error)?;
     let started = Instant::now();
     let (sender, mut receiver) = mpsc::channel::<AudioChunk>(2);
     let format = resolved_format.format;
@@ -354,14 +365,16 @@ async fn fish_file_speech(
                             .map_err(|e| ApiError::internal(e.to_string()))?,
                     );
                 }
-                let pcm = encode_speech_samples(&chunk.samples, rate, AudioFormat::RawI16)?;
+                let pcm = encode_speech_samples(&chunk.samples, rate, AudioFormat::RawI16)
+                    .map_err(core_api_error)?;
                 wav.as_mut()
                     .unwrap()
                     .append_pcm(&pcm)
                     .await
                     .map_err(|e| ApiError::internal(e.to_string()))?;
             } else {
-                let pcm = encode_speech_samples(&chunk.samples, rate, format)?;
+                let pcm =
+                    encode_speech_samples(&chunk.samples, rate, format).map_err(core_api_error)?;
                 reservation
                     .grow(pcm.len())
                     .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -426,7 +439,7 @@ async fn fish_file_speech(
             WorkloadClass::Interactive,
         )
         .await
-        .map_err(ApiError::from)
+        .map_err(core_api_error)
     };
     // The plan runs until it completes, fails, stalls (per-segment progress
     // deadline) or the client disconnects; a fixed wall clock failed long
@@ -548,7 +561,8 @@ async fn stream_speech(
         crate::api::tts_long_form::SpeechTextPlan::fish(
             &req.input,
             gen_request.config.options.max_tokens,
-        )?
+        )
+        .map_err(core_api_error)?
         .segments
         .len()
     } else {

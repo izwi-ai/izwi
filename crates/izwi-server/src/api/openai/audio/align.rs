@@ -17,7 +17,7 @@ use crate::api::audio_payload::{
     read_multipart_audio_base64_payload, read_multipart_audio_file_payload, AudioPayload,
 };
 use crate::api::speech_text_upload::multipart_upload_api_error;
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::WorkloadClass;
 
@@ -112,7 +112,8 @@ pub async fn align(
             req.language.as_deref(),
             req.model.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
     let processing_time_ms = started.elapsed().as_secs_f64() * 1000.0;
 
     let alignments = alignment_words(raw_alignments);

@@ -32,6 +32,7 @@ The gateway role (`izwi-server --role gateway`) reads these variables once, at s
 | `IZWI_GATEWAY_WORKER_TLS_CA_REFS` | unset | Comma-separated `file:/absolute/path` private CA roots for worker TLS. |
 | `IZWI_GATEWAY_WORKER_TLS_CLIENT_CERT_REF` | unset | `file:/absolute/path` client certificate for worker mTLS (with the key). |
 | `IZWI_GATEWAY_WORKER_TLS_CLIENT_KEY_REF` | unset | `file:/absolute/path` client private key for worker mTLS (warned about when other users can read it). |
+| `IZWI_DESKTOP_OWNER_PIPE` | unset | `1` when a parent process owns the gateway: stdin closing shuts it down. |
 | `IZWI_OTLP_TRACES_ENDPOINT` | unset | OTLP/HTTP collector for request spans; unset exports none. |
 
 ## Flags with an environment variable

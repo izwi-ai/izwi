@@ -666,7 +666,7 @@ pub async fn generate_chat(
 /// `messages`, as the gateway reports it.
 fn chat_error(err: izwi_core::Error) -> ApiError {
     let overflow = err.kind() == izwi_core::ErrorKind::ContextLengthExceeded;
-    let error = ApiError::from(err);
+    let error = crate::error::core_api_error(err);
     if overflow {
         error.with_param("messages")
     } else {

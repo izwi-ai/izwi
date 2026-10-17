@@ -10,11 +10,17 @@
 // The lint policy these modules had in izwi-server.
 #![allow(clippy::type_complexity)]
 
+pub mod api;
+pub mod error;
 pub mod gateway_deployments;
 pub mod gateway_rate_quota;
 pub mod gateway_shared_approvals;
 pub mod gateway_tenant_concurrency;
 pub mod gateway_worker_tls;
+pub mod ids;
+pub mod lifecycle;
+pub mod logging;
+pub mod shutdown;
 #[cfg(test)]
 mod test_support;
 pub mod worker_registry;

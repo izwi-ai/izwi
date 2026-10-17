@@ -25,7 +25,7 @@ use crate::api::audio_payload::{
 };
 use crate::api::request_context::RequestContext;
 use crate::api::speech_text_upload::multipart_upload_api_error;
-use crate::error::ApiError;
+use crate::error::{core_api_error, ApiError};
 use crate::state::AppState;
 use izwi_core::{
     parse_model_variant, resolve_asr_model_variant, validate_asr_language, AsrTranscription,
@@ -288,7 +288,8 @@ pub async fn transcriptions(
             permit.runtime_context(),
             timestamp_request.any(),
         )
-        .await?;
+        .await
+        .map_err(core_api_error)?;
 
     let mut words = None;
     let mut segments = None;

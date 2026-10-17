@@ -157,6 +157,12 @@ pub(crate) static GATEWAY_ENV: &[EnvVar] = &[
         "",
         "`file:/absolute/path` client private key for worker mTLS (warned about when other users can read it).",
     ),
+    // Shutdown (izwi-gateway shutdown.rs)
+    var(
+        "IZWI_DESKTOP_OWNER_PIPE",
+        "",
+        "`1` when a parent process owns the gateway: stdin closing shuts it down.",
+    ),
     var(
         "IZWI_OTLP_TRACES_ENDPOINT",
         "",

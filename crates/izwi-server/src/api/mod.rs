@@ -5,7 +5,7 @@ pub mod agent;
 pub(crate) mod audio_payload;
 pub mod chat;
 pub mod diarization;
-pub mod docs;
+pub use izwi_gateway::api::docs;
 pub(crate) mod idempotency;
 pub mod internal;
 pub mod jobs;
