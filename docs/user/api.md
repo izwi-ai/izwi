@@ -195,6 +195,10 @@ answer `404` there, because the worker protocol has no unary speech or
 Responses invocation. Use a local-role server for those routes (realtime
 speech goes through the gateway's realtime socket).
 
+The gateway is the standalone `izwi-gateway` binary, which runs no model, or
+`izwi-server --role gateway`; both serve the same API. Its `/openapi.json`
+lists only the routes above, plus the probes and `/docs`.
+
 Use `/v1/admin/models` when you need download, load, unload, local path, status, or speech-capability details.
 
 ### Chat Completions

@@ -9,7 +9,8 @@ versioned JSON file.
 
 It needs only `python3` (3.8 or later, standard library). It works against
 both roles: the local server (`izwi serve` / `izwi-server --role local`) and
-the gateway (`izwi-server --role gateway` in front of workers).
+the gateway (`izwi-gateway`, or `izwi-server --role gateway`, in front of
+workers).
 
 `izwi bench chat` remains the closed-loop, fixed-iteration tool. Its
 per-request ITL is a mean, so it cannot show an inter-token tail.

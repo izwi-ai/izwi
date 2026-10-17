@@ -667,7 +667,8 @@ The following features are scaffolded or partially implemented but not yet activ
 
 ### Adding a New Model Family
 
-1. Add a variant to `ModelFamily` and `ModelTask` in `catalog/variant.rs`.
+1. Add a variant to `ModelFamily` and `ModelTask` in `catalog/variant.rs` (the
+   accelerator-free `izwi-model-catalog` crate, which izwi-core re-exports).
 2. Implement `family()`, `primary_task()`, and `backend_hint()` arms for the new variant.
 3. Create a loader in `families/<new_family>/`.
 4. Implement `ModelExecutor` for the new architecture in `models/architectures/`.

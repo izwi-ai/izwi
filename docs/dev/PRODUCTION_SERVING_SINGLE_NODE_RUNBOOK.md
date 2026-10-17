@@ -23,7 +23,7 @@ The supported operational shape in this runbook is:
 TLS ingress (required before a non-loopback public bind)
         |
         v
-izwi-server --role gateway       hardware-independent; no model/runtime/DB
+izwi-gateway                     hardware-independent; no model/runtime/DB
         |
         | authenticated HTTP on numeric loopback
         v
@@ -34,9 +34,13 @@ izwi-serving-supervisor          validates, starts, fences, restarts, drains
 ```
 
 - The gateway owns the public OpenAI-compatible request contract, authentication,
-  policy call, request bounds, routing, and response/SSE translation. Gateway
-  mode branches before `RuntimeService`, persistence, preload, local batch
-  workers, or accelerator delegation are initialized.
+  policy call, request bounds, routing, and response/SSE translation. The
+  `izwi-gateway` binary links no inference engine at all: no izwi-core, Candle,
+  Metal or CUDA code is in it (`scripts/ci/check-serving-boundary.sh` enforces
+  this), so it is smaller and runs on any host. `izwi-server --role gateway`
+  takes the same flags and environment and still works; it runs the same
+  gateway code inside the larger server binary. Prefer `izwi-gateway` for new
+  deployments; the Docker `production-gateway` target is a slim image of it.
 - The supervisor assigns each child its CPU threads/memory or accelerator
   identity/memory before process startup. It clears the child environment,
   restores only an allowlist plus the worker's validated
@@ -160,8 +164,9 @@ worker links made by a gateway.
 
 - `--gateway-topology standalone` is the default and accepts only numeric-
   loopback HTTP worker endpoints. `--gateway-topology fleet-one-gateway`
-  requires `--role gateway`, HTTPS, a configured client certificate/private
-  key, and versioned worker approvals that pin both node and worker identity.
+  requires the gateway (`izwi-gateway`, or `izwi-server --role gateway`), HTTPS,
+  a configured client certificate/private key, and versioned worker approvals
+  that pin both node and worker identity.
 - Supervised workers bind numeric loopback only: node config validation
   rejects any other bind. Plaintext worker client URLs must use a numeric
   loopback host such as `127.0.0.1` or `::1`; `localhost` is deliberately not
@@ -332,8 +337,7 @@ Prefer typed approvals over the legacy `--worker-endpoint` form. For one CPU wor
 the process shape is:
 
 ```sh
-izwi-server \
-  --role gateway \
+izwi-gateway \
   --gateway-topology standalone \
   --host 127.0.0.1 \
   --port 8080 \
@@ -349,8 +353,15 @@ izwi-server \
   --gateway-worker-status-poll-ms 2000
 ```
 
-Supply the public and private credential environment described above. The
-standalone numeric-loopback compatibility syntax is:
+Supply the public and private credential environment described above.
+`izwi-server --role gateway` accepts exactly the same flags. The gateway reads
+no configuration file: its listener takes `--host`/`--port` (or `IZWI_HOST`,
+`IZWI_PORT`), `IZWI_TIMEOUT` and `IZWI_CORS`/`IZWI_CORS_ORIGINS`, and every
+gateway variable is listed in [`env/gateway.md`](env/gateway.md). Its log
+targets are `izwi_gateway` (the default filter logs warnings), so debug a
+gateway with `RUST_LOG=izwi_gateway=debug`, not `izwi_server`. It logs, and
+exports spans, as service `izwi-gateway` (`izwi-server` when the server runs
+the role). The standalone numeric-loopback compatibility syntax is:
 
 ```text
 URL|TASK|PUBLIC_MODEL|DEPLOYMENT_ID|MODEL_GENERATION

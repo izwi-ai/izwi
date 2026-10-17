@@ -18,6 +18,11 @@ is never promoted to real hardware or performance evidence.
 | Multiple machines | One gateway | Versioned node/worker-pinned HTTPS approvals | Fleet topology fails closed without mTLS client identity, HTTPS, and exact operator-pinned node/worker IDs; the worker terminates TLS/mTLS from bounded file references (supervised workers stay loopback-only), but no separate-machine handshake or artifact path was exercised | Not supported as an operational profile |
 | Multiple gateways | Two or more gateways | Any worker fleet | Two real gateway processes over one shared coordination database prove T07 (atomic admission), T20 (partitioned quota not multiplied), P8.1 (shared approvals), claim steering, gateway-crash + TTL recovery, and store-outage degradation (`tests/fleet_rig.rs`, SQLite and PostgreSQL lanes); a hung coordination store is unit-tested: status polls and dispatch proceed and admission falls back to the worker. Capacity claims cover only the transit to worker acceptance and steer selection while the worker remains the atomic admission arbiter | Supported on the validated store lanes: SQLite (one host) and PostgreSQL (shared fleet); MySQL is not supported; circuit state and accepted-work ownership stay per-gateway |
 
+The gateway in every cell is the standalone `izwi-gateway` binary (Docker
+target `production-gateway`), which links no inference engine; the process
+suites run it. `izwi-server --role gateway` runs the same gateway code with
+the same flags and stays supported (`gateway_role_process.rs`).
+
 ## Worker contract, health, and stream backpressure
 
 These apply to every cell above.
@@ -30,7 +35,7 @@ These apply to every cell above.
 
 ## Committed prefix reuse by model family and backend (DS1.6)
 
-The catalog (`crates/izwi-core/src/catalog/prefix_reuse.rs`) records one cell
+The catalog (`crates/izwi-model-catalog/src/catalog/prefix_reuse.rs`) records one cell
 per model family per backend lane; serving surfaces default to catalog-auto,
 which engages reuse only for supported cells (normally those with lane
 evidence; a cell supported ahead of its evidence says so). An explicit
