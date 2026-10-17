@@ -324,17 +324,6 @@ impl NativeExecutor {
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
-    pub(super) fn env_bool(key: &str) -> Option<bool> {
-        std::env::var(key).ok().and_then(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            match normalized.as_str() {
-                "1" | "true" | "yes" | "on" => Some(true),
-                "0" | "false" | "no" | "off" => Some(false),
-                _ => None,
-            }
-        })
-    }
-
     pub(super) fn env_usize(key: &str) -> Option<usize> {
         std::env::var(key)
             .ok()
@@ -534,6 +523,7 @@ impl NativeExecutor {
         finish(cfg, chunks, AsrChunkPlannerKind::Duration, None)
     }
 
+    #[cfg(test)]
     pub(super) fn transcribe_with_chunk_plan<F>(
         request_id: &str,
         stream_tx: Option<&StreamStagingBuffer>,
@@ -568,6 +558,7 @@ impl NativeExecutor {
         .map(|result| result.text)
     }
 
+    #[cfg(test)]
     pub(super) fn transcribe_with_chunk_plan_with_details<F>(
         request_id: &str,
         is_cancelled: &dyn Fn() -> bool,
@@ -598,6 +589,7 @@ impl NativeExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn transcribe_with_chunk_plan_with_context_and_details<F>(
         request_id: &str,
         stream_tx: Option<&StreamStagingBuffer>,
@@ -627,6 +619,7 @@ impl NativeExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn transcribe_with_chunk_plan_with_details_and_options<F>(
         request_id: &str,
         is_cancelled: &dyn Fn() -> bool,
@@ -810,6 +803,7 @@ impl NativeExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn next_audio_delta(all_samples: &[f32], emitted_samples: &mut usize) -> Vec<f32> {
         let start = (*emitted_samples).min(all_samples.len());
         let delta = all_samples[start..].to_vec();
@@ -817,6 +811,7 @@ impl NativeExecutor {
         delta
     }
 
+    #[cfg(test)]
     pub(super) fn next_audio_delta_stable(
         all_samples: &[f32],
         emitted_samples: &mut usize,

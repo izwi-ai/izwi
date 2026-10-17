@@ -120,8 +120,6 @@ pub struct SchedulerConfig {
     pub chunked_prefill_threshold: usize,
     /// Defer lower-priority decode while a higher-priority request is waiting.
     pub enable_preemption: bool,
-    /// Enable VAD-triggered preemption (for audio interruption handling)
-    pub enable_vad_preemption: bool,
     /// Enable adaptive, latency-aware batching heuristics.
     pub enable_adaptive_batching: bool,
     /// Minimum token budget for adaptive scheduling.
@@ -160,17 +158,6 @@ pub struct SchedulerConfig {
     pub unbatched_dispatch_rows: usize,
 }
 
-/// VAD preemption event - signals that user started speaking.
-#[derive(Debug, Clone)]
-pub struct VadPreemptionEvent {
-    /// Timestamp of the VAD detection
-    pub timestamp: Instant,
-    /// Speech probability from VAD
-    pub speech_probability: f32,
-    /// Request IDs that should be preempted (currently generating requests)
-    pub requests_to_preempt: Vec<RequestId>,
-}
-
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -180,7 +167,6 @@ impl Default for SchedulerConfig {
             enable_chunked_prefill: false,
             chunked_prefill_threshold: 192,
             enable_preemption: false,
-            enable_vad_preemption: true,
             enable_adaptive_batching: false,
             min_tokens_per_step: 96,
             target_ttft_ms: 250.0,
@@ -212,7 +198,6 @@ impl From<&EngineCoreConfig> for SchedulerConfig {
             enable_chunked_prefill: config.effective_chunked_prefill(),
             chunked_prefill_threshold: config.chunked_prefill_threshold,
             enable_preemption: config.enable_preemption,
-            enable_vad_preemption: true, // Default to enabled for audio apps
             enable_adaptive_batching: config.enable_adaptive_batching,
             min_tokens_per_step: config.min_tokens_per_step,
             target_ttft_ms: config.target_ttft_ms,
@@ -394,8 +379,6 @@ pub struct SchedulerTelemetry {
     pub dynamic_tokens_per_step: usize,
     /// Current adaptive prefill chunk threshold.
     pub dynamic_prefill_chunk_threshold: usize,
-    /// Exponential moving average of prefill chunk backoff pressure.
-    pub prefill_backoff_ewma: f64,
 }
 
 impl SchedulerTelemetry {
@@ -407,7 +390,6 @@ impl SchedulerTelemetry {
             avg_queue_age_ms: 0.0,
             dynamic_tokens_per_step: default_budget.max(1),
             dynamic_prefill_chunk_threshold: default_chunk,
-            prefill_backoff_ewma: 0.0,
         }
     }
 
@@ -712,8 +694,6 @@ impl Default for RequestCachePolicy {
     }
 }
 
-impl RequestCachePolicy {}
-
 /// Decode rows that can share one physical dispatch: the same loaded model,
 /// task and native decode batching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,7 +706,6 @@ struct DecodeDispatchKey {
 /// State for a running request.
 #[derive(Debug, Clone)]
 struct RunningRequest {
-    request_id: RequestId,
     sequence_id: SequenceId,
     /// Number of tokens processed so far (prompt + generated)
     num_tokens_processed: usize,
@@ -748,8 +727,6 @@ struct RunningRequest {
     incremental_prefill_quanta_committed: usize,
     /// Priority of this request
     priority: Priority,
-    /// Coarse latency/throughput class for this request.
-    workload_class: WorkloadClass,
     /// Whether this request has produced its first output token.
     first_token_emitted: bool,
     /// Whether this request is temporarily paused due to preemption.
@@ -939,7 +916,6 @@ impl Scheduler {
         self.running.insert(
             request.id.clone(),
             RunningRequest {
-                request_id: request.id.clone(),
                 sequence_id,
                 num_tokens_processed: 0,
                 num_tokens_generated: 0,
@@ -952,7 +928,6 @@ impl Scheduler {
                 finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: request.priority,
-                workload_class: request.workload_class,
                 first_token_emitted: false,
                 paused: false,
                 last_service: 0,
@@ -1756,8 +1731,6 @@ impl Scheduler {
             } else {
                 remaining_decode_budget
             };
-        let prefill_admission_cap = usize::MAX;
-        let mut prefill_admissions = 0usize;
         let mut scheduling_full_prefill_batch = false;
 
         // Phase 2a: continue incomplete prefills before admitting new waiting requests.
@@ -1916,9 +1889,7 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, num_computed, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, num_computed, target_tokens);
-            let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
-            self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             if let Some(running) = self.running.get_mut(&request_id) {
                 running.prefill_in_flight = true;
@@ -1964,7 +1935,6 @@ impl Scheduler {
 
         while remaining_batch > 0
             && remaining_prefill_budget > 0
-            && prefill_admissions < prefill_admission_cap
             && waiting_attempts < max_waiting_attempts
         {
             let request_id = match self.take_next_waiting_request() {
@@ -2073,16 +2043,13 @@ impl Scheduler {
                 Self::align_first_prefill_chunk(&metadata, prefix_start, target_tokens);
             let target_tokens =
                 Self::clip_prefill_to_snapshot_boundary(&metadata, prefix_start, target_tokens);
-            let original_target_tokens = target_tokens;
             let num_tokens = target_tokens;
             let span_end = prefix_start.saturating_add(num_tokens);
-            self.record_prefill_backoff(original_target_tokens, num_tokens);
 
             // Create running state. A jumped request counts its shared
             // prefix as already-committed progress so prefill completion
             // still lands at the full prompt length.
             let running = RunningRequest {
-                request_id: request_id.clone(),
                 sequence_id: metadata.sequence_id,
                 num_tokens_processed: prefix_start,
                 num_tokens_generated: 0,
@@ -2098,7 +2065,6 @@ impl Scheduler {
                 finalize_in_flight: false,
                 incremental_prefill_quanta_committed: 0,
                 priority: metadata.priority,
-                workload_class: metadata.workload_class,
                 first_token_emitted: false,
                 paused: false,
                 last_service: 0,
@@ -2136,7 +2102,6 @@ impl Scheduler {
                 remaining_prefill_budget = remaining_prefill_budget.saturating_sub(num_tokens);
                 remaining_batch -= 1;
             }
-            prefill_admissions = prefill_admissions.saturating_add(1);
             result.total_tokens += num_tokens;
             self.record_scheduled_service(&request_id, num_tokens);
         }
@@ -2591,6 +2556,7 @@ impl Scheduler {
         state.in_flight = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_realtime_stage_outcome(
         &mut self,
         session: &SessionKey,
@@ -3405,6 +3371,7 @@ impl Scheduler {
     }
 
     /// Compatibility helper retained for existing deadline tests.
+    #[cfg(test)]
     pub(crate) fn pending_expired_cleanup_sessions(&self) -> Vec<SessionKey> {
         let mut sessions: Vec<_> = self
             .pending_releases
@@ -4222,18 +4189,6 @@ impl Scheduler {
         scale.clamp(0.40, 1.0)
     }
 
-    fn record_prefill_backoff(&mut self, original_tokens: usize, selected_tokens: usize) {
-        if original_tokens == 0 {
-            return;
-        }
-        let ratio = if selected_tokens >= original_tokens {
-            0.0
-        } else {
-            1.0 - (selected_tokens as f64 / original_tokens as f64)
-        };
-        SchedulerTelemetry::update_ewma(&mut self.telemetry.prefill_backoff_ewma, ratio, 0.25);
-    }
-
     fn update_dynamic_prefill_chunk_threshold(&mut self) {
         let base = self.config.chunked_prefill_threshold.max(32);
         let min_chunk = 32usize;
@@ -4244,11 +4199,9 @@ impl Scheduler {
             .clamp(min_chunk, max_chunk);
         let step = (base / 8).max(8);
 
-        if self.telemetry.prefill_backoff_ewma > 0.35 {
-            current = current.saturating_sub(step).max(min_chunk);
-        } else if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 1.10 {
+        if self.telemetry.avg_ttft_ms > self.config.target_ttft_ms * 1.10 {
             current = current.saturating_add(step).min(max_chunk);
-        } else if self.telemetry.prefill_backoff_ewma < 0.08 {
+        } else {
             current = current.saturating_add((step / 2).max(4)).min(max_chunk);
         }
 

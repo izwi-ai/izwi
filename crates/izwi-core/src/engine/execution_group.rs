@@ -320,6 +320,7 @@ impl Drop for PhysicalTaskDrainRegistration {
 }
 
 impl PreparedEngineStep {
+    #[cfg(test)]
     pub(super) fn new(
         executor: UnifiedExecutor,
         dispatches: Vec<PreparedPhysicalDispatch>,
@@ -483,7 +484,6 @@ pub(super) struct ExecutedPhysicalBatch {
     pub(super) physical_batch: PhysicalBatch,
     pub(super) report: PhysicalBatchReport,
     pub(super) results: Vec<ExecutorStepResult>,
-    #[allow(dead_code)]
     pub(super) managed_cache_reservations: Vec<super::ManagedCacheReservation>,
 }
 

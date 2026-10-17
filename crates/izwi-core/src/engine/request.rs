@@ -789,6 +789,7 @@ pub(super) struct StreamBindingGuard {
 }
 
 impl StreamStagingBuffer {
+    #[cfg(test)]
     pub(super) fn clear(&self) -> Result<()> {
         let mut state = self
             .state
@@ -1336,7 +1337,6 @@ pub struct EngineCoreRequest {
     /// Backpressure behavior for streaming output.
     pub stream_policy: EngineStreamPolicy,
     /// Channel for streaming output (internal use)
-    #[allow(dead_code)]
     pub(crate) streaming_tx: Option<mpsc::Sender<StreamingOutput>>,
     /// Cooperative cancellation signal set without waiting for the core write lock.
     pub(crate) cancellation: Option<Arc<AtomicBool>>,
@@ -1359,6 +1359,7 @@ impl EngineCoreRequest {
         self.realtime_asr_ingress.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn install_realtime_asr_operation(
         &self,
         operation_id: RealtimeOperationId,
@@ -3470,6 +3471,7 @@ impl EngineCoreRequest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn prepared_asr_encoder_artifact_retained_bytes(&self) -> Result<u64> {
         self.prepared_asr_encoder_artifact
             .as_ref()
@@ -5421,6 +5423,7 @@ impl EngineCoreRequest {
         self.v2_state_descriptor.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) fn v2_state_fingerprint(&self) -> Option<[u8; 32]> {
         self.v2_state_fingerprint
     }
@@ -5618,6 +5621,7 @@ impl EngineCoreRequest {
         std::mem::take(&mut state.audio_credits)
     }
 
+    #[cfg(test)]
     pub(super) fn begin_stream_staging(&self) -> Result<()> {
         self.stream_staging.clear()
     }
@@ -5940,139 +5944,51 @@ impl RequestProcessor {
 }
 
 /// Builder for creating requests with a fluent API.
+#[cfg(test)]
 pub struct RequestBuilder {
     request: EngineCoreRequest,
 }
 
+#[cfg(test)]
 impl RequestBuilder {
     /// Create a new TTS request builder.
+    #[cfg(test)]
     pub fn tts(text: impl Into<String>) -> Self {
         Self {
             request: EngineCoreRequest::tts(text),
         }
     }
 
-    /// Create a new ASR request builder.
-    pub fn asr(audio_base64: impl Into<String>) -> Self {
-        Self {
-            request: EngineCoreRequest::asr(audio_base64),
-        }
-    }
-
-    /// Create a new ASR request builder from audio bytes.
-    pub fn asr_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
-        Self {
-            request: EngineCoreRequest::asr_bytes(audio_bytes),
-        }
-    }
-
-    /// Create a new chat request builder.
-    pub fn chat(messages: Vec<ChatMessage>) -> Self {
-        Self {
-            request: EngineCoreRequest::chat(messages),
-        }
-    }
-
-    /// Create a new speech-to-speech request builder.
-    pub fn speech_to_speech(audio_base64: impl Into<String>) -> Self {
-        Self {
-            request: EngineCoreRequest::speech_to_speech(audio_base64),
-        }
-    }
-
-    /// Create a new speech-to-speech request builder from audio bytes.
-    pub fn speech_to_speech_bytes(audio_bytes: impl Into<Vec<u8>>) -> Self {
-        Self {
-            request: EngineCoreRequest::speech_to_speech_bytes(audio_bytes),
-        }
-    }
-
-    /// Set the request ID.
-    pub fn id(mut self, id: impl Into<String>) -> Self {
-        self.request.id = id.into();
-        self
-    }
-
-    /// Set model variant.
-    pub fn model_variant(mut self, model_variant: ModelVariant) -> Self {
-        self.request.model_variant = Some(model_variant);
-        self
-    }
-
     /// Set the voice.
+    #[cfg(test)]
     pub fn voice(mut self, voice: impl Into<String>) -> Self {
         self.request.params.voice = Some(voice.into());
         self
     }
 
-    /// Set the speaker (alias for voice).
-    pub fn speaker(mut self, speaker: impl Into<String>) -> Self {
-        self.request.params.speaker = Some(speaker.into());
-        self
-    }
-
-    /// Set reference audio and text for voice cloning.
-    pub fn reference(mut self, audio: impl Into<String>, text: impl Into<String>) -> Self {
-        self.request.reference_audio = Some(audio.into());
-        self.request.reference_text = Some(text.into());
-        self
-    }
-
-    /// Set voice description.
-    pub fn voice_description(mut self, description: impl Into<String>) -> Self {
-        self.request.voice_description = Some(description.into());
-        self
-    }
-
     /// Set temperature.
+    #[cfg(test)]
     pub fn temperature(mut self, temp: f32) -> Self {
         self.request.params.temperature = temp;
         self
     }
 
-    /// Set top_p.
-    pub fn top_p(mut self, p: f32) -> Self {
-        self.request.params.top_p = p;
-        self
-    }
-
-    /// Set top_k.
-    pub fn top_k(mut self, k: usize) -> Self {
-        self.request.params.top_k = k;
-        self
-    }
-
     /// Set max tokens.
+    #[cfg(test)]
     pub fn max_tokens(mut self, max: usize) -> Self {
         self.request.params.max_tokens = max;
         self
     }
 
-    /// Set audio temperature.
-    pub fn audio_temperature(mut self, temp: f32) -> Self {
-        self.request.params.audio_temperature = Some(temp);
-        self
-    }
-
-    /// Set audio top_k.
-    pub fn audio_top_k(mut self, k: usize) -> Self {
-        self.request.params.audio_top_k = Some(k);
-        self
-    }
-
-    /// Set priority.
-    pub fn priority(mut self, priority: Priority) -> Self {
-        self.request.priority = priority;
-        self
-    }
-
     /// Set workload class.
+    #[cfg(test)]
     pub fn workload_class(mut self, workload_class: WorkloadClass) -> Self {
         self.request.workload_class = workload_class;
         self
     }
 
     /// Enable streaming.
+    #[cfg(test)]
     pub fn streaming(mut self) -> Self {
         self.request.streaming = true;
         if self.request.workload_class == WorkloadClass::Online {
@@ -6081,60 +5997,8 @@ impl RequestBuilder {
         self
     }
 
-    /// Set audio input (for ASR/chat).
-    pub fn audio_input(mut self, audio: impl Into<String>) -> Self {
-        self.request.audio_input = Some(audio.into());
-        self.request.audio_bytes = None;
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set audio input bytes for first-party ASR/speech routes.
-    pub fn audio_bytes(mut self, audio: impl Into<Vec<u8>>) -> Self {
-        self.request.audio_bytes = Some(audio.into());
-        self.request.audio_input = None;
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set text input (for chat).
-    pub fn text_input(mut self, text: impl Into<String>) -> Self {
-        self.request.text = Some(text.into());
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set chat messages.
-    pub fn chat_messages(mut self, messages: Vec<ChatMessage>) -> Self {
-        self.request.chat_messages = Some(messages);
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set language hint.
-    pub fn language(mut self, language: impl Into<String>) -> Self {
-        self.request.language = Some(language.into());
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set ASR initial prompt/context hint.
-    pub fn asr_prompt(mut self, prompt: impl Into<String>) -> Self {
-        let prompt = prompt.into();
-        let trimmed = prompt.trim();
-        self.request.asr_prompt = (!trimmed.is_empty()).then_some(trimmed.to_string());
-        self.request.sync_task_from_fields();
-        self
-    }
-
-    /// Set speech-to-speech system prompt.
-    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.request.system_prompt = Some(prompt.into());
-        self.request.sync_task_from_fields();
-        self
-    }
-
     /// Build the request.
+    #[cfg(test)]
     pub fn build(mut self) -> EngineCoreRequest {
         self.request.sync_task_from_fields();
         self.request

@@ -242,10 +242,6 @@ pub struct EngineCoreConfig {
     #[serde(default = "default_num_codebooks")]
     pub num_codebooks: usize,
 
-    /// Chunk size for streaming output (samples)
-    #[serde(default = "default_streaming_chunk_size")]
-    pub streaming_chunk_size: usize,
-
     /// Selected backend for execution and device policy.
     #[serde(default = "default_backend_kind")]
     pub backend: BackendKind,
@@ -487,9 +483,6 @@ fn default_sample_rate() -> u32 {
 fn default_num_codebooks() -> usize {
     8
 }
-fn default_streaming_chunk_size() -> usize {
-    4800
-} // 200ms at 24kHz
 
 fn default_backend_kind() -> BackendKind {
     BackendRouter::resolve_context(
@@ -691,7 +684,6 @@ impl Default for EngineCoreConfig {
             chunked_prefill_threshold: default_chunked_prefill_threshold(),
             sample_rate: default_sample_rate(),
             num_codebooks: default_num_codebooks(),
-            streaming_chunk_size: default_streaming_chunk_size(),
             backend: default_backend_kind(),
             num_threads: default_num_threads(),
             enable_preemption: default_enable_preemption(),

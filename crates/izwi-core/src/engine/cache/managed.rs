@@ -442,7 +442,7 @@ struct PendingPrefixCommit {
 /// device pages. At commit the device pages publish into the prefix index and
 /// the host entries are reclaimed; on abort the record drops and the host
 /// entries stay valid. `blocks` are the device pages the bytes were restored
-/// into, `digests`/`slots` the host identities they came from, all in chain
+/// into, `digests` the host identities they came from, all in chain
 /// order starting at the device match boundary.
 #[derive(Clone)]
 struct PendingPrefixPromotion {
@@ -451,7 +451,6 @@ struct PendingPrefixPromotion {
     device_end_tokens: u32,
     blocks: Vec<crate::kv::CacheBlockRef>,
     digests: Vec<[u8; 32]>,
-    slots: Vec<usize>,
     latency_ns: u64,
 }
 
@@ -842,6 +841,7 @@ impl ManagedKvCacheManager {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_prefix_cache_salt(
         resource_authority: Option<Arc<ResourceAuthority>>,
         salt: Option<[u8; 32]>,
@@ -910,6 +910,7 @@ impl ManagedKvCacheManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn telemetry_snapshot(&self) -> ManagedKvTelemetrySnapshot {
         self.telemetry.snapshot()
     }
@@ -1181,30 +1182,6 @@ impl ManagedKvCacheManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn bind_model_state(
-        &mut self,
-        model_instance: ModelInstanceId,
-        backend: BackendKind,
-        capacity_pages: usize,
-        page_tokens_hint: usize,
-        contract: &InferenceStateContract,
-    ) -> Result<Arc<ManagedKvModelRuntime>> {
-        let capacity_pages = u32::try_from(capacity_pages)
-            .map_err(|_| Error::InvalidInput("managed KV page capacity exceeds u32".to_string()))?;
-        self.bind_model_state_with_capacity(
-            model_instance,
-            backend,
-            ManagedStateCapacityRequest {
-                total_paged_pages: capacity_pages,
-                logical_token_reach: None,
-                retained_sequence_rows: capacity_pages,
-                staged_transaction_rows: capacity_pages,
-            },
-            page_tokens_hint,
-            contract,
-        )
-    }
-
     pub(crate) fn bind_request_with_capacity(
         &mut self,
         model_instance: ModelInstanceId,
@@ -1611,6 +1588,7 @@ impl ManagedKvCacheManager {
 
     /// Resolve an arena runtime that was allocated by model loading. Request
     /// admission must never create backing storage or expand model residency.
+    #[cfg(test)]
     pub(crate) fn require_loaded_runtime(
         &self,
         model_instance: ModelInstanceId,
@@ -1642,6 +1620,7 @@ impl ManagedKvCacheManager {
         Ok(Some(state.runtime.clone()))
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &mut self,
         runtime: &ManagedKvModelRuntime,
@@ -1813,6 +1792,7 @@ impl ManagedKvCacheManager {
 
     /// Incremental admission is only safe for execution adapters that can
     /// replay an already-streamed request after capacity preemption.
+    #[cfg(test)]
     pub(crate) fn prepare_incremental(
         &mut self,
         runtime: &ManagedKvModelRuntime,
@@ -3662,6 +3642,7 @@ pub(super) fn managed_device_ordinal(device: &Device) -> Option<u32> {
 
 // Kept crate-visible so model-owned contract tests can run the exact shared
 // capacity planner without allocating a backend arena.
+#[cfg(test)]
 pub(crate) fn plan_managed_state_capacity(
     state_plan: &ResolvedStatePlan,
     model_instance: ModelInstanceId,
@@ -4221,6 +4202,7 @@ fn cuda_resident_geometry(
 /// paged arenas. Every arena may already be at its final steady backing when
 /// another arena grows, but only the arena currently being replaced retains an
 /// additional old backing alongside its target allocation.
+#[cfg(test)]
 fn cuda_contiguous_replacement_required_bytes(
     tokens: u64,
     paged: &[CudaContiguousPagedGeometry],
@@ -4318,6 +4300,7 @@ fn fit_cuda_resident_token_reach(
     Ok(low)
 }
 
+#[cfg(test)]
 fn fit_cuda_contiguous_token_reach(
     maximum_tokens: u64,
     minimum_page_tokens: u32,
@@ -5101,7 +5084,6 @@ fn promote_host_tail(
         device_end_tokens: tail.device_end_tokens,
         blocks: blocks[..copy.restored_pages].to_vec(),
         digests: tail.digests[..copy.restored_pages].to_vec(),
-        slots: tail.slots[..copy.restored_pages].to_vec(),
         latency_ns: copy.latency_ns,
     });
     PromotedTail {

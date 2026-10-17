@@ -1604,12 +1604,14 @@ pub(super) trait PhysicalExecutionInputs: Send + 'static {
 }
 
 /// Copied inputs for the compatibility entry point.
+#[cfg(test)]
 struct OwnedPhysicalExecution {
     batch: PhysicalBatch,
     requests: Vec<EngineCoreRequest>,
     scheduled: Vec<ScheduledRequest>,
 }
 
+#[cfg(test)]
 impl PhysicalExecutionInputs for OwnedPhysicalExecution {
     fn with_execution<R>(&self, run: impl FnOnce(PhysicalBatchExecution<'_>) -> R) -> R {
         let requests = self.requests.iter().collect::<Vec<_>>();
@@ -2000,10 +2002,6 @@ impl<'a, T> ExecutorStateLease<'a, T> {
 
     fn state(&self) -> Option<&T> {
         self.state.as_ref()
-    }
-
-    fn state_mut(&mut self) -> Option<&mut T> {
-        self.state.as_mut()
     }
 
     fn require_state_mut(&mut self) -> Result<&mut T> {
@@ -2667,6 +2665,7 @@ impl NativeExecutor {
     }
 
     /// Create a new native executor.
+    #[cfg(test)]
     pub fn new(config: WorkerConfig) -> Self {
         Self::with_realtime_coordinators(
             config,
@@ -4446,6 +4445,7 @@ impl UnifiedExecutor {
 
     /// Compatibility boundary for callers that do not need to interpose
     /// workspace admission between physical admission and device entry.
+    #[cfg(test)]
     pub async fn execute_physical_batch(
         &self,
         batch: &PhysicalBatch,
@@ -4541,6 +4541,7 @@ impl UnifiedExecutor {
     }
 
     /// Check if ready.
+    #[cfg(test)]
     pub async fn is_ready(&self) -> bool {
         if self
             .physical_execution_admission
@@ -4581,14 +4582,6 @@ impl UnifiedExecutor {
             }
             None => Ok(work(self.inner.read().await.as_ref())),
         }
-    }
-
-    /// Cleanup transient backend state for a completed/aborted request.
-    pub async fn cleanup_request(&self, request_id: &str) -> CacheReleaseReport {
-        let request_id = request_id.to_string();
-        self.on_device(move |executor| executor.cleanup_request(&request_id))
-            .await
-            .unwrap_or_else(|_| CacheReleaseReport::unconfirmed())
     }
 
     pub(crate) async fn suspend_session_for_capacity(
@@ -4732,12 +4725,7 @@ fn cleanup_session_state_locked<T>(
     }
 }
 
-/// Decode base64-encoded audio to samples.
-pub fn decode_audio_base64(audio_b64: &str, _sample_rate: u32) -> Result<Vec<f32>> {
-    let (samples, _) = decode_audio_base64_with_rate(audio_b64)?;
-    Ok(samples)
-}
-
+#[cfg(test)]
 fn decode_audio_base64_with_rate(audio_b64: &str) -> Result<(Vec<f32>, u32)> {
     audio::decode_audio_base64_with_rate(audio_b64)
 }

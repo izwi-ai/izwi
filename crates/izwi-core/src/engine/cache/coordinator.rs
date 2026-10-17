@@ -159,6 +159,7 @@ impl TerminalTransactionHistory {
                 .is_some_and(|high| txn_id <= high)
     }
 
+    #[cfg(test)]
     fn state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
         self.states.get(&txn_id).copied()
     }
@@ -407,10 +408,6 @@ impl KvCacheCoordinator {
         }
     }
 
-    pub fn arena(&self) -> KvArenaId {
-        self.arena
-    }
-
     pub fn register_table(
         &mut self,
         session: SessionKey,
@@ -453,6 +450,7 @@ impl KvCacheCoordinator {
             .ok_or(KvCoordinatorError::MissingTable)
     }
 
+    #[cfg(test)]
     pub fn transaction_state(&self, txn_id: PlanId) -> Option<KvTransactionState> {
         self.transactions.get(&txn_id).map(|txn| txn.state)
     }
@@ -460,6 +458,7 @@ impl KvCacheCoordinator {
     /// Returns the exact disposition when `txn_id` remains in the bounded
     /// diagnostic window. `None` does not prove that the transaction was never
     /// completed; stale-ID rejection is retained independently.
+    #[cfg(test)]
     pub fn terminal_state(&self, txn_id: PlanId) -> Option<KvTerminalState> {
         self.terminal_transactions.state(txn_id)
     }
@@ -1007,6 +1006,7 @@ impl KvCacheCoordinator {
     }
 
     /// CAS the expected table version and atomically publish optional full pages.
+    #[cfg(test)]
     pub fn commit(
         &mut self,
         txn_id: PlanId,
@@ -1018,6 +1018,7 @@ impl KvCacheCoordinator {
     /// CAS the table and apply prefix-index ownership changes as one metadata
     /// transaction. Callers stage their index mutation first and make it
     /// visible only after this method succeeds.
+    #[cfg(test)]
     pub fn commit_with_prefix_updates(
         &mut self,
         txn_id: PlanId,
@@ -1314,20 +1315,7 @@ impl KvCacheCoordinator {
         Ok(())
     }
 
-    /// Add a durable prefix-index reference to a committed page.
-    pub fn retain_prefix(&mut self, block: CacheBlockRef) -> KvCoordinatorResult<()> {
-        self.validate_block(block, None)?;
-        let slot = &mut self.slots[block.index as usize];
-        if slot.table_refs == 0 && slot.prefix_refs == 0 {
-            return Err(KvCoordinatorError::UnpublishedPrefix);
-        }
-        if slot.prefix_refs == 0 && (slot.writer.is_some() || slot.reservations != 0) {
-            return Err(KvCoordinatorError::WriteConflict);
-        }
-        slot.prefix_refs += 1;
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn release_prefix(&mut self, block: CacheBlockRef) -> KvCoordinatorResult<()> {
         self.release_prefixes(&[block])
     }
@@ -1416,6 +1404,7 @@ impl KvCacheCoordinator {
     }
 
     /// Expensive internal consistency check intended for tests/shadow diagnostics.
+    #[cfg(test)]
     pub fn check_invariants(&self) -> KvCoordinatorResult<()> {
         let free = &self.free;
         if let Some(index) = free
@@ -1683,7 +1672,6 @@ mod tests {
 
     use crate::backends::kv::{CpuKvArena, KvArena, KvArenaConfig, KvLayerConfig, KvWriteArgs};
     use crate::backends::BackendKind;
-    use crate::engine::cache::window::advance_window;
     use crate::engine::ModelInstanceId;
     use crate::kv::{KvLayerBinding, KvSlotRef};
 
@@ -2522,13 +2510,13 @@ mod tests {
         reserve_fresh(&mut coordinator, 110, initial, 3, 10);
         let initial_pages = prepare_and_complete(&mut coordinator, 110).writable_blocks;
         let committed = coordinator.commit(110, &[]).unwrap();
-        let advanced = advance_window(&initial_pages, 0, 5, 10, 4).unwrap();
+        // Start 5 of 10 tokens in 4-token pages hides only page 0.
         coordinator
             .reserve_window(KvWindowReserveRequest {
                 txn_id: 111,
                 expected: committed,
                 target_committed_tokens: 10,
-                target_window_start: advanced.window_start,
+                target_window_start: 5,
                 page_tokens: 4,
             })
             .unwrap();
@@ -2543,11 +2531,11 @@ mod tests {
             .unwrap();
         let trimmed = coordinator.commit(111, &[]).unwrap();
         assert_eq!(trimmed.window_start, 5);
-        assert_eq!(trimmed.groups[0].blocks, advanced.visible_blocks);
+        assert_eq!(trimmed.groups[0].blocks, initial_pages[1..]);
         assert_eq!(coordinator.stats().allocated_pages, 2);
         assert_eq!(coordinator.stats().table_refs, 2);
         assert_eq!(
-            coordinator.pin_transfer(&[advanced.released_blocks[0]]),
+            coordinator.pin_transfer(&[initial_pages[0]]),
             Err(KvCoordinatorError::StaleBlock)
         );
         coordinator.check_invariants().unwrap();

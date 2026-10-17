@@ -62,13 +62,14 @@ use super::scheduler::{
     BeginTerminalRelease, ExecutionLane, LaneScope, LaneSelection, Scheduler, SchedulerConfig,
     TerminalReleaseCause,
 };
-use super::types::{
-    AudioOutput, EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId,
-};
+use super::types::{EngineOutput, FinishReason as OutputFinishReason, LatencyBreakdown, RequestId};
 use super::{ResourceAmount, ResourceVector};
 use crate::backends::BackendKind;
 use crate::error::{Error, Result};
 use crate::model::ModelVariant;
+
+#[cfg(test)]
+use super::types::AudioOutput;
 
 #[derive(Debug, Clone, Default)]
 struct RequestPhaseTiming {
@@ -1551,6 +1552,7 @@ impl EngineCore {
     /// Roll back every registered physical ticket. The main engine driver uses
     /// this hook when a prepared dispatch can no longer produce a completion
     /// (for example, a cancelled/join-failed runner task).
+    #[cfg(test)]
     pub(super) fn rollback_all_in_flight_dispatches(&mut self) -> usize {
         let batch_ids = self
             .in_flight_dispatches
@@ -3661,6 +3663,7 @@ impl EngineCore {
         Ok(prepared)
     }
 
+    #[cfg(test)]
     fn merge_audio_output(
         existing: Option<AudioOutput>,
         current: Option<AudioOutput>,
@@ -3705,6 +3708,7 @@ impl EngineCore {
         }
     }
 
+    #[cfg(test)]
     fn merge_executor_output(
         existing: Option<ExecutorOutput>,
         current: ExecutorOutput,
@@ -3788,6 +3792,7 @@ impl EngineCore {
         )
     }
 
+    #[cfg(test)]
     fn new_with_executor(config: EngineCoreConfig, executor: UnifiedExecutor) -> Result<Self> {
         Self::new_with_executor_and_managed_authority(config, executor, None, None)
     }
@@ -3810,8 +3815,7 @@ impl EngineCore {
         let scheduler = Scheduler::new(scheduler_config);
 
         // Create output processor
-        let output_processor =
-            OutputProcessor::new(config.sample_rate).with_chunk_size(config.streaming_chunk_size);
+        let output_processor = OutputProcessor::new(config.sample_rate);
         let managed_prefix_salt = config
             .enable_prefix_caching
             .then_some(config.managed_prefix_cache_salt.as_deref())
@@ -4104,6 +4108,7 @@ impl EngineCore {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub(crate) async fn enqueue_realtime_asr_push(
         &mut self,
         session: &super::SessionKey,
@@ -4180,21 +4185,6 @@ impl EngineCore {
                 )))
             }
         }
-    }
-
-    pub(crate) async fn enqueue_realtime_asr_finish(
-        &mut self,
-        session: &super::SessionKey,
-        max_output_steps: usize,
-        max_cache_append: usize,
-    ) -> Result<(super::RealtimeOperationId, RealtimeAsrOperationWaiter)> {
-        self.enqueue_realtime_asr_finish_with_cost(
-            session,
-            max_output_steps,
-            max_cache_append,
-            WorkCost::new(1, 1, 0),
-        )
-        .await
     }
 
     pub(crate) async fn enqueue_realtime_asr_finish_with_cost(
@@ -6262,6 +6252,7 @@ impl EngineCore {
     /// Allocate and admit physical KV backing while the authoritative model
     /// generation is still Loading. Ready publication happens only after this
     /// succeeds, and request admission performs lookup only.
+    #[cfg(test)]
     pub(crate) fn load_managed_model_cache(
         &mut self,
         model_instance: super::ModelInstanceId,

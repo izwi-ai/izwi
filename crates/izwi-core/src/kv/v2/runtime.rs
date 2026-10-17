@@ -2960,9 +2960,7 @@ mod tests {
         let completions = leases.release().unwrap();
         assert_eq!(completions.len(), 2);
         assert!(completions.iter().all(|completion| {
-            completion.stage == stage
-                && completion.domain == completion.physical.slot.pool.domain
-                && completion.physical.writes.is_empty()
+            completion.stage == stage && completion.domain == completion.physical.slot.pool.domain
         }));
     }
 

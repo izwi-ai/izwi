@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::models::registry::{
@@ -16,12 +15,7 @@ use super::super::types::AudioOutput;
 use super::super::SessionKey;
 use super::state::ActiveChatDecode;
 use super::stop_sequences::StopSequenceFilter;
-use super::{
-    ExecutorOutput, ExecutorPhaseTiming, ExecutorStateLease, ModelSessionResult, NativeExecutor,
-};
-
-const FALLBACK_CHAT_STREAM_BATCH_PIECES: usize = 4;
-const FALLBACK_CHAT_STREAM_BATCH_BYTES: usize = 32;
+use super::{ExecutorOutput, ExecutorStateLease, ModelSessionResult, NativeExecutor};
 
 fn begins_resumable_prefill_state(
     scheduled: &ScheduledRequest,
@@ -85,13 +79,6 @@ fn resumable_prefill_span(
     Ok((start, end))
 }
 
-#[derive(Debug, Default)]
-struct StreamDeltaBatch {
-    emitted_first: bool,
-    pending: String,
-    pending_pieces: usize,
-}
-
 struct ContinuousChatStateBatch<'a> {
     rows: Vec<(
         usize,
@@ -148,40 +135,6 @@ impl Drop for ContinuousChatStateBatch<'_> {
         // Dropping each lease restores clean/rolled-back rows and poisons any
         // row whose physical mutation could not be rolled back.
         self.rows.clear();
-    }
-}
-
-impl StreamDeltaBatch {
-    fn push(&mut self, delta: &str) -> Option<String> {
-        if delta.is_empty() {
-            return None;
-        }
-        if !self.emitted_first {
-            self.emitted_first = true;
-            return Some(delta.to_string());
-        }
-
-        self.pending.push_str(delta);
-        self.pending_pieces += 1;
-        if self.pending_pieces >= FALLBACK_CHAT_STREAM_BATCH_PIECES
-            || self.pending.len() >= FALLBACK_CHAT_STREAM_BATCH_BYTES
-            || delta.ends_with('\n')
-        {
-            return self.take_pending();
-        }
-        None
-    }
-
-    fn finish(&mut self) -> Option<String> {
-        self.take_pending()
-    }
-
-    fn take_pending(&mut self) -> Option<String> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        self.pending_pieces = 0;
-        Some(std::mem::take(&mut self.pending))
     }
 }
 
@@ -371,115 +324,6 @@ impl NativeExecutor {
                 "managed Qwen3.8 MTP cache was routed to another model family".into(),
             ));
         }
-        // Fallback path for chat backends that do not expose incremental decode state.
-        if !model.supports_incremental_decode() {
-            if StopSequenceFilter::new(&request.params.stop_sequences).is_some() {
-                return Err(Error::InvalidInput(format!(
-                    "Chat model {variant} does not support stop strings"
-                )));
-            }
-            let mut phase_timing_override: Option<ExecutorPhaseTiming> = None;
-            let output = Self::run_blocking(|| {
-                let generation_started = Instant::now();
-                let mut first_output_ms_since_start: Option<f64> = None;
-                let mut sequence = 0usize;
-                let mut stream_err: Option<Error> = None;
-                let mut stream_batch = StreamDeltaBatch::default();
-                let mut streamed_text = String::new();
-
-                let mut emit = |delta: &str| {
-                    if first_output_ms_since_start.is_none() && !delta.is_empty() {
-                        first_output_ms_since_start =
-                            Some(generation_started.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    if let Some(tx) = stream_tx.as_ref() {
-                        if stream_err.is_none() {
-                            streamed_text.push_str(delta);
-                            if let Some(chunk) = stream_batch.push(delta) {
-                                if let Err(err) = Self::stream_text_with_policy(
-                                    tx,
-                                    stream_policy,
-                                    &request.id,
-                                    &mut sequence,
-                                    chunk,
-                                ) {
-                                    stream_err = Some(err);
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let mut output = model.generate_with_callback_and_config(
-                    messages,
-                    max_new_tokens,
-                    &generation_config,
-                    &mut emit,
-                )?;
-
-                if let Some(tx) = stream_tx.as_ref() {
-                    if stream_err.is_none() {
-                        if let Some(chunk) = stream_batch.finish() {
-                            if let Err(err) = Self::stream_text_with_policy(
-                                tx,
-                                stream_policy,
-                                &request.id,
-                                &mut sequence,
-                                chunk,
-                            ) {
-                                stream_err = Some(err);
-                            }
-                        }
-                    }
-                }
-                if let Some(err) = stream_err {
-                    return Err(err);
-                }
-                if let Some(tx) = stream_tx.as_ref() {
-                    Self::stream_final_marker_with_policy(
-                        tx,
-                        stream_policy,
-                        &request.id,
-                        &mut sequence,
-                    )?;
-                    output.text = canonical_chat_terminal_text(&streamed_text, output.text);
-                }
-
-                let total_ms = generation_started.elapsed().as_secs_f64() * 1000.0;
-                let prefill_ms = first_output_ms_since_start.unwrap_or(total_ms);
-                let decode_ms = (total_ms - prefill_ms).max(0.0);
-                let decode_steps = if decode_ms > 0.0 {
-                    u32::try_from(output.tokens_generated.max(1)).unwrap_or(u32::MAX)
-                } else {
-                    0
-                };
-                phase_timing_override = Some(ExecutorPhaseTiming {
-                    prefill_ms: Some(prefill_ms.max(0.0)),
-                    decode_ms: Some(decode_ms),
-                    first_output_ms_since_start,
-                    prefill_steps: Some(1),
-                    decode_steps: Some(decode_steps),
-                    ..ExecutorPhaseTiming::default()
-                });
-
-                Ok(output)
-            })?;
-
-            return Ok(ModelSessionResult::atomic(ExecutorOutput {
-                request_id: request.id.clone(),
-                audio: Some(AudioOutput::empty(24_000)),
-                text: Some(output.text),
-                input_transcription: None,
-                tokens_processed: request.num_prompt_tokens(),
-                tokens_generated: output.tokens_generated.max(1),
-                finished: true,
-                phase_timing_override,
-                asr_diagnostics: None,
-                error: None,
-                logprobs: Vec::new(),
-            }));
-        }
-
         // Prefill scheduling can happen after preemption; only recover state
         // owned by this exact request incarnation. The in-flight marker remains
         // visible to cleanup until this quantum is committed or released.
@@ -892,18 +736,6 @@ impl NativeExecutor {
             logprobs: terminal_logprobs,
         })
         .with_managed_cache_completions(managed_cache_completions))
-    }
-
-    pub(super) fn chat_decode_batch(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ModelSessionResult>> {
-        self.chat_decode_batch_with_managed(
-            requests,
-            scheduled,
-            (0..scheduled.len()).map(|_| None).collect(),
-        )
     }
 
     pub(super) fn chat_decode_batch_with_managed(
@@ -1776,37 +1608,6 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, other);
-    }
-
-    #[test]
-    fn stream_delta_batch_emits_first_delta_immediately_then_batches() {
-        let mut batch = StreamDeltaBatch::default();
-
-        assert_eq!(batch.push("A"), Some("A".to_string()));
-        assert_eq!(batch.push("b"), None);
-        assert_eq!(batch.push("c"), None);
-        assert_eq!(batch.push("d"), None);
-        assert_eq!(batch.push("e"), Some("bcde".to_string()));
-    }
-
-    #[test]
-    fn stream_delta_batch_flushes_pending_on_finish() {
-        let mut batch = StreamDeltaBatch::default();
-
-        assert_eq!(batch.push("hello"), Some("hello".to_string()));
-        assert_eq!(batch.push(" "), None);
-        assert_eq!(batch.push("world"), None);
-        assert_eq!(batch.finish(), Some(" world".to_string()));
-        assert_eq!(batch.finish(), None);
-    }
-
-    #[test]
-    fn stream_delta_batch_flushes_on_newline_boundary() {
-        let mut batch = StreamDeltaBatch::default();
-
-        assert_eq!(batch.push("intro"), Some("intro".to_string()));
-        assert_eq!(batch.push(" line"), None);
-        assert_eq!(batch.push("\n"), Some(" line\n".to_string()));
     }
 
     #[test]

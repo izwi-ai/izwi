@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 use super::super::metrics::{
     record_engine_stream_backpressure, record_engine_stream_delivery_failure,
@@ -533,6 +533,7 @@ impl NativeExecutor {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -604,6 +605,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text_per_character(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -619,6 +621,7 @@ impl NativeExecutor {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn stream_text_per_character_with_policy(
         tx: &StreamStagingBuffer,
         policy: StreamBackpressurePolicy,
@@ -636,6 +639,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_audio(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -711,6 +715,7 @@ impl NativeExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn stream_final_marker(
         tx: &StreamStagingBuffer,
         request_id: &str,
@@ -731,20 +736,6 @@ impl NativeExecutor {
         sequence: &mut usize,
     ) -> Result<()> {
         Self::stream_audio_with_policy(tx, policy, request_id, sequence, Vec::new(), 0, true)
-    }
-}
-
-fn stream_send_error(err: mpsc::error::TrySendError<StreamingOutput>) -> Error {
-    match err {
-        mpsc::error::TrySendError::Closed(_) => {
-            Error::InferenceError("Streaming output channel closed".to_string())
-        }
-        mpsc::error::TrySendError::Full(_) => {
-            record_engine_stream_backpressure();
-            Error::InferenceError(
-                "Streaming output backpressure exceeded queue capacity".to_string(),
-            )
-        }
     }
 }
 

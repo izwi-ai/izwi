@@ -252,12 +252,9 @@ impl InvocationPagedKvPoolOwner {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> InvocationPagedKvPoolId {
         self.inner.id
-    }
-
-    pub(crate) fn workspace_domain(&self) -> &InvocationWorkspaceDomain {
-        &self.inner.workspace_domain
     }
 
     pub(crate) fn handle(&self) -> InvocationPagedKvPoolHandle {
@@ -268,6 +265,7 @@ impl InvocationPagedKvPoolOwner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn maximum_tokens_per_lease(&self) -> Result<u64> {
         u64::from(self.inner.pages_per_slot)
             .checked_mul(u64::from(self.inner.arena.config().page_tokens))
@@ -277,6 +275,7 @@ impl InvocationPagedKvPoolOwner {
     /// Acquire, zero, and fence one fixed page range before exposing it as a
     /// model-facing physical cache. A failed zero/fence returns the exact slot
     /// generation to the pool without exposing partially scrubbed storage.
+    #[cfg(test)]
     pub(crate) fn lease(&self) -> Result<InvocationPagedKvLease> {
         lease_from_inner(self.inner.clone())
     }
@@ -287,6 +286,7 @@ impl InvocationPagedKvPoolOwner {
         close_and_drain(self.inner.as_ref())
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_active_lease(&self, slot: InvocationPagedKvSlotRef) -> bool {
         contains_active_lease(self.inner.as_ref(), slot)
     }
@@ -390,6 +390,7 @@ fn lease_from_inner(inner: Arc<InvocationPagedKvPoolInner>) -> Result<Invocation
     })
 }
 
+#[cfg(test)]
 fn contains_active_lease(
     inner: &InvocationPagedKvPoolInner,
     slot: InvocationPagedKvSlotRef,
@@ -500,8 +501,8 @@ impl InvocationPagedKvLease {
             .expect("live invocation paged lease must retain its cache")
     }
 
-    /// Release the slot and return only backend-sealed write completions that
-    /// authenticate slots belonging to this exact lease generation.
+    /// Release the slot. Fails unless every backend-sealed write completion
+    /// authenticates slots belonging to this exact lease generation.
     pub(crate) fn release(mut self) -> Result<InvocationPagedKvCompletion> {
         let mut cache = self
             .cache
@@ -518,10 +519,7 @@ impl InvocationPagedKvLease {
         );
         self.released = true;
         validation?;
-        Ok(InvocationPagedKvCompletion {
-            slot: self.slot,
-            writes,
-        })
+        Ok(InvocationPagedKvCompletion { slot: self.slot })
     }
 }
 
@@ -546,7 +544,6 @@ impl Drop for InvocationPagedKvLease {
 #[derive(Debug)]
 pub(crate) struct InvocationPagedKvCompletion {
     pub(crate) slot: InvocationPagedKvSlotRef,
-    pub(crate) writes: Vec<Arc<KvWriteBatchCompletion>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -980,7 +977,6 @@ mod tests {
             .unwrap();
         lease.cache_mut().commit_prepared(prepared).unwrap();
         let completion = lease.release().unwrap();
-        assert_eq!(completion.writes.len(), 1);
         assert_eq!(completion.slot.pool, pool.id());
 
         let next = pool.lease().unwrap();
@@ -1026,10 +1022,10 @@ mod tests {
             .commit_shared_completion(0, 2, Arc::new(completion.project_slot_range(2, 2).unwrap()))
             .unwrap();
 
-        let first_completion = first.release().unwrap();
-        let second_completion = second.release().unwrap();
-        assert_eq!(first_completion.writes[0].slots(), first_slots);
-        assert_eq!(second_completion.writes[0].slots(), second_slots);
+        // Release authenticates each lease's projected completion against
+        // its own slots.
+        first.release().unwrap();
+        second.release().unwrap();
     }
 
     #[test]

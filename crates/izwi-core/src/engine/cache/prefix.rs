@@ -12,9 +12,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::telemetry::ManagedKvTelemetry;
-use crate::engine::cache::coordinator::{KvCacheCoordinator, KvCoordinatorError, KvSnapshot};
-use crate::engine::{ModelInstanceId, PlanId};
+use crate::engine::cache::coordinator::{KvCacheCoordinator, KvCoordinatorError};
+use crate::engine::ModelInstanceId;
 use crate::kv::{CacheBlockRef, KvPlanFingerprint};
+
+#[cfg(test)]
+use crate::engine::cache::coordinator::KvSnapshot;
+#[cfg(test)]
+use crate::engine::PlanId;
 
 const PREFIX_NAMESPACE_DOMAIN: &[u8] = b"izwi.kv.prefix-namespace.v1\0";
 const PREFIX_PAGE_DOMAIN: &[u8] = b"izwi.kv.prefix-page.v1\0";
@@ -152,10 +157,12 @@ impl CommittedPrefixIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -352,7 +359,6 @@ impl KvPrefixMatch {
 /// their exact identity.
 #[derive(Debug, Clone)]
 pub struct LruSubtreeView {
-    pub root_digest: [u8; 32],
     pub digests: Vec<[u8; 32]>,
     pub keys: Vec<KvPrefixPageKey>,
     pub blocks: Vec<CacheBlockRef>,
@@ -384,6 +390,7 @@ impl StagedPrefixCommit {
 }
 
 impl CoordinatedPrefixIndex {
+    #[cfg(test)]
     pub fn new(capacity_pages: usize) -> Self {
         Self::with_telemetry(capacity_pages, Arc::new(ManagedKvTelemetry::default()))
     }
@@ -399,10 +406,12 @@ impl CoordinatedPrefixIndex {
         &self.telemetry
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
@@ -414,6 +423,7 @@ impl CoordinatedPrefixIndex {
     /// Commit a written cache transaction and publish complete pages in one
     /// control-plane operation. Any validation or CAS failure leaves the live
     /// prefix index unchanged.
+    #[cfg(test)]
     pub fn commit_transaction(
         &mut self,
         coordinator: &mut KvCacheCoordinator,
@@ -597,7 +607,6 @@ impl CoordinatedPrefixIndex {
             blocks.push(block);
         }
         Some(LruSubtreeView {
-            root_digest: root,
             digests,
             keys,
             blocks,

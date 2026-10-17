@@ -1365,10 +1365,6 @@ impl BatchWorkspaceLease {
     pub fn record_materialized_usage(&self, resources: ResourceVector) -> Result<()> {
         self.lease.record_materialized_usage(resources)
     }
-
-    pub(crate) fn prepare_materialized_release(&self, resources: ResourceVector) -> Result<()> {
-        self.lease.prepare_materialized_release(resources)
-    }
 }
 
 impl ResourceLease {

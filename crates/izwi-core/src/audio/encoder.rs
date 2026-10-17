@@ -104,26 +104,3 @@ impl AudioEncoder {
         }
     }
 }
-
-/// Streaming audio chunk for real-time output
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct EncodedChunk {
-    pub data: Vec<u8>,
-    pub format: AudioFormat,
-    pub sample_count: usize,
-    pub duration_ms: f32,
-}
-
-impl EncodedChunk {
-    #[allow(dead_code)]
-    pub fn new(data: Vec<u8>, format: AudioFormat, sample_count: usize, sample_rate: u32) -> Self {
-        let duration_ms = (sample_count as f32 / sample_rate as f32) * 1000.0;
-        Self {
-            data,
-            format,
-            sample_count,
-            duration_ms,
-        }
-    }
-}

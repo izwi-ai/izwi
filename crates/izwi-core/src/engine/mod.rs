@@ -47,15 +47,14 @@ mod scheduler;
 pub mod signal_frontend;
 mod types;
 
-#[allow(unused_imports)]
 pub(crate) use cache::invocation::{
     InvocationPagedKvCompletion, InvocationPagedKvLease, InvocationPagedKvPoolHandle,
-    InvocationPagedKvPoolId, InvocationPagedKvPoolOwner, InvocationPagedKvSlotRef,
+    InvocationPagedKvPoolId,
 };
-#[allow(unused_imports)]
-pub(crate) use cache::invocation_tensor::{
-    InvocationStaticAttentionLease, InvocationTensorLease, InvocationTensorPoolHandle,
-    InvocationTensorPoolId, InvocationTensorPoolOwner, InvocationTensorSlotRef,
+pub(crate) use cache::invocation_tensor::{InvocationStaticAttentionLease, InvocationTensorLease};
+#[cfg(test)]
+pub(crate) use cache::{
+    invocation::InvocationPagedKvPoolOwner, invocation_tensor::InvocationTensorPoolOwner,
 };
 
 pub(crate) use cache::composite::{
@@ -72,11 +71,8 @@ pub use cache::managed::{
 #[cfg(test)]
 pub(crate) use cache::physical::PhysicalStateManager;
 pub(crate) use cache::physical::{RetainedTensorStateRuntimeIdV2, RetainedTensorStateRuntimeV2};
-#[allow(unused_imports)]
 pub(crate) use cache::retained_static_attention::{
-    RetainedStaticAttentionBatchRow, RetainedStaticAttentionRuntimeIdV2,
     RetainedStaticAttentionRuntimeV2, RetainedStaticAttentionSequenceId,
-    RetainedStaticAttentionTransactionId,
 };
 pub use cache::telemetry::ManagedKvTelemetrySnapshot;
 pub(crate) use config::backend_step_sizes;
@@ -696,16 +692,12 @@ pub struct Engine {
     gates: StepGates,
     /// Request processor validates and preprocesses inputs
     request_processor: RequestProcessor,
-    /// Output processor formats results for clients
-    output_processor: OutputProcessor,
     /// Configuration
     config: EngineCoreConfig,
     /// Loaded models used to prepare exact public chat prompts before admission.
     model_registry: Option<Arc<ModelRegistry>>,
     /// Bounds direct request preprocessing that runs outside Runtime admission.
     direct_request_preparation_permits: Arc<Semaphore>,
-    /// Whether the engine is running
-    running: std::sync::atomic::AtomicBool,
     /// Metrics collector
     metrics: Arc<RwLock<EngineMetrics>>,
     /// Event-driven wakeup for run-loop when new requests arrive.
@@ -1399,20 +1391,17 @@ impl Engine {
             effective_physical_execution_cap,
         );
         let request_processor = RequestProcessor::new(config.clone());
-        let output_processor = OutputProcessor::new(config.sample_rate);
         let direct_request_preparation_capacity = config.max_batch_size.max(1);
 
         Ok(Self {
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(config.lane_step_drivers),
             request_processor,
-            output_processor,
             config,
             model_registry,
             direct_request_preparation_permits: Arc::new(Semaphore::new(
                 direct_request_preparation_capacity,
             )),
-            running: std::sync::atomic::AtomicBool::new(false),
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2862,72 +2851,6 @@ impl Engine {
         }
     }
 
-    /// Run the engine continuously, processing requests as they arrive.
-    ///
-    /// This should be called in a separate task. It will run until `stop()` is called.
-    pub async fn run(&self) -> Result<()> {
-        use std::sync::atomic::Ordering;
-
-        self.running.store(true, Ordering::SeqCst);
-        info!("Engine started");
-        let mut idle_backoff_ms = 1u64;
-
-        while self.running.load(Ordering::SeqCst) {
-            // Check if there are requests to process
-            let has_work = {
-                let core = self.core.read().await;
-                core.has_pending_work() || {
-                    let audio = self
-                        .delivery_lanes
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    !audio.lanes.is_empty() || !audio.completed.is_empty()
-                }
-            };
-
-            if has_work {
-                match self.step().await {
-                    Ok(outputs) if outputs.is_empty() => {
-                        self.idle_wait(std::time::Duration::from_millis(idle_backoff_ms), None)
-                            .await;
-                        idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
-                    }
-                    Ok(_) => idle_backoff_ms = 1,
-                    Err(e) => {
-                        warn!("Engine step error: {}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(idle_backoff_ms))
-                            .await;
-                        idle_backoff_ms = idle_backoff_ms.saturating_mul(2).min(50);
-                    }
-                }
-            } else {
-                self.core.read().await.end_device_busy_period();
-                // Event-driven wait to avoid hot polling on local/edge devices.
-                tokio::select! {
-                    _ = self.wake_notify.notified() => {},
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {},
-                }
-                idle_backoff_ms = 1;
-            }
-        }
-
-        info!("Engine stopped");
-        Ok(())
-    }
-
-    /// Stop the engine.
-    pub fn stop(&self) {
-        use std::sync::atomic::Ordering;
-        self.running.store(false, Ordering::SeqCst);
-        self.wake_notify.notify_waiters();
-    }
-
-    /// Check if the engine is running.
-    pub fn is_running(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        self.running.load(Ordering::SeqCst)
-    }
-
     /// Get engine metrics.
     pub async fn metrics(&self) -> EngineMetrics {
         self.metrics.read().await.clone()
@@ -3115,47 +3038,6 @@ impl Engine {
         }
     }
 
-    /// Queue one exact source-sample interval and wait for its authoritative
-    /// commit acknowledgement. Engine stepping must be running concurrently.
-    pub(crate) async fn push_realtime_asr_samples(
-        &self,
-        handle: &RealtimeAsrSessionHandle,
-        samples: Vec<f32>,
-        sample_rate: u32,
-        max_output_steps: usize,
-        max_cache_append: usize,
-    ) -> Result<RealtimeAsrOperationAck> {
-        self.push_realtime_asr_samples_with_outputs(
-            handle,
-            samples,
-            sample_rate,
-            max_output_steps,
-            max_cache_append,
-        )
-        .await
-        .map(|(ack, _)| ack)
-    }
-
-    pub(crate) async fn push_realtime_asr_samples_with_outputs(
-        &self,
-        handle: &RealtimeAsrSessionHandle,
-        samples: Vec<f32>,
-        sample_rate: u32,
-        max_output_steps: usize,
-        max_cache_append: usize,
-    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
-        let logical_units = u64::try_from(samples.len()).unwrap_or(u64::MAX).max(1);
-        self.push_realtime_asr_samples_with_outputs_and_cost(
-            handle,
-            samples,
-            sample_rate,
-            max_output_steps,
-            max_cache_append,
-            WorkCost::new(logical_units, logical_units, 0),
-        )
-        .await
-    }
-
     pub(crate) async fn push_realtime_asr_samples_with_outputs_and_cost(
         &self,
         handle: &RealtimeAsrSessionHandle,
@@ -3187,33 +3069,6 @@ impl Engine {
             .await
     }
 
-    /// Fence input and wait until the exact finish operation commits.
-    pub(crate) async fn finish_realtime_asr_session(
-        &self,
-        handle: &RealtimeAsrSessionHandle,
-        max_output_steps: usize,
-        max_cache_append: usize,
-    ) -> Result<RealtimeAsrOperationAck> {
-        self.finish_realtime_asr_session_with_outputs(handle, max_output_steps, max_cache_append)
-            .await
-            .map(|(ack, _)| ack)
-    }
-
-    pub(crate) async fn finish_realtime_asr_session_with_outputs(
-        &self,
-        handle: &RealtimeAsrSessionHandle,
-        max_output_steps: usize,
-        max_cache_append: usize,
-    ) -> Result<(RealtimeAsrOperationAck, Vec<StreamingOutput>)> {
-        self.finish_realtime_asr_session_with_outputs_and_cost(
-            handle,
-            max_output_steps,
-            max_cache_append,
-            WorkCost::new(1, 1, 0),
-        )
-        .await
-    }
-
     pub(crate) async fn finish_realtime_asr_session_with_outputs_and_cost(
         &self,
         handle: &RealtimeAsrSessionHandle,
@@ -3239,14 +3094,6 @@ impl Engine {
         self.wake_notify.notify_one();
         self.await_realtime_asr_operation_with_outputs(handle, operation_id, waiter)
             .await
-    }
-
-    /// Abort only the exact session incarnation carried by this handle.
-    pub(crate) async fn abort_realtime_asr_session(
-        &self,
-        handle: &RealtimeAsrSessionHandle,
-    ) -> Result<bool> {
-        self.abort_request_session(&handle.session).await
     }
 
     /// Begin exact-session cleanup and return proof that executor and managed
@@ -3417,6 +3264,7 @@ impl Engine {
 
     /// Admit and allocate managed physical state before the model generation
     /// becomes Ready.
+    #[cfg(test)]
     pub(crate) async fn load_managed_model_cache(
         &self,
         model_instance: ModelInstanceId,
@@ -4417,13 +4265,11 @@ mod tests {
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(config.lane_step_drivers),
             request_processor: RequestProcessor::new(config.clone()),
-            output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(
                 config.max_batch_size.max(1),
             )),
             config,
             model_registry: None,
-            running: std::sync::atomic::AtomicBool::new(false),
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5805,11 +5651,9 @@ mod tests {
             core: Arc::new(RwLock::new(core)),
             gates: StepGates::new(false),
             request_processor: RequestProcessor::new(config.clone()),
-            output_processor: OutputProcessor::new(config.sample_rate),
             direct_request_preparation_permits: Arc::new(Semaphore::new(2)),
             config,
             model_registry: None,
-            running: std::sync::atomic::AtomicBool::new(false),
             metrics: Arc::new(RwLock::new(EngineMetrics::default())),
             wake_notify: Arc::new(Notify::new()),
             request_controls: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -5911,63 +5755,6 @@ mod tests {
         assert!(slow_still_active);
         assert!(fast_cleaned);
         drop((slow_registration, fast_registration));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_routes_scalar_terminal_outputs_to_registered_mailboxes() {
-        let max_batch_width = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let engine = Arc::new(engine_with_test_executor(Box::new(
-            ImmediateTerminalExecutor::new(max_batch_width.clone()),
-        )));
-        let first_request = immediate_terminal_request("run-first");
-        let second_request = immediate_terminal_request("run-second");
-
-        let (first_registration, first_completion) = engine
-            .register_completion_mailbox(first_request.id.clone())
-            .unwrap();
-        engine
-            .add_request_with_completion(first_request, Some(first_registration.registration_id))
-            .await
-            .unwrap();
-        let (second_registration, second_completion) = engine
-            .register_completion_mailbox(second_request.id.clone())
-            .unwrap();
-        engine
-            .add_request_with_completion(second_request, Some(second_registration.registration_id))
-            .await
-            .unwrap();
-
-        let run_engine = engine.clone();
-        let runner = tokio::spawn(async move { run_engine.run().await });
-        let (first, second) = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
-            tokio::join!(first_completion, second_completion)
-        })
-        .await
-        .expect("run loop did not route both completions");
-        engine.stop();
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), runner)
-            .await
-            .expect("run loop did not stop")
-            .expect("run task panicked")
-            .expect("run loop failed");
-
-        let first = first.expect("first mailbox closed");
-        let second = second.expect("second mailbox closed");
-        assert_eq!(first.request_id, "run-first");
-        assert_eq!(second.request_id, "run-second");
-        assert_eq!(
-            max_batch_width.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "unbound direct callers must remain on width-one compatibility execution"
-        );
-
-        // Exact-session acknowledgement happens after the mailboxes are routed,
-        // so the public ID is reusable once delivery completes.
-        engine
-            .add_request(immediate_terminal_request("run-first"))
-            .await
-            .expect("delivered session must release its public ID fence");
-        engine.abort_all_requests().await;
     }
 
     #[tokio::test]

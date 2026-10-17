@@ -51,6 +51,8 @@ impl Default for MelConfig {
 
 pub struct MelSpectrogram {
     config: MelConfig,
+    /// Dense filterbank for the test-only reference implementation.
+    #[cfg(test)]
     mel_filterbank_flat: Vec<f32>,
     mel_filterbank_spans: Vec<MelFilterSpan>,
     window: Vec<f32>,
@@ -74,6 +76,7 @@ impl MelSpectrogram {
             config.mel_scale,
             config.mel_norm,
         );
+        #[cfg(test)]
         let mel_filterbank_flat = mel_filterbank
             .iter()
             .flat_map(|row| row.iter().copied())
@@ -86,6 +89,7 @@ impl MelSpectrogram {
 
         Ok(Self {
             config,
+            #[cfg(test)]
             mel_filterbank_flat,
             mel_filterbank_spans,
             window,
@@ -232,6 +236,7 @@ impl MelSpectrogram {
             .collect()
     }
 
+    #[cfg(test)]
     fn whisper_normalize(log_mel: &mut [Vec<f32>]) {
         let mut max_val = f32::NEG_INFINITY;
         for frame in log_mel.iter() {

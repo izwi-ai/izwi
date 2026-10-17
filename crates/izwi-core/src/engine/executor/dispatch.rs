@@ -462,14 +462,6 @@ impl NativeExecutor {
         self.finish_scheduled_execution(requests, scheduled, outputs, dispatch, rows)
     }
 
-    pub(super) fn execute_continuous_chat_requests(
-        &self,
-        requests: &[&EngineCoreRequest],
-        scheduled: &[ScheduledRequest],
-    ) -> Result<Vec<ExecutorStepResult>> {
-        self.execute_continuous_chat_requests_with_rows(requests, scheduled, None)
-    }
-
     pub(super) fn execute_continuous_chat_requests_with_rows(
         &self,
         requests: &[&EngineCoreRequest],
