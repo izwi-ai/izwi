@@ -46,7 +46,12 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned: a new stable release can add clippy lints that fail
+        # `-D warnings` with no repo change. Bump deliberately, together
+        # with the version the lanes are verified with locally. No
+        # rust-toolchain.toml: it would override the 1.88.0 (MSRV) CUDA
+        # compile lanes, which install that version as the rustup default.
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Require preprovisioned model storage
         run: |
