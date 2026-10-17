@@ -1,6 +1,6 @@
 //! Runtime telemetry ownership.
 
-pub mod histogram;
+pub use izwi_prometheus as histogram;
 mod metrics;
 mod replay;
 mod tracing;

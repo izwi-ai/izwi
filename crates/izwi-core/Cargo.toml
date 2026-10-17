@@ -10,6 +10,7 @@ license.workspace = true
 izwi-asr-toolkit = { path = "../izwi-asr-toolkit" }
 izwi-env = { path = "../izwi-env" }
 izwi-model-catalog = { path = "../izwi-model-catalog" }
+izwi-prometheus = { path = "../izwi-prometheus" }
 izwi-vad = { path = "../izwi-vad" }
 
 tokio = { workspace = true }

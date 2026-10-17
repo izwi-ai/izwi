@@ -3725,6 +3725,7 @@ dependencies = [
  "izwi-asr-toolkit",
  "izwi-env",
  "izwi-model-catalog",
+ "izwi-prometheus",
  "izwi-vad",
  "memmap2",
  "objc2 0.6.3",
@@ -3819,6 +3820,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "izwi-prometheus"
+version = "0.1.0-beta-18"
 
 [[package]]
 name = "izwi-server"
