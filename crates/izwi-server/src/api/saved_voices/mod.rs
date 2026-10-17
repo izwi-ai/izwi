@@ -65,5 +65,5 @@ pub(crate) async fn resolve_saved_voice_reference(
 }
 
 fn map_saved_voice_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Saved voice storage error: {err}"))
+    crate::error::store_api_error(err, "Saved voice storage error")
 }

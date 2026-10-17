@@ -405,5 +405,5 @@ fn map_store_error(err: anyhow::Error) -> ApiError {
 }
 
 fn map_observation_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Voice memory storage error: {err}"))
+    crate::error::store_api_error(err, "Voice memory storage error")
 }

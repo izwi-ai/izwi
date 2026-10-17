@@ -357,7 +357,7 @@ impl VoiceStore {
         let now = now_unix_millis_i64();
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
-            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+            .ok_or_else(|| StoreError::not_found("Voice turn not found"))?;
         db.execute_raw(raw::statement(
             db,
             r#"
@@ -391,7 +391,7 @@ impl VoiceStore {
         let now = now_unix_millis_i64();
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
-            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+            .ok_or_else(|| StoreError::not_found("Voice turn not found"))?;
         db.execute_raw(raw::statement(
             db,
             r#"
@@ -424,7 +424,7 @@ impl VoiceStore {
         let now = now_unix_millis_i64();
         let session_id = fetch_turn_session_id(db, &turn_id)
             .await?
-            .ok_or_else(|| anyhow!("Voice turn not found"))?;
+            .ok_or_else(|| StoreError::not_found("Voice turn not found"))?;
         let completed = db
             .execute_raw(raw::statement(
                 db,

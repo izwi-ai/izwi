@@ -2123,7 +2123,7 @@ fn truncate_summary_error(raw: &str) -> String {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Transcription storage error: {err}"))
+    crate::error::store_api_error(err, "Transcription storage error")
 }
 
 fn map_media_ingest_error(err: MediaIngestError) -> ApiError {

@@ -489,5 +489,5 @@ fn diarization_audio_response(audio: StoredDiarizationAudio) -> Response {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Storage error: {err}"))
+    crate::error::store_api_error(err, "Storage error")
 }

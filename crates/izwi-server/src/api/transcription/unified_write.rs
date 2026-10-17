@@ -250,5 +250,5 @@ async fn resolve_diarization_only_kind(
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Storage error: {err}"))
+    crate::error::store_api_error(err, "Storage error")
 }

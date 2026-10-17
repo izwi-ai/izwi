@@ -3078,6 +3078,71 @@ async fn local_router_rejects_cross_site_writes_and_rebound_hosts() {
     drop(temp_dir);
 }
 
+/// DUR-F13: Studio store refusals are client errors (400), not storage
+/// faults (500).
+#[tokio::test]
+async fn studio_segment_refusals_are_bad_requests() {
+    let (state, _root) = test_state("studio_segment_refusals", false);
+    state.lifecycle.mark_ready();
+    let config = ServeRuntimeConfig {
+        backend: izwi_core::backends::BackendPreference::Cpu,
+        ui_enabled: false,
+        ..ServeRuntimeConfig::default()
+    };
+    let app = create_router(state.clone(), &config);
+    let created = send_request(
+        app.clone(),
+        build_request(
+            Method::POST,
+            "/v1/studio/projects",
+            Some(
+                &serde_json::json!({
+                    "model_id": "Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                    "speaker": "Vivian",
+                    "source_text": "One sentence. Another sentence."
+                })
+                .to_string(),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let project = read_json(created).await;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let segment_ids = project["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|segment| segment["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(!segment_ids.is_empty());
+
+    let reorder = send_request(
+        app.clone(),
+        build_request(
+            Method::PATCH,
+            &format!("/v1/studio/projects/{project_id}/segments/reorder"),
+            Some(r#"{"ordered_segment_ids":["not-a-segment"]}"#),
+        ),
+    )
+    .await;
+    assert_eq!(reorder.status(), StatusCode::BAD_REQUEST);
+    let delete_all = send_request(
+        app,
+        build_request(
+            Method::POST,
+            &format!("/v1/studio/projects/{project_id}/segments/bulk-delete"),
+            Some(&serde_json::json!({ "segment_ids": segment_ids }).to_string()),
+        ),
+    )
+    .await;
+    assert_eq!(delete_all.status(), StatusCode::BAD_REQUEST);
+    assert!(read_json(delete_all).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("at least one segment"));
+}
+
 async fn send_request(mut app: Router, request: Request<Body>) -> Response {
     app.as_service::<Body>()
         .call(request)

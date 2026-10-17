@@ -1322,15 +1322,15 @@ fn audio_response(audio: StoredSpeechAudio, as_attachment: bool) -> Response {
 }
 
 fn map_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Studio project storage error: {err}"))
+    crate::error::store_api_error(err, "Studio project storage error")
 }
 
 fn map_saved_voice_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Saved voice storage error: {err}"))
+    crate::error::store_api_error(err, "Saved voice storage error")
 }
 
 fn map_speech_store_error(err: anyhow::Error) -> ApiError {
-    ApiError::internal(format!("Speech history storage error: {err}"))
+    crate::error::store_api_error(err, "Speech history storage error")
 }
 
 async fn apply_project_pronunciations(

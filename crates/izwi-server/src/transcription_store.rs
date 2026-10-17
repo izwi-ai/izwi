@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::StoreError;
 use crate::{
     db::{raw, StoreDatabase},
     entity::{transcription_records, RuntimeProjectionAttempt},
@@ -496,7 +497,7 @@ impl TranscriptionStore {
             });
 
         if record.audio_bytes.is_empty() {
-            return Err(anyhow!("Audio payload cannot be empty"));
+            return Err(StoreError::invalid("Audio payload cannot be empty").into());
         }
 
         let audio_storage_path = persist_audio_object(

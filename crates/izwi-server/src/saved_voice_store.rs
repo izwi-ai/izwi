@@ -2,11 +2,12 @@
 
 use anyhow::{anyhow, Context};
 use izwi_hooks::{HookMetadata, MediaNamespace, MediaStorageProvider};
-use sea_orm::{ConnectionTrait, EntityTrait, QueryResult, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, QueryResult, Set, SqlErr};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::StoreError;
 use crate::{
     db::{raw, StoreDatabase},
     entity::saved_voices,
@@ -265,7 +266,7 @@ impl SavedVoiceStore {
             .or_else(|| Some("local_upload".to_string()));
 
         if voice.audio_bytes.is_empty() {
-            return Err(anyhow!("Audio payload cannot be empty"));
+            return Err(StoreError::invalid("Audio payload cannot be empty").into());
         }
 
         let audio_storage_path = persist_audio_object(
@@ -300,6 +301,13 @@ impl SavedVoiceStore {
         .await
         {
             let _ = delete_media_object(&self.media_storage, Some(&audio_storage_path)).await;
+            // The id is new, so the name is the only unique value that can clash.
+            if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
+                return Err(StoreError::invalid(
+                    "A saved voice with this name already exists. Choose a different name.",
+                )
+                .into());
+            }
             return Err(err).context("Failed to insert saved voice");
         }
 
@@ -474,7 +482,7 @@ fn parse_allowed_uses(raw: &str) -> Vec<String> {
 fn sanitize_required_text(raw: &str, max_chars: usize, field_name: &str) -> anyhow::Result<String> {
     let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        return Err(anyhow!("{field_name} cannot be empty"));
+        return Err(StoreError::invalid(format!("{field_name} cannot be empty")).into());
     }
     Ok(truncate_string(&normalized, max_chars))
 }
@@ -560,6 +568,39 @@ mod tests {
     fn clear_env() {
         std::env::remove_var("IZWI_DB_PATH");
         std::env::remove_var("IZWI_MEDIA_DIR");
+    }
+
+    /// DUR-F13: a duplicate name is a typed client error, found by the
+    /// database's constraint kind rather than by its message text.
+    #[tokio::test]
+    async fn duplicate_name_is_a_typed_invalid_request() {
+        let _guard = env_lock();
+        let (_temp, store) = setup_store();
+        let voice = |name: &str| NewSavedVoice {
+            name: name.to_string(),
+            reference_text: "A calm reference sample".to_string(),
+            audio_mime_type: "audio/wav".to_string(),
+            audio_filename: None,
+            audio_bytes: vec![1, 2, 3, 4],
+            source_route_kind: None,
+            source_record_id: None,
+        };
+        store
+            .create_voice(voice("Demo"))
+            .await
+            .expect("first voice");
+        let error = store
+            .create_voice(voice("demo"))
+            .await
+            .expect_err("names are unique regardless of case");
+        assert!(
+            crate::error::StoreError::find(&error).is_some(),
+            "{error:#}"
+        );
+        let api = crate::error::store_api_error(error, "Saved voice storage error");
+        assert_eq!(api.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(api.message.contains("already exists"), "{}", api.message);
+        clear_env();
     }
 
     #[tokio::test]
