@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::backends::BackendPreference;
 use crate::config::{
     BatchSizePreference, ContextLengthPreference, EngineConfig, PhysicalExecutionMode,
-    PhysicalInFlightLimit,
+    PhysicalInFlightLimit, RealtimeAsrSessionConfig,
 };
 use crate::Result;
 
@@ -43,6 +43,10 @@ pub const ENV_MAX_RETAINED_SEQUENCES: &str = "IZWI_MAX_RETAINED_SEQUENCES";
 pub const ENV_MAX_STAGED_TRANSACTIONS: &str = "IZWI_MAX_STAGED_TRANSACTIONS";
 pub const ENV_MAX_QUEUED_REQUESTS: &str = "IZWI_MAX_QUEUED_REQUESTS";
 pub const ENV_MAX_SEQUENCE_LENGTH: &str = "IZWI_MAX_SEQUENCE_LENGTH";
+/// Realtime ASR session limits ([`RealtimeAsrSessionConfig`]).
+pub const ENV_ASR_REALTIME_MAX_SESSIONS: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
+pub const ENV_ASR_REALTIME_MAX_LIFETIME_SECS: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
+pub const ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
 pub const ENV_NUM_THREADS: &str = "IZWI_NUM_THREADS";
 pub const ENV_MAX_CONCURRENT: &str = "IZWI_MAX_CONCURRENT";
 pub const ENV_TIMEOUT: &str = "IZWI_TIMEOUT";
@@ -87,6 +91,9 @@ pub struct ServeRuntimeConfig {
     pub max_staged_transactions: usize,
     pub max_queued_requests: usize,
     pub max_sequence_length: ContextLengthPreference,
+    /// Unset limits take the engine's per-backend defaults.
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
     pub num_threads: usize,
     pub max_concurrent_requests: usize,
     pub request_timeout_secs: u64,
@@ -128,6 +135,7 @@ impl Default for ServeRuntimeConfig {
             max_staged_transactions: default_max_staged_transactions(),
             max_queued_requests: default_max_queued_requests(),
             max_sequence_length: ContextLengthPreference::Auto,
+            asr_realtime: RealtimeAsrSessionConfig::default(),
             num_threads: default_num_threads(),
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout_secs: default_request_timeout_secs(),
@@ -221,6 +229,16 @@ impl ServeRuntimeConfig {
         if let Some(max_sequence_length) = overrides.max_sequence_length {
             self.max_sequence_length = max_sequence_length;
         }
+        let asr_realtime = &overrides.asr_realtime;
+        if let Some(max_sessions) = asr_realtime.max_sessions {
+            self.asr_realtime.max_sessions = Some(max_sessions);
+        }
+        if let Some(max_lifetime_secs) = asr_realtime.max_lifetime_secs {
+            self.asr_realtime.max_lifetime_secs = Some(max_lifetime_secs);
+        }
+        if let Some(idle_timeout_secs) = asr_realtime.idle_timeout_secs {
+            self.asr_realtime.idle_timeout_secs = Some(idle_timeout_secs);
+        }
         if let Some(num_threads) = overrides.num_threads {
             self.num_threads = num_threads;
         }
@@ -267,6 +285,7 @@ impl ServeRuntimeConfig {
             max_staged_transactions: self.max_staged_transactions,
             max_queued_requests: self.max_queued_requests.max(1),
             max_sequence_length: self.max_sequence_length,
+            asr_realtime: self.asr_realtime,
             backend: self.backend,
             num_threads: self.num_threads.max(1),
             ..Default::default()
@@ -303,6 +322,8 @@ pub struct ServeRuntimeConfigOverrides {
     pub max_staged_transactions: Option<usize>,
     pub max_queued_requests: Option<usize>,
     pub max_sequence_length: Option<ContextLengthPreference>,
+    #[serde(default)]
+    pub asr_realtime: RealtimeAsrSessionConfig,
     pub num_threads: Option<usize>,
     pub max_concurrent_requests: Option<usize>,
     pub request_timeout_secs: Option<u64>,
@@ -377,6 +398,11 @@ impl ServeRuntimeConfigOverrides {
             max_staged_transactions: read_env_usize(ENV_MAX_STAGED_TRANSACTIONS, &[]),
             max_queued_requests: read_env_usize(ENV_MAX_QUEUED_REQUESTS, &[]),
             max_sequence_length: read_env_context(ENV_MAX_SEQUENCE_LENGTH, &[]),
+            asr_realtime: RealtimeAsrSessionConfig {
+                max_sessions: read_env_usize(ENV_ASR_REALTIME_MAX_SESSIONS, &[]),
+                max_lifetime_secs: read_env_u64(ENV_ASR_REALTIME_MAX_LIFETIME_SECS, &[]),
+                idle_timeout_secs: read_env_u64(ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, &[]),
+            },
             num_threads: read_env_usize(ENV_NUM_THREADS, &[]),
             max_concurrent_requests: read_env_usize(ENV_MAX_CONCURRENT, LEGACY_ENV_MAX_CONCURRENT),
             request_timeout_secs: read_env_u64(ENV_TIMEOUT, LEGACY_ENV_TIMEOUT),
@@ -620,6 +646,9 @@ mod tests {
         ENV_MAX_STAGED_TRANSACTIONS,
         ENV_MAX_QUEUED_REQUESTS,
         ENV_MAX_SEQUENCE_LENGTH,
+        ENV_ASR_REALTIME_MAX_SESSIONS,
+        ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+        ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS,
         ENV_NUM_THREADS,
         ENV_MAX_CONCURRENT,
         ENV_TIMEOUT,
@@ -829,6 +858,42 @@ workers = 5
         );
         assert_eq!(overrides.ui_enabled, Some(false));
         clear_env();
+    }
+
+    /// SPK-F9: the local role reads the realtime ASR limits once into its
+    /// typed config, and a later source overrides each limit on its own.
+    #[test]
+    fn realtime_asr_limits_come_from_the_environment_and_later_sources() {
+        let _guard = crate::env_test_lock().lock().expect("env lock poisoned");
+        clear_env();
+        std::env::set_var(ENV_ASR_REALTIME_MAX_SESSIONS, "8");
+        std::env::set_var(ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, "300");
+        let cli = ServeRuntimeConfigOverrides {
+            asr_realtime: RealtimeAsrSessionConfig {
+                idle_timeout_secs: Some(600),
+                ..RealtimeAsrSessionConfig::default()
+            },
+            ..ServeRuntimeConfigOverrides::default()
+        };
+
+        let resolved = ServeRuntimeConfig::from_sources(
+            &ServeRuntimeConfigOverrides::default(),
+            &ServeRuntimeConfigOverrides::from_env(),
+            &cli,
+        );
+        clear_env();
+
+        let expected = RealtimeAsrSessionConfig {
+            max_sessions: Some(8),
+            max_lifetime_secs: None,
+            idle_timeout_secs: Some(600),
+        };
+        assert_eq!(resolved.asr_realtime, expected);
+        assert_eq!(resolved.engine_config().asr_realtime, expected);
+        assert_eq!(
+            ServeRuntimeConfig::default().engine_config().asr_realtime,
+            RealtimeAsrSessionConfig::default()
+        );
     }
 
     #[test]

@@ -8,9 +8,11 @@
 //! The model runtime (izwi-core) reads further engine variables of its own.
 
 use izwi_core::serve_runtime::{
-    ENV_KV_HOST_OFFLOAD, ENV_KV_HOST_POOL_BUDGET_BYTES, ENV_KV_OFFLOAD_HIGH_WATERMARK,
-    ENV_KV_OFFLOAD_LOW_WATERMARK, ENV_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES,
-    ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES, ENV_MAX_TOKENS_PER_STEP, ENV_PREFIX_REUSE_AUTO,
+    ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+    ENV_ASR_REALTIME_MAX_SESSIONS, ENV_KV_HOST_OFFLOAD, ENV_KV_HOST_POOL_BUDGET_BYTES,
+    ENV_KV_OFFLOAD_HIGH_WATERMARK, ENV_KV_OFFLOAD_LOW_WATERMARK,
+    ENV_KV_OFFLOAD_MAX_IN_FLIGHT_PAGES, ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES,
+    ENV_MAX_TOKENS_PER_STEP, ENV_PREFIX_REUSE_AUTO,
 };
 use izwi_serving_fence::{
     MANAGED_WORKER_ENV, WORKER_EXECUTION_REPRESENTATION_ENV, WORKER_GENERATION_FENCE_ENV,
@@ -342,6 +344,22 @@ pub(crate) static WORKER_ENV: &[EnvVar] = &[
         ENV_KV_OFFLOAD_MAX_PROMOTION_PAGES,
         "the engine default",
         "Pages promoted back per step.",
+    ),
+    // Realtime ASR sessions
+    var(
+        ENV_ASR_REALTIME_MAX_SESSIONS,
+        "16 on CUDA, 4 on CPU and Metal",
+        "Concurrent realtime ASR sessions (also the state arena rows a load reserves).",
+    ),
+    var(
+        ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+        "28800 (8 hours)",
+        "Seconds one realtime ASR session may live.",
+    ),
+    var(
+        ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS,
+        "90",
+        "Seconds without audio before a realtime ASR session is reaped.",
     ),
 ];
 

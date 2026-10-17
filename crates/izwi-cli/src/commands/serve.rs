@@ -718,6 +718,7 @@ mod tests {
                 max_staged_transactions: 8,
                 max_queued_requests: 128,
                 max_sequence_length: izwi_core::ContextLengthPreference::Auto,
+                asr_realtime: Default::default(),
                 backend: BackendPreference::Auto,
                 num_threads: 4,
                 max_concurrent_requests: 100,

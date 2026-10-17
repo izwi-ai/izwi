@@ -52,6 +52,10 @@ use crate::runtime::types::{
     SpeakerAttributedAsrStatus, SpeakerAttributedAsrTurn,
 };
 use crate::runtime::CoordinatorLane;
+use crate::serve_runtime::{
+    ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+    ENV_ASR_REALTIME_MAX_SESSIONS,
+};
 use izwi_asr_toolkit::{clean_transcript_text, plan_audio_chunks, AsrLongFormConfig, AudioChunk};
 
 #[derive(Clone, Copy)]
@@ -162,9 +166,6 @@ const GRANITE_SAA_PREFIX_MAX_CHARS: usize = 6_000;
 const GRANITE_SAA_MIN_OVERLAP_WORDS: usize = 4;
 const GRANITE_SAA_MAX_OVERLAP_WORDS: usize = 80;
 const UNKNOWN_SAA_SPEAKER: &str = "UNKNOWN";
-const ASR_REALTIME_MAX_SESSIONS_ENV: &str = "IZWI_ASR_REALTIME_MAX_SESSIONS";
-const ASR_REALTIME_MAX_LIFETIME_SECS_ENV: &str = "IZWI_ASR_REALTIME_MAX_LIFETIME_SECS";
-const ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV: &str = "IZWI_ASR_REALTIME_IDLE_TIMEOUT_SECS";
 /// Concurrent realtime sessions on CPU and Metal, which is also the row count
 /// of the realtime state arena a load allocates up front: Nemotron's is about
 /// 37 MB of F32 per row (twice per session), so 16 sessions held 1.18 GB that
@@ -548,19 +549,19 @@ impl RealtimeAsrSessionLimits {
         };
         let max_sessions = match configured(config.max_sessions, "max_sessions")? {
             Some(sessions) => sessions,
-            None => positive_usize_env_or_default(ASR_REALTIME_MAX_SESSIONS_ENV, default_sessions)?,
+            None => positive_usize_env_or_default(ENV_ASR_REALTIME_MAX_SESSIONS, default_sessions)?,
         };
         let max_lifetime_secs = match configured(config.max_lifetime_secs, "max_lifetime_secs")? {
             Some(secs) => secs,
             None => positive_u64_env_or_default(
-                ASR_REALTIME_MAX_LIFETIME_SECS_ENV,
+                ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
                 DEFAULT_ASR_REALTIME_MAX_LIFETIME_SECS,
             )?,
         };
         let idle_timeout_secs = match configured(config.idle_timeout_secs, "idle_timeout_secs")? {
             Some(secs) => secs,
             None => positive_u64_env_or_default(
-                ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV,
+                ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS,
                 DEFAULT_ASR_REALTIME_IDLE_TIMEOUT_SECS,
             )?,
         };
@@ -586,13 +587,13 @@ impl RealtimeAsrSessionPolicy {
     fn new(limits: RealtimeAsrSessionLimits) -> Result<Self> {
         if limits.max_sessions > Semaphore::MAX_PERMITS {
             return Err(Error::ConfigError(format!(
-                "{ASR_REALTIME_MAX_SESSIONS_ENV} cannot exceed {}",
+                "{ENV_ASR_REALTIME_MAX_SESSIONS} cannot exceed {}",
                 Semaphore::MAX_PERMITS
             )));
         }
         if Instant::now().checked_add(limits.max_lifetime).is_none() {
             return Err(Error::ConfigError(format!(
-                "{ASR_REALTIME_MAX_LIFETIME_SECS_ENV} exceeds the platform clock range"
+                "{ENV_ASR_REALTIME_MAX_LIFETIME_SECS} exceeds the platform clock range"
             )));
         }
         Ok(Self {
@@ -5158,10 +5159,14 @@ mod tests {
     /// environment and the defaults.
     #[test]
     fn realtime_session_limits_default_for_production_and_follow_the_config() {
+        // serve_runtime's tests set these variables under this lock.
+        let _env = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let env_set = [
-            ASR_REALTIME_MAX_SESSIONS_ENV,
-            ASR_REALTIME_MAX_LIFETIME_SECS_ENV,
-            ASR_REALTIME_IDLE_TIMEOUT_SECS_ENV,
+            ENV_ASR_REALTIME_MAX_SESSIONS,
+            ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+            ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS,
         ]
         .iter()
         .any(|name| std::env::var_os(name).is_some());

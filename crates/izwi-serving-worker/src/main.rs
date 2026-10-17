@@ -1,7 +1,8 @@
 use anyhow::{bail, Context};
 use env_config::{WORKER_TLS_CERT_REF_ENV, WORKER_TLS_CLIENT_CA_REF_ENV, WORKER_TLS_KEY_REF_ENV};
 use izwi_core::{
-    backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RuntimeHealth, RuntimeService,
+    backends::RuntimeDeviceAssignment, EngineConfig, ModelVariant, RealtimeAsrSessionConfig,
+    RuntimeHealth, RuntimeService,
 };
 use izwi_serving_fence::{
     try_acquire_worker_fences, LockLease, LockNamespace, WorkerFenceLeases, WorkerLockPaths,
@@ -151,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
             engine_defaults.kv_offload_max_promotion_pages,
         )?,
         max_sequence_length: max_sequence_length.unwrap_or(engine_defaults.max_sequence_length),
+        asr_realtime: realtime_asr_limits(&env)?,
         ..EngineConfig::default()
     };
     // A worker process owns one explicitly assigned backend for its entire life.
@@ -1205,6 +1207,20 @@ fn parse_cpu_affinity(env: &EnvSnapshot) -> anyhow::Result<Vec<u16>> {
     Ok(affinity)
 }
 
+/// The realtime ASR session limits set in the environment; an unset limit
+/// takes the engine's per-backend default, and the engine rejects zero.
+fn realtime_asr_limits(env: &EnvSnapshot) -> anyhow::Result<RealtimeAsrSessionConfig> {
+    use izwi_core::serve_runtime::{
+        ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, ENV_ASR_REALTIME_MAX_LIFETIME_SECS,
+        ENV_ASR_REALTIME_MAX_SESSIONS,
+    };
+    Ok(RealtimeAsrSessionConfig {
+        max_sessions: env.parse(ENV_ASR_REALTIME_MAX_SESSIONS)?,
+        max_lifetime_secs: env.parse(ENV_ASR_REALTIME_MAX_LIFETIME_SECS)?,
+        idle_timeout_secs: env.parse(ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS)?,
+    })
+}
+
 fn parse_positive_env<T>(env: &EnvSnapshot, name: &str, fallback: T) -> anyhow::Result<T>
 where
     T: std::str::FromStr + Default + PartialEq,
@@ -1858,6 +1874,27 @@ n4hqQcj6Ww1lUPQR8+rJ24RBjCuhRANCAARrApXyDvzciYQCSB4ddOaW3lsBSwJN
             .expect("the server closes a stalled handshake");
         assert!(matches!(closed, Ok(0) | Err(_)), "{closed:?}");
         server.abort();
+    }
+
+    #[test]
+    fn realtime_asr_limits_come_from_the_environment() {
+        use izwi_core::serve_runtime::{
+            ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, ENV_ASR_REALTIME_MAX_SESSIONS,
+        };
+        let env = env_config::snapshot([
+            (ENV_ASR_REALTIME_MAX_SESSIONS, "8"),
+            (ENV_ASR_REALTIME_IDLE_TIMEOUT_SECS, "300"),
+        ]);
+        assert_eq!(
+            realtime_asr_limits(&env).unwrap(),
+            RealtimeAsrSessionConfig {
+                max_sessions: Some(8),
+                max_lifetime_secs: None,
+                idle_timeout_secs: Some(300),
+            }
+        );
+        let invalid = env_config::snapshot([(ENV_ASR_REALTIME_MAX_SESSIONS, "many")]);
+        assert!(realtime_asr_limits(&invalid).is_err());
     }
 
     fn test_tls_config() -> WorkerTlsConfig {
