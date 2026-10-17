@@ -23,7 +23,7 @@ use std::{
     fmt::Write as _,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
     },
     time::Duration,
 };
@@ -418,6 +418,14 @@ struct AttemptRecord {
     evict_after: Option<Instant>,
 }
 
+/// Locks the attempt table or an admission slot. A panic while one was held
+/// must not turn every later request on this worker into a panic, so a
+/// poisoned lock is recovered with whatever state the interrupted section
+/// left, the policy the gateway registry and tenant limits follow too.
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[derive(Default)]
 struct AttemptTable {
     records: HashMap<AttemptId, AttemptRecord>,
@@ -552,12 +560,7 @@ impl WorkerMetrics {
         engine_telemetry: Option<&RuntimeTelemetrySnapshot>,
     ) -> String {
         let active = state.config.max_active_invocations - state.capacity.available_permits();
-        let retained_attempts = state
-            .attempts
-            .lock()
-            .expect("worker attempt table poisoned")
-            .records
-            .len();
+        let retained_attempts = lock_recover(&state.attempts).records.len();
         let mut output = String::with_capacity(MAX_PROMETHEUS_RESPONSE_BYTES);
         macro_rules! metric {
             ($name:literal, $kind:literal, $help:literal, $value:expr) => {{
@@ -834,7 +837,7 @@ impl<E> WorkerState<E> {
     }
 
     fn reserve_attempt(&self, request: &InvocationRequest) -> ReserveAttempt {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::reserve_new_attempt(
             &mut table,
             AttemptIdentity::from(request),
@@ -847,7 +850,7 @@ impl<E> WorkerState<E> {
     /// fencing identity model, so `query_attempt`/`cancel_attempt` over HTTP
     /// behave identically for them.
     fn reserve_realtime_session(&self, admit: &RealtimeSessionAdmit) -> ReserveAttempt {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::reserve_new_attempt(
             &mut table,
             AttemptIdentity {
@@ -906,12 +909,12 @@ impl<E> WorkerState<E> {
     }
 
     fn remove_reservation(&self, attempt_id: &AttemptId) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         Self::remove_record(&mut table, attempt_id);
     }
 
     fn install_admission(&self, attempt_id: &AttemptId, cancel: watch::Sender<bool>) -> bool {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         let record = table
             .records
             .get_mut(attempt_id)
@@ -923,7 +926,7 @@ impl<E> WorkerState<E> {
     }
 
     fn update_attempt(&self, attempt_id: &AttemptId, state: AttemptState, sequence: Option<u64>) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if let Some(record) = table.records.get_mut(attempt_id) {
             record.state = state;
             if let Some(sequence) = sequence {
@@ -937,7 +940,7 @@ impl<E> WorkerState<E> {
     }
 
     fn mark_cancellation_requested(&self, attempt_id: &AttemptId) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if let Some(record) = table.records.get_mut(attempt_id) {
             record.cancel_requested = true;
             record.state = AttemptState::CancellationRequested;
@@ -945,7 +948,7 @@ impl<E> WorkerState<E> {
     }
 
     fn insert_cancel_tombstone(&self, identity: AttemptIdentity) {
-        let mut table = self.attempts.lock().expect("worker attempt table poisoned");
+        let mut table = lock_recover(&self.attempts);
         if table.records.contains_key(&identity.attempt_id) {
             return;
         }
@@ -1057,11 +1060,7 @@ impl<E: InvocationExecutor> WorkerService<E> {
     /// Capacity remains held until each execution reports confirmed teardown.
     pub fn request_cancel_all(&self) -> usize {
         let cancellations = {
-            let mut table = self
-                .state
-                .attempts
-                .lock()
-                .expect("worker attempt table poisoned");
+            let mut table = lock_recover(&self.state.attempts);
             table
                 .records
                 .values_mut()
@@ -1592,9 +1591,7 @@ async fn invoke<E: InvocationExecutor>(
                 execution_started_at: Instant::now(),
             };
             let abandoned_handoff = {
-                let mut slot = slot_for_admission
-                    .lock()
-                    .expect("worker admission slot poisoned");
+                let mut slot = lock_recover(&slot_for_admission);
                 if slot.abandoned {
                     Some(handoff)
                 } else {
@@ -1610,9 +1607,7 @@ async fn invoke<E: InvocationExecutor>(
         .in_current_span(),
     );
     let handoff = match tokio::time::timeout(admission_budget, &mut admission_wait).await {
-        Ok(()) => admission_slot
-            .lock()
-            .expect("worker admission slot poisoned")
+        Ok(()) => lock_recover(&admission_slot)
             .handoff
             .take()
             .expect("admission notification carries ownership"),
@@ -1621,9 +1616,7 @@ async fn invoke<E: InvocationExecutor>(
             // admission already published ownership, it wins. Otherwise mark
             // the receiver abandoned before returning the uncertain response.
             let completed = {
-                let mut slot = admission_slot
-                    .lock()
-                    .expect("worker admission slot poisoned");
+                let mut slot = lock_recover(&admission_slot);
                 if let Some(handoff) = slot.handoff.take() {
                     Some(handoff)
                 } else {
@@ -2353,10 +2346,7 @@ async fn query_attempt<E: InvocationExecutor>(
     let Ok(attempt_id) = AttemptId::new(raw_attempt_id) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let mut table = state
-        .attempts
-        .lock()
-        .expect("worker attempt table poisoned");
+    let mut table = lock_recover(&state.attempts);
     let Some(record) = table.records.get(&attempt_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2409,10 +2399,7 @@ async fn cancel_attempt<E: InvocationExecutor>(
         return StatusCode::CONFLICT.into_response();
     }
     let (disposition, cancel) = {
-        let mut table = state
-            .attempts
-            .lock()
-            .expect("worker attempt table poisoned");
+        let mut table = lock_recover(&state.attempts);
         let expired = table
             .records
             .get(&request.identity.attempt_id)
@@ -3510,6 +3497,37 @@ mod tests {
         let body = std::str::from_utf8(&body).unwrap();
         assert!(body.contains("izwi_worker_body_limit_rejections_total 1\n"));
         assert!(body.contains("izwi_worker_rejected_total 1\n"));
+    }
+
+    /// HYG-R4: a panic while the attempt table was held must not take the
+    /// worker down with it; later requests recover the lock.
+    #[tokio::test]
+    async fn a_poisoned_attempt_table_keeps_serving() {
+        let executor = ScriptExecutor {
+            events: Mutex::new(Some(VecDeque::new())),
+            teardown: ExecutionTeardown::Completed,
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let service = WorkerService::new(config(), executor).unwrap();
+        let state = Arc::clone(&service.state);
+        let poisoner = std::thread::spawn(move || {
+            let _table = state.attempts.lock().unwrap();
+            panic!("poison the attempt table");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(service.state.attempts.is_poisoned());
+
+        assert_eq!(service.request_cancel_all(), 0);
+        let response = service
+            .router()
+            .oneshot(authorized_request(
+                "POST",
+                INVOCATIONS_PATH,
+                Body::from(serde_json::to_vec(&invocation()).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
