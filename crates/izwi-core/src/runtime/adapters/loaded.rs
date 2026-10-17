@@ -24,6 +24,7 @@ use crate::kv::v2::{
 };
 use crate::model::ModelVariant;
 
+use super::table::{table_selects, LoadedAdapterKind};
 use super::{
     scalar_execution_profile, AdapterMetadata, CapabilityKind, InferenceStateRequirement,
     RuntimeAdapterRegistry, StreamingMode,
@@ -899,108 +900,20 @@ pub(super) trait LoadedExecutionAdapterFactory: fmt::Debug + Send + Sync {
     ) -> Result<Arc<dyn LoadedExecutionAdapter>>;
 }
 
-fn is_physical_qwen_tts(metadata: AdapterMetadata) -> bool {
-    matches!(
-        metadata.capability,
-        CapabilityKind::Tts | CapabilityKind::StreamingTts
-    ) && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Tts
-}
-
-fn is_nemotron_realtime(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::RealtimeAsr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::NemotronAsr
-}
-
-fn is_voxtral_realtime(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::RealtimeAsr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::Voxtral
-}
-
-fn is_continuous_physical_chat(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Chat
-        && matches!(
-            metadata.model_variant.family(),
-            crate::catalog::ModelFamily::Qwen3MoeChat
-                | crate::catalog::ModelFamily::Qwen3Chat
-                | crate::catalog::ModelFamily::Qwen35Chat
-                | crate::catalog::ModelFamily::Qwen35MoeChat
-                | crate::catalog::ModelFamily::Gemma3Chat
-                | crate::catalog::ModelFamily::Qwen38Chat
-                | crate::catalog::ModelFamily::Lfm2Chat
-        )
-}
-
-fn is_continuous_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
-}
-
-fn is_whisper_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::WhisperAsr
-}
-
-fn is_vibevoice_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceAsr
-}
-
-fn is_granite_speech_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::GraniteSpeechAsr
-}
-
-fn is_lfm25_audio_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
-}
-
-fn is_parakeet_physical_asr(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Asr
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::ParakeetAsr
-}
-
-fn is_lfm25_audio_physical_tts(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Tts
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::Lfm25Audio
-}
-
-fn is_vibevoice_physical_tts(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Tts
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::VibeVoiceTts
-}
-
-fn is_fish_s2_physical_tts(metadata: AdapterMetadata) -> bool {
-    matches!(
-        metadata.capability,
-        CapabilityKind::Tts | CapabilityKind::StreamingTts
-    ) && metadata.model_variant.family() == crate::catalog::ModelFamily::FishS2Tts
-}
-
-fn is_voxtral_physical_tts(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Tts
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::VoxtralTts
-}
-
-fn is_kokoro_static_tts(metadata: AdapterMetadata) -> bool {
-    metadata.capability == CapabilityKind::Tts
-        && metadata.model_variant.family() == crate::catalog::ModelFamily::KokoroTts
-}
-
 #[derive(Debug, Clone, Copy)]
 struct PhysicalQwenTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for PhysicalQwenTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.qwen_tts.physical_sequence"
+        LoadedAdapterKind::QwenTtsSequence.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_physical_qwen_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::QwenTtsSequence, metadata, backend_kind)
     }
 
     fn create(
@@ -1026,15 +939,15 @@ struct VoxtralRealtimeAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for VoxtralRealtimeAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.voxtral_realtime.physical_paged"
+        LoadedAdapterKind::VoxtralRealtime.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_voxtral_realtime(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VoxtralRealtime, metadata, backend_kind)
     }
 
     fn create(
@@ -1054,15 +967,15 @@ impl LoadedExecutionAdapterFactory for VoxtralRealtimeAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for NemotronRealtimeAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.nemotron_realtime.physical_tensor"
+        LoadedAdapterKind::NemotronRealtime.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_nemotron_realtime(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::NemotronRealtime, metadata, backend_kind)
     }
 
     fn create(
@@ -1085,15 +998,15 @@ struct ContinuousPhysicalChatAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for ContinuousPhysicalChatAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.physical_chat.tensor_continuous"
+        LoadedAdapterKind::ContinuousChat.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_continuous_physical_chat(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::ContinuousChat, metadata, backend_kind)
     }
 
     fn create(
@@ -1117,15 +1030,19 @@ struct ContinuousPhysicalAsrAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for ContinuousPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.qwen3_asr.tensor_continuous"
+        LoadedAdapterKind::Qwen3AsrContinuous.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_continuous_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(
+            LoadedAdapterKind::Qwen3AsrContinuous,
+            metadata,
+            backend_kind,
+        )
     }
 
     fn create(
@@ -1178,15 +1095,15 @@ struct KokoroStaticTtsAdapterFactory;
 
 impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.kokoro_tts.tensor_static"
+        LoadedAdapterKind::KokoroStaticTts.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Static
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_kokoro_static_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::KokoroStaticTts, metadata, backend_kind)
     }
 
     fn create(
@@ -1207,13 +1124,13 @@ impl LoadedExecutionAdapterFactory for KokoroStaticTtsAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for VoxtralPhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.voxtral_tts.physical_sequence"
+        LoadedAdapterKind::VoxtralTts.factory_id()
     }
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_voxtral_physical_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VoxtralTts, metadata, backend_kind)
     }
     fn create(
         &self,
@@ -1232,15 +1149,15 @@ impl LoadedExecutionAdapterFactory for VoxtralPhysicalTtsAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.fish_s2_tts.physical_sequence"
+        LoadedAdapterKind::FishS2Tts.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_fish_s2_physical_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::FishS2Tts, metadata, backend_kind)
     }
 
     fn create(
@@ -1259,13 +1176,13 @@ impl LoadedExecutionAdapterFactory for FishS2PhysicalTtsAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for VibeVoicePhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.vibevoice_tts.physical_sequence"
+        LoadedAdapterKind::VibeVoiceTts.factory_id()
     }
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_vibevoice_physical_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VibeVoiceTts, metadata, backend_kind)
     }
     fn create(
         &self,
@@ -1284,15 +1201,15 @@ impl LoadedExecutionAdapterFactory for VibeVoicePhysicalTtsAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.lfm25_audio_tts.physical_sequence"
+        LoadedAdapterKind::Lfm25AudioTts.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_lfm25_audio_physical_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Lfm25AudioTts, metadata, backend_kind)
     }
 
     fn create(
@@ -1312,15 +1229,15 @@ impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalTtsAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.lfm25_audio_asr.physical_sequence"
+        LoadedAdapterKind::Lfm25AudioAsr.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_lfm25_audio_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Lfm25AudioAsr, metadata, backend_kind)
     }
 
     fn create(
@@ -1340,15 +1257,15 @@ impl LoadedExecutionAdapterFactory for Lfm25AudioPhysicalAsrAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for ParakeetPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.parakeet_asr.physical_recurrent"
+        LoadedAdapterKind::ParakeetAsr.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_parakeet_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::ParakeetAsr, metadata, backend_kind)
     }
 
     fn create(
@@ -1368,15 +1285,15 @@ impl LoadedExecutionAdapterFactory for ParakeetPhysicalAsrAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.granite_speech_asr.physical_sequence"
+        LoadedAdapterKind::GraniteSpeechAsr.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_granite_speech_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::GraniteSpeechAsr, metadata, backend_kind)
     }
 
     fn create(
@@ -1396,15 +1313,15 @@ impl LoadedExecutionAdapterFactory for GraniteSpeechPhysicalAsrAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for VibeVoicePhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.vibevoice_asr.physical_sequence"
+        LoadedAdapterKind::VibeVoiceAsr.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Continuous
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_vibevoice_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::VibeVoiceAsr, metadata, backend_kind)
     }
 
     fn create(
@@ -1424,15 +1341,15 @@ impl LoadedExecutionAdapterFactory for VibeVoicePhysicalAsrAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.whisper_asr.physical_sequence"
+        LoadedAdapterKind::WhisperAsr.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::Static
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        is_whisper_physical_asr(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::WhisperAsr, metadata, backend_kind)
     }
 
     fn create(
@@ -1452,29 +1369,15 @@ impl LoadedExecutionAdapterFactory for WhisperPhysicalAsrAdapterFactory {
 
 impl LoadedExecutionAdapterFactory for ScalarExecutionAdapterFactory {
     fn id(&self) -> &'static str {
-        "builtin.scalar"
+        LoadedAdapterKind::Scalar.factory_id()
     }
 
     fn batch_mode(&self) -> NativeBatchMode {
         NativeBatchMode::None
     }
 
-    fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
-        !is_physical_qwen_tts(metadata)
-            && !is_nemotron_realtime(metadata)
-            && !is_voxtral_realtime(metadata)
-            && !is_continuous_physical_chat(metadata)
-            && !is_continuous_physical_asr(metadata)
-            && !is_whisper_physical_asr(metadata)
-            && !is_vibevoice_physical_asr(metadata)
-            && !is_granite_speech_physical_asr(metadata)
-            && !is_lfm25_audio_physical_asr(metadata)
-            && !is_parakeet_physical_asr(metadata)
-            && !is_lfm25_audio_physical_tts(metadata)
-            && !is_vibevoice_physical_tts(metadata)
-            && !is_fish_s2_physical_tts(metadata)
-            && !is_voxtral_physical_tts(metadata)
-            && !is_kokoro_static_tts(metadata)
+    fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
+        table_selects(LoadedAdapterKind::Scalar, metadata, backend_kind)
     }
 
     fn create(
@@ -5889,23 +5792,9 @@ mod tests {
             NativeBatchMode::None
         }
 
-        fn supports(&self, metadata: AdapterMetadata, _backend_kind: BackendKind) -> bool {
+        fn supports(&self, metadata: AdapterMetadata, backend_kind: BackendKind) -> bool {
             metadata.model_variant != self.excluded_model_variant
-                && !is_physical_qwen_tts(metadata)
-                && !is_nemotron_realtime(metadata)
-                && !is_voxtral_realtime(metadata)
-                && !is_continuous_physical_chat(metadata)
-                && !is_continuous_physical_asr(metadata)
-                && !is_whisper_physical_asr(metadata)
-                && !is_vibevoice_physical_asr(metadata)
-                && !is_granite_speech_physical_asr(metadata)
-                && !is_lfm25_audio_physical_asr(metadata)
-                && !is_parakeet_physical_asr(metadata)
-                && !is_lfm25_audio_physical_tts(metadata)
-                && !is_vibevoice_physical_tts(metadata)
-                && !is_fish_s2_physical_tts(metadata)
-                && !is_voxtral_physical_tts(metadata)
-                && !is_kokoro_static_tts(metadata)
+                && ScalarExecutionAdapterFactory.supports(metadata, backend_kind)
         }
 
         fn create(
@@ -5956,7 +5845,7 @@ mod tests {
                     assert_eq!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
                     assert_eq!(contract.stages.len(), 1);
                     assert_eq!(contract.stages[0].batch_mode, NativeBatchMode::None);
-                } else if is_fish_s2_physical_tts(metadata) {
+                } else if factory.id() == LoadedAdapterKind::FishS2Tts.factory_id() {
                     // The factory implements native batching, but an unqualified
                     // scalar load must publish the scalar graph truthfully.
                     assert_ne!(contract.adapter_abi_revision, SCALAR_ADAPTER_ABI);
@@ -6303,7 +6192,8 @@ mod tests {
                             == crate::catalog::ModelFamily::Qwen3Tts;
                         let kokoro_tts = execution.metadata().capability == CapabilityKind::Tts
                             && variant.family() == crate::catalog::ModelFamily::KokoroTts;
-                        let fish_s2_tts = is_fish_s2_physical_tts(execution.metadata());
+                        let fish_s2_tts = FishS2PhysicalTtsAdapterFactory
+                            .supports(execution.metadata(), BackendKind::Cpu);
                         let retained_tts = execution.metadata().capability == CapabilityKind::Tts
                             && matches!(
                                 variant.family(),
@@ -7288,7 +7178,7 @@ mod tests {
             .unwrap();
             for capability in [CapabilityKind::Tts, CapabilityKind::StreamingTts] {
                 let adapter = draft.capabilities.get(&capability).unwrap();
-                assert!(is_fish_s2_physical_tts(adapter.metadata()));
+                assert!(FishS2PhysicalTtsAdapterFactory.supports(adapter.metadata(), backend));
                 for streaming in [
                     StreamingRequirements::NONE,
                     StreamingRequirements::native(true),

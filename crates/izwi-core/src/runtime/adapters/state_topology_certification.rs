@@ -5,6 +5,7 @@
 //! explicit topology classification before this test can pass.
 
 use super::*;
+use crate::catalog::ModelFamily;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CertifiedTopology {

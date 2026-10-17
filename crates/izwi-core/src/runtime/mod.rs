@@ -37,6 +37,8 @@ pub(crate) use asr::{
     ASR_TEXT_PROMPT_TOKEN_RESERVE,
 };
 
+pub(crate) use adapters::capability_rows;
+pub use adapters::CapabilityKind;
 pub(crate) use asr::{
     granite_asr_planned_max_tokens, granite_auto_asr_max_tokens_for_duration,
     invocation_decode_room,
@@ -49,7 +51,7 @@ pub use chat_request::{
 };
 pub use conformance::{
     capability_conformance_cases, required_conformance_capabilities, CapabilityConformanceCase,
-    ConformanceCapability, ConformanceExecutionClass,
+    ConformanceExecutionClass,
 };
 pub use coordinator::{CoordinatorLane, CoordinatorSnapshot, InferenceCoordinator, JobSpec};
 pub(crate) use coordinator::{PhysicalExecutionAdmission, PhysicalExecutionLease};
@@ -95,4 +97,4 @@ pub use voice_session::{VoiceSession, VoiceSessionPhase};
 
 // Allow executor regression tests to validate the real loaded adapter join.
 #[cfg(test)]
-pub(crate) use adapters::{CapabilityKind, LoadedModelBundleDraft, RuntimeAdapterRegistry};
+pub(crate) use adapters::{LoadedModelBundleDraft, RuntimeAdapterRegistry};

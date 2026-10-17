@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use izwi_core::{
-    capability_conformance_cases, required_conformance_capabilities, AudioChunk,
-    ConformanceCapability, EngineConfig, EngineCoreRequest, GenerationConfig, GenerationRequest,
-    ModelVariant, RuntimeService, RuntimeTelemetrySnapshot, VoiceSessionPhase,
+    capability_conformance_cases, required_conformance_capabilities, AudioChunk, CapabilityKind,
+    EngineConfig, EngineCoreRequest, GenerationConfig, GenerationRequest, ModelVariant,
+    RuntimeService, RuntimeTelemetrySnapshot, VoiceSessionPhase,
 };
 
 #[test]
@@ -38,7 +38,7 @@ fn builtin_conformance_case_ids_are_unique_and_descriptive() {
             case.id.contains(case.capability.as_str())
                 || matches!(
                     case.capability,
-                    ConformanceCapability::Vad | ConformanceCapability::Endpointing
+                    CapabilityKind::Vad | CapabilityKind::Endpointing
                 ),
             "case id `{}` should name its capability `{}`",
             case.id,

@@ -87,8 +87,8 @@ use crate::models::architectures::whisper::asr::{
 use crate::models::registry::AsrModelLease;
 use crate::models::shared::chat::{ChatMessage, ChatRequestConfig};
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
-    LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
+    capability_row, CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding,
+    LoadedExecutionContract, LoadedModelBundle, RuntimeAdapterRegistry, StreamingRequirements,
 };
 use crate::runtime::asr::RealtimeAsrSessionPolicy;
 use crate::runtime::asr_no_speech::{asr_no_speech_gate_applies, AsrNoSpeechGate};
@@ -1268,38 +1268,20 @@ pub(crate) fn media_preparation_resources(
     Ok(resources)
 }
 
+/// Whether the capability table lets `capability` on `variant` run in the
+/// coordinator's resumable lane.
+fn resumable_capability(capability: CapabilityKind, variant: ModelVariant) -> bool {
+    capability_row(capability, variant).is_some_and(|row| row.resumable)
+}
+
 fn coordinator_lane_for_metadata(
     task_type: TaskType,
     model_variant: Option<ModelVariant>,
     _streaming: bool,
     workload_class: WorkloadClass,
 ) -> CoordinatorLane {
-    let sequence = model_variant.is_some_and(|variant| match task_type {
-        TaskType::Chat => {
-            matches!(
-                variant.family(),
-                ModelFamily::Qwen35Chat | ModelFamily::Qwen38Chat
-            ) || matches!(
-                variant,
-                ModelVariant::Qwen306B
-                    | ModelVariant::Qwen306B4Bit
-                    | ModelVariant::Qwen317B
-                    | ModelVariant::Qwen317B4Bit
-            )
-        }
-        TaskType::ASR => matches!(
-            variant.family(),
-            ModelFamily::Qwen3Asr
-                | ModelFamily::WhisperAsr
-                | ModelFamily::VibeVoiceAsr
-                | ModelFamily::GraniteSpeechAsr
-                | ModelFamily::Lfm25Audio
-        ),
-        TaskType::TTS => matches!(
-            variant.family(),
-            ModelFamily::Qwen3Tts | ModelFamily::Lfm25Audio
-        ),
-        TaskType::SpeechToSpeech => false,
+    let sequence = model_variant.is_some_and(|variant| {
+        resumable_capability(CapabilityKind::for_engine_task(task_type), variant)
     });
     if workload_class == WorkloadClass::Realtime {
         CoordinatorLane::Realtime
@@ -1312,16 +1294,9 @@ fn coordinator_lane_for_metadata(
 
 fn coordinator_lane_for_request(request: &EngineCoreRequest) -> CoordinatorLane {
     if request.task_type == TaskType::ASR
-        && request.model_variant.is_some_and(|variant| {
-            matches!(
-                variant.family(),
-                ModelFamily::Qwen3Asr
-                    | ModelFamily::WhisperAsr
-                    | ModelFamily::VibeVoiceAsr
-                    | ModelFamily::GraniteSpeechAsr
-                    | ModelFamily::Lfm25Audio
-            )
-        })
+        && request
+            .model_variant
+            .is_some_and(|variant| resumable_capability(CapabilityKind::Asr, variant))
         && request.prepared_asr_execution_shape().is_none()
     {
         // This admission owns only decoded-media preparation. It must not be

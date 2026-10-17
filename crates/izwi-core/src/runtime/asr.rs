@@ -32,8 +32,8 @@ use crate::models::registry::{
     VoxtralModelLease,
 };
 use crate::runtime::adapters::{
-    CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding, LoadedExecutionContract,
-    RuntimeAdapterRegistry, StreamingMode,
+    capability_row, CapabilityKind, ExecutionTargetKind, LoadedCapabilityBinding,
+    LoadedExecutionContract, RealtimeAsrPath, RuntimeAdapterRegistry, StreamingMode,
 };
 use crate::runtime::audio_io::{
     base64_decode, decode_audio_bytes_canonical, validate_base64_audio_retained_size,
@@ -362,11 +362,7 @@ impl GraniteSaaPrefixMode {
 
 fn resolve_asr_realtime_stream_variant(model_id: Option<&str>) -> Option<ModelVariant> {
     let variant = resolve_asr_model_variant(model_id);
-    matches!(
-        variant.family(),
-        ModelFamily::NemotronAsr | ModelFamily::Voxtral
-    )
-    .then_some(variant)
+    capability_row(CapabilityKind::RealtimeAsr, variant).map(|_| variant)
 }
 
 /// Check a request's language against what the routed ASR model was trained
@@ -1064,25 +1060,16 @@ struct RuntimeEngineRealtimeSession {
     max_cache_append: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RealtimeAsrExecutionPath {
-    Engine,
-    Direct,
-}
-
-fn realtime_asr_execution_path(variant: ModelVariant) -> RealtimeAsrExecutionPath {
-    match variant.family() {
-        // Voxtral publishes a paged managed state runtime, which is what the
-        // Engine's realtime session admission requires. Nemotron publishes a
-        // retained tensor state runtime (its realtime contract has no
-        // paged-attention domains), so it executes on the direct native
-        // streaming path; routing it through Engine admission fails closed
-        // with "requires a physical managed state runtime" (a regression
-        // from 7215003a that the single-node server masked behind its
-        // chunked fallback).
-        ModelFamily::Voxtral => RealtimeAsrExecutionPath::Engine,
-        _ => RealtimeAsrExecutionPath::Direct,
-    }
+/// Where a realtime session executes, from the capability table. Voxtral
+/// publishes a paged managed state runtime, which the Engine's realtime
+/// session admission requires; Nemotron publishes a retained tensor state
+/// runtime and runs on the direct native streaming path (routing it through
+/// Engine admission fails closed with "requires a physical managed state
+/// runtime"). A model without a realtime row takes the direct path.
+fn realtime_asr_execution_path(variant: ModelVariant) -> RealtimeAsrPath {
+    capability_row(CapabilityKind::RealtimeAsr, variant)
+        .and_then(|row| row.realtime_path)
+        .unwrap_or(RealtimeAsrPath::Direct)
 }
 
 struct RealtimeAsrEngineOperationHandles {
@@ -1194,7 +1181,7 @@ fn realtime_segment_rollover_due(
 }
 
 impl RuntimeAsrRealtimeStream {
-    fn execution_path(&self) -> RealtimeAsrExecutionPath {
+    fn execution_path(&self) -> RealtimeAsrPath {
         realtime_asr_execution_path(self.variant)
     }
 
@@ -1913,7 +1900,7 @@ impl RuntimeService {
             .with_deadline(absolute_deadline);
         let metadata_bytes =
             language.map(str::len).unwrap_or_default() + prompt.map(str::len).unwrap_or_default();
-        if realtime_asr_execution_path(variant) == RealtimeAsrExecutionPath::Engine {
+        if realtime_asr_execution_path(variant) == RealtimeAsrPath::Engine {
             return self
                 .start_engine_realtime_stream(
                     variant,
@@ -2068,7 +2055,7 @@ impl RuntimeService {
             stream.ensure_open()?;
             return Ok(Vec::new());
         }
-        if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
+        if stream.execution_path() == RealtimeAsrPath::Engine {
             let mut events = Vec::new();
             if realtime_segment_rollover_due(
                 stream.committed_samples,
@@ -2421,7 +2408,7 @@ impl RuntimeService {
         &self,
         stream: &mut RuntimeAsrRealtimeStream,
     ) -> Result<Vec<RuntimeAsrRealtimeEvent>> {
-        if stream.execution_path() == RealtimeAsrExecutionPath::Engine {
+        if stream.execution_path() == RealtimeAsrPath::Engine {
             let outputs = self.finish_engine_realtime_segment(stream).await?;
             stream.close();
             return Ok(stream.map_engine_outputs(outputs));
@@ -5313,15 +5300,15 @@ mod tests {
         );
         assert_eq!(
             realtime_asr_execution_path(ModelVariant::Nemotron35AsrStreaming06B),
-            RealtimeAsrExecutionPath::Direct
+            RealtimeAsrPath::Direct
         );
         assert_eq!(
             realtime_asr_execution_path(ModelVariant::VoxtralMini4BRealtime2602),
-            RealtimeAsrExecutionPath::Engine
+            RealtimeAsrPath::Engine
         );
         assert_eq!(
             realtime_asr_execution_path(ModelVariant::WhisperLargeV3Turbo),
-            RealtimeAsrExecutionPath::Direct
+            RealtimeAsrPath::Direct
         );
 
         assert_eq!(resolve_asr_realtime_stream_variant(None), None);

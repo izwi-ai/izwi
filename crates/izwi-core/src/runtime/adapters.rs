@@ -6,7 +6,6 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::backends::BackendKind;
-use crate::catalog::ModelFamily;
 use crate::catalog::ModelVariant;
 use crate::engine::{
     CacheMode, CancellationGranularity, ExecutionMode, ExecutionProfile, NativeBatchMode,
@@ -15,15 +14,20 @@ use crate::engine::{
 use crate::error::{Error, Result};
 
 mod loaded;
+mod table;
 
 pub(crate) use loaded::{
     LoadedCapabilityBinding, LoadedExecutionContract, LoadedModelBundle, LoadedModelBundleDraft,
     LoadedStatePublication, StreamingRequirements,
 };
+pub(crate) use table::{capability_row, capability_rows, RealtimeAsrPath};
 
+/// A runtime capability. Model capabilities resolve through the capability
+/// table; voice activity detection and endpointing run without a model
+/// adapter (the server's VAD) and only name conformance cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CapabilityKind {
+pub enum CapabilityKind {
     Asr,
     SpeakerAttributedAsr,
     RealtimeAsr,
@@ -35,6 +39,8 @@ pub(crate) enum CapabilityKind {
     Diarization,
     ForcedAlignment,
     Tokenizer,
+    Vad,
+    Endpointing,
 }
 
 impl CapabilityKind {
@@ -47,7 +53,7 @@ impl CapabilityKind {
         }
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Asr => "asr",
             Self::SpeakerAttributedAsr => "speaker_attributed_asr",
@@ -60,6 +66,27 @@ impl CapabilityKind {
             Self::Diarization => "diarization",
             Self::ForcedAlignment => "forced_alignment",
             Self::Tokenizer => "tokenizer",
+            Self::Vad => "vad",
+            Self::Endpointing => "endpointing",
+        }
+    }
+
+    /// The registry id of this capability's built-in adapter.
+    pub(crate) const fn adapter_id(self) -> &'static str {
+        match self {
+            Self::Asr => "builtin.asr",
+            Self::SpeakerAttributedAsr => "builtin.speaker_attributed_asr",
+            Self::RealtimeAsr => "builtin.realtime_asr",
+            Self::Tts => "builtin.tts",
+            Self::StreamingTts => "builtin.streaming_tts",
+            Self::Chat => "builtin.chat",
+            Self::AudioChat => "builtin.audio_chat",
+            Self::SpeechToSpeech => "builtin.speech_to_speech",
+            Self::Diarization => "builtin.diarization",
+            Self::ForcedAlignment => "builtin.forced_alignment",
+            Self::Tokenizer => "builtin.tokenizer",
+            Self::Vad => "builtin.vad",
+            Self::Endpointing => "builtin.endpointing",
         }
     }
 }
@@ -111,91 +138,6 @@ impl InferenceStateRequirement {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FamilyInferenceStatePolicy {
-    tts: InferenceStateRequirement,
-    streaming_tts: InferenceStateRequirement,
-    asr: InferenceStateRequirement,
-    chat: InferenceStateRequirement,
-}
-
-impl FamilyInferenceStatePolicy {
-    const STATELESS: Self = Self {
-        tts: InferenceStateRequirement::Stateless,
-        streaming_tts: InferenceStateRequirement::Stateless,
-        asr: InferenceStateRequirement::Stateless,
-        chat: InferenceStateRequirement::Stateless,
-    };
-}
-
-/// Exhaustive family-level inference-state truth.
-///
-/// Keeping this match exhaustive is intentional: adding a model family must
-/// include an explicit state-lifetime decision before its adapters can compile.
-const fn family_inference_state_policy(family: ModelFamily) -> FamilyInferenceStatePolicy {
-    use InferenceStateRequirement::{Invocation, Retained, RetainedAndInvocation};
-    use ModelFamily::*;
-
-    match family {
-        Qwen3Tts => FamilyInferenceStatePolicy {
-            tts: RetainedAndInvocation,
-            streaming_tts: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        KokoroTts => FamilyInferenceStatePolicy::STATELESS,
-        VibeVoiceTts => FamilyInferenceStatePolicy {
-            tts: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        VoxtralTts => FamilyInferenceStatePolicy {
-            tts: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        FishS2Tts => FamilyInferenceStatePolicy {
-            tts: RetainedAndInvocation,
-            streaming_tts: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        ParakeetAsr => FamilyInferenceStatePolicy {
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        NemotronAsr | Voxtral => FamilyInferenceStatePolicy {
-            asr: Invocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        GraniteSpeechAsr => FamilyInferenceStatePolicy {
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        VibeVoiceAsr => FamilyInferenceStatePolicy {
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        WhisperAsr => FamilyInferenceStatePolicy {
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        Qwen3Asr => FamilyInferenceStatePolicy {
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        Qwen3MoeChat | Qwen3Chat | Qwen35Chat | Qwen35MoeChat | Qwen38Chat | Gemma3Chat
-        | Lfm2Chat => FamilyInferenceStatePolicy {
-            chat: Retained,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        Lfm25Audio => FamilyInferenceStatePolicy {
-            tts: RetainedAndInvocation,
-            asr: RetainedAndInvocation,
-            ..FamilyInferenceStatePolicy::STATELESS
-        },
-        SortformerDiarization | Qwen3ForcedAligner | Tokenizer => {
-            FamilyInferenceStatePolicy::STATELESS
-        }
-    }
-}
-
 impl SequenceExecutionMode {
     const fn enabled(self) -> bool {
         matches!(self, Self::Always)
@@ -211,10 +153,6 @@ pub(crate) struct AdapterMetadata {
     pub(crate) execution_target: ExecutionTargetKind,
     pub(crate) sequence_execution: SequenceExecutionMode,
     pub(crate) state_requirement: InferenceStateRequirement,
-}
-
-pub(crate) trait ModelCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata>;
 }
 
 #[derive(Debug)]
@@ -247,17 +185,13 @@ impl RuntimeAdapterRegistry {
             request_parallelism: request_parallelism.max(1),
             loaded_adapter_factories: loaded::built_in_loaded_adapter_factories(),
         };
-        registry.register_adapter(TtsCapabilityAdapter);
-        registry.register_adapter(StreamingTtsCapabilityAdapter);
-        registry.register_adapter(AsrCapabilityAdapter);
-        registry.register_adapter(SpeakerAttributedAsrCapabilityAdapter);
-        registry.register_adapter(RealtimeAsrCapabilityAdapter);
-        registry.register_adapter(ChatCapabilityAdapter);
-        registry.register_adapter(AudioChatCapabilityAdapter);
-        registry.register_adapter(SpeechToSpeechCapabilityAdapter);
-        registry.register_adapter(DiarizationCapabilityAdapter);
-        registry.register_adapter(ForcedAlignmentCapabilityAdapter);
-        registry.register_adapter(TokenizerCapabilityAdapter);
+        for variant in ModelVariant::all().iter().copied() {
+            for row in table::capability_rows(variant) {
+                registry
+                    .adapters
+                    .insert((row.capability, variant), row.metadata_for(variant));
+            }
+        }
         registry.validate_loaded_adapter_factories()?;
         Ok(registry)
     }
@@ -330,18 +264,6 @@ impl RuntimeAdapterRegistry {
         }
         Ok(())
     }
-
-    fn register_adapter<A>(&mut self, adapter: A)
-    where
-        A: ModelCapabilityAdapter,
-    {
-        for variant in ModelVariant::all().iter().copied() {
-            if let Some(metadata) = adapter.metadata_for(variant) {
-                self.adapters
-                    .insert((metadata.capability, metadata.model_variant), metadata);
-            }
-        }
-    }
 }
 
 pub(crate) fn scalar_execution_profile(
@@ -383,288 +305,6 @@ pub(crate) fn scalar_execution_profile(
     profile.cache_namespace =
         sequence.then(|| format!("{}:{}:state-v2", variant, backend_kind.as_str()));
     profile
-}
-
-/// Every non-streaming TTS family runs on the engine. Voxtral-TTS was
-/// marked DirectModel while its loaded adapter publishes only the engine's
-/// sequence stages, so no route could run a request (VXT-1).
-fn tts_execution_target(_model_variant: ModelVariant) -> ExecutionTargetKind {
-    ExecutionTargetKind::TokenEngine
-}
-
-fn streaming_tts_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_kokoro() {
-        ExecutionTargetKind::DirectModel
-    } else {
-        tts_execution_target(model_variant)
-    }
-}
-
-fn tts_streaming_mode(model_variant: ModelVariant) -> StreamingMode {
-    let Some(capabilities) = model_variant.speech_capabilities() else {
-        return StreamingMode::None;
-    };
-    if capabilities.supports_streaming {
-        StreamingMode::Chunked
-    } else {
-        StreamingMode::None
-    }
-}
-
-fn asr_execution_target(model_variant: ModelVariant) -> ExecutionTargetKind {
-    if model_variant.is_audio_chat()
-        && model_variant.family() != crate::catalog::ModelFamily::Lfm25Audio
-    {
-        ExecutionTargetKind::DirectModel
-    } else {
-        ExecutionTargetKind::TokenEngine
-    }
-}
-
-fn chat_sequence_execution(model_variant: ModelVariant) -> SequenceExecutionMode {
-    if matches!(
-        model_variant.family(),
-        ModelFamily::Qwen3MoeChat
-            | ModelFamily::Qwen3Chat
-            | ModelFamily::Qwen35Chat
-            | ModelFamily::Qwen35MoeChat
-            | ModelFamily::Qwen38Chat
-            | ModelFamily::Gemma3Chat
-            | ModelFamily::Lfm2Chat
-    ) {
-        SequenceExecutionMode::Always
-    } else {
-        SequenceExecutionMode::None
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TtsCapabilityAdapter;
-
-impl ModelCapabilityAdapter for TtsCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.speech_capabilities()?;
-        Some(AdapterMetadata {
-            id: "builtin.tts",
-            capability: CapabilityKind::Tts,
-            model_variant,
-            streaming_mode: tts_streaming_mode(model_variant),
-            execution_target: tts_execution_target(model_variant),
-            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
-                SequenceExecutionMode::Always
-            } else {
-                SequenceExecutionMode::None
-            },
-            state_requirement: family_inference_state_policy(model_variant.family()).tts,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StreamingTtsCapabilityAdapter;
-
-impl ModelCapabilityAdapter for StreamingTtsCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        let capabilities = model_variant.speech_capabilities()?;
-        if !capabilities.supports_streaming || model_variant.streams_on_its_tts_route() {
-            return None;
-        }
-        Some(AdapterMetadata {
-            id: "builtin.streaming_tts",
-            capability: CapabilityKind::StreamingTts,
-            model_variant,
-            streaming_mode: StreamingMode::Chunked,
-            execution_target: streaming_tts_execution_target(model_variant),
-            sequence_execution: if model_variant.family() == ModelFamily::Qwen3Tts {
-                SequenceExecutionMode::Always
-            } else {
-                SequenceExecutionMode::None
-            },
-            state_requirement: family_inference_state_policy(model_variant.family()).streaming_tts,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AsrCapabilityAdapter;
-
-impl ModelCapabilityAdapter for AsrCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        (model_variant.is_asr() || model_variant.is_voxtral() || model_variant.is_audio_chat())
-            .then_some(AdapterMetadata {
-                id: "builtin.asr",
-                capability: CapabilityKind::Asr,
-                model_variant,
-                streaming_mode: if model_variant.is_audio_chat()
-                    || model_variant.is_voxtral()
-                    || model_variant.family() == crate::catalog::ModelFamily::Qwen3Asr
-                {
-                    StreamingMode::Chunked
-                } else {
-                    StreamingMode::None
-                },
-                execution_target: asr_execution_target(model_variant),
-                sequence_execution: if matches!(
-                    model_variant.family(),
-                    ModelFamily::Qwen3Asr
-                        | ModelFamily::WhisperAsr
-                        | ModelFamily::VibeVoiceAsr
-                        | ModelFamily::GraniteSpeechAsr
-                        | ModelFamily::Lfm25Audio
-                ) {
-                    SequenceExecutionMode::Always
-                } else {
-                    SequenceExecutionMode::None
-                },
-                state_requirement: family_inference_state_policy(model_variant.family()).asr,
-            })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SpeakerAttributedAsrCapabilityAdapter;
-
-impl ModelCapabilityAdapter for SpeakerAttributedAsrCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant
-            .supports_speaker_attributed_asr()
-            .then_some(AdapterMetadata {
-                id: "builtin.speaker_attributed_asr",
-                capability: CapabilityKind::SpeakerAttributedAsr,
-                model_variant,
-                streaming_mode: StreamingMode::None,
-                execution_target: ExecutionTargetKind::PipelineRunner,
-                sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Invocation,
-            })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RealtimeAsrCapabilityAdapter;
-
-impl ModelCapabilityAdapter for RealtimeAsrCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        matches!(
-            model_variant,
-            ModelVariant::Nemotron35AsrStreaming06B | ModelVariant::VoxtralMini4BRealtime2602
-        )
-        .then_some(AdapterMetadata {
-            id: "builtin.realtime_asr",
-            capability: CapabilityKind::RealtimeAsr,
-            model_variant,
-            streaming_mode: StreamingMode::Realtime,
-            execution_target: ExecutionTargetKind::RealtimeRunner,
-            sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::RetainedAndInvocation,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ChatCapabilityAdapter;
-
-impl ModelCapabilityAdapter for ChatCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_chat().then_some(AdapterMetadata {
-            id: "builtin.chat",
-            capability: CapabilityKind::Chat,
-            model_variant,
-            streaming_mode: StreamingMode::Chunked,
-            execution_target: ExecutionTargetKind::TokenEngine,
-            sequence_execution: chat_sequence_execution(model_variant),
-            state_requirement: family_inference_state_policy(model_variant.family()).chat,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AudioChatCapabilityAdapter;
-
-impl ModelCapabilityAdapter for AudioChatCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_audio_chat().then_some(AdapterMetadata {
-            id: "builtin.audio_chat",
-            capability: CapabilityKind::AudioChat,
-            model_variant,
-            streaming_mode: StreamingMode::Chunked,
-            execution_target: ExecutionTargetKind::TokenEngine,
-            sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Invocation,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SpeechToSpeechCapabilityAdapter;
-
-impl ModelCapabilityAdapter for SpeechToSpeechCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_audio_chat().then_some(AdapterMetadata {
-            id: "builtin.speech_to_speech",
-            capability: CapabilityKind::SpeechToSpeech,
-            model_variant,
-            streaming_mode: StreamingMode::Chunked,
-            execution_target: ExecutionTargetKind::TokenEngine,
-            sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Invocation,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DiarizationCapabilityAdapter;
-
-impl ModelCapabilityAdapter for DiarizationCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant
-            .supports_diarization_records()
-            .then_some(AdapterMetadata {
-                id: "builtin.diarization",
-                capability: CapabilityKind::Diarization,
-                model_variant,
-                streaming_mode: StreamingMode::None,
-                execution_target: ExecutionTargetKind::PipelineRunner,
-                sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Invocation,
-            })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ForcedAlignmentCapabilityAdapter;
-
-impl ModelCapabilityAdapter for ForcedAlignmentCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant
-            .is_forced_aligner()
-            .then_some(AdapterMetadata {
-                id: "builtin.forced_alignment",
-                capability: CapabilityKind::ForcedAlignment,
-                model_variant,
-                streaming_mode: StreamingMode::None,
-                execution_target: ExecutionTargetKind::BatchRunner,
-                sequence_execution: SequenceExecutionMode::None,
-                state_requirement: InferenceStateRequirement::Stateless,
-            })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TokenizerCapabilityAdapter;
-
-impl ModelCapabilityAdapter for TokenizerCapabilityAdapter {
-    fn metadata_for(&self, model_variant: ModelVariant) -> Option<AdapterMetadata> {
-        model_variant.is_tokenizer().then_some(AdapterMetadata {
-            id: "builtin.tokenizer",
-            capability: CapabilityKind::Tokenizer,
-            model_variant,
-            streaming_mode: StreamingMode::None,
-            execution_target: ExecutionTargetKind::Artifact,
-            sequence_execution: SequenceExecutionMode::None,
-            state_requirement: InferenceStateRequirement::Stateless,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -726,6 +366,81 @@ mod tests {
             .into_iter()
             .map(|metadata| metadata.capability)
             .collect()
+    }
+
+    #[test]
+    fn capability_table_is_complete_and_drives_every_adapter_and_factory() {
+        let registry = RuntimeAdapterRegistry::built_in();
+
+        for variant in ModelVariant::all().iter().copied() {
+            let rows = table::capability_rows(variant).collect::<Vec<_>>();
+            let tabled = rows
+                .iter()
+                .map(|row| row.capability)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                tabled,
+                expected_capabilities(variant),
+                "capability table rows for {variant:?}"
+            );
+            assert_eq!(rows.len(), tabled.len(), "{variant:?} has overlapping rows");
+
+            for row in rows {
+                let metadata = row.metadata_for(variant);
+                if matches!(
+                    row.capability,
+                    CapabilityKind::Tts | CapabilityKind::StreamingTts
+                ) {
+                    assert_eq!(
+                        row.streaming_mode == StreamingMode::Chunked,
+                        variant
+                            .speech_capabilities()
+                            .is_some_and(|capabilities| capabilities.supports_streaming),
+                        "{variant:?} {:?} streaming disagrees with the catalog",
+                        row.capability
+                    );
+                }
+                assert_eq!(
+                    *registry.require(row.capability, variant).unwrap(),
+                    metadata,
+                    "{variant:?} {:?} adapter is not the table row",
+                    row.capability
+                );
+                for backend in row.backends.iter().copied() {
+                    assert_eq!(
+                        registry
+                            .loaded_adapter_factory(metadata, backend)
+                            .unwrap()
+                            .id(),
+                        row.loaded_adapter.factory_id(),
+                        "{variant:?} {:?} on {backend:?}",
+                        row.capability
+                    );
+                }
+            }
+        }
+
+        for row in table::CAPABILITY_TABLE {
+            assert!(
+                ModelVariant::all()
+                    .iter()
+                    .any(|variant| row.serves(*variant)),
+                "{:?} {:?} serves no catalog variant",
+                row.family,
+                row.capability
+            );
+        }
+        let tabled_factories = table::CAPABILITY_TABLE
+            .iter()
+            .map(|row| row.loaded_adapter.factory_id())
+            .collect::<BTreeSet<_>>();
+        for factory in loaded::built_in_loaded_adapter_factories() {
+            assert!(
+                tabled_factories.contains(factory.id()),
+                "factory {} serves no table row",
+                factory.id()
+            );
+        }
     }
 
     #[test]

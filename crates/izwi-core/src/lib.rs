@@ -103,7 +103,7 @@ pub use performance::{
 pub use runtime::{
     capability_conformance_cases, prometheus_voice_metric_name, prometheus_voice_metric_type,
     required_conformance_capabilities, voice_metric_catalog, voice_metric_prometheus_contract,
-    CapabilityConformanceCase, ConformanceCapability, ConformanceExecutionClass, VoiceLatency,
+    CapabilityConformanceCase, CapabilityKind, ConformanceExecutionClass, VoiceLatency,
     VoiceMetricDescriptor, VOICE_ASR_FINAL_SECONDS, VOICE_ASR_FIRST_PARTIAL_SECONDS,
     VOICE_AUDIO_EGRESS_UNDERRUNS_TOTAL, VOICE_AUDIO_INGRESS_DROPPED_FRAMES_TOTAL,
     VOICE_BARGE_IN_LATENCY_SECONDS, VOICE_BARGE_IN_TOTAL, VOICE_ENDPOINTING_LATENCY_SECONDS,
