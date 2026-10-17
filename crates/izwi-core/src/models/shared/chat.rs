@@ -132,9 +132,47 @@ impl Default for ChatGenerationConfig {
     }
 }
 
+/// Tokens `[start, end)` of a capacity replay's journal: the prompt followed
+/// by the generated tokens.
+pub(crate) fn replay_journal_span(
+    prompt_ids: &[u32],
+    generated_ids: &[u32],
+    start: usize,
+    end: usize,
+) -> crate::error::Result<Vec<u32>> {
+    if start > end || end > prompt_ids.len() + generated_ids.len() {
+        return Err(crate::error::Error::InvalidInput(format!(
+            "replay span [{start},{end}) exceeds its {}-token journal",
+            prompt_ids.len() + generated_ids.len()
+        )));
+    }
+    Ok(prompt_ids
+        .iter()
+        .chain(generated_ids)
+        .skip(start)
+        .take(end - start)
+        .copied()
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ChatGenerationConfig, ChatReasoningEffort, ChatRequestConfig, ChatTemplateKwargs};
+
+    #[test]
+    fn replay_journal_spans_cross_from_prompt_to_generated_tokens() {
+        let prompt = [1, 2, 3];
+        let generated = [7, 8];
+        assert_eq!(
+            super::replay_journal_span(&prompt, &generated, 1, 5).unwrap(),
+            [2, 3, 7, 8]
+        );
+        assert_eq!(
+            super::replay_journal_span(&prompt, &generated, 3, 4).unwrap(),
+            [7]
+        );
+        assert!(super::replay_journal_span(&prompt, &generated, 2, 6).is_err());
+    }
 
     #[test]
     fn chat_generation_config_default_is_greedy() {

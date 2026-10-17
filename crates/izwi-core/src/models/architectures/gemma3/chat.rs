@@ -24,7 +24,9 @@ use crate::model::ModelVariant;
 use crate::models::architectures::gemma3::core::Gemma3PhysicalModel;
 use crate::models::shared::attention::paged::default_kv_page_size;
 use crate::models::shared::attention::physical::PhysicalPagedKvCache;
-use crate::models::shared::chat::{ChatGenerationConfig, ChatMessage, ChatRole};
+use crate::models::shared::chat::{
+    replay_journal_span, ChatGenerationConfig, ChatMessage, ChatRole,
+};
 use crate::models::shared::config::checkpoint_dtype_from_config_json;
 use crate::models::shared::sampling::{sample_chat_rows, ChatSampler};
 use crate::tokenizer::{IncrementalDecoder, Tokenizer};
@@ -49,9 +51,35 @@ pub struct ChatDecodeState {
     stagnant_steps: usize,
     max_new_tokens: usize,
     finished: bool,
+    /// Cache length a capacity replay is rebuilding; the state decodes again
+    /// once its cache reaches it.
+    replay_end: Option<usize>,
     /// DS9.3: logprob entries produced by the current decode step, drained
     /// by the registry right after the step. Cleared at each sample.
     pub(crate) pending_logprobs: Vec<crate::engine::TokenLogprob>,
+}
+
+/// CPU continuation record of a session released for capacity: the
+/// generated-token journal (the prompt is the request's own) and the sampler
+/// and text state at a quantum boundary. It owns no tensors; the released
+/// cache is rebuilt by replaying the prompt and every generated token but the
+/// pending one.
+#[derive(Clone)]
+pub(crate) struct ChatReplayCheckpoint {
+    replay_tokens: usize,
+    pending_token: u32,
+    prefill_progress: usize,
+    generated_ids: Vec<u32>,
+    sampler: ChatSampler,
+    text: ReplyText,
+    stagnant_steps: usize,
+    max_new_tokens: usize,
+}
+
+impl ChatReplayCheckpoint {
+    pub(crate) fn replay_tokens(&self) -> usize {
+        self.replay_tokens
+    }
 }
 
 pub(crate) struct ChatDecodeCheckpoint {
@@ -70,6 +98,37 @@ pub(crate) struct ChatDecodeCheckpoint {
 impl ChatDecodeState {
     pub(crate) fn prefill_progress(&self) -> usize {
         self.prefill_progress
+    }
+
+    /// The replay a capacity suspension still has to rebuild, if any.
+    pub(crate) fn replay_tokens(&self) -> Option<usize> {
+        self.replay_end
+    }
+
+    /// Capture the CPU continuation record at a quantum boundary, before the
+    /// caller releases the cache.
+    pub(crate) fn replay_checkpoint(&self) -> Result<ChatReplayCheckpoint> {
+        let replay_tokens = self.replay_end.unwrap_or(self.position);
+        let pending_token = self.pending_token.filter(|_| {
+            !self.finished
+                && self.unconsumed_logits.is_none()
+                && replay_tokens + 1 == self.prefill_progress + self.generated_ids.len()
+        });
+        let Some(pending_token) = pending_token else {
+            return Err(Error::InvalidInput(
+                "a Gemma session suspends only between decode quanta".into(),
+            ));
+        };
+        Ok(ChatReplayCheckpoint {
+            replay_tokens,
+            pending_token,
+            prefill_progress: self.prefill_progress,
+            generated_ids: self.generated_ids.clone(),
+            sampler: self.sampler.clone(),
+            text: self.text.clone(),
+            stagnant_steps: self.stagnant_steps,
+            max_new_tokens: self.max_new_tokens,
+        })
     }
 
     pub(crate) fn install_physical_reservation(
@@ -694,17 +753,18 @@ impl Gemma3ChatModel {
         ))
     }
 
+    /// Start a session in engine-owned physical KV, prefilling the
+    /// request's sealed prompt (the tokens a capacity replay writes back).
     pub fn start_decode_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<ChatDecodeState> {
-        let prompt_ids = self.build_prompt(messages)?;
         let mut state =
-            self.begin_resumable_prefill_managed(&prompt_ids, max_new_tokens, config, cache)?;
-        self.continue_resumable_prefill(&mut state, &prompt_ids, 0, prompt_ids.len())?;
+            self.begin_resumable_prefill_managed(prompt_ids, max_new_tokens, config, cache)?;
+        self.continue_resumable_prefill(&mut state, prompt_ids, 0, prompt_ids.len())?;
         Ok(state)
     }
 
@@ -744,8 +804,75 @@ impl Gemma3ChatModel {
             stagnant_steps: 0,
             max_new_tokens: max_new_tokens.max(1),
             finished: false,
+            replay_end: None,
             pending_logprobs: Vec::new(),
         })
+    }
+
+    /// Start rebuilding a suspended session in an empty reservation. The
+    /// state decodes again after [`Self::continue_replay`] reaches the end
+    /// of the checkpoint's replay.
+    pub(crate) fn begin_replay_managed(
+        &self,
+        saved: &ChatReplayCheckpoint,
+        cache: PhysicalPagedKvCache,
+    ) -> Result<ChatDecodeState> {
+        if cache.context_len() != 0 || saved.replay_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "Gemma replay requires an empty reservation and a non-empty journal".into(),
+            ));
+        }
+        Ok(ChatDecodeState {
+            cache,
+            unconsumed_logits: None,
+            position: 0,
+            pending_token: Some(saved.pending_token),
+            prefill_progress: saved.prefill_progress,
+            generated_ids: saved.generated_ids.clone(),
+            sampler: saved.sampler.clone(),
+            text: saved.text.clone(),
+            stagnant_steps: saved.stagnant_steps,
+            max_new_tokens: saved.max_new_tokens,
+            finished: false,
+            replay_end: Some(saved.replay_tokens),
+            pending_logprobs: Vec::new(),
+        })
+    }
+
+    /// Write `[span_start, span_end)` of the replay journal (the prompt, then
+    /// the generated tokens) into the cache without sampling or emitting.
+    /// Returns whether the replay is complete.
+    pub(crate) fn continue_replay(
+        &self,
+        state: &mut ChatDecodeState,
+        prompt_ids: &[u32],
+        span_start: usize,
+        span_end: usize,
+    ) -> Result<bool> {
+        let replay_end = state
+            .replay_end
+            .ok_or_else(|| Error::InvalidInput("Gemma state has no pending replay".into()))?;
+        if span_start != state.position
+            || span_start != state.cache.context_len()
+            || span_start >= span_end
+            || span_end > replay_end
+            || prompt_ids.len() != state.prefill_progress
+        {
+            return Err(Error::InvalidInput(format!(
+                "Gemma replay span [{span_start},{span_end}) does not continue cursor {} of {replay_end}",
+                state.position
+            )));
+        }
+        let ids = replay_journal_span(prompt_ids, &state.generated_ids, span_start, span_end)?;
+        let input = Tensor::from_vec(ids, (1, span_end - span_start), &self.device.device)?;
+        self.text_model
+            .prefill_physical(&input, span_start, &mut state.cache)?;
+        state.position = span_end;
+        let complete = span_end == replay_end;
+        if complete {
+            state.replay_end = None;
+        }
+        Ok(complete)
     }
 
     pub(crate) fn continue_resumable_prefill(
@@ -803,6 +930,11 @@ impl Gemma3ChatModel {
     }
 
     pub fn decode_step(&self, state: &mut ChatDecodeState) -> Result<ChatDecodeStep> {
+        if state.replay_end.is_some() {
+            return Err(Error::InferenceError(
+                "Gemma decode cannot run before its replay completes".into(),
+            ));
+        }
         if state.finished || state.generated_ids.len() >= state.max_new_tokens {
             return self.finish_decode(state, String::new());
         }
@@ -857,6 +989,7 @@ impl Gemma3ChatModel {
             state.finished
                 || state.generated_ids.len() >= state.max_new_tokens
                 || state.unconsumed_logits.is_some()
+                || state.replay_end.is_some()
         }) {
             return Err(Error::InvalidInput(
                 "Gemma continuous batch contains an unready decode state".into(),
@@ -1263,6 +1396,12 @@ mod tests {
     }
 }
 
+/// The tiny Gemma 3 chat model over sixteen whole-character pieces.
+#[cfg(test)]
+pub(crate) fn tiny_chat_model_for_test(device: &candle_core::Device) -> Gemma3ChatModel {
+    stream_tests::tiny_chat_model(device, &stream_tests::PLAIN_PIECES)
+}
+
 #[cfg(test)]
 mod stream_tests {
     use super::*;
@@ -1282,7 +1421,7 @@ mod stream_tests {
         "7>", "e", "f", "g",
     ];
     /// Sixteen whole-character pieces.
-    const PLAIN_PIECES: [&str; 16] = [
+    pub(super) const PLAIN_PIECES: [&str; 16] = [
         "▁a", "b", "c", "▁", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
     ];
 
@@ -1332,7 +1471,7 @@ mod stream_tests {
         }
     }
 
-    fn tiny_chat_model(device: &Device, pieces: &[&str]) -> Gemma3ChatModel {
+    pub(super) fn tiny_chat_model(device: &Device, pieces: &[&str]) -> Gemma3ChatModel {
         Gemma3ChatModel {
             variant: ModelVariant::Gemma34BIt,
             device: DeviceProfile {
@@ -1520,6 +1659,143 @@ mod stream_tests {
     fn assert_streams_on(device: &Device) {
         assert_stream_matches_whole_sequence_decode(device, &PLAIN_PIECES, true);
         assert_stream_matches_whole_sequence_decode(device, &SPLIT_PIECES, false);
+    }
+
+    /// Run the pending token's forward as `decode_step` does and return
+    /// the logits it leaves for sampling.
+    fn pending_logits(model: &Gemma3ChatModel, state: &mut ChatDecodeState) -> Vec<f32> {
+        let pending = state.pending_token.take().expect("pending token");
+        let input = Tensor::from_vec(vec![pending], (1, 1), &model.device.device).unwrap();
+        let logits = model
+            .text_model
+            .forward_physical(&input, state.position, &mut state.cache)
+            .unwrap();
+        state.position += 1;
+        state.unconsumed_logits = Some(logits.clone());
+        logits.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    /// D2: a session released for capacity after `SUSPEND_AT` tokens and
+    /// rebuilt in a fresh cache by replaying its prompt and generated tokens
+    /// over the original span boundaries resumes exactly: bit-identical
+    /// next-step logits, and the same greedy and seeded streams (held
+    /// placeholder text included). A one-span replay runs other op shapes
+    /// and is held to a tolerance.
+    fn assert_replay_resumes_exactly(device: &Device) {
+        const REPLAY_NEW_TOKENS: usize = 40;
+        const SUSPEND_AT: usize = 9;
+        let sampled = ChatGenerationConfig {
+            temperature: 1.5,
+            seed: 11,
+            ..ChatGenerationConfig::default()
+        };
+        for pieces in [&PLAIN_PIECES, &SPLIT_PIECES] {
+            let model = tiny_chat_model(device, pieces);
+            for config in [ChatGenerationConfig::default(), sampled.clone()] {
+                for one_span in [false, true] {
+                    let mut caches = test_physical_caches_on(
+                        device,
+                        2,
+                        1,
+                        2,
+                        PROMPT.len() + REPLAY_NEW_TOKENS + 1,
+                        3,
+                    );
+                    let fresh = caches.pop().unwrap();
+                    let mut rows = caches
+                        .into_iter()
+                        .map(|cache| {
+                            let mut state = model
+                                .begin_resumable_prefill_managed(
+                                    &PROMPT,
+                                    REPLAY_NEW_TOKENS,
+                                    &config,
+                                    cache,
+                                )
+                                .unwrap();
+                            model
+                                .continue_resumable_prefill(&mut state, &PROMPT, 0, PROMPT.len())
+                                .unwrap();
+                            state
+                        })
+                        .collect::<Vec<_>>();
+                    let mut suspended = rows.pop().unwrap();
+                    let mut baseline = rows.pop().unwrap();
+                    for _ in 0..SUSPEND_AT {
+                        let step = model.decode_step(&mut baseline).unwrap();
+                        assert_eq!(model.decode_step(&mut suspended).unwrap().delta, step.delta);
+                    }
+                    assert!(
+                        !baseline.finished,
+                        "the fixture ended before the suspension"
+                    );
+                    let checkpoint = suspended.replay_checkpoint().unwrap();
+                    assert_eq!(checkpoint.replay_tokens(), PROMPT.len() + SUSPEND_AT - 1);
+                    drop(suspended);
+                    let mut replayed = model.begin_replay_managed(&checkpoint, fresh).unwrap();
+                    assert!(model.decode_step(&mut replayed).is_err());
+                    let spans = if one_span {
+                        vec![(0, checkpoint.replay_tokens())]
+                    } else {
+                        std::iter::once((0, PROMPT.len()))
+                            .chain(
+                                (PROMPT.len()..checkpoint.replay_tokens())
+                                    .map(|start| (start, start + 1)),
+                            )
+                            .collect()
+                    };
+                    for (index, (start, end)) in spans.iter().copied().enumerate() {
+                        let complete = model
+                            .continue_replay(&mut replayed, &PROMPT, start, end)
+                            .unwrap();
+                        assert_eq!(complete, index + 1 == spans.len());
+                    }
+                    let expected = pending_logits(&model, &mut baseline);
+                    let actual = pending_logits(&model, &mut replayed);
+                    if one_span {
+                        let error = expected
+                            .iter()
+                            .zip(&actual)
+                            .map(|(left, right)| {
+                                let error = (left - right).abs();
+                                if error.is_finite() {
+                                    error
+                                } else {
+                                    f32::INFINITY
+                                }
+                            })
+                            .fold(0.0, f32::max);
+                        assert!(error < 1e-4, "one-span replay logits differ by {error}");
+                        continue;
+                    }
+                    assert_eq!(actual, expected, "rebuilt next-step logits");
+                    while !baseline.finished {
+                        let step = model.decode_step(&mut baseline).unwrap();
+                        let resumed = model.decode_step(&mut replayed).unwrap();
+                        assert_eq!(resumed.delta, step.delta);
+                        assert_eq!(resumed.text, step.text);
+                    }
+                    assert!(replayed.finished);
+                    assert_eq!(replayed.generated_ids, baseline.generated_ids);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_session_resumes_exactly_on_cpu() {
+        assert_replay_resumes_exactly(&Device::Cpu);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn replayed_session_resumes_exactly_on_metal() {
+        let Some((device, _serial)) = crate::models::shared::metal_test_device_or_skip(
+            "gemma3 replayed_session_resumes_exactly_on_metal",
+        ) else {
+            return;
+        };
+        assert_replay_resumes_exactly(&device);
     }
 
     #[test]

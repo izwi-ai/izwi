@@ -271,6 +271,29 @@ impl NativeExecutor {
         Ok(Some(tokens))
     }
 
+    /// Whether `session` is a capacity replay that has not finished
+    /// rebuilding its state. Its prefill quanta are replay spans, whatever the
+    /// engine's prefill mode, and they run through the scalar handler.
+    pub(super) fn chat_session_replaying(&self, session: &SessionKey) -> Result<bool> {
+        if self
+            .suspended_chat_states
+            .lock()
+            .map_err(|_| Error::InferenceError("suspended chat mutex poisoned".into()))?
+            .contains_key(session)
+        {
+            return Ok(true);
+        }
+        let states = self
+            .chat_decode_states
+            .lock()
+            .map_err(|_| Error::InferenceError("chat state mutex poisoned".into()))?;
+        Ok(matches!(
+            states.get(session),
+            Some(super::ExecutorStateSlot::Ready { state, .. })
+                if state.state.replay_tokens().is_some()
+        ))
+    }
+
     pub(super) fn chat_generation_config(request: &EngineCoreRequest) -> ChatGenerationConfig {
         request.chat_generation_config()
     }
@@ -316,9 +339,12 @@ impl NativeExecutor {
         let resumable_prefill = (self.config.enable_chunked_prefill
             || super::binds_mixed_step(request))
             && model.supports_resumable_prefill();
+        let replaying =
+            scheduled.is_prefill && self.chat_session_replaying(&scheduled.session_key())?;
         if managed_cache.is_some()
             && scheduled.is_prefill
             && !resumable_prefill
+            && !replaying
             && (scheduled.num_computed_tokens != 0
                 || scheduled.num_tokens != request.num_prompt_tokens())
         {
@@ -613,7 +639,7 @@ impl NativeExecutor {
                 Some(cache) if matches!(model.as_ref(), NativeChatModel::Gemma3(_)) => {
                     Self::run_blocking(|| {
                         model.start_gemma3_decode_state_managed(
-                            messages,
+                            &request.prompt_tokens,
                             max_new_tokens,
                             &generation_config,
                             cache,
@@ -632,7 +658,7 @@ impl NativeExecutor {
                 }
                 Some(cache) => Self::run_blocking(|| {
                     model.start_qwen3_decode_state_managed(
-                        messages,
+                        &request.prompt_tokens,
                         max_new_tokens,
                         &generation_config,
                         cache,
@@ -680,7 +706,7 @@ impl NativeExecutor {
                 request.id.clone(),
             )));
         }
-        let resumable_prefill_quantum = scheduled.is_prefill && resumable_prefill;
+        let resumable_prefill_quantum = scheduled.is_prefill && (resumable_prefill || replaying);
         let resumable_span_tokens = resumable_prefill_quantum.then_some(scheduled.num_tokens);
         let replay_tokens = state_lease
             .state()
@@ -708,7 +734,12 @@ impl NativeExecutor {
             let mut stopped_logprobs = None;
             let mut step = if let (Some(_), Some((start, end))) = (replay_tokens, resumable_span) {
                 Self::run_blocking(|| {
-                    model.continue_replay(&mut active_state.state, start, end)
+                    model.continue_replay(
+                        &mut active_state.state,
+                        &request.prompt_tokens,
+                        start,
+                        end,
+                    )
                 })?;
                 crate::engine::metrics::record_capacity_replay(end - start);
                 NativeChatDecodeStep {
@@ -2031,6 +2062,156 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    /// D2/D3: a streaming chat session suspended for capacity after
+    /// `suspend_after` decode quanta is rebuilt the way CPU and Metal serve it
+    /// (chunked prefill off, so the whole replay is one prefill span in a fresh
+    /// reservation). The replay span publishes nothing and generates nothing,
+    /// and the resumed session streams the same deltas, sequence numbers,
+    /// final text and token counts as an unpreempted run with the same seed.
+    fn assert_replay_resumes_the_stream(
+        lease: &crate::models::registry::ChatModelLease,
+        capability: &crate::kv::InferenceStateCapability,
+        variant: ModelVariant,
+        prompt: &[u32],
+        suspend_after: usize,
+    ) {
+        use crate::backends::BackendKind;
+        use crate::engine::ModelInstanceId;
+
+        let instance = ModelInstanceId::new(9393);
+        let mut manager = crate::engine::cache::managed::ManagedKvCacheManager::new(None);
+        let runtime = manager
+            .bind_request(instance, BackendKind::Cpu, 16, 8, capability)
+            .unwrap()
+            .unwrap();
+        let request = |id: &str| {
+            let mut request = EngineCoreRequest::chat(vec![ChatMessage {
+                role: ChatRole::User,
+                content: id.into(),
+            }])
+            .with_model_variant(variant)
+            .with_streaming(true);
+            request.id = id.into();
+            request.model_instance_id = Some(instance);
+            request.params.max_tokens = 16;
+            request.params.temperature = 0.8;
+            request.params.seed = Some(7);
+            request
+                .install_chat_execution_preparation_with_model(
+                    variant,
+                    prompt.to_vec(),
+                    None,
+                    lease.clone(),
+                    64,
+                )
+                .unwrap();
+            request
+                .install_managed_cache_runtime(runtime.clone())
+                .unwrap();
+            request
+        };
+        let executor = NativeExecutor::new(super::super::WorkerConfig::default());
+        assert!(!executor.config.enable_chunked_prefill);
+        let mut plan = 0;
+        let mut run = |manager: &mut crate::engine::cache::managed::ManagedKvCacheManager,
+                       request: &EngineCoreRequest,
+                       start: usize,
+                       end: usize,
+                       prefill: bool| {
+            plan += 1;
+            let row = MixedWorld::row(request, plan, start, end, prefill);
+            let reservation = manager
+                .prepare_incremental(
+                    &runtime,
+                    row.plan_id,
+                    &row.session_key(),
+                    &row.work,
+                    Some(request),
+                )
+                .unwrap()
+                .unwrap();
+            request.begin_stream_staging().unwrap();
+            let result = executor.execute_single_request(&[request], &row, Some(&reservation));
+            assert!(result.output.error.is_none(), "{:?}", result.output.error);
+            let receipt = reservation
+                .completed_write_receipt(&result.managed_cache_completions)
+                .unwrap();
+            manager
+                .finalize(&reservation, Some(&receipt), true)
+                .unwrap();
+            let events = request
+                .take_staged_stream_outputs()
+                .unwrap()
+                .into_iter()
+                .map(|event| (event.text, event.sequence, event.is_final))
+                .collect::<Vec<_>>();
+            (result.output, events)
+        };
+        // Each run's events, generated tokens and terminal output.
+        let mut streams = Vec::new();
+        for (id, suspend) in [("baseline", None), ("preempted", Some(suspend_after))] {
+            let request = request(id);
+            let (output, mut events) = run(&mut manager, &request, 0, prompt.len(), true);
+            let mut generated = output.tokens_generated;
+            let mut cursor = prompt.len();
+            let mut decoded = 0;
+            let terminal = loop {
+                if suspend == Some(decoded) {
+                    let session = MixedWorld::row(&request, 0, 0, 0, false).session_key();
+                    let replay_tokens = executor.suspend_chat_session(&session).unwrap().unwrap();
+                    assert_eq!(replay_tokens, cursor);
+                    manager.release_session(&session).unwrap();
+                    let (output, replay_events) =
+                        run(&mut manager, &request, 0, replay_tokens, true);
+                    assert!(replay_events.is_empty(), "replay republished output");
+                    assert_eq!(output.tokens_generated, 0);
+                    assert_eq!(output.tokens_processed, replay_tokens);
+                    assert!(!output.finished);
+                }
+                let (output, step_events) = run(&mut manager, &request, cursor, cursor + 1, false);
+                events.extend(step_events);
+                generated += output.tokens_generated;
+                cursor += 1;
+                decoded += 1;
+                if output.finished {
+                    break output;
+                }
+            };
+            assert!(decoded > suspend_after, "the run ended before its suspension");
+            streams.push((events, generated, terminal.text, terminal.tokens_processed));
+        }
+        assert_eq!(streams[1], streams[0]);
+    }
+
+    #[test]
+    fn replayed_dense_sessions_resume_their_streams_without_republishing() {
+        use crate::kv::InferenceStateContractProvider;
+        use crate::models::architectures::gemma3::chat::tiny_chat_model_for_test as tiny_gemma3;
+        use crate::models::architectures::qwen3::chat::tiny_chat_model_for_test as tiny_qwen3;
+        use crate::models::registry::ChatModelLease;
+
+        let qwen3 = tiny_qwen3(&candle_core::Device::Cpu);
+        let capability = qwen3.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Qwen3(qwen3));
+        assert_replay_resumes_the_stream(
+            &lease,
+            &capability,
+            ModelVariant::Qwen306B,
+            &[0, 1, 7, 2, 5],
+            6,
+        );
+        let gemma3 = tiny_gemma3(&candle_core::Device::Cpu);
+        let capability = gemma3.inference_state_contract().unwrap();
+        let lease = ChatModelLease::for_test(NativeChatModel::Gemma3(gemma3));
+        assert_replay_resumes_the_stream(
+            &lease,
+            &capability,
+            ModelVariant::Gemma34BIt,
+            &[0, 1, 2, 9, 4],
+            6,
+        );
     }
 
     /// Two chat requests over one tiny Qwen3.8 model, managed cache and

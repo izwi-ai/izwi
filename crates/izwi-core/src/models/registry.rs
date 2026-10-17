@@ -4524,6 +4524,8 @@ pub(crate) enum NativeChatDecodeCheckpoint {
 /// capacity: everything needed to rebuild its released physical state by
 /// replaying tokens. It owns no tensors, cache views or device events.
 pub(crate) enum NativeChatReplayCheckpoint {
+    Qwen3(crate::models::architectures::qwen3::chat::ChatReplayCheckpoint),
+    Gemma3(crate::models::architectures::gemma3::chat::ChatReplayCheckpoint),
     Qwen38(crate::models::architectures::qwen38::chat::Qwen38ReplayCheckpoint),
     Qwen36Moe(crate::models::architectures::qwen36moe::exec::Qwen36ReplayCheckpoint),
 }
@@ -4532,6 +4534,8 @@ impl NativeChatReplayCheckpoint {
     /// Tokens the replay writes back: everything the released state held.
     pub(crate) fn replay_tokens(&self) -> usize {
         match self {
+            Self::Qwen3(checkpoint) => checkpoint.replay_tokens(),
+            Self::Gemma3(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen38(checkpoint) => checkpoint.replay_tokens(),
             Self::Qwen36Moe(checkpoint) => checkpoint.replay_tokens(),
         }
@@ -4628,11 +4632,13 @@ impl NativeChatDecodeState {
     /// replay. The caller fences the last completed step first.
     pub(crate) fn replay_checkpoint(&self) -> Result<Option<NativeChatReplayCheckpoint>> {
         Ok(Some(match self {
+            Self::Qwen3(state) => NativeChatReplayCheckpoint::Qwen3(state.replay_checkpoint()?),
+            Self::Gemma3(state) => NativeChatReplayCheckpoint::Gemma3(state.replay_checkpoint()?),
             Self::Qwen38(state) => NativeChatReplayCheckpoint::Qwen38(state.replay_checkpoint()?),
             Self::Qwen36Moe(state) => {
                 NativeChatReplayCheckpoint::Qwen36Moe(state.replay_checkpoint()?)
             }
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => return Ok(None),
+            Self::Qwen35(_) | Self::Lfm2(_) => return Ok(None),
         }))
     }
 
@@ -4640,9 +4646,11 @@ impl NativeChatDecodeState {
     /// decodes normally.
     pub(crate) fn replay_tokens(&self) -> Option<usize> {
         match self {
+            Self::Qwen3(state) => state.replay_tokens(),
+            Self::Gemma3(state) => state.replay_tokens(),
             Self::Qwen38(state) => state.replay_tokens(),
             Self::Qwen36Moe(state) => state.replay_tokens(),
-            Self::Qwen3(_) | Self::Qwen35(_) | Self::Gemma3(_) | Self::Lfm2(_) => None,
+            Self::Qwen35(_) | Self::Lfm2(_) => None,
         }
     }
 
@@ -5232,12 +5240,8 @@ impl NativeChatModel {
     /// validation, so it does not declare one.
     pub fn replay_capability(&self) -> ReplayCapability {
         match self {
-            Self::Qwen38(_) => ReplayCapability::TokenReplay,
-            Self::Qwen3(_)
-            | Self::Qwen35(_)
-            | Self::Qwen36Moe(_)
-            | Self::Gemma3(_)
-            | Self::Lfm2(_) => ReplayCapability::None,
+            Self::Qwen3(_) | Self::Gemma3(_) | Self::Qwen38(_) => ReplayCapability::TokenReplay,
+            Self::Qwen35(_) | Self::Qwen36Moe(_) | Self::Lfm2(_) => ReplayCapability::None,
         }
     }
 
@@ -5257,6 +5261,20 @@ impl NativeChatModel {
         mtp_cache: Option<PhysicalPagedKvCache>,
     ) -> Result<NativeChatDecodeState> {
         match (self, checkpoint) {
+            (Self::Qwen3(model), NativeChatReplayCheckpoint::Qwen3(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Qwen3(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
+            (Self::Gemma3(model), NativeChatReplayCheckpoint::Gemma3(checkpoint))
+                if mtp_cache.is_none() =>
+            {
+                Ok(NativeChatDecodeState::Gemma3(
+                    model.begin_replay_managed(checkpoint, cache)?,
+                ))
+            }
             (Self::Qwen38(model), NativeChatReplayCheckpoint::Qwen38(checkpoint)) => {
                 Ok(NativeChatDecodeState::Qwen38(
                     model.begin_replay_state_physical(checkpoint, cache, mtp_cache)?,
@@ -5273,16 +5291,23 @@ impl NativeChatModel {
         }
     }
 
-    /// Replay `[span_start, span_end)` of a suspended session's journal into
-    /// its state without sampling or emitting output. Returns whether the
-    /// replay is complete.
+    /// Replay `[span_start, span_end)` of a suspended session's journal (its
+    /// prompt, then its generated tokens) into its state without sampling or
+    /// emitting output. Returns whether the replay is complete.
     pub(crate) fn continue_replay(
         &self,
         state: &mut NativeChatDecodeState,
+        prompt_ids: &[u32],
         span_start: usize,
         span_end: usize,
     ) -> Result<bool> {
         match (self, state) {
+            (Self::Qwen3(model), NativeChatDecodeState::Qwen3(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
+            (Self::Gemma3(model), NativeChatDecodeState::Gemma3(state)) => {
+                model.continue_replay(state, prompt_ids, span_start, span_end)
+            }
             (Self::Qwen38(model), NativeChatDecodeState::Qwen38(state)) => {
                 model.continue_replay_physical(state, span_start, span_end)
             }
@@ -5335,14 +5360,14 @@ impl NativeChatModel {
     /// cache until they publish an equivalent managed adapter.
     pub fn start_qwen3_decode_state_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Qwen3(model) => Ok(NativeChatDecodeState::Qwen3(model.start_decode_managed(
-                messages,
+                prompt_ids,
                 max_new_tokens,
                 config,
                 cache,
@@ -5694,14 +5719,14 @@ impl NativeChatModel {
 
     pub(crate) fn start_gemma3_decode_state_managed(
         &self,
-        messages: &[ChatMessage],
+        prompt_ids: &[u32],
         max_new_tokens: usize,
         config: &ChatGenerationConfig,
         cache: PhysicalPagedKvCache,
     ) -> Result<NativeChatDecodeState> {
         match self {
             Self::Gemma3(model) => Ok(NativeChatDecodeState::Gemma3(model.start_decode_managed(
-                messages,
+                prompt_ids,
                 max_new_tokens,
                 config,
                 cache,

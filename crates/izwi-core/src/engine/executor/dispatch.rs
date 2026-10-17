@@ -523,7 +523,12 @@ impl NativeExecutor {
         rows: &[ReadyQuantum],
         force_split: bool,
     ) -> Result<Vec<ExecutorStepResult>> {
-        let outputs = if force_split {
+        // A capacity replay span rebuilds a state outside the mixed forward.
+        let mut replaying = false;
+        for row in scheduled.iter().filter(|row| row.is_prefill) {
+            replaying |= self.chat_session_replaying(&row.session_key())?;
+        }
+        let outputs = if force_split || replaying {
             self.chat_mixed_step_split(requests, scheduled, rows)?
         } else {
             let managed_caches =

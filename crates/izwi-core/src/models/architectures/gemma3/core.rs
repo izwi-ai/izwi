@@ -672,6 +672,39 @@ impl Gemma3PhysicalModel {
         position: usize,
         cache: &mut PhysicalPagedKvCache,
     ) -> Result<Tensor> {
+        let (hidden, prepared) = self.prepare_physical_hidden(input_ids, position, cache)?;
+        let sequence = hidden.dim(1)?;
+        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
+        let logits = match self.config.final_logit_softcapping {
+            Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
+            None => logits,
+        };
+        let logits = logits.narrow(1, sequence - 1, 1)?;
+        cache.commit_prepared(prepared)?;
+        Ok(logits)
+    }
+
+    /// Commit a span's KV without projecting logits (a capacity replay).
+    pub(crate) fn prefill_physical(
+        &self,
+        input_ids: &Tensor,
+        position: usize,
+        cache: &mut PhysicalPagedKvCache,
+    ) -> Result<()> {
+        let (_hidden, prepared) = self.prepare_physical_hidden(input_ids, position, cache)?;
+        cache.commit_prepared(prepared)?;
+        Ok(())
+    }
+
+    fn prepare_physical_hidden(
+        &self,
+        input_ids: &Tensor,
+        position: usize,
+        cache: &PhysicalPagedKvCache,
+    ) -> Result<(
+        Tensor,
+        crate::models::shared::attention::physical::PreparedPhysicalPagedStep,
+    )> {
         let (batch, sequence) = input_ids.dims2()?;
         if batch != 1 || sequence == 0 {
             return Err(Error::InvalidInput(
@@ -698,14 +731,7 @@ impl Gemma3PhysicalModel {
             hidden =
                 layer.forward_physical(&hidden, position, cache, &mut prepared, layer_index)?;
         }
-        let logits = hidden.apply(&self.norm)?.apply(&self.lm_head)?;
-        let logits = match self.config.final_logit_softcapping {
-            Some(softcap) => ((logits / softcap)?.tanh()? * softcap)?,
-            None => logits,
-        };
-        let logits = logits.narrow(1, sequence - 1, 1)?;
-        cache.commit_prepared(prepared)?;
-        Ok(logits)
+        Ok((hidden, prepared))
     }
 
     pub(crate) fn forward_physical_decode_batch(
