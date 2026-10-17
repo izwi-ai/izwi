@@ -262,6 +262,19 @@ impl RequestAdmissionLimiter {
 pub struct StoredResponseInputItem {
     pub role: String,
     pub content: String,
+    /// A `function_call` or `function_call_output` input item as it was
+    /// sent; `None` for a message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<serde_json::Value>,
+}
+
+/// A `function_call` output item of a stored response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredFunctionCall {
+    pub id: String,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +291,9 @@ pub struct StoredResponseRecord {
     pub model: String,
     pub input_items: Vec<StoredResponseInputItem>,
     pub output_text: Option<String>,
+    /// Tool calls the answer made, after its text.
+    #[serde(default)]
+    pub output_function_calls: Vec<StoredFunctionCall>,
     #[serde(default)]
     pub input_tokens: usize,
     pub output_tokens: usize,
@@ -833,8 +849,10 @@ mod tests {
                 input_items: vec![StoredResponseInputItem {
                     role: "user".to_string(),
                     content: "old".to_string(),
+                    item: None,
                 }],
                 output_text: Some("old".to_string()),
+                output_function_calls: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 input_cached_tokens: 1,
@@ -852,6 +870,7 @@ mod tests {
                 model: "test".to_string(),
                 input_items: Vec::new(),
                 output_text: Some("new".to_string()),
+                output_function_calls: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 input_cached_tokens: 1,
@@ -1114,6 +1133,7 @@ mod tests {
             model: "test".to_string(),
             input_items: Vec::new(),
             output_text: Some(id.to_string()),
+            output_function_calls: Vec::new(),
             input_tokens: 1,
             output_tokens: 1,
             input_cached_tokens: 1,

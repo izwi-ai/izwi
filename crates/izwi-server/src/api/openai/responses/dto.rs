@@ -55,14 +55,28 @@ pub enum ResponseInput {
     Many(Vec<ResponseInputItem>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// An input item: a message (the default), a `function_call` the model
+/// made in an earlier turn, or the `function_call_output` answering it.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResponseInputItem {
+    #[serde(default, rename = "type")]
+    pub item_type: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<InboundContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A `function_call`'s JSON-encoded arguments.
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+    /// A `function_call_output`'s result: a string, or content parts.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,16 +94,26 @@ pub struct ResponseObject {
     pub metadata: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ResponseOutputItem {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub item_type: &'static str,
-    pub role: &'static str,
-    pub content: Vec<ResponseOutputContent>,
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseOutputItem {
+    Message {
+        id: String,
+        role: &'static str,
+        content: Vec<ResponseOutputContent>,
+    },
+    /// A tool call the client runs and answers with a
+    /// `function_call_output` input item carrying the same `call_id`.
+    FunctionCall {
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        status: &'static str,
+    },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResponseOutputContent {
     #[serde(rename = "type")]
     pub content_type: &'static str,
@@ -128,7 +152,8 @@ pub struct ResponseDeletedObject {
 #[derive(Debug, Serialize)]
 pub struct ResponseInputItemsList {
     pub object: &'static str,
-    pub data: Vec<ResponseInputItemObject>,
+    /// Message items, and function call items as they were sent.
+    pub data: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +191,9 @@ pub struct ResponseStreamCreatedPayload {
 #[derive(Debug, Serialize)]
 pub struct ResponseStreamDeltaPayload {
     pub response_id: String,
+    pub item_id: String,
+    pub output_index: usize,
+    pub content_index: usize,
     pub delta: String,
 }
 

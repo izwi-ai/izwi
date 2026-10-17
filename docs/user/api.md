@@ -558,7 +558,8 @@ Request fields:
 | `metadata`, `user` | Stored or accepted for compatibility. |
 | `temperature`, `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` | Optional runtime sampling controls. |
 | `store` | `false` skips process-local retention. Default retains completed records. |
-| `tools`, `tool_choice`, `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions, except that tool calls stay in the output text (Responses has no `function_call` output items yet). Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
+| `tools`, `tool_choice` | Function tools in the Responses form (`{"type": "function", "name", "parameters"}`) or the chat completions form. A tool call in the answer is a `function_call` output item (`id` `fc_<hex>`, `call_id` `call_<hex>`, `name`, JSON `arguments`) after the message, which is left out when the answer only calls tools; streaming sends `response.output_item.added`, `response.function_call_arguments.delta`/`.done` and `response.output_item.done` for it. Send the result back as a `{"type": "function_call_output", "call_id", "output"}` input item, after the `function_call` item itself. As in chat completions, `tool_choice` `required` and named functions are refused. |
+| `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Same behavior as chat completions. Response ids are `resp_<hex>` and message ids `msg_<hex>`. |
 
 Stored records are process-local:
 
