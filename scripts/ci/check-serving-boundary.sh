@@ -4,12 +4,13 @@
 # The gateway, protocol, transport client, and supervisor must never depend
 # on inference backends: a gateway process must not construct a runtime,
 # probe a device, or link accelerator code, on CPU, Metal, or CUDA alike.
-# Only izwi-serving-worker (which hosts RuntimeService) may depend on
-# izwi-core. The gateway role is still served by izwi-server, which links
-# izwi-core for its chat path; the gateway components already in
-# izwi-gateway must stay free of it. This gate fails closed if any boundary
-# crate gains a backend dependency. Only linked (normal and build) dependencies count: test-only
-# dev-dependencies never reach a shipped binary.
+# Only izwi-serving-worker (which hosts RuntimeService) and izwi-server's
+# local role may depend on izwi-core. The izwi-gateway binary, and the
+# accelerator-free crates it shares with izwi-core and izwi-server (model
+# catalog, Prometheus exposition, durable store), must stay free of it on
+# every target. This gate fails closed if any boundary crate gains a
+# backend dependency. Only linked (normal and build) dependencies count:
+# test-only dev-dependencies never reach a shipped binary.
 
 set -euo pipefail
 
@@ -17,15 +18,18 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
 boundary_crates=(
+    izwi-db
     izwi-env
     izwi-gateway
+    izwi-model-catalog
+    izwi-prometheus
     izwi-serving-protocol
     izwi-serving-client
     izwi-serving-fence
     izwi-serving-supervisor
 )
 tree_of() {
-    cargo tree --locked -p "$1" --edges normal,build --prefix none 2>/dev/null || true
+    cargo tree --locked -p "$1" --target all --edges normal,build --prefix none 2>/dev/null || true
 }
 forbidden_pattern='(izwi-core|candle-core|candle-nn|candle-transformers|metal |/metal-|cuda|cudnn|accelerate)'
 

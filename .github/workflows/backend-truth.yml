@@ -155,9 +155,9 @@ jobs:
           workspaces: |
             . -> target
 
-      # release.yml ships the supervisor and worker for Windows. The
-      # workspace rustc-wrapper is a python script for the macOS linker that
-      # Windows cannot execute, so this check runs without it.
+      # release.yml ships the supervisor, worker and gateway for Windows.
+      # The workspace rustc-wrapper is a python script for the macOS linker
+      # that Windows cannot execute, so this check runs without it.
       - name: Check serving crates for Windows
         shell: bash
         run: >-
@@ -166,6 +166,10 @@ jobs:
           -p izwi-serving-worker
           -p izwi-serving-protocol
           -p izwi-serving-client
+          -p izwi-gateway
+          -p izwi-model-catalog
+          -p izwi-prometheus
+          -p izwi-db
 
   fleet-stores:
     name: Store Validation (PostgreSQL)

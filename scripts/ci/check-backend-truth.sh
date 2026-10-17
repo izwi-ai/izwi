@@ -381,13 +381,18 @@ run_cargo_serving() {
     require_command cargo
 
     # Every serving crate's unit and integration tests (the client's contract
-    # suites run in the worker crate, against the real worker), plus the
-    # gateway's own tests and process suites and the process harness they
-    # spawn through. The fleet rig's gateway pairs share one coordination
-    # database per test, so it runs serially.
+    # suites run in the worker crate, against the real worker), the
+    # accelerator-free crates the gateway shares with the engine (model
+    # catalog, Prometheus exposition, durable store), plus the gateway's own
+    # tests and process suites and the process harness they spawn through.
+    # The fleet rig's gateway pairs share one coordination database per test,
+    # so it runs serially.
     cargo test --locked --no-fail-fast \
         -p izwi-test-process \
         -p izwi-env \
+        -p izwi-model-catalog \
+        -p izwi-prometheus \
+        -p izwi-db \
         -p izwi-serving-protocol \
         -p izwi-serving-client \
         -p izwi-serving-fence \
