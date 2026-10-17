@@ -571,11 +571,16 @@ mod tests {
     }
 
     /// DUR-F13: a duplicate name is a typed client error, found by the
-    /// database's constraint kind rather than by its message text.
+    /// database's constraint kind rather than by its message text. Runs on
+    /// PostgreSQL too when `IZWI_TEST_STORE_PG_URL` is set.
     #[tokio::test]
     async fn duplicate_name_is_a_typed_invalid_request() {
-        let _guard = env_lock();
-        let (_temp, store) = setup_store();
+        let database = crate::db::test_database::TestDatabase::new().await;
+        let media = tempfile::tempdir().expect("temp dir");
+        let store = SavedVoiceStore::initialize_with_storage(
+            database.database(),
+            Arc::new(LocalMediaStorageProvider::new(media.path().to_path_buf())),
+        );
         let voice = |name: &str| NewSavedVoice {
             name: name.to_string(),
             reference_text: "A calm reference sample".to_string(),
@@ -600,7 +605,6 @@ mod tests {
         let api = crate::error::store_api_error(error, "Saved voice storage error");
         assert_eq!(api.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(api.message.contains("already exists"), "{}", api.message);
-        clear_env();
     }
 
     #[tokio::test]

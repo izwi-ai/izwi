@@ -4,7 +4,7 @@ use crate::{
         store::{NewJobStage, NewRuntimeJob, QuotaLimits},
         types::{MediaAsset, RuntimeJobKind, RuntimeJobStatus, RuntimeStageStatus},
     },
-    db::StoreDatabase,
+    db::{test_database::TestDatabase, StoreDatabase},
     persistence::LocalMediaStorageProvider,
     speech_history_store::SpeechRouteKind,
     storage_layout,
@@ -20,12 +20,14 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
-use tempfile::TempDir;
 use tokio::sync::Notify;
 
-fn conformance_store(root: &TempDir, provider: Arc<dyn MediaStorageProvider>) -> ArtifactStore {
+async fn conformance_store(
+    database: &TestDatabase,
+    provider: Arc<dyn MediaStorageProvider>,
+) -> ArtifactStore {
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("artifacts.sqlite3")),
+        database.database(),
     ));
     ArtifactStore::new(
         metadata,
@@ -285,8 +287,11 @@ fn test_provider_write_input(
     }
 }
 
-async fn assert_provider_conformance(root: &TempDir, provider: Arc<dyn MediaStorageProvider>) {
-    let store = conformance_store(root, provider);
+async fn assert_provider_conformance(
+    database: &TestDatabase,
+    provider: Arc<dyn MediaStorageProvider>,
+) {
+    let store = conformance_store(database, provider).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
     let other = ArtifactTenant::parse("tenant-b").unwrap();
     let descriptor = store
@@ -343,10 +348,11 @@ async fn assert_provider_conformance(root: &TempDir, provider: Arc<dyn MediaStor
 #[tokio::test]
 async fn local_filesystem_provider_conforms_to_opaque_artifact_contract() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(LocalMediaStorageProvider::new(root.path().join("media")));
-    assert_provider_conformance(&root, provider.clone()).await;
+    assert_provider_conformance(&database, provider.clone()).await;
 
-    let store = conformance_store(&root, provider);
+    let store = conformance_store(&database, provider).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
     for (content_type, filename) in [
         ("image/png", "sample.png"),
@@ -390,11 +396,11 @@ async fn local_filesystem_provider_conforms_to_opaque_artifact_contract() {
 #[tokio::test]
 async fn deterministic_remote_like_provider_conforms_to_opaque_artifact_contract() {
     use tokio::io::AsyncReadExt;
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    assert_provider_conformance(&root, provider.clone()).await;
+    assert_provider_conformance(&database, provider.clone()).await;
 
-    let store = conformance_store(&root, provider);
+    let store = conformance_store(&database, provider).await;
     let tenant = ArtifactTenant::parse("tenant-remote").unwrap();
     let descriptor = store
         .put(
@@ -430,14 +436,12 @@ fn scheduling_tenant_mapping_is_stable_and_bounded() {
 
 #[tokio::test]
 async fn attempt_publication_atomically_hides_provider_keys_and_is_idempotent() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("attempt.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -476,9 +480,7 @@ async fn attempt_publication_atomically_hides_provider_keys_and_is_idempotent() 
     ));
     let reopened = ArtifactStore::new(
         {
-            let mut reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-                root.path().join("attempt.sqlite3"),
-            ));
+            let mut reopened = BatchRuntimeStore::initialize_with_database(database.database());
             reopened.set_test_clock(clock.clone());
             Arc::new(reopened)
         },
@@ -522,9 +524,10 @@ async fn attempt_publication_atomically_hides_provider_keys_and_is_idempotent() 
 #[tokio::test]
 async fn reserved_file_attempt_publication_is_opaque_and_provider_readable() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("attempt-file.sqlite3")),
+        database.database(),
     ));
     let store = ArtifactStore::new(
         metadata.clone(),
@@ -601,9 +604,10 @@ async fn reserved_file_attempt_publication_is_opaque_and_provider_readable() {
 #[tokio::test]
 async fn speech_final_file_settlement_commits_history_stage_job_and_reservation() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("speech-final.sqlite3")),
+        database.database(),
     ));
     let store = ArtifactStore::new(
         metadata.clone(),
@@ -735,9 +739,10 @@ async fn speech_final_file_settlement_commits_history_stage_job_and_reservation(
 #[tokio::test]
 async fn speech_final_file_settlement_fences_cancelled_attempt_and_keeps_object_recoverable() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("speech-final-cancel.sqlite3")),
+        database.database(),
     ));
     let store = ArtifactStore::new(
         metadata.clone(),
@@ -826,9 +831,10 @@ async fn speech_final_file_settlement_fences_cancelled_attempt_and_keeps_object_
 #[tokio::test]
 async fn speech_final_file_settlement_fences_expired_attempt_and_keeps_object_recoverable() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("speech-final-expired.sqlite3")),
+        database.database(),
     ));
     let store = ArtifactStore::new(
         metadata.clone(),
@@ -939,12 +945,12 @@ async fn speech_final_file_settlement_fences_expired_attempt_and_keeps_object_re
 #[tokio::test]
 async fn speech_final_file_settlement_recovers_after_provider_write_failure() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let db_path = root.path().join("speech-provider-fail.sqlite3");
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1064,13 +1070,12 @@ async fn speech_final_file_settlement_recovers_after_provider_write_failure() {
 #[tokio::test]
 async fn speech_final_file_settlement_recovers_orphaned_stored_reservation_after_reopen() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let db_path = root.path().join("speech-crash-reopen.sqlite3");
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata =
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1110,8 +1115,7 @@ async fn speech_final_file_settlement_recovers_orphaned_stored_reservation_after
     drop(store);
     drop(metadata);
 
-    let mut reopened_metadata =
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+    let mut reopened_metadata = BatchRuntimeStore::initialize_with_database(database.database());
     reopened_metadata.set_test_clock(clock.clone());
     let reopened_metadata = Arc::new(reopened_metadata);
     let reopened_store = ArtifactStore::new(
@@ -1185,13 +1189,12 @@ async fn speech_final_file_settlement_recovers_orphaned_stored_reservation_after
 async fn speech_final_file_settlement_replacement_settles_after_stale_attempt_loses_ownership()
 {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("speech-stale-reclaim.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1464,13 +1467,12 @@ async fn verified_stream_reader_handles_empty_reads_and_rejects_short_or_long_bo
 #[tokio::test]
 async fn reserved_file_capability_and_source_identity_fail_before_publication() {
     let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("attempt-file-errors.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1531,11 +1533,11 @@ async fn reserved_file_capability_and_source_identity_fail_before_publication() 
 #[tokio::test]
 async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_writes() {
     let root = tempfile::tempdir().unwrap();
-    let db_path = root.path().join("reserved-file-recovery.sqlite3");
+    let database = TestDatabase::new().await;
     let media_root = root.path().join("media");
     let provider = Arc::new(LocalMediaStorageProvider::new(media_root.clone()));
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(db_path.clone()),
+        database.database(),
     ));
     let mut store = ArtifactStore::new(
         metadata.clone(),
@@ -1594,7 +1596,7 @@ async fn local_reserved_file_restart_cleanup_removes_partial_and_unacknowledged_
     tokio::time::sleep(Duration::from_millis(110)).await;
     let reopened = ArtifactStore::new(
         Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(db_path),
+            database.database(),
         )),
         provider,
         ArtifactStoreLimits::default(),
@@ -1628,14 +1630,12 @@ fn reserved_publication_requires_an_exact_provider_digest() {
 
 #[tokio::test]
 async fn stale_attempt_keeps_written_provider_object_recoverable() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("stale-attempt.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1695,14 +1695,12 @@ async fn stale_attempt_keeps_written_provider_object_recoverable() {
 
 #[tokio::test]
 async fn attempt_publication_rejects_a_different_scheduling_tenant() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     // Both clocks are fixed so the 10 ms reservations expire only when the
     // test advances them, however slowly it runs.
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("tenant-fence.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     provider.set_now_unix_ms(1_000);
@@ -1747,11 +1745,9 @@ async fn attempt_publication_rejects_a_different_scheduling_tenant() {
 
 #[tokio::test]
 async fn pcm_entry_limit_rejects_reference_and_recovers_provider_write() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("pcm-limit.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_pcm_replay_entry_limit_for_test(1);
     // Both clocks are fixed so the 10 ms reservations cannot expire
     // before the writes land, however slowly the test runs.
@@ -1821,9 +1817,9 @@ async fn pcm_entry_limit_rejects_reference_and_recovers_provider_write() {
 
 #[tokio::test]
 async fn read_rejects_provider_bytes_that_do_not_match_the_durable_digest() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let store = conformance_store(&root, provider.clone());
+    let store = conformance_store(&database, provider.clone()).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
     let descriptor = store
         .put(
@@ -1847,11 +1843,11 @@ async fn read_rejects_provider_bytes_that_do_not_match_the_durable_digest() {
 
 #[tokio::test]
 async fn upload_limit_fails_before_calling_the_provider() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let store = ArtifactStore::new(
         Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(root.path().join("artifacts.sqlite3")),
+            database.database(),
         )),
         provider.clone(),
         ArtifactStoreLimits {
@@ -1881,10 +1877,10 @@ async fn upload_limit_fails_before_calling_the_provider() {
 
 #[tokio::test]
 async fn provider_without_reserved_writes_is_rejected_before_bytes_are_sent() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     provider.supports_reserved.store(false, Ordering::SeqCst);
-    let store = conformance_store(&root, provider.clone());
+    let store = conformance_store(&database, provider.clone()).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
 
     assert!(matches!(
@@ -1906,9 +1902,9 @@ async fn provider_without_reserved_writes_is_rejected_before_bytes_are_sent() {
 
 #[tokio::test]
 async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let mut store = conformance_store(&root, provider.clone());
+    let mut store = conformance_store(&database, provider.clone()).await;
     store.set_reservation_lifetime_for_test(Duration::from_millis(100));
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
 
@@ -1942,11 +1938,10 @@ async fn invalid_provider_storage_keys_are_recovered_after_the_write_fence() {
 
 #[tokio::test]
 async fn exact_provider_request_without_returned_key_is_recovered_after_reopen() {
-    let root = tempfile::tempdir().unwrap();
-    let db_path = root.path().join("artifacts.sqlite3");
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(db_path.clone()),
+        database.database(),
     ));
     let write_id = new_uuid();
     let mut request_metadata = HookMetadata::new();
@@ -1992,7 +1987,7 @@ async fn exact_provider_request_without_returned_key_is_recovered_after_reopen()
 
     let reopened = ArtifactStore::new(
         Arc::new(BatchRuntimeStore::initialize_with_database(
-            StoreDatabase::new(db_path),
+            database.database(),
         )),
         provider.clone(),
         ArtifactStoreLimits::default(),
@@ -2059,11 +2054,9 @@ async fn delayed_reserved_put_cannot_publish_after_recovery_fences_its_write_id(
 
 #[tokio::test]
 async fn provider_write_capacity_fails_before_bytes_are_sent() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_provider_write_capacity_for_test(1);
     let metadata = Arc::new(metadata);
     let input = test_provider_write_input(
@@ -2100,11 +2093,9 @@ async fn provider_write_capacity_fails_before_bytes_are_sent() {
 
 #[tokio::test]
 async fn provider_write_cleanup_claim_is_exact_and_nonduplicating() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let reservation = metadata
         .reserve_provider_write(test_provider_write_input(
@@ -2173,9 +2164,9 @@ async fn provider_write_cleanup_claim_is_exact_and_nonduplicating() {
 
 #[tokio::test]
 async fn filename_cannot_escape_provider_namespace() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let store = conformance_store(&root, provider.clone());
+    let store = conformance_store(&database, provider.clone()).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
 
     for filename in ["../secret", "nested/file.wav", "nested\\file.wav"] {
@@ -2201,9 +2192,9 @@ async fn filename_cannot_escape_provider_namespace() {
 
 #[tokio::test]
 async fn failed_physical_delete_remains_logically_deleted() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let store = conformance_store(&root, provider.clone());
+    let store = conformance_store(&database, provider.clone()).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
     let descriptor = store
         .put(
@@ -2238,11 +2229,9 @@ async fn failed_physical_delete_remains_logically_deleted() {
 /// once the object is gone and the grace passed.
 #[tokio::test]
 async fn retention_labels_expire_ephemeral_objects_and_keep_durable_ones() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     let provider = Arc::new(MemoryMediaProvider::default());
@@ -2328,11 +2317,9 @@ async fn retention_labels_expire_ephemeral_objects_and_keep_durable_ones() {
 
 #[tokio::test]
 async fn cleanup_intent_survives_store_reopen_and_retries_known_dead_object() {
-    let root = tempfile::tempdir().unwrap();
-    let db_path = root.path().join("artifacts.sqlite3");
+    let database = TestDatabase::new().await;
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
-    let mut metadata =
-        BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path.clone()));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let provider = Arc::new(MemoryMediaProvider::default());
     provider.set_now_unix_ms(1_000);
@@ -2352,7 +2339,7 @@ async fn cleanup_intent_survives_store_reopen_and_retries_known_dead_object() {
     drop(store);
 
     clock.store(2_000, Ordering::SeqCst);
-    let mut reopened = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+    let mut reopened = BatchRuntimeStore::initialize_with_database(database.database());
     reopened.set_test_clock(clock);
     provider.fail_deletes.store(false, Ordering::SeqCst);
     let reopened = ArtifactStore::new(
@@ -2382,8 +2369,8 @@ async fn cleanup_intent_survives_store_reopen_and_retries_known_dead_object() {
 async fn opaque_speech_delete_atomically_hides_row_and_retries_provider_cleanup() {
     use sea_orm::ConnectionTrait;
 
-    let root = tempfile::tempdir().unwrap();
-    let db = StoreDatabase::new(root.path().join("speech-delete.sqlite3"));
+    let database = TestDatabase::new().await;
+    let db = database.database();
     let clock = Arc::new(AtomicI64::new(1_000));
     let mut metadata = BatchRuntimeStore::initialize_with_database(db.clone());
     metadata.set_test_clock(clock.clone());
@@ -2458,8 +2445,8 @@ async fn opaque_speech_delete_atomically_hides_row_and_retries_provider_cleanup(
 async fn opaque_speech_delete_capacity_failure_rolls_back_row_and_tombstone() {
     use sea_orm::ConnectionTrait;
 
-    let root = tempfile::tempdir().unwrap();
-    let db = StoreDatabase::new(root.path().join("speech-delete-capacity.sqlite3"));
+    let database = TestDatabase::new().await;
+    let db = database.database();
     let mut metadata = BatchRuntimeStore::initialize_with_database(db.clone());
     metadata.set_artifact_cleanup_capacity_for_test(0);
     let provider = Arc::new(MemoryMediaProvider::default());
@@ -2508,8 +2495,8 @@ async fn opaque_speech_delete_capacity_failure_rolls_back_row_and_tombstone() {
 async fn opaque_speech_delete_rejects_mismatched_authoritative_relation() {
     use sea_orm::ConnectionTrait;
 
-    let root = tempfile::tempdir().unwrap();
-    let db = StoreDatabase::new(root.path().join("speech-delete-mismatch.sqlite3"));
+    let database = TestDatabase::new().await;
+    let db = database.database();
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
     let provider = Arc::new(MemoryMediaProvider::default());
     let store =
@@ -2641,8 +2628,8 @@ async fn opaque_speech_delete_rejects_mismatched_authoritative_relation() {
 async fn opaque_speech_delete_acknowledges_post_commit_cleanup_bookkeeping_failure() {
     use sea_orm::ConnectionTrait;
 
-    let root = tempfile::tempdir().unwrap();
-    let db = StoreDatabase::new(root.path().join("speech-delete-bookkeeping.sqlite3"));
+    let database = TestDatabase::new().await;
+    let db = database.database();
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
     let provider = Arc::new(MemoryMediaProvider::default());
     let store = ArtifactStore::new(metadata, provider.clone(), Default::default()).unwrap();
@@ -2651,23 +2638,33 @@ async fn opaque_speech_delete_acknowledges_post_commit_cleanup_bookkeeping_failu
     insert_opaque_speech_history_relation(&db, "speech-bookkeeping", &tenant, &descriptor)
         .await;
     let connection = db.connection().await.unwrap();
-    connection
-        .execute_raw(
-            crate::db::raw::statement(
-                connection,
-                r#"
-                    CREATE TRIGGER reject_cleanup_intent_delete
-                    BEFORE DELETE ON artifact_cleanup_intents
-                    BEGIN
-                        SELECT RAISE(FAIL, 'injected cleanup bookkeeping failure');
-                    END
-                    "#,
-                vec![],
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    let (create_trigger, drop_trigger) = match connection.get_database_backend() {
+        sea_orm::DbBackend::Postgres => (
+            r#"
+                CREATE FUNCTION reject_cleanup_intent_delete() RETURNS trigger
+                LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected cleanup bookkeeping failure';
+                END
+                $$;
+                CREATE TRIGGER reject_cleanup_intent_delete
+                BEFORE DELETE ON artifact_cleanup_intents
+                FOR EACH ROW EXECUTE FUNCTION reject_cleanup_intent_delete();
+                "#,
+            "DROP TRIGGER reject_cleanup_intent_delete ON artifact_cleanup_intents",
+        ),
+        _ => (
+            r#"
+                CREATE TRIGGER reject_cleanup_intent_delete
+                BEFORE DELETE ON artifact_cleanup_intents
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected cleanup bookkeeping failure');
+                END
+                "#,
+            "DROP TRIGGER reject_cleanup_intent_delete",
+        ),
+    };
+    connection.execute_unprepared(create_trigger).await.unwrap();
 
     assert!(store
         .delete_speech_history_audio(
@@ -2693,17 +2690,7 @@ async fn opaque_speech_delete_acknowledges_post_commit_cleanup_bookkeeping_failu
         1
     );
 
-    connection
-        .execute_raw(
-            crate::db::raw::statement(
-                connection,
-                "DROP TRIGGER reject_cleanup_intent_delete",
-                vec![],
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    connection.execute_unprepared(drop_trigger).await.unwrap();
     assert_eq!(store.cleanup_due(64).await.unwrap().completed, 1);
 }
 
@@ -2711,8 +2698,8 @@ async fn opaque_speech_delete_acknowledges_post_commit_cleanup_bookkeeping_failu
 async fn opaque_speech_delete_waits_for_runtime_ownership_teardown() {
     use sea_orm::ConnectionTrait;
 
-    let root = tempfile::tempdir().unwrap();
-    let db = StoreDatabase::new(root.path().join("speech-delete-owner.sqlite3"));
+    let database = TestDatabase::new().await;
+    let db = database.database();
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(db.clone()));
     let provider = Arc::new(MemoryMediaProvider::default());
     let store = ArtifactStore::new(metadata.clone(), provider, Default::default()).unwrap();
@@ -2775,10 +2762,8 @@ async fn opaque_speech_delete_waits_for_runtime_ownership_teardown() {
 
 #[tokio::test]
 async fn cleanup_capacity_failure_happens_before_second_tombstone() {
-    let root = tempfile::tempdir().unwrap();
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let database = TestDatabase::new().await;
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_artifact_cleanup_capacity_for_test(1);
     let provider = Arc::new(MemoryMediaProvider::default());
     let store = ArtifactStore::new(
@@ -2865,11 +2850,9 @@ async fn execute_sql(metadata: &BatchRuntimeStore, sql: &str, values: Vec<sea_or
 /// saved voice, which every speech request with that voice reuses.
 #[tokio::test]
 async fn unreferenced_input_media_expires_and_referenced_media_is_kept() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let metadata = Arc::new(metadata);
     let provider = Arc::new(MemoryMediaProvider::default());
@@ -3020,11 +3003,9 @@ async fn assert_cleanup_quota_matches_intents(metadata: &BatchRuntimeStore) {
 /// completed cleanup gives its unit back.
 #[tokio::test]
 async fn cleanup_quota_is_per_tenant_and_released_on_completion() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     metadata.set_artifact_cleanup_limits_for_test(QuotaLimits {
         global: 2,
@@ -3093,9 +3074,9 @@ async fn cleanup_quota_is_per_tenant_and_released_on_completion() {
 /// Migration 3 seeds the cleanup quota from the intents that exist.
 #[tokio::test]
 async fn cleanup_quota_is_seeded_from_existing_intents_on_upgrade() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let metadata = Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(root.path().join("artifacts.sqlite3")),
+        database.database(),
     ));
     let provider = Arc::new(MemoryMediaProvider::default());
     let store = ArtifactStore::new(
@@ -3125,9 +3106,9 @@ async fn cleanup_quota_is_seeded_from_existing_intents_on_upgrade() {
 
 #[tokio::test]
 async fn provider_not_found_completes_cleanup_idempotently() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let provider = Arc::new(MemoryMediaProvider::default());
-    let store = conformance_store(&root, provider.clone());
+    let store = conformance_store(&database, provider.clone()).await;
     let tenant = ArtifactTenant::parse("tenant-a").unwrap();
     let descriptor = put_test_artifact(&store, &tenant, "missing").await;
     provider.remove_single_object();
@@ -3143,11 +3124,9 @@ async fn provider_not_found_completes_cleanup_idempotently() {
 
 #[tokio::test]
 async fn due_cleanup_is_bounded_and_never_selects_active_artifacts() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let provider = Arc::new(MemoryMediaProvider::default());
     provider.set_now_unix_ms(1_000);
@@ -3184,11 +3163,9 @@ async fn due_cleanup_is_bounded_and_never_selects_active_artifacts() {
 
 #[tokio::test]
 async fn duplicate_cleaners_and_retry_metadata_remain_safe_and_bounded() {
-    let root = tempfile::tempdir().unwrap();
+    let database = TestDatabase::new().await;
     let clock = Arc::new(std::sync::atomic::AtomicI64::new(1_000));
-    let mut metadata = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("artifacts.sqlite3"),
-    ));
+    let mut metadata = BatchRuntimeStore::initialize_with_database(database.database());
     metadata.set_test_clock(clock.clone());
     let provider = Arc::new(MemoryMediaProvider::default());
     provider.set_now_unix_ms(1_000);

@@ -7,7 +7,7 @@ use crate::{
             RuntimeJobStatus, RuntimeStageStatus,
         },
     },
-    db::StoreDatabase,
+    db::test_database::TestDatabase,
 };
 use izwi_core::{EngineConfig, RuntimeStageOutcome};
 use serde_json::json;
@@ -189,21 +189,20 @@ impl StageExecutor for SynchronousBlockingExecutor {
     }
 }
 
-fn build_store() -> Arc<BatchRuntimeStore> {
-    let root = tempfile::tempdir().expect("temp dir");
-    let db_path = root.keep().join("runtime.sqlite");
-    Arc::new(BatchRuntimeStore::initialize_with_database(
-        StoreDatabase::new(db_path),
-    ))
+/// A store on a fresh test database (SQLite, or PostgreSQL when
+/// `IZWI_TEST_STORE_PG_URL` is set), which must outlive the store.
+async fn build_store() -> (Arc<BatchRuntimeStore>, TestDatabase) {
+    let database = TestDatabase::new().await;
+    let store = BatchRuntimeStore::initialize_with_database(database.database());
+    (Arc::new(store), database)
 }
 
-fn build_store_with_faults() -> (Arc<BatchRuntimeStore>, Arc<StoreFaults>) {
-    let root = tempfile::tempdir().expect("temp dir");
-    let db_path = root.keep().join("runtime.sqlite");
+async fn build_store_with_faults() -> (Arc<BatchRuntimeStore>, Arc<StoreFaults>, TestDatabase) {
+    let database = TestDatabase::new().await;
     let faults = Arc::new(StoreFaults::default());
-    let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(db_path));
+    let mut store = BatchRuntimeStore::initialize_with_database(database.database());
     store.set_faults_for_test(faults.clone());
-    (Arc::new(store), faults)
+    (Arc::new(store), faults, database)
 }
 
 async fn create_queued_fake_stage(
@@ -254,7 +253,7 @@ async fn create_queued_stage(
 
 #[tokio::test]
 async fn concurrent_worker_heartbeats_every_lease_and_drains_all_slots() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let mut stage_ids = Vec::new();
     for _ in 0..3 {
         stage_ids.push(create_queued_fake_stage(&store, 2).await.unwrap().1);
@@ -364,13 +363,14 @@ fn old_attempt_cleanup_preserves_a_reclaimed_stages_new_execution() {
     assert!(slots.read().unwrap().is_empty());
 }
 
-#[test]
-fn weighted_active_claims_reduce_all_available_worker_resources() {
+#[tokio::test]
+async fn weighted_active_claims_reduce_all_available_worker_resources() {
+    let (store, _database) = build_store().await;
     let mut config = BatchWorkerConfig::local("weighted-worker");
     config.resources.concurrency_slots = 7;
     config.resources.memory_bytes = Some(100);
     let runner = BatchWorkerRunner::new(
-        build_store(),
+        store,
         vec![],
         config,
         BatchWorkerHealth::new("weighted-worker"),
@@ -425,7 +425,7 @@ fn stage_execution_outcome_is_bounded_and_uuid_typed() {
 
 #[tokio::test]
 async fn cooperative_speech_yield_releases_slot_without_failure_or_retry_consumption() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.unwrap();
     let health = BatchWorkerHealth::new("yield-worker");
     let runner = BatchWorkerRunner::new(
@@ -456,7 +456,7 @@ async fn cooperative_speech_yield_releases_slot_without_failure_or_retry_consump
 
 #[tokio::test]
 async fn runner_claims_and_completes_stage() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
     let health = BatchWorkerHealth::new("worker-test");
     let runner = BatchWorkerRunner::new(
@@ -498,7 +498,7 @@ async fn runner_claims_and_completes_stage() {
 
 #[tokio::test]
 async fn heartbeat_failure_after_claim_does_not_strand_the_claimed_stage() {
-    let (store, faults) = build_store_with_faults();
+    let (store, faults, _database) = build_store_with_faults().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
     let health = BatchWorkerHealth::new("worker-test");
     let runner = BatchWorkerRunner::new(
@@ -536,7 +536,7 @@ async fn heartbeat_failure_after_claim_does_not_strand_the_claimed_stage() {
 
 #[tokio::test]
 async fn transient_completion_errors_are_retried_instead_of_discarding_the_result() {
-    let (store, faults) = build_store_with_faults();
+    let (store, faults, _database) = build_store_with_faults().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let executor = Arc::new(FakeExecutor {
         calls: AtomicUsize::new(0),
@@ -565,7 +565,7 @@ async fn transient_completion_errors_are_retried_instead_of_discarding_the_resul
 
 #[tokio::test]
 async fn persistent_settlement_errors_give_up_after_bounded_retries() {
-    let (store, faults) = build_store_with_faults();
+    let (store, faults, _database) = build_store_with_faults().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let runner = BatchWorkerRunner::new(
         store.clone(),
@@ -595,7 +595,7 @@ async fn persistent_settlement_errors_give_up_after_bounded_retries() {
 
 #[tokio::test]
 async fn context_aware_execution_records_attempt_scoped_progress() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
     let runner = BatchWorkerRunner::new(
         store.clone(),
@@ -620,7 +620,7 @@ async fn context_aware_execution_records_attempt_scoped_progress() {
 
 #[tokio::test]
 async fn execution_deadline_retains_ownership_until_executor_teardown() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -710,7 +710,7 @@ async fn execution_deadline_retains_ownership_until_executor_teardown() {
 
 #[tokio::test]
 async fn reclaimed_lease_does_not_release_the_stale_local_executor_early() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 3).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -808,7 +808,7 @@ async fn reclaimed_lease_does_not_release_the_stale_local_executor_early() {
 
 #[tokio::test]
 async fn transient_lease_store_errors_do_not_cancel_execution_before_the_lease_deadline() {
-    let (store, faults) = build_store_with_faults();
+    let (store, faults, _database) = build_store_with_faults().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -873,7 +873,7 @@ async fn transient_lease_store_errors_do_not_cancel_execution_before_the_lease_d
 
 #[tokio::test]
 async fn lease_renewal_errors_past_the_local_lease_deadline_cancel_execution() {
-    let (store, faults) = build_store_with_faults();
+    let (store, faults, _database) = build_store_with_faults().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -941,7 +941,7 @@ async fn lease_renewal_errors_past_the_local_lease_deadline_cancel_execution() {
 
 #[tokio::test]
 async fn durable_user_cancellation_wins_after_a_deadline_signal() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -1013,7 +1013,7 @@ async fn durable_user_cancellation_wins_after_a_deadline_signal() {
 
 #[tokio::test]
 async fn draining_runner_records_heartbeat_without_claiming() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
     let mut config = BatchWorkerConfig::local("worker-test");
     config.draining = true;
@@ -1047,10 +1047,8 @@ async fn draining_runner_records_heartbeat_without_claiming() {
 #[tokio::test]
 async fn idle_polls_refresh_an_unchanged_heartbeat_at_most_once_per_interval() {
     let clock = Arc::new(AtomicI64::new(1_000));
-    let root = tempfile::tempdir().expect("temp dir");
-    let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("runtime.sqlite"),
-    ));
+    let database = TestDatabase::new().await;
+    let mut store = BatchRuntimeStore::initialize_with_database(database.database());
     store.set_test_clock(clock.clone());
     let store = Arc::new(store);
     let runner = BatchWorkerRunner::new(
@@ -1102,7 +1100,7 @@ async fn idle_polls_refresh_an_unchanged_heartbeat_at_most_once_per_interval() {
 
 #[tokio::test]
 async fn runner_only_claims_registered_stage_kinds_and_reports_configuration() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_stage(&store, 1, "unregistered_stage")
         .await
         .expect("stage");
@@ -1145,10 +1143,8 @@ async fn cancellation_retains_capacity_until_non_cooperative_executor_teardown()
     let clock = Arc::new(AtomicI64::new(
         super::super::store::current_timestamp_millis(),
     ));
-    let root = tempfile::tempdir().expect("temp dir");
-    let mut store = BatchRuntimeStore::initialize_with_database(StoreDatabase::new(
-        root.path().join("runtime.sqlite"),
-    ));
+    let database = TestDatabase::new().await;
+    let mut store = BatchRuntimeStore::initialize_with_database(database.database());
     store.set_test_clock(clock.clone());
     let store = Arc::new(store);
     let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
@@ -1297,7 +1293,7 @@ async fn shutdown_drain_waits_for_active_iteration_while_renewing_lease() {
     let clock = Arc::new(AtomicI64::new(
         super::super::store::current_timestamp_millis(),
     ));
-    let mut store = build_store();
+    let (mut store, _database) = build_store().await;
     Arc::get_mut(&mut store)
         .expect("unshared store")
         .set_test_clock(clock.clone());
@@ -1397,7 +1393,7 @@ async fn shutdown_drain_waits_for_active_iteration_while_renewing_lease() {
 
 #[tokio::test]
 async fn bounded_shutdown_detaches_and_retains_unresolved_execution_ownership() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -1488,7 +1484,7 @@ async fn bounded_shutdown_detaches_and_retains_unresolved_execution_ownership() 
 
 #[tokio::test]
 async fn process_shutdown_keeps_runtime_alive_until_exact_execution_teardown() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (_job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -1533,7 +1529,7 @@ async fn process_shutdown_keeps_runtime_alive_until_exact_execution_teardown() {
 
 #[tokio::test]
 async fn runner_records_runtime_stage_observations_when_attached() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 1).await.expect("stage");
     let runtime = Arc::new(RuntimeService::new(EngineConfig::default()).expect("runtime"));
     let runner = BatchWorkerRunner::new(
@@ -1575,7 +1571,7 @@ async fn runner_records_runtime_stage_observations_when_attached() {
 /// second attempt would fail the same way.
 #[tokio::test]
 async fn runner_does_not_retry_a_deterministic_failure() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let executor = Arc::new(DeterministicFailureExecutor {
         calls: AtomicUsize::new(0),
@@ -1607,7 +1603,7 @@ async fn runner_does_not_retry_a_deterministic_failure() {
 
 #[tokio::test]
 async fn idle_slots_wake_when_this_process_enqueues_a_stage() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let mut config = BatchWorkerConfig::local("wakeup-worker");
     // Long enough that only the wake-up can explain a prompt claim.
     config.idle_poll_interval = Duration::from_secs(60);
@@ -1621,6 +1617,9 @@ async fn idle_slots_wake_when_this_process_enqueues_a_stage() {
         config,
         BatchWorkerHealth::new("wakeup-worker"),
     );
+    // Migrate first, so the timeouts below measure the slot and not the
+    // schema (PostgreSQL test schemas migrate one at a time).
+    store.connection().await.expect("store opens");
     let supervisor = runner.clone().spawn();
     tokio::time::timeout(Duration::from_secs(5), async {
         while store
@@ -1652,7 +1651,7 @@ async fn idle_slots_wake_when_this_process_enqueues_a_stage() {
 
 #[tokio::test]
 async fn runner_retries_then_completes_stage() {
-    let store = build_store();
+    let (store, _database) = build_store().await;
     let (job_id, stage_id) = create_queued_fake_stage(&store, 2).await.expect("stage");
     let runner = BatchWorkerRunner::new(
         store.clone(),
