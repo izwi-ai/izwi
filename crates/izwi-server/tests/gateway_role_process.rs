@@ -129,3 +129,20 @@ async fn server_gateway_role_routes_inference_through_an_approved_worker() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn server_help_never_prints_the_worker_bearer_token() {
+    const TOKEN: &str = "help-must-not-print-this-token";
+    let output = Command::new(env!("CARGO_BIN_EXE_izwi-server"))
+        .arg("--help")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", TOKEN)
+        .output()
+        .expect("izwi-server runs");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("IZWI_GATEWAY_WORKER_BEARER_TOKEN"), "{help}");
+    assert!(
+        !help.contains(TOKEN),
+        "--help printed the bearer token:\n{help}"
+    );
+}

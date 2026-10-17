@@ -1555,3 +1555,20 @@ async fn gateway_process_continues_the_callers_trace_into_the_worker_call() {
     let _ = gateway.kill();
     let _ = gateway.wait();
 }
+
+#[test]
+fn gateway_help_never_prints_the_worker_bearer_token() {
+    const TOKEN: &str = "help-must-not-print-this-token";
+    let output = Command::new(env!("CARGO_BIN_EXE_izwi-gateway"))
+        .arg("--help")
+        .env("IZWI_GATEWAY_WORKER_BEARER_TOKEN", TOKEN)
+        .output()
+        .expect("gateway binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("IZWI_GATEWAY_WORKER_BEARER_TOKEN"), "{help}");
+    assert!(
+        !help.contains(TOKEN),
+        "--help printed the bearer token:\n{help}"
+    );
+}

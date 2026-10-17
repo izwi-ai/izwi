@@ -81,7 +81,7 @@ pub struct GatewayArgs {
     pub worker_credential_id: Option<String>,
 
     /// Private worker bearer token required by gateway mode.
-    #[arg(long, env = "IZWI_GATEWAY_WORKER_BEARER_TOKEN")]
+    #[arg(long, env = "IZWI_GATEWAY_WORKER_BEARER_TOKEN", hide_env_values = true)]
     pub worker_bearer_token: Option<String>,
 
     /// Accepted with `--worker-endpoint` for compatibility and ignored: the
