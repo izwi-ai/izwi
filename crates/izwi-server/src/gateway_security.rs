@@ -459,10 +459,12 @@ fn bounded_body_limit_from_env() -> Result<usize, GatewayPerimeterConfigError> {
 
 fn bool_from_env(name: &str) -> Result<bool, GatewayPerimeterConfigError> {
     match std::env::var(name) {
-        Ok(value) if matches!(value.as_str(), "1" | "true" | "TRUE") => Ok(true),
-        Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE") => Ok(false),
-        Ok(_) => Err(GatewayPerimeterConfigError::InvalidTrustedIngress),
-        Err(_) => Ok(false),
+        Ok(value) => izwi_serving_protocol::env::parse_bool(name, &value)
+            .map_err(|_| GatewayPerimeterConfigError::InvalidTrustedIngress),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(GatewayPerimeterConfigError::InvalidTrustedIngress)
+        }
     }
 }
 
@@ -528,6 +530,24 @@ mod tests {
         assert_eq!(
             GatewayPerimeterConfig::from_env().unwrap_err(),
             GatewayPerimeterConfigError::InvalidSecretReference
+        );
+        clear_gateway_security_env();
+    }
+
+    /// HYG-D9: the trusted-ingress switch uses the shared boolean vocabulary
+    /// and still fails closed on anything else.
+    #[test]
+    fn trusted_ingress_uses_the_shared_boolean_vocabulary() {
+        let _guard = crate::test_support::env_lock();
+        clear_gateway_security_env();
+        for (value, expected) in [("yes", Ok(true)), ("On", Ok(true)), ("0", Ok(false))] {
+            std::env::set_var(TRUSTED_INGRESS_TLS_ENV, value);
+            assert_eq!(bool_from_env(TRUSTED_INGRESS_TLS_ENV), expected, "{value}");
+        }
+        std::env::set_var(TRUSTED_INGRESS_TLS_ENV, "sure");
+        assert_eq!(
+            bool_from_env(TRUSTED_INGRESS_TLS_ENV),
+            Err(GatewayPerimeterConfigError::InvalidTrustedIngress)
         );
         clear_gateway_security_env();
     }
