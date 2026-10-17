@@ -1132,9 +1132,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(shape.units, budget.max_model_tokens as u64);
-        // One 180-character chunk at 4 frames per character, halved speed.
-        assert_eq!(shape.kokoro_chunk_frames, Some(1_440));
-        assert_eq!(shape.max_output_samples, 1_440 * 600);
+        // One 180-character chunk at 4 frames per character plus the
+        // 64-frame chunk allowance, halved speed.
+        assert_eq!(shape.kokoro_chunk_frames, Some(1_568));
+        assert_eq!(shape.max_output_samples, 1_568 * 600);
     }
 
     /// KOK-8/9: a 45-word stream reserved 3.34 GB on Metal (4,096 frames of
@@ -1155,7 +1156,9 @@ mod tests {
             direct_tts_additional_resources(backend, &request, ModelVariant::Kokoro82M, 4_096)
                 .unwrap()
         };
-        let frames = 180 * 4;
+        // Its heaviest 180-character window, plus the per-chunk allowance.
+        let frames = crate::runtime::kokoro::kokoro_stream_chunk_frames(paragraph, 1.0);
+        assert!((64 + 180 * 4..=64 + 180 * 8).contains(&frames), "{frames}");
         let price = |backend| kokoro_chunk_price(frames, backend).unwrap();
         let output_bytes = frames as u64 * 600 * 4;
         let metal = price(BackendKind::Metal);

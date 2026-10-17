@@ -1139,7 +1139,7 @@ fn kokoro_synthesis_resources(
         None;
     let mut output_samples = 0u64;
     for (index, chunk) in prepared.chunks.iter().enumerate() {
-        let frames = kokoro_chunk_frame_bound(chunk.source_text.chars().count(), chunk.speed);
+        let frames = kokoro_chunk_frame_bound(&chunk.source_text, usize::MAX, chunk.speed);
         let price = kokoro_chunk_price(frames, backend)?;
         let pause = if index == 0 {
             0
@@ -11571,8 +11571,9 @@ mod tests {
             requested_speed: 1.0,
             chunks: vec![chunk(&"a".repeat(100)), chunk(&"b".repeat(40))],
         };
-        let wide = kokoro_chunk_price(400, BackendKind::Metal).unwrap();
-        let narrow = kokoro_chunk_price(160, BackendKind::Metal).unwrap();
+        // 64 frames per chunk plus four per character.
+        let wide = kokoro_chunk_price(64 + 400, BackendKind::Metal).unwrap();
+        let narrow = kokoro_chunk_price(64 + 160, BackendKind::Metal).unwrap();
         let output = (wide.output_samples + narrow.output_samples + 960) * 4;
         assert_eq!(
             kokoro_synthesis_resources(BackendKind::Metal, &prepared)
