@@ -60,6 +60,14 @@ const FRAGMENT_CONFIDENCE_MARGIN: f32 = 0.08;
 const PHRASE_CAPITALIZED_GAP_SECS: f32 = 0.35;
 const PHRASE_HARD_GAP_SECS: f32 = 0.75;
 
+/// The ASR text and word timings of one diarization pipeline run.
+struct DiarizationPipelineTranscript {
+    asr_text: String,
+    asr_words: Vec<String>,
+    alignments: Vec<(String, u32, u32)>,
+    model_aligned_words: usize,
+}
+
 #[derive(Debug, Clone)]
 struct PipelineAudio {
     samples: Arc<[f32]>,
@@ -679,293 +687,30 @@ impl RuntimeService {
             })
             .await?;
 
-        let diarization = self
-            .diarize_samples_stage(
+        // The transcript and its word timings do not depend on the speaker
+        // segments, so ASR and forced alignment run beside diarization
+        // instead of after it (SPK-F18); attribution joins the two.
+        let (diarization, words_and_timings) = tokio::try_join!(
+            self.diarize_samples_stage(
                 &pipeline_job,
                 audio.clone(),
                 steady_usage,
                 diarization_variant,
                 runtime_request.config.clone(),
-            )
-            .await?;
-
-        let asr_variant = resolve_asr_model_variant(runtime_request.asr_model_id.as_deref());
-        self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
-        let asr_target = self
-            .adapter_registry
-            .require(CapabilityKind::Asr, asr_variant)?
-            .execution_target;
-        let (asr_lease, asr_contract, asr_state) = self
-            .load_capability_with_state_for_job(
-                &pipeline_job,
-                asr_variant,
-                CapabilityKind::Asr,
-                false,
-                asr_target,
-                CapabilityLoadOptions {
-                    asr_long_form: true,
-                },
-            )
-            .await?;
-        let asr_model = match diarization_asr_registry_route(asr_variant) {
-            DiarizationAsrRegistryRoute::Voxtral => DiarizationAsrModel::Voxtral(
-                self.model_registry
-                    .get_voxtral_lease(asr_variant)
-                    .await
-                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
             ),
-            DiarizationAsrRegistryRoute::Native => DiarizationAsrModel::Native(
-                self.model_registry
-                    .get_asr(asr_variant)
-                    .await
-                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+            self.transcribe_and_align_for_diarization(
+                &pipeline_job,
+                runtime_request.asr_model_id.as_deref(),
+                runtime_request.aligner_model_id.as_deref(),
+                &audio,
             ),
-        };
-
-        let aligner_variant = crate::runtime::asr::resolve_forced_aligner_variant(
-            runtime_request.aligner_model_id.as_deref(),
         )?;
-        let aligner_binding = match self
-            .load_capability_for_job(
-                &pipeline_job,
-                aligner_variant,
-                CapabilityKind::ForcedAlignment,
-                false,
-                ExecutionTargetKind::BatchRunner,
-            )
-            .await
-        {
-            Ok(binding) => Some(binding),
-            Err(err) => {
-                warn!("Forced aligner load failed, using heuristic timings: {err}");
-                None
-            }
-        };
-        let aligner_model = if aligner_binding.is_some() {
-            match self.model_registry.get_asr(aligner_variant).await {
-                Some(model) => Some(model),
-                None => {
-                    warn!(
-                        "Forced aligner {} was loaded but not found in registry",
-                        aligner_variant
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Compose the ASR family hint with the invocation context so
-        // invocation-backed families chunk within the memory-fitted cache.
-        let asr_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
-            asr_model.max_audio_seconds_hint(),
-            asr_model.audio_token_rate(),
-            self.model_registry.effective_context(asr_variant),
-            |_| NativeAsrGenerationOptions::default().max_new_tokens,
-        )?;
-        tracing::info!(
-            variant = %asr_variant,
-            asr_limit_secs = ?asr_limit_secs,
-            "resolved diarization pipeline ASR invocation audio limit"
-        );
-
-        let aligner_limit = aligner_model
-            .as_ref()
-            .and_then(|model| model.max_audio_seconds_hint());
-        let use_single_pass_asr = should_use_single_pass_diarization_asr(
-            audio.duration_secs,
-            aligner_limit,
-            aligner_model.is_some(),
-        );
-        let invocation_asr = matches!(
-            asr_contract.metadata.state_requirement,
-            InferenceStateRequirement::Invocation
-                | InferenceStateRequirement::RetainedAndInvocation
-        );
-        let _asr_lease = asr_lease;
-
-        let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
-            let audio_for_task = audio.clone();
-            let transcription = if invocation_asr {
-                self.coordinator
-                    .run_loaded_blocking_stage_with_invocation_workspace(
-                        &pipeline_job,
-                        asr_contract,
-                        asr_state,
-                        WorkUnit::AtomicJob {
-                            kind: "diarization.transcribe".to_string(),
-                        },
-                        move |leases| {
-                            asr_model.transcribe_from_invocation_workspace(
-                                &audio_for_task.samples,
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                                None,
-                                NativeAsrGenerationOptions::default(),
-                                leases,
-                            )
-                        },
-                    )
-                    .await?
-            } else {
-                self.coordinator
-                    .run_loaded_blocking_stage(
-                        &pipeline_job,
-                        asr_contract,
-                        WorkUnit::AtomicJob {
-                            kind: "diarization.transcribe".to_string(),
-                        },
-                        move || {
-                            asr_model.transcribe_with_details(
-                                &audio_for_task.samples,
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                            )
-                        },
-                    )
-                    .await?
-            };
-            (transcription.text, Vec::new(), transcription.language)
-        } else if invocation_asr {
-            let cfg = pipeline_chunk_config();
-            let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
-            let cfg = degrade_pipeline_chunk_config(cfg, chunk_limit);
-            let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
-            if chunks.is_empty() {
-                return Err(Error::InvalidInput(
-                    "ASR chunk planner produced no chunks".to_string(),
-                ));
-            }
-            let mut assembler = TranscriptAssembler::new(cfg);
-            let mut transcribed = Vec::with_capacity(chunks.len());
-            for chunk in chunks {
-                if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len()
-                {
-                    continue;
-                }
-                let model = asr_model.clone();
-                let chunk_audio = audio.clone();
-                let chunk_start = chunk.start_sample;
-                let chunk_end = chunk.end_sample;
-                let transcription = self
-                    .coordinator
-                    .run_loaded_blocking_stage_with_invocation_workspace(
-                        &pipeline_job,
-                        asr_contract.clone(),
-                        asr_state.clone(),
-                        WorkUnit::AtomicJob {
-                            kind: "diarization.transcribe_chunks".to_string(),
-                        },
-                        move |leases| {
-                            model.transcribe_from_invocation_workspace(
-                                &chunk_audio.samples[chunk_start..chunk_end],
-                                PIPELINE_SAMPLE_RATE,
-                                None,
-                                None,
-                                NativeAsrGenerationOptions::default(),
-                                leases,
-                            )
-                        },
-                    )
-                    .await?;
-                assembler.push_chunk_text(&transcription.text);
-                transcribed.push(TranscribedChunk {
-                    range: chunk,
-                    text: transcription.text,
-                    language: transcription.language,
-                });
-            }
-            (assembler.finish().trim().to_string(), transcribed, None)
-    } else {
-        let audio_for_task = audio.clone();
-        let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
-        let (text, chunks) = self
-            .coordinator
-            .run_loaded_blocking_stage(
-                &pipeline_job,
-                asr_contract,
-                WorkUnit::AtomicJob {
-                    kind: "diarization.transcribe_chunks".to_string(),
-                },
-                move || {
-                    transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit)
-                },
-            )
-            .await?;
-        (text, chunks, None)
-    };
-        let asr_words = extract_words(&asr_text);
-
-        let mut model_aligned_words = 0usize;
-        let mut alignments = if asr_text.is_empty() {
-            Vec::new()
-        } else if use_single_pass_asr {
-            match (aligner_model, aligner_binding) {
-                (Some(model), Some((aligner_lease, aligner_contract))) => {
-                    let audio_for_task = audio.clone();
-                    let text_for_task = asr_text.clone();
-                    let language_for_task = detected_language.clone();
-                    match self
-                        .coordinator
-                        .run_loaded_blocking_stage(
-                            &pipeline_job,
-                            aligner_contract,
-                            WorkUnit::AtomicJob {
-                                kind: "diarization.force_align".to_string(),
-                            },
-                            move || {
-                                let _aligner_lease = aligner_lease;
-                                model.force_align(
-                                    &audio_for_task.samples,
-                                    audio_for_task.sample_rate,
-                                    &text_for_task,
-                                    language_for_task.as_deref(),
-                                )
-                            },
-                        )
-                        .await
-                    {
-                        Ok(aligned) => {
-                            model_aligned_words = aligned.len();
-                            aligned
-                        }
-                        Err(err) => {
-                            warn!("Forced alignment failed, using heuristic timings: {err}");
-                            fallback_word_timings_from_words(&asr_words, audio.duration_secs)
-                        }
-                    }
-                }
-                _ => fallback_word_timings_from_words(&asr_words, audio.duration_secs),
-            }
-        } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
-            (aligner_model, aligner_binding)
-        {
-            let audio_for_task = audio.clone();
-            let chunks_for_task = chunk_texts.clone();
-            let (aligned, aligned_word_count) = self
-                .coordinator
-                .run_loaded_blocking_stage(
-                    &pipeline_job,
-                    aligner_contract,
-                    WorkUnit::AtomicJob {
-                        kind: "diarization.force_align_chunks".to_string(),
-                    },
-                    move || {
-                        let _aligner_lease = aligner_lease;
-                        Ok(force_align_audio_chunks(
-                            model,
-                            &audio_for_task,
-                            &chunks_for_task,
-                        ))
-                    },
-                )
-                .await?;
-            model_aligned_words = aligned_word_count;
-            aligned
-        } else {
-            fallback_word_timings_from_chunks(&chunk_texts, audio.sample_rate)
-        };
+        let DiarizationPipelineTranscript {
+            asr_text,
+            asr_words,
+            mut alignments,
+            mut model_aligned_words,
+        } = words_and_timings;
 
         if alignment_is_suspicious(&alignments, asr_words.len(), diarization.duration_secs) {
             warn!(
@@ -1064,6 +809,299 @@ impl RuntimeService {
             alignment_coverage,
             unattributed_words,
             llm_refined,
+        })
+    }
+
+    /// The pipeline's transcript and word timings: ASR (single pass, or
+    /// chunked within the model's invocation limit) then forced alignment,
+    /// falling back to heuristic timings when no aligner is available.
+    async fn transcribe_and_align_for_diarization(
+        &self,
+        job: &JobLease,
+        asr_model_id: Option<&str>,
+        aligner_model_id: Option<&str>,
+        audio: &PipelineAudio,
+    ) -> Result<DiarizationPipelineTranscript> {
+        let asr_variant = resolve_asr_model_variant(asr_model_id);
+        self.observe_broker_capability_request(CapabilityKind::Asr, Some(asr_variant), false)?;
+        let asr_target = self
+            .adapter_registry
+            .require(CapabilityKind::Asr, asr_variant)?
+            .execution_target;
+        let (asr_lease, asr_contract, asr_state) = self
+            .load_capability_with_state_for_job(
+                job,
+                asr_variant,
+                CapabilityKind::Asr,
+                false,
+                asr_target,
+                CapabilityLoadOptions {
+                    asr_long_form: true,
+                },
+            )
+            .await?;
+        let asr_model = match diarization_asr_registry_route(asr_variant) {
+            DiarizationAsrRegistryRoute::Voxtral => DiarizationAsrModel::Voxtral(
+                self.model_registry
+                    .get_voxtral_lease(asr_variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+            ),
+            DiarizationAsrRegistryRoute::Native => DiarizationAsrModel::Native(
+                self.model_registry
+                    .get_asr(asr_variant)
+                    .await
+                    .ok_or_else(|| Error::ModelNotFound(asr_variant.to_string()))?,
+            ),
+        };
+
+        let aligner_variant =
+            crate::runtime::asr::resolve_forced_aligner_variant(aligner_model_id)?;
+        let aligner_binding = match self
+            .load_capability_for_job(
+                job,
+                aligner_variant,
+                CapabilityKind::ForcedAlignment,
+                false,
+                ExecutionTargetKind::BatchRunner,
+            )
+            .await
+        {
+            Ok(binding) => Some(binding),
+            Err(err) => {
+                warn!("Forced aligner load failed, using heuristic timings: {err}");
+                None
+            }
+        };
+        let aligner_model = if aligner_binding.is_some() {
+            match self.model_registry.get_asr(aligner_variant).await {
+                Some(model) => Some(model),
+                None => {
+                    warn!(
+                        "Forced aligner {} was loaded but not found in registry",
+                        aligner_variant
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Compose the ASR family hint with the invocation context so
+        // invocation-backed families chunk within the memory-fitted cache.
+        let asr_limit_secs = crate::runtime::asr::compose_invocation_audio_limit(
+            asr_model.max_audio_seconds_hint(),
+            asr_model.audio_token_rate(),
+            self.model_registry.effective_context(asr_variant),
+            |_| NativeAsrGenerationOptions::default().max_new_tokens,
+        )?;
+        tracing::info!(
+            variant = %asr_variant,
+            asr_limit_secs = ?asr_limit_secs,
+            "resolved diarization pipeline ASR invocation audio limit"
+        );
+
+        let aligner_limit = aligner_model
+            .as_ref()
+            .and_then(|model| model.max_audio_seconds_hint());
+        let use_single_pass_asr = should_use_single_pass_diarization_asr(
+            audio.duration_secs,
+            aligner_limit,
+            aligner_model.is_some(),
+        );
+        let invocation_asr = matches!(
+            asr_contract.metadata.state_requirement,
+            InferenceStateRequirement::Invocation
+                | InferenceStateRequirement::RetainedAndInvocation
+        );
+        let _asr_lease = asr_lease;
+
+        let (asr_text, chunk_texts, detected_language) = if use_single_pass_asr {
+            let audio_for_task = audio.clone();
+            let transcription = if invocation_asr {
+                self.coordinator
+                    .run_loaded_blocking_stage_with_invocation_workspace(
+                        job,
+                        asr_contract,
+                        asr_state,
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe".to_string(),
+                        },
+                        move |leases| {
+                            asr_model.transcribe_from_invocation_workspace(
+                                &audio_for_task.samples,
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                                None,
+                                NativeAsrGenerationOptions::default(),
+                                leases,
+                            )
+                        },
+                    )
+                    .await?
+            } else {
+                self.coordinator
+                    .run_loaded_blocking_stage(
+                        job,
+                        asr_contract,
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe".to_string(),
+                        },
+                        move || {
+                            asr_model.transcribe_with_details(
+                                &audio_for_task.samples,
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                            )
+                        },
+                    )
+                    .await?
+            };
+            (transcription.text, Vec::new(), transcription.language)
+        } else if invocation_asr {
+            let cfg = pipeline_chunk_config();
+            let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
+            let cfg = degrade_pipeline_chunk_config(cfg, chunk_limit);
+            let chunks = plan_audio_chunks(&audio.samples, audio.sample_rate, &cfg, chunk_limit);
+            if chunks.is_empty() {
+                return Err(Error::InvalidInput(
+                    "ASR chunk planner produced no chunks".to_string(),
+                ));
+            }
+            let mut assembler = TranscriptAssembler::new(cfg);
+            let mut transcribed = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                if chunk.end_sample <= chunk.start_sample || chunk.end_sample > audio.samples.len()
+                {
+                    continue;
+                }
+                let model = asr_model.clone();
+                let chunk_audio = audio.clone();
+                let chunk_start = chunk.start_sample;
+                let chunk_end = chunk.end_sample;
+                let transcription = self
+                    .coordinator
+                    .run_loaded_blocking_stage_with_invocation_workspace(
+                        job,
+                        asr_contract.clone(),
+                        asr_state.clone(),
+                        WorkUnit::AtomicJob {
+                            kind: "diarization.transcribe_chunks".to_string(),
+                        },
+                        move |leases| {
+                            model.transcribe_from_invocation_workspace(
+                                &chunk_audio.samples[chunk_start..chunk_end],
+                                PIPELINE_SAMPLE_RATE,
+                                None,
+                                None,
+                                NativeAsrGenerationOptions::default(),
+                                leases,
+                            )
+                        },
+                    )
+                    .await?;
+                assembler.push_chunk_text(&transcription.text);
+                transcribed.push(TranscribedChunk {
+                    range: chunk,
+                    text: transcription.text,
+                    language: transcription.language,
+                });
+            }
+            (assembler.finish().trim().to_string(), transcribed, None)
+        } else {
+            let audio_for_task = audio.clone();
+            let chunk_limit = combined_chunk_limit(asr_limit_secs, aligner_limit);
+            let (text, chunks) = self
+                .coordinator
+                .run_loaded_blocking_stage(
+                    job,
+                    asr_contract,
+                    WorkUnit::AtomicJob {
+                        kind: "diarization.transcribe_chunks".to_string(),
+                    },
+                    move || transcribe_audio_chunks(asr_model, &audio_for_task, None, chunk_limit),
+                )
+                .await?;
+            (text, chunks, None)
+        };
+        let asr_words = extract_words(&asr_text);
+
+        let mut model_aligned_words = 0usize;
+        let alignments = if asr_text.is_empty() {
+            Vec::new()
+        } else if use_single_pass_asr {
+            match (aligner_model, aligner_binding) {
+                (Some(model), Some((aligner_lease, aligner_contract))) => {
+                    let audio_for_task = audio.clone();
+                    let text_for_task = asr_text.clone();
+                    let language_for_task = detected_language.clone();
+                    match self
+                        .coordinator
+                        .run_loaded_blocking_stage(
+                            job,
+                            aligner_contract,
+                            WorkUnit::AtomicJob {
+                                kind: "diarization.force_align".to_string(),
+                            },
+                            move || {
+                                let _aligner_lease = aligner_lease;
+                                model.force_align(
+                                    &audio_for_task.samples,
+                                    audio_for_task.sample_rate,
+                                    &text_for_task,
+                                    language_for_task.as_deref(),
+                                )
+                            },
+                        )
+                        .await
+                    {
+                        Ok(aligned) => {
+                            model_aligned_words = aligned.len();
+                            aligned
+                        }
+                        Err(err) => {
+                            warn!("Forced alignment failed, using heuristic timings: {err}");
+                            fallback_word_timings_from_words(&asr_words, audio.duration_secs)
+                        }
+                    }
+                }
+                _ => fallback_word_timings_from_words(&asr_words, audio.duration_secs),
+            }
+        } else if let (Some(model), Some((aligner_lease, aligner_contract))) =
+            (aligner_model, aligner_binding)
+        {
+            let audio_for_task = audio.clone();
+            let chunks_for_task = chunk_texts.clone();
+            let (aligned, aligned_word_count) = self
+                .coordinator
+                .run_loaded_blocking_stage(
+                    job,
+                    aligner_contract,
+                    WorkUnit::AtomicJob {
+                        kind: "diarization.force_align_chunks".to_string(),
+                    },
+                    move || {
+                        let _aligner_lease = aligner_lease;
+                        Ok(force_align_audio_chunks(
+                            model,
+                            &audio_for_task,
+                            &chunks_for_task,
+                        ))
+                    },
+                )
+                .await?;
+            model_aligned_words = aligned_word_count;
+            aligned
+        } else {
+            fallback_word_timings_from_chunks(&chunk_texts, audio.sample_rate)
+        };
+
+        Ok(DiarizationPipelineTranscript {
+            asr_text,
+            asr_words,
+            alignments,
+            model_aligned_words,
         })
     }
 
