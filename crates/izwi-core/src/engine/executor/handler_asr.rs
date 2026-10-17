@@ -442,7 +442,6 @@ fn with_nemotron_offline_state<T>(
 }
 
 impl NativeExecutor {
-
     pub(super) fn transcribe_request(
         &self,
         request: &EngineCoreRequest,
