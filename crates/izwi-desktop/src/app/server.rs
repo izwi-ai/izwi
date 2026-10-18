@@ -274,7 +274,8 @@ fn configure_local_server_command(cmd: &mut Command, bind_host: &str, port: u16)
     // The standalone server reads the shared user config.toml and overlays its
     // inherited environment once. Do not synthesize default performance env
     // here: that would erase persisted opt-outs before the server can merge them.
-    cmd.env("IZWI_HOST", bind_host)
+    super::console::hide_console_window(cmd)
+        .env("IZWI_HOST", bind_host)
         .env("IZWI_PORT", port.to_string())
         .env(DESKTOP_OWNER_PIPE_ENV, "1")
         .stdin(Stdio::piped());

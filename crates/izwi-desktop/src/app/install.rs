@@ -263,7 +263,8 @@ fn add_windows_user_path(path: &std::path::Path) -> Result<()> {
         escaped
     );
 
-    let status = std::process::Command::new("powershell")
+    let mut command = std::process::Command::new("powershell");
+    let status = super::console::hide_console_window(&mut command)
         .arg("-NoProfile")
         .arg("-NonInteractive")
         .arg("-Command")
