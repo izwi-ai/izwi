@@ -353,29 +353,6 @@ export function TextToSpeechPage({
     };
   }, [record, recordId, streamingRecord]);
 
-  const detailTitle = visibleRecord?.model_id || "Speech generation";
-  const detailDescription = useMemo(() => {
-    if (!visibleRecord) {
-      return "Inspect status and generation details for this text-to-speech record.";
-    }
-
-    const processingStatus = normalizeSpeechProcessingStatus(
-      visibleRecord.processing_status,
-      visibleRecord.processing_error,
-    );
-
-    switch (processingStatus) {
-      case "pending":
-        return "This generation is queued.";
-      case "processing":
-        return "This generation is actively rendering audio.";
-      case "failed":
-        return "This generation failed. Any audio already played may be incomplete.";
-      case "ready":
-      default:
-        return "Inspect status and generation details for this text-to-speech record.";
-    }
-  }, [visibleRecord]);
 
   const visibleVoiceLabel = useMemo(
     () =>
@@ -485,28 +462,16 @@ export function TextToSpeechPage({
       )}
       {recordId ? (
         <>
-          <PageHeader
-            breadcrumbs={[
-              { label: "Text to Speech", to: "/text-to-speech" },
-              { label: detailTitle },
-            ]}
-            title={detailTitle}
-            description={detailDescription}
-            actions={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={openModelManager}
-              >
-                <Settings2 className="h-4 w-4" />
-                Models
-              </Button>
-            }
-          />
-
           <TextToSpeechRecordDetail
+            parentCrumb={{ label: "Text to Speech", to: "/text-to-speech" }}
+            extraMenuItems={[
+              {
+                id: "models",
+                label: "Models",
+                icon: Settings2,
+                onSelect: openModelManager,
+              },
+            ]}
             record={visibleRecord}
             audioUrl={detailAudioUrl}
             voiceLabel={visibleVoiceLabel}

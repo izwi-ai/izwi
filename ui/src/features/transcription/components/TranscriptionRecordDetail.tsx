@@ -1,12 +1,17 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
+  CalendarDays,
   Check,
+  Clock,
   Copy,
+  Cpu,
   Download,
+  Languages,
   Loader2,
   RotateCcw,
   Trash2,
+  Type,
 } from "lucide-react";
 
 import {
@@ -23,13 +28,19 @@ import {
 } from "@/components/ui/dialog";
 import { TranscriptionExportDialog } from "@/features/transcription/components/TranscriptionExportDialog";
 import { TranscriptionReviewWorkspace } from "@/features/transcription/components/TranscriptionReviewWorkspace";
-import { SpeechTextRecordShell } from "@/features/speech-text/components/SpeechTextRecordShell";
 import {
-  formatAudioDuration,
-  formatCreatedAt,
-  normalizeProcessingStatus,
-} from "@/features/transcription/playground/support";
-import { formatTranscriptionText } from "@/features/transcription/transcript";
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import type { RowMenuItem } from "@/components/history/RowMenu";
+import type { Breadcrumb } from "@/components/PageShell";
+import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { normalizeProcessingStatus } from "@/features/transcription/playground/support";
+import {
+  formatTranscriptionText,
+  transcriptionWordCount,
+} from "@/features/transcription/transcript";
 
 interface TranscriptionRecordDetailProps {
   record: TranscriptionRecord | null;
@@ -43,6 +54,10 @@ interface TranscriptionRecordDetailProps {
   deletePending?: boolean;
   summaryRefreshPending?: boolean;
   summaryRefreshError?: string | null;
+  /** The list this record belongs to, for the breadcrumb trail. */
+  parentCrumb: Breadcrumb;
+  /** Route actions for the header menu (Models). */
+  extraMenuItems?: RowMenuItem[];
 }
 
 function progressPhaseLabel(
@@ -161,6 +176,8 @@ export function TranscriptionRecordDetail({
   deletePending = false,
   summaryRefreshPending = false,
   summaryRefreshError = null,
+  parentCrumb,
+  extraMenuItems = [],
 }: TranscriptionRecordDetailProps) {
   const [copied, setCopied] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -214,42 +231,77 @@ export function TranscriptionRecordDetail({
     await onDelete();
   }
 
+  const title =
+    record?.audio_filename || record?.model_id || "Transcription record";
+  const wordCount = record ? transcriptionWordCount(record) : 0;
+  const meta: RecordMetaItem[] = record
+    ? [
+        { icon: CalendarDays, label: formatHistoryDate(record.created_at) },
+        ...(record.duration_secs != null
+          ? [{ icon: Clock, label: formatClockDuration(record.duration_secs) }]
+          : []),
+        ...(record.language ? [{ icon: Languages, label: record.language }] : []),
+        ...(record.model_id
+          ? [
+              {
+                icon: Cpu,
+                label: getModelDisplayName(record.model_id),
+                title: "Model",
+              },
+            ]
+          : []),
+        ...(wordCount > 0
+          ? [
+              {
+                icon: Type,
+                label: `${wordCount} word${wordCount === 1 ? "" : "s"}`,
+              },
+            ]
+          : []),
+      ]
+    : [];
+  const menuItems: RowMenuItem[] = [
+    ...(onRegenerateSummary
+      ? [
+          {
+            id: "summary",
+            label: summaryRefreshPending
+              ? "Regenerating summary…"
+              : "Regenerate summary",
+            icon: summaryRefreshPending ? Loader2 : RotateCcw,
+            disabled:
+              !record ||
+              processingStatus !== "ready" ||
+              summaryRefreshPending ||
+              !hasTranscript,
+            onSelect: onRegenerateSummary,
+          },
+        ]
+      : []),
+    ...extraMenuItems,
+    ...(onDelete
+      ? [
+          {
+            id: "delete",
+            label: "Delete",
+            icon: Trash2,
+            danger: true,
+            separatorBefore: true,
+            disabled: deletePending,
+            onSelect: () => setDeleteConfirmOpen(true),
+          },
+        ]
+      : []),
+  ];
+
   return (
-    <SpeechTextRecordShell
-      metadata={
-        <>
-          {record ? <span>{formatCreatedAt(record.created_at)}</span> : null}
-          {record?.duration_secs != null ? (
-            <span>{formatAudioDuration(record.duration_secs)}</span>
-          ) : null}
-          {record?.language ? <span>{record.language}</span> : null}
-          {record?.model_id ? <span>{record.model_id}</span> : null}
-        </>
-      }
+    <RecordPage
+      title={title}
+      breadcrumbs={[parentCrumb, { label: title }]}
+      meta={meta}
+      menuItems={menuItems}
       actions={
         <>
-          {onRegenerateSummary ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2"
-              onClick={onRegenerateSummary}
-              disabled={
-                !record ||
-                processingStatus !== "ready" ||
-                summaryRefreshPending ||
-                !hasTranscript
-              }
-            >
-              {summaryRefreshPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <RotateCcw className="h-4 w-4" />
-              )}
-              Regenerate summary
-            </Button>
-          ) : null}
           <Button
             type="button"
             variant="outline"
@@ -264,7 +316,6 @@ export function TranscriptionRecordDetail({
           <TranscriptionExportDialog record={record}>
             <Button
               type="button"
-              variant="outline"
               size="sm"
               className="h-9 gap-2"
               disabled={!hasTranscript}
@@ -273,23 +324,6 @@ export function TranscriptionRecordDetail({
               Export
             </Button>
           </TranscriptionExportDialog>
-          {onDelete ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--danger-border)] text-[var(--danger-text)] hover:bg-[var(--danger-bg)]"
-              onClick={() => setDeleteConfirmOpen(true)}
-              disabled={deletePending}
-            >
-              {deletePending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="h-4 w-4" />
-              )}
-              Delete
-            </Button>
-          ) : null}
         </>
       }
       alerts={
@@ -442,6 +476,6 @@ export function TranscriptionRecordDetail({
           </div>
         </DialogContent>
       </Dialog>
-    </SpeechTextRecordShell>
+    </RecordPage>
   );
 }

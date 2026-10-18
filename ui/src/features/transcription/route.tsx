@@ -676,30 +676,6 @@ export function TranscriptionPage({
       )?.status ?? null,
     [resolvedAlignerModel, transcriptionAlignerModels],
   );
-  const detailDescription = useMemo(() => {
-    const visibleRecord =
-      streamingRecord && streamingRecord.id === recordId ? streamingRecord : record;
-
-    if (!visibleRecord) {
-      return "Inspect job status, transcript output, and summary state for this transcription record.";
-    }
-
-    const processingStatus = normalizeProcessingStatus(
-      visibleRecord.processing_status,
-      visibleRecord.processing_error,
-    );
-    switch (processingStatus) {
-      case "pending":
-        return "This transcription job is queued.";
-      case "processing":
-        return "This transcription job is actively processing.";
-      case "failed":
-        return "This transcription job failed during processing.";
-      case "ready":
-      default:
-        return "Inspect job status, transcript output, and summary state for this transcription record.";
-    }
-  }, [record, recordId, streamingRecord]);
   const visibleRecord = useMemo(() => {
     if (!recordId) {
       return null;
@@ -779,37 +755,20 @@ export function TranscriptionPage({
     ? openSpeakerAttributedAsrModelManager
     : openTranscriptionModelManager;
 
-  const detailTitle =
-    visibleRecord?.audio_filename ||
-    visibleRecord?.model_id ||
-    "Transcription record";
-
   return (
     <PageShell className={recordId ? "pb-32 sm:pb-36" : undefined}>
       {recordId ? (
         <>
-          <PageHeader
-            breadcrumbs={[
-              { label: "Transcription", to: "/transcription" },
-              { label: detailTitle },
-            ]}
-            title={detailTitle}
-            description={detailDescription}
-            actions={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={handleOpenModels}
-              >
-                <Settings2 className="h-4 w-4" />
-                Models
-              </Button>
-            }
-          />
-
           <TranscriptionRecordDetail
+            parentCrumb={{ label: "Transcription", to: "/transcription" }}
+            extraMenuItems={[
+              {
+                id: "models",
+                label: "Models",
+                icon: Settings2,
+                onSelect: handleOpenModels,
+              },
+            ]}
             record={visibleRecord}
             audioUrl={detailAudioUrl}
             loading={recordLoading}

@@ -1890,7 +1890,12 @@ describe("TranscriptionPage detail route", () => {
       await screen.findByRole("heading", { name: "meeting.wav" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
 
     expect(
       await screen.findByText(

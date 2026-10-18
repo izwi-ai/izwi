@@ -1220,7 +1220,12 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
     fireEvent.click(screen.getByRole("button", { name: /Delete generation/i }));
 
     await waitFor(() =>
@@ -1295,7 +1300,7 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    expect(await screen.findByText("Voice: Narrator Prime")).toBeInTheDocument();
+    expect(await screen.findByTitle("Voice")).toHaveTextContent("Narrator Prime");
     expect(screen.queryByText(/^READY$/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/Saved voice:\s*voice-1/i)).not.toBeInTheDocument();
   });
@@ -1316,7 +1321,7 @@ describe("TextToSpeechPage", () => {
       await screen.findByRole("navigation", { name: "Breadcrumb" }),
     ).toBeInTheDocument();
 
-    expect(await screen.findByText("Voice: Anna")).toBeInTheDocument();
+    expect(await screen.findByTitle("Voice")).toHaveTextContent("Anna");
     expect(screen.queryByText("Voice: Ono_anna")).not.toBeInTheDocument();
   });
 });

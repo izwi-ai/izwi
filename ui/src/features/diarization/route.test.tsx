@@ -1060,7 +1060,12 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Delete$/i }));
     fireEvent.click(
       await screen.findByRole("button", { name: /Delete record/i }),
     );
@@ -1094,7 +1099,12 @@ describe("DiarizationPage routes", () => {
       expect(apiMocks.getDiarizationRecord).toHaveBeenCalledWith("diar-1"),
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: /Cancel run/i }));
+    const recordMenu = await screen.findByRole("button", {
+      name: /^More actions for /,
+    });
+    fireEvent.pointerDown(recordMenu, { button: 0, ctrlKey: false });
+    fireEvent.click(recordMenu);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Cancel run/i }));
 
     await waitFor(() =>
       expect(apiMocks.cancelDiarizationRecord).toHaveBeenCalledWith("diar-1"),

@@ -27,10 +27,16 @@ interface RowMenuProps {
   label: string;
   items: RowMenuItem[];
   busy?: boolean;
+  triggerClassName?: string;
 }
 
 /** The "…" menu at the end of a history row. */
-export function RowMenu({ label, items, busy = false }: RowMenuProps) {
+export function RowMenu({
+  label,
+  items,
+  busy = false,
+  triggerClassName,
+}: RowMenuProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -38,7 +44,10 @@ export function RowMenu({ label, items, busy = false }: RowMenuProps) {
           type="button"
           variant="ghost"
           size="icon"
-          className="h-7 w-7 rounded-lg text-[var(--text-subtle)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]"
+          className={cn(
+            "h-7 w-7 rounded-lg text-[var(--text-subtle)] hover:bg-[var(--bg-surface-2)] hover:text-[var(--text-primary)]",
+            triggerClassName,
+          )}
           aria-label={`More actions for ${label}`}
         >
           {busy ? (

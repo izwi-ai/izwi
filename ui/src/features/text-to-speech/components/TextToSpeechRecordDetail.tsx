@@ -1,10 +1,14 @@
 import { useMemo, useState } from "react";
 import {
   AlertTriangle,
+  CalendarDays,
   Check,
+  Clock,
   Copy,
+  Cpu,
   Download,
   Loader2,
+  Mic,
   OctagonX,
   Trash2,
 } from "lucide-react";
@@ -20,10 +24,27 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  formatSpeechCreatedAt,
-  formatSpeechDuration,
-  normalizeSpeechProcessingStatus,
-} from "@/features/text-to-speech/support";
+  formatClockDuration,
+  formatHistoryDate,
+} from "@/components/history/format";
+import type { RowMenuItem } from "@/components/history/RowMenu";
+import type { Breadcrumb } from "@/components/PageShell";
+import { RecordPage, type RecordMetaItem } from "@/components/RecordPage";
+import { getModelDisplayName } from "@/features/models/catalog/modelMetadata";
+import { normalizeSpeechProcessingStatus } from "@/features/text-to-speech/support";
+
+const TITLE_MAX_CHARS = 60;
+
+/** The opening of the spoken text, which names a take better than its model. */
+function speechRecordTitle(record: SpeechHistoryRecord | null): string {
+  const text = record?.input_text?.replace(/\s+/g, " ").trim() ?? "";
+  if (!text) {
+    return "Speech generation";
+  }
+  return text.length > TITLE_MAX_CHARS
+    ? `${text.slice(0, TITLE_MAX_CHARS).trimEnd()}…`
+    : text;
+}
 
 interface TextToSpeechRecordDetailProps {
   record: SpeechHistoryRecord | null;
@@ -36,6 +57,10 @@ interface TextToSpeechRecordDetailProps {
   cancelPending?: boolean;
   onCancel?: () => Promise<void> | void;
   onDelete?: () => Promise<void> | void;
+  /** The list this record belongs to, for the breadcrumb trail. */
+  parentCrumb: Breadcrumb;
+  /** Route actions for the header menu (Models). */
+  extraMenuItems?: RowMenuItem[];
 }
 
 export function TextToSpeechRecordDetail({
@@ -49,6 +74,8 @@ export function TextToSpeechRecordDetail({
   cancelPending = false,
   onCancel,
   onDelete,
+  parentCrumb,
+  extraMenuItems = [],
 }: TextToSpeechRecordDetailProps) {
   const [copied, setCopied] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -103,38 +130,66 @@ export function TextToSpeechRecordDetail({
     await onDelete();
   }
 
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
-            {record ? <span>{formatSpeechCreatedAt(record.created_at)}</span> : null}
-            {record?.audio_duration_secs != null ? (
-              <span>{formatSpeechDuration(record.audio_duration_secs)}</span>
-            ) : null}
-            {record?.model_id ? <span>{record.model_id}</span> : null}
-            {voiceLabel ? <span>Voice: {voiceLabel}</span> : null}
-          </div>
-        </div>
+  const title = speechRecordTitle(record);
+  const meta: RecordMetaItem[] = record
+    ? [
+        { icon: CalendarDays, label: formatHistoryDate(record.created_at) },
+        ...(record.audio_duration_secs != null
+          ? [
+              {
+                icon: Clock,
+                label: formatClockDuration(record.audio_duration_secs),
+              },
+            ]
+          : []),
+        ...(voiceLabel ? [{ icon: Mic, label: voiceLabel, title: "Voice" }] : []),
+        ...(record.model_id
+          ? [
+              {
+                icon: Cpu,
+                label: getModelDisplayName(record.model_id),
+                title: "Model",
+              },
+            ]
+          : []),
+      ]
+    : [];
+  const menuItems: RowMenuItem[] = [
+    ...(onCancel && canCancel
+      ? [
+          {
+            id: "cancel",
+            label: cancelPending ? "Cancelling…" : "Cancel generation",
+            icon: OctagonX,
+            disabled: cancelPending,
+            onSelect: () => void onCancel(),
+          },
+        ]
+      : []),
+    ...extraMenuItems,
+    ...(onDelete
+      ? [
+          {
+            id: "delete",
+            label: "Delete",
+            icon: Trash2,
+            danger: true,
+            separatorBefore: true,
+            disabled: deletePending,
+            onSelect: () => setDeleteConfirmOpen(true),
+          },
+        ]
+      : []),
+  ];
 
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {onCancel && canCancel ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--status-warning-border)] text-[var(--status-warning-text)]"
-              onClick={() => void onCancel()}
-              disabled={cancelPending}
-            >
-              {cancelPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <OctagonX className="h-4 w-4" />
-              )}
-              Cancel generation
-            </Button>
-          ) : null}
+  return (
+    <RecordPage
+      title={title}
+      breadcrumbs={[parentCrumb, { label: title }]}
+      meta={meta}
+      menuItems={menuItems}
+      actions={
+        <>
           <Button
             type="button"
             variant="outline"
@@ -148,7 +203,6 @@ export function TextToSpeechRecordDetail({
           </Button>
           <Button
             type="button"
-            variant="outline"
             size="sm"
             className="h-9 gap-2"
             onClick={() => void handleDownloadAudio()}
@@ -157,26 +211,9 @@ export function TextToSpeechRecordDetail({
             <Download className="h-4 w-4" />
             Download
           </Button>
-          {onDelete ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 gap-2 border-[var(--danger-border)] text-[var(--danger-text)] hover:bg-[var(--danger-bg)]"
-              onClick={() => setDeleteConfirmOpen(true)}
-              disabled={deletePending}
-            >
-              {deletePending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 className="h-4 w-4" />
-              )}
-              Delete
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
+        </>
+      }
+    >
       {error ? (
         <Card
           className="border-[var(--danger-border)] bg-[var(--danger-bg)] p-4 text-sm text-[var(--danger-text)]"
@@ -257,7 +294,7 @@ export function TextToSpeechRecordDetail({
           <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
             <div className="text-xs text-[var(--text-muted)]">Audio duration</div>
             <div className="mt-1 text-sm font-semibold text-[var(--text-primary)]">
-              {formatSpeechDuration(record?.audio_duration_secs ?? null)}
+              {formatClockDuration(record?.audio_duration_secs ?? null)}
             </div>
           </div>
           <div className="rounded-xl border border-[var(--border-muted)] bg-[var(--bg-surface-1)] p-3">
@@ -344,6 +381,6 @@ export function TextToSpeechRecordDetail({
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+    </RecordPage>
   );
 }

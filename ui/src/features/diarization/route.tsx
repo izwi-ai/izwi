@@ -33,7 +33,6 @@ import {
 import { useDiarizationHistory } from "@/features/diarization/hooks/useDiarizationHistory";
 import { useDiarizationRecord } from "@/features/diarization/hooks/useDiarizationRecord";
 import { summarizeDiarizationRecord } from "@/features/diarization/historySummary";
-import { normalizeDiarizationProcessingStatus } from "@/utils/diarizationProcessing";
 import { Settings2 } from "lucide-react";
 
 interface DiarizationPageProps {
@@ -316,29 +315,6 @@ export function DiarizationPage({
   }, [latestRecord, record, recordId]);
   const listTitle =
     routeBasePath === "/transcription" ? "Transcription" : "Diarization";
-  const detailTitle =
-    visibleRecord?.audio_filename || visibleRecord?.id || "Diarization record";
-  const detailDescription = useMemo(() => {
-    if (!visibleRecord) {
-      return "Inspect transcript output, speaker corrections, and quality reruns for this saved diarization record.";
-    }
-
-    const processingStatus = normalizeDiarizationProcessingStatus(
-      visibleRecord.processing_status,
-      visibleRecord.processing_error,
-    );
-    switch (processingStatus) {
-      case "pending":
-        return "This diarization run is queued.";
-      case "processing":
-        return "This diarization run is actively processing.";
-      case "failed":
-        return "This diarization run failed during processing.";
-      case "ready":
-      default:
-        return "Inspect transcript output, speaker corrections, and quality reruns for this saved diarization record.";
-    }
-  }, [visibleRecord]);
   const visibleHistoryRecords = useMemo(() => {
     if (!latestRecord) {
       return records;
@@ -519,28 +495,16 @@ export function DiarizationPage({
     <PageShell className={recordId ? "pb-24 sm:pb-28" : undefined}>
       {recordId ? (
         <>
-          <PageHeader
-            breadcrumbs={[
-              { label: listTitle, to: buildRoutePath() },
-              { label: detailTitle },
-            ]}
-            title={detailTitle}
-            description={detailDescription}
-            actions={
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="h-9 gap-2"
-                onClick={handleOpenModels}
-              >
-                <Settings2 className="h-4 w-4" />
-                Models
-              </Button>
-            }
-          />
-
           <DiarizationRecordDetail
+            parentCrumb={{ label: listTitle, to: buildRoutePath() }}
+            extraMenuItems={[
+              {
+                id: "models",
+                label: "Models",
+                icon: Settings2,
+                onSelect: handleOpenModels,
+              },
+            ]}
             record={visibleRecord}
             audioUrl={detailAudioUrl}
             loading={recordLoading}
